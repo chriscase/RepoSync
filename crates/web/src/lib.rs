@@ -16,11 +16,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
-use axum::http::{header, Method};
+use axum::http::{header, Method, StatusCode, Uri};
+use axum::response::IntoResponse;
 use axum::Router;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -151,8 +152,28 @@ impl WebServer {
             .ok()
             .and_then(|p| p.parent().map(|p| p.join("static")))
             .unwrap_or_else(|| std::path::PathBuf::from("static"));
-        let serve_spa = ServeDir::new(&static_dir)
-            .not_found_service(ServeFile::new(static_dir.join("index.html")));
+        let index_html_path = static_dir.join("index.html");
+        // ServeDir serves real files (JS, CSS, images). For any path that
+        // doesn't match a file, the fallback handler returns index.html with
+        // status 200 so client-side routing works correctly.
+        let serve_static = ServeDir::new(&static_dir);
+        let spa_fallback = {
+            let index_path = index_html_path.clone();
+            axum::routing::get(move |_uri: Uri| {
+                let path = index_path.clone();
+                async move {
+                    match tokio::fs::read(&path).await {
+                        Ok(contents) => (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                            contents,
+                        ).into_response(),
+                        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+            })
+        };
+        let serve_spa = serve_static.fallback(spa_fallback);
 
         let app = Router::new()
             // API routes
