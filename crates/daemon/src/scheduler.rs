@@ -308,52 +308,9 @@ impl Scheduler {
             }
 
             // Read credentials from kv_state.
-            // Chain: repo_id → parent_id → global
-            let svn_password = self
-                .db
-                .get_state(&format!("secret_svn_password_{}", repo.id))
-                .ok()
-                .flatten()
-                .filter(|v| !v.is_empty())
-                .or_else(|| {
-                    repo.parent_id.as_ref().and_then(|pid| {
-                        self.db
-                            .get_state(&format!("secret_svn_password_{}", pid))
-                            .ok()
-                            .flatten()
-                            .filter(|v| !v.is_empty())
-                    })
-                })
-                .or_else(|| {
-                    self.db
-                        .get_state("secret_svn_password")
-                        .ok()
-                        .flatten()
-                        .filter(|v| !v.is_empty())
-                });
-
-            let git_token = self
-                .db
-                .get_state(&format!("secret_git_token_{}", repo.id))
-                .ok()
-                .flatten()
-                .filter(|v| !v.is_empty())
-                .or_else(|| {
-                    repo.parent_id.as_ref().and_then(|pid| {
-                        self.db
-                            .get_state(&format!("secret_git_token_{}", pid))
-                            .ok()
-                            .flatten()
-                            .filter(|v| !v.is_empty())
-                    })
-                })
-                .or_else(|| {
-                    self.db
-                        .get_state("secret_git_token")
-                        .ok()
-                        .flatten()
-                        .filter(|v| !v.is_empty())
-                });
+            // Chain: repo_id → parent → grandparent → … → global
+            let svn_password = self.db.resolve_credential_chain(&repo.id, "secret_svn_password");
+            let git_token = self.db.resolve_credential_chain(&repo.id, "secret_git_token");
 
             // Build SVN URL: repo.svn_url + repo.svn_branch
             let svn_url = if repo.svn_branch.is_empty() {

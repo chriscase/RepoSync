@@ -919,6 +919,12 @@ struct CreateBranchPairRequest {
     git_branch: String,
     #[serde(default)]
     skip_import: bool,
+    /// Auto-create the SVN branch via `svn copy` from the parent's branch.
+    /// Defaults to true when not specified.
+    auto_create_svn_branch: Option<bool>,
+    /// Auto-create the Git branch via the provider API from the parent's branch.
+    /// Defaults to true when not specified.
+    auto_create_git_branch: Option<bool>,
 }
 
 async fn create_branch_pair(
@@ -945,10 +951,13 @@ async fn create_branch_pair(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound(format!("repository {} not found", id)))?;
 
-    // Reject nesting: parent must not itself be a child
-    if parent.parent_id.is_some() {
+    // Check nesting depth (max 4 levels: root + 3 children)
+    let ancestors = db
+        .resolve_ancestor_chain(&parent.id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+    if ancestors.len() >= 3 {
         return Err(AppError::BadRequest(
-            "cannot create branch pair on a child repository (no nesting)".into(),
+            "maximum nesting depth of 4 exceeded".into(),
         ));
     }
 
@@ -959,9 +968,118 @@ async fn create_branch_pair(
         return Err(AppError::BadRequest("git_branch is required".into()));
     }
 
+    // Auto-create SVN branch if requested (default: true)
+    let auto_svn = body.auto_create_svn_branch.unwrap_or(true);
+    let auto_git = body.auto_create_git_branch.unwrap_or(true);
+
+    if auto_svn {
+        let svn_password = db
+            .resolve_credential_chain(&parent.id, "secret_svn_password")
+            .unwrap_or_default();
+        let svn_client = SvnClient::new(
+            &parent.svn_url,
+            &parent.svn_username,
+            &svn_password,
+        );
+        // Get current HEAD rev for the copy
+        let parent_svn_url = if parent.svn_branch.is_empty() {
+            parent.svn_url.clone()
+        } else {
+            format!(
+                "{}/{}",
+                parent.svn_url.trim_end_matches('/'),
+                parent.svn_branch.trim_start_matches('/')
+            )
+        };
+        let info_client = SvnClient::new(&parent_svn_url, &parent.svn_username, &svn_password);
+        match info_client.info().await {
+            Ok(info) => {
+                // Determine branches_path and branch name from body.svn_branch
+                // e.g., "branches/fix-123" → branches_path="branches", name="fix-123"
+                let (branches_path, branch_name) = if let Some(pos) = body.svn_branch.rfind('/') {
+                    (&body.svn_branch[..pos], &body.svn_branch[pos + 1..])
+                } else {
+                    ("branches", body.svn_branch.as_str())
+                };
+                match svn_client
+                    .create_branch(branch_name, &parent.svn_branch, branches_path, info.latest_rev)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            branch = %body.svn_branch,
+                            from = %parent.svn_branch,
+                            rev = info.latest_rev,
+                            "auto-created SVN branch"
+                        );
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        // Treat "already exists" as success
+                        if err_str.contains("already exists") || err_str.contains("E160020") {
+                            info!(branch = %body.svn_branch, "SVN branch already exists, continuing");
+                        } else {
+                            return Err(AppError::Internal(format!(
+                                "failed to create SVN branch: {}", e
+                            )));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(AppError::Internal(format!(
+                    "failed to query SVN info for branch creation: {}", e
+                )));
+            }
+        }
+    }
+
+    // Auto-create Git branch if requested (default: true)
+    if auto_git {
+        let git_token = db
+            .resolve_credential_chain(&parent.id, "secret_git_token")
+            .unwrap_or_default();
+        let provider = match parent.git_provider.as_str() {
+            "gitea" => reposync_core::config::GitProvider::Gitea,
+            _ => reposync_core::config::GitProvider::GitHub,
+        };
+        let github_client = reposync_core::git::github::GitHubClient::new(
+            &parent.git_api_url,
+            &git_token,
+            provider,
+        );
+        match github_client
+            .create_branch(&parent.git_repo, &body.git_branch, &parent.git_branch)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    branch = %body.git_branch,
+                    from = %parent.git_branch,
+                    "auto-created Git branch"
+                );
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("already exists") || err_str.contains("Reference already exists") {
+                    info!(branch = %body.git_branch, "Git branch already exists, continuing");
+                } else {
+                    return Err(AppError::Internal(format!(
+                        "failed to create Git branch: {}", e
+                    )));
+                }
+            }
+        }
+    }
+
     let new_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    let name = format!("{} / {}", parent.name, body.git_branch);
+    // Build name: use root repo name + this branch name
+    let root_name = ancestors
+        .last()
+        .map(|r| r.name.as_str())
+        .unwrap_or(&parent.name);
+    let name = format!("{} / {}", root_name, body.git_branch);
 
     let child = reposync_core::models::Repository {
         id: new_id.clone(),
@@ -1001,18 +1119,8 @@ async fn create_branch_pair(
             body.svn_branch.trim_start_matches('/')
         );
 
-        // Read parent credentials
-        let svn_password = db
-            .get_state(&format!("secret_svn_password_{}", parent.id))
-            .ok()
-            .flatten()
-            .filter(|v| !v.is_empty())
-            .or_else(|| {
-                db.get_state("secret_svn_password")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            });
+        // Read credentials via ancestor chain
+        let svn_password = db.resolve_credential_chain(&parent.id, "secret_svn_password");
 
         let svn_client = SvnClient::new(
             &svn_url,

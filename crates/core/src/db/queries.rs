@@ -2033,6 +2033,99 @@ impl Database {
     }
 
     /// Delete a repository by ID.
+    /// Walk the `parent_id` chain from a given repo upward and return the list
+    /// of ancestors: `[parent, grandparent, ..., root]`.  Includes a cycle
+    /// guard and a hard depth limit of 4.
+    pub fn resolve_ancestor_chain(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<models::Repository>, DatabaseError> {
+        let mut chain = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut current_pid = self
+            .get_repository(repo_id)?
+            .and_then(|r| r.parent_id);
+        while let Some(pid) = current_pid {
+            if !visited.insert(pid.clone()) {
+                break; // cycle guard
+            }
+            if chain.len() >= 4 {
+                break; // depth limit
+            }
+            let ancestor = self
+                .get_repository(&pid)?
+                .ok_or_else(|| DatabaseError::NotFound {
+                    entity: "repository".into(),
+                    id: pid.clone(),
+                })?;
+            current_pid = ancestor.parent_id.clone();
+            chain.push(ancestor);
+        }
+        Ok(chain)
+    }
+
+    /// Resolve a credential (e.g. `secret_svn_password`) by walking the
+    /// parent chain: repo → parent → grandparent → … → global.
+    pub fn resolve_credential_chain(
+        &self,
+        repo_id: &str,
+        key_prefix: &str,
+    ) -> Option<String> {
+        // 1. Repo-specific key
+        if let Some(val) = self
+            .get_state(&format!("{}_{}", key_prefix, repo_id))
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+        {
+            return Some(val);
+        }
+        // 2. Walk parent chain
+        let mut pid = self
+            .get_repository(repo_id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.parent_id);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(current_pid) = pid {
+            if !visited.insert(current_pid.clone()) {
+                break;
+            }
+            if let Some(val) = self
+                .get_state(&format!("{}_{}", key_prefix, current_pid))
+                .ok()
+                .flatten()
+                .filter(|v| !v.is_empty())
+            {
+                return Some(val);
+            }
+            pid = self
+                .get_repository(&current_pid)
+                .ok()
+                .flatten()
+                .and_then(|r| r.parent_id);
+        }
+        // 3. Fall back to global key
+        self.get_state(key_prefix)
+            .ok()
+            .flatten()
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Recursively collect all descendant repository IDs for a given repo.
+    pub fn list_all_descendants(&self, repo_id: &str) -> Result<Vec<String>, DatabaseError> {
+        let mut result = Vec::new();
+        let mut stack = vec![repo_id.to_string()];
+        while let Some(current_id) = stack.pop() {
+            let children = self.list_child_repositories(&current_id)?;
+            for child in children {
+                result.push(child.id.clone());
+                stack.push(child.id);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn delete_repository(&self, id: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let changed = conn.execute("DELETE FROM repositories WHERE id = ?1", params![id])?;

@@ -314,7 +314,13 @@ export const api = {
     fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteRepo: (id: string) =>
     fetchJson<void>(`/repos/${id}`, { method: 'DELETE' }),
-  createBranchPair: (repoId: string, data: { svn_branch: string; git_branch: string; skip_import: boolean }) =>
+  createBranchPair: (repoId: string, data: {
+    svn_branch: string;
+    git_branch: string;
+    skip_import: boolean;
+    auto_create_svn_branch?: boolean;
+    auto_create_git_branch?: boolean;
+  }) =>
     fetchJson<Repository>(`/repos/${repoId}/branches`, { method: 'POST', body: JSON.stringify(data) }),
 
   listBranchPairs: (repoId: string) =>

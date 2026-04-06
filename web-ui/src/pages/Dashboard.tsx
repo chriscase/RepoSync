@@ -193,32 +193,8 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </button>
-                {/* Branch pairs inside card */}
-                {children.length > 0 && (
-                  <div className="border-t border-gray-700/50 bg-gray-900/30 px-4 py-2 space-y-0.5">
-                    <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-gray-500 mb-1">
-                      <GitBranch className="w-2.5 h-2.5" />
-                      <span>Branches</span>
-                    </div>
-                    {children.map((child: Repository) => (
-                      <button
-                        key={child.id}
-                        onClick={() => navigate(`/repos/${child.id}`)}
-                        className="w-full flex items-center gap-2 px-2 py-1 rounded hover:bg-gray-700/40 transition-colors text-left"
-                      >
-                        <GitBranch className="w-3 h-3 text-purple-400 flex-shrink-0" />
-                        <span className="text-xs font-medium text-gray-300 truncate">{child.name.split(' / ').pop()}</span>
-                        <span className="text-[10px] text-blue-400/60">{child.svn_branch}</span>
-                        <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
-                        <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
-                        <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
-                          <span className="text-[10px] text-gray-600">{formatTimeAgo(child.updated_at)}</span>
-                          {child.enabled ? <span className="w-1.5 h-1.5 rounded-full bg-green-400" /> : <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
+                {/* Branch pairs inside card (recursive) */}
+                <DashboardBranchTree repoId={repo.id} childMap={childMap} navigate={navigate} depth={0} />
               </div>
               );
             })}
@@ -505,6 +481,52 @@ function StatusCard({
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
       {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
+    </div>
+  );
+}
+
+/** Recursive component for rendering nested branch pairs in Dashboard repo cards. */
+function DashboardBranchTree({
+  repoId,
+  childMap,
+  navigate,
+  depth,
+}: {
+  repoId: string;
+  childMap: Map<string, Repository[]>;
+  navigate: (path: string) => void;
+  depth: number;
+}) {
+  const children = childMap.get(repoId) ?? [];
+  if (children.length === 0) return null;
+
+  return (
+    <div className={`border-t border-gray-700/50 bg-gray-900/30 px-4 py-2 space-y-0.5 ${depth > 0 ? 'border-t-0 pl-6' : ''}`}>
+      {depth === 0 && (
+        <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+          <GitBranch className="w-2.5 h-2.5" />
+          <span>Branches</span>
+        </div>
+      )}
+      {children.map((child: Repository) => (
+        <div key={child.id}>
+          <button
+            onClick={() => navigate(`/repos/${child.id}`)}
+            className="w-full flex items-center gap-2 px-2 py-1 rounded hover:bg-gray-700/40 transition-colors text-left"
+          >
+            <GitBranch className="w-3 h-3 text-purple-400 flex-shrink-0" />
+            <span className="text-xs font-medium text-gray-300 truncate">{child.name.split(' / ').pop()}</span>
+            <span className="text-[10px] text-blue-400/60">{child.svn_branch}</span>
+            <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
+            <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
+            <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
+              <span className="text-[10px] text-gray-600">{formatTimeAgo(child.updated_at)}</span>
+              {child.enabled ? <span className="w-1.5 h-1.5 rounded-full bg-green-400" /> : <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />}
+            </span>
+          </button>
+          <DashboardBranchTree repoId={child.id} childMap={childMap} navigate={navigate} depth={depth + 1} />
+        </div>
+      ))}
     </div>
   );
 }

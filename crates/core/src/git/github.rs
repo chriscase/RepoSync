@@ -466,6 +466,140 @@ impl GitHubClient {
         Ok(repo)
     }
 
+    /// Create a new branch in the remote repository from an existing branch.
+    ///
+    /// Works for both GitHub and Gitea:
+    /// - GitHub: GET ref → POST git/refs
+    /// - Gitea: POST /repos/{owner}/{repo}/branches
+    #[instrument(skip(self))]
+    pub async fn create_branch(
+        &self,
+        repo: &str,
+        branch_name: &str,
+        from_branch: &str,
+    ) -> Result<(), GitHubError> {
+        match self.provider {
+            GitProvider::Gitea => {
+                // Gitea has a dedicated branch creation endpoint
+                let url = format!("{}/repos/{}/branches", self.api_url, repo);
+                let body = serde_json::json!({
+                    "new_branch_name": branch_name,
+                    "old_branch_name": from_branch,
+                });
+                let resp = self
+                    .auth(self.http.post(&url).json(&body))
+                    .send()
+                    .await?;
+                if resp.status().as_u16() == 409 {
+                    // Branch already exists
+                    return Ok(());
+                }
+                self.check_response(resp).await?;
+            }
+            GitProvider::GitHub => {
+                // Step 1: Get the SHA of the source branch
+                let ref_url = format!(
+                    "{}/repos/{}/git/ref/heads/{}",
+                    self.api_url, repo, from_branch
+                );
+                let resp = self.auth(self.http.get(&ref_url)).send().await?;
+                let resp = self.check_response(resp).await?;
+                let ref_data: serde_json::Value = resp.json().await?;
+                let sha = ref_data["object"]["sha"]
+                    .as_str()
+                    .ok_or_else(|| GitHubError::ApiError {
+                        status: 500,
+                        body: format!(
+                            "could not resolve SHA for branch '{}'",
+                            from_branch
+                        ),
+                    })?
+                    .to_string();
+
+                // Step 2: Create the new ref
+                let refs_url =
+                    format!("{}/repos/{}/git/refs", self.api_url, repo);
+                let body = serde_json::json!({
+                    "ref": format!("refs/heads/{}", branch_name),
+                    "sha": sha,
+                });
+                let resp = self
+                    .auth(self.http.post(&refs_url).json(&body))
+                    .send()
+                    .await?;
+                if resp.status().as_u16() == 422 {
+                    // Reference already exists
+                    return Ok(());
+                }
+                self.check_response(resp).await?;
+            }
+        }
+        info!(
+            repo,
+            branch_name,
+            from_branch,
+            "created remote branch"
+        );
+        Ok(())
+    }
+
+    /// Delete a branch in the remote repository.
+    #[instrument(skip(self))]
+    pub async fn delete_branch(
+        &self,
+        repo: &str,
+        branch_name: &str,
+    ) -> Result<(), GitHubError> {
+        match self.provider {
+            GitProvider::Gitea => {
+                let url = format!(
+                    "{}/repos/{}/branches/{}",
+                    self.api_url, repo, branch_name
+                );
+                let resp = self.auth(self.http.delete(&url)).send().await?;
+                if resp.status().as_u16() == 404 {
+                    return Ok(()); // already deleted
+                }
+                self.check_response(resp).await?;
+            }
+            GitProvider::GitHub => {
+                let url = format!(
+                    "{}/repos/{}/git/refs/heads/{}",
+                    self.api_url, repo, branch_name
+                );
+                let resp = self.auth(self.http.delete(&url)).send().await?;
+                if resp.status().as_u16() == 422 {
+                    return Ok(()); // already deleted
+                }
+                self.check_response(resp).await?;
+            }
+        }
+        info!(repo, branch_name, "deleted remote branch");
+        Ok(())
+    }
+
+    /// Check if a branch is merged into another branch.
+    /// Returns the number of commits ahead (0 = fully merged).
+    #[instrument(skip(self))]
+    pub async fn compare_branches(
+        &self,
+        repo: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<u64, GitHubError> {
+        let url = format!(
+            "{}/repos/{}/compare/{}...{}",
+            self.api_url, repo, base, head
+        );
+        let resp = self.auth(self.http.get(&url)).send().await?;
+        let resp = self.check_response(resp).await?;
+        let data: serde_json::Value = resp.json().await?;
+        let ahead = data["ahead_by"].as_u64()
+            .or_else(|| data["commits"].as_array().map(|a| a.len() as u64))
+            .unwrap_or(0);
+        Ok(ahead)
+    }
+
     /// Get the authenticated user's login.
     #[instrument(skip(self))]
     pub async fn get_authenticated_user(&self) -> Result<GitHubUser, GitHubError> {

@@ -75,7 +75,13 @@ export default function RepoDetail() {
   const [svnTesting, setSvnTesting] = useState(false);
   const [gitTesting, setGitTesting] = useState(false);
   const [showBranchModal, setShowBranchModal] = useState(false);
-  const [branchForm, setBranchForm] = useState({ svn_branch: '', git_branch: '', skip_import: true });
+  const [branchForm, setBranchForm] = useState({
+    svn_branch: '',
+    git_branch: '',
+    skip_import: true,
+    auto_create_svn_branch: true,
+    auto_create_git_branch: true,
+  });
   const [branchSuccess, setBranchSuccess] = useState(false);
 
   const { data: repo, isLoading, isError, error } = useQuery({
@@ -858,9 +864,9 @@ export default function RepoDetail() {
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-100">Add Branch Pair</h2>
+              <h2 className="text-lg font-semibold text-gray-100">Create Branch</h2>
               <button
-                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: true }); branchMutation.reset(); }}
+                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true }); branchMutation.reset(); }}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -869,32 +875,82 @@ export default function RepoDetail() {
             <div className="p-6 space-y-4">
               {branchMutation.isError && (
                 <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
-                  Failed to create branch pair: {branchMutation.error?.message}
+                  Failed to create branch: {branchMutation.error?.message}
                 </div>
               )}
+
+              {/* Parent context */}
+              <div className="bg-gray-900/50 border border-gray-700/50 rounded-lg px-3 py-2 text-xs text-gray-400">
+                <span className="text-gray-500">Branching from:</span>{' '}
+                <span className="text-blue-400 font-mono">{repo?.svn_branch || 'trunk'}</span>
+                {' \u2192 '}
+                <span className="text-purple-400 font-mono">{repo?.git_branch || 'main'}</span>
+              </div>
+
               <div>
-                <label className="block text-sm text-gray-400 mb-1">SVN Branch Path</label>
+                <label className="block text-sm text-gray-400 mb-1">Branch Name</label>
+                <input
+                  type="text"
+                  className={inputClass}
+                  value={branchForm.git_branch}
+                  onChange={(e) => {
+                    const name = e.target.value;
+                    setBranchForm(prev => ({
+                      ...prev,
+                      git_branch: name,
+                      svn_branch: name ? `branches/${name}` : '',
+                    }));
+                  }}
+                  placeholder="e.g., fix-123, tech-update-Q2"
+                />
+              </div>
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">SVN Branch Path <span className="text-gray-600">(auto-derived, editable)</span></label>
                 <input
                   type="text"
                   className={inputClass}
                   value={branchForm.svn_branch}
                   onChange={(e) => setBranchForm(prev => ({ ...prev, svn_branch: e.target.value }))}
-                  placeholder="branches/SLS/tech_update_2026Q2"
+                  placeholder="branches/fix-123"
                 />
               </div>
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">Git Branch Name</label>
-                <input
-                  type="text"
-                  className={inputClass}
-                  value={branchForm.git_branch}
-                  onChange={(e) => setBranchForm(prev => ({ ...prev, git_branch: e.target.value }))}
-                  placeholder="tech-update-2026Q2"
-                />
+
+              {/* Auto-create options */}
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={branchForm.auto_create_svn_branch}
+                    onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_svn_branch: e.target.checked }))}
+                    className="rounded border-gray-600 bg-gray-700 text-blue-600"
+                  />
+                  <span className="text-sm text-gray-300">Create SVN branch <span className="text-gray-500">(svn copy)</span></span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={branchForm.auto_create_git_branch}
+                    onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_git_branch: e.target.checked }))}
+                    className="rounded border-gray-600 bg-gray-700 text-purple-600"
+                  />
+                  <span className="text-sm text-gray-300">Create Git branch <span className="text-gray-500">(from {repo?.git_branch || 'main'})</span></span>
+                </label>
               </div>
+
+              {/* Import mode */}
               <div>
                 <label className="block text-sm text-gray-400 mb-2">Import Mode</label>
                 <div className="space-y-2">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="importMode"
+                      checked={branchForm.skip_import}
+                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: true }))}
+                      className="text-blue-600"
+                    />
+                    <span className="text-sm text-gray-300">Start from now <span className="text-gray-500">(recommended)</span></span>
+                  </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
@@ -905,22 +961,12 @@ export default function RepoDetail() {
                     />
                     <span className="text-sm text-gray-300">Import full history</span>
                   </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="importMode"
-                      checked={branchForm.skip_import}
-                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: true }))}
-                      className="text-blue-600"
-                    />
-                    <span className="text-sm text-gray-300">Start from now (skip import)</span>
-                  </label>
                 </div>
               </div>
             </div>
             <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
-                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: true }); branchMutation.reset(); }}
+                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true }); branchMutation.reset(); }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
               >
                 Cancel
@@ -930,8 +976,8 @@ export default function RepoDetail() {
                 disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
-                <Plus className="w-4 h-4" />
-                {branchMutation.isPending ? 'Creating...' : 'Create'}
+                <GitBranch className="w-4 h-4" />
+                {branchMutation.isPending ? 'Creating...' : 'Create Branch'}
               </button>
             </div>
           </div>
