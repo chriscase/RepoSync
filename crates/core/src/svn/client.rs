@@ -276,7 +276,8 @@ impl SvnClient {
             .arg("--no-auth-cache")
             .arg("--username")
             .arg(&self.username)
-            .env("SVN_PASSWORD", &self.password)
+            .arg("--password")
+            .arg(&self.password)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -315,7 +316,8 @@ impl SvnClient {
             .arg("--no-auth-cache")
             .arg("--username")
             .arg(&self.username)
-            .env("SVN_PASSWORD", &self.password)
+            .arg("--password")
+            .arg(&self.password)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
