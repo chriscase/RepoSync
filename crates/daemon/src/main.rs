@@ -152,8 +152,23 @@ async fn main() -> Result<()> {
                 reposync_core::config::SyncMode::Direct => "direct",
                 reposync_core::config::SyncMode::Pr => "pr",
             };
+            // Try to reuse an existing repo UUID from orphaned credential keys.
+            // This handles the case where the DB was reset but kv_state still has
+            // per-repo credentials stored under the old UUID.
+            let reuse_repo_id: Option<String> = (|| {
+                let conn = db.conn();
+                let mut stmt = conn
+                    .prepare("SELECT key FROM kv_state WHERE key LIKE 'secret_svn_password_%' AND key != 'secret_svn_password' LIMIT 1")
+                    .ok()?;
+                let key: String = stmt.query_row([], |row| row.get(0)).ok()?;
+                key.strip_prefix("secret_svn_password_").map(|s| s.to_string())
+            })();
+            if let Some(ref id) = reuse_repo_id {
+                info!("Reusing existing repo UUID {} from orphaned credential keys", id);
+            }
+
             let default_repo = reposync_core::models::Repository {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: reuse_repo_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: config.github.repo.clone(),
                 svn_url: config.svn.url.clone(),
                 svn_branch: config.svn.trunk_path.clone(),

@@ -62,7 +62,7 @@ export function renderAuditEvent(event: ActivityEvent): React.ReactNode {
         {repoName && repoName !== 'default' && <RepoBadge name={repoName} />}
         {direction && <DirectionBadge direction={direction} />}
         {action && <ActionBadge action={action} />}
-        <span className="text-sm text-gray-200 truncate" title={event.description ?? event.title}>
+        <span className="text-sm text-gray-200 line-clamp-2" title={event.description ?? event.title}>
           {event.description ?? event.title}
         </span>
         {author && (
