@@ -20,6 +20,7 @@ use crate::AppState;
 pub struct ListConflictsQuery {
     pub per_page: Option<u32>,
     pub status: Option<String>,
+    pub repo_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -32,6 +33,7 @@ struct ConflictListItem {
     git_hash: Option<String>,
     created_at: String,
     resolved_at: Option<String>,
+    repo_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -49,6 +51,7 @@ struct ConflictDetail {
     resolved_by: Option<String>,
     created_at: String,
     resolved_at: Option<String>,
+    repo_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +84,7 @@ async fn list_conflicts(
 
     let limit = query.per_page.unwrap_or(20).min(100);
     let status_filter = query.status.as_deref();
+    let repo_filter = query.repo_id.as_deref();
 
     let db = &state.db;
     let entries = db
@@ -89,6 +93,10 @@ async fn list_conflicts(
 
     let items = entries
         .into_iter()
+        .filter(|c| match repo_filter {
+            Some(rid) => c.repo_id.as_deref() == Some(rid),
+            None => true,
+        })
         .map(|c| ConflictListItem {
             id: c.id,
             file_path: c.file_path,
@@ -98,6 +106,7 @@ async fn list_conflicts(
             git_hash: c.git_sha,
             created_at: c.created_at,
             resolved_at: c.resolved_at,
+            repo_id: c.repo_id,
         })
         .collect();
 
@@ -135,6 +144,7 @@ async fn get_conflict(
         resolved_by: conflict.resolved_by,
         created_at: conflict.created_at,
         resolved_at: conflict.resolved_at,
+        repo_id: conflict.repo_id,
     }))
 }
 

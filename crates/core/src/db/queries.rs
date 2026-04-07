@@ -52,6 +52,7 @@ pub struct ConflictEntry {
     pub resolved_by: Option<String>,
     pub created_at: String,
     pub resolved_at: Option<String>,
+    pub repo_id: Option<String>,
 }
 
 /// A row from the `watermarks` table.
@@ -283,8 +284,8 @@ impl Database {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
-             base_content, svn_rev, git_sha, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             base_content, svn_rev, git_sha, status, created_at, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 conflict.id,
                 conflict.file_path,
@@ -295,7 +296,8 @@ impl Database {
                 conflict.svn_revision,
                 conflict.git_hash,
                 conflict.status,
-                now
+                now,
+                conflict.repo_id
             ],
         )?;
         debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
@@ -307,7 +309,7 @@ impl Database {
         let conn = self.conn();
         conn.query_row(
             "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at
+             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
              FROM conflicts WHERE id = ?1",
             params![id],
             |row| {
@@ -325,6 +327,7 @@ impl Database {
                     resolved_by: row.get(10)?,
                     created_at: row.get(11)?,
                     resolved_at: row.get(12)?,
+                    repo_id: row.get(13)?,
                 })
             },
         )
@@ -356,14 +359,14 @@ impl Database {
         let (sql, bound_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
             Some(s) => (
                 "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at
+                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
                  FROM conflicts WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2"
                     .to_string(),
                 vec![Box::new(s.to_string()), Box::new(limit)],
             ),
             None => (
                 "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at
+                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
                  FROM conflicts ORDER BY created_at DESC LIMIT ?1"
                     .to_string(),
                 vec![Box::new(limit)],
@@ -389,6 +392,7 @@ impl Database {
                     resolved_by: row.get(10)?,
                     created_at: row.get(11)?,
                     resolved_at: row.get(12)?,
+                    repo_id: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -401,42 +405,67 @@ impl Database {
         status: Option<&str>,
         pagination: &models::Pagination,
     ) -> Result<models::PaginatedResult<models::WebConflict>, DatabaseError> {
+        self.list_conflicts_paginated_filtered(status, None, pagination)
+    }
+
+    /// List conflicts with optional status and repo_id filters.
+    pub fn list_conflicts_paginated_filtered(
+        &self,
+        status: Option<&str>,
+        repo_id: Option<&str>,
+        pagination: &models::Pagination,
+    ) -> Result<models::PaginatedResult<models::WebConflict>, DatabaseError> {
         let conn = self.conn();
 
-        // Count total
-        let total: i64 = match status {
-            Some(s) => conn.query_row(
-                "SELECT COUNT(*) FROM conflicts WHERE status = ?1",
-                params![s],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))?,
+        // Build WHERE clause dynamically
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut count_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(s) = status {
+            where_clauses.push(format!("status = ?{}", count_params.len() + 1));
+            count_params.push(Box::new(s.to_string()));
+        }
+        if let Some(r) = repo_id {
+            where_clauses.push(format!("repo_id = ?{}", count_params.len() + 1));
+            count_params.push(Box::new(r.to_string()));
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_clauses.join(" AND "))
         };
+
+        // Count total
+        let count_param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            count_params.iter().map(|p| p.as_ref()).collect();
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM conflicts{}", where_sql),
+            count_param_refs.as_slice(),
+            |row| row.get(0),
+        )?;
 
         let per_page = pagination.per_page.max(1);
         let total_pages = ((total as u64).saturating_add(per_page as u64 - 1)) / per_page as u64;
         let offset = ((pagination.page.max(1) - 1) as i64) * per_page as i64;
 
-        let (sql, bound_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
-            Some(s) => (
-                "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at
-                 FROM conflicts WHERE status = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
-                    .to_string(),
-                vec![
-                    Box::new(s.to_string()),
-                    Box::new(per_page as i64),
-                    Box::new(offset),
-                ],
-            ),
-            None => (
-                "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at
-                 FROM conflicts ORDER BY created_at DESC LIMIT ?1 OFFSET ?2"
-                    .to_string(),
-                vec![Box::new(per_page as i64), Box::new(offset)],
-            ),
-        };
+        // Build the SELECT with the same WHERE plus LIMIT/OFFSET
+        let mut bound_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(s) = status {
+            bound_params.push(Box::new(s.to_string()));
+        }
+        if let Some(r) = repo_id {
+            bound_params.push(Box::new(r.to_string()));
+        }
+        bound_params.push(Box::new(per_page as i64));
+        bound_params.push(Box::new(offset));
+
+        let sql = format!(
+            "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
+             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
+             FROM conflicts{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
+            where_sql,
+            bound_params.len() - 1,
+            bound_params.len()
+        );
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -461,6 +490,7 @@ impl Database {
                     resolved_by: row.get(10)?,
                     detected_at: parse_datetime(&created_at_str),
                     resolved_at: resolved_at_str.as_deref().map(parse_datetime),
+                    repo_id: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -479,7 +509,7 @@ impl Database {
         let conn = self.conn();
         let result = conn.query_row(
             "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at
+             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
              FROM conflicts WHERE id = ?1",
             params![id],
             |row| {
@@ -501,6 +531,7 @@ impl Database {
                     resolved_by: row.get(10)?,
                     detected_at: parse_datetime(&created_at_str),
                     resolved_at: resolved_at_str.as_deref().map(parse_datetime),
+                    repo_id: row.get(13)?,
                 })
             },
         );

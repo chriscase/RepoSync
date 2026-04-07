@@ -78,6 +78,7 @@ pub struct Conflict {
     pub status: String,
     pub resolution: Option<String>,
     pub resolved_by: Option<String>,
+    pub repo_id: Option<String>,
 }
 
 impl Conflict {
@@ -95,6 +96,7 @@ impl Conflict {
             status: "detected".to_string(),
             resolution: None,
             resolved_by: None,
+            repo_id: None,
         }
     }
 }
@@ -278,6 +280,7 @@ pub struct WebConflict {
     pub resolved_by: Option<String>,
     pub detected_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    pub repo_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

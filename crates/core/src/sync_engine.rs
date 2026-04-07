@@ -312,6 +312,7 @@ impl SyncEngine {
                     db_conflict.base_content = conflict.base_content.clone();
                     db_conflict.svn_revision = conflict.svn_rev;
                     db_conflict.git_hash = conflict.git_sha.clone();
+                    db_conflict.repo_id = self.repo_id.clone();
                     let _ = self.db.insert_conflict(&db_conflict);
                 }
             }

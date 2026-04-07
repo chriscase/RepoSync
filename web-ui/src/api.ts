@@ -27,6 +27,7 @@ export interface Conflict {
   resolved_by: string | null;
   created_at: string;
   resolved_at: string | null;
+  repo_id?: string;
 }
 
 export interface AuditEntry {
@@ -203,9 +204,10 @@ export const api = {
 
   getSystemMetrics: () => fetchJson<SystemMetrics>('/status/system'),
 
-  getConflicts: (status?: string) => {
+  getConflicts: (status?: string, repoId?: string) => {
     const params = new URLSearchParams();
     if (status) params.append('status', status);
+    if (repoId) params.append('repo_id', repoId);
     const qs = params.toString();
     return fetchJson<Conflict[]>(`/conflicts${qs ? `?${qs}` : ''}`);
   },
