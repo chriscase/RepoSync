@@ -42,54 +42,54 @@ export default function Config() {
 
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Configuration</h1>
+      <h1 className="text-2xl font-bold text-gray-100">Configuration</h1>
 
       {/* Identity Mappings */}
-      <div className="bg-white shadow rounded-lg p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">
+      <div className="bg-gray-800 shadow rounded-lg p-6 border border-gray-700">
+        <h2 className="text-lg font-semibold text-gray-100 mb-4">
           Author Identity Mappings
         </h2>
-        <p className="text-sm text-gray-500 mb-4">
+        <p className="text-sm text-gray-400 mb-4">
           Map SVN usernames to Git author identities. These mappings ensure
           commits are attributed to the correct developer on both sides.
         </p>
 
         {/* Existing Mappings */}
-        <table className="min-w-full divide-y divide-gray-200 mb-4">
-          <thead className="bg-gray-50">
+        <table className="min-w-full divide-y divide-gray-700 mb-4">
+          <thead className="bg-gray-700/50">
             <tr>
-              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-400 uppercase">
                 SVN Username
               </th>
-              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-400 uppercase">
                 Git Name
               </th>
-              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-400 uppercase">
                 Git Email
               </th>
-              <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
+              <th className="px-4 py-2 text-left text-xs font-medium text-gray-400 uppercase">
                 GitHub
               </th>
-              <th className="px-4 py-2 text-right text-xs font-medium text-gray-500 uppercase">
+              <th className="px-4 py-2 text-right text-xs font-medium text-gray-400 uppercase">
                 Action
               </th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-gray-200">
+          <tbody className="divide-y divide-gray-700">
             {(mappings ?? []).map((m: AuthorMapping) => (
-              <tr key={m.svn_username}>
-                <td className="px-4 py-2 font-mono text-sm">
+              <tr key={m.svn_username} className="hover:bg-gray-700/50">
+                <td className="px-4 py-2 font-mono text-sm text-gray-200">
                   {m.svn_username}
                 </td>
-                <td className="px-4 py-2 text-sm">{m.name}</td>
-                <td className="px-4 py-2 text-sm">{m.email}</td>
+                <td className="px-4 py-2 text-sm text-gray-300">{m.name}</td>
+                <td className="px-4 py-2 text-sm text-gray-300">{m.email}</td>
                 <td className="px-4 py-2 text-sm text-gray-500">
                   {m.github ?? '-'}
                 </td>
                 <td className="px-4 py-2 text-right">
                   <button
                     onClick={() => removeMapping(m.svn_username)}
-                    className="text-red-600 hover:text-red-900 text-sm"
+                    className="text-red-400 hover:text-red-300 text-sm"
                   >
                     Remove
                   </button>
@@ -100,8 +100,8 @@ export default function Config() {
         </table>
 
         {/* Add New Mapping */}
-        <div className="border-t pt-4">
-          <h3 className="text-sm font-medium text-gray-700 mb-2">
+        <div className="border-t border-gray-700 pt-4">
+          <h3 className="text-sm font-medium text-gray-300 mb-2">
             Add New Mapping
           </h3>
           <div className="flex space-x-2">
@@ -111,7 +111,7 @@ export default function Config() {
               onChange={(e) =>
                 setNewMapping({ ...newMapping, svn_username: e.target.value })
               }
-              className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+              className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <input
               placeholder="Full Name"
@@ -119,7 +119,7 @@ export default function Config() {
               onChange={(e) =>
                 setNewMapping({ ...newMapping, name: e.target.value })
               }
-              className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+              className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <input
               placeholder="email@company.com"
@@ -127,7 +127,7 @@ export default function Config() {
               onChange={(e) =>
                 setNewMapping({ ...newMapping, email: e.target.value })
               }
-              className="flex-1 rounded-md border border-gray-300 px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+              className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <button
               onClick={addMapping}
