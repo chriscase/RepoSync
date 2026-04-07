@@ -1067,11 +1067,31 @@ impl SyncEngine {
         svn_changes: &[SvnChangeSet],
         git_changes: &[GitChangeSet],
     ) -> Vec<Conflict> {
+        // SVN paths from the changeset include the branch prefix
+        // (e.g. `trunk/README.md`), but Git paths are relative to the repo
+        // root (e.g. `README.md`). Strip the SVN branch prefix so the
+        // detector can match paths correctly.
+        let trunk_path = self.config.svn.trunk_path.trim_matches('/');
+        let strip_prefix = |p: &str| -> String {
+            let p = p.trim_start_matches('/');
+            if !trunk_path.is_empty() {
+                if let Some(rest) = p.strip_prefix(trunk_path) {
+                    return rest.trim_start_matches('/').to_string();
+                }
+            }
+            // Also handle hard-coded "trunk/" prefix as fallback for repos
+            // configured with empty trunk_path but synced from a trunk URL.
+            if let Some(rest) = p.strip_prefix("trunk/") {
+                return rest.to_string();
+            }
+            p.to_string()
+        };
+
         let svn_file_changes: Vec<FileChange> = svn_changes
             .iter()
             .flat_map(|cs| {
                 cs.changed_files.iter().map(|f| FileChange {
-                    path: f.path.clone(),
+                    path: strip_prefix(&f.path),
                     change_kind: match f.action.as_str() {
                         "A" => ChangeKind::Added,
                         "D" => ChangeKind::Deleted,
@@ -1088,7 +1108,7 @@ impl SyncEngine {
             .iter()
             .flat_map(|cs| {
                 cs.changed_files.iter().map(|f| FileChange {
-                    path: f.path.clone(),
+                    path: f.path.trim_start_matches('/').to_string(),
                     change_kind: match f.action.as_str() {
                         "A" => ChangeKind::Added,
                         "D" => ChangeKind::Deleted,
