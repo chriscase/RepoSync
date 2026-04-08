@@ -386,18 +386,18 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // Try the per-repo git directory first, then legacy layout
+            // Only scan the per-repo git directory. The legacy global
+            // /opt/reposync/git-repo holds history from the original
+            // single-repo deployment and would cross-contaminate fresh
+            // sync pairs with watermarks from a totally unrelated repo.
             let repo_git_dir = config
                 .daemon
                 .data_dir
                 .join("repos")
                 .join(&repo.id)
                 .join("git-repo");
-            let legacy_git_dir = config.daemon.data_dir.join("git-repo");
             let git_dir = if repo_git_dir.join(".git").exists() {
                 Some(&repo_git_dir)
-            } else if legacy_git_dir.join(".git").exists() {
-                Some(&legacy_git_dir)
             } else {
                 None
             };
