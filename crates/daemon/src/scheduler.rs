@@ -271,6 +271,23 @@ impl Scheduler {
                 continue;
             }
 
+            // A repo that has never been initialized must not be touched
+            // by the scheduler. The scheduler only knows how to do
+            // *incremental* sync from a watermark; bootstrapping a fresh
+            // repo (initial clone, full history replay, credential
+            // setup) is the job of the /api/repos/:id/import handler
+            // and its `run_full_import` path. If last_sync_at is NULL
+            // AND last_svn_rev is 0, the user hasn't kicked an import
+            // yet — leave it alone, don't clone, don't sync, don't
+            // take the busy slot.
+            if repo.last_sync_at.is_none() && repo.last_svn_rev == 0 {
+                debug!(
+                    repo_name = %repo.name,
+                    "skipping: repo has never been initialized (awaiting import)"
+                );
+                continue;
+            }
+
             // Check if it's time to sync based on poll_interval_secs and last_sync_at.
             let interval_secs = if repo.poll_interval_secs > 0 {
                 repo.poll_interval_secs
@@ -292,7 +309,6 @@ impl Scheduler {
                     }
                 }
             }
-            // last_sync_at is None => never synced => definitely due.
 
             // Check if this repo is already busy (another sync cycle OR
             // an import is holding the working tree). The busy lock is
