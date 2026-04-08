@@ -1,0 +1,32 @@
+[Unit]
+Description=RepoSync Daemon (user-level)
+Documentation=https://github.com/chriscase/RepoSync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/reposync/GitSvnSync/target/release/reposync-daemon --config /home/chrisc/gitsvnsync.toml
+WorkingDirectory=/opt/reposync/GitSvnSync/target/release
+Restart=always
+RestartSec=10
+
+# Capture full backtraces on panic
+Environment=RUST_BACKTRACE=full
+
+# Admin password is only used on first start to bootstrap the admin user.
+# After the admin user exists, this can be removed.
+# Consider moving to EnvironmentFile for production.
+Environment=REPOSYNC_ADMIN_PASSWORD=changeme
+
+# Log to journal - inspect with: journalctl --user -u reposync -f
+StandardOutput=append:/tmp/reposync.log
+StandardError=append:/tmp/reposync.log
+SyslogIdentifier=reposync
+
+# Resource limits — prevent runaway memory usage from killing the host
+MemoryMax=8G
+TasksMax=512
+
+[Install]
+WantedBy=default.target

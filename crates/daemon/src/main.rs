@@ -76,6 +76,43 @@ async fn main() -> Result<()> {
         .with_file(false)
         .init();
 
+    // Install a panic hook so unexpected crashes (panics from spawned
+    // tasks, libgit2 FFI, etc.) are captured to the log with a backtrace
+    // instead of vanishing silently to stderr. Without this, crashes look
+    // like the daemon just stopped writing logs and died.
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let message = match panic_info.payload().downcast_ref::<&str>() {
+            Some(s) => (*s).to_string(),
+            None => match panic_info.payload().downcast_ref::<String>() {
+                Some(s) => s.clone(),
+                None => "<non-string panic payload>".to_string(),
+            },
+        };
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        error!(
+            location = %location,
+            message = %message,
+            "!!! DAEMON PANIC !!!"
+        );
+        error!("panic backtrace:\n{}", backtrace);
+        // Also write to stderr so nohup's redirect captures it even if
+        // tracing is somehow broken at this point.
+        eprintln!("!!! PANIC at {}: {}", location, message);
+        eprintln!("{}", backtrace);
+    }));
+
+    // Install SIGHUP ignore handler BEFORE doing any other work. This is
+    // the critical fix for "daemon silently dies when SSH session ends":
+    // systemd-logind sends SIGHUP to the entire user session on SSH
+    // disconnect, which by default kills nohup'd processes too. By
+    // installing our own async handler that consumes SIGHUP without
+    // exiting, the daemon survives.
+    signals::ignore_sighup();
+
     // Startup banner
     info!("========================================");
     info!("  RepoSync Daemon v{}", env!("CARGO_PKG_VERSION"));
@@ -486,9 +523,48 @@ async fn main() -> Result<()> {
 
     // Create shared import progress — shared between web server and scheduler
     // so the scheduler can pause sync cycles during an active import.
-    let import_progress = std::sync::Arc::new(tokio::sync::RwLock::new(
-        reposync_core::import::ImportProgress::default(),
-    ));
+    //
+    // Recovery: load the last persisted import state from the DB. If it was
+    // in an "active" phase (connecting, importing, verifying, final_push),
+    // the daemon must have crashed mid-import — reconcile by marking it as
+    // Failed with a note so the user knows why and can re-trigger.
+    let mut recovered_progress = sync_engine
+        .db()
+        .load_import_progress()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    use reposync_core::import::ImportPhase;
+    if matches!(
+        recovered_progress.phase,
+        ImportPhase::Connecting
+            | ImportPhase::Importing
+            | ImportPhase::Verifying
+            | ImportPhase::FinalPush
+    ) {
+        let prev_phase = format!("{:?}", recovered_progress.phase);
+        warn!(
+            previous_phase = %prev_phase,
+            current_rev = recovered_progress.current_rev,
+            total_revs = recovered_progress.total_revs,
+            "import was active when daemon last stopped — marking as failed"
+        );
+        recovered_progress.phase = ImportPhase::Failed;
+        recovered_progress.errors.push(format!(
+            "Daemon crashed or was killed while import was in '{}' phase at r{}/r{}. \
+             Please re-trigger the import via the repository detail page.",
+            prev_phase.to_lowercase(),
+            recovered_progress.current_rev,
+            recovered_progress.total_revs
+        ));
+        recovered_progress.push_log(format!(
+            "Import marked as failed on daemon startup (previous phase: {})",
+            prev_phase
+        ));
+        // Persist the reconciled state immediately so the web UI reflects it.
+        let _ = sync_engine.db().persist_import_progress(&recovered_progress);
+    }
+    let import_progress = std::sync::Arc::new(tokio::sync::RwLock::new(recovered_progress));
 
     // Initialize web server
     let web_server = WebServer::new(
