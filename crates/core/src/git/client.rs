@@ -382,25 +382,21 @@ impl GitClient {
         Ok(oid)
     }
 
-    /// Push a local branch to a remote (with optional force).
+    /// Push a local branch to a remote.
+    ///
+    /// Authentication is always driven by the credentials embedded in the
+    /// remote URL via [`Self::ensure_remote_credentials`]. Callers must
+    /// ensure the remote URL has fresh credentials before invoking push.
     #[instrument(skip(self))]
-    pub fn push(
-        &self,
-        remote_name: &str,
-        branch: &str,
-        _token: Option<&str>,
-    ) -> Result<(), GitError> {
+    pub fn push(&self, remote_name: &str, branch: &str) -> Result<(), GitError> {
         self.push_impl(remote_name, branch, false)
     }
 
     /// Force-push a local branch to a remote (overwrites remote history).
+    ///
+    /// See [`Self::push`] for authentication notes.
     #[instrument(skip(self))]
-    pub fn push_force(
-        &self,
-        remote_name: &str,
-        branch: &str,
-        _token: Option<&str>,
-    ) -> Result<(), GitError> {
+    pub fn push_force(&self, remote_name: &str, branch: &str) -> Result<(), GitError> {
         self.push_impl(remote_name, branch, true)
     }
 

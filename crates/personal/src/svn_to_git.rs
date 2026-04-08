@@ -195,14 +195,14 @@ impl SvnToGitSync {
             let sha_str = git_sha.to_string();
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
-            // 9. Push to origin.
+            // 9. Push to origin. Credentials come from the remote URL
+            // (set up at clone time / by ensure_remote_credentials).
             let branch = self.config.github.default_branch.clone();
-            let token = self.config.github.token.clone();
             let gc = self.git_client.clone();
 
             tokio::task::spawn_blocking(move || {
                 let git_client = gc.lock().unwrap();
-                git_client.push("origin", &branch, token.as_deref())
+                git_client.push("origin", &branch)
             })
             .await
             .context("push task panicked")?

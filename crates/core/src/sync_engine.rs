@@ -505,11 +505,11 @@ impl SyncEngine {
                     )
                     .map_err(SyncError::GitError)?;
 
-                // 4. Push to remote.
-                let token = self.config.github.token.as_deref();
+                // 4. Push to remote. Authentication flows through the
+                // remote URL credentials set by `reload_credentials` at
+                // the start of the cycle, not through a token parameter.
                 let branch = &self.config.github.default_branch;
-                git.push("origin", branch, token)
-                    .map_err(SyncError::GitError)?;
+                git.push("origin", branch).map_err(SyncError::GitError)?;
 
                 Ok::<_, SyncError>(oid.to_string())
             })?;

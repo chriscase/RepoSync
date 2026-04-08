@@ -502,6 +502,34 @@ async fn start_repo_import(
         }
     }
 
+    // 2b. Acquire the process-wide busy slot so that no scheduler cycle
+    // can touch this repo's working tree while the import runs. If the
+    // scheduler is currently in the middle of a cycle we wait briefly
+    // for it to finish before starting the import. The guard is moved
+    // into the background task and released when the import completes.
+    let busy_guard = {
+        let mut guard = None;
+        for attempt in 0..30 {
+            if let Some(g) = reposync_core::busy::try_acquire(&id) {
+                guard = Some(g);
+                break;
+            }
+            if attempt == 0 {
+                info!(repo_id = %id, "waiting for in-flight sync cycle to finish before import");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match guard {
+            Some(g) => g,
+            None => {
+                return Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "message": "A sync cycle is currently running for this repository. Please retry in a moment.",
+                })));
+            }
+        }
+    };
+
     // 3. Reset progress
     {
         let mut p = progress.write().await;
@@ -689,6 +717,9 @@ async fn start_repo_import(
 
     // 12. Spawn the import task
     tokio::spawn(async move {
+        // Hold the busy guard for the entire lifetime of the import so
+        // the scheduler skips this repo until we're done.
+        let _busy_guard = busy_guard;
         let result = import::run_full_import(
             &svn_client,
             &git_client,

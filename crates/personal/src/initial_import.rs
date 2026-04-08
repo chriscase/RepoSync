@@ -191,10 +191,9 @@ impl<'a> InitialImport<'a> {
         let sha = oid.to_string();
         info!(sha = %sha, rev = head_rev, "created snapshot commit");
 
-        // Push
-        let token = self.config.github.token.as_deref();
+        // Push (credentials via remote URL)
         git_client
-            .push("origin", &self.config.github.default_branch, token)
+            .push("origin", &self.config.github.default_branch)
             .context("failed to push to GitHub")?;
         drop(git_client);
 
@@ -390,12 +389,11 @@ impl<'a> InitialImport<'a> {
             drop(git_client);
         }
 
-        // Push all at once
+        // Push all at once (credentials via remote URL)
         if count > 0 {
             let git_client = self.git_client.lock().unwrap();
-            let token = self.config.github.token.as_deref();
             git_client
-                .push("origin", &self.config.github.default_branch, token)
+                .push("origin", &self.config.github.default_branch)
                 .context("failed to push to GitHub")?;
             drop(git_client);
         }

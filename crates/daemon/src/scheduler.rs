@@ -6,7 +6,6 @@
 //! 2. Per-repo sync cycles for every enabled repository in the database,
 //!    each honoring its own `poll_interval_secs` and `last_sync_at`.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,8 +61,6 @@ pub struct Scheduler {
     db: Database,
     /// Global config (for data_dir, identity, etc.).
     app_config: AppConfig,
-    /// Set of repo IDs currently being synced, to prevent overlapping runs.
-    running_repos: Arc<tokio::sync::Mutex<HashSet<String>>>,
     /// Handles for in-flight sync tasks, for graceful shutdown.
     pub sync_handles: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Cached identity mapper (shared across all repo sync cycles).
@@ -89,7 +86,6 @@ impl Scheduler {
             import_progress,
             db,
             app_config,
-            running_repos: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             sync_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             cached_identity_mapper: std::sync::OnceLock::new(),
         }
@@ -298,13 +294,12 @@ impl Scheduler {
             }
             // last_sync_at is None => never synced => definitely due.
 
-            // Check if this repo is already running.
-            {
-                let running = self.running_repos.lock().await;
-                if running.contains(&repo.id) {
-                    debug!(repo_name = %repo.name, "skipping: repo sync already in progress");
-                    continue;
-                }
+            // Check if this repo is already busy (another sync cycle OR
+            // an import is holding the working tree). The busy lock is
+            // process-wide and shared with the web API import handler.
+            if reposync_core::busy::is_busy(&repo.id) {
+                debug!(repo_name = %repo.name, "skipping: repo is busy (sync or import in progress)");
+                continue;
             }
 
             // Read credentials from kv_state.
@@ -451,19 +446,25 @@ impl Scheduler {
 
             let repo_id = repo.id.clone();
             let repo_name = repo.name.clone();
-            let running_repos = self.running_repos.clone();
             let ws = self.ws_broadcast.clone();
 
-            // Mark this repo as running.
-            {
-                let mut running = running_repos.lock().await;
-                running.insert(repo_id.clone());
-            }
+            // Acquire the process-wide busy slot. If we can't, another
+            // task beat us to it — skip cleanly.
+            let busy_guard = match reposync_core::busy::try_acquire(&repo_id) {
+                Some(g) => g,
+                None => {
+                    debug!(repo_name = %repo_name, "lost race for busy slot, skipping");
+                    continue;
+                }
+            };
 
             info!(repo_name = %repo_name, repo_id = %repo_id, "starting per-repo sync cycle");
 
             let sync_handles = self.sync_handles.clone();
             let handle = tokio::spawn(async move {
+                // Move the busy guard into the task so it's released when
+                // the cycle finishes (including on panic).
+                let _busy_guard = busy_guard;
                 let result = engine.run_sync_cycle().await;
 
                 match &result {
@@ -503,9 +504,7 @@ impl Scheduler {
                     }
                 }
 
-                // Remove from running set.
-                let mut running = running_repos.lock().await;
-                running.remove(&repo_id);
+                // busy guard drops here, releasing the slot.
             });
 
             // Track the handle for graceful shutdown.
