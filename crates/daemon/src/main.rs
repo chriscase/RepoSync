@@ -342,34 +342,46 @@ async fn main() -> Result<()> {
     }
 
     // Auto-detect watermarks for repos where last_svn_rev == 0.
-    // This recovers watermark state from existing git history after a
-    // database reset or first migration to the repo-table watermark scheme.
+    // Recovery is strictly per-repo: we only restore from sources that are
+    // scoped to this specific repo_id. Reading from global / single-repo
+    // legacy state would cross-contaminate brand-new sync pairs with
+    // watermarks from a totally unrelated repository.
+    //
+    // Note: only the *first* repo created on a server (when repos was empty)
+    // can use the global watermarks table — that's the migration path from
+    // single-repo deployments. For all other repos, only per-repo sources
+    // are valid.
     {
         let repos = engine.db().list_repositories().unwrap_or_default();
+        let single_repo_migration = repos.len() == 1;
         for repo in &repos {
             if repo.last_svn_rev != 0 {
                 continue;
             }
             info!(repo_name = %repo.name, "repo has last_svn_rev=0, attempting auto-detect");
 
-            // First, check the global watermarks table (import writes here)
-            if let Ok(Some(rev_str)) = engine.db().get_watermark("svn_rev") {
-                if let Ok(rev) = rev_str.parse::<i64>() {
-                    if rev > 0 {
-                        let sha = engine.db().get_watermark("git_sha")
-                            .ok().flatten().unwrap_or_default();
-                        match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
-                            Ok(()) => {
-                                info!(repo_name = %repo.name, rev, "Recovered watermark from watermarks table");
-                                continue;
+            // Only allow recovery from the global watermarks table when this
+            // is a single-repo migration scenario (the daemon was previously
+            // running as a single-repo deployment and we're upgrading).
+            if single_repo_migration {
+                if let Ok(Some(rev_str)) = engine.db().get_watermark("svn_rev") {
+                    if let Ok(rev) = rev_str.parse::<i64>() {
+                        if rev > 0 {
+                            let sha = engine.db().get_watermark("git_sha")
+                                .ok().flatten().unwrap_or_default();
+                            match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
+                                Ok(()) => {
+                                    info!(repo_name = %repo.name, rev, "Recovered watermark from global watermarks table (single-repo migration)");
+                                    continue;
+                                }
+                                Err(e) => warn!("Failed to write watermark for {}: {}", repo.name, e),
                             }
-                            Err(e) => warn!("Failed to write watermark for {}: {}", repo.name, e),
                         }
                     }
                 }
             }
 
-            // Also check per-repo kv_state keys
+            // Per-repo kv_state keys (always safe — these are scoped by repo_id)
             let repo_key = format!("last_svn_rev_{}", repo.id);
             if let Ok(Some(rev_str)) = engine.db().get_state(&repo_key) {
                 if let Ok(rev) = rev_str.parse::<i64>() {
