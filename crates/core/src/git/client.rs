@@ -81,6 +81,26 @@ impl GitClient {
         })
     }
 
+    /// Ensure the local HEAD points at `refs/heads/<branch>`. Useful after
+    /// cloning an empty remote where libgit2 may set HEAD to a default
+    /// branch name that doesn't match the configured `git_branch`.
+    pub fn ensure_head_on_branch(&self, branch: &str) -> Result<(), GitError> {
+        let target_ref = format!("refs/heads/{}", branch);
+        // If HEAD is already pointing at the right symbolic ref, do nothing.
+        if let Ok(head) = self.repo.head() {
+            if head.name() == Some(target_ref.as_str()) {
+                return Ok(());
+            }
+        }
+        // Set HEAD as a symbolic reference (it's fine if the target doesn't
+        // exist yet — that's what "unborn" HEAD means, and the first commit
+        // will materialize it).
+        self.repo
+            .reference_symbolic("HEAD", &target_ref, true, "reposync: align HEAD with configured branch")?;
+        info!(branch, "aligned HEAD to refs/heads/{}", branch);
+        Ok(())
+    }
+
     pub fn repo_path(&self) -> &Path {
         &self.repo_path
     }
@@ -159,6 +179,13 @@ impl GitClient {
     }
 
     /// Fetch and fast-forward merge.
+    ///
+    /// Gracefully handles two empty-repo scenarios:
+    /// 1. Remote has no branches yet (brand-new empty Git repo) — just
+    ///    fetches and returns; nothing to merge.
+    /// 2. Local HEAD doesn't point to a branch yet (fresh clone of empty
+    ///    repo) — set HEAD to the fetched ref so subsequent commits land
+    ///    on the right branch.
     #[instrument(skip(self, token))]
     pub fn pull(
         &self,
@@ -168,19 +195,57 @@ impl GitClient {
     ) -> Result<(), GitError> {
         self.fetch(remote_name, token)?;
         let fetch_head_ref = format!("refs/remotes/{}/{}", remote_name, branch);
-        let fetch_commit = self
-            .repo
-            .find_reference(&fetch_head_ref)?
-            .peel_to_commit()?;
-        let head_ref = self.repo.head()?;
-        if head_ref.is_branch() {
-            let mut head_ref_mut = self
-                .repo
-                .find_reference(head_ref.name().unwrap_or("HEAD"))?;
-            head_ref_mut.set_target(fetch_commit.id(), "reposync: fast-forward pull")?;
-            self.repo.set_head(head_ref.name().unwrap_or("HEAD"))?;
-            self.repo
-                .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+        let fetch_commit = match self.repo.find_reference(&fetch_head_ref) {
+            Ok(reference) => match reference.peel_to_commit() {
+                Ok(commit) => Some(commit),
+                Err(e) => {
+                    debug!(error = %e, "fetched ref could not be peeled to commit; treating remote as empty");
+                    None
+                }
+            },
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                // Remote has no branches at all (brand new empty repo).
+                info!(
+                    remote = remote_name,
+                    branch,
+                    "remote has no '{}' branch yet; treating as empty remote",
+                    branch
+                );
+                None
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let Some(fetch_commit) = fetch_commit else {
+            // Empty remote — nothing to merge. The local repo may also be
+            // empty; either way, sync_svn_to_git will create the initial
+            // commit and push it.
+            return Ok(());
+        };
+
+        // Try to fast-forward the local branch. If HEAD isn't on a branch
+        // yet (e.g., fresh clone with no checkout), set HEAD to the fetched
+        // ref's commit and checkout.
+        match self.repo.head() {
+            Ok(head_ref) if head_ref.is_branch() => {
+                let mut head_ref_mut = self
+                    .repo
+                    .find_reference(head_ref.name().unwrap_or("HEAD"))?;
+                head_ref_mut.set_target(fetch_commit.id(), "reposync: fast-forward pull")?;
+                self.repo.set_head(head_ref.name().unwrap_or("HEAD"))?;
+                self.repo
+                    .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+            }
+            _ => {
+                // No local branch checked out — create one tracking the
+                // remote branch and check it out.
+                let local_ref = format!("refs/heads/{}", branch);
+                self.repo
+                    .reference(&local_ref, fetch_commit.id(), true, "reposync: initial track")?;
+                self.repo.set_head(&local_ref)?;
+                self.repo
+                    .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
+            }
         }
         info!("pull completed");
         Ok(())
@@ -425,12 +490,18 @@ impl GitClient {
     }
 
     /// Walk commits from HEAD backwards until we reach `since_sha`.
+    ///
+    /// Returns an empty vec if HEAD is unborn (empty repo).
     pub fn get_commits_since(
         &self,
         since_sha: Option<&str>,
         max_commits: Option<usize>,
     ) -> Result<Vec<GitCommitInfo>, GitError> {
         let cap = max_commits.unwrap_or(1000);
+        // If HEAD doesn't exist (empty repo), return empty list.
+        if self.repo.head().is_err() {
+            return Ok(Vec::new());
+        }
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
         revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;

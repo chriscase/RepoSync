@@ -397,6 +397,14 @@ impl Scheduler {
                 .ensure_remote_credentials("origin", git_token.as_deref())
                 .ok();
 
+            // Ensure HEAD is aligned with the configured branch. After
+            // cloning an empty remote, libgit2 may leave HEAD pointing
+            // at the wrong default branch name (e.g. master instead of
+            // main). This is a no-op once a real commit exists.
+            git_client
+                .ensure_head_on_branch(&repo.git_branch)
+                .ok();
+
             // Reuse cached identity mapper when possible (P7 optimization).
             let identity_mapper = match self.cached_identity_mapper.get() {
                 Some(cached) => cached.clone(),
