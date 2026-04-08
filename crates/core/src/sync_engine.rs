@@ -406,11 +406,22 @@ impl SyncEngine {
                 // reconstruct the target state from an authoritative
                 // full-tree snapshot of the revision via `svn export`.
                 //
-                // This used to have a faster "svn cat per file" path for
-                // small changesets, but per-file cat was error-prone
-                // (rename/delete history, peg-rev semantics) and when a
-                // single file failed it would silently commit a partial
-                // tree. Full export is the only mode we trust.
+                // The export is the ONLY source of truth here. We do
+                // NOT iterate `change.changed_files` — those paths come
+                // from the SVN log and are repository-relative (e.g.
+                // `/branches/.../trunk/source/SLS/foo.js`), which does
+                // not match the export dir layout (`source/SLS/foo.js`
+                // because the export is rooted at the branch URL). If
+                // we honored those paths we'd either miss files or
+                // write them to the wrong place, producing phantom
+                // top-level directories in the git tree.
+                //
+                // Instead we mirror the behavior of `run_full_import`:
+                // export the whole tree at this revision, remove any
+                // files in the git working tree that are NOT in the
+                // export (stale cleanup), then copy-with-policy every
+                // file from the export over the working tree. This
+                // matches the branch state exactly.
                 let export_dir = tempfile::tempdir()
                     .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
                 let export_path = if self.config.svn.layout == SvnLayout::Standard {
@@ -425,43 +436,38 @@ impl SyncEngine {
                         .map_err(SyncError::SvnError)?;
                 }
 
-                for file in &change.changed_files {
-                    let src = export_dir.path().join(&file.path);
-                    let dst = repo_path.join(&file.path);
-                    match file.action.as_str() {
-                        "D" => {
-                            if dst.exists() {
-                                std::fs::remove_file(&dst).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            }
-                        }
-                        _ => {
-                            if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            }
-                            if src.exists() && src.is_file() {
-                                std::fs::copy(&src, &dst).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            } else {
-                                // The diff said this file should exist
-                                // at this rev, but the export didn't
-                                // produce it. Refuse to commit a partial
-                                // tree — fail the cycle so the operator
-                                // can investigate.
-                                return Err(SyncError::GitError(
-                                    crate::errors::GitError::ApplyFailed(format!(
-                                        "file '{}' missing from svn export at r{} — refusing to commit partial tree",
-                                        file.path, change.revision
-                                    )),
-                                ));
-                            }
-                        }
-                    }
-                }
+                // Stale cleanup: anything in the git working tree that's
+                // not present in the export must go (excluding .git).
+                crate::import::remove_stale_files(export_dir.path(), &repo_path).map_err(
+                    |e| {
+                        SyncError::GitError(crate::errors::GitError::ApplyFailed(format!(
+                            "stale file cleanup failed at r{}: {}",
+                            change.revision, e
+                        )))
+                    },
+                )?;
+
+                // Mirror export → working tree (with default LFS/size
+                // policy — incremental sync trusts the threshold that
+                // the initial import established).
+                let fallback_policy = crate::file_policy::FilePolicy::with_lfs(
+                    0,
+                    vec![],
+                    0,
+                    &[],
+                );
+                crate::import::copy_tree_with_policy(
+                    export_dir.path(),
+                    &repo_path,
+                    &fallback_policy,
+                    &self.db,
+                )
+                .map_err(|e| {
+                    SyncError::GitError(crate::errors::GitError::ApplyFailed(format!(
+                        "tree copy failed at r{}: {}",
+                        change.revision, e
+                    )))
+                })?;
             }
 
             // 3. Commit with identity and sync marker.
