@@ -103,7 +103,11 @@ impl SvnClient {
             return Err(SvnError::RevisionNotFound(rev));
         }
         let rev_range = format!("{}:{}", rev - 1, rev);
-        self.run_svn(&["diff", "-r", &rev_range, &self.url]).await
+        // Peg at rev so the URL is resolved as it existed at that
+        // revision — important for branch pairs whose branch path was
+        // deleted in later revisions.
+        let peg_url = format!("{}@{}", self.url, rev);
+        self.run_svn(&["diff", "-r", &rev_range, &peg_url]).await
     }
 
     #[instrument(skip(self), fields(url = %self.url, rev))]
@@ -256,15 +260,29 @@ impl SvnClient {
     }
 
     /// Get the content of a file at a specific revision.
+    ///
+    /// Uses peg-revision syntax (`url@N`) so the path is resolved *in
+    /// revision N*, not in HEAD. Without the peg, `svn cat -r N url`
+    /// asks the server "find `url` as of HEAD, then give me its content
+    /// at rev N" — which fails for files that were renamed or deleted
+    /// in any later revision. With the peg, the server treats `url` as
+    /// a path that existed at rev N, which is what we actually want.
     #[instrument(skip(self), fields(file_path = %file_path, rev))]
     pub async fn cat(&self, file_path: &str, rev: i64) -> Result<String, SvnError> {
         let rev_str = rev.to_string();
-        let url = if file_path.starts_with("http://") || file_path.starts_with("https://") {
+        let base_url = if file_path.starts_with("http://") || file_path.starts_with("https://") {
             file_path.to_string()
         } else {
             format!("{}/{}", self.url, file_path)
         };
-        self.run_svn(&["cat", "-r", &rev_str, &url]).await
+        // Append the peg revision. SVN URLs can contain '@' in path
+        // segments, but the peg must be the last '@'. Escape any
+        // existing '@' by doubling: svn accepts `path@@REV` to mean
+        // "path named `path@` at peg REV" when the path has a literal
+        // '@'. Simpler: append `@REV` — if the path has no '@' this is
+        // unambiguous, and we don't expect SVN paths with '@' in them.
+        let peg_url = format!("{}@{}", base_url, rev_str);
+        self.run_svn(&["cat", &peg_url]).await
     }
 
     // -- Internal helpers ----------------------------------------------------
