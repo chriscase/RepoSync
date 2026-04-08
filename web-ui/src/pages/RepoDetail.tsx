@@ -249,11 +249,23 @@ export default function RepoDetail() {
     setSvnTesting(true);
     setSvnTestResult(null);
     try {
-      // Use per-repo test endpoint that reads stored credentials from DB
+      // Prefer unsaved form values (so the user can test edits before saving).
+      // Any empty field falls through to the saved DB value on the server side.
       const token = localStorage.getItem('session_token');
+      const body: Record<string, string> = {};
+      if (form) {
+        if (form.svn_url) body.svn_url = form.svn_url;
+        if (form.svn_branch) body.svn_branch = form.svn_branch;
+        if (form.svn_username) body.svn_username = form.svn_username;
+        if (form.svn_password) body.svn_password = form.svn_password;
+      }
       const res = await fetch(`/api/repos/${id}/test-svn`, {
         method: 'POST',
-        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
       });
       const result = await res.json();
       setSvnTestResult(result);
@@ -268,11 +280,21 @@ export default function RepoDetail() {
     setGitTesting(true);
     setGitTestResult(null);
     try {
-      // Use per-repo test endpoint that reads stored credentials from DB
+      // Prefer unsaved form values (so the user can test edits before saving).
       const token = localStorage.getItem('session_token');
+      const body: Record<string, string> = {};
+      if (form) {
+        if (form.git_api_url) body.git_api_url = form.git_api_url;
+        if (form.git_repo) body.git_repo = form.git_repo;
+        if (form.git_token) body.git_token = form.git_token;
+      }
       const res = await fetch(`/api/repos/${id}/test-git`, {
         method: 'POST',
-        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(body),
       });
       const result = await res.json();
       setGitTestResult(result);

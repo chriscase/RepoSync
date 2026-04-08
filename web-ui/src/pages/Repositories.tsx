@@ -171,7 +171,7 @@ export default function Repositories() {
     setSvnTestResult(null);
     try {
       const result = await api.testSvnConnection({
-        url: form.svn_url,
+        url: form.svn_url + (form.svn_branch ? '/' + form.svn_branch.replace(/^\/+/, '') : ''),
         username: form.svn_username,
         password: form.svn_password || undefined,
       });
@@ -191,6 +191,7 @@ export default function Repositories() {
         api_url: form.git_api_url,
         repo: form.git_repo,
         provider: form.git_provider,
+        token: form.git_token || undefined,
       });
       setGitTestResult(result);
     } catch (e: any) {
