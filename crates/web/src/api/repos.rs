@@ -539,16 +539,25 @@ async fn start_repo_import(
     }
 
     // 4. Read credentials from kv_state
-    let svn_password = db
-        .get_state(&format!("secret_svn_password_{}", id))
-        .unwrap_or(None)
-        .or_else(|| db.get_state("secret_svn_password").unwrap_or(None))
+    let svn_password_repo = db.get_state(&format!("secret_svn_password_{}", id)).unwrap_or(None);
+    let svn_password_global = db.get_state("secret_svn_password").unwrap_or(None);
+    let svn_password = svn_password_repo.clone()
+        .or(svn_password_global.clone())
         .unwrap_or_default();
+    debug!(
+        repo_id = %id,
+        source = if svn_password_repo.is_some() { "repo-specific" } else if svn_password_global.is_some() { "global" } else { "none" },
+        "resolved SVN password for import"
+    );
 
-    let git_token: Option<String> = db
-        .get_state(&format!("secret_git_token_{}", id))
-        .unwrap_or(None)
-        .or_else(|| db.get_state("secret_git_token").unwrap_or(None));
+    let git_token_repo = db.get_state(&format!("secret_git_token_{}", id)).unwrap_or(None);
+    let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
+    let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
+    debug!(
+        repo_id = %id,
+        source = if git_token_repo.is_some() { "repo-specific" } else if git_token_global.is_some() { "global" } else { "none" },
+        "resolved Git token for import"
+    );
 
     // 5. Build SVN import URL
     let svn_import_url = {
@@ -626,11 +635,22 @@ async fn start_repo_import(
 
         // Reset watermark to 0
         let _ = db.update_repo_watermark(&id, 0, "");
+
+        // Clear stale sync_records, commit_map, and error count
+        if let Ok(n) = db.delete_sync_records_for_repo(&id) {
+            debug!(repo_id = %id, count = n, "cleared sync_records for reimport");
+        }
+        if let Ok(n) = db.delete_commit_map_for_repo(&id) {
+            debug!(repo_id = %id, count = n, "cleared commit_map for reimport");
+        }
+        // Reset error count (clears audit_log errors + resets total_errors column)
+        let _ = db.clear_errors_for_repo(&id);
+
         {
             let mut p = progress.write().await;
-            p.push_log("[info] Reset: remote wiped, starting fresh import...".into());
+            p.push_log("[info] Reset: remote wiped, records cleared, starting fresh import...".into());
         }
-        info!(repo_id = %id, "reset complete, git repo and remote wiped");
+        info!(repo_id = %id, "reset complete, git repo and remote wiped, stale records cleared");
     }
 
     std::fs::create_dir_all(&git_repo_path)
@@ -729,6 +749,7 @@ async fn start_repo_import(
             &import_config,
             progress.clone(),
             ws_broadcast.clone(),
+            Some(repo_id_clone.clone()),
         )
         .await;
 

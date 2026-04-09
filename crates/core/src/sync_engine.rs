@@ -578,12 +578,25 @@ impl SyncEngine {
             self.db
                 .insert_sync_record(&record)
                 .map_err(SyncError::DatabaseError)?;
+            debug!(
+                record_id = %record.id,
+                direction = "svn_to_git",
+                svn_rev = change.revision,
+                git_sha = %&git_sha[..12.min(git_sha.len())],
+                "sync_record created"
+            );
 
             // Update the SVN watermark (dual-write: kv_state + repo table).
             let _ = self
                 .db
                 .set_state(&self.svn_rev_key(), &change.revision.to_string());
             if let Some(rid) = self.effective_repo_id() {
+                debug!(
+                    repo_id = %rid,
+                    new_svn_rev = change.revision,
+                    new_git_sha = %&git_sha[..12.min(git_sha.len())],
+                    "watermark updated"
+                );
                 let _ = self.db.update_repo_watermark(rid, change.revision, &git_sha);
                 let _ = self.db.increment_repo_sync_count(rid);
             }

@@ -323,6 +323,13 @@ impl Scheduler {
             let svn_password = self.db.resolve_credential_chain(&repo.id, "secret_svn_password");
             let git_token = self.db.resolve_credential_chain(&repo.id, "secret_git_token");
 
+            debug!(
+                repo_name = %repo.name,
+                svn_password_found = svn_password.is_some(),
+                git_token_found = git_token.is_some(),
+                "resolved credentials via chain"
+            );
+
             // Build SVN URL: repo.svn_url + repo.svn_branch
             let svn_url = if repo.svn_branch.is_empty() {
                 repo.svn_url.clone()
@@ -473,7 +480,14 @@ impl Scheduler {
             );
             engine.set_repo_id(repo.id.clone());
             if repo.lfs_threshold_mb > 0 {
-                engine.set_lfs_threshold_bytes((repo.lfs_threshold_mb as u64) * 1024 * 1024);
+                let threshold_bytes = (repo.lfs_threshold_mb as u64) * 1024 * 1024;
+                engine.set_lfs_threshold_bytes(threshold_bytes);
+                debug!(
+                    repo_name = %repo.name,
+                    lfs_threshold_mb = repo.lfs_threshold_mb,
+                    lfs_threshold_bytes = threshold_bytes,
+                    "LFS enforcement enabled for sync engine"
+                );
             }
 
             let repo_id = repo.id.clone();

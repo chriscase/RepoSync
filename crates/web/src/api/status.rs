@@ -104,6 +104,10 @@ async fn get_status(
 
         let active_conflicts = db.count_active_conflicts_for_repo(repo_id).unwrap_or(0);
 
+        // Use 24h rolling window for errors (same as global status)
+        let errors_24h = db.count_errors_for_repo(repo_id).unwrap_or(repo.total_errors);
+        let last_error = db.last_error_at_for_repo(repo_id).unwrap_or(None);
+
         return Ok(Json(StatusResponse {
             state: repo.sync_status,
             last_sync_at: repo.last_sync_at,
@@ -112,8 +116,8 @@ async fn get_status(
             total_syncs: repo.total_syncs,
             total_conflicts: 0,
             active_conflicts,
-            total_errors: repo.total_errors,
-            last_error_at: None,
+            total_errors: errors_24h,
+            last_error_at: last_error,
             uptime_secs: 0,
         }));
     }
@@ -149,6 +153,7 @@ async fn get_status(
 async fn reset_errors(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
+    Query(query): Query<RepoQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     crate::api::auth::validate_session(
         &state,
@@ -158,17 +163,24 @@ async fn reset_errors(
 
     let db = &state.db;
 
-    let cleared = db
-        .clear_errors()
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+    let cleared = if let Some(ref repo_id) = query.repo_id {
+        // Clear errors for a specific repo (also resets total_errors column)
+        db.clear_errors_for_repo(repo_id)
+            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+    } else {
+        // Clear all errors
+        db.clear_errors()
+            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+    };
 
     let _ = db.insert_audit_log(
         "errors_cleared",
+        query.repo_id.as_deref(),
         None,
         None,
         None,
-        None,
-        Some(&format!("Cleared {} error entries", cleared)),
+        Some(&format!("Cleared {} error entries{}", cleared,
+            query.repo_id.as_ref().map(|id| format!(" for repo {}", id)).unwrap_or_default())),
         true,
     );
 

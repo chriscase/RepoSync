@@ -376,6 +376,7 @@ pub async fn run_full_import(
     import_config: &ImportConfig,
     progress: Arc<RwLock<ImportProgress>>,
     ws_broadcast: Option<broadcast::Sender<String>>,
+    repo_id: Option<String>,
 ) -> Result<u64> {
     // Helper to push a log line and broadcast it.
     let log = |progress: &Arc<RwLock<ImportProgress>>,
@@ -617,6 +618,13 @@ pub async fn run_full_import(
         };
 
         // Update file stats — use current file count (not cumulative)
+        info!(
+            rev,
+            copied = copy_stats.copied,
+            lfs_tracked = copy_stats.lfs_tracked,
+            skipped = copy_stats.skipped,
+            "import: tree copy completed for revision"
+        );
         {
             let mut p = progress.write().await;
             p.current_file_count = copy_stats.copied as u64;
@@ -630,8 +638,15 @@ pub async fn run_full_import(
                 debug!(rev, svn_author = %entry.author, git_name = %name, "mapped SVN author");
                 (name, email)
             }
-            Err(_) => {
+            Err(e) => {
                 // Fall back to SVN username as both name and email prefix
+                debug!(
+                    rev,
+                    svn_author = %entry.author,
+                    error = %e,
+                    "identity mapping failed, using fallback {}@svn",
+                    entry.author
+                );
                 (
                     entry.author.clone(),
                     format!("{}@svn", entry.author),
@@ -701,7 +716,7 @@ pub async fn run_full_import(
                 );
                 log(&progress, &ws_broadcast, log_line).await;
 
-                // Record in DB
+                // Record in DB (commit_map for bidirectional mapping)
                 db.insert_commit_map(
                     rev,
                     &sha,
@@ -710,6 +725,25 @@ pub async fn run_full_import(
                     &format!("{} <{}>", author_name, author_email),
                 )
                 .ok();
+
+                // Record sync_record for audit trail and UI display
+                let sync_record = crate::models::SyncRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    repo_id: repo_id.clone(),
+                    svn_revision: Some(rev),
+                    git_hash: Some(sha.clone()),
+                    direction: crate::models::SyncDirection::SvnToGit,
+                    author: entry.author.clone(),
+                    message: entry.message.clone(),
+                    timestamp: chrono::Utc::now(),
+                    synced_at: chrono::Utc::now(),
+                    status: crate::models::SyncRecordStatus::Applied,
+                };
+                if let Err(e) = db.insert_sync_record(&sync_record) {
+                    debug!(rev, error = %e, "failed to insert sync_record during import");
+                } else {
+                    debug!(rev, sha = %short_sha, "import: sync_record created");
+                }
 
                 count += 1;
                 commits_since_push += 1;

@@ -231,9 +231,12 @@ export const api = {
     return fetchJson<AuditListResponse>(`/audit?${params.toString()}`);
   },
 
-  resetErrors: async (): Promise<{ok: boolean, cleared: number}> => {
+  resetErrors: async (repoId?: string): Promise<{ok: boolean, cleared: number}> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/status/reset-errors`, {
+    const url = repoId
+      ? `${API_BASE}/status/reset-errors?repo_id=${encodeURIComponent(repoId)}`
+      : `${API_BASE}/status/reset-errors`;
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::Command;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use super::parser::{
     parse_svn_diff_summarize, parse_svn_info, parse_svn_log, SvnDiffEntry, SvnInfo, SvnLogEntry,
@@ -359,7 +359,14 @@ impl SvnClient {
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
         }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        trace!(
+            cmd = args[0],
+            exit_code = output.status.code().unwrap_or(0),
+            stdout_len = stdout.len(),
+            "svn command completed"
+        );
+        Ok(stdout)
     }
 
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {

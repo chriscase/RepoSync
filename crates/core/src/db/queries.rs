@@ -990,6 +990,65 @@ impl Database {
         Ok(count)
     }
 
+    /// Delete all sync records for a specific repository (used during reset/reimport).
+    pub fn delete_sync_records_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
+        let conn = self.conn();
+        let count = conn.execute(
+            "DELETE FROM sync_records WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        info!(repo_id, count, "deleted sync_records for repo");
+        Ok(count)
+    }
+
+    /// Delete all commit_map entries for a specific repository (used during reset/reimport).
+    pub fn delete_commit_map_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
+        let conn = self.conn();
+        let count = conn.execute(
+            "DELETE FROM commit_map WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        info!(repo_id, count, "deleted commit_map entries for repo");
+        Ok(count)
+    }
+
+    /// Count errors in the last 24 hours for a specific repository.
+    pub fn count_errors_for_repo(&self, repo_id: &str) -> Result<i64, DatabaseError> {
+        let conn = self.conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE success = 0 AND repo_id = ?1 AND created_at > datetime('now', '-24 hours')",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get the most recent error timestamp for a specific repository.
+    pub fn last_error_at_for_repo(&self, repo_id: &str) -> Result<Option<String>, DatabaseError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT MAX(created_at) FROM audit_log WHERE success = 0 AND repo_id = ?1",
+        )?;
+        let result: Option<String> = stmt.query_row(params![repo_id], |row| row.get(0))?;
+        Ok(result)
+    }
+
+    /// Delete error entries from audit_log for a specific repository.
+    pub fn clear_errors_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
+        let conn = self.conn();
+        let count = conn.execute(
+            "DELETE FROM audit_log WHERE success = 0 AND repo_id = ?1",
+            params![repo_id],
+        )?;
+        // Also reset the cumulative total_errors column
+        let _ = conn.execute(
+            "UPDATE repositories SET total_errors = 0 WHERE id = ?1",
+            params![repo_id],
+        );
+        info!(repo_id, count, "cleared error entries for repo");
+        Ok(count)
+    }
+
     /// Get the last SVN revision from the commit map or sync records.
     pub fn get_last_svn_revision(&self) -> Result<Option<i64>, DatabaseError> {
         let conn = self.conn();

@@ -854,6 +854,7 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
             &import_config,
             progress.clone(),
             ws_broadcast.clone(),
+            None, // setup wizard doesn't have a repo_id yet
         )
         .await;
 
