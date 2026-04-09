@@ -543,6 +543,50 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Get the HEAD SHA of a branch.
+    #[instrument(skip(self), fields(repo, branch))]
+    pub async fn get_branch_sha(
+        &self,
+        repo: &str,
+        branch: &str,
+    ) -> Result<String, GitHubError> {
+        match self.provider {
+            GitProvider::Gitea => {
+                let url = format!(
+                    "{}/repos/{}/branches/{}",
+                    self.api_url, repo, branch
+                );
+                let resp = self.auth(self.http.get(&url)).send().await?;
+                let resp = self.check_response(resp).await?;
+                let data: serde_json::Value = resp.json().await?;
+                data["commit"]["id"]
+                    .as_str()
+                    .or_else(|| data["commit"]["sha"].as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| GitHubError::ApiError {
+                        status: 500,
+                        body: format!("could not resolve SHA for branch '{}'", branch),
+                    })
+            }
+            GitProvider::GitHub => {
+                let ref_url = format!(
+                    "{}/repos/{}/git/ref/heads/{}",
+                    self.api_url, repo, branch
+                );
+                let resp = self.auth(self.http.get(&ref_url)).send().await?;
+                let resp = self.check_response(resp).await?;
+                let data: serde_json::Value = resp.json().await?;
+                data["object"]["sha"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| GitHubError::ApiError {
+                        status: 500,
+                        body: format!("could not resolve SHA for branch '{}'", branch),
+                    })
+            }
+        }
+    }
+
     /// Delete a branch in the remote repository.
     #[instrument(skip(self))]
     pub async fn delete_branch(

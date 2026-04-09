@@ -1142,7 +1142,7 @@ async fn create_branch_pair(
     db.insert_repository(&child)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
 
-    // skip_import: set watermark to latest SVN rev so we start from now
+    // skip_import: set watermarks to current state so we start from now
     if body.skip_import {
         let svn_url = format!(
             "{}/{}",
@@ -1159,17 +1159,48 @@ async fn create_branch_pair(
             svn_password.as_deref().unwrap_or(""),
         );
 
+        // Get the current HEAD SHA of the new Git branch so the sync engine
+        // doesn't try to replay every commit from the start of history.
+        let git_token = db
+            .resolve_credential_chain(&parent.id, "secret_git_token")
+            .unwrap_or_default();
+        let provider = match parent.git_provider.as_str() {
+            "gitea" => reposync_core::config::GitProvider::Gitea,
+            _ => reposync_core::config::GitProvider::GitHub,
+        };
+        let github_client = reposync_core::git::github::GitHubClient::new(
+            &parent.git_api_url,
+            &git_token,
+            provider,
+        );
+        let git_head_sha = match github_client
+            .get_branch_sha(&parent.git_repo, &body.git_branch)
+            .await
+        {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!(
+                    repo_id = %new_id,
+                    error = %e,
+                    "could not query Git HEAD SHA for skip_import; git watermark not set"
+                );
+                String::new()
+            }
+        };
+
         match svn_client.info().await {
             Ok(svn_info) => {
                 let latest_rev = svn_info.latest_rev;
-                if let Err(e) = db.update_repo_watermark(&new_id, latest_rev, "") {
+                if let Err(e) = db.update_repo_watermark(&new_id, latest_rev, &git_head_sha) {
                     warn!(repo_id = %new_id, error = %e, "failed to set watermark for branch pair");
                 } else {
                     info!(
                         repo_id = %new_id,
                         latest_rev,
-                        "Branch pair created in 'start from now' mode, watermark set to r{}",
-                        latest_rev
+                        git_head_sha = %git_head_sha,
+                        "Branch pair created in 'start from now' mode, watermark set to r{} / {}",
+                        latest_rev,
+                        &git_head_sha[..8.min(git_head_sha.len())]
                     );
                 }
             }
