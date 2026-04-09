@@ -645,6 +645,11 @@ async fn start_repo_import(
         }
         // Reset error count (clears audit_log errors + resets total_errors column)
         let _ = db.clear_errors_for_repo(&id);
+        // Reset sync_status to idle and total_syncs to 0
+        let _ = db.conn().execute(
+            "UPDATE repositories SET sync_status = 'idle', total_syncs = 0 WHERE id = ?1",
+            rusqlite::params![&id],
+        );
 
         {
             let mut p = progress.write().await;
