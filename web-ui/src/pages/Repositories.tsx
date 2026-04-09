@@ -265,7 +265,6 @@ export default function Repositories() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {parents.map((repo: Repository) => {
-            const children = childrenByParent.get(repo.id) ?? [];
             const status = statusMap.get(repo.id);
             const lastSync = status?.last_sync_at ?? repo.updated_at;
             const totalSyncs = status?.total_syncs ?? 0;

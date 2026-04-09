@@ -150,7 +150,6 @@ export default function Dashboard() {
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3">
             {parents.map((repo: Repository) => {
-              const children = childMap.get(repo.id) || [];
               return (
               <div key={repo.id} className="bg-gray-800/60 border border-gray-700 rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors">
                 <button

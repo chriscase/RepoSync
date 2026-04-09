@@ -140,7 +140,7 @@ export default function RepoDetail() {
       queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
       queryClient.invalidateQueries({ queryKey: ['repos'] });
       setShowBranchModal(false);
-      setBranchForm({ svn_branch: '', git_branch: '', skip_import: true });
+      setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true });
       setBranchSuccess(true);
       setTimeout(() => setBranchSuccess(false), 3000);
     },
