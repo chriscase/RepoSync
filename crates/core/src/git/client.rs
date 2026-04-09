@@ -261,6 +261,14 @@ impl GitClient {
         committer_name: &str,
         committer_email: &str,
     ) -> Result<Oid, GitError> {
+        // Remove stale index.lock if present
+        if let Some(workdir) = self.repo.workdir() {
+            let lock_path = workdir.join(".git/index.lock");
+            if lock_path.exists() {
+                warn!(path = %lock_path.display(), "removing stale index.lock before commit");
+                let _ = std::fs::remove_file(&lock_path);
+            }
+        }
         let mut index = self.repo.index()?;
         index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
         index.write()?;
@@ -303,6 +311,17 @@ impl GitClient {
             repo_path = %repo_path.display(),
             "committing via git CLI (LFS-aware)"
         );
+
+        // Remove stale index.lock if present — a previous git operation
+        // may have crashed or been killed, leaving the lock behind.
+        let lock_path = repo_path.join(".git/index.lock");
+        if lock_path.exists() {
+            warn!(
+                path = %lock_path.display(),
+                "removing stale index.lock before git add"
+            );
+            let _ = std::fs::remove_file(&lock_path);
+        }
 
         // Stage all changes using git add, which invokes LFS clean filters.
         let add_output = std::process::Command::new("git")
