@@ -192,6 +192,34 @@ impl SvnClient {
         let src_url = format!("{}/{}", self.url, source_path);
         let dest_url = format!("{}/{}/{}", self.url, branches_path, name);
         let rev_str = source_rev.to_string();
+
+        // Ensure the parent directory exists (e.g., branches/dev/ for branches/dev/james-wilson).
+        // svn copy fails if intermediate directories are missing.
+        let parent_url = format!("{}/{}", self.url, branches_path);
+        match self
+            .run_svn(&[
+                "mkdir",
+                "--parents",
+                &parent_url,
+                "-m",
+                &format!("Create directory {}", branches_path),
+            ])
+            .await
+        {
+            Ok(_) => {
+                info!(branches_path, "created parent directory for branch");
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                // Ignore "already exists" — the directory is already there
+                if err_str.contains("already exists") || err_str.contains("E160020") {
+                    debug!(branches_path, "parent directory already exists");
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+
         let message = format!(
             "Create branch {} from {} at r{}",
             name, source_path, source_rev
