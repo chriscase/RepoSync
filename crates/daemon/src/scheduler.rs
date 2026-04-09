@@ -334,6 +334,15 @@ impl Scheduler {
                 )
             };
 
+            if svn_password.is_none() {
+                warn!(
+                    repo_name = %repo.name,
+                    repo_id = %repo.id,
+                    parent_id = ?repo.parent_id,
+                    "SVN password not found via credential chain"
+                );
+            }
+
             let svn_client = SvnClient::new(
                 &svn_url,
                 &repo.svn_username,
