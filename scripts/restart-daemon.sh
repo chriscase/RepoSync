@@ -18,7 +18,10 @@ DATA_DIR="${REPOSYNC_DATA_DIR:-/opt/reposync}"
 PID_FILE="${REPOSYNC_PID_FILE:-/tmp/reposync-daemon.pid}"
 LOG_FILE="${REPOSYNC_LOG:-/tmp/reposync.log}"
 HEALTH_URL="http://localhost:8080/api/status/health"
-SHUTDOWN_TIMEOUT=10
+# The daemon's internal graceful shutdown budget is:
+#   scheduler stop: 10s + in-flight sync tasks: 30s + web server: 5s = 45s
+# Give it the full budget plus a small buffer.
+SHUTDOWN_TIMEOUT=50
 STARTUP_TIMEOUT=15
 
 # Parse arguments

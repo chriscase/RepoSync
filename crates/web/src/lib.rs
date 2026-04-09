@@ -56,6 +56,9 @@ pub struct AppState {
     /// Login attempt tracker for rate limiting (IP -> (count, window_start)).
     pub login_attempts:
         std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
+    /// Handles for in-flight import tasks, for graceful shutdown.
+    pub import_handles:
+        tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -106,6 +109,7 @@ impl WebServer {
             prev_net_snapshot: std::sync::Mutex::new(None),
             repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
             login_attempts: std::sync::Mutex::new(HashMap::new()),
+            import_handles: tokio::sync::Mutex::new(Vec::new()),
         });
         Self { state }
     }

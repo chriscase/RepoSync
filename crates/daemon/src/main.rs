@@ -578,6 +578,7 @@ async fn main() -> Result<()> {
     let ws_broadcast = web_server.broadcast_sender();
     let listen_addr = config.web.listen.clone();
     let app_state_for_cleanup = web_server.app_state();
+    let app_state_for_shutdown = web_server.app_state();
 
     // Start web server — runs on the main tokio runtime directly
     // (not spawned) to ensure it gets immediate access to worker threads.
@@ -668,6 +669,29 @@ async fn main() -> Result<()> {
                 }
             }
             info!("in-flight sync task shutdown complete");
+        }
+    }
+
+    // Wait for in-flight import tasks (up to 60s — imports are long-running)
+    {
+        let handles: Vec<_> = {
+            let mut locked = app_state_for_shutdown.import_handles.lock().await;
+            locked.drain(..).filter(|h| !h.is_finished()).collect()
+        };
+        if !handles.is_empty() {
+            info!(count = handles.len(), "waiting for in-flight import tasks...");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            for handle in handles {
+                match tokio::time::timeout_at(deadline, handle).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("import task error: {}", e),
+                    Err(_) => {
+                        warn!("remaining import tasks did not complete within 60s");
+                        break;
+                    }
+                }
+            }
+            info!("in-flight import task shutdown complete");
         }
     }
 

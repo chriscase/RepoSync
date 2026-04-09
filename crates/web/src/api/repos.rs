@@ -740,8 +740,9 @@ async fn start_repo_import(
     let ws_broadcast = Some(state.ws_broadcast.clone());
     let repo_id_clone = id.clone();
 
-    // 12. Spawn the import task
-    tokio::spawn(async move {
+    // 12. Spawn the import task (tracked for graceful shutdown)
+    let import_handles = state.import_handles.clone();
+    let handle = tokio::spawn(async move {
         // Hold the busy guard for the entire lifetime of the import so
         // the scheduler skips this repo until we're done.
         let _busy_guard = busy_guard;
@@ -822,6 +823,14 @@ async fn start_repo_import(
             let _ = sender.send(json.to_string());
         }
     });
+
+    // Track the import handle so graceful shutdown waits for it
+    {
+        let mut handles = import_handles.lock().await;
+        // Clean up finished handles
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
+    }
 
     Ok(Json(serde_json::json!({
         "ok": true,
