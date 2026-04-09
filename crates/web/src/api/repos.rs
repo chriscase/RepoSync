@@ -992,11 +992,82 @@ async fn create_branch_pair(
         ));
     }
 
-    if body.svn_branch.is_empty() {
+    // --- Input validation ---
+    let git_branch = body.git_branch.trim().to_string();
+    let svn_branch = body.svn_branch.trim().to_string();
+
+    if git_branch.is_empty() {
+        return Err(AppError::BadRequest("git_branch is required".into()));
+    }
+    if svn_branch.is_empty() {
         return Err(AppError::BadRequest("svn_branch is required".into()));
     }
-    if body.git_branch.is_empty() {
-        return Err(AppError::BadRequest("git_branch is required".into()));
+
+    // Length limits
+    if git_branch.len() > 200 {
+        return Err(AppError::BadRequest("git_branch exceeds 200 character limit".into()));
+    }
+    if svn_branch.len() > 200 {
+        return Err(AppError::BadRequest("svn_branch exceeds 200 character limit".into()));
+    }
+
+    // Character validation: alphanumeric, dots, underscores, hyphens, slashes
+    let valid_branch_chars = |s: &str| -> bool {
+        s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    };
+    if !valid_branch_chars(&git_branch) {
+        return Err(AppError::BadRequest(
+            "git_branch contains invalid characters (only alphanumeric, '.', '_', '-', '/' allowed)".into(),
+        ));
+    }
+    if !valid_branch_chars(&svn_branch) {
+        return Err(AppError::BadRequest(
+            "svn_branch contains invalid characters (only alphanumeric, '.', '_', '-', '/' allowed)".into(),
+        ));
+    }
+
+    // Path traversal prevention
+    if git_branch.contains("..") || svn_branch.contains("..") {
+        return Err(AppError::BadRequest("branch names must not contain '..'".into()));
+    }
+
+    // Structural validation
+    if git_branch.contains("//") || svn_branch.contains("//") {
+        return Err(AppError::BadRequest("branch names must not contain '//'".into()));
+    }
+    if git_branch.starts_with('/') || git_branch.ends_with('/')
+        || svn_branch.starts_with('/') || svn_branch.ends_with('/')
+    {
+        return Err(AppError::BadRequest("branch names must not start or end with '/'".into()));
+    }
+    if git_branch.starts_with('-') || svn_branch.starts_with('-') {
+        return Err(AppError::BadRequest("branch names must not start with '-'".into()));
+    }
+
+    // Git-specific reserved names
+    if git_branch.ends_with(".lock")
+        || git_branch == "HEAD"
+        || git_branch.starts_with("refs/")
+    {
+        return Err(AppError::BadRequest("git_branch uses a reserved name".into()));
+    }
+
+    // Parent must be enabled
+    if !parent.enabled {
+        return Err(AppError::BadRequest(
+            "cannot create branch pair from a disabled repository".into(),
+        ));
+    }
+
+    // Duplicate check: ensure no existing child has the same git_branch
+    let existing_children = db
+        .list_child_repositories(&parent.id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+    if existing_children.iter().any(|c| c.git_branch == git_branch) {
+        return Err(AppError::BadRequest(format!(
+            "a branch pair with git_branch '{}' already exists",
+            git_branch
+        )));
     }
 
     // Auto-create SVN branch if requested (default: true)
@@ -1025,12 +1096,12 @@ async fn create_branch_pair(
         let info_client = SvnClient::new(&parent_svn_url, &parent.svn_username, &svn_password);
         match info_client.info().await {
             Ok(info) => {
-                // Determine branches_path and branch name from body.svn_branch
+                // Determine branches_path and branch name from svn_branch
                 // e.g., "branches/fix-123" → branches_path="branches", name="fix-123"
-                let (branches_path, branch_name) = if let Some(pos) = body.svn_branch.rfind('/') {
-                    (&body.svn_branch[..pos], &body.svn_branch[pos + 1..])
+                let (branches_path, branch_name) = if let Some(pos) = svn_branch.rfind('/') {
+                    (&svn_branch[..pos], &svn_branch[pos + 1..])
                 } else {
-                    ("branches", body.svn_branch.as_str())
+                    ("branches", svn_branch.as_str())
                 };
                 match svn_client
                     .create_branch(branch_name, &parent.svn_branch, branches_path, info.latest_rev)
@@ -1038,7 +1109,7 @@ async fn create_branch_pair(
                 {
                     Ok(()) => {
                         info!(
-                            branch = %body.svn_branch,
+                            branch = %svn_branch,
                             from = %parent.svn_branch,
                             rev = info.latest_rev,
                             "auto-created SVN branch"
@@ -1048,7 +1119,7 @@ async fn create_branch_pair(
                         let err_str = e.to_string();
                         // Treat "already exists" as success
                         if err_str.contains("already exists") || err_str.contains("E160020") {
-                            info!(branch = %body.svn_branch, "SVN branch already exists, continuing");
+                            info!(branch = %svn_branch, "SVN branch already exists, continuing");
                         } else {
                             return Err(AppError::Internal(format!(
                                 "failed to create SVN branch: {}", e
@@ -1080,12 +1151,12 @@ async fn create_branch_pair(
             provider,
         );
         match github_client
-            .create_branch(&parent.git_repo, &body.git_branch, &parent.git_branch)
+            .create_branch(&parent.git_repo, &git_branch, &parent.git_branch)
             .await
         {
             Ok(()) => {
                 info!(
-                    branch = %body.git_branch,
+                    branch = %git_branch,
                     from = %parent.git_branch,
                     "auto-created Git branch"
                 );
@@ -1093,7 +1164,7 @@ async fn create_branch_pair(
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.contains("already exists") || err_str.contains("Reference already exists") {
-                    info!(branch = %body.git_branch, "Git branch already exists, continuing");
+                    info!(branch = %git_branch, "Git branch already exists, continuing");
                 } else {
                     return Err(AppError::Internal(format!(
                         "failed to create Git branch: {}", e
@@ -1110,18 +1181,18 @@ async fn create_branch_pair(
         .last()
         .map(|r| r.name.as_str())
         .unwrap_or(&parent.name);
-    let name = format!("{} / {}", root_name, body.git_branch);
+    let name = format!("{} / {}", root_name, git_branch);
 
     let child = reposync_core::models::Repository {
         id: new_id.clone(),
         name,
         svn_url: parent.svn_url.clone(),
-        svn_branch: body.svn_branch.clone(),
+        svn_branch: svn_branch.clone(),
         svn_username: parent.svn_username.clone(),
         git_provider: parent.git_provider.clone(),
         git_api_url: parent.git_api_url.clone(),
         git_repo: parent.git_repo.clone(),
-        git_branch: body.git_branch.clone(),
+        git_branch: git_branch.clone(),
         sync_mode: parent.sync_mode.clone(),
         poll_interval_secs: parent.poll_interval_secs,
         lfs_threshold_mb: parent.lfs_threshold_mb,
@@ -1147,7 +1218,7 @@ async fn create_branch_pair(
         let svn_url = format!(
             "{}/{}",
             parent.svn_url.trim_end_matches('/'),
-            body.svn_branch.trim_start_matches('/')
+            svn_branch.trim_start_matches('/')
         );
 
         // Read credentials via ancestor chain
@@ -1174,7 +1245,7 @@ async fn create_branch_pair(
             provider,
         );
         let git_head_sha = match github_client
-            .get_branch_sha(&parent.git_repo, &body.git_branch)
+            .get_branch_sha(&parent.git_repo, &git_branch)
             .await
         {
             Ok(sha) => sha,

@@ -162,17 +162,23 @@ sudo install -m 755 target/release/reposync        /usr/local/bin/reposync
 
 ${INSTALL_WEB_UI_CMD}
 
-echo '[remote] Restarting reposync service...'
-sudo systemctl daemon-reload
-sudo systemctl restart reposync
-
-sleep 1
-if systemctl is-active --quiet reposync; then
-    echo '[remote] reposync service is ACTIVE'
+echo '[remote] Restarting reposync daemon...'
+if systemctl is-enabled --quiet reposync 2>/dev/null && systemctl is-active --quiet reposync 2>/dev/null; then
+    echo '[remote] Using systemd to restart...'
+    sudo systemctl daemon-reload
+    sudo systemctl restart reposync
+    sleep 1
+    if systemctl is-active --quiet reposync; then
+        echo '[remote] reposync service is ACTIVE'
+    else
+        echo '[remote] ERROR: reposync service failed to start'
+        sudo journalctl -u reposync -n 30 --no-pager
+        exit 1
+    fi
 else
-    echo '[remote] ERROR: reposync service failed to start'
-    sudo journalctl -u reposync -n 30 --no-pager
-    exit 1
+    echo '[remote] Using restart-daemon.sh (no active systemd service)...'
+    REPOSYNC_BIN=${REMOTE_REPO_DIR}/target/release/reposync-daemon \
+        bash ${REMOTE_REPO_DIR}/scripts/restart-daemon.sh
 fi
 
 echo '[remote] Deployed version:'

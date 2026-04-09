@@ -910,11 +910,12 @@ export default function RepoDetail() {
               </div>
 
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Branch Name</label>
+                <label className="block text-sm text-gray-400 mb-1">Branch Name <span className="text-gray-600 text-xs">({branchForm.git_branch.length}/200)</span></label>
                 <input
                   type="text"
                   className={inputClass}
                   value={branchForm.git_branch}
+                  maxLength={200}
                   onChange={(e) => {
                     const name = e.target.value;
                     setBranchForm(prev => ({
@@ -923,8 +924,24 @@ export default function RepoDetail() {
                       svn_branch: name ? `branches/${name}` : '',
                     }));
                   }}
-                  placeholder="e.g., fix-123, tech-update-Q2"
+                  placeholder="e.g., fix-123, dev/james-wilson"
                 />
+                {(() => {
+                  const v = branchForm.git_branch;
+                  if (!v) return null;
+                  const invalid = /[^a-zA-Z0-9._\/-]/.test(v);
+                  const hasTraversal = v.includes('..');
+                  const hasDoubleSlash = v.includes('//');
+                  const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
+                  const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
+                  const err = invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
+                    : hasTraversal ? 'Must not contain ".."'
+                    : hasDoubleSlash ? 'Must not contain "//"'
+                    : badEdges ? 'Must not start/end with "/" or start with "-"'
+                    : reserved ? 'Reserved name not allowed'
+                    : null;
+                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
+                })()}
               </div>
               <div>
                 <label className="block text-sm text-gray-400 mb-1">SVN Branch Path <span className="text-gray-600">(auto-derived, editable)</span></label>
@@ -932,9 +949,18 @@ export default function RepoDetail() {
                   type="text"
                   className={inputClass}
                   value={branchForm.svn_branch}
+                  maxLength={200}
                   onChange={(e) => setBranchForm(prev => ({ ...prev, svn_branch: e.target.value }))}
                   placeholder="branches/fix-123"
                 />
+                {(() => {
+                  const v = branchForm.svn_branch;
+                  if (!v) return null;
+                  const invalid = /[^a-zA-Z0-9._\/-]/.test(v);
+                  const hasTraversal = v.includes('..');
+                  const err = invalid ? 'Invalid characters' : hasTraversal ? 'Must not contain ".."' : null;
+                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
+                })()}
               </div>
 
               {/* Auto-create options */}
@@ -995,7 +1021,12 @@ export default function RepoDetail() {
               </button>
               <button
                 onClick={() => branchMutation.mutate(branchForm)}
-                disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()}
+                disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()
+                  || /[^a-zA-Z0-9._\/-]/.test(branchForm.git_branch) || /[^a-zA-Z0-9._\/-]/.test(branchForm.svn_branch)
+                  || branchForm.git_branch.includes('..') || branchForm.svn_branch.includes('..')
+                  || branchForm.git_branch.includes('//') || branchForm.git_branch.startsWith('/') || branchForm.git_branch.endsWith('/')
+                  || branchForm.git_branch.startsWith('-') || branchForm.git_branch === 'HEAD' || branchForm.git_branch.endsWith('.lock')
+                }
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />

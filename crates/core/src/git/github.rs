@@ -550,11 +550,14 @@ impl GitHubClient {
         repo: &str,
         branch: &str,
     ) -> Result<String, GitHubError> {
+        // URL-encode the branch name so slashes (e.g., dev/james-wilson)
+        // are passed correctly in the URL path.
+        let encoded_branch = branch.replace('/', "%2F");
         match self.provider {
             GitProvider::Gitea => {
                 let url = format!(
                     "{}/repos/{}/branches/{}",
-                    self.api_url, repo, branch
+                    self.api_url, repo, encoded_branch
                 );
                 let resp = self.auth(self.http.get(&url)).send().await?;
                 let resp = self.check_response(resp).await?;

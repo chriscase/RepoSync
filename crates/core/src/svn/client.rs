@@ -189,6 +189,14 @@ impl SvnClient {
         branches_path: &str,
         source_rev: i64,
     ) -> Result<(), SvnError> {
+        // Guard against path traversal in branch names
+        if name.contains("..") || branches_path.contains("..") || source_path.contains("..") {
+            return Err(SvnError::CommandFailed {
+                exit_code: 1,
+                stderr: "path traversal ('..') not allowed in branch names".to_string(),
+            });
+        }
+
         let src_url = format!("{}/{}", self.url, source_path);
         let dest_url = format!("{}/{}/{}", self.url, branches_path, name);
         let rev_str = source_rev.to_string();
