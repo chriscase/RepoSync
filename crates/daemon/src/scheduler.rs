@@ -459,6 +459,10 @@ impl Scheduler {
             let mut repo_config = self.app_config.clone();
             repo_config.svn.trunk_path = String::new();
             repo_config.svn.layout = reposync_core::config::SvnLayout::Custom;
+            // Override the git branch so the sync engine pulls the correct branch
+            // for this repo (child branch pairs have a different git_branch than
+            // the global config's default_branch).
+            repo_config.github.default_branch = repo.git_branch.clone();
 
             let mut engine = SyncEngine::new(
                 repo_config,
