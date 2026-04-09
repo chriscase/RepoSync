@@ -472,6 +472,9 @@ impl Scheduler {
                 identity_mapper,
             );
             engine.set_repo_id(repo.id.clone());
+            if repo.lfs_threshold_mb > 0 {
+                engine.set_lfs_threshold_bytes((repo.lfs_threshold_mb as u64) * 1024 * 1024);
+            }
 
             let repo_id = repo.id.clone();
             let repo_name = repo.name.clone();

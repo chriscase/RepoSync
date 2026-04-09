@@ -90,6 +90,9 @@ pub struct SyncEngine {
     started_at: chrono::DateTime<Utc>,
     /// Optional repo ID for per-repo credential and watermark keys.
     repo_id: Option<String>,
+    /// LFS threshold in bytes. Files larger than this are tracked via Git LFS.
+    /// 0 means LFS is disabled.
+    lfs_threshold_bytes: u64,
 }
 
 impl SyncEngine {
@@ -111,12 +114,19 @@ impl SyncEngine {
             running: Arc::new(AtomicBool::new(false)),
             started_at: Utc::now(),
             repo_id: None,
+            lfs_threshold_bytes: 0,
         }
     }
 
     /// Set the repository ID for per-repo credential and watermark keys.
     pub fn set_repo_id(&mut self, id: String) {
         self.repo_id = Some(id);
+    }
+
+    /// Set the LFS threshold in bytes. Files larger than this will be
+    /// tracked via Git LFS during SVN-to-Git sync.
+    pub fn set_lfs_threshold_bytes(&mut self, threshold: u64) {
+        self.lfs_threshold_bytes = threshold;
     }
 
     /// Return the kv_state key for the last SVN revision watermark.
@@ -447,13 +457,13 @@ impl SyncEngine {
                     },
                 )?;
 
-                // Mirror export → working tree (with default LFS/size
-                // policy — incremental sync trusts the threshold that
-                // the initial import established).
+                // Mirror export → working tree with LFS enforcement.
+                // Use the repo's LFS threshold so large files are
+                // tracked via Git LFS instead of committed as blobs.
                 let fallback_policy = crate::file_policy::FilePolicy::with_lfs(
                     0,
                     vec![],
-                    0,
+                    self.lfs_threshold_bytes,
                     &[],
                 );
                 crate::import::copy_tree_with_policy(
@@ -468,6 +478,58 @@ impl SyncEngine {
                         change.revision, e
                     )))
                 })?;
+            }
+
+            // 2b. LFS enforcement: after applying changes, scan modified files
+            // and ensure any above the LFS threshold are tracked via .gitattributes.
+            if self.lfs_threshold_bytes > 0 {
+                let changed_files: Vec<String> = change
+                    .changed_files
+                    .iter()
+                    .filter_map(|cf| {
+                        // Strip trunk prefix for standard layout
+                        let path = if self.config.svn.layout == SvnLayout::Standard {
+                            let tp = self.config.svn.trunk_path.trim_matches('/');
+                            if !tp.is_empty() {
+                                cf.path.strip_prefix(&format!("/{}/", tp))
+                                    .or_else(|| cf.path.strip_prefix(&format!("{}/", tp)))
+                                    .unwrap_or(&cf.path)
+                            } else {
+                                &cf.path
+                            }
+                        } else {
+                            &cf.path
+                        };
+                        let clean = path.trim_start_matches('/');
+                        if clean.is_empty() { None } else { Some(clean.to_string()) }
+                    })
+                    .collect();
+
+                for rel_path in &changed_files {
+                    let full_path = repo_path.join(rel_path);
+                    if let Ok(meta) = std::fs::metadata(&full_path) {
+                        if meta.len() > self.lfs_threshold_bytes {
+                            let pattern = crate::lfs::pattern_for_path(rel_path);
+                            if let Err(e) = crate::lfs::ensure_lfs_tracked(&repo_path, &pattern) {
+                                warn!(
+                                    path = rel_path.as_str(),
+                                    size = meta.len(),
+                                    threshold = self.lfs_threshold_bytes,
+                                    error = %e,
+                                    "failed to update .gitattributes for LFS tracking"
+                                );
+                            } else {
+                                info!(
+                                    path = rel_path.as_str(),
+                                    size = meta.len(),
+                                    threshold = self.lfs_threshold_bytes,
+                                    pattern = pattern.as_str(),
+                                    "LFS: large file detected during sync, .gitattributes updated"
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             // 3. Commit with identity and sync marker.
