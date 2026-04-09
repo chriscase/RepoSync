@@ -741,7 +741,7 @@ async fn start_repo_import(
     let repo_id_clone = id.clone();
 
     // 12. Spawn the import task (tracked for graceful shutdown)
-    let import_handles = state.import_handles.clone();
+    let state_for_handle = state.clone();
     let handle = tokio::spawn(async move {
         // Hold the busy guard for the entire lifetime of the import so
         // the scheduler skips this repo until we're done.
@@ -826,7 +826,7 @@ async fn start_repo_import(
 
     // Track the import handle so graceful shutdown waits for it
     {
-        let mut handles = import_handles.lock().await;
+        let mut handles = state_for_handle.import_handles.lock().await;
         // Clean up finished handles
         handles.retain(|h| !h.is_finished());
         handles.push(handle);
