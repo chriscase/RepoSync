@@ -839,6 +839,7 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
         branch: config.github.default_branch.clone(),
         push_token: git_token,
         message_prefix: None,
+        trunk_path: config.svn.trunk_path.clone(),
     };
 
     let progress = state.import_progress.clone();

@@ -361,6 +361,9 @@ pub struct ImportConfig {
     /// Commit message prefix format.  `{rev}`, `{author}`, `{date}` are
     /// available as placeholders.  If empty, uses the original SVN message.
     pub message_prefix: Option<String>,
+    /// SVN trunk path to strip from diff paths (e.g. "trunk").
+    /// Empty means no stripping (custom layout or branch-level import).
+    pub trunk_path: String,
 }
 
 /// Run a full SVN history import, replaying every revision as a Git commit.
@@ -568,7 +571,17 @@ pub async fn run_full_import(
         if idx > 0 {
             match svn_client.diff_full(rev).await {
                 Ok(diff_text) if !diff_text.trim().is_empty() => {
-                    match crate::sync_engine::apply_diff_to_path(&repo_path, &diff_text).await {
+                    // Strip trunk prefix from diff paths so they match the
+                    // git repo layout (e.g. "a/trunk/source/..." → "a/source/...")
+                    let processed_diff = if !import_config.trunk_path.is_empty() {
+                        let tp = import_config.trunk_path.trim_matches('/');
+                        diff_text
+                            .replace(&format!("a/{}/", tp), "a/")
+                            .replace(&format!("b/{}/", tp), "b/")
+                    } else {
+                        diff_text
+                    };
+                    match crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await {
                         Ok(()) => {
                             used_incremental = true;
                             debug!(rev, "applied incremental SVN diff");

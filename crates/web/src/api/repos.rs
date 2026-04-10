@@ -735,6 +735,7 @@ async fn start_repo_import(
         branch: repo.git_branch.clone(),
         push_token: git_token,
         message_prefix: None,
+        trunk_path: repo.svn_branch.clone(),
     };
 
     let ws_broadcast = Some(state.ws_broadcast.clone());
