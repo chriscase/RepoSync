@@ -123,7 +123,9 @@ fi
 
 # ---- Phase 5: Restart daemon ------------------------------------------------
 step "Phase 5: Restart daemon ($(ts))"
-ssh_cmd "REPOSYNC_BIN=$REMOTE_REPO_DIR/target/release/reposync-daemon bash $REMOTE_REPO_DIR/scripts/restart-daemon.sh"
+# restart-daemon.sh exits 255 via SSH even on success; ignore exit code
+# and verify via health check in phase 6 instead.
+ssh_cmd "REPOSYNC_BIN=$REMOTE_REPO_DIR/target/release/reposync-daemon bash $REMOTE_REPO_DIR/scripts/restart-daemon.sh" || true
 
 # ---- Phase 6: Post-deploy verification --------------------------------------
 step "Phase 6: Verify deployment ($(ts))"
