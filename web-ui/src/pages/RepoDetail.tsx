@@ -28,6 +28,8 @@ type EditForm = {
   poll_interval_secs: number;
   lfs_threshold_mb: number;
   auto_merge: boolean;
+  allowed_paths: string;
+  blocked_patterns: string;
 };
 
 function repoToForm(repo: Repository): EditForm {
@@ -46,6 +48,8 @@ function repoToForm(repo: Repository): EditForm {
     poll_interval_secs: repo.poll_interval_secs,
     lfs_threshold_mb: repo.lfs_threshold_mb,
     auto_merge: repo.auto_merge,
+    allowed_paths: repo.allowed_paths ? JSON.parse(repo.allowed_paths).join('\n') : '',
+    blocked_patterns: repo.blocked_patterns ? JSON.parse(repo.blocked_patterns).join('\n') : '',
   };
 }
 
@@ -241,9 +245,18 @@ export default function RepoDetail() {
 
   async function handleSave() {
     if (!form) return;
-    // Save repo config (exclude credential fields)
-    const { svn_password, git_token, ...repoData } = form;
-    updateMutation.mutate(repoData);
+    // Save repo config (exclude credential fields, convert path rules to JSON)
+    const { svn_password, git_token, allowed_paths, blocked_patterns, ...repoData } = form;
+    const pathData = {
+      ...repoData,
+      allowed_paths: allowed_paths.trim()
+        ? JSON.stringify(allowed_paths.split('\n').map(s => s.trim()).filter(Boolean))
+        : null,
+      blocked_patterns: blocked_patterns.trim()
+        ? JSON.stringify(blocked_patterns.split('\n').map(s => s.trim()).filter(Boolean))
+        : null,
+    };
+    updateMutation.mutate(pathData);
     // Save credentials if provided
     if (svn_password || git_token) {
       const credData: { svn_password?: string; git_token?: string } = {};
@@ -407,6 +420,17 @@ export default function RepoDetail() {
               </button>
             </>
           )}
+          {(repo?.allowed_paths || repo?.blocked_patterns) && (
+            <a
+              href={`/api/repos/${id}/hooks/pre-commit`}
+              download="pre-commit"
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white hover:border-gray-500 text-sm font-medium transition-colors"
+              title="Download Git pre-commit hook script"
+            >
+              <GitBranch className="w-4 h-4" />
+              Git Hook
+            </a>
+          )}
           <button
             onClick={() => syncMutation.mutate()}
             disabled={syncMutation.isPending || syncTriggered}
@@ -559,6 +583,30 @@ export default function RepoDetail() {
             <FieldNumber label="Poll Interval (s)" value={form.poll_interval_secs} onChange={(v) => setField('poll_interval_secs', v)} min={10} />
             <FieldNumber label="LFS Threshold (MB)" value={form.lfs_threshold_mb} onChange={(v) => setField('lfs_threshold_mb', v)} min={0} />
             <FieldToggle label="Auto Merge" checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
+            <div className="col-span-full grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Allowed SVN Paths <span className="text-gray-600">(one per line)</span></label>
+                <textarea
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  rows={3}
+                  value={form.allowed_paths}
+                  onChange={(e) => setField('allowed_paths', e.target.value)}
+                  placeholder={"source/\nconfig/"}
+                />
+                <p className="text-xs text-gray-500 mt-1">Files must be under these path prefixes. Leave empty for no restriction.</p>
+              </div>
+              <div>
+                <label className="block text-sm text-gray-400 mb-1">Blocked Patterns <span className="text-gray-600">(one per line)</span></label>
+                <textarea
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  rows={3}
+                  value={form.blocked_patterns}
+                  onChange={(e) => setField('blocked_patterns', e.target.value)}
+                  placeholder={"*.exe\ntemp/"}
+                />
+                <p className="text-xs text-gray-500 mt-1">Files matching these patterns will be excluded from SVN sync.</p>
+              </div>
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">

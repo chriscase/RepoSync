@@ -528,6 +528,10 @@ export interface Repository {
   created_by: string | null;
   created_at: string;
   updated_at: string;
+  allowed_paths: string | null;
+  blocked_patterns: string | null;
+  consecutive_errors: number;
+  sync_status: string;
 }
 
 export interface ImportStatus {

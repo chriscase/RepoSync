@@ -88,6 +88,8 @@ struct UpdateRepoRequest {
     lfs_threshold_mb: Option<i64>,
     auto_merge: Option<bool>,
     enabled: Option<bool>,
+    allowed_paths: Option<String>,
+    blocked_patterns: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -373,8 +375,8 @@ async fn update_repo(
         sync_status: existing.sync_status,
         total_syncs: existing.total_syncs,
         total_errors: existing.total_errors,
-        allowed_paths: existing.allowed_paths,
-        blocked_patterns: existing.blocked_patterns,
+        allowed_paths: body.allowed_paths.or(existing.allowed_paths),
+        blocked_patterns: body.blocked_patterns.or(existing.blocked_patterns),
         consecutive_errors: existing.consecutive_errors,
     };
 
