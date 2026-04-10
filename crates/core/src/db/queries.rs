@@ -1049,6 +1049,44 @@ impl Database {
         Ok(count)
     }
 
+    /// Hard-delete a repository and all associated data from all tables.
+    /// Used for branch pair cleanup. Wraps all deletes in a transaction.
+    pub fn hard_delete_repository(&self, repo_id: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN TRANSACTION")?;
+
+        let tables_with_repo_id = [
+            "sync_records",
+            "commit_map",
+            "conflicts",
+            "audit_log",
+        ];
+        for table in &tables_with_repo_id {
+            let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
+            match conn.execute(&sql, params![repo_id]) {
+                Ok(n) => debug!(table, repo_id, count = n, "deleted records"),
+                Err(e) => debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping"),
+            }
+        }
+
+        // Clean up kv_state credential entries for this repo
+        let cred_pattern = format!("%_{}", repo_id);
+        let _ = conn.execute(
+            "DELETE FROM kv_state WHERE key LIKE ?1",
+            params![cred_pattern],
+        );
+
+        // Delete the repository row itself
+        conn.execute(
+            "DELETE FROM repositories WHERE id = ?1",
+            params![repo_id],
+        )?;
+
+        conn.execute_batch("COMMIT")?;
+        info!(repo_id, "hard-deleted repository and all associated data");
+        Ok(())
+    }
+
     /// Get the last SVN revision from the commit map or sync records.
     pub fn get_last_svn_revision(&self) -> Result<Option<i64>, DatabaseError> {
         let conn = self.conn();

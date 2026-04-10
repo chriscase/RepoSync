@@ -75,6 +75,9 @@ export default function RepoDetail() {
   const [svnTesting, setSvnTesting] = useState(false);
   const [gitTesting, setGitTesting] = useState(false);
   const [showBranchModal, setShowBranchModal] = useState(false);
+  const [deleteBranchTarget, setDeleteBranchTarget] = useState<Repository | null>(null);
+  const [deleteBranchConfirmText, setDeleteBranchConfirmText] = useState('');
+  const [deleteBranchOpts, setDeleteBranchOpts] = useState({ delete_git: true, delete_svn: true });
   const [branchForm, setBranchForm] = useState({
     svn_branch: '',
     git_branch: '',
@@ -143,6 +146,16 @@ export default function RepoDetail() {
       setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true });
       setBranchSuccess(true);
       setTimeout(() => setBranchSuccess(false), 3000);
+    },
+  });
+
+  const deleteBranchMutation = useMutation({
+    mutationFn: () => api.deleteBranchPair(deleteBranchTarget!.id, deleteBranchOpts),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
+      queryClient.invalidateQueries({ queryKey: ['repos'] });
+      setDeleteBranchTarget(null);
+      setDeleteBranchConfirmText('');
     },
   });
 
@@ -860,6 +873,7 @@ export default function RepoDetail() {
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Git Branch</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Last Sync</th>
+                  {isAdmin && <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase"></th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-700">
@@ -880,6 +894,21 @@ export default function RepoDetail() {
                       </span>
                     </td>
                     <td className="px-6 py-3 text-sm text-gray-400">{formatTimeAgo(bp.updated_at)}</td>
+                    {isAdmin && (
+                      <td className="px-6 py-3 text-right">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteBranchTarget(bp);
+                            setDeleteBranchConfirmText('');
+                          }}
+                          className="text-gray-500 hover:text-red-400 transition-colors p-1"
+                          title="Delete branch pair"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -1040,6 +1069,70 @@ export default function RepoDetail() {
               >
                 <GitBranch className="w-4 h-4" />
                 {branchMutation.isPending ? 'Creating...' : 'Create Branch'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Branch Pair Confirmation Modal */}
+      {deleteBranchTarget && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
+            <div className="flex items-center justify-between p-6 border-b border-gray-700">
+              <h2 className="text-lg font-semibold text-red-400">Delete Branch Pair</h2>
+              <button onClick={() => { setDeleteBranchTarget(null); deleteBranchMutation.reset(); }} className="text-gray-400 hover:text-gray-200">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              {deleteBranchMutation.isError && (
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
+                  {deleteBranchMutation.error?.message}
+                </div>
+              )}
+              <p className="text-sm text-gray-300">
+                This will permanently delete <span className="font-semibold text-gray-100">{deleteBranchTarget.name}</span> and all associated sync records.
+              </p>
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={deleteBranchOpts.delete_git}
+                    onChange={(e) => setDeleteBranchOpts(p => ({ ...p, delete_git: e.target.checked }))}
+                    className="rounded border-gray-600 bg-gray-700 text-red-600" />
+                  <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-500 font-mono">({deleteBranchTarget.git_branch})</span></span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={deleteBranchOpts.delete_svn}
+                    onChange={(e) => setDeleteBranchOpts(p => ({ ...p, delete_svn: e.target.checked }))}
+                    className="rounded border-gray-600 bg-gray-700 text-red-600" />
+                  <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-500 font-mono">({deleteBranchTarget.svn_branch})</span></span>
+                </label>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400 mb-2">
+                  Type <span className="font-mono text-yellow-300">{deleteBranchTarget.git_branch}</span> to confirm:
+                </p>
+                <input
+                  type="text"
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
+                  value={deleteBranchConfirmText}
+                  onChange={(e) => setDeleteBranchConfirmText(e.target.value)}
+                  placeholder={deleteBranchTarget.git_branch}
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
+              <button
+                onClick={() => { setDeleteBranchTarget(null); deleteBranchMutation.reset(); }}
+                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+              >Cancel</button>
+              <button
+                onClick={() => deleteBranchMutation.mutate()}
+                disabled={deleteBranchMutation.isPending || deleteBranchConfirmText !== deleteBranchTarget.git_branch}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+                {deleteBranchMutation.isPending ? 'Deleting...' : 'Delete Branch Pair'}
               </button>
             </div>
           </div>

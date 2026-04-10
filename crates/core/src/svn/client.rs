@@ -238,6 +238,38 @@ impl SvnClient {
         Ok(())
     }
 
+    /// Delete an SVN branch (or directory) from the repository.
+    #[instrument(skip(self), fields(url = %self.url))]
+    pub async fn delete_branch(
+        &self,
+        branch_path: &str,
+    ) -> Result<(), SvnError> {
+        if branch_path.contains("..") {
+            return Err(SvnError::CommandFailed {
+                exit_code: 1,
+                stderr: "path traversal ('..') not allowed in branch path".to_string(),
+            });
+        }
+        let branch_url = format!("{}/{}", self.url, branch_path);
+        let message = format!("Delete branch {}", branch_path);
+        match self.run_svn(&["rm", &branch_url, "-m", &message]).await {
+            Ok(_) => {
+                info!(branch_path, "deleted SVN branch");
+                Ok(())
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                // Treat "not found" as success — branch may already be gone
+                if err_str.contains("E200009") || err_str.contains("non-existent") || err_str.contains("E160013") {
+                    info!(branch_path, "SVN branch already deleted or not found");
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     #[instrument(skip(self), fields(url = %self.url, rev))]
     pub async fn export(&self, path: &str, rev: i64, dest: &Path) -> Result<(), SvnError> {
         let src_url = if path.is_empty() {

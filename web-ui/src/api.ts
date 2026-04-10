@@ -331,6 +331,16 @@ export const api = {
   listBranchPairs: (repoId: string) =>
     fetchJson<Repository[]>(`/repos/${repoId}/branches`),
 
+  deleteBranchPair: (repoId: string, opts?: { delete_git?: boolean; delete_svn?: boolean }) => {
+    const params = new URLSearchParams();
+    if (opts?.delete_git !== undefined) params.set('delete_git', String(opts.delete_git));
+    if (opts?.delete_svn !== undefined) params.set('delete_svn', String(opts.delete_svn));
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return fetchJson<{ ok: boolean; message: string; warnings: string[] }>(
+      `/repos/${repoId}/branch-pair${qs}`, { method: 'DELETE' }
+    );
+  },
+
   triggerRepoSync: (id: string) =>
     fetchJson<{ ok: boolean }>(`/repos/${id}/sync`, { method: 'POST' }),
   getRepoCredentials: (id: string) =>

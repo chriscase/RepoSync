@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -192,6 +192,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id/credentials", post(save_credentials))
         .route("/api/repos/:id/branches", post(create_branch_pair))
         .route("/api/repos/:id/branches", get(list_branch_pairs))
+        .route("/api/repos/:id/branch-pair", delete(delete_branch_pair))
         .route("/api/repos/:id/test-svn", post(test_repo_svn))
         .route("/api/repos/:id/test-git", post(test_repo_git))
 }
@@ -1353,6 +1354,154 @@ async fn list_branch_pairs(
         .collect();
 
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct DeleteBranchPairQuery {
+    #[serde(default = "default_true")]
+    delete_git: bool,
+    #[serde(default = "default_true")]
+    delete_svn: bool,
+}
+async fn delete_branch_pair(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Query(opts): Query<DeleteBranchPairQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let db = &state.db;
+
+    // Load the branch pair
+    let repo = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound(format!("repository {} not found", id)))?;
+
+    // Only branch pairs (with a parent) can be hard-deleted
+    let parent_id = repo.parent_id.as_ref().ok_or_else(|| {
+        AppError::BadRequest("only branch pairs can be deleted (this is a root repository)".into())
+    })?;
+
+    // Block if it has children
+    let children = db
+        .list_child_repositories(&id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+    if !children.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "cannot delete: branch pair has {} child pair(s) — delete them first",
+            children.len()
+        )));
+    }
+
+    // Acquire busy guard to prevent sync/import racing
+    let _busy_guard = reposync_core::busy::try_acquire(&id)
+        .ok_or_else(|| AppError::BadRequest("branch pair is currently busy (sync or import in progress)".into()))?;
+
+    // Load parent for credential resolution
+    let parent = db
+        .get_repository(parent_id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .ok_or_else(|| AppError::Internal("parent repository not found".into()))?;
+
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Optionally delete Git branch on remote
+    if opts.delete_git && !repo.git_branch.is_empty() {
+        let git_token = db
+            .resolve_credential_chain(&parent.id, "secret_git_token")
+            .unwrap_or_default();
+        let provider = match parent.git_provider.as_str() {
+            "gitea" => reposync_core::config::GitProvider::Gitea,
+            _ => reposync_core::config::GitProvider::GitHub,
+        };
+        let github_client = reposync_core::git::github::GitHubClient::new(
+            &parent.git_api_url,
+            &git_token,
+            provider,
+        );
+        match github_client.delete_branch(&parent.git_repo, &repo.git_branch).await {
+            Ok(()) => info!(branch = %repo.git_branch, "deleted Git branch"),
+            Err(e) => {
+                let msg = format!("failed to delete Git branch '{}': {}", repo.git_branch, e);
+                warn!(%msg);
+                warnings.push(msg);
+            }
+        }
+    }
+
+    // Optionally delete SVN branch on remote
+    if opts.delete_svn && !repo.svn_branch.is_empty() {
+        let svn_password = db
+            .resolve_credential_chain(&parent.id, "secret_svn_password")
+            .unwrap_or_default();
+        let svn_client = reposync_core::svn::SvnClient::new(
+            &parent.svn_url,
+            &parent.svn_username,
+            &svn_password,
+        );
+        match svn_client.delete_branch(&repo.svn_branch).await {
+            Ok(()) => info!(branch = %repo.svn_branch, "deleted SVN branch"),
+            Err(e) => {
+                let msg = format!("failed to delete SVN branch '{}': {}", repo.svn_branch, e);
+                warn!(%msg);
+                warnings.push(msg);
+            }
+        }
+    }
+
+    // Delete local filesystem (git clone)
+    let repo_dir = state.config.daemon.data_dir.join("repos").join(&id);
+    if repo_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&repo_dir) {
+            let msg = format!("failed to remove local repo dir: {}", e);
+            warn!(%msg);
+            warnings.push(msg);
+        } else {
+            debug!(path = %repo_dir.display(), "removed local repo directory");
+        }
+    }
+
+    // Hard-delete all DB records
+    let repo_name = repo.name.clone();
+    db.hard_delete_repository(&id)
+        .map_err(|e| AppError::Internal(format!("database error during deletion: {}", e)))?;
+
+    // Audit log (written to parent's audit trail since the child repo no longer exists)
+    let _ = db.insert_audit_log_with_repo(
+        "deleted_branch_pair",
+        None,
+        None,
+        None,
+        None,
+        Some(&format!("Deleted branch pair '{}' (git: {}, svn: {})", repo_name, repo.git_branch, repo.svn_branch)),
+        true,
+        Some(parent_id),
+    );
+
+    info!(
+        repo_id = %id,
+        repo_name = %repo_name,
+        git_branch = %repo.git_branch,
+        svn_branch = %repo.svn_branch,
+        warnings = ?warnings,
+        "branch pair deleted"
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": format!("Branch pair '{}' deleted", repo_name),
+        "warnings": warnings,
+    })))
 }
 
 /// Optional form-value overrides for the SVN test endpoint.
