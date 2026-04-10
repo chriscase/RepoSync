@@ -104,6 +104,31 @@ impl GitClient {
     pub fn repo_path(&self) -> &Path {
         &self.repo_path
     }
+
+    /// Get the current HEAD commit SHA.
+    pub fn head_sha(&self) -> Result<String, GitError> {
+        let head = self.repo.head().map_err(GitError::from)?;
+        let oid = head
+            .peel_to_commit()
+            .map_err(GitError::from)?
+            .id();
+        Ok(oid.to_string())
+    }
+
+    /// Hard-reset HEAD to a specific commit SHA.
+    /// Used to roll back failed pushes so bad commits don't accumulate.
+    pub fn reset_hard(&self, sha: &str) -> Result<(), GitError> {
+        let oid = git2::Oid::from_str(sha)
+            .map_err(|e| GitError::Git2Error(e))?;
+        let commit = self.repo.find_commit(oid)
+            .map_err(GitError::from)?;
+        self.repo
+            .reset(commit.as_object(), git2::ResetType::Hard, None)
+            .map_err(GitError::from)?;
+        info!(sha, "git reset --hard completed");
+        Ok(())
+    }
+
     pub fn repo(&self) -> &Repository {
         &self.repo
     }

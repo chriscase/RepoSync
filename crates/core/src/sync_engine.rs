@@ -588,8 +588,17 @@ impl SyncEngine {
             // Wrap commit+push in block_in_place so the synchronous git
             // CLI call doesn't block the tokio async runtime (which would
             // make the web UI unresponsive during pushes).
+            //
+            // IMPORTANT: If the push fails, we must roll back the commit
+            // so it doesn't poison future pushes. Otherwise the local git
+            // history accumulates unpushable commits that block all
+            // subsequent syncs.
             let git_sha = tokio::task::block_in_place(|| {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+
+                // Save HEAD before committing so we can roll back on push failure
+                let pre_commit_head = git.head_sha().ok();
+
                 let oid = git
                     .commit(
                         &commit_message,
@@ -600,13 +609,35 @@ impl SyncEngine {
                     )
                     .map_err(SyncError::GitError)?;
 
-                // 4. Push to remote. Authentication flows through the
-                // remote URL credentials set by `reload_credentials` at
-                // the start of the cycle, not through a token parameter.
+                // 4. Push to remote.
                 let branch = &self.config.github.default_branch;
-                git.push("origin", branch).map_err(SyncError::GitError)?;
-
-                Ok::<_, SyncError>(oid.to_string())
+                match git.push("origin", branch) {
+                    Ok(()) => Ok::<_, SyncError>(oid.to_string()),
+                    Err(push_err) => {
+                        // Push failed — roll back the commit to keep local
+                        // history clean. The next sync cycle will re-detect
+                        // the SVN change and retry.
+                        warn!(
+                            sha = %oid,
+                            error = %push_err,
+                            "git push failed, rolling back commit to prevent history poisoning"
+                        );
+                        if let Some(ref prev_sha) = pre_commit_head {
+                            if let Err(reset_err) = git.reset_hard(prev_sha) {
+                                error!(
+                                    error = %reset_err,
+                                    "CRITICAL: failed to roll back git commit after push failure — manual intervention may be needed"
+                                );
+                            } else {
+                                info!(
+                                    rolled_back_to = %prev_sha,
+                                    "successfully rolled back git commit after push failure"
+                                );
+                            }
+                        }
+                        Err(SyncError::GitError(push_err))
+                    }
+                }
             })?;
 
             // 5. Record the sync only after successful write.
