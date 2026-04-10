@@ -6,15 +6,14 @@
 #   scripts/deploy.sh [--branch <branch>] [--no-web-ui] [--dry-run]
 #
 # Requires:
-#   - SSH alias "rk10" in ~/.ssh/config (with ControlMaster recommended)
-#   - git remote "server" pointing to rk10:RepoSync
-#   - Rust toolchain available on rk10 (via rustup)
-#   - chrisc has sudo rights for: install, systemctl daemon-reload, systemctl restart
+#   - SSH access to the server (via rk10 alias or GIT_SSH_COMMAND override)
+#   - git remote "server" pointing to rk10:GitSvnSync
+#   - Rust toolchain available on the server (via rustup)
 #
-# Web UI note:
-#   The daemon serves static files from a "static/" directory next to the binary
-#   (/usr/local/bin/static/). The web UI dist is built locally (no Node.js needed
-#   on the server) and synced via rsync, then sudo-copied into place remotely.
+# Static files:
+#   The daemon serves static files from a "static/" directory next to the
+#   binary (target/release/static/). The web UI is built locally and synced
+#   to that location via scp.
 # =============================================================================
 
 set -euo pipefail
@@ -23,20 +22,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ---- Configuration -----------------------------------------------------------
-SSH_HOST="rk10"
-REMOTE_REPO_DIR="~/RepoSync"
-REMOTE_STATIC_DIR="/usr/local/bin/static"
+SSH_HOST="${DEPLOY_SSH_HOST:-rk10}"
+SSH_OPTS="${DEPLOY_SSH_OPTS:--o ControlMaster=no -o ControlPath=none}"
+REMOTE_REPO_DIR="~/GitSvnSync"
 BRANCH="${DEPLOY_BRANCH:-main}"
 BUILD_WEB_UI=true
 DRY_RUN=false
+HEALTH_URL="http://localhost:8080/api/status/health"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --branch)   BRANCH="$2"; shift 2 ;;
+        --branch)    BRANCH="$2"; shift 2 ;;
         --no-web-ui) BUILD_WEB_UI=false; shift ;;
-        --dry-run)  DRY_RUN=true; shift ;;
-        *) echo "Unknown argument: $1"; exit 1 ;;
+        --dry-run)   DRY_RUN=true; shift ;;
+        *)           echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
@@ -44,6 +44,7 @@ done
 log()  { echo "[deploy] $*"; }
 step() { echo ""; echo "==> $*"; }
 ts()   { date '+%H:%M:%S'; }
+ssh_cmd() { ssh $SSH_OPTS "$SSH_HOST" "bash -c '$*'"; }
 
 run() {
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -58,31 +59,17 @@ step "Pre-flight checks ($(ts))"
 
 cd "$REPO_ROOT"
 
-if ! git remote get-url server &>/dev/null; then
-    echo "ERROR: git remote 'server' not found."
-    echo "       Run: git remote add server rk10:RepoSync"
-    exit 1
-fi
-
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
-    log "Warning: current branch is '$CURRENT_BRANCH', deploying '$BRANCH'"
-fi
+LOCAL_SHA="$(git rev-parse --short HEAD)"
+log "Local commit: $LOCAL_SHA ($(git log --oneline -1))"
 
 if [[ -n "$(git status --porcelain)" ]]; then
-    log "Warning: working tree has uncommitted changes (they will NOT be deployed)"
+    log "WARNING: working tree has uncommitted changes (they will NOT be deployed)"
 fi
 
-# Ensure ControlMaster socket directory exists (SSH won't create it)
-mkdir -p ~/.ssh/cm
-chmod 700 ~/.ssh/cm
-
-# Verify SSH connectivity (skip in dry-run)
-if [[ "$DRY_RUN" == "true" ]]; then
-    log "Skipping SSH connectivity check (dry-run)"
-else
+# Verify SSH connectivity
+if [[ "$DRY_RUN" != "true" ]]; then
     log "Testing SSH connectivity to $SSH_HOST..."
-    if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" true 2>/dev/null; then
+    if ! ssh $SSH_OPTS -o ConnectTimeout=10 "$SSH_HOST" true 2>/dev/null; then
         echo "ERROR: Cannot connect to $SSH_HOST. Check SSH config and VPN."
         exit 1
     fi
@@ -91,107 +78,81 @@ fi
 
 # ---- Phase 1: Push code ------------------------------------------------------
 step "Phase 1: Push code to server ($(ts))"
-run git push server "$BRANCH":"$BRANCH"
+# Push to a temp branch to avoid "refusing to update checked out branch" error
+run env GIT_SSH_COMMAND="ssh $SSH_OPTS" git push server "$BRANCH":deploy-incoming --force
 
-# ---- Phase 2: Build web UI locally and sync to server ------------------------
-# Build locally (where Node.js is available), rsync the compiled dist/ to a
-# staging area on the server, then the remote script sudo-copies it into place.
+# ---- Phase 2: Build web UI locally -------------------------------------------
 if [[ "$BUILD_WEB_UI" == "true" ]]; then
     step "Phase 2: Build web UI locally ($(ts))"
-    log "Running npm build in web-ui/..."
-    run bash -c "cd '$REPO_ROOT/web-ui' && npm install && npm run build"
-
-    log "Syncing web-ui/dist/ to server staging area..."
-    run rsync -az --delete \
-        -e "ssh" \
-        "$REPO_ROOT/web-ui/dist/" \
-        "$SSH_HOST:~/reposync-web-ui-dist/"
-    log "Web UI synced to ~/reposync-web-ui-dist/ on server"
+    run bash -c "cd '$REPO_ROOT/web-ui' && npm install --silent && npm run build"
+    log "Web UI built ($(ls web-ui/dist/assets/index-*.js | xargs basename))"
 else
     step "Phase 2: Skipping web UI build (--no-web-ui)"
 fi
 
-# ---- Phase 3: Remote build, install, and restart (single SSH session) --------
+# ---- Phase 3: Remote merge, build, deploy ------------------------------------
 step "Phase 3: Remote build + install + restart ($(ts))"
-log "Single SSH session to $SSH_HOST for all remote operations..."
 
-# All remote work in one heredoc — one TCP connection (reused via ControlMaster
-# if the push in Phase 1 already opened a socket), one handshake.
-#
-# 'source ~/.cargo/env' is required: non-interactive SSH sessions don't run
-# ~/.bashrc, so rustup's PATH additions are missing by default.
+log "Merging deploy-incoming on server..."
+ssh_cmd "cd $REMOTE_REPO_DIR && git merge deploy-incoming && git branch -d deploy-incoming"
 
-INSTALL_WEB_UI_CMD=""
-if [[ "$BUILD_WEB_UI" == "true" && "$DRY_RUN" != "true" ]]; then
-    INSTALL_WEB_UI_CMD="
-echo '[remote] Installing web UI static files...'
-sudo mkdir -p ${REMOTE_STATIC_DIR}
-sudo rsync -a --delete ~/reposync-web-ui-dist/ ${REMOTE_STATIC_DIR}/
-echo '[remote] Web UI installed to ${REMOTE_STATIC_DIR}/'
-"
-fi
+log "Building release binary..."
+ssh_cmd "cd $REMOTE_REPO_DIR && source ~/.cargo/env && cargo build --release --bin reposync-daemon 2>&1 | tail -3"
 
-REMOTE_SCRIPT="
-set -euo pipefail
+# ---- Phase 4: Deploy static files -------------------------------------------
+if [[ "$BUILD_WEB_UI" == "true" ]]; then
+    step "Phase 4: Deploy static files ($(ts))"
 
-cd ${REMOTE_REPO_DIR}
+    # The binary serves from {binary_dir}/static/ — which is target/release/static/
+    REMOTE_STATIC_DIR="$REMOTE_REPO_DIR/target/release/static"
 
-echo '[remote] Checking out branch: ${BRANCH}'
-git fetch origin ${BRANCH}
-git checkout ${BRANCH}
-git reset --hard origin/${BRANCH}
+    # Clean and copy
+    ssh_cmd "rm -rf $REMOTE_STATIC_DIR && mkdir -p $REMOTE_STATIC_DIR"
+    scp $SSH_OPTS -r "$REPO_ROOT/web-ui/dist/"* "$SSH_HOST:$REMOTE_STATIC_DIR/" 2>/dev/null
 
-# Ensure Rust is in PATH for non-interactive SSH sessions
-if [ -f \"\$HOME/.cargo/env\" ]; then
-    # shellcheck source=/dev/null
-    source \"\$HOME/.cargo/env\"
-fi
-
-RUST_VERSION=\$(rustc --version 2>/dev/null || echo 'not found')
-echo '[remote] Rust: '\$RUST_VERSION
-
-echo '[remote] Building release binaries...'
-BUILD_START=\$(date +%s)
-cargo build --release --workspace 2>&1
-BUILD_END=\$(date +%s)
-echo '[remote] Build complete in '\$(( BUILD_END - BUILD_START ))' seconds'
-
-echo '[remote] Installing binaries to /usr/local/bin/...'
-sudo install -m 755 target/release/reposync-daemon /usr/local/bin/reposync-daemon
-sudo install -m 755 target/release/reposync        /usr/local/bin/reposync
-
-${INSTALL_WEB_UI_CMD}
-
-echo '[remote] Restarting reposync daemon...'
-if systemctl is-enabled --quiet reposync 2>/dev/null && systemctl is-active --quiet reposync 2>/dev/null; then
-    echo '[remote] Using systemd to restart...'
-    sudo systemctl daemon-reload
-    sudo systemctl restart reposync
-    sleep 1
-    if systemctl is-active --quiet reposync; then
-        echo '[remote] reposync service is ACTIVE'
+    # Verify the right file landed
+    REMOTE_JS=$(ssh_cmd "ls $REMOTE_STATIC_DIR/assets/index-*.js | xargs basename")
+    LOCAL_JS=$(basename web-ui/dist/assets/index-*.js)
+    if [[ "$REMOTE_JS" == "$LOCAL_JS" ]]; then
+        log "Static files verified: $LOCAL_JS"
     else
-        echo '[remote] ERROR: reposync service failed to start'
-        sudo journalctl -u reposync -n 30 --no-pager
+        echo "ERROR: Static file mismatch! Local: $LOCAL_JS, Remote: $REMOTE_JS"
         exit 1
     fi
-else
-    echo '[remote] Using restart-daemon.sh (no active systemd service)...'
-    REPOSYNC_BIN=${REMOTE_REPO_DIR}/target/release/reposync-daemon \
-        bash ${REMOTE_REPO_DIR}/scripts/restart-daemon.sh
 fi
 
-echo '[remote] Deployed version:'
-/usr/local/bin/reposync --version 2>/dev/null || true
-"
+# ---- Phase 5: Restart daemon ------------------------------------------------
+step "Phase 5: Restart daemon ($(ts))"
+ssh_cmd "REPOSYNC_BIN=$REMOTE_REPO_DIR/target/release/reposync-daemon bash $REMOTE_REPO_DIR/scripts/restart-daemon.sh"
 
-if [[ "$DRY_RUN" == "true" ]]; then
-    log "[dry-run] Would execute on $SSH_HOST:"
-    echo "$REMOTE_SCRIPT"
+# ---- Phase 6: Post-deploy verification --------------------------------------
+step "Phase 6: Verify deployment ($(ts))"
+
+HEALTH=$(ssh_cmd "curl -sf $HEALTH_URL 2>/dev/null || echo FAILED")
+log "Health response: $HEALTH"
+
+# Extract version and git commit from health response
+DEPLOYED_SHA=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('git_commit','unknown'))" 2>/dev/null || echo "parse_error")
+DEPLOYED_VER=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','unknown'))" 2>/dev/null || echo "parse_error")
+
+log "Deployed: v$DEPLOYED_VER, commit: $DEPLOYED_SHA"
+log "Expected: commit $LOCAL_SHA"
+
+if [[ "$DEPLOYED_SHA" == "$LOCAL_SHA" ]]; then
+    log "VERIFIED: deployed commit matches local HEAD"
+elif [[ "$DEPLOYED_SHA" == "${LOCAL_SHA}+dirty" ]]; then
+    log "VERIFIED: deployed commit matches (with uncommitted changes on server)"
 else
-    ssh "$SSH_HOST" bash <<< "$REMOTE_SCRIPT"
+    echo ""
+    echo "WARNING: Deploy verification FAILED!"
+    echo "  Expected commit: $LOCAL_SHA"
+    echo "  Deployed commit: $DEPLOYED_SHA"
+    echo "  The running binary may not match the code you intended to deploy."
+    echo ""
 fi
 
 # ---- Done --------------------------------------------------------------------
 step "Deploy complete ($(ts))"
-log "Service live at http://orw-chrisc-rk10.wv.mentorg.com:8080"
+log "Commit:  $DEPLOYED_SHA"
+log "Version: $DEPLOYED_VER"
+log "URL:     http://orw-chrisc-rk10.wv.mentorg.com:8080"

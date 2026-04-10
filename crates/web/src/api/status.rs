@@ -21,6 +21,7 @@ struct RepoQuery {
 struct HealthResponse {
     ok: bool,
     version: String,
+    git_commit: String,
 }
 
 /// Status response wrapping the core SyncStatus.
@@ -78,6 +79,7 @@ async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        git_commit: env!("GIT_COMMIT_SHA").to_string(),
     })
 }
 
