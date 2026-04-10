@@ -896,30 +896,107 @@ impl SyncEngine {
             );
 
             // 4b. Validate file paths against allowed/blocked rules.
+            // If some files violate, revert them from SVN working copy and
+            // continue with only the valid files. Only skip the entire commit
+            // if ALL files are violations.
             if let Err(violations) = self.validate_file_paths(&file_contents) {
+                // Collect just the bare file paths that violated
+                let violating_paths: Vec<String> = file_contents
+                    .iter()
+                    .filter(|(action, path, _)| {
+                        if action == "D" { return false; }
+                        if !self.allowed_paths.is_empty() {
+                            if !self.allowed_paths.iter().any(|prefix| path.starts_with(prefix)) {
+                                return true;
+                            }
+                        }
+                        for pattern in &self.blocked_patterns {
+                            let matches = if pattern.starts_with('*') {
+                                path.ends_with(&pattern[1..])
+                            } else if pattern.ends_with('/') {
+                                path.starts_with(pattern)
+                            } else {
+                                path == pattern || path.starts_with(&format!("{}/", pattern))
+                            };
+                            if matches { return true; }
+                        }
+                        false
+                    })
+                    .map(|(_, path, _)| path.clone())
+                    .collect();
+
+                let valid_count = file_contents.len() - violating_paths.len();
+
                 warn!(
                     sha = %change.sha,
                     violations = ?violations,
-                    "skipping Git-to-SVN commit: path validation failed"
+                    valid_files = valid_count,
+                    "path validation: {} file(s) violate rules, {} valid file(s) remain",
+                    violating_paths.len(),
+                    valid_count,
                 );
-                if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.advance_all_watermarks(rid, &change.sha);
+
+                if valid_count == 0 {
+                    // ALL files violate — skip entire commit
+                    warn!(sha = %change.sha, "skipping entire commit: all files violate path rules");
+                    if let Some(rid) = self.effective_repo_id() {
+                        let _ = self.db.advance_all_watermarks(rid, &change.sha);
+                    }
+                    let _ = self.db.insert_audit_log_with_repo(
+                        "path_violation_skipped",
+                        Some("git_to_svn"),
+                        None,
+                        Some(&change.sha),
+                        Some(&change.author_name),
+                        Some(&format!(
+                            "Skipped entire commit {}: {}",
+                            &change.sha[..8.min(change.sha.len())],
+                            violations.join("; ")
+                        )),
+                        false,
+                        self.effective_repo_id(),
+                    );
+                    continue;
                 }
+
+                // Revert violating files from SVN working copy
+                let revert_paths: Vec<&str> = violating_paths.iter().map(|s| s.as_str()).collect();
+                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if let Err(e) = svn.revert_files(svn_wc_dir.path(), &revert_paths).await {
+                    warn!(error = %e, "failed to revert violating files, skipping commit");
+                    if let Some(rid) = self.effective_repo_id() {
+                        let _ = self.db.advance_all_watermarks(rid, &change.sha);
+                    }
+                    continue;
+                }
+                // Also remove the files from disk if they were newly added
+                for path in &violating_paths {
+                    let full = svn_wc_dir.path().join(path);
+                    let _ = std::fs::remove_file(&full);
+                }
+                info!(
+                    sha = %change.sha,
+                    reverted = violating_paths.len(),
+                    remaining = valid_count,
+                    "reverted violating files, proceeding with valid files only"
+                );
+
                 let _ = self.db.insert_audit_log_with_repo(
-                    "path_violation_skipped",
+                    "path_violation_filtered",
                     Some("git_to_svn"),
                     None,
                     Some(&change.sha),
                     Some(&change.author_name),
                     Some(&format!(
-                        "Skipped commit {}: {}",
+                        "Commit {} filtered: removed {} violating file(s), synced {} valid file(s). Violations: {}",
                         &change.sha[..8.min(change.sha.len())],
+                        violating_paths.len(),
+                        valid_count,
                         violations.join("; ")
                     )),
-                    false,
+                    true,
                     self.effective_repo_id(),
                 );
-                continue;
             }
 
             // 5. Commit to SVN.

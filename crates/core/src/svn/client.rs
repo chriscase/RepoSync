@@ -295,6 +295,19 @@ impl SvnClient {
         Ok(output)
     }
 
+    /// Run `svn revert` on files in a working copy.
+    #[instrument(skip(self, files), fields(path = %path.display()))]
+    pub async fn revert_files(&self, path: &Path, files: &[&str]) -> Result<(), SvnError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec!["revert"];
+        args.extend_from_slice(files);
+        self.run_svn_in_dir(path, &args).await?;
+        debug!(count = files.len(), "svn revert completed");
+        Ok(())
+    }
+
     /// Run `svn add` on files in a working copy.
     #[instrument(skip(self, files), fields(path = %path.display()))]
     pub async fn add(&self, path: &Path, files: &[&str]) -> Result<(), SvnError> {
