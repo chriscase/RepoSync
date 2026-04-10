@@ -135,6 +135,50 @@ pub enum GitError {
     IoError(#[from] std::io::Error),
 }
 
+impl GitError {
+    /// Returns true if this error is permanent and should NOT be retried.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            GitError::PushRejected { detail, .. } => {
+                // Large file rejection or pre-receive hook rejection
+                detail.contains("pre-receive hook declined")
+                    || detail.contains("exceeds GitHub")
+                    || detail.contains("GH001")
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Sanitize sensitive tokens from error messages before displaying to users.
+/// Removes GitHub tokens and x-access-token URLs.
+pub fn sanitize_error_message(msg: &str) -> String {
+    let mut result = msg.to_string();
+
+    // Redact x-access-token:TOKEN@ patterns in URLs
+    while let Some(start) = result.find("x-access-token:") {
+        if let Some(at_pos) = result[start..].find('@') {
+            let end = start + at_pos + 1;
+            result.replace_range(start..end, "x-access-token:[REDACTED]@");
+        } else {
+            break;
+        }
+    }
+
+    // Redact GitHub tokens (ghp_, gho_, github_pat_)
+    for prefix in &["ghp_", "gho_", "github_pat_"] {
+        while let Some(start) = result.find(prefix) {
+            let token_end = result[start..]
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|i| start + i)
+                .unwrap_or(result.len());
+            result.replace_range(start..token_end, "[REDACTED_TOKEN]");
+        }
+    }
+
+    result
+}
+
 // ---------------------------------------------------------------------------
 // GitHub API errors
 // ---------------------------------------------------------------------------
@@ -216,6 +260,7 @@ impl SyncError {
     pub fn is_permanent(&self) -> bool {
         match self {
             SyncError::SvnError(e) => e.is_permanent(),
+            SyncError::GitError(e) => e.is_permanent(),
             _ => false,
         }
     }

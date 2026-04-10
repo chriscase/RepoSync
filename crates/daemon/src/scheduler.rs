@@ -582,11 +582,12 @@ impl Scheduler {
                             }
                         }
 
+                        let sanitized_error = reposync_core::errors::sanitize_error_message(&e.to_string());
                         let msg = serde_json::json!({
                             "type": "repo_sync_failed",
                             "repo_id": repo_id,
                             "repo_name": repo_name,
-                            "error": e.to_string(),
+                            "error": sanitized_error,
                             "is_permanent": e.is_permanent(),
                         });
                         let _ = ws.send(msg.to_string());
