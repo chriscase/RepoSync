@@ -81,6 +81,24 @@ pub enum SvnError {
     IoError(#[from] std::io::Error),
 }
 
+impl SvnError {
+    /// Returns true if this error is permanent and should NOT be retried.
+    /// Permanent errors include: authentication failures, access denied by
+    /// server hooks, and missing binaries.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            SvnError::AuthenticationFailed { .. } => true,
+            SvnError::BinaryNotFound(_) => true,
+            SvnError::CommandFailed { stderr, .. } => {
+                stderr.contains("E195023")   // forbidden by pre-commit hook
+                    || stderr.contains("E175013") // access denied
+                    || stderr.contains("E170001") // authentication failed
+            }
+            _ => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Git errors
 // ---------------------------------------------------------------------------
@@ -191,6 +209,16 @@ pub enum SyncError {
     /// Identity mapping error during sync.
     #[error("sync identity error: {0}")]
     IdentityError(#[from] IdentityError),
+}
+
+impl SyncError {
+    /// Returns true if this error is permanent and should NOT be retried.
+    pub fn is_permanent(&self) -> bool {
+        match self {
+            SyncError::SvnError(e) => e.is_permanent(),
+            _ => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

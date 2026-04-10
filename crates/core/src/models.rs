@@ -380,6 +380,17 @@ pub struct Repository {
     pub total_syncs: i64,
     #[serde(default)]
     pub total_errors: i64,
+    /// JSON array of allowed path prefixes (e.g., `["source/", "config/"]`).
+    /// NULL means no restriction.
+    #[serde(default)]
+    pub allowed_paths: Option<String>,
+    /// JSON array of blocked glob patterns (e.g., `["*.exe", "temp/"]`).
+    /// NULL means no blocked patterns.
+    #[serde(default)]
+    pub blocked_patterns: Option<String>,
+    /// Consecutive permanent error count for circuit breaker.
+    #[serde(default)]
+    pub consecutive_errors: i64,
 }
 
 fn default_sync_status() -> String {

@@ -595,6 +595,9 @@ async fn apply_config(
                 sync_status: "idle".to_string(),
                 total_syncs: 0,
                 total_errors: 0,
+                allowed_paths: None,
+                blocked_patterns: None,
+                consecutive_errors: 0,
             };
             match db.insert_repository(&new_repo) {
                 Ok(()) => info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard"),

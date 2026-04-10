@@ -229,6 +229,9 @@ async fn main() -> Result<()> {
                 sync_status: "idle".to_string(),
                 total_syncs: 0,
                 total_errors: 0,
+                allowed_paths: None,
+                blocked_patterns: None,
+                consecutive_errors: 0,
             };
             match db.insert_repository(&default_repo) {
                 Ok(()) => {

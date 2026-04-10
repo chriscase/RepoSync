@@ -608,6 +608,41 @@ export default function RepoDetail() {
 
       {/* ===== NEW DASHBOARD SECTIONS ===== */}
 
+      {/* Circuit Breaker: Error Paused Banner */}
+      {status?.state === 'error_paused' && isAdmin && (
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 flex items-center justify-between">
+          <div>
+            <p className="text-red-300 font-medium">Sync Paused — Permanent Error</p>
+            <p className="text-sm text-red-400 mt-1">
+              The sync engine encountered repeated permanent errors and has been automatically paused.
+              You can skip the failing commit to advance past it, or retry if the issue has been resolved.
+            </p>
+          </div>
+          <div className="flex gap-2 ml-4 flex-shrink-0">
+            <button
+              onClick={async () => {
+                await api.skipCommit(id!);
+                queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
+                queryClient.invalidateQueries({ queryKey: ['repo', id] });
+              }}
+              className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 text-white text-sm font-medium transition-colors"
+            >
+              Skip Commit
+            </button>
+            <button
+              onClick={async () => {
+                await api.retryRepo(id!);
+                queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
+                queryClient.invalidateQueries({ queryKey: ['repo', id] });
+              }}
+              className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Status Cards Row */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <StatusCard

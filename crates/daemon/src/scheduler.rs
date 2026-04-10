@@ -270,6 +270,11 @@ impl Scheduler {
             if !repo.enabled {
                 continue;
             }
+            // Circuit breaker: skip repos that have been paused due to permanent errors
+            if repo.sync_status == "error_paused" {
+                debug!(repo_name = %repo.name, "skipping: circuit breaker active (error_paused)");
+                continue;
+            }
 
             // A repo that has never been initialized must not be touched
             // by the scheduler. The scheduler only knows how to do
@@ -490,6 +495,18 @@ impl Scheduler {
                 );
             }
 
+            // Parse and set path validation rules
+            let allowed_paths: Vec<String> = repo.allowed_paths.as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let blocked_patterns: Vec<String> = repo.blocked_patterns.as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if !allowed_paths.is_empty() || !blocked_patterns.is_empty() {
+                engine.set_path_rules(allowed_paths, blocked_patterns);
+                debug!(repo_name = %repo.name, "path validation rules configured");
+            }
+
             let repo_id = repo.id.clone();
             let repo_name = repo.name.clone();
             let ws = self.ws_broadcast.clone();
@@ -513,8 +530,14 @@ impl Scheduler {
                 let _busy_guard = busy_guard;
                 let result = engine.run_sync_cycle().await;
 
+                // Access the engine's DB for circuit breaker updates
+                let engine_db = engine.db();
+
                 match &result {
                     Ok(sync_stats) => {
+                        // Reset consecutive errors on success
+                        let _ = engine_db.reset_consecutive_errors(&repo_id);
+
                         info!(
                             repo_name = %repo_name,
                             svn_to_git = sync_stats.svn_to_git_count,
@@ -540,11 +563,31 @@ impl Scheduler {
                             "per-repo sync cycle failed"
                         );
 
+                        // Circuit breaker: only count permanent errors
+                        if e.is_permanent() {
+                            if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id) {
+                                if count >= 3 {
+                                    warn!(
+                                        repo_name = %repo_name,
+                                        repo_id = %repo_id,
+                                        consecutive_errors = count,
+                                        "circuit breaker triggered: pausing repo after {} permanent errors",
+                                        count
+                                    );
+                                    let _ = engine_db.conn().execute(
+                                        "UPDATE repositories SET sync_status = 'error_paused' WHERE id = ?1",
+                                        rusqlite::params![&repo_id],
+                                    );
+                                }
+                            }
+                        }
+
                         let msg = serde_json::json!({
                             "type": "repo_sync_failed",
                             "repo_id": repo_id,
                             "repo_name": repo_name,
                             "error": e.to_string(),
+                            "is_permanent": e.is_permanent(),
                         });
                         let _ = ws.send(msg.to_string());
                     }

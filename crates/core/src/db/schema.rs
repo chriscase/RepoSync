@@ -277,6 +277,15 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         ALTER TABLE conflicts ADD COLUMN resolved_content TEXT;
         "#,
     ),
+    (
+        11,
+        "path rules and circuit breaker fields for repositories",
+        r#"
+        ALTER TABLE repositories ADD COLUMN allowed_paths TEXT;
+        ALTER TABLE repositories ADD COLUMN blocked_patterns TEXT;
+        ALTER TABLE repositories ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0;
+        "#,
+    ),
 ];
 
 /// Run all pending migrations against `conn`.

@@ -195,6 +195,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id/branch-pair", delete(delete_branch_pair))
         .route("/api/repos/:id/test-svn", post(test_repo_svn))
         .route("/api/repos/:id/test-git", post(test_repo_git))
+        .route("/api/repos/:id/skip-commit", post(skip_commit))
+        .route("/api/repos/:id/retry", post(retry_repo))
+        .route("/api/repos/:id/hooks/pre-commit", get(get_pre_commit_hook))
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +290,9 @@ async fn create_repo(
         sync_status: "idle".to_string(),
         total_syncs: 0,
         total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
     };
 
     let db = &state.db;
@@ -367,6 +373,9 @@ async fn update_repo(
         sync_status: existing.sync_status,
         total_syncs: existing.total_syncs,
         total_errors: existing.total_errors,
+        allowed_paths: existing.allowed_paths,
+        blocked_patterns: existing.blocked_patterns,
+        consecutive_errors: existing.consecutive_errors,
     };
 
     db.update_repository(&updated)
@@ -1245,6 +1254,9 @@ async fn create_branch_pair(
         sync_status: "idle".to_string(),
         total_syncs: 0,
         total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
     };
 
     db.insert_repository(&child)
@@ -1640,3 +1652,217 @@ async fn test_repo_git(
         Err(e) => Ok(Json(serde_json::json!({"ok": false, "message": format!("Connection failed: {}", e)}))),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Skip Commit — advance watermark past a stuck commit
+// ---------------------------------------------------------------------------
+
+async fn skip_commit(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let db = &state.db;
+    let repo = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+
+    // Get HEAD SHA of the git branch to skip to
+    let git_token = db
+        .resolve_credential_chain(&id, "secret_git_token")
+        .unwrap_or_default();
+    let provider = match repo.git_provider.as_str() {
+        "gitea" => reposync_core::config::GitProvider::Gitea,
+        _ => reposync_core::config::GitProvider::GitHub,
+    };
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        &repo.git_api_url,
+        &git_token,
+        provider,
+    );
+    let head_sha = github_client
+        .get_branch_sha(&repo.git_repo, &repo.git_branch)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to get branch HEAD: {}", e)))?;
+
+    let old_sha = repo.last_git_sha.clone();
+
+    // Advance all watermarks atomically
+    db.advance_all_watermarks(&id, &head_sha)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+
+    // Reset circuit breaker state
+    let _ = db.reset_consecutive_errors(&id);
+    let _ = db.conn().execute(
+        "UPDATE repositories SET sync_status = 'idle' WHERE id = ?1",
+        rusqlite::params![&id],
+    );
+
+    let _ = db.insert_audit_log_with_repo(
+        "skip_commit",
+        None,
+        None,
+        Some(&head_sha),
+        None,
+        Some(&format!(
+            "Skipped from {} to HEAD {}",
+            &old_sha[..8.min(old_sha.len())],
+            &head_sha[..8.min(head_sha.len())]
+        )),
+        true,
+        Some(&id),
+    );
+
+    info!(
+        repo_id = %id,
+        old_sha = %&old_sha[..8.min(old_sha.len())],
+        new_sha = %&head_sha[..8.min(head_sha.len())],
+        "skipped commit: watermark advanced to HEAD"
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "Watermark advanced to HEAD",
+        "old_sha": old_sha,
+        "new_sha": head_sha,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Retry — resume a circuit-broken repo
+// ---------------------------------------------------------------------------
+
+async fn retry_repo(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let db = &state.db;
+    let _ = db.reset_consecutive_errors(&id);
+    let _ = db.conn().execute(
+        "UPDATE repositories SET sync_status = 'idle' WHERE id = ?1",
+        rusqlite::params![&id],
+    );
+
+    info!(repo_id = %id, "retry: circuit breaker reset, sync resumed");
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "Sync resumed",
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Git Hook Download — serve a pre-commit hook script
+// ---------------------------------------------------------------------------
+
+async fn get_pre_commit_hook(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    validate_session(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+
+    let db = &state.db;
+    let repo = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+
+    let allowed: Vec<String> = repo
+        .allowed_paths
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let blocked: Vec<String> = repo
+        .blocked_patterns
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let mut script = String::from("#!/bin/bash\n");
+    script.push_str("# RepoSync pre-commit hook — validates file paths against SVN rules\n");
+    script.push_str("# Install: cp this file .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit\n");
+    script.push_str("# Or: mkdir -p .githooks && cp this file .githooks/pre-commit && git config core.hooksPath .githooks\n\n");
+
+    if allowed.is_empty() && blocked.is_empty() {
+        script.push_str("# No path rules configured for this repository.\nexit 0\n");
+    } else {
+        script.push_str("ERRORS=0\n\n");
+
+        if !allowed.is_empty() {
+            script.push_str("# Allowed path prefixes\n");
+            script.push_str("ALLOWED_PATHS=(");
+            for (i, p) in allowed.iter().enumerate() {
+                if i > 0 { script.push(' '); }
+                script.push_str(&format!("\"{}\"", p));
+            }
+            script.push_str(")\n\n");
+
+            script.push_str("for file in $(git diff --cached --name-only --diff-filter=ACM); do\n");
+            script.push_str("  ALLOWED=0\n");
+            script.push_str("  for prefix in \"${ALLOWED_PATHS[@]}\"; do\n");
+            script.push_str("    if [[ \"$file\" == \"$prefix\"* ]]; then\n");
+            script.push_str("      ALLOWED=1\n");
+            script.push_str("      break\n");
+            script.push_str("    fi\n");
+            script.push_str("  done\n");
+            script.push_str("  if [ $ALLOWED -eq 0 ]; then\n");
+            script.push_str("    echo \"ERROR: '$file' is not under an allowed path: ${ALLOWED_PATHS[*]}\"\n");
+            script.push_str("    ERRORS=$((ERRORS + 1))\n");
+            script.push_str("  fi\n");
+            script.push_str("done\n\n");
+        }
+
+        if !blocked.is_empty() {
+            script.push_str("# Blocked patterns\n");
+            for pattern in &blocked {
+                script.push_str(&format!(
+                    "for file in $(git diff --cached --name-only --diff-filter=ACM); do\n  case \"$file\" in\n    {}) echo \"ERROR: '$file' matches blocked pattern '{}'\"; ERRORS=$((ERRORS + 1));;\n  esac\ndone\n\n",
+                    pattern, pattern
+                ));
+            }
+        }
+
+        script.push_str("if [ $ERRORS -gt 0 ]; then\n");
+        script.push_str("  echo \"\"\n");
+        script.push_str("  echo \"Commit blocked: $ERRORS file(s) violate SVN path rules.\"\n");
+        script.push_str("  echo \"These files would be rejected by the SVN server.\"\n");
+        script.push_str("  exit 1\n");
+        script.push_str("fi\n");
+    }
+
+    Ok(axum::response::Response::builder()
+        .status(200)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header(
+            "Content-Disposition",
+            "attachment; filename=\"pre-commit\"",
+        )
+        .body(axum::body::Body::from(script))
+        .unwrap())
+}
+

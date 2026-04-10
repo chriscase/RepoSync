@@ -1087,6 +1087,63 @@ impl Database {
         Ok(())
     }
 
+    /// Advance ALL watermark locations atomically for a given repo.
+    /// Updates repositories table, per-repo kv_state, and global kv_state.
+    /// Used by "skip commit" and path validation to move past a failing commit.
+    pub fn advance_all_watermarks(&self, repo_id: &str, git_sha: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN TRANSACTION")?;
+
+        // 1. Update repositories table
+        conn.execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
+            params![git_sha, repo_id],
+        )?;
+
+        // 2. Update per-repo kv_state key
+        let kv_key = format!("last_git_sha_{}", repo_id);
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![kv_key, git_sha, now],
+        )?;
+
+        // 3. Update global kv_state key
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
+            params![git_sha, now],
+        )?;
+
+        conn.execute_batch("COMMIT")?;
+        info!(repo_id, git_sha, "advanced all watermarks atomically");
+        Ok(())
+    }
+
+    /// Increment consecutive permanent error count. Returns the new count.
+    pub fn increment_consecutive_errors(&self, repo_id: &str) -> Result<i64, DatabaseError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE repositories SET consecutive_errors = consecutive_errors + 1 WHERE id = ?1",
+            params![repo_id],
+        )?;
+        let count: i64 = conn.query_row(
+            "SELECT consecutive_errors FROM repositories WHERE id = ?1",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Reset consecutive error counter (called on successful sync).
+    pub fn reset_consecutive_errors(&self, repo_id: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE repositories SET consecutive_errors = 0 WHERE id = ?1",
+            params![repo_id],
+        )?;
+        Ok(())
+    }
+
     /// Get the last SVN revision from the commit map or sync records.
     pub fn get_last_svn_revision(&self) -> Result<Option<i64>, DatabaseError> {
         let conn = self.conn();
@@ -1896,8 +1953,8 @@ impl Database {
     pub fn insert_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 repo.id,
                 repo.name,
@@ -1923,6 +1980,9 @@ impl Database {
                 repo.total_syncs,
                 repo.total_errors,
                 repo.parent_id,
+                repo.allowed_paths,
+                repo.blocked_patterns,
+                repo.consecutive_errors,
             ],
         )?;
         debug!(id = %repo.id, name = %repo.name, "inserted repository");
@@ -1933,7 +1993,7 @@ impl Database {
     pub fn get_repository(&self, id: &str) -> Result<Option<models::Repository>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id
+            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors
              FROM repositories WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -1953,7 +2013,10 @@ impl Database {
                 auto_merge: row.get::<_, i32>(12)? != 0,
                 enabled: row.get::<_, i32>(13)? != 0,
                 created_by: row.get(14)?,
-                parent_id: row.get(23)?,
+                    parent_id: row.get(23)?,
+                    allowed_paths: row.get(24)?,
+                    blocked_patterns: row.get(25)?,
+                    consecutive_errors: row.get(26)?,
                 created_at: row.get(15)?,
                 updated_at: row.get(16)?,
                 last_svn_rev: row.get(17)?,
@@ -1975,7 +2038,7 @@ impl Database {
     pub fn list_repositories(&self) -> Result<Vec<models::Repository>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id
+            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors
              FROM repositories ORDER BY name",
         )?;
         let entries = stmt
@@ -1996,7 +2059,10 @@ impl Database {
                     auto_merge: row.get::<_, i32>(12)? != 0,
                     enabled: row.get::<_, i32>(13)? != 0,
                     created_by: row.get(14)?,
-                    parent_id: row.get(23)?,
+                        parent_id: row.get(23)?,
+                    allowed_paths: row.get(24)?,
+                    blocked_patterns: row.get(25)?,
+                    consecutive_errors: row.get(26)?,
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     last_svn_rev: row.get(17)?,
@@ -2015,7 +2081,7 @@ impl Database {
     pub fn list_child_repositories(&self, parent_id: &str) -> Result<Vec<models::Repository>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id
+            "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors
              FROM repositories WHERE parent_id = ?1 ORDER BY name",
         )?;
         let entries = stmt
@@ -2036,7 +2102,10 @@ impl Database {
                     auto_merge: row.get::<_, i32>(12)? != 0,
                     enabled: row.get::<_, i32>(13)? != 0,
                     created_by: row.get(14)?,
-                    parent_id: row.get(23)?,
+                        parent_id: row.get(23)?,
+                    allowed_paths: row.get(24)?,
+                    blocked_patterns: row.get(25)?,
+                    consecutive_errors: row.get(26)?,
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     last_svn_rev: row.get(17)?,
@@ -2055,8 +2124,8 @@ impl Database {
     pub fn update_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let changed = conn.execute(
-            "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21
-             WHERE id = ?22",
+            "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21, allowed_paths = ?22, blocked_patterns = ?23, consecutive_errors = ?24
+             WHERE id = ?25",
             params![
                 repo.name,
                 repo.svn_url,
@@ -2079,6 +2148,9 @@ impl Database {
                 repo.total_syncs,
                 repo.total_errors,
                 repo.parent_id,
+                repo.allowed_paths,
+                repo.blocked_patterns,
+                repo.consecutive_errors,
                 repo.id,
             ],
         )?;

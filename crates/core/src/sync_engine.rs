@@ -93,6 +93,10 @@ pub struct SyncEngine {
     /// LFS threshold in bytes. Files larger than this are tracked via Git LFS.
     /// 0 means LFS is disabled.
     lfs_threshold_bytes: u64,
+    /// Allowed path prefixes for Git-to-SVN sync. Empty means no restriction.
+    allowed_paths: Vec<String>,
+    /// Blocked path patterns for Git-to-SVN sync. Empty means no blocked patterns.
+    blocked_patterns: Vec<String>,
 }
 
 impl SyncEngine {
@@ -115,6 +119,8 @@ impl SyncEngine {
             started_at: Utc::now(),
             repo_id: None,
             lfs_threshold_bytes: 0,
+            allowed_paths: Vec::new(),
+            blocked_patterns: Vec::new(),
         }
     }
 
@@ -127,6 +133,47 @@ impl SyncEngine {
     /// tracked via Git LFS during SVN-to-Git sync.
     pub fn set_lfs_threshold_bytes(&mut self, threshold: u64) {
         self.lfs_threshold_bytes = threshold;
+    }
+
+    /// Set path validation rules for Git-to-SVN sync.
+    pub fn set_path_rules(&mut self, allowed: Vec<String>, blocked: Vec<String>) {
+        self.allowed_paths = allowed;
+        self.blocked_patterns = blocked;
+    }
+
+    /// Validate file paths against allowed/blocked rules.
+    /// Returns Ok(()) if all paths are valid, Err with list of violations.
+    fn validate_file_paths(&self, files: &[(String, String, Option<Vec<u8>>)]) -> Result<(), Vec<String>> {
+        if self.allowed_paths.is_empty() && self.blocked_patterns.is_empty() {
+            return Ok(());
+        }
+        let mut violations = Vec::new();
+        for (action, path, _) in files {
+            if action == "D" { continue; } // deletions are always ok
+            // Check allowed paths
+            if !self.allowed_paths.is_empty() {
+                let allowed = self.allowed_paths.iter().any(|prefix| path.starts_with(prefix));
+                if !allowed {
+                    violations.push(format!("'{}' not under allowed paths {:?}", path, self.allowed_paths));
+                }
+            }
+            // Check blocked patterns (simple suffix/prefix matching)
+            for pattern in &self.blocked_patterns {
+                let matches = if pattern.starts_with('*') {
+                    // Suffix match: *.exe matches foo.exe
+                    path.ends_with(&pattern[1..])
+                } else if pattern.ends_with('/') {
+                    // Prefix match: temp/ matches temp/foo.txt
+                    path.starts_with(pattern)
+                } else {
+                    path == pattern || path.starts_with(&format!("{}/", pattern))
+                };
+                if matches {
+                    violations.push(format!("'{}' matches blocked pattern '{}'", path, pattern));
+                }
+            }
+        }
+        if violations.is_empty() { Ok(()) } else { Err(violations) }
     }
 
     /// Return the kv_state key for the last SVN revision watermark.
@@ -847,6 +894,33 @@ impl SyncEngine {
                 svn_status = %svn_status,
                 "SVN working copy has pending changes, committing"
             );
+
+            // 4b. Validate file paths against allowed/blocked rules.
+            if let Err(violations) = self.validate_file_paths(&file_contents) {
+                warn!(
+                    sha = %change.sha,
+                    violations = ?violations,
+                    "skipping Git-to-SVN commit: path validation failed"
+                );
+                if let Some(rid) = self.effective_repo_id() {
+                    let _ = self.db.advance_all_watermarks(rid, &change.sha);
+                }
+                let _ = self.db.insert_audit_log_with_repo(
+                    "path_violation_skipped",
+                    Some("git_to_svn"),
+                    None,
+                    Some(&change.sha),
+                    Some(&change.author_name),
+                    Some(&format!(
+                        "Skipped commit {}: {}",
+                        &change.sha[..8.min(change.sha.len())],
+                        violations.join("; ")
+                    )),
+                    false,
+                    self.effective_repo_id(),
+                );
+                continue;
+            }
 
             // 5. Commit to SVN.
             let commit_message = format!(

@@ -343,6 +343,16 @@ export const api = {
 
   triggerRepoSync: (id: string) =>
     fetchJson<{ ok: boolean }>(`/repos/${id}/sync`, { method: 'POST' }),
+
+  skipCommit: (repoId: string) =>
+    fetchJson<{ ok: boolean; message: string; old_sha: string; new_sha: string }>(
+      `/repos/${repoId}/skip-commit`, { method: 'POST' }
+    ),
+
+  retryRepo: (repoId: string) =>
+    fetchJson<{ ok: boolean; message: string }>(
+      `/repos/${repoId}/retry`, { method: 'POST' }
+    ),
   getRepoCredentials: (id: string) =>
     fetchJson<{ svn_password_set: boolean; git_token_set: boolean }>(`/repos/${id}/credentials`),
   saveRepoCredentials: (id: string, data: { svn_password?: string; git_token?: string }) =>
