@@ -133,9 +133,11 @@ step "Phase 6: Verify deployment ($(ts))"
 HEALTH=$(ssh_cmd "curl -sf $HEALTH_URL 2>/dev/null || echo FAILED")
 log "Health response: $HEALTH"
 
-# Extract version and git commit from health response
-DEPLOYED_SHA=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('git_commit','unknown'))" 2>/dev/null || echo "parse_error")
-DEPLOYED_VER=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','unknown'))" 2>/dev/null || echo "parse_error")
+# Extract version and git commit from health response (parse locally)
+DEPLOYED_SHA=$(echo "$HEALTH" | grep -o '"git_commit":"[^"]*"' | cut -d'"' -f4)
+DEPLOYED_VER=$(echo "$HEALTH" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+DEPLOYED_SHA="${DEPLOYED_SHA:-unknown}"
+DEPLOYED_VER="${DEPLOYED_VER:-unknown}"
 
 log "Deployed: v$DEPLOYED_VER, commit: $DEPLOYED_SHA"
 log "Expected: commit $LOCAL_SHA"
