@@ -1163,16 +1163,35 @@ export default function RepoDetail() {
             </div>
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-sm text-gray-300 font-medium">Delete Repository</p>
-                <p className="text-sm text-gray-500 mt-0.5">Permanently remove this repository configuration.</p>
+                <p className="text-sm text-gray-300 font-medium">
+                  {repo?.parent_id ? 'Delete Branch Pair' : 'Delete Repository'}
+                </p>
+                <p className="text-sm text-gray-500 mt-0.5">
+                  {repo?.parent_id
+                    ? 'Delete this branch pair and remove the Git and SVN branches.'
+                    : 'Permanently remove this repository configuration.'}
+                </p>
               </div>
-              <button
-                onClick={() => setShowDeleteConfirm(true)}
-                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
-              >
-                <Trash2 className="w-4 h-4" />
-                Delete Repository
-              </button>
+              {repo?.parent_id ? (
+                <button
+                  onClick={() => {
+                    setDeleteBranchTarget(repo);
+                    setDeleteBranchConfirmText('');
+                  }}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete Branch Pair
+                </button>
+              ) : (
+                <button
+                  onClick={() => setShowDeleteConfirm(true)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete Repository
+                </button>
+              )}
             </div>
           </div>
         </div>
