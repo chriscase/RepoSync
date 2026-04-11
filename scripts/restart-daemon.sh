@@ -86,8 +86,12 @@ log "Starting daemon: $DAEMON_BIN --config $CONFIG"
 cd "$DATA_DIR"
 nohup "$DAEMON_BIN" --config "$CONFIG" >> "$LOG_FILE" 2>&1 &
 NEW_PID=$!
+# Note: The daemon writes its own lockfile at {data_dir}/reposync.lock
+# with the authoritative PID. This PID file is a convenience for the
+# restart script to find the process on the next restart.
 echo "$NEW_PID" > "$PID_FILE"
 log "Daemon started with PID $NEW_PID (PID file: $PID_FILE)"
+log "Singleton lock: $DATA_DIR/reposync.lock"
 
 # ---- Phase 3: Verify health -------------------------------------------------
 log "Waiting for health check..."

@@ -3,6 +3,7 @@
 //! Loads configuration, initializes all subsystems, starts the web server
 //! and sync scheduler, and handles graceful shutdown.
 
+mod lockfile;
 mod scheduler;
 mod signals;
 
@@ -128,6 +129,16 @@ async fn main() -> Result<()> {
 
     // Ensure data directory exists
     std::fs::create_dir_all(&config.daemon.data_dir).context("failed to create data directory")?;
+
+    // Acquire singleton lock — prevents duplicate daemon instances.
+    // The lock is held for the lifetime of _lock_guard. On process exit
+    // (including SIGKILL/crash), the OS releases the flock automatically.
+    let _lock_guard = lockfile::acquire(&config.daemon.data_dir)
+        .map_err(|e| {
+            error!("{}", e);
+            anyhow::anyhow!("{}", e)
+        })?;
+    info!("Acquired singleton lock (PID {})", std::process::id());
 
     // Initialize database
     let db_path = config.daemon.data_dir.join("reposync.db");
