@@ -36,3 +36,19 @@ fn read_proc_rss() -> Option<u64> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_process_rss_returns_value() {
+        let rss = process_rss_bytes();
+        // On Linux, the process always has some RSS (at least a few MB)
+        // On non-Linux (Windows), returns 0
+        #[cfg(target_os = "linux")]
+        assert!(rss > 0, "RSS should be > 0 on Linux, got {}", rss);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(rss, 0, "RSS should be 0 on non-Linux");
+    }
+}

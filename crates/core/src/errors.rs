@@ -453,4 +453,179 @@ mod tests {
         let core_err: CoreError = CoreError::Database(db_err);
         assert!(matches!(core_err, CoreError::Database(_)));
     }
+
+    // ---- is_permanent() tests ----
+
+    #[test]
+    fn test_svn_error_auth_failed_is_permanent() {
+        let err = SvnError::AuthenticationFailed {
+            username: "user".into(),
+            detail: "bad password".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_svn_error_binary_not_found_is_permanent() {
+        let err = SvnError::BinaryNotFound("svn".into());
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_svn_error_forbidden_by_hook_is_permanent() {
+        let err = SvnError::CommandFailed {
+            exit_code: 1,
+            stderr: "svn: E195023: Changing file is forbidden by the server".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_svn_error_access_denied_is_permanent() {
+        let err = SvnError::CommandFailed {
+            exit_code: 1,
+            stderr: "svn: E175013: Access denied".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_svn_error_auth_code_is_permanent() {
+        let err = SvnError::CommandFailed {
+            exit_code: 1,
+            stderr: "svn: E170001: Authentication failed".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_svn_error_generic_command_failure_not_permanent() {
+        let err = SvnError::CommandFailed {
+            exit_code: 1,
+            stderr: "svn: E200015: some other error".into(),
+        };
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn test_svn_error_network_not_permanent() {
+        let err = SvnError::NetworkError("connection timeout".into());
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn test_git_error_push_rejected_hook_is_permanent() {
+        let err = GitError::PushRejected {
+            branch: "main".into(),
+            detail: "remote rejected: pre-receive hook declined".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_git_error_push_rejected_size_is_permanent() {
+        let err = GitError::PushRejected {
+            branch: "main".into(),
+            detail: "file exceeds GitHub Enterprise file size limit".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_git_error_push_rejected_gh001_is_permanent() {
+        let err = GitError::PushRejected {
+            branch: "main".into(),
+            detail: "GH001: Large files detected".into(),
+        };
+        assert!(err.is_permanent());
+    }
+
+    #[test]
+    fn test_git_error_push_rejected_generic_not_permanent() {
+        let err = GitError::PushRejected {
+            branch: "main".into(),
+            detail: "non-fast-forward".into(),
+        };
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn test_git_error_other_not_permanent() {
+        let err = GitError::RefNotFound("main".into());
+        assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn test_sync_error_delegates_to_svn() {
+        let svn_err = SvnError::AuthenticationFailed {
+            username: "u".into(),
+            detail: "d".into(),
+        };
+        let sync_err = SyncError::SvnError(svn_err);
+        assert!(sync_err.is_permanent());
+    }
+
+    #[test]
+    fn test_sync_error_delegates_to_git() {
+        let git_err = GitError::PushRejected {
+            branch: "main".into(),
+            detail: "pre-receive hook declined".into(),
+        };
+        let sync_err = SyncError::GitError(git_err);
+        assert!(sync_err.is_permanent());
+    }
+
+    #[test]
+    fn test_sync_error_already_running_not_permanent() {
+        let err = SyncError::AlreadyRunning {
+            started_at: "2026-01-01".into(),
+        };
+        assert!(!err.is_permanent());
+    }
+
+    // ---- sanitize_error_message() tests ----
+
+    #[test]
+    fn test_sanitize_github_token() {
+        let msg = "auth failed with ghp_ABC123DEF456";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghp_ABC123DEF456"));
+        assert!(result.contains("[REDACTED_TOKEN]"));
+    }
+
+    #[test]
+    fn test_sanitize_gho_token() {
+        let msg = "token gho_XYZ789 is invalid";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("gho_XYZ789"));
+        assert!(result.contains("[REDACTED_TOKEN]"));
+    }
+
+    #[test]
+    fn test_sanitize_access_token_url() {
+        let msg = "push to https://x-access-token:ghp_SECRET123@github.com/repo.git failed";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghp_SECRET123"));
+        assert!(result.contains("x-access-token:[REDACTED]@"));
+    }
+
+    #[test]
+    fn test_sanitize_no_tokens_unchanged() {
+        let msg = "normal error message with no sensitive data";
+        let result = sanitize_error_message(msg);
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn test_sanitize_empty_string() {
+        assert_eq!(sanitize_error_message(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_multiple_tokens() {
+        let msg = "token1=ghp_AAA token2=gho_BBB";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghp_AAA"));
+        assert!(!result.contains("gho_BBB"));
+    }
 }

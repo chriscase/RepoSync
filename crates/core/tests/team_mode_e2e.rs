@@ -185,7 +185,7 @@ fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
     }
 
     git_client
-        .push("origin", "main", None)
+        .push("origin", "main")
         .expect("failed to push initial commit to origin");
 
     git_client
@@ -367,7 +367,7 @@ async fn test_team_mode_git_to_svn_sync() {
             "dev@example.com",
         )
         .unwrap();
-    git_client.push("origin", "main", None).unwrap();
+    git_client.push("origin", "main").unwrap();
 
     // Set up DB and engine, seeding watermarks.
     let db = setup_db(&tmp.path().join("sync.db"));
@@ -435,7 +435,7 @@ async fn test_team_mode_bidirectional_sync() {
             "gituser@example.com",
         )
         .unwrap();
-    git_client.push("origin", "main", None).unwrap();
+    git_client.push("origin", "main").unwrap();
 
     // Seed watermarks past initial commits.
     let db = setup_db(&tmp.path().join("sync.db"));
@@ -575,7 +575,7 @@ async fn test_team_mode_conflict_detection() {
             "gituser@example.com",
         )
         .unwrap();
-    git_client.push("origin", "main", None).unwrap();
+    git_client.push("origin", "main").unwrap();
 
     // Seed watermarks past the initial commits.
     let db = setup_db(&tmp.path().join("sync.db"));
@@ -718,7 +718,7 @@ async fn test_team_mode_git_to_svn_multi_commit_order() {
         )
         .unwrap();
 
-    git_client.push("origin", "main", None).unwrap();
+    git_client.push("origin", "main").unwrap();
 
     // Set up DB and engine.
     let db = setup_db(&tmp.path().join("sync.db"));

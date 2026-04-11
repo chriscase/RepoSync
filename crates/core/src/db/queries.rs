@@ -2822,4 +2822,146 @@ mod tests {
             Some("svn connection timeout")
         );
     }
+
+    // ---- Test helpers ----
+
+    fn create_test_repo(db: &Database, id: &str, name: &str) -> crate::models::Repository {
+        let repo = crate::models::Repository {
+            id: id.to_string(),
+            name: name.to_string(),
+            svn_url: "svn://test".to_string(),
+            svn_branch: "trunk".to_string(),
+            svn_username: "test".to_string(),
+            git_provider: "github".to_string(),
+            git_api_url: "https://api.github.com".to_string(),
+            git_repo: "test/repo".to_string(),
+            git_branch: "main".to_string(),
+            sync_mode: "direct".to_string(),
+            poll_interval_secs: 60,
+            lfs_threshold_mb: 0,
+            auto_merge: true,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".to_string(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+        };
+        db.insert_repository(&repo).unwrap();
+        repo
+    }
+
+    // ---- advance_all_watermarks tests ----
+
+    #[test]
+    fn test_advance_all_watermarks_updates_repo_table() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Test Repo");
+
+        db.advance_all_watermarks("repo1", "abc123def").unwrap();
+
+        let repo = db.get_repository("repo1").unwrap().unwrap();
+        assert_eq!(repo.last_git_sha, "abc123def");
+    }
+
+    #[test]
+    fn test_advance_all_watermarks_updates_kv_state() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Test Repo");
+
+        db.advance_all_watermarks("repo1", "sha456").unwrap();
+
+        let kv_val = db.get_state("last_git_sha_repo1").unwrap();
+        assert_eq!(kv_val.as_deref(), Some("sha456"));
+    }
+
+    #[test]
+    fn test_advance_all_watermarks_updates_global_kv() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Test Repo");
+
+        db.advance_all_watermarks("repo1", "sha789").unwrap();
+
+        let global = db.get_state("last_git_hash").unwrap();
+        assert_eq!(global.as_deref(), Some("sha789"));
+    }
+
+    // ---- consecutive_errors tests ----
+
+    #[test]
+    fn test_increment_consecutive_errors() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Test Repo");
+
+        let count = db.increment_consecutive_errors("repo1").unwrap();
+        assert_eq!(count, 1);
+
+        let count = db.increment_consecutive_errors("repo1").unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_reset_consecutive_errors() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Test Repo");
+
+        db.increment_consecutive_errors("repo1").unwrap();
+        db.increment_consecutive_errors("repo1").unwrap();
+        db.reset_consecutive_errors("repo1").unwrap();
+
+        let repo = db.get_repository("repo1").unwrap().unwrap();
+        assert_eq!(repo.consecutive_errors, 0);
+    }
+
+    // ---- hard_delete_repository tests ----
+
+    #[test]
+    fn test_hard_delete_removes_all_data() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Test Repo");
+
+        // Insert a sync record
+        let record = crate::models::SyncRecord {
+            id: "sr1".to_string(),
+            repo_id: Some("repo1".to_string()),
+            svn_revision: Some(1),
+            git_hash: Some("abc".to_string()),
+            direction: crate::models::SyncDirection::SvnToGit,
+            author: "test".to_string(),
+            message: "test".to_string(),
+            timestamp: chrono::Utc::now(),
+            synced_at: chrono::Utc::now(),
+            status: crate::models::SyncRecordStatus::Applied,
+        };
+        db.insert_sync_record(&record).unwrap();
+
+        // Delete
+        db.hard_delete_repository("repo1").unwrap();
+
+        // Verify repo gone
+        assert!(db.get_repository("repo1").unwrap().is_none());
+
+        // Verify sync records gone (count should be 0 since we only had one repo's records)
+        assert_eq!(db.count_sync_records().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_hard_delete_preserves_other_repos() {
+        let db = setup_db();
+        create_test_repo(&db, "repo1", "Repo 1");
+        create_test_repo(&db, "repo2", "Repo 2");
+
+        db.hard_delete_repository("repo1").unwrap();
+
+        assert!(db.get_repository("repo1").unwrap().is_none());
+        assert!(db.get_repository("repo2").unwrap().is_some());
+    }
 }

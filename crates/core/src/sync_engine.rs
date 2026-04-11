@@ -142,38 +142,8 @@ impl SyncEngine {
     }
 
     /// Validate file paths against allowed/blocked rules.
-    /// Returns Ok(()) if all paths are valid, Err with list of violations.
     fn validate_file_paths(&self, files: &[(String, String, Option<Vec<u8>>)]) -> Result<(), Vec<String>> {
-        if self.allowed_paths.is_empty() && self.blocked_patterns.is_empty() {
-            return Ok(());
-        }
-        let mut violations = Vec::new();
-        for (action, path, _) in files {
-            if action == "D" { continue; } // deletions are always ok
-            // Check allowed paths
-            if !self.allowed_paths.is_empty() {
-                let allowed = self.allowed_paths.iter().any(|prefix| path.starts_with(prefix));
-                if !allowed {
-                    violations.push(format!("'{}' not under allowed paths {:?}", path, self.allowed_paths));
-                }
-            }
-            // Check blocked patterns (simple suffix/prefix matching)
-            for pattern in &self.blocked_patterns {
-                let matches = if pattern.starts_with('*') {
-                    // Suffix match: *.exe matches foo.exe
-                    path.ends_with(&pattern[1..])
-                } else if pattern.ends_with('/') {
-                    // Prefix match: temp/ matches temp/foo.txt
-                    path.starts_with(pattern)
-                } else {
-                    path == pattern || path.starts_with(&format!("{}/", pattern))
-                };
-                if matches {
-                    violations.push(format!("'{}' matches blocked pattern '{}'", path, pattern));
-                }
-            }
-        }
-        if violations.is_empty() { Ok(()) } else { Err(violations) }
+        validate_file_paths_impl(&self.allowed_paths, &self.blocked_patterns, files)
     }
 
     /// Return the kv_state key for the last SVN revision watermark.
@@ -1586,6 +1556,41 @@ pub struct ChangedFile {
     pub is_binary: bool,
 }
 
+/// Validate file paths against allowed/blocked rules.
+/// Extracted as a standalone function for testability.
+pub(crate) fn validate_file_paths_impl(
+    allowed_paths: &[String],
+    blocked_patterns: &[String],
+    files: &[(String, String, Option<Vec<u8>>)],
+) -> Result<(), Vec<String>> {
+    if allowed_paths.is_empty() && blocked_patterns.is_empty() {
+        return Ok(());
+    }
+    let mut violations = Vec::new();
+    for (action, path, _) in files {
+        if action == "D" { continue; }
+        if !allowed_paths.is_empty() {
+            let allowed = allowed_paths.iter().any(|prefix| path.starts_with(prefix));
+            if !allowed {
+                violations.push(format!("'{}' not under allowed paths {:?}", path, allowed_paths));
+            }
+        }
+        for pattern in blocked_patterns {
+            let matches = if pattern.starts_with('*') {
+                path.ends_with(&pattern[1..])
+            } else if pattern.ends_with('/') {
+                path.starts_with(pattern)
+            } else {
+                path == pattern || path.starts_with(&format!("{}/", pattern))
+            };
+            if matches {
+                violations.push(format!("'{}' matches blocked pattern '{}'", path, pattern));
+            }
+        }
+    }
+    if violations.is_empty() { Ok(()) } else { Err(violations) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,5 +1619,90 @@ mod tests {
             SyncState::ResolutionApplied.to_string(),
             "resolution_applied"
         );
+    }
+
+    // ---- validate_file_paths tests ----
+
+    fn make_file(action: &str, path: &str) -> (String, String, Option<Vec<u8>>) {
+        (action.to_string(), path.to_string(), None)
+    }
+
+    #[test]
+    fn test_no_rules_allows_everything() {
+        let files = vec![make_file("A", "anything.txt")];
+        assert!(validate_file_paths_impl(&[], &[], &files).is_ok());
+    }
+
+    #[test]
+    fn test_allowed_paths_valid_file() {
+        let allowed = vec!["source/".to_string()];
+        let files = vec![make_file("A", "source/foo.txt")];
+        assert!(validate_file_paths_impl(&allowed, &[], &files).is_ok());
+    }
+
+    #[test]
+    fn test_allowed_paths_invalid_file() {
+        let allowed = vec!["source/".to_string()];
+        let files = vec![make_file("A", "root.txt")];
+        let result = validate_file_paths_impl(&allowed, &[], &files);
+        assert!(result.is_err());
+        let violations = result.unwrap_err();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("root.txt"));
+    }
+
+    #[test]
+    fn test_allowed_paths_multiple_prefixes() {
+        let allowed = vec!["source/".to_string(), "config/".to_string()];
+        let files = vec![
+            make_file("A", "source/foo.rs"),
+            make_file("M", "config/app.toml"),
+        ];
+        assert!(validate_file_paths_impl(&allowed, &[], &files).is_ok());
+    }
+
+    #[test]
+    fn test_allowed_paths_mixed_valid_invalid() {
+        let allowed = vec!["source/".to_string()];
+        let files = vec![
+            make_file("A", "source/good.rs"),
+            make_file("A", "bad.txt"),
+            make_file("A", "source/also-good.rs"),
+        ];
+        let result = validate_file_paths_impl(&allowed, &[], &files);
+        assert!(result.is_err());
+        let violations = result.unwrap_err();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("bad.txt"));
+    }
+
+    #[test]
+    fn test_delete_always_passes() {
+        let allowed = vec!["source/".to_string()];
+        let files = vec![make_file("D", "root-level-file.txt")];
+        assert!(validate_file_paths_impl(&allowed, &[], &files).is_ok());
+    }
+
+    #[test]
+    fn test_blocked_suffix_pattern() {
+        let blocked = vec!["*.exe".to_string()];
+        let files = vec![make_file("A", "program.exe")];
+        let result = validate_file_paths_impl(&[], &blocked, &files);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_blocked_prefix_pattern() {
+        let blocked = vec!["temp/".to_string()];
+        let files = vec![make_file("A", "temp/data.txt")];
+        let result = validate_file_paths_impl(&[], &blocked, &files);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_blocked_no_match_passes() {
+        let blocked = vec!["*.exe".to_string()];
+        let files = vec![make_file("A", "source/foo.rs")];
+        assert!(validate_file_paths_impl(&[], &blocked, &files).is_ok());
     }
 }

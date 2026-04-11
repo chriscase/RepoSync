@@ -13,6 +13,7 @@ use fs2::FileExt;
 use tracing::{info, warn};
 
 /// Guard that holds the exclusive lock. Drop releases the lock.
+#[derive(Debug)]
 pub struct LockGuard {
     _file: File,
     path: PathBuf,
@@ -128,5 +129,50 @@ fn is_process_alive(#[allow(unused)] pid: u32) -> bool {
     {
         // On non-Unix, assume alive (conservative)
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acquire_creates_lock_with_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire(dir.path()).unwrap();
+
+        let lock_path = dir.path().join("reposync.lock");
+        assert!(lock_path.exists());
+
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        let pid: u32 = contents.trim().parse().unwrap();
+        assert_eq!(pid, std::process::id());
+
+        drop(guard); // release lock
+    }
+
+    #[test]
+    fn test_acquire_blocks_second_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = acquire(dir.path()).unwrap();
+
+        // Second acquire should fail
+        let result = acquire(dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("already running"), "Error was: {}", err);
+    }
+
+    #[test]
+    fn test_acquire_after_drop_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let _guard = acquire(dir.path()).unwrap();
+            // guard drops here
+        }
+
+        // Should succeed since lock was released
+        let _guard2 = acquire(dir.path()).unwrap();
     }
 }
