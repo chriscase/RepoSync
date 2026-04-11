@@ -334,7 +334,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 10);
+        assert_eq!(get_schema_version(&conn).unwrap(), 11);
     }
 
     #[test]

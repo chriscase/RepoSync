@@ -155,13 +155,21 @@ impl GitError {
 pub fn sanitize_error_message(msg: &str) -> String {
     let mut result = msg.to_string();
 
-    // Redact x-access-token:TOKEN@ patterns in URLs
-    while let Some(start) = result.find("x-access-token:") {
-        if let Some(at_pos) = result[start..].find('@') {
-            let end = start + at_pos + 1;
-            result.replace_range(start..end, "x-access-token:[REDACTED]@");
-        } else {
-            break;
+    // Redact x-access-token:TOKEN@ patterns in URLs.
+    // Replace the token part only (between ":" and "@") to avoid
+    // re-matching the replacement text in the while loop.
+    {
+        let mut search_from = 0;
+        while let Some(pos) = result[search_from..].find("x-access-token:") {
+            let start = search_from + pos;
+            let after_prefix = start + "x-access-token:".len();
+            if let Some(at_offset) = result[after_prefix..].find('@') {
+                let at_pos = after_prefix + at_offset;
+                result.replace_range(after_prefix..at_pos, "[REDACTED]");
+                search_from = after_prefix + "[REDACTED]".len() + 1; // skip past the @
+            } else {
+                break;
+            }
         }
     }
 
