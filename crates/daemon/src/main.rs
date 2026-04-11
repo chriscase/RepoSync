@@ -4,6 +4,7 @@
 //! and sync scheduler, and handles graceful shutdown.
 
 mod lockfile;
+pub(crate) mod memory;
 mod scheduler;
 mod signals;
 

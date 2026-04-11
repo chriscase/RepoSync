@@ -68,6 +68,11 @@ pub struct DaemonConfig {
     /// Directory for persistent data (database, working copies).
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+
+    /// Maximum daemon RSS in megabytes. If exceeded, sync cycles are skipped
+    /// until memory drops below the limit. 0 = disabled. Default 512.
+    #[serde(default = "default_memory_limit_mb")]
+    pub memory_limit_mb: u64,
 }
 
 fn default_poll_interval() -> u64 {
@@ -79,6 +84,9 @@ fn default_log_level() -> String {
 fn default_data_dir() -> PathBuf {
     PathBuf::from("/var/lib/reposync")
 }
+fn default_memory_limit_mb() -> u64 {
+    512
+}
 
 impl Default for DaemonConfig {
     fn default() -> Self {
@@ -86,6 +94,7 @@ impl Default for DaemonConfig {
             poll_interval_secs: default_poll_interval(),
             log_level: default_log_level(),
             data_dir: default_data_dir(),
+            memory_limit_mb: default_memory_limit_mb(),
         }
     }
 }

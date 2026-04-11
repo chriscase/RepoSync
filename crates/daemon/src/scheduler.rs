@@ -65,6 +65,8 @@ pub struct Scheduler {
     pub sync_handles: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Cached identity mapper (shared across all repo sync cycles).
     cached_identity_mapper: std::sync::OnceLock<Arc<IdentityMapper>>,
+    /// Maximum RSS in bytes. Sync cycles are skipped when exceeded. 0 = disabled.
+    memory_limit_bytes: u64,
 }
 
 impl Scheduler {
@@ -77,6 +79,7 @@ impl Scheduler {
         db: Database,
         app_config: AppConfig,
     ) -> Self {
+        let memory_limit_bytes = app_config.daemon.memory_limit_mb * 1024 * 1024;
         Self {
             sync_engine,
             poll_interval,
@@ -88,6 +91,7 @@ impl Scheduler {
             app_config,
             sync_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             cached_identity_mapper: std::sync::OnceLock::new(),
+            memory_limit_bytes,
         }
     }
 
@@ -120,6 +124,22 @@ impl Scheduler {
                 // Regular polling interval
                 _ = interval.tick() => {
                     tick_count += 1;
+
+                    // Memory guard: skip sync cycles if RSS exceeds limit
+                    if self.memory_limit_bytes > 0 {
+                        let rss = crate::memory::process_rss_bytes();
+                        if rss > self.memory_limit_bytes {
+                            warn!(
+                                rss_mb = rss / 1024 / 1024,
+                                limit_mb = self.memory_limit_bytes / 1024 / 1024,
+                                "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
+                                rss / 1024 / 1024,
+                                self.memory_limit_bytes / 1024 / 1024,
+                            );
+                            continue;
+                        }
+                    }
+
                     // Per-repo scheduler handles all repos from the DB.
                     self.maybe_run_repo_cycles().await;
                     // Periodic maintenance (every ~10 minutes)

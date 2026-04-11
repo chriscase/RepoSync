@@ -65,6 +65,8 @@ struct SystemMetrics {
     net_down_bytes_per_sec: f64,
     /// SVN process active (svn export/log/info running)
     svn_active: bool,
+    /// Daemon process RSS (resident set size) in bytes
+    process_rss_bytes: u64,
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -253,6 +255,7 @@ async fn get_system_metrics(
         };
 
         let svn_active = is_process_running("svn");
+        let process_rss_bytes = process_rss();
 
         SystemMetrics {
             disk_free_bytes,
@@ -273,6 +276,7 @@ async fn get_system_metrics(
             net_up_bytes_per_sec,
             net_down_bytes_per_sec,
             svn_active,
+            process_rss_bytes,
         }
     })
     .await
@@ -353,6 +357,32 @@ fn parse_meminfo_kb(s: &str) -> u64 {
 fn mem_usage() -> (u64, u64) {
     // Fallback defaults: report 0 on non-Linux.
     (0, 0)
+}
+
+/// Return daemon process RSS in bytes from `/proc/self/status`.
+#[cfg(target_os = "linux")]
+fn process_rss() -> u64 {
+    let content = match std::fs::read_to_string("/proc/self/status") {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest
+                .trim()
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0)
+                * 1024; // kB to bytes
+        }
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_rss() -> u64 {
+    0
 }
 
 /// Return (load_1m, load_5m, load_15m) from `/proc/loadavg`.
