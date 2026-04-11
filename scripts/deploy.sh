@@ -123,9 +123,8 @@ fi
 
 # ---- Phase 5: Restart daemon ------------------------------------------------
 step "Phase 5: Restart daemon ($(ts))"
-# restart-daemon.sh exits 255 via SSH even on success; ignore exit code
-# and verify via health check in phase 6 instead.
-ssh_cmd "REPOSYNC_BIN=$REMOTE_REPO_DIR/target/release/reposync-daemon bash $REMOTE_REPO_DIR/scripts/restart-daemon.sh" || true
+# Use systemd if the service is enabled (preferred), fall back to restart script.
+ssh_cmd "sudo systemctl restart reposync 2>/dev/null && echo 'restarted via systemd' || REPOSYNC_BIN=$REMOTE_REPO_DIR/target/release/reposync-daemon bash $REMOTE_REPO_DIR/scripts/restart-daemon.sh" || true
 
 # ---- Phase 6: Post-deploy verification --------------------------------------
 step "Phase 6: Verify deployment ($(ts))"
