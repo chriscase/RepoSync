@@ -484,6 +484,13 @@ impl SyncEngine {
             // instead of removing the file.
             let git_diff = convert_svn_diff_to_git(&processed_diff);
 
+            debug!(
+                rev = change.revision,
+                raw_diff_lines = processed_diff.lines().count(),
+                converted_diff_preview = %git_diff.lines().take(6).collect::<Vec<_>>().join(" | "),
+                "SVN diff converted for git apply"
+            );
+
             let diff_applied = if !git_diff.trim().is_empty() {
                 apply_diff_to_path(&repo_path, &git_diff).await.is_ok()
             } else {
