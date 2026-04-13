@@ -314,7 +314,7 @@ impl SvnClient {
         if files.is_empty() {
             return Ok(());
         }
-        let mut args = vec!["add", "--force"];
+        let mut args = vec!["add", "--force", "--parents"];
         args.extend(files);
         self.run_svn_in_dir(path, &args).await?;
         debug!(count = files.len(), "svn add completed");
