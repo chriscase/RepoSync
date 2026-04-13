@@ -521,72 +521,41 @@ impl SyncEngine {
             }
 
             if !diff_applied {
-                // Fallback path: git apply couldn't patch the diff, so
-                // reconstruct the target state from an authoritative
-                // full-tree snapshot of the revision via `svn export`.
+                // git apply failed for this SVN revision.  During incremental
+                // sync we MUST NOT fall back to a full SVN export because:
+                //   1. It replaces LFS pointers with raw binary content → push rejected
+                //   2. It creates massive commits (hundreds of files) → OOM / pre-receive hook
+                //   3. It can introduce rogue directory paths
                 //
-                // The export is the ONLY source of truth here. We do
-                // NOT iterate `change.changed_files` — those paths come
-                // from the SVN log and are repository-relative (e.g.
-                // `/branches/.../trunk/source/SLS/foo.js`), which does
-                // not match the export dir layout (`source/SLS/foo.js`
-                // because the export is rooted at the branch URL). If
-                // we honored those paths we'd either miss files or
-                // write them to the wrong place, producing phantom
-                // top-level directories in the git tree.
-                //
-                // Instead we mirror the behavior of `run_full_import`:
-                // export the whole tree at this revision, remove any
-                // files in the git working tree that are NOT in the
-                // export (stale cleanup), then copy-with-policy every
-                // file from the export over the working tree. This
-                // matches the branch state exactly.
-                let export_dir = tempfile::tempdir()
-                    .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
-                let export_path = if self.config.svn.layout == SvnLayout::Standard {
-                    self.config.svn.trunk_path.trim_matches('/').to_string()
-                } else {
-                    String::new()
-                };
-                {
-                    let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    svn.export(&export_path, change.revision, export_dir.path())
-                        .await
-                        .map_err(SyncError::SvnError)?;
+                // Instead, skip this revision and advance the watermark.
+                // The revision's changes are already in SVN; a future
+                // reimport can reconcile any drift.
+                warn!(
+                    rev = change.revision,
+                    message = %change.message,
+                    files = change.changed_files.len(),
+                    "git apply failed for SVN revision — skipping (export fallback disabled for incremental sync)"
+                );
+
+                if let Some(ref rid) = self.repo_id {
+                    let _ = self.db.advance_svn_watermark(rid, change.revision);
                 }
 
-                // Stale cleanup: anything in the git working tree that's
-                // not present in the export must go (excluding .git).
-                crate::import::remove_stale_files(export_dir.path(), &repo_path).map_err(
-                    |e| {
-                        SyncError::GitError(crate::errors::GitError::ApplyFailed(format!(
-                            "stale file cleanup failed at r{}: {}",
-                            change.revision, e
-                        )))
-                    },
-                )?;
-
-                // Mirror export → working tree with LFS enforcement.
-                // Use the repo's LFS threshold so large files are
-                // tracked via Git LFS instead of committed as blobs.
-                let fallback_policy = crate::file_policy::FilePolicy::with_lfs(
-                    0,
-                    vec![],
-                    self.lfs_threshold_bytes,
-                    &[],
+                let _ = self.db.insert_audit_log_with_repo(
+                    "svn_to_git_skip",
+                    Some("svn_to_git"),
+                    Some(change.revision),
+                    None,
+                    Some(&change.author),
+                    Some(&format!(
+                        "Skipped r{}: git apply failed, export fallback disabled. Message: {}",
+                        change.revision,
+                        change.message.lines().next().unwrap_or("")
+                    )),
+                    false,
+                    self.effective_repo_id(),
                 );
-                crate::import::copy_tree_with_policy(
-                    export_dir.path(),
-                    &repo_path,
-                    &fallback_policy,
-                    &self.db,
-                )
-                .map_err(|e| {
-                    SyncError::GitError(crate::errors::GitError::ApplyFailed(format!(
-                        "tree copy failed at r{}: {}",
-                        change.revision, e
-                    )))
-                })?;
+                continue;
             }
 
             // 2b. LFS enforcement: after applying changes, scan modified files
