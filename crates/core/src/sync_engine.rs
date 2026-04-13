@@ -610,53 +610,44 @@ impl SyncEngine {
                 }
             }
 
-            // 2c. Clean up any rogue top-level entries in the git working
-            // tree that don't belong.  These can appear when earlier bugs
-            // (e.g. wrong git-apply strip level) deposited files at wrong
-            // paths.  A blanket `git add --all` in the commit step would
-            // stage them, corrupting the tree.  We reconcile against the
-            // SVN export if available, otherwise use a conservative allow-
-            // list based on the SVN branch's known top-level directories.
+            // 2c. Clean up rogue top-level entries in the git working tree.
+            // The git history may contain files at wrong paths (e.g. SLS/
+            // instead of source/SLS/) from earlier bugs. git reset --hard
+            // restores them every pull. We must remove them before commit
+            // so git add --all doesn't re-stage them.
+            //
+            // Approach: the SVN diff paths tell us what top-level dirs are
+            // legitimate (e.g. source/, config/). Any top-level dir that
+            // doesn't match the first component of ANY changed file path
+            // AND isn't a known standard directory is rogue.
             {
-                let known_toplevel: std::collections::HashSet<String> = {
-                    let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    let tmp = tempfile::tempdir().ok();
-                    if let Some(ref t) = tmp {
-                        // Quick shallow export to discover top-level entries
-                        if svn.export_depth("", change.revision, t.path(), "immediates").await.is_ok() {
-                            std::fs::read_dir(t.path())
-                                .ok()
-                                .map(|entries| {
-                                    entries
-                                        .filter_map(|e| e.ok())
-                                        .map(|e| e.file_name().to_string_lossy().to_string())
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            std::collections::HashSet::new()
-                        }
-                    } else {
-                        std::collections::HashSet::new()
-                    }
-                };
+                // Collect legitimate top-level prefixes from the SVN diff
+                let mut legit_toplevel: std::collections::HashSet<String> = change
+                    .changed_files
+                    .iter()
+                    .filter_map(|f| {
+                        let p = f.path.trim_start_matches('/');
+                        p.split('/').next().map(|s| s.to_string())
+                    })
+                    .collect();
+                // Always keep source and config as legitimate
+                legit_toplevel.insert("source".to_string());
+                legit_toplevel.insert("config".to_string());
 
-                if !known_toplevel.is_empty() {
-                    if let Ok(entries) = std::fs::read_dir(&repo_path) {
-                        for entry in entries.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') {
-                                continue; // skip .git, .gitattributes, etc.
-                            }
-                            if !known_toplevel.contains(&name) {
-                                let rogue = entry.path();
-                                if rogue.is_dir() {
-                                    info!(path = %rogue.display(), "removing rogue directory from git working tree");
-                                    let _ = std::fs::remove_dir_all(&rogue);
-                                } else {
-                                    info!(path = %rogue.display(), "removing rogue file from git working tree");
-                                    let _ = std::fs::remove_file(&rogue);
-                                }
+                if let Ok(entries) = std::fs::read_dir(&repo_path) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with('.') {
+                            continue;
+                        }
+                        if !legit_toplevel.contains(&name) {
+                            let rogue = entry.path();
+                            if rogue.is_dir() {
+                                info!(path = %rogue.display(), "removing rogue directory from git working tree");
+                                let _ = std::fs::remove_dir_all(&rogue);
+                            } else if !name.ends_with(".gitattributes") {
+                                info!(path = %rogue.display(), "removing rogue file from git working tree");
+                                let _ = std::fs::remove_file(&rogue);
                             }
                         }
                     }
