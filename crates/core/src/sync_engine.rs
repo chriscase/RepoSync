@@ -477,8 +477,15 @@ impl SyncEngine {
             } else {
                 diff
             };
-            let diff_applied = if !processed_diff.trim().is_empty() {
-                apply_diff_to_path(&repo_path, &processed_diff).await.is_ok()
+            // Convert SVN diff format to git-compatible format:
+            // - SVN uses "(nonexistent)" for deleted files; git needs "/dev/null"
+            // - SVN uses "(revision N)" for existing files; git needs actual paths
+            // Without this, git apply treats deletions as "truncate to empty"
+            // instead of removing the file.
+            let git_diff = convert_svn_diff_to_git(&processed_diff);
+
+            let diff_applied = if !git_diff.trim().is_empty() {
+                apply_diff_to_path(&repo_path, &git_diff).await.is_ok()
             } else {
                 false
             };
@@ -1605,6 +1612,51 @@ impl SyncEngine {
             false
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// SVN diff → git diff conversion
+// ---------------------------------------------------------------------------
+
+/// Convert SVN unified diff format to git-compatible format.
+///
+/// Key differences:
+/// - SVN deletion: `+++ path\t(nonexistent)` → git: `+++ /dev/null`
+/// - SVN new file: `--- path\t(nonexistent)` → git: `--- /dev/null`
+/// - SVN revision: `--- path\t(revision N)` → git: `--- path` (strip annotation)
+///
+/// Without this conversion, `git apply` treats SVN deletions as "truncate
+/// to zero bytes" instead of actually deleting the file, because it doesn't
+/// recognize `(nonexistent)` as a deletion marker.
+fn convert_svn_diff_to_git(svn_diff: &str) -> String {
+    let mut result = String::with_capacity(svn_diff.len());
+    for line in svn_diff.lines() {
+        if line.starts_with("--- ") && line.contains("\t(nonexistent)") {
+            // New file: source didn't exist → /dev/null
+            result.push_str("--- /dev/null");
+        } else if line.starts_with("+++ ") && line.contains("\t(nonexistent)") {
+            // Deleted file: target doesn't exist → /dev/null
+            result.push_str("+++ /dev/null");
+        } else if line.starts_with("--- ") && line.contains("\t(revision ") {
+            // Existing file: strip the "(revision N)" annotation
+            if let Some(tab_pos) = line.find('\t') {
+                result.push_str(&line[..tab_pos]);
+            } else {
+                result.push_str(line);
+            }
+        } else if line.starts_with("+++ ") && line.contains("\t(revision ") {
+            // Modified file target: strip annotation
+            if let Some(tab_pos) = line.find('\t') {
+                result.push_str(&line[..tab_pos]);
+            } else {
+                result.push_str(line);
+            }
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
