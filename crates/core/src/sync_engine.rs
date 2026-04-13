@@ -942,54 +942,13 @@ impl SyncEngine {
             // 4. Stage changes in SVN.
             let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
-            // 4a. Pre-add parent directories for new files, sorted by depth
-            // (shallowest first). This ensures SVN's WC database has entries
-            // for every parent node before we add child files. Without this,
-            // `svn add --parents` can fail with E150000 when the WC metadata
-            // for a parent directory is absent or stale.
-            //
-            // NOTE: SVN 1.7+ uses a single .svn/wc.db at the WC root, so we
-            // cannot check for .svn dirs in subdirectories. Instead, we always
-            // pre-add all parent directories — svn add --force is a no-op for
-            // already-versioned items, so this is safe.
             if !added_files.is_empty() {
-                let mut dirs_to_add: Vec<String> = Vec::new();
-                for file_path in &added_files {
-                    let path = std::path::Path::new(file_path);
-                    let mut ancestors = Vec::new();
-                    let mut current = path.parent();
-                    while let Some(p) = current {
-                        if p.as_os_str().is_empty() {
-                            break;
-                        }
-                        ancestors.push(p.to_string_lossy().to_string());
-                        current = p.parent();
-                    }
-                    ancestors.reverse();
-                    for dir in ancestors {
-                        if !dirs_to_add.contains(&dir) {
-                            let dir_on_disk = svn_wc_dir.path().join(&dir);
-                            if dir_on_disk.is_dir() {
-                                dirs_to_add.push(dir);
-                            }
-                        }
-                    }
-                }
-
-                for dir in &dirs_to_add {
-                    debug!(dir = %dir, "pre-adding parent directory to SVN");
-                    let _ = svn.run_svn_in_dir_public(
-                        svn_wc_dir.path(),
-                        &["add", "--depth", "empty", "--force", dir],
-                    ).await;
-                }
-
                 debug!(
                     sha = %change.sha,
                     files = ?added_files,
                     "running svn add"
                 );
-                svn.add(svn_wc_dir.path(), &added_files)
+                svn.add_with_retry(svn_wc_dir.path(), &added_files)
                     .await
                     .map_err(SyncError::SvnError)?;
             }

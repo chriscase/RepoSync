@@ -346,13 +346,65 @@ impl SvnClient {
         if files.is_empty() {
             return Ok(());
         }
-        // Add files one at a time with --parents so each file's parent
-        // directory chain is properly registered in SVN. Batching can fail
-        // when multiple files share a new parent that isn't yet versioned.
         for file in files {
             self.run_svn_in_dir(path, &["add", "--force", "--parents", file]).await?;
         }
         debug!(count = files.len(), "svn add completed");
+        Ok(())
+    }
+
+    /// Add files with retry: on E150000/E155010 (parent node not found),
+    /// walk the file's parent chain and add each ancestor directory
+    /// individually, then retry the file add.
+    pub async fn add_with_retry(&self, wc_path: &Path, files: &[&str]) -> Result<(), SvnError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        for file in files {
+            let result = self.run_svn_in_dir(
+                wc_path, &["add", "--force", "--parents", file]
+            ).await;
+
+            if let Err(ref e) = result {
+                let err = e.to_string();
+                if err.contains("E150000") || err.contains("E155010") || err.contains("parent directory") {
+                    // Walk parent directories from shallowest to deepest,
+                    // adding each one individually. This builds up the WC
+                    // database entries that --parents alone can't create
+                    // for multi-level new directories.
+                    let file_path = std::path::Path::new(file);
+                    let mut ancestors: Vec<&std::path::Path> = Vec::new();
+                    let mut cur = file_path.parent();
+                    while let Some(p) = cur {
+                        if p.as_os_str().is_empty() { break; }
+                        ancestors.push(p);
+                        cur = p.parent();
+                    }
+                    ancestors.reverse(); // shallowest first
+
+                    for ancestor in &ancestors {
+                        let dir_str = ancestor.to_string_lossy();
+                        let full = wc_path.join(&*dir_str);
+                        if full.is_dir() {
+                            // Try adding this directory; ignore errors for
+                            // already-versioned dirs
+                            let _ = self.run_svn_in_dir(
+                                wc_path,
+                                &["add", "--force", "--parents", &dir_str],
+                            ).await;
+                        }
+                    }
+
+                    // Retry the file add
+                    self.run_svn_in_dir(
+                        wc_path, &["add", "--force", "--parents", file]
+                    ).await?;
+                } else {
+                    result?;
+                }
+            }
+        }
+        debug!(count = files.len(), "svn add (with retry) completed");
         Ok(())
     }
 
