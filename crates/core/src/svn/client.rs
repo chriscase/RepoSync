@@ -346,9 +346,12 @@ impl SvnClient {
         if files.is_empty() {
             return Ok(());
         }
-        let mut args = vec!["add", "--force", "--parents"];
-        args.extend(files);
-        self.run_svn_in_dir(path, &args).await?;
+        // Add files one at a time with --parents so each file's parent
+        // directory chain is properly registered in SVN. Batching can fail
+        // when multiple files share a new parent that isn't yet versioned.
+        for file in files {
+            self.run_svn_in_dir(path, &["add", "--force", "--parents", file]).await?;
+        }
         debug!(count = files.len(), "svn add completed");
         Ok(())
     }
