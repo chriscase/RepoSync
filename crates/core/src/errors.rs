@@ -144,6 +144,11 @@ impl GitError {
     pub fn is_permanent(&self) -> bool {
         match self {
             GitError::PushRejected { detail, .. } => {
+                // Non-fast-forward is transient — auto-resolves on retry
+                // after the next pull incorporates remote changes.
+                if detail.contains("non-fast-forward") {
+                    return false;
+                }
                 // Large file rejection or pre-receive hook rejection
                 detail.contains("pre-receive hook declined")
                     || detail.contains("exceeds GitHub")

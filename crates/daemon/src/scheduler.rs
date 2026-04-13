@@ -604,15 +604,29 @@ impl Scheduler {
                             }
                         }
 
-                        let sanitized_error = reposync_core::errors::sanitize_error_message(&e.to_string());
-                        let msg = serde_json::json!({
-                            "type": "repo_sync_failed",
-                            "repo_id": repo_id,
-                            "repo_name": repo_name,
-                            "error": sanitized_error,
-                            "is_permanent": e.is_permanent(),
-                        });
-                        let _ = ws.send(msg.to_string());
+                        // Suppress Teams notifications for transient push failures
+                        // (non-fast-forward). These auto-resolve on the next cycle
+                        // after pulling the remote changes. Sending error cards for
+                        // every transient conflict creates noise.
+                        let error_str = e.to_string();
+                        let is_transient_push = error_str.contains("non-fast-forward");
+
+                        if is_transient_push {
+                            info!(
+                                repo_name = %repo_name,
+                                "push rejected (non-fast-forward) — will retry next cycle"
+                            );
+                        } else {
+                            let sanitized_error = reposync_core::errors::sanitize_error_message(&error_str);
+                            let msg = serde_json::json!({
+                                "type": "repo_sync_failed",
+                                "repo_id": repo_id,
+                                "repo_name": repo_name,
+                                "error": sanitized_error,
+                                "is_permanent": e.is_permanent(),
+                            });
+                            let _ = ws.send(msg.to_string());
+                        }
                     }
                 }
 
