@@ -138,19 +138,46 @@ impl TeamsNotifier {
             facts.push(json!({"title": "Conflicts", "value": format!("{}", conflicts)}));
         }
 
-        Some(json!([
-            {
+        // Include commit messages if available
+        let messages: Vec<String> = event
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| {
+                        let truncated = if s.len() > 80 { format!("{}...", &s[..80]) } else { s.to_string() };
+                        format!("• {}", truncated)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut body = vec![
+            json!({
                 "type": "TextBlock",
                 "text": format!("✅ Sync completed — {}", repo_name),
                 "weight": "Bolder",
                 "size": "Medium",
                 "color": "Good"
-            },
-            {
+            }),
+            json!({
                 "type": "FactSet",
                 "facts": facts
-            }
-        ]))
+            }),
+        ];
+
+        if !messages.is_empty() {
+            body.push(json!({
+                "type": "TextBlock",
+                "text": messages.join("\n"),
+                "wrap": true,
+                "size": "Small",
+                "color": "Default"
+            }));
+        }
+
+        Some(serde_json::Value::Array(body))
     }
 
     fn format_sync_failed(&self, event: &serde_json::Value) -> serde_json::Value {

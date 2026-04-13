@@ -69,6 +69,8 @@ pub struct SyncStats {
     pub conflicts_auto_resolved: usize,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// Recent commit messages synced in this cycle (for notifications).
+    pub recent_messages: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +353,20 @@ impl SyncEngine {
 
         // 4. Apply Git -> SVN.
         stats.git_to_svn_count = self.sync_git_to_svn(&git_changes).await?;
+
+        // Collect recent commit messages for notifications (first line only, max 5)
+        for change in &svn_changes {
+            let first_line = change.message.lines().next().unwrap_or("").to_string();
+            if !first_line.is_empty() && stats.recent_messages.len() < 5 {
+                stats.recent_messages.push(first_line);
+            }
+        }
+        for change in &git_changes {
+            let first_line = change.message.lines().next().unwrap_or("").to_string();
+            if !first_line.is_empty() && stats.recent_messages.len() < 5 {
+                stats.recent_messages.push(first_line);
+            }
+        }
 
         info!(
             svn_to_git = stats.svn_to_git_count,

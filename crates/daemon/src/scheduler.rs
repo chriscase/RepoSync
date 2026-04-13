@@ -573,6 +573,7 @@ impl Scheduler {
                             "svn_to_git": sync_stats.svn_to_git_count,
                             "git_to_svn": sync_stats.git_to_svn_count,
                             "conflicts": sync_stats.conflicts_detected,
+                            "messages": sync_stats.recent_messages,
                         });
                         let _ = ws.send(msg.to_string());
                     }
