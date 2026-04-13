@@ -1628,12 +1628,21 @@ pub async fn apply_diff_to_path(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(crate::errors::GitError::IoError)?;
-    if let Some(ref mut stdin) = child.stdin {
+    // Write diff to stdin and explicitly close it so git apply sees EOF
+    // and begins processing. Without closing, git apply may hang forever.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| crate::errors::GitError::IoError(
+                std::io::Error::new(std::io::ErrorKind::Other, "failed to open git apply stdin")
+            ))?;
         use tokio::io::AsyncWriteExt;
         stdin
             .write_all(diff_content.as_bytes())
             .await
             .map_err(crate::errors::GitError::IoError)?;
+        // stdin is dropped here, closing the pipe
     }
     let output = child
         .wait_with_output()
