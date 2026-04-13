@@ -491,6 +491,16 @@ impl SyncEngine {
                 "SVN diff converted for git apply"
             );
 
+            // DEBUG: write diff to temp file for inspection
+            let debug_diff_path = repo_path.join(format!(".reposync-debug-r{}.patch", change.revision));
+            let _ = std::fs::write(&debug_diff_path, &git_diff);
+            info!(
+                rev = change.revision,
+                diff_path = %debug_diff_path.display(),
+                diff_lines = git_diff.lines().count(),
+                "wrote debug diff to file"
+            );
+
             let diff_applied = if !git_diff.trim().is_empty() {
                 apply_diff_to_path(&repo_path, &git_diff).await.is_ok()
             } else {
