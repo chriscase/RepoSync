@@ -353,58 +353,64 @@ impl SvnClient {
         Ok(())
     }
 
-    /// Add files with retry: on E150000/E155010 (parent node not found),
-    /// walk the file's parent chain and add each ancestor directory
-    /// individually, then retry the file add.
+    /// Add files robustly: find the topmost NEW directory for each file
+    /// and add it recursively with `svn add --force`. This avoids E150000
+    /// parent-node errors because we always add from a versioned parent
+    /// downward, letting SVN handle the entire subtree at once.
     pub async fn add_with_retry(&self, wc_path: &Path, files: &[&str]) -> Result<(), SvnError> {
         if files.is_empty() {
             return Ok(());
         }
+
+        // Find topmost new directories that need adding.
+        // A "new" directory is one that exists on disk but whose parent
+        // IS versioned in SVN (i.e., the parent is part of the checkout).
+        // We detect this by checking `svn info` on each ancestor.
+        let mut top_dirs_added: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         for file in files {
-            let result = self.run_svn_in_dir(
-                wc_path, &["add", "--force", "--parents", file]
-            ).await;
+            let file_path = std::path::Path::new(file);
 
-            if let Err(ref e) = result {
-                let err = e.to_string();
-                if err.contains("E150000") || err.contains("E155010") || err.contains("parent directory") {
-                    // Walk parent directories from shallowest to deepest,
-                    // adding each one individually. This builds up the WC
-                    // database entries that --parents alone can't create
-                    // for multi-level new directories.
-                    let file_path = std::path::Path::new(file);
-                    let mut ancestors: Vec<&std::path::Path> = Vec::new();
-                    let mut cur = file_path.parent();
-                    while let Some(p) = cur {
-                        if p.as_os_str().is_empty() { break; }
-                        ancestors.push(p);
-                        cur = p.parent();
-                    }
-                    ancestors.reverse(); // shallowest first
-
-                    for ancestor in &ancestors {
-                        let dir_str = ancestor.to_string_lossy();
-                        let full = wc_path.join(&*dir_str);
-                        if full.is_dir() {
-                            // Try adding this directory; ignore errors for
-                            // already-versioned dirs
-                            let _ = self.run_svn_in_dir(
-                                wc_path,
-                                &["add", "--force", "--parents", &dir_str],
-                            ).await;
-                        }
-                    }
-
-                    // Retry the file add
-                    self.run_svn_in_dir(
-                        wc_path, &["add", "--force", "--parents", file]
-                    ).await?;
+            // Walk up from the file's parent to find the topmost unversioned dir
+            let mut topmost_new: Option<String> = None;
+            let mut cur = file_path.parent();
+            while let Some(p) = cur {
+                if p.as_os_str().is_empty() { break; }
+                let dir_str = p.to_string_lossy().to_string();
+                // Check if this directory is versioned by running svn info
+                let info_result = self.run_svn_in_dir(
+                    wc_path, &["info", &dir_str]
+                ).await;
+                if info_result.is_err() {
+                    // Not versioned — this might be the topmost new dir
+                    topmost_new = Some(dir_str);
                 } else {
-                    result?;
+                    // Versioned — stop walking up
+                    break;
                 }
+                cur = p.parent();
+            }
+
+            if let Some(ref top_dir) = topmost_new {
+                if !top_dirs_added.contains(top_dir) {
+                    debug!(dir = %top_dir, "adding new directory tree to SVN");
+                    // Add the topmost new directory — SVN will recursively
+                    // add everything inside it since --force doesn't skip
+                    // unversioned contents.
+                    self.run_svn_in_dir(
+                        wc_path, &["add", "--force", top_dir]
+                    ).await?;
+                    top_dirs_added.insert(top_dir.clone());
+                }
+                // File is already added by the recursive dir add
+            } else {
+                // Parent is versioned, just add the file directly
+                self.run_svn_in_dir(
+                    wc_path, &["add", "--force", file]
+                ).await?;
             }
         }
-        debug!(count = files.len(), "svn add (with retry) completed");
+        debug!(count = files.len(), "svn add completed");
         Ok(())
     }
 
