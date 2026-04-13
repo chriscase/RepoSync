@@ -1561,7 +1561,7 @@ pub async fn apply_diff_to_path(
     use tokio::process::Command;
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_path)
-        .args(["apply", "--3way", "-"])
+        .args(["apply", "--3way", "-p0", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
