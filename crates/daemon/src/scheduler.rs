@@ -611,8 +611,10 @@ impl Scheduler {
                         let error_str = e.to_string();
                         let is_transient = error_str.contains("non-fast-forward")
                             || error_str.contains("E155011")  // SVN "out of date"
+                            || error_str.contains("E155010")  // SVN "node not found"
                             || error_str.contains("E150000")  // SVN "can't find parent"
-                            || error_str.contains("out of date");
+                            || error_str.contains("out of date")
+                            || error_str.contains("parent directory");
 
                         if is_transient {
                             info!(

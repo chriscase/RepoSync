@@ -947,6 +947,11 @@ impl SyncEngine {
             // for every parent node before we add child files. Without this,
             // `svn add --parents` can fail with E150000 when the WC metadata
             // for a parent directory is absent or stale.
+            //
+            // NOTE: SVN 1.7+ uses a single .svn/wc.db at the WC root, so we
+            // cannot check for .svn dirs in subdirectories. Instead, we always
+            // pre-add all parent directories — svn add --force is a no-op for
+            // already-versioned items, so this is safe.
             if !added_files.is_empty() {
                 let mut dirs_to_add: Vec<String> = Vec::new();
                 for file_path in &added_files {
@@ -960,23 +965,19 @@ impl SyncEngine {
                         ancestors.push(p.to_string_lossy().to_string());
                         current = p.parent();
                     }
-                    // Reverse so shallowest first
                     ancestors.reverse();
                     for dir in ancestors {
                         if !dirs_to_add.contains(&dir) {
                             let dir_on_disk = svn_wc_dir.path().join(&dir);
-                            let svn_dir = dir_on_disk.join(".svn");
-                            // Only add directories that exist on disk but might not be versioned
-                            if dir_on_disk.is_dir() && !svn_dir.exists() {
+                            if dir_on_disk.is_dir() {
                                 dirs_to_add.push(dir);
                             }
                         }
                     }
                 }
 
-                // Add unversioned parent directories (shallowest first)
                 for dir in &dirs_to_add {
-                    debug!(dir = %dir, "pre-adding unversioned parent directory");
+                    debug!(dir = %dir, "pre-adding parent directory to SVN");
                     let _ = svn.run_svn_in_dir_public(
                         svn_wc_dir.path(),
                         &["add", "--depth", "empty", "--force", dir],
