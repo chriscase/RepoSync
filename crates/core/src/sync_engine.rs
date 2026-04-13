@@ -492,7 +492,25 @@ impl SyncEngine {
             );
 
             let diff_applied = if !git_diff.trim().is_empty() {
-                apply_diff_to_path(&repo_path, &git_diff).await.is_ok()
+                let result = apply_diff_to_path(&repo_path, &git_diff).await;
+                if result.is_ok() {
+                    // Verify: check that files were created at the correct paths
+                    for cf in &change.changed_files {
+                        let expected = repo_path.join(&cf.path);
+                        if expected.exists() {
+                            info!(path = %cf.path, "git apply created file at correct path");
+                        } else {
+                            warn!(path = %cf.path, "git apply succeeded but file NOT at expected path");
+                        }
+                    }
+                } else {
+                    warn!(
+                        rev = change.revision,
+                        error = %result.as_ref().unwrap_err(),
+                        "git apply failed"
+                    );
+                }
+                result.is_ok()
             } else {
                 false
             };
