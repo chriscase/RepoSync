@@ -227,7 +227,7 @@ function NotificationsConfig() {
             <li>Open <strong>Microsoft Teams</strong> and go to the channel where you want notifications</li>
             <li>Click the <strong>••• (More options)</strong> next to the channel name</li>
             <li>Select <strong>Workflows</strong></li>
-            <li>Search for <strong>"Post to a channel when a webhook request is received"</strong> and select it</li>
+            <li>Search for <strong>"webhook"</strong> and select <strong>"Send webhook alerts to a channel"</strong></li>
             <li>Name your workflow (e.g., "RepoSync Notifications") and click <strong>Next</strong></li>
             <li>Select the channel to post to and click <strong>Add workflow</strong></li>
             <li>Copy the <strong>webhook URL</strong> and paste it below</li>

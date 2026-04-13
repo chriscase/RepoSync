@@ -1345,6 +1345,25 @@ async fn create_branch_pair(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::Internal("failed to read back created branch pair".into()))?;
 
+    // Broadcast branch creation event (Teams + WebSocket)
+    let branch_event = serde_json::json!({
+        "type": "branch_pair_created",
+        "repo_name": created.name,
+        "git_branch": created.git_branch,
+        "svn_branch": created.svn_branch,
+    });
+    let _ = state.ws_broadcast.send(branch_event.to_string());
+
+    // Send Teams notification directly (for events not in ws_broadcast listener)
+    let teams_url = db.get_state("teams_webhook_url").ok().flatten().filter(|v| !v.is_empty());
+    if let Some(url) = teams_url {
+        let card = reposync_core::notify::teams::format_branch_created(
+            &created.name, &created.git_branch, &created.svn_branch,
+        );
+        let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
+        let _ = notifier.send_card(card).await;
+    }
+
     Ok(Json(serde_json::to_value(created).map_err(|e| AppError::Internal(format!("serialization error: {}", e)))?))
 }
 
@@ -1513,6 +1532,14 @@ async fn delete_branch_pair(
         warnings = ?warnings,
         "branch pair deleted"
     );
+
+    // Send Teams notification for deletion
+    let teams_url = db.get_state("teams_webhook_url").ok().flatten().filter(|v| !v.is_empty());
+    if let Some(url) = teams_url {
+        let card = reposync_core::notify::teams::format_branch_deleted(&repo_name, &repo.git_branch);
+        let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
+        let _ = notifier.send_card(card).await;
+    }
 
     Ok(Json(serde_json::json!({
         "ok": true,
