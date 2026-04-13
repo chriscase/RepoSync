@@ -2200,6 +2200,18 @@ impl Database {
         Ok(())
     }
 
+    /// Advance only the SVN revision watermark for a repository (no git SHA change).
+    /// Used when skipping metadata-only SVN revisions that produce no git commit.
+    pub fn advance_svn_watermark(&self, repo_id: &str, svn_rev: i64) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
+            params![svn_rev, repo_id],
+        )?;
+        debug!(repo_id, svn_rev, "advanced SVN watermark (metadata-only skip)");
+        Ok(())
+    }
+
     /// Update the sync status for a repository.
     pub fn update_repo_sync_status(
         &self,

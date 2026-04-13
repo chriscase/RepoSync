@@ -483,6 +483,29 @@ impl SyncEngine {
                 false
             };
 
+            // If the diff is empty AND the changeset has no changed files,
+            // this is a metadata-only revision (branch creation, property
+            // change, svn:mergeinfo update, etc.). Skip it — there's nothing
+            // to commit and falling back to a full SVN export would create a
+            // massive commit touching every file, which can trigger remote
+            // pre-receive hook rejections and OOM on push.
+            if !diff_applied && processed_diff.trim().is_empty() && change.changed_files.is_empty() {
+                info!(
+                    rev = change.revision,
+                    "skipping SVN revision with empty diff and no changed files (metadata-only)"
+                );
+                // Advance the watermark so we don't re-process this revision.
+                let per_repo_key = self.effective_repo_id()
+                    .map(|rid| format!("last_svn_rev_{}", rid));
+                if let Some(ref key) = per_repo_key {
+                    let _ = self.db.set_state(key, &change.revision.to_string());
+                }
+                if let Some(ref rid) = self.repo_id {
+                    let _ = self.db.advance_svn_watermark(rid, change.revision);
+                }
+                continue;
+            }
+
             if !diff_applied {
                 // Fallback path: git apply couldn't patch the diff, so
                 // reconstruct the target state from an authoritative
