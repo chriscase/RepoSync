@@ -1108,10 +1108,19 @@ impl SyncEngine {
                 .map_err(SyncError::DatabaseError)?;
 
             // Update the Git watermark (dual-write: kv_state + repo table).
+            // IMPORTANT: Only advance the git SHA here, NOT the SVN rev.
+            // The SVN rev created by git_to_svn is higher than any pending
+            // SVN→Git revisions. If we set last_svn_rev here, we'd skip
+            // SVN commits that were made between our fetch and our commit
+            // (bidirectional race condition / data loss).
             let _ = self.db.set_state("last_git_hash", &change.sha);
             if let Some(rid) = self.effective_repo_id() {
                 let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                let _ = self.db.update_repo_watermark(rid, svn_rev, &change.sha);
+                // Only advance git SHA in repo table; preserve SVN rev watermark
+                let current_svn_rev = self.db.get_repo_watermark(rid)
+                    .map(|(rev, _)| rev)
+                    .unwrap_or(0);
+                let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
                 let _ = self.db.increment_repo_sync_count(rid);
             }
 
