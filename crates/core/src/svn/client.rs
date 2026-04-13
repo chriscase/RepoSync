@@ -285,6 +285,30 @@ impl SvnClient {
         Ok(())
     }
 
+    /// Export at a given depth (e.g. "immediates" for top-level only).
+    #[instrument(skip(self), fields(url = %self.url, rev, depth))]
+    pub async fn export_depth(
+        &self,
+        path: &str,
+        rev: i64,
+        dest: &Path,
+        depth: &str,
+    ) -> Result<(), SvnError> {
+        let src_url = if path.is_empty() {
+            self.url.clone()
+        } else {
+            format!("{}/{}", self.url, path)
+        };
+        let rev_str = rev.to_string();
+        let dest_str = dest.to_string_lossy().to_string();
+        self.run_svn(&[
+            "export", "--force", "-r", &rev_str, "--depth", depth, &src_url, &dest_str,
+        ])
+        .await?;
+        debug!(dest = %dest.display(), rev, depth, "svn export (depth) completed");
+        Ok(())
+    }
+
     // -- Working copy methods (personal branch mode) -------------------------
 
     /// Run `svn update` on a working copy.

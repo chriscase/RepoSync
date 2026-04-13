@@ -627,6 +627,59 @@ impl SyncEngine {
                 }
             }
 
+            // 2c. Clean up any rogue top-level entries in the git working
+            // tree that don't belong.  These can appear when earlier bugs
+            // (e.g. wrong git-apply strip level) deposited files at wrong
+            // paths.  A blanket `git add --all` in the commit step would
+            // stage them, corrupting the tree.  We reconcile against the
+            // SVN export if available, otherwise use a conservative allow-
+            // list based on the SVN branch's known top-level directories.
+            {
+                let known_toplevel: std::collections::HashSet<String> = {
+                    let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let tmp = tempfile::tempdir().ok();
+                    if let Some(ref t) = tmp {
+                        // Quick shallow export to discover top-level entries
+                        if svn.export_depth("", change.revision, t.path(), "immediates").await.is_ok() {
+                            std::fs::read_dir(t.path())
+                                .ok()
+                                .map(|entries| {
+                                    entries
+                                        .filter_map(|e| e.ok())
+                                        .map(|e| e.file_name().to_string_lossy().to_string())
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            std::collections::HashSet::new()
+                        }
+                    } else {
+                        std::collections::HashSet::new()
+                    }
+                };
+
+                if !known_toplevel.is_empty() {
+                    if let Ok(entries) = std::fs::read_dir(&repo_path) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.starts_with('.') {
+                                continue; // skip .git, .gitattributes, etc.
+                            }
+                            if !known_toplevel.contains(&name) {
+                                let rogue = entry.path();
+                                if rogue.is_dir() {
+                                    info!(path = %rogue.display(), "removing rogue directory from git working tree");
+                                    let _ = std::fs::remove_dir_all(&rogue);
+                                } else {
+                                    info!(path = %rogue.display(), "removing rogue file from git working tree");
+                                    let _ = std::fs::remove_file(&rogue);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // 3. Commit with identity and sync marker.
             let commit_message = format!(
                 "{}\n\n{} synced from SVN r{}",
