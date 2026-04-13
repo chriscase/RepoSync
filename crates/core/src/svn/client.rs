@@ -449,6 +449,11 @@ impl SvnClient {
         Ok(stdout)
     }
 
+    /// Public wrapper for running SVN commands in a working copy directory.
+    pub async fn run_svn_in_dir_public(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
+        self.run_svn_in_dir(dir, args).await
+    }
+
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
         let mut cmd = Command::new("svn");
         cmd.current_dir(dir)

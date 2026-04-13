@@ -941,7 +941,48 @@ impl SyncEngine {
 
             // 4. Stage changes in SVN.
             let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+
+            // 4a. Pre-add parent directories for new files, sorted by depth
+            // (shallowest first). This ensures SVN's WC database has entries
+            // for every parent node before we add child files. Without this,
+            // `svn add --parents` can fail with E150000 when the WC metadata
+            // for a parent directory is absent or stale.
             if !added_files.is_empty() {
+                let mut dirs_to_add: Vec<String> = Vec::new();
+                for file_path in &added_files {
+                    let path = std::path::Path::new(file_path);
+                    let mut ancestors = Vec::new();
+                    let mut current = path.parent();
+                    while let Some(p) = current {
+                        if p.as_os_str().is_empty() {
+                            break;
+                        }
+                        ancestors.push(p.to_string_lossy().to_string());
+                        current = p.parent();
+                    }
+                    // Reverse so shallowest first
+                    ancestors.reverse();
+                    for dir in ancestors {
+                        if !dirs_to_add.contains(&dir) {
+                            let dir_on_disk = svn_wc_dir.path().join(&dir);
+                            let svn_dir = dir_on_disk.join(".svn");
+                            // Only add directories that exist on disk but might not be versioned
+                            if dir_on_disk.is_dir() && !svn_dir.exists() {
+                                dirs_to_add.push(dir);
+                            }
+                        }
+                    }
+                }
+
+                // Add unversioned parent directories (shallowest first)
+                for dir in &dirs_to_add {
+                    debug!(dir = %dir, "pre-adding unversioned parent directory");
+                    let _ = svn.run_svn_in_dir_public(
+                        svn_wc_dir.path(),
+                        &["add", "--depth", "empty", "--force", dir],
+                    ).await;
+                }
+
                 debug!(
                     sha = %change.sha,
                     files = ?added_files,
@@ -1110,15 +1151,39 @@ impl SyncEngine {
             }
 
             // 5. Commit to SVN.
+            // Run svn update immediately before commit to minimize the window
+            // for E155011 "out of date" errors. The WC may be stale if a
+            // previous commit in this batch advanced the server HEAD.
+            {
+                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let _ = svn.update(svn_wc_dir.path()).await;
+            }
+
             let commit_message = format!(
                 "{}\n\n{} synced from Git {}",
                 change.message,
                 SYNC_MARKER,
                 &change.sha[..8.min(change.sha.len())]
             );
-            let svn_commit_result = svn
+            let mut svn_commit_result = svn
                 .commit(svn_wc_dir.path(), &commit_message, &svn_username)
                 .await;
+
+            // Retry once on E155011 (out of date) — run svn update and try again
+            if let Err(ref e) = svn_commit_result {
+                let err_str = e.to_string();
+                if err_str.contains("E155011") || err_str.contains("out of date") {
+                    warn!(
+                        sha = %change.sha,
+                        "svn commit got 'out of date' — updating WC and retrying"
+                    );
+                    let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let _ = svn.update(svn_wc_dir.path()).await;
+                    svn_commit_result = svn
+                        .commit(svn_wc_dir.path(), &commit_message, &svn_username)
+                        .await;
+                }
+            }
 
             // Handle "nothing to commit" gracefully — the SVN working copy
             // was already in sync (e.g. files were already synced by a prior

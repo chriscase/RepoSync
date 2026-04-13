@@ -609,12 +609,16 @@ impl Scheduler {
                         // after pulling the remote changes. Sending error cards for
                         // every transient conflict creates noise.
                         let error_str = e.to_string();
-                        let is_transient_push = error_str.contains("non-fast-forward");
+                        let is_transient = error_str.contains("non-fast-forward")
+                            || error_str.contains("E155011")  // SVN "out of date"
+                            || error_str.contains("E150000")  // SVN "can't find parent"
+                            || error_str.contains("out of date");
 
-                        if is_transient_push {
+                        if is_transient {
                             info!(
                                 repo_name = %repo_name,
-                                "push rejected (non-fast-forward) — will retry next cycle"
+                                "transient sync error — will retry next cycle: {}",
+                                &error_str[..error_str.len().min(100)]
                             );
                         } else {
                             let sanitized_error = reposync_core::errors::sanitize_error_message(&error_str);
