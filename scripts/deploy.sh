@@ -123,8 +123,23 @@ fi
 
 # ---- Phase 5: Restart daemon ------------------------------------------------
 step "Phase 5: Restart daemon ($(ts))"
-# Use systemd if the service is enabled (preferred), fall back to restart script.
-ssh_cmd "sudo systemctl restart reposync 2>/dev/null && echo 'restarted via systemd' || REPOSYNC_BIN=$REMOTE_REPO_DIR/target/release/reposync-daemon bash $REMOTE_REPO_DIR/scripts/restart-daemon.sh" || true
+# Get PID before restart to verify it actually changed
+OLD_PID=$(ssh $SSH_OPTS "$SSH_HOST" "bash -c 'systemctl show reposync --property=MainPID --value 2>/dev/null || echo 0'")
+log "Pre-restart PID: $OLD_PID"
+
+# Restart via systemd (use bash explicitly to avoid csh issues)
+ssh $SSH_OPTS "$SSH_HOST" "bash -c 'sudo systemctl restart reposync'"
+sleep 3
+
+# Verify PID changed
+NEW_PID=$(ssh $SSH_OPTS "$SSH_HOST" "bash -c 'systemctl show reposync --property=MainPID --value 2>/dev/null || echo 0'")
+log "Post-restart PID: $NEW_PID"
+
+if [[ "$OLD_PID" == "$NEW_PID" ]] && [[ "$OLD_PID" != "0" ]]; then
+    echo "WARNING: Daemon PID did not change ($OLD_PID → $NEW_PID). Restart may have failed!"
+else
+    log "Daemon restarted: PID $OLD_PID → $NEW_PID"
+fi
 
 # ---- Phase 6: Post-deploy verification --------------------------------------
 step "Phase 6: Verify deployment ($(ts))"
