@@ -324,7 +324,7 @@ fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
 
     // Push the initial commit to origin to establish the branch.
     git_client
-        .push("origin", "main", None)
+        .push("origin", "main")
         .expect("failed to push initial commit to origin");
 
     git_client
@@ -1458,7 +1458,7 @@ fn test_git_client_init_commit_push() {
     assert_eq!(git_client.get_head_sha().unwrap(), oid.to_string());
 
     // Push to bare origin.
-    git_client.push("origin", "main", None).unwrap();
+    git_client.push("origin", "main").unwrap();
 
     // Verify push landed in bare repo.
     let bare_repo = git2::Repository::open_bare(&bare_dir).unwrap();

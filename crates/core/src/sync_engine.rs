@@ -60,6 +60,21 @@ impl std::fmt::Display for SyncState {
     }
 }
 
+/// A single commit synced during a cycle (for rich notifications).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncedCommit {
+    /// "svn_to_git" or "git_to_svn"
+    pub direction: String,
+    /// Author name (Git author or SVN committer)
+    pub author: String,
+    /// Full commit message (first line used as summary)
+    pub message: String,
+    /// Number of files changed
+    pub files_changed: usize,
+    /// Short identifier — SVN revision ("r1234") or Git SHA prefix ("abc1234")
+    pub revision_id: String,
+}
+
 /// Statistics from a single sync cycle.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncStats {
@@ -71,6 +86,8 @@ pub struct SyncStats {
     pub completed_at: Option<String>,
     /// Recent commit messages synced in this cycle (for notifications).
     pub recent_messages: Vec<String>,
+    /// Rich commit details for Teams notifications (max 10).
+    pub synced_commits: Vec<SyncedCommit>,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,17 +371,39 @@ impl SyncEngine {
         // 4. Apply Git -> SVN.
         stats.git_to_svn_count = self.sync_git_to_svn(&git_changes).await?;
 
-        // Collect recent commit messages for notifications (first line only, max 5)
+        // Collect commit details for notifications (max 10 commits)
         for change in &svn_changes {
             let first_line = change.message.lines().next().unwrap_or("").to_string();
             if !first_line.is_empty() && stats.recent_messages.len() < 5 {
                 stats.recent_messages.push(first_line);
+            }
+            if stats.synced_commits.len() < 10 {
+                stats.synced_commits.push(SyncedCommit {
+                    direction: "svn_to_git".to_string(),
+                    author: change.author.clone(),
+                    message: change.message.clone(),
+                    files_changed: change.changed_files.len(),
+                    revision_id: format!("r{}", change.revision),
+                });
             }
         }
         for change in &git_changes {
             let first_line = change.message.lines().next().unwrap_or("").to_string();
             if !first_line.is_empty() && stats.recent_messages.len() < 5 {
                 stats.recent_messages.push(first_line);
+            }
+            if stats.synced_commits.len() < 10 {
+                stats.synced_commits.push(SyncedCommit {
+                    direction: "git_to_svn".to_string(),
+                    author: change.author_name.clone(),
+                    message: change.message.clone(),
+                    files_changed: change.changed_files.len(),
+                    revision_id: if change.sha.len() >= 7 {
+                        change.sha[..7].to_string()
+                    } else {
+                        change.sha.clone()
+                    },
+                });
             }
         }
 

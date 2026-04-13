@@ -123,6 +123,7 @@ async fn build_test_server() -> (
         prev_net_snapshot: std::sync::Mutex::new(None),
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
     });
 
     let app = Router::new()
@@ -220,6 +221,7 @@ async fn build_test_server_full() -> (
         prev_net_snapshot: std::sync::Mutex::new(None),
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
     });
 
     let app = Router::new()
@@ -343,6 +345,7 @@ async fn build_test_server_with_ldap(
         prev_net_snapshot: std::sync::Mutex::new(None),
         repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
         login_attempts: std::sync::Mutex::new(HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
     });
 
     let app = Router::new()
