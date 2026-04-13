@@ -295,6 +295,7 @@ async fn create_repo(
         allowed_paths: None,
         blocked_patterns: None,
         consecutive_errors: 0,
+        teams_webhook_url: None,
     };
 
     let db = &state.db;
@@ -378,6 +379,7 @@ async fn update_repo(
         allowed_paths: body.allowed_paths.or(existing.allowed_paths),
         blocked_patterns: body.blocked_patterns.or(existing.blocked_patterns),
         consecutive_errors: existing.consecutive_errors,
+        teams_webhook_url: existing.teams_webhook_url,
     };
 
     db.update_repository(&updated)
@@ -1259,6 +1261,7 @@ async fn create_branch_pair(
         allowed_paths: None,
         blocked_patterns: None,
         consecutive_errors: 0,
+        teams_webhook_url: None,
     };
 
     db.insert_repository(&child)

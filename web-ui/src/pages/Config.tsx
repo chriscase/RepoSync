@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api, type AuthorMapping } from '../api';
 
@@ -138,6 +138,144 @@ export default function Config() {
             </button>
           </div>
         </div>
+      </div>
+
+      {/* Notifications Section */}
+      <NotificationsConfig />
+    </div>
+  );
+}
+
+function NotificationsConfig() {
+  const [teamsUrl, setTeamsUrl] = React.useState('');
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+  const [testing, setTesting] = React.useState(false);
+  const [message, setMessage] = React.useState('');
+  const [showSetup, setShowSetup] = React.useState(false);
+
+  React.useEffect(() => {
+    const token = localStorage.getItem('session_token');
+    fetch('/api/config/notifications', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        setTeamsUrl(d.teams_webhook_url || '');
+        setLoading(false);
+      })
+      .catch(() => setLoading(false));
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    setMessage('');
+    const token = localStorage.getItem('session_token');
+    try {
+      await fetch('/api/config/notifications', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ teams_webhook_url: teamsUrl || null }),
+      });
+      setMessage('Saved');
+      setTimeout(() => setMessage(''), 3000);
+    } catch {
+      setMessage('Save failed');
+    }
+    setSaving(false);
+  };
+
+  const testNotification = async () => {
+    setTesting(true);
+    setMessage('');
+    const token = localStorage.getItem('session_token');
+    try {
+      const res = await fetch('/api/config/notifications/test', {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      const d = await res.json();
+      setMessage(d.ok ? 'Test notification sent!' : d.error || 'Failed');
+    } catch {
+      setMessage('Failed to send test');
+    }
+    setTesting(false);
+  };
+
+  if (loading) return null;
+
+  return (
+    <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-6">
+      <h2 className="text-lg font-semibold text-gray-100 mb-4">
+        Notifications — Microsoft Teams
+      </h2>
+
+      <button
+        onClick={() => setShowSetup(!showSetup)}
+        className="text-sm text-blue-400 hover:text-blue-300 mb-4 flex items-center gap-1"
+      >
+        {showSetup ? '▼' : '▶'} Setup Instructions
+      </button>
+
+      {showSetup && (
+        <div className="bg-gray-900/50 border border-gray-700 rounded-lg p-4 mb-4 text-sm text-gray-300 space-y-2">
+          <p className="font-medium text-gray-200">How to create a Teams Webhook:</p>
+          <ol className="list-decimal list-inside space-y-1 ml-2">
+            <li>Open <strong>Microsoft Teams</strong> and go to the channel where you want notifications</li>
+            <li>Click the <strong>••• (More options)</strong> next to the channel name</li>
+            <li>Select <strong>Workflows</strong></li>
+            <li>Search for <strong>"Post to a channel when a webhook request is received"</strong> and select it</li>
+            <li>Name your workflow (e.g., "RepoSync Notifications") and click <strong>Next</strong></li>
+            <li>Select the channel to post to and click <strong>Add workflow</strong></li>
+            <li>Copy the <strong>webhook URL</strong> and paste it below</li>
+          </ol>
+          <p className="text-xs text-gray-500 mt-2">
+            No admin permissions required — any team member can create a workflow on their channel.
+          </p>
+        </div>
+      )}
+
+      <div className="space-y-3">
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Teams Webhook URL</label>
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={teamsUrl}
+              onChange={(e) => setTeamsUrl(e.target.value)}
+              placeholder="https://prod-XX.westus.logic.azure.com/workflows/..."
+              className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
+            />
+            <button
+              onClick={save}
+              disabled={saving}
+              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 text-sm font-medium"
+            >
+              {saving ? 'Saving...' : 'Save'}
+            </button>
+            {teamsUrl && (
+              <button
+                onClick={testNotification}
+                disabled={testing}
+                className="px-4 py-2 border border-gray-600 text-gray-300 rounded-md hover:border-blue-500 hover:text-white disabled:opacity-50 text-sm font-medium"
+              >
+                {testing ? 'Sending...' : 'Test'}
+              </button>
+            )}
+          </div>
+          {message && (
+            <p className={`text-xs mt-1 ${message.includes('fail') ? 'text-red-400' : 'text-green-400'}`}>
+              {message}
+            </p>
+          )}
+        </div>
+        <p className="text-xs text-gray-500">
+          Notifications will be sent for: sync activity, errors, circuit breaker alerts, imports, branch pair changes, and path violations.
+          No-change sync cycles are automatically filtered out.
+        </p>
       </div>
     </div>
   );

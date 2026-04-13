@@ -5,6 +5,7 @@
 
 pub mod email;
 pub mod slack;
+pub mod teams;
 
 use tracing::{info, warn};
 
@@ -17,6 +18,7 @@ use crate::sync_engine::SyncStats;
 pub struct Notifier {
     slack: Option<slack::SlackNotifier>,
     email: Option<email::EmailNotifier>,
+    pub teams: Option<teams::TeamsNotifier>,
 }
 
 impl Notifier {
@@ -39,7 +41,12 @@ impl Notifier {
             _ => None,
         };
 
-        Self { slack, email }
+        let teams = config.teams_webhook_url.as_ref().map(|url| {
+            info!("Teams notifications enabled");
+            teams::TeamsNotifier::new(url.clone())
+        });
+
+        Self { slack, email, teams }
     }
 
     /// Send a conflict notification to all configured channels.

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::HeaderMap;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +90,11 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/config/identity",
             get(get_identity_mappings).put(update_identity_mappings),
         )
+        .route(
+            "/api/config/notifications",
+            get(get_notification_config).post(save_notification_config),
+        )
+        .route("/api/config/notifications/test", post(test_teams_notification))
 }
 
 async fn get_config(
@@ -182,5 +187,96 @@ async fn update_identity_mappings(
     Ok(Json(serde_json::json!({
         "ok": true,
         "count": body.mappings.len(),
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// Notification config (Teams webhook)
+// ---------------------------------------------------------------------------
+
+async fn get_notification_config(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    crate::api::auth::validate_session(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+
+    let db = &state.db;
+    let teams_url = db.get_state("teams_webhook_url").unwrap_or(None).unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "teams_webhook_url": teams_url,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct SaveNotificationConfig {
+    teams_webhook_url: Option<String>,
+}
+
+async fn save_notification_config(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<SaveNotificationConfig>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = crate::api::auth::validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let db = &state.db;
+    let url = body.teams_webhook_url.unwrap_or_default();
+    db.set_state("teams_webhook_url", &url)
+        .map_err(|e| AppError::Internal(format!("db error: {}", e)))?;
+
+    tracing::info!(
+        url_set = !url.is_empty(),
+        "Teams notification webhook URL updated"
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+    })))
+}
+
+async fn test_teams_notification(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = crate::api::auth::validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let db = &state.db;
+    let url = db
+        .get_state("teams_webhook_url")
+        .unwrap_or(None)
+        .unwrap_or_default();
+
+    if url.is_empty() {
+        return Err(AppError::BadRequest("No Teams webhook URL configured".into()));
+    }
+
+    let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
+    notifier
+        .send_test()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to send test notification: {}", e)))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "Test notification sent to Teams",
     })))
 }

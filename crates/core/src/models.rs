@@ -391,6 +391,9 @@ pub struct Repository {
     /// Consecutive permanent error count for circuit breaker.
     #[serde(default)]
     pub consecutive_errors: i64,
+    /// Per-repo Teams webhook URL (overrides global setting).
+    #[serde(default)]
+    pub teams_webhook_url: Option<String>,
 }
 
 fn default_sync_status() -> String {

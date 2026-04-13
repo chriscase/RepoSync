@@ -244,6 +244,7 @@ async fn main() -> Result<()> {
                 allowed_paths: None,
                 blocked_patterns: None,
                 consecutive_errors: 0,
+                teams_webhook_url: None,
             };
             match db.insert_repository(&default_repo) {
                 Ok(()) => {
@@ -592,6 +593,61 @@ async fn main() -> Result<()> {
     );
     let ws_broadcast = web_server.broadcast_sender();
     let listen_addr = config.web.listen.clone();
+
+    // Spawn Teams notification listener if configured.
+    // Subscribes to the same broadcast channel as WebSocket clients
+    // and forwards relevant events to Teams as Adaptive Cards.
+    if let Some(ref teams_url) = config.notifications.teams_webhook_url {
+        let teams_notifier = reposync_core::notify::teams::TeamsNotifier::new(teams_url.clone());
+        let mut teams_rx = ws_broadcast.subscribe();
+        tokio::spawn(async move {
+            info!("Teams notification listener started");
+            loop {
+                match teams_rx.recv().await {
+                    Ok(msg) => {
+                        teams_notifier.process_event(&msg).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "Teams listener lagged, missed events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("Teams listener: broadcast channel closed, shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Also check for Teams webhook URL from database (kv_state)
+    // This allows admin to configure via the Settings UI without restarting
+    {
+        let check_db = reposync_core::db::Database::new(&config.daemon.data_dir.join("reposync.db"))
+            .ok();
+        let db_teams_url = check_db
+            .and_then(|db| db.get_state("teams_webhook_url").ok().flatten())
+            .filter(|v| !v.is_empty());
+        if let Some(ref url) = db_teams_url {
+            if config.notifications.teams_webhook_url.is_none() {
+                let teams_notifier = reposync_core::notify::teams::TeamsNotifier::new(url.clone());
+                let mut teams_rx = ws_broadcast.subscribe();
+                tokio::spawn(async move {
+                    info!("Teams notification listener started (from DB config)");
+                    loop {
+                        match teams_rx.recv().await {
+                            Ok(msg) => {
+                                teams_notifier.process_event(&msg).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(skipped = n, "Teams listener lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+        }
+    }
     let app_state_for_cleanup = web_server.app_state();
     let app_state_for_shutdown = web_server.app_state();
 

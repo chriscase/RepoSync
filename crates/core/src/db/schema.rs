@@ -286,6 +286,13 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         ALTER TABLE repositories ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0;
         "#,
     ),
+    (
+        12,
+        "per-repo Teams webhook URL",
+        r#"
+        ALTER TABLE repositories ADD COLUMN teams_webhook_url TEXT;
+        "#,
+    ),
 ];
 
 /// Run all pending migrations against `conn`.
@@ -334,7 +341,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 11);
+        assert_eq!(get_schema_version(&conn).unwrap(), 12);
     }
 
     #[test]

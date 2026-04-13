@@ -384,6 +384,14 @@ pub struct NotificationConfig {
     /// Resolved Slack webhook URL.
     #[serde(skip)]
     pub slack_webhook_url: Option<String>,
+
+    /// Environment variable holding the Teams webhook URL.
+    #[serde(default)]
+    pub teams_webhook_url_env: Option<String>,
+
+    /// Resolved Teams webhook URL (set at runtime from env or DB).
+    #[serde(skip)]
+    pub teams_webhook_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +565,12 @@ impl AppConfig {
         if let Some(ref env_name) = self.notifications.slack_webhook_url_env {
             self.notifications.slack_webhook_url =
                 resolve_optional_env(env_name, "notifications.slack_webhook_url_env");
+        }
+
+        // Teams webhook URL
+        if let Some(ref env_name) = self.notifications.teams_webhook_url_env {
+            self.notifications.teams_webhook_url =
+                resolve_optional_env(env_name, "notifications.teams_webhook_url_env");
         }
 
         debug!("environment variable resolution complete");
