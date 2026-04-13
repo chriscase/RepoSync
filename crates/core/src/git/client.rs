@@ -219,58 +219,35 @@ impl GitClient {
         token: Option<&str>,
     ) -> Result<(), GitError> {
         self.fetch(remote_name, token)?;
-        let fetch_head_ref = format!("refs/remotes/{}/{}", remote_name, branch);
-        let fetch_commit = match self.repo.find_reference(&fetch_head_ref) {
-            Ok(reference) => match reference.peel_to_commit() {
-                Ok(commit) => Some(commit),
-                Err(e) => {
-                    debug!(error = %e, "fetched ref could not be peeled to commit; treating remote as empty");
-                    None
-                }
-            },
-            Err(e) if e.code() == git2::ErrorCode::NotFound => {
-                // Remote has no branches at all (brand new empty repo).
+
+        // Use git CLI for the reset/checkout step instead of libgit2.
+        // libgit2's checkout_head does not support Git LFS smudge filters,
+        // causing "failed to read file into stream" for any LFS-tracked file.
+        let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
+        let remote_ref = format!("{}/{}", remote_name, branch);
+
+        let output = std::process::Command::new("git")
+            .args(["reset", "--hard", &remote_ref])
+            .current_dir(repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::IoError)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // If the remote ref doesn't exist yet (empty remote), that's OK
+            if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
                 info!(
                     remote = remote_name,
                     branch,
                     "remote has no '{}' branch yet; treating as empty remote",
                     branch
                 );
-                None
+                return Ok(());
             }
-            Err(e) => return Err(e.into()),
-        };
-
-        let Some(fetch_commit) = fetch_commit else {
-            // Empty remote — nothing to merge. The local repo may also be
-            // empty; either way, sync_svn_to_git will create the initial
-            // commit and push it.
-            return Ok(());
-        };
-
-        // Try to fast-forward the local branch. If HEAD isn't on a branch
-        // yet (e.g., fresh clone with no checkout), set HEAD to the fetched
-        // ref's commit and checkout.
-        match self.repo.head() {
-            Ok(head_ref) if head_ref.is_branch() => {
-                let mut head_ref_mut = self
-                    .repo
-                    .find_reference(head_ref.name().unwrap_or("HEAD"))?;
-                head_ref_mut.set_target(fetch_commit.id(), "reposync: fast-forward pull")?;
-                self.repo.set_head(head_ref.name().unwrap_or("HEAD"))?;
-                self.repo
-                    .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
-            }
-            _ => {
-                // No local branch checked out — create one tracking the
-                // remote branch and check it out.
-                let local_ref = format!("refs/heads/{}", branch);
-                self.repo
-                    .reference(&local_ref, fetch_commit.id(), true, "reposync: initial track")?;
-                self.repo.set_head(&local_ref)?;
-                self.repo
-                    .checkout_head(Some(git2::build::CheckoutBuilder::new().force()))?;
-            }
+            return Err(GitError::Git2Error(git2::Error::from_str(
+                &format!("git reset --hard {} failed: {}", remote_ref, stderr.trim())
+            )));
         }
         info!("pull completed");
         Ok(())
