@@ -1145,10 +1145,33 @@ impl SyncEngine {
                 SYNC_MARKER,
                 &change.sha[..8.min(change.sha.len())]
             );
-            let svn_rev = svn
+            let svn_commit_result = svn
                 .commit(svn_wc_dir.path(), &commit_message, &svn_username)
-                .await
-                .map_err(SyncError::SvnError)?;
+                .await;
+
+            // Handle "nothing to commit" gracefully — the SVN working copy
+            // was already in sync (e.g. files were already synced by a prior
+            // cycle, or this is an echo commit the detection didn't catch).
+            let svn_rev = match svn_commit_result {
+                Ok(rev) => rev,
+                Err(crate::errors::SvnError::NothingToCommit) => {
+                    info!(
+                        sha = %change.sha,
+                        "svn commit: nothing to commit — files already in sync, advancing watermark"
+                    );
+                    // Advance git watermark so we don't retry this commit
+                    let _ = self.db.set_state("last_git_hash", &change.sha);
+                    if let Some(rid) = self.effective_repo_id() {
+                        let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
+                        let current_svn_rev = self.db.get_repo_watermark(rid)
+                            .map(|(rev, _)| rev)
+                            .unwrap_or(0);
+                        let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(SyncError::SvnError(e)),
+            };
 
             // 6. Record the sync only after successful write.
             let record = crate::models::SyncRecord {

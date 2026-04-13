@@ -68,6 +68,10 @@ pub enum SvnError {
     #[error("svn revision {0} not found")]
     RevisionNotFound(i64),
 
+    /// SVN commit returned success but nothing was committed (working copy clean).
+    #[error("nothing to commit")]
+    NothingToCommit,
+
     /// A checkout / working-copy operation failed.
     #[error("svn working copy error at '{path}': {detail}")]
     WorkingCopyError { path: String, detail: String },

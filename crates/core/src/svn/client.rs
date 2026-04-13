@@ -135,6 +135,14 @@ impl SvnClient {
         let output = self
             .run_svn_in_dir(path, &["commit", "-m", message, &path_str])
             .await?;
+
+        // SVN returns exit 0 with empty output when there's nothing to commit.
+        // This is not an error — it just means the working copy is clean.
+        if output.trim().is_empty() {
+            info!("svn commit: nothing to commit (empty output)");
+            return Err(SvnError::NothingToCommit);
+        }
+
         let rev = parse_committed_revision(&output).ok_or_else(|| {
             warn!(raw_output = %output, "failed to parse committed revision from svn commit output");
             SvnError::CommandFailed {
