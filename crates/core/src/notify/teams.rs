@@ -222,7 +222,7 @@ impl TeamsNotifier {
         // Only send on completion or failure, not every progress update
         match phase {
             "completed" => {
-                let repo_id = event.get("repo_id").and_then(|v| v.as_str()).unwrap_or("");
+                let _repo_id = event.get("repo_id").and_then(|v| v.as_str()).unwrap_or("");
                 let total_revs = event.get("total_revs").and_then(|v| v.as_i64()).unwrap_or(0);
                 let commits = event.get("commits_created").and_then(|v| v.as_i64()).unwrap_or(0);
 

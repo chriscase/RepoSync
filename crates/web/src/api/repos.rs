@@ -1258,10 +1258,10 @@ async fn create_branch_pair(
         sync_status: "idle".to_string(),
         total_syncs: 0,
         total_errors: 0,
-        allowed_paths: None,
-        blocked_patterns: None,
+        allowed_paths: parent.allowed_paths.clone(),
+        blocked_patterns: parent.blocked_patterns.clone(),
         consecutive_errors: 0,
-        teams_webhook_url: None,
+        teams_webhook_url: parent.teams_webhook_url.clone(),
     };
 
     db.insert_repository(&child)
