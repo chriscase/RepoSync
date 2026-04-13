@@ -683,8 +683,12 @@ impl SyncEngine {
                 // Save HEAD before committing so we can roll back on push failure
                 let pre_commit_head = git.head_sha().ok();
 
+                // Use commit_via_cli instead of libgit2's commit() so that
+                // the git CLI's LFS clean filter runs.  libgit2 does not
+                // support LFS filters and will fail with "failed to read
+                // file into stream" when LFS-tracked files are present.
                 let oid = git
-                    .commit(
+                    .commit_via_cli(
                         &commit_message,
                         &git_identity.name,
                         &git_identity.email,
