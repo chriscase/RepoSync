@@ -20,7 +20,7 @@
 #
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail  # no -e: we handle errors ourselves, don't abort on first failure
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -115,41 +115,58 @@ svn_delete_and_commit() {
 
 git_add_and_push() {
     local branch="$1" msg="$2"
-    (
-        cd "$GIT_REPO"
-        git checkout "$branch" -q 2>/dev/null
-        git fetch origin -q 2>/dev/null
-        git reset --hard "origin/$branch" -q 2>/dev/null
+    cd "$GIT_REPO"
+    git checkout "$branch" -q 2>/dev/null || true
+    git fetch origin -q 2>/dev/null || true
+    # Reset to remote; stash any dirty state from LFS pointer issues
+    git stash -q 2>/dev/null || true
+    git reset --hard "origin/$branch" -q 2>/dev/null || true
+    git stash drop -q 2>/dev/null || true
 
-        git add "$TEST_DIR" 2>/dev/null || true
-        git commit -m "$msg" -q 2>/dev/null || { warn "  Git: nothing to commit"; return 0; }
+    git add "$TEST_DIR" 2>/dev/null || true
+    git commit -m "$msg" -q 2>/dev/null || { warn "  Git: nothing to commit for: $msg"; return 0; }
 
-        # Push with retry on non-fast-forward
-        if ! git push origin "$branch" -q 2>/dev/null; then
-            git pull origin "$branch" --rebase -q 2>/dev/null
-            git push origin "$branch" -q 2>/dev/null || warn "  Git push failed after retry"
+    # Push with up to 3 retries on non-fast-forward
+    local pushed=false
+    for attempt in 1 2 3; do
+        if git push origin "$branch" -q 2>/dev/null; then
+            pushed=true
+            break
         fi
+        git fetch origin -q 2>/dev/null || true
+        git rebase "origin/$branch" -q 2>/dev/null || {
+            git rebase --abort 2>/dev/null || true
+            git reset --hard "origin/$branch" -q 2>/dev/null || true
+            # Re-create the file and commit again
+            git add "$TEST_DIR" 2>/dev/null || true
+            git commit -m "$msg" -q 2>/dev/null || true
+        }
+    done
+    if [[ "$pushed" == true ]]; then
         log "  Git: $msg ($branch)"
-    )
+    else
+        warn "  Git: push failed after 3 attempts: $msg ($branch)"
+    fi
 }
 
 git_delete_and_push() {
     local branch="$1" file="$2" msg="$3"
-    (
-        cd "$GIT_REPO"
-        git checkout "$branch" -q 2>/dev/null
-        git fetch origin -q 2>/dev/null
-        git reset --hard "origin/$branch" -q 2>/dev/null
+    cd "$GIT_REPO"
+    git checkout "$branch" -q 2>/dev/null || true
+    git fetch origin -q 2>/dev/null || true
+    git stash -q 2>/dev/null || true
+    git reset --hard "origin/$branch" -q 2>/dev/null || true
+    git stash drop -q 2>/dev/null || true
 
-        git rm "$file" -q 2>/dev/null || { warn "  Git: file not found for delete"; return 0; }
-        git commit -m "$msg" -q 2>/dev/null
+    git rm "$file" -q 2>/dev/null || { warn "  Git: file not found for delete: $file"; return 0; }
+    git commit -m "$msg" -q 2>/dev/null || { warn "  Git: nothing to commit for delete"; return 0; }
 
-        if ! git push origin "$branch" -q 2>/dev/null; then
-            git pull origin "$branch" --rebase -q 2>/dev/null
-            git push origin "$branch" -q 2>/dev/null || warn "  Git push failed after retry"
-        fi
-        log "  Git: $msg ($branch)"
-    )
+    if ! git push origin "$branch" -q 2>/dev/null; then
+        git fetch origin -q 2>/dev/null || true
+        git rebase "origin/$branch" -q 2>/dev/null || git rebase --abort 2>/dev/null || true
+        git push origin "$branch" -q 2>/dev/null || warn "  Git push failed after retry: $msg"
+    fi
+    log "  Git: $msg ($branch)"
 }
 
 # ---- PR helpers -------------------------------------------------------------
