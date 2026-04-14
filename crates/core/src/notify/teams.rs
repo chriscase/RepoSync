@@ -85,8 +85,16 @@ impl TeamsNotifier {
         };
 
         if let Some(body) = card_body {
+            let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            info!(
+                event_type,
+                repo_name,
+                "sending Teams notification"
+            );
             if let Err(e) = self.send_card(body).await {
-                warn!(error = %e, event_type, "failed to send Teams notification");
+                warn!(error = %e, event_type, repo_name, "failed to send Teams notification");
+            } else {
+                info!(event_type, repo_name, "Teams notification sent");
             }
             true
         } else {
