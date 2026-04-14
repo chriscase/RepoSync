@@ -1012,20 +1012,32 @@ impl SyncEngine {
             // verify that changes were actually staged.
             if !added_files.is_empty() {
                 debug!(sha = %change.sha, count = added_files.len(), "staging additions");
-                // svn add --force . adds everything it can. Errors about
-                // parent nodes (E150000, W155010) are expected when new
-                // directories are walked in arbitrary order — SVN adds
-                // what it can on the first pass. We ignore ALL errors
-                // here and rely on `svn status` below to verify changes
-                // were staged. If nothing was staged, we skip the commit.
-                let _ = svn.run_svn_in_dir_public(
-                    svn_wc_dir.path(), &["add", "--force", "."]
-                ).await;
-                // Second pass: retry to pick up anything the first pass
-                // missed (parent dirs are now registered from pass 1).
-                let _ = svn.run_svn_in_dir_public(
-                    svn_wc_dir.path(), &["add", "--force", "."]
-                ).await;
+                // svn add --force . adds everything it can per pass.
+                // New nested directories may need multiple passes because
+                // SVN walks files in arbitrary order and can encounter a
+                // child before its parent is registered. We loop until
+                // a pass produces no new additions (converged).
+                for pass in 1..=10 {
+                    let result = svn.run_svn_in_dir_public(
+                        svn_wc_dir.path(), &["add", "--force", "."]
+                    ).await;
+                    match result {
+                        Ok(output) => {
+                            // If no "A " lines in output, nothing new was added
+                            if !output.lines().any(|l| l.starts_with('A')) {
+                                break;
+                            }
+                            debug!(sha = %change.sha, pass, "svn add pass added new items");
+                        }
+                        Err(_) => {
+                            // Errors are expected (E150000, W155010).
+                            // Keep looping — next pass picks up more.
+                            if pass == 10 {
+                                warn!(sha = %change.sha, "svn add still has errors after 10 passes");
+                            }
+                        }
+                    }
+                }
             }
             if !deleted_files.is_empty() {
                 debug!(sha = %change.sha, count = deleted_files.len(), "staging deletions");
