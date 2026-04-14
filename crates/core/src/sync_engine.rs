@@ -1004,11 +1004,32 @@ impl SyncEngine {
             // directory in one atomic operation, avoiding all E150000
             // parent-node issues. The --force flag makes it a no-op for
             // already-versioned items.
+            //
+            // NOTE: We ignore errors from this command because `svn add`
+            // emits W155010 warnings (and exits non-zero) for nodes that
+            // are not found in the WC — but it still successfully adds
+            // everything it can. The subsequent `svn status` check will
+            // verify that changes were actually staged.
             if !added_files.is_empty() {
                 debug!(sha = %change.sha, count = added_files.len(), "staging additions");
-                svn.run_svn_in_dir_public(svn_wc_dir.path(), &["add", "--force", "."])
-                    .await
-                    .map_err(SyncError::SvnError)?;
+                let add_result = svn.run_svn_in_dir_public(
+                    svn_wc_dir.path(), &["add", "--force", "."]
+                ).await;
+                if let Err(ref e) = add_result {
+                    // Only fail on real errors, not warnings about nodes not found
+                    let err_str = e.to_string();
+                    if !err_str.contains("W155010") && !err_str.contains("W150002")
+                        && !err_str.contains("already under version control")
+                    {
+                        add_result.map_err(SyncError::SvnError)?;
+                    } else {
+                        debug!(
+                            sha = %change.sha,
+                            "svn add warnings (non-fatal): {}",
+                            &err_str[..err_str.len().min(200)]
+                        );
+                    }
+                }
             }
             if !deleted_files.is_empty() {
                 debug!(sha = %change.sha, count = deleted_files.len(), "staging deletions");
