@@ -999,22 +999,19 @@ impl SyncEngine {
             // 4. Stage changes in SVN.
             let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
+            // Stage ALL changes at once using `svn add --force .` from the
+            // WC root. This recursively adds every unversioned file and
+            // directory in one atomic operation, avoiding all E150000
+            // parent-node issues. The --force flag makes it a no-op for
+            // already-versioned items.
             if !added_files.is_empty() {
-                debug!(
-                    sha = %change.sha,
-                    files = ?added_files,
-                    "running svn add"
-                );
-                svn.add_with_retry(svn_wc_dir.path(), &added_files)
+                debug!(sha = %change.sha, count = added_files.len(), "staging additions");
+                svn.run_svn_in_dir_public(svn_wc_dir.path(), &["add", "--force", "."])
                     .await
                     .map_err(SyncError::SvnError)?;
             }
             if !deleted_files.is_empty() {
-                debug!(
-                    sha = %change.sha,
-                    files = ?deleted_files,
-                    "running svn rm"
-                );
+                debug!(sha = %change.sha, count = deleted_files.len(), "staging deletions");
                 svn.rm(svn_wc_dir.path(), &deleted_files)
                     .await
                     .map_err(SyncError::SvnError)?;
