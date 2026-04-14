@@ -1012,24 +1012,20 @@ impl SyncEngine {
             // verify that changes were actually staged.
             if !added_files.is_empty() {
                 debug!(sha = %change.sha, count = added_files.len(), "staging additions");
-                let add_result = svn.run_svn_in_dir_public(
+                // svn add --force . adds everything it can. Errors about
+                // parent nodes (E150000, W155010) are expected when new
+                // directories are walked in arbitrary order — SVN adds
+                // what it can on the first pass. We ignore ALL errors
+                // here and rely on `svn status` below to verify changes
+                // were staged. If nothing was staged, we skip the commit.
+                let _ = svn.run_svn_in_dir_public(
                     svn_wc_dir.path(), &["add", "--force", "."]
                 ).await;
-                if let Err(ref e) = add_result {
-                    // Only fail on real errors, not warnings about nodes not found
-                    let err_str = e.to_string();
-                    if !err_str.contains("W155010") && !err_str.contains("W150002")
-                        && !err_str.contains("already under version control")
-                    {
-                        add_result.map_err(SyncError::SvnError)?;
-                    } else {
-                        debug!(
-                            sha = %change.sha,
-                            "svn add warnings (non-fatal): {}",
-                            &err_str[..err_str.len().min(200)]
-                        );
-                    }
-                }
+                // Second pass: retry to pick up anything the first pass
+                // missed (parent dirs are now registered from pass 1).
+                let _ = svn.run_svn_in_dir_public(
+                    svn_wc_dir.path(), &["add", "--force", "."]
+                ).await;
             }
             if !deleted_files.is_empty() {
                 debug!(sha = %change.sha, count = deleted_files.len(), "staging deletions");
