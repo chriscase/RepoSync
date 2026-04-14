@@ -1012,31 +1012,45 @@ impl SyncEngine {
             // verify that changes were actually staged.
             if !added_files.is_empty() {
                 debug!(sha = %change.sha, count = added_files.len(), "staging additions");
-                // svn add --force . adds everything it can per pass.
-                // New nested directories may need multiple passes because
-                // SVN walks files in arbitrary order and can encounter a
-                // child before its parent is registered. We loop until
-                // a pass produces no new additions (converged).
-                for pass in 1..=10 {
-                    let result = svn.run_svn_in_dir_public(
-                        svn_wc_dir.path(), &["add", "--force", "."]
-                    ).await;
-                    match result {
-                        Ok(output) => {
-                            // If no "A " lines in output, nothing new was added
-                            if !output.lines().any(|l| l.starts_with('A')) {
-                                break;
-                            }
-                            debug!(sha = %change.sha, pass, "svn add pass added new items");
+
+                // Collect all parent directories that need adding, sorted
+                // shallowest-first. Then add directories top-down, then files.
+                // This guarantees every parent is registered in SVN's WC
+                // database before any child is added.
+                let mut dirs_to_add: Vec<String> = Vec::new();
+                for file_path in &added_files {
+                    let p = std::path::Path::new(file_path);
+                    let mut cur = p.parent();
+                    while let Some(dir) = cur {
+                        if dir.as_os_str().is_empty() { break; }
+                        let ds = dir.to_string_lossy().to_string();
+                        if !dirs_to_add.contains(&ds) {
+                            dirs_to_add.push(ds);
                         }
-                        Err(_) => {
-                            // Errors are expected (E150000, W155010).
-                            // Keep looping — next pass picks up more.
-                            if pass == 10 {
-                                warn!(sha = %change.sha, "svn add still has errors after 10 passes");
-                            }
-                        }
+                        cur = dir.parent();
                     }
+                }
+                // Sort by depth (shallowest first = fewest separators)
+                dirs_to_add.sort_by_key(|d| d.matches('/').count());
+
+                // Add each directory individually, shallowest first.
+                // --force makes it a no-op for already-versioned dirs.
+                for dir in &dirs_to_add {
+                    let full = svn_wc_dir.path().join(dir);
+                    if full.is_dir() {
+                        let _ = svn.run_svn_in_dir_public(
+                            svn_wc_dir.path(),
+                            &["add", "--force", "--depth", "empty", dir],
+                        ).await;
+                    }
+                }
+
+                // Now add the actual files — parents are guaranteed registered.
+                for file in &added_files {
+                    let _ = svn.run_svn_in_dir_public(
+                        svn_wc_dir.path(),
+                        &["add", "--force", file],
+                    ).await;
                 }
             }
             if !deleted_files.is_empty() {
