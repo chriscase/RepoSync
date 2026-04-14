@@ -865,6 +865,45 @@ impl SyncEngine {
                 contents
             };
 
+            // 1b. EARLY filter: remove files that don't match allowed_paths
+            // BEFORE copying to SVN WC. This prevents svn add from failing
+            // on paths like SLS/ that don't exist in the SVN branch structure.
+            let file_contents: Vec<(String, String, Option<Vec<u8>>)> = if !self.allowed_paths.is_empty() {
+                file_contents
+                    .into_iter()
+                    .filter(|(action, path, _)| {
+                        if action == "D" {
+                            // Allow deletes even for blocked paths
+                            true
+                        } else if self.allowed_paths.iter().any(|prefix| path.starts_with(prefix)) {
+                            true
+                        } else {
+                            debug!(
+                                sha = %change.sha,
+                                path = %path,
+                                "early filter: skipping file not under allowed_paths"
+                            );
+                            false
+                        }
+                    })
+                    .collect()
+            } else {
+                file_contents
+            };
+
+            if file_contents.is_empty() {
+                // All files were filtered out — advance watermark and skip
+                let _ = self.db.set_state("last_git_hash", &change.sha);
+                if let Some(rid) = self.effective_repo_id() {
+                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
+                    let current_svn_rev = self.db.get_repo_watermark(rid)
+                        .map(|(rev, _)| rev)
+                        .unwrap_or(0);
+                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                }
+                continue;
+            }
+
             // 2. Prepare SVN working copy: checkout on first use, update thereafter.
             let svn_url_for_log;
             {
