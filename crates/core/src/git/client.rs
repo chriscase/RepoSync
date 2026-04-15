@@ -173,32 +173,27 @@ impl GitClient {
     /// Fetch from a named remote with a 5-minute timeout.
     #[instrument(skip(self, token))]
     pub fn fetch(&self, remote_name: &str, token: Option<&str>) -> Result<(), GitError> {
-        const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-        info!(remote = remote_name, "fetching");
-        let mut remote = self.repo.find_remote(remote_name)?;
-        let mut callbacks = RemoteCallbacks::new();
-        if let Some(tok) = token {
-            let tok = tok.to_string();
-            callbacks.credentials(move |_url, _username, _allowed| {
-                Cred::userpass_plaintext("x-access-token", &tok)
-            });
+        let _ = token; // credentials embedded in remote URL by ensure_remote_credentials
+        info!(remote = remote_name, "fetching via git CLI");
+        let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
+
+        // Use git CLI for fetch — libgit2's HTTP client fails with 403 on
+        // GitHub Enterprise in some configurations, and doesn't support LFS
+        // filter smudge on fetched refs. The CLI uses the credentials
+        // embedded in the remote URL (set via ensure_remote_credentials).
+        let output = std::process::Command::new("git")
+            .args(["fetch", remote_name, "--prune", "--quiet"])
+            .current_dir(repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::IoError)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitError::Git2Error(git2::Error::from_str(
+                &format!("git fetch failed: {}", stderr.trim())
+            )));
         }
-        // Abort the transfer if it exceeds the timeout.
-        let fetch_start = std::time::Instant::now();
-        let fetch_start_for_cb = fetch_start;
-        callbacks.transfer_progress(move |_stats| {
-            fetch_start_for_cb.elapsed() < FETCH_TIMEOUT
-        });
-        let mut fetch_opts = FetchOptions::new();
-        fetch_opts.remote_callbacks(callbacks);
-        remote.fetch(&[] as &[&str], Some(&mut fetch_opts), None)
-            .map_err(|e| {
-                if fetch_start.elapsed() >= FETCH_TIMEOUT {
-                    GitError::ApplyFailed(format!("git fetch timed out after {}s", FETCH_TIMEOUT.as_secs()))
-                } else {
-                    e.into()
-                }
-            })?;
         debug!("fetch completed");
         Ok(())
     }
