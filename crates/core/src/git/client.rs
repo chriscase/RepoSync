@@ -2,10 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use git2::{
-    BranchType, Cred, FetchOptions, IndexAddOption, Oid, RemoteCallbacks, Repository,
-    Signature,
-};
+use git2::{BranchType, IndexAddOption, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -148,25 +145,44 @@ impl GitClient {
         let Some(url) = remote.url() else {
             return Ok(());
         };
-        // Only modify http(s) URLs that don't already have credentials.
+        // Only modify http(s) URLs.
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Ok(());
         }
-        if url.contains('@') {
-            // Already has credentials embedded — leave it alone.
-            return Ok(());
-        }
-        // Insert x-access-token:<tok>@ after the scheme.
-        let new_url = if let Some(rest) = url.strip_prefix("https://") {
-            format!("https://x-access-token:{}@{}", tok, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            format!("http://x-access-token:{}@{}", tok, rest)
+
+        // Strip any existing credentials (old/stale token) from the URL,
+        // then re-embed with the current token. This ensures that when the
+        // token is rotated in the dashboard, the remote URL picks up the
+        // new value on the next sync cycle — no manual intervention needed.
+        let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+            ("https://", r)
+        } else if let Some(r) = url.strip_prefix("http://") {
+            ("http://", r)
         } else {
             return Ok(());
         };
-        info!("updating remote URL to embed credentials");
-        self.repo
-            .remote_set_url(remote_name, &new_url)?;
+
+        // Strip existing "user:pass@" prefix if present
+        let hostpath = if let Some(at_pos) = rest.find('@') {
+            // But only if the @ is before the first '/' (i.e., part of userinfo,
+            // not part of the path)
+            let slash_pos = rest.find('/').unwrap_or(rest.len());
+            if at_pos < slash_pos {
+                &rest[at_pos + 1..]
+            } else {
+                rest
+            }
+        } else {
+            rest
+        };
+
+        let new_url = format!("{}x-access-token:{}@{}", scheme, tok, hostpath);
+
+        // Only update if the URL actually changed (avoid spurious writes).
+        if url != new_url {
+            info!("updating remote URL to embed fresh credentials");
+            self.repo.remote_set_url(remote_name, &new_url)?;
+        }
         Ok(())
     }
 

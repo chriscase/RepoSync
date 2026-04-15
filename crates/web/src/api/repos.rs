@@ -983,7 +983,58 @@ async fn save_credentials(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('secret_git_token', ?1, ?2)",
                 rusqlite::params![token, now],
             );
-            tracing::info!(repo_id = %id, "Git token stored for repository");
+
+            // Propagate to all descendant branch pairs so a single token
+            // rotation at the parent doesn't require manual updates on
+            // every child. Uses BFS to walk the full descendant tree.
+            let mut queue: Vec<String> = vec![id.clone()];
+            let mut propagated = 0;
+            while let Some(current) = queue.pop() {
+                if let Ok(children) = db.list_child_repositories(&current) {
+                    for child in children {
+                        let child_key = format!("secret_git_token_{}", child.id);
+                        let _ = db.conn().execute(
+                            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![child_key, token, now],
+                        );
+                        queue.push(child.id);
+                        propagated += 1;
+                    }
+                }
+            }
+            tracing::info!(
+                repo_id = %id,
+                propagated_to_children = propagated,
+                "Git token stored and propagated to descendants"
+            );
+        }
+    }
+
+    if let Some(ref password) = body.svn_password {
+        if !password.is_empty() {
+            // Also propagate SVN password to descendants for the same reason.
+            let mut queue: Vec<String> = vec![id.clone()];
+            let mut propagated = 0;
+            while let Some(current) = queue.pop() {
+                if let Ok(children) = db.list_child_repositories(&current) {
+                    for child in children {
+                        let child_key = format!("secret_svn_password_{}", child.id);
+                        let _ = db.conn().execute(
+                            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![child_key, password, now],
+                        );
+                        queue.push(child.id);
+                        propagated += 1;
+                    }
+                }
+            }
+            if propagated > 0 {
+                tracing::info!(
+                    repo_id = %id,
+                    propagated_to_children = propagated,
+                    "SVN password propagated to descendants"
+                );
+            }
         }
     }
 
