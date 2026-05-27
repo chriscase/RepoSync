@@ -363,10 +363,11 @@ impl GitClient {
             .map_err(GitError::IoError)?;
 
         if diff_output.status.success() {
-            // Exit code 0 means no staged changes — nothing to commit.
-            return Err(GitError::Git2Error(git2::Error::from_str(
-                "nothing to commit (working tree clean)",
-            )));
+            // Exit code 0 means no staged changes — nothing to commit. Surface
+            // a distinct variant so callers can treat a no-op revision as such
+            // instead of a failure (import already skips it; the sync engine
+            // records it as a no-op and advances the watermark).
+            return Err(GitError::NothingToCommit);
         }
 
         // Build the commit via git CLI with explicit author/committer.

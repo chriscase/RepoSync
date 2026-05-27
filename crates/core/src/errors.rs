@@ -134,6 +134,13 @@ pub enum GitError {
     #[error("git apply failed: {0}")]
     ApplyFailed(String),
 
+    /// `git commit` found no staged changes: the revision produced no net
+    /// change in the working tree (e.g. a delete of an already-absent path,
+    /// or exported content byte-identical to what the mirror already has).
+    /// This is NOT a failure — callers should treat it as a no-op revision.
+    #[error("nothing to commit (working tree clean)")]
+    NothingToCommit,
+
     /// Generic I/O wrapper.
     #[error("git I/O error: {0}")]
     IoError(#[from] std::io::Error),

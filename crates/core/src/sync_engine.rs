@@ -583,9 +583,32 @@ impl SyncEngine {
                     }
                     let dest = repo_path.join(rel);
                     if cf.action == "D" {
-                        if dest.exists() {
-                            if let Err(e) = std::fs::remove_file(&dest) {
-                                warn!(path = rel, error = %e, "materialize: failed to remove deleted file");
+                        // SVN "D" deletes a file OR a directory, and SVN reports
+                        // the deletion only at the directory level (not per
+                        // descendant). remove_file errors with EISDIR on a
+                        // directory, so dispatch on the actual type:
+                        // remove_dir_all clears the directory and every tracked
+                        // child so the commit records all the deletions.
+                        // symlink_metadata avoids recursing through a symlinked
+                        // dir, and a missing path is treated as already-deleted
+                        // (idempotent — e.g. a parent dir delete already removed
+                        // this child earlier in the loop).
+                        match std::fs::symlink_metadata(&dest) {
+                            Ok(meta) => {
+                                let res = if meta.is_dir() {
+                                    std::fs::remove_dir_all(&dest)
+                                } else {
+                                    std::fs::remove_file(&dest)
+                                };
+                                if let Err(e) = res {
+                                    warn!(path = rel, error = %e, "materialize: failed to remove deleted path");
+                                    materialized = false;
+                                    break;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                warn!(path = rel, error = %e, "materialize: stat failed for deleted path");
                                 materialized = false;
                                 break;
                             }
@@ -742,7 +765,7 @@ impl SyncEngine {
             // so it doesn't poison future pushes. Otherwise the local git
             // history accumulates unpushable commits that block all
             // subsequent syncs.
-            let git_sha = tokio::task::block_in_place(|| {
+            let committed: Option<String> = tokio::task::block_in_place(|| {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
 
                 // Save HEAD before committing so we can roll back on push failure
@@ -752,20 +775,27 @@ impl SyncEngine {
                 // the git CLI's LFS clean filter runs.  libgit2 does not
                 // support LFS filters and will fail with "failed to read
                 // file into stream" when LFS-tracked files are present.
-                let oid = git
-                    .commit_via_cli(
-                        &commit_message,
-                        &git_identity.name,
-                        &git_identity.email,
-                        "reposync",
-                        "sync@reposync.local",
-                    )
-                    .map_err(SyncError::GitError)?;
+                let oid = match git.commit_via_cli(
+                    &commit_message,
+                    &git_identity.name,
+                    &git_identity.email,
+                    "reposync",
+                    "sync@reposync.local",
+                ) {
+                    Ok(oid) => oid,
+                    // No-op revision: nothing staged (e.g. a delete of a path
+                    // already absent from the mirror, or exported bytes identical
+                    // to what is already committed). HEAD is unchanged so there is
+                    // nothing to push; signal a no-op to the caller rather than
+                    // erroring the whole cycle.
+                    Err(crate::errors::GitError::NothingToCommit) => return Ok(None),
+                    Err(e) => return Err(SyncError::GitError(e)),
+                };
 
                 // 4. Push to remote.
                 let branch = &self.config.github.default_branch;
                 match git.push("origin", branch) {
-                    Ok(()) => Ok::<_, SyncError>(oid.to_string()),
+                    Ok(()) => Ok::<_, SyncError>(Some(oid.to_string())),
                     Err(push_err) => {
                         // Push failed — roll back the commit to keep local
                         // history clean. The next sync cycle will re-detect
@@ -792,6 +822,52 @@ impl SyncEngine {
                     }
                 }
             })?;
+
+            // Resolve the git SHA to record. `None` means the revision was a
+            // no-op (the diff/materialize produced no net change — e.g. a delete
+            // of an already-absent path). Treat it like a metadata-only revision:
+            // record it as applied at the UNCHANGED HEAD so the watermark advances
+            // and the self-heal clamp (which pulls back to the max applied svn_rev)
+            // won't claw it back and re-process it every cycle. This is what kept
+            // a trailing no-op revision erroring `nothing to commit` forever.
+            let git_sha = match committed {
+                Some(sha) => sha,
+                None => {
+                    let head = tokio::task::block_in_place(|| {
+                        self.git_client
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .head_sha()
+                            .ok()
+                    });
+                    match head {
+                        Some(h) => {
+                            info!(
+                                rev = change.revision,
+                                head = %h,
+                                "revision produced no git changes; recording no-op at current HEAD"
+                            );
+                            h
+                        }
+                        None => {
+                            // HEAD unreadable (unexpected on a valid mirror).
+                            // Advance the watermark so we don't get stuck, but
+                            // skip recording an applied record this cycle.
+                            warn!(
+                                rev = change.revision,
+                                "no-op revision but HEAD unreadable; advancing watermark without record"
+                            );
+                            if let Some(rid) = self.effective_repo_id() {
+                                let _ = self.db.advance_svn_watermark(rid, change.revision);
+                            }
+                            let _ = self
+                                .db
+                                .set_state(&self.svn_rev_key(), &change.revision.to_string());
+                            continue;
+                        }
+                    }
+                }
+            };
 
             // 5. Record the sync only after successful write.
             let record = crate::models::SyncRecord {
