@@ -539,41 +539,97 @@ impl SyncEngine {
             }
 
             if !diff_applied {
-                // git apply failed for this SVN revision.  During incremental
-                // sync we MUST NOT fall back to a full SVN export because:
-                //   1. It replaces LFS pointers with raw binary content → push rejected
-                //   2. It creates massive commits (hundreds of files) → OOM / pre-receive hook
-                //   3. It can introduce rogue directory paths
+                // Patch-based application failed. This is usually a context
+                // mismatch: the mirror's content has drifted from / fallen
+                // behind SVN's pre-revision state, and a plain `svn diff` has no
+                // `index` line for git's 3-way fallback ("repository lacks the
+                // necessary blob to perform 3-way merge"). It is also vulnerable
+                // to CRLF and svn:keyword expansion.
                 //
-                // Instead, skip this revision and advance the watermark.
-                // The revision's changes are already in SVN; a future
-                // reimport can reconcile any drift.
+                // Rather than skip and strand the revision, reconstruct it by
+                // materializing the revision's CHANGED FILES directly from SVN
+                // (exact bytes via `svn export`). This is scoped to the changed
+                // files only — NOT a full export — so it does not create massive
+                // commits, and the LFS enforcement step below + the commit-time
+                // LFS clean filter keep large files as pointers, avoiding the
+                // pitfalls that got the blanket export fallback disabled.
                 warn!(
                     rev = change.revision,
-                    message = %change.message,
                     files = change.changed_files.len(),
-                    "git apply failed for SVN revision — skipping (export fallback disabled for incremental sync)"
+                    "git apply failed; materializing changed files from SVN at this revision"
                 );
-
-                if let Some(ref rid) = self.repo_id {
-                    let _ = self.db.advance_svn_watermark(rid, change.revision);
+                // The synced branch path (e.g. "trunk" or "branches/dev/ChrisC")
+                // from the repo config. changed_files paths are repository-root-
+                // relative (e.g. "trunk/source/foo"), but `self.url`/`svn export`
+                // and the git mirror are relative to the branch, so strip it.
+                let branch_prefix = self
+                    .effective_repo_id()
+                    .and_then(|rid| self.db.get_repository(rid).ok().flatten())
+                    .map(|r| r.svn_branch.trim_matches('/').to_string())
+                    .unwrap_or_default();
+                let mut materialized = !change.changed_files.is_empty();
+                for cf in &change.changed_files {
+                    let raw = cf.path.trim_start_matches('/');
+                    let rel = if branch_prefix.is_empty() {
+                        raw
+                    } else if raw == branch_prefix {
+                        // bare branch-root dir entry — nothing file-level to materialize
+                        ""
+                    } else {
+                        raw.strip_prefix(&format!("{}/", branch_prefix)).unwrap_or(raw)
+                    };
+                    if rel.is_empty() {
+                        continue;
+                    }
+                    let dest = repo_path.join(rel);
+                    if cf.action == "D" {
+                        if dest.exists() {
+                            if let Err(e) = std::fs::remove_file(&dest) {
+                                warn!(path = rel, error = %e, "materialize: failed to remove deleted file");
+                                materialized = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        if let Some(parent) = dest.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        if let Err(e) = svn.export(rel, change.revision, &dest).await {
+                            warn!(path = rel, rev = change.revision, error = %e, "materialize: svn export failed");
+                            materialized = false;
+                            break;
+                        }
+                    }
                 }
-
-                let _ = self.db.insert_audit_log_with_repo(
-                    "svn_to_git_skip",
-                    Some("svn_to_git"),
-                    Some(change.revision),
-                    None,
-                    Some(&change.author),
-                    Some(&format!(
-                        "Skipped r{}: git apply failed, export fallback disabled. Message: {}",
-                        change.revision,
-                        change.message.lines().next().unwrap_or("")
-                    )),
-                    false,
-                    self.effective_repo_id(),
+                if !materialized {
+                    // Could not reconstruct this revision from SVN. Do NOT advance
+                    // the watermark; stop the cycle so the revision is retried on
+                    // the next poll (no stranding).
+                    warn!(
+                        rev = change.revision,
+                        "could not materialize revision from SVN; stopping cycle to retry next poll"
+                    );
+                    let _ = self.db.insert_audit_log_with_repo(
+                        "svn_to_git_skip",
+                        Some("svn_to_git"),
+                        Some(change.revision),
+                        None,
+                        Some(&change.author),
+                        Some(&format!(
+                            "r{}: git apply failed and SVN materialization failed; will retry. Message: {}",
+                            change.revision,
+                            change.message.lines().next().unwrap_or("")
+                        )),
+                        false,
+                        self.effective_repo_id(),
+                    );
+                    break;
+                }
+                info!(
+                    rev = change.revision,
+                    "materialized revision from SVN export (git apply fallback)"
                 );
-                continue;
+                // Fall through to LFS enforcement + commit/push below.
             }
 
             // 2b. LFS enforcement: after applying changes, scan modified files
@@ -1380,6 +1436,25 @@ impl SyncEngine {
                     let _ = self.db.update_repo_watermark(rid, detected, "");
                 }
                 last_rev = detected;
+            }
+        }
+
+        // Self-heal: never begin a fetch ahead of what we have actually applied
+        // to git. A stored watermark can drift ahead of reality if a prior
+        // failure advanced it without a successful commit (e.g. a credential
+        // outage). Clamp down to the highest applied revision so any stranded
+        // revisions are re-fetched and synced. Skip the clamp when the repo has
+        // no applied records yet (0), to preserve git-history auto-detection.
+        if let Some(rid) = self.effective_repo_id() {
+            if let Ok(applied) = self.db.get_max_applied_svn_rev(rid) {
+                if applied > 0 && applied < last_rev {
+                    warn!(
+                        stored_watermark = last_rev,
+                        last_applied = applied,
+                        "watermark is ahead of last applied revision; self-healing down to applied revision"
+                    );
+                    last_rev = applied;
+                }
             }
         }
 

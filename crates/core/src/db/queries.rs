@@ -2200,6 +2200,21 @@ impl Database {
         Ok(())
     }
 
+    /// Highest SVN revision actually applied to git for a repository.
+    /// This is the ground truth used to self-heal a watermark that has drifted
+    /// ahead of reality (e.g. a failure advanced `last_svn_rev` without a commit).
+    /// Returns 0 when the repo has no applied svn->git records yet.
+    pub fn get_max_applied_svn_rev(&self, repo_id: &str) -> Result<i64, DatabaseError> {
+        let conn = self.conn();
+        let rev: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(svn_rev), 0) FROM sync_records \
+             WHERE repo_id = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        Ok(rev)
+    }
+
     /// Advance only the SVN revision watermark for a repository (no git SHA change).
     /// Used when skipping metadata-only SVN revisions that produce no git commit.
     pub fn advance_svn_watermark(&self, repo_id: &str, svn_rev: i64) -> Result<(), DatabaseError> {

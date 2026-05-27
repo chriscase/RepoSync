@@ -293,6 +293,14 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         ALTER TABLE repositories ADD COLUMN teams_webhook_url TEXT;
         "#,
     ),
+    (
+        13,
+        "composite index for max-applied-svn-rev watermark self-heal lookup",
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_sync_records_repo_dir_status_rev
+            ON sync_records (repo_id, direction, status, svn_rev);
+        "#,
+    ),
 ];
 
 /// Run all pending migrations against `conn`.
