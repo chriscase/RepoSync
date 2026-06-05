@@ -513,6 +513,13 @@ export interface Repository {
   id: string;
   name: string;
   parent_id: string | null;
+  /**
+   * If set, this repository was duplicated from another via the
+   * "Duplicate to new destination" flow. Used for lineage display and
+   * the catch-up indicator that compares this row's watermark against
+   * its source. NULL for repositories created directly.
+   */
+  cloned_from_id: string | null;
   svn_url: string;
   svn_branch: string;
   svn_username: string;
@@ -532,6 +539,11 @@ export interface Repository {
   blocked_patterns: string | null;
   consecutive_errors: number;
   sync_status: string;
+  last_svn_rev?: number;
+  last_git_sha?: string;
+  last_sync_at?: string | null;
+  total_syncs?: number;
+  total_errors?: number;
 }
 
 export interface ImportStatus {

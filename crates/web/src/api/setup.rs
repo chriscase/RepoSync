@@ -599,6 +599,7 @@ async fn apply_config(
                 blocked_patterns: None,
                 consecutive_errors: 0,
                 teams_webhook_url: None,
+                cloned_from_id: None,
             };
             match db.insert_repository(&new_repo) {
                 Ok(()) => info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard"),

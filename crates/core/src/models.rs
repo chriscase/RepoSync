@@ -394,6 +394,11 @@ pub struct Repository {
     /// Per-repo Teams webhook URL (overrides global setting).
     #[serde(default)]
     pub teams_webhook_url: Option<String>,
+    /// ID of the repository this row was duplicated from, if any. NULL for
+    /// repositories created directly (i.e. not via the duplicate flow).
+    /// Enables lineage display and the catch-up indicator on duplicated pairs.
+    #[serde(default)]
+    pub cloned_from_id: Option<String>,
 }
 
 fn default_sync_status() -> String {

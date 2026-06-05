@@ -301,6 +301,15 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
             ON sync_records (repo_id, direction, status, svn_rev);
         "#,
     ),
+    (
+        14,
+        "cloned_from_id column for repository lineage tracking",
+        r#"
+        ALTER TABLE repositories ADD COLUMN cloned_from_id TEXT;
+        CREATE INDEX IF NOT EXISTS idx_repositories_cloned_from
+            ON repositories(cloned_from_id);
+        "#,
+    ),
 ];
 
 /// Run all pending migrations against `conn`.

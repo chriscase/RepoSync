@@ -296,6 +296,7 @@ async fn create_repo(
         blocked_patterns: None,
         consecutive_errors: 0,
         teams_webhook_url: None,
+        cloned_from_id: None,
     };
 
     let db = &state.db;
@@ -380,6 +381,7 @@ async fn update_repo(
         blocked_patterns: body.blocked_patterns.or(existing.blocked_patterns),
         consecutive_errors: existing.consecutive_errors,
         teams_webhook_url: existing.teams_webhook_url,
+        cloned_from_id: existing.cloned_from_id,
     };
 
     db.update_repository(&updated)
@@ -1313,6 +1315,7 @@ async fn create_branch_pair(
         blocked_patterns: parent.blocked_patterns.clone(),
         consecutive_errors: 0,
         teams_webhook_url: parent.teams_webhook_url.clone(),
+        cloned_from_id: None,
     };
 
     db.insert_repository(&child)

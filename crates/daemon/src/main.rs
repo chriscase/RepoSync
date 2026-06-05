@@ -245,6 +245,7 @@ async fn main() -> Result<()> {
                 blocked_patterns: None,
                 consecutive_errors: 0,
                 teams_webhook_url: None,
+                cloned_from_id: None,
             };
             match db.insert_repository(&default_repo) {
                 Ok(()) => {
