@@ -189,6 +189,24 @@ impl SvnClient {
         Ok(branches)
     }
 
+    /// List the immediate children of `self.url` as of the given revision.
+    /// Used by the sync engine's top-level cleanup to determine which entries
+    /// SHOULD exist in the git working tree: anything in the git mirror that
+    /// isn't in this listing is safe to delete (legacy / wrong-path leftovers).
+    /// Returns entry names with any trailing '/' stripped (so `dir/` -> `dir`).
+    #[instrument(skip(self), fields(url = %self.url))]
+    pub async fn list_top(&self, rev: i64) -> Result<Vec<String>, SvnError> {
+        let rev_str = rev.to_string();
+        let output = self.run_svn(&["list", "-r", &rev_str, &self.url]).await?;
+        let entries: Vec<String> = output
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.trim_end_matches('/').to_string())
+            .collect();
+        debug!(rev, count = entries.len(), "listed top-level entries at rev");
+        Ok(entries)
+    }
+
     #[instrument(skip(self), fields(url = %self.url))]
     pub async fn create_branch(
         &self,

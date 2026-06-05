@@ -492,25 +492,53 @@ impl SyncEngine {
             );
 
             let diff_applied = if !git_diff.trim().is_empty() {
-                let result = apply_diff_to_path(&repo_path, &git_diff).await;
-                if result.is_ok() {
-                    // Verify: check that files were created at the correct paths
-                    for cf in &change.changed_files {
-                        let expected = repo_path.join(&cf.path);
-                        if expected.exists() {
-                            info!(path = %cf.path, "git apply created file at correct path");
-                        } else {
-                            warn!(path = %cf.path, "git apply succeeded but file NOT at expected path");
+                match apply_diff_to_path(&repo_path, &git_diff).await {
+                    Ok(()) => {
+                        // Verify the diff put the right files at the right places.
+                        // changed_files paths are repo-ROOT-relative (carry the
+                        // branch prefix, e.g. "/trunk/docs/foo.txt"); the git
+                        // mirror's layout is BRANCH-stripped, so the expected
+                        // location is "<repo_path>/docs/foo.txt". When `git apply
+                        // -p0` consumes the SVN diff as-is, files can land at
+                        // "<repo_path>/trunk/docs/foo.txt" instead — superficially
+                        // "applied" but at the wrong path. Detect that and treat
+                        // it as a failure so the materialize fallback (which strips
+                        // the branch prefix correctly) takes over. Deletes ("D")
+                        // are expected to leave the path absent, so skip them.
+                        let branch_prefix = self
+                            .effective_repo_id()
+                            .and_then(|rid| self.db.get_repository(rid).ok().flatten())
+                            .map(|r| r.svn_branch.trim_matches('/').to_string())
+                            .unwrap_or_default();
+                        let mut all_placed = true;
+                        for cf in &change.changed_files {
+                            if cf.action == "D" {
+                                continue;
+                            }
+                            let raw = cf.path.trim_start_matches('/');
+                            let rel = if branch_prefix.is_empty() {
+                                raw
+                            } else {
+                                raw.strip_prefix(&format!("{}/", branch_prefix)).unwrap_or(raw)
+                            };
+                            if repo_path.join(rel).exists() {
+                                info!(path = rel, "git apply placed file at correct path");
+                            } else {
+                                warn!(
+                                    path = rel,
+                                    rev = change.revision,
+                                    "git apply succeeded but file NOT at expected branch-stripped path; will materialize"
+                                );
+                                all_placed = false;
+                            }
                         }
+                        all_placed
                     }
-                } else {
-                    warn!(
-                        rev = change.revision,
-                        error = %result.as_ref().unwrap_err(),
-                        "git apply failed"
-                    );
+                    Err(e) => {
+                        warn!(rev = change.revision, error = %e, "git apply failed");
+                        false
+                    }
                 }
-                result.is_ok()
             } else {
                 false
             };
@@ -707,46 +735,68 @@ impl SyncEngine {
                 }
             }
 
-            // 2c. Clean up rogue top-level entries in the git working tree.
-            // The git history may contain files at wrong paths (e.g. SLS/
-            // instead of source/SLS/) from earlier bugs. git reset --hard
-            // restores them every pull. We must remove them before commit
-            // so git add --all doesn't re-stage them.
+            // 2c. Cleanup: remove top-level git working-tree entries that are
+            // NOT in SVN at the current revision.
             //
-            // Approach: the SVN diff paths tell us what top-level dirs are
-            // legitimate (e.g. source/, config/). Any top-level dir that
-            // doesn't match the first component of ANY changed file path
-            // AND isn't a known standard directory is rogue.
+            // Historical purpose: prevent legacy "wrong path" files (e.g.
+            // SLS/ instead of source/SLS/ from earlier bugs) from being
+            // re-staged by `git add --all`. The previous heuristic derived
+            // "legit" from the first component of the CURRENT revision's
+            // changed_files, then hard-coded `source` and `config`. That
+            // logic was destructive: an SVN rev that changed one file under
+            // `docs/` would shrink legit_toplevel to `{docs, source, config}`
+            // and delete everything else (README, Makefile, src, assets,
+            // tests, …). It mass-deleted the sandbox mirror on r6502.
+            //
+            // Authoritative truth instead: ask SVN what the branch root
+            // looks like at this rev. Anything in the git mirror that is
+            // not in that listing is safe to delete. Fail safe: if we cannot
+            // reach SVN, skip cleanup so we never delete based on bad info.
             {
-                // Collect legitimate top-level prefixes from the SVN diff
-                let mut legit_toplevel: std::collections::HashSet<String> = change
-                    .changed_files
-                    .iter()
-                    .filter_map(|f| {
-                        let p = f.path.trim_start_matches('/');
-                        p.split('/').next().map(|s| s.to_string())
-                    })
-                    .collect();
-                // Always keep source and config as legitimate
-                legit_toplevel.insert("source".to_string());
-                legit_toplevel.insert("config".to_string());
-
-                if let Ok(entries) = std::fs::read_dir(&repo_path) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') {
-                            continue;
-                        }
-                        if !legit_toplevel.contains(&name) {
-                            let rogue = entry.path();
-                            if rogue.is_dir() {
-                                info!(path = %rogue.display(), "removing rogue directory from git working tree");
-                                let _ = std::fs::remove_dir_all(&rogue);
-                            } else if !name.ends_with(".gitattributes") {
-                                info!(path = %rogue.display(), "removing rogue file from git working tree");
-                                let _ = std::fs::remove_file(&rogue);
+                let svn = self
+                    .svn_client
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                match svn.list_top(change.revision).await {
+                    Ok(entries) => {
+                        let legit_toplevel: std::collections::HashSet<String> = entries
+                            .into_iter()
+                            .map(|e| e.trim_matches('/').to_string())
+                            .filter(|n| !n.is_empty())
+                            .collect();
+                        if let Ok(dir_entries) = std::fs::read_dir(&repo_path) {
+                            for entry in dir_entries.flatten() {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name.starts_with('.') {
+                                    continue;
+                                }
+                                if legit_toplevel.contains(&name) {
+                                    continue;
+                                }
+                                let path = entry.path();
+                                if path.is_dir() {
+                                    info!(
+                                        path = %path.display(),
+                                        "cleanup: removing top-level dir not present in SVN at rev"
+                                    );
+                                    let _ = std::fs::remove_dir_all(&path);
+                                } else if !name.ends_with(".gitattributes") {
+                                    info!(
+                                        path = %path.display(),
+                                        "cleanup: removing top-level file not present in SVN at rev"
+                                    );
+                                    let _ = std::fs::remove_file(&path);
+                                }
                             }
                         }
+                    }
+                    Err(e) => {
+                        warn!(
+                            rev = change.revision,
+                            error = %e,
+                            "could not list SVN branch root for top-level cleanup; skipping (fail safe)"
+                        );
                     }
                 }
             }
