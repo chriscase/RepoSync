@@ -574,6 +574,9 @@ pub enum AppError {
     NotFound(String),
     Unauthorized(String),
     Forbidden(String),
+    /// Resource state conflicts with the request (HTTP 409). Used e.g. when
+    /// a unique-named resource already exists.
+    Conflict(String),
     Internal(String),
 }
 
@@ -584,6 +587,7 @@ impl axum::response::IntoResponse for AppError {
             AppError::NotFound(_) => (axum::http::StatusCode::NOT_FOUND, String::new()),
             AppError::Unauthorized(_) => (axum::http::StatusCode::UNAUTHORIZED, String::new()),
             AppError::Forbidden(_) => (axum::http::StatusCode::FORBIDDEN, String::new()),
+            AppError::Conflict(_) => (axum::http::StatusCode::CONFLICT, String::new()),
             AppError::Internal(msg) => {
                 // Log the full error server-side but return a generic message to clients
                 tracing::error!(detail = %msg, "internal server error");
@@ -594,7 +598,8 @@ impl axum::response::IntoResponse for AppError {
         let client_message = match self {
             AppError::Internal(_) => "internal server error".to_string(),
             AppError::BadRequest(msg) | AppError::NotFound(msg) |
-            AppError::Unauthorized(msg) | AppError::Forbidden(msg) => msg,
+            AppError::Unauthorized(msg) | AppError::Forbidden(msg) |
+            AppError::Conflict(msg) => msg,
         };
 
         let body = serde_json::json!({ "error": client_message });

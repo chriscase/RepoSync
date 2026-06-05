@@ -53,6 +53,36 @@ struct CreateRepoRequest {
     enabled: bool,
 }
 
+/// Body of `POST /api/repos/:id/duplicate`. Mirrors the source repo's SVN
+/// configuration onto a new repository row that targets a new git
+/// destination. The SVN-side fields are taken from the source; only the
+/// new destination + name are required from the caller.
+#[derive(Deserialize)]
+struct DuplicateRepoRequest {
+    /// Unique display name for the new repository row.
+    name: String,
+    /// Git provider identifier (e.g. "github", "gitea", "gitlab", "custom").
+    git_provider: String,
+    /// Base URL for the provider's API (e.g. "https://api.github.com" or
+    /// "http://gitea.local:3001/api/v1").
+    git_api_url: String,
+    /// Owner/name path of the destination repo (e.g. "myorg/myrepo").
+    git_repo: String,
+    /// Default branch on the new destination. Defaults to the source's
+    /// `git_branch` when omitted.
+    #[serde(default)]
+    git_branch: Option<String>,
+    /// Optional credential for the new destination. Stored under
+    /// `secret_git_token_<new_repo_id>` if provided; the caller can also
+    /// add it later via the existing credentials endpoint.
+    #[serde(default)]
+    git_token: Option<String>,
+    /// Whether the new row should be enabled for polling immediately
+    /// (default true).
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
 fn default_github() -> String {
     "github".to_string()
 }
@@ -115,6 +145,10 @@ struct RepoDetail {
     id: String,
     name: String,
     parent_id: Option<String>,
+    /// If set, this row was duplicated from another via the
+    /// "Duplicate to new destination" flow. Used for lineage and the
+    /// catch-up indicator on the frontend.
+    cloned_from_id: Option<String>,
     svn_url: String,
     svn_branch: String,
     svn_username: String,
@@ -140,6 +174,7 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             id: r.id,
             name: r.name,
             parent_id: r.parent_id,
+            cloned_from_id: r.cloned_from_id,
             svn_url: r.svn_url,
             svn_branch: r.svn_branch,
             svn_username: r.svn_username,
@@ -187,6 +222,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id", get(get_repo))
         .route("/api/repos/:id", put(update_repo))
         .route("/api/repos/:id", delete(delete_repo))
+        .route("/api/repos/:id/duplicate", post(duplicate_repo))
         .route("/api/repos/:id/sync", post(trigger_sync))
         .route("/api/repos/:id/import", post(start_repo_import))
         .route("/api/repos/:id/import/status", get(repo_import_status))
@@ -305,6 +341,183 @@ async fn create_repo(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
 
     Ok(Json(RepoDetail::from(repo)))
+}
+
+/// Duplicate an existing repository row to a new git destination.
+///
+/// Creates a new `repositories` row that mirrors the source's SVN
+/// configuration (URL, branch, username, sync mode, polling, LFS, path
+/// rules) but points at a new git provider/repo/branch. The new row has
+/// blank watermarks (`last_svn_rev = 0`, `last_git_sha = ""`, etc.) and
+/// `cloned_from_id` set to the source's id, enabling the catch-up indicator
+/// on the frontend. Credentials are handled separately: the source's SVN
+/// password (if any) is copied to the new repo's key since the SVN source
+/// is identical; the optional `git_token` from the body is stored under the
+/// new repo's git-token key.
+///
+/// This endpoint does NOT trigger the initial import — the caller follows
+/// up with `POST /api/repos/<new_id>/import` if/when they want replay to
+/// begin. This keeps each endpoint single-purpose (the wizard makes two
+/// calls when the "start import immediately" checkbox is set).
+///
+/// Errors:
+///   - 401 / 403 — unauthenticated or not admin
+///   - 404 — source repository id not found
+///   - 400 — missing required body fields
+///   - 409 — `name` already in use by another repository
+///   - 500 — database / internal error
+async fn duplicate_repo(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(source_id): Path<String>,
+    Json(body): Json<DuplicateRepoRequest>,
+) -> Result<Json<RepoDetail>, AppError> {
+    let (user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    // Validate required body fields.
+    if body.name.trim().is_empty() {
+        return Err(AppError::BadRequest("name is required".into()));
+    }
+    if body.git_provider.trim().is_empty() {
+        return Err(AppError::BadRequest("git_provider is required".into()));
+    }
+    if body.git_api_url.trim().is_empty() {
+        return Err(AppError::BadRequest("git_api_url is required".into()));
+    }
+    if body.git_repo.trim().is_empty() {
+        return Err(AppError::BadRequest("git_repo is required".into()));
+    }
+
+    let db = &state.db;
+
+    // Load the source row. 404 if it does not exist.
+    let source = db
+        .get_repository(&source_id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound(format!("source repository {} not found", source_id)))?;
+
+    // Pre-check name uniqueness so we can return a clean 409 instead of
+    // bubbling a sqlite UNIQUE-constraint failure as a 500. The schema's
+    // UNIQUE constraint on `name` remains the authoritative guard against
+    // any race; this check is for the common case.
+    let name_taken = db
+        .list_repositories()
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .iter()
+        .any(|r| r.name == body.name);
+    if name_taken {
+        return Err(AppError::Conflict(format!(
+            "repository name '{}' is already in use",
+            body.name
+        )));
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let new_id = Uuid::new_v4().to_string();
+    let new_git_branch = body
+        .git_branch
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| source.git_branch.clone());
+
+    let new_repo = reposync_core::models::Repository {
+        id: new_id.clone(),
+        name: body.name,
+        // SVN-side fields are copied verbatim — both rows sync the same source.
+        svn_url: source.svn_url.clone(),
+        svn_branch: source.svn_branch.clone(),
+        svn_username: source.svn_username.clone(),
+        // Git-side fields come from the caller.
+        git_provider: body.git_provider,
+        git_api_url: body.git_api_url,
+        git_repo: body.git_repo,
+        git_branch: new_git_branch,
+        // Behavior / policy fields copied from source so the duplicate
+        // behaves the same as the original by default.
+        sync_mode: source.sync_mode.clone(),
+        poll_interval_secs: source.poll_interval_secs,
+        lfs_threshold_mb: source.lfs_threshold_mb,
+        auto_merge: source.auto_merge,
+        allowed_paths: source.allowed_paths.clone(),
+        blocked_patterns: source.blocked_patterns.clone(),
+        // Enable state from caller.
+        enabled: body.enabled,
+        created_by: Some(user_id),
+        // Duplicates are top-level rows, not children. Branch-pair cascading
+        // will be handled by a follow-up enhancement.
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        // Fresh watermarks — the duplicate starts from nothing and replays
+        // history via the initial-import path the caller invokes next.
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".to_string(),
+        total_syncs: 0,
+        total_errors: 0,
+        consecutive_errors: 0,
+        // Inherit any per-repo Teams webhook from the source so notifications
+        // route the same way without re-configuration.
+        teams_webhook_url: source.teams_webhook_url.clone(),
+        // The whole point of this endpoint: record the lineage.
+        cloned_from_id: Some(source.id.clone()),
+    };
+
+    db.insert_repository(&new_repo).map_err(|e| {
+        // Race fallback: if uniqueness fired between our pre-check and the
+        // insert, surface it as 409 instead of 500.
+        let msg = e.to_string();
+        if msg.contains("UNIQUE constraint failed") {
+            AppError::Conflict(format!(
+                "repository name '{}' is already in use",
+                new_repo.name
+            ))
+        } else {
+            AppError::Internal(format!("database error: {}", msg))
+        }
+    })?;
+
+    // Copy the SVN password from the source if it has one. The duplicate
+    // targets the same SVN URL with the same credentials by definition.
+    // We do NOT copy any git token from the source — the new destination
+    // has its own credential, supplied either now via `git_token` or later
+    // via the existing credentials endpoint.
+    if let Ok(Some(svn_pw)) = db.get_state(&format!("secret_svn_password_{}", source.id)) {
+        if let Err(e) = db.set_state(&format!("secret_svn_password_{}", new_id), &svn_pw) {
+            warn!(repo_id = %new_id, error = %e, "failed to copy source SVN password to duplicate");
+        }
+    }
+
+    if let Some(token) = body.git_token.as_deref() {
+        if !token.is_empty() {
+            if let Err(e) = db.set_state(&format!("secret_git_token_{}", new_id), token) {
+                warn!(
+                    repo_id = %new_id,
+                    error = %e,
+                    "failed to store git token for duplicate (caller can retry via credentials endpoint)"
+                );
+            }
+        }
+    }
+
+    info!(
+        new_id = %new_id,
+        source_id = %source.id,
+        name = %new_repo.name,
+        git_repo = %new_repo.git_repo,
+        "duplicated repository to new git destination"
+    );
+
+    Ok(Json(RepoDetail::from(new_repo)))
 }
 
 async fn get_repo(
