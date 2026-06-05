@@ -5,6 +5,7 @@ import { api, type Repository, type SyncStatus } from '../api';
 import { GitBranch, Plus, Database, Clock, X, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
 import { formatTimeAgo } from '../utils/time';
+import { computeCutoverStatus, cutoverBadgeClasses } from '../utils/cutoverStatus';
 
 /** Custom SVG icon: two circular sync arrows, one blue (SVN) and one purple (Git) */
 function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
@@ -269,6 +270,13 @@ export default function Repositories() {
             const lastSync = status?.last_sync_at ?? repo.updated_at;
             const totalSyncs = status?.total_syncs ?? 0;
             const activeConflicts = status?.active_conflicts ?? 0;
+            // Catch-up indicator: only renders when this row is a
+            // duplicate. The source is looked up in the same repos list
+            // we're rendering — no extra fetch.
+            const source = repo.cloned_from_id
+              ? repoList.find((r) => r.id === repo.cloned_from_id) ?? null
+              : null;
+            const cutover = computeCutoverStatus(repo, source);
 
             return (
               <div key={repo.id} className="group/card bg-gray-800/60 border border-gray-700 rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors">
@@ -286,7 +294,7 @@ export default function Repositories() {
                     {/* Main Content */}
                     <div className="flex-1 min-w-0">
                       {/* Name + Badge row */}
-                      <div className="flex items-center gap-3 mb-2.5">
+                      <div className="flex items-center gap-3 mb-2.5 flex-wrap">
                         <h3 className="text-lg font-semibold text-gray-100 truncate group-hover/card:text-blue-400 transition-colors">
                           {repo.name}
                         </h3>
@@ -299,6 +307,18 @@ export default function Repositories() {
                         >
                           {repo.enabled ? 'Enabled' : 'Disabled'}
                         </span>
+                        {cutover && (() => {
+                          const cls = cutoverBadgeClasses(cutover.state);
+                          return (
+                            <span
+                              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded border text-xs font-medium flex-shrink-0 ${cls.container}`}
+                              title={cutover.detail ?? ''}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${cls.dot}`} />
+                              {cutover.label}
+                            </span>
+                          );
+                        })()}
                       </div>
 
                       {/* SVN URL + Git repo */}

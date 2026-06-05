@@ -12,6 +12,7 @@ import {
 
 import { getStoredUser } from '../utils/auth';
 import { formatTimeAgo } from '../utils/time';
+import { computeCutoverStatus, cutoverBadgeClasses } from '../utils/cutoverStatus';
 
 type EditForm = {
   name: string;
@@ -114,6 +115,20 @@ export default function RepoDetail() {
     queryFn: () => api.getRepo(id!),
     enabled: !!id,
   });
+
+  // If this repo was duplicated from another (cloned_from_id set), fetch
+  // the source so the catch-up indicator and lineage breadcrumb can render.
+  // React Query dedupes — if we navigated here from the source page, the
+  // entry is already cached.
+  const sourceId = repo?.cloned_from_id ?? null;
+  const { data: sourceRepo } = useQuery({
+    queryKey: ['repo', sourceId],
+    queryFn: () => api.getRepo(sourceId!),
+    enabled: !!sourceId,
+    // The catch-up indicator polls every 5s while the import runs.
+    refetchInterval: 5000,
+  });
+  const cutover = repo ? computeCutoverStatus(repo, sourceRepo ?? null) : null;
 
   // Status query scoped to this repo
   const { data: status } = useQuery<SyncStatus>({
@@ -465,7 +480,7 @@ export default function RepoDetail() {
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 flex-wrap">
           <Link
             to="/repos"
             className="inline-flex items-center gap-1 text-sm text-gray-400 hover:text-gray-200 transition-colors"
@@ -473,11 +488,30 @@ export default function RepoDetail() {
             <ArrowLeft className="w-4 h-4" />
             Back to Repositories
           </Link>
+          {/* Lineage breadcrumb — only shown when this row is a duplicate.
+              Clicking the source name navigates back to the source row so
+              the operator can disable it once cutover is safe. */}
+          {repo.cloned_from_id && (
+            <div className="inline-flex items-center gap-1.5 text-sm text-gray-400">
+              <Copy className="w-3.5 h-3.5 text-gray-500" />
+              <span>Duplicate of</span>
+              {sourceRepo ? (
+                <Link
+                  to={`/repos/${sourceRepo.id}`}
+                  className="text-blue-400 hover:text-blue-300 underline-offset-2 hover:underline"
+                >
+                  {sourceRepo.name}
+                </Link>
+              ) : (
+                <span className="text-gray-500 italic">unknown source</span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           <h1 className="text-2xl font-bold text-gray-100">{repo.name}</h1>
           <span
             className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${
@@ -488,6 +522,21 @@ export default function RepoDetail() {
           >
             {repo.enabled ? 'Enabled' : 'Disabled'}
           </span>
+          {/* Catch-up status badge — only shown when this row is a
+              duplicate, comparing the clone's processed watermark against
+              the source's. Green means it's safe to disable the source. */}
+          {cutover && (() => {
+            const cls = cutoverBadgeClasses(cutover.state);
+            return (
+              <span
+                className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded border text-xs font-medium ${cls.container}`}
+                title={cutover.detail ?? ''}
+              >
+                <span className={`w-2 h-2 rounded-full ${cls.dot}`} />
+                {cutover.label}
+              </span>
+            );
+          })()}
         </div>
         <div className="flex items-center gap-3">
           {/* Enable/Disable toggle */}
