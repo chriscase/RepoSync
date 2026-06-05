@@ -7,7 +7,7 @@ import ServerMonitor from '../components/ServerMonitor';
 import {
   ArrowLeft, RefreshCw, Settings, Database, GitBranch, Clock,
   Activity, Zap, Save, X, Trash2, Power, AlertTriangle, CheckCircle,
-  ChevronDown, Plus,
+  ChevronDown, Plus, Copy,
 } from 'lucide-react';
 
 import { getStoredUser } from '../utils/auth';
@@ -90,6 +90,24 @@ export default function RepoDetail() {
     auto_create_git_branch: true,
   });
   const [branchSuccess, setBranchSuccess] = useState(false);
+
+  // "Duplicate to new destination" wizard: copies the source's SVN config
+  // to a new repository row targeting a new git destination. The new row
+  // gets `cloned_from_id = source.id` so the catch-up indicator can compare
+  // their watermarks once the initial import is triggered.
+  const [showDuplicateModal, setShowDuplicateModal] = useState(false);
+  const [duplicateForm, setDuplicateForm] = useState({
+    name: '',
+    git_provider: '',
+    git_api_url: '',
+    git_repo: '',
+    git_branch: '',
+    git_token: '',
+    enabled: true,
+    start_import: true,
+  });
+  const [duplicateError, setDuplicateError] = useState<string | null>(null);
+  const [duplicateNameError, setDuplicateNameError] = useState<string | null>(null);
 
   const { data: repo, isLoading, isError, error } = useQuery({
     queryKey: ['repo', id],
@@ -190,6 +208,99 @@ export default function RepoDetail() {
       queryClient.invalidateQueries({ queryKey: ['repos'] });
     },
   });
+
+  const duplicateMutation = useMutation({
+    mutationFn: async (data: typeof duplicateForm) => {
+      // Two-call flow: create the duplicate row, then (optionally) kick off
+      // the initial import. Keeps each endpoint single-purpose.
+      const { start_import, git_token, ...body } = data;
+      const payload: any = { ...body };
+      if (git_token && git_token.length > 0) payload.git_token = git_token;
+      if (!payload.git_branch || payload.git_branch.length === 0) {
+        delete payload.git_branch;
+      }
+      const created = await api.duplicateRepo(id!, payload);
+      if (start_import) {
+        // Best-effort: if the import kickoff fails we still return the
+        // new row so the user can retry from the new repo's page.
+        try {
+          await api.startRepoImport(created.id);
+        } catch (e) {
+          // swallow — surfaced as a non-blocking toast below if desired
+          console.warn('startRepoImport after duplicate failed', e);
+        }
+      }
+      return created;
+    },
+    onSuccess: (created) => {
+      queryClient.invalidateQueries({ queryKey: ['repos'] });
+      queryClient.invalidateQueries({ queryKey: ['repo', id] });
+      setShowDuplicateModal(false);
+      setDuplicateError(null);
+      setDuplicateNameError(null);
+      navigate(`/repos/${created.id}`);
+    },
+    onError: (err: any) => {
+      const msg = err?.message || String(err);
+      // 409 → name conflict; surface as inline error on the name field.
+      // The endpoint returns the message "repository name '<X>' is already in use".
+      if (msg.toLowerCase().includes('already in use')) {
+        setDuplicateNameError(msg);
+        setDuplicateError(null);
+      } else {
+        setDuplicateError(msg);
+        setDuplicateNameError(null);
+      }
+    },
+  });
+
+  function openDuplicateModal() {
+    if (!repo) return;
+    // Pre-fill provider + branch from the source so the wizard is minimum-friction.
+    setDuplicateForm({
+      name: '',
+      git_provider: repo.git_provider,
+      git_api_url: '',
+      git_repo: '',
+      git_branch: repo.git_branch,
+      git_token: '',
+      enabled: true,
+      start_import: true,
+    });
+    setDuplicateError(null);
+    setDuplicateNameError(null);
+    setShowDuplicateModal(true);
+  }
+
+  function closeDuplicateModal() {
+    setShowDuplicateModal(false);
+    setDuplicateError(null);
+    setDuplicateNameError(null);
+    duplicateMutation.reset();
+  }
+
+  function handleDuplicateSubmit() {
+    setDuplicateError(null);
+    setDuplicateNameError(null);
+    // Lightweight client-side validation; the backend re-checks.
+    if (!duplicateForm.name.trim()) {
+      setDuplicateNameError('Name is required');
+      return;
+    }
+    if (!duplicateForm.git_provider.trim()) {
+      setDuplicateError('Git provider is required');
+      return;
+    }
+    if (!duplicateForm.git_api_url.trim()) {
+      setDuplicateError('Git API URL is required');
+      return;
+    }
+    if (!duplicateForm.git_repo.trim()) {
+      setDuplicateError('Git repo path is required');
+      return;
+    }
+    duplicateMutation.mutate(duplicateForm);
+  }
 
   const deleteMutation = useMutation({
     mutationFn: () => api.deleteRepo(id!),
@@ -394,13 +505,25 @@ export default function RepoDetail() {
           </button>
 
           {!editing ? (
-            <button
-              onClick={startEdit}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-            >
-              <Settings className="w-4 h-4" />
-              Edit
-            </button>
+            <>
+              <button
+                onClick={startEdit}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+              >
+                <Settings className="w-4 h-4" />
+                Edit
+              </button>
+              {isAdmin && (
+                <button
+                  onClick={openDuplicateModal}
+                  title="Sync this SVN source to an additional git destination (e.g. for migration or mirroring)"
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+                >
+                  <Copy className="w-4 h-4" />
+                  Duplicate to new destination
+                </button>
+              )}
+            </>
           ) : (
             <>
               <button
@@ -1001,6 +1124,162 @@ export default function RepoDetail() {
           <p className="text-gray-400 text-sm px-6 pb-6">No branch pairs configured</p>
         )}
       </div>
+
+      {/* Duplicate to New Destination Modal */}
+      {showDuplicateModal && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between p-6 border-b border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-100 flex items-center gap-2">
+                <Copy className="w-5 h-5 text-blue-400" />
+                Duplicate to new destination
+              </h2>
+              <button
+                onClick={closeDuplicateModal}
+                className="text-gray-400 hover:text-gray-200 transition-colors"
+                aria-label="Close"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 space-y-4">
+              {duplicateError && (
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
+                  {duplicateError}
+                </div>
+              )}
+
+              {/* Source (read-only summary) */}
+              <div className="bg-gray-900/50 border border-gray-700/50 rounded-lg p-3 space-y-1 text-xs">
+                <div className="text-gray-500 uppercase tracking-wide mb-1">Source (unchanged)</div>
+                <div><span className="text-gray-500">Repo:</span> <span className="text-gray-200">{repo?.name}</span></div>
+                <div><span className="text-gray-500">SVN URL:</span> <span className="font-mono text-blue-400">{repo?.svn_url}</span></div>
+                <div><span className="text-gray-500">SVN branch:</span> <span className="font-mono text-blue-400">{repo?.svn_branch || '(root)'}</span></div>
+                <p className="text-gray-500 mt-2 leading-snug">
+                  This creates a NEW sync pair targeting a new git destination. The original
+                  pair above is untouched, so you can cut over only after the duplicate has
+                  caught up. SVN credentials are reused automatically.
+                </p>
+              </div>
+
+              {/* Required: name */}
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Name <span className="text-red-400">*</span></label>
+                <input
+                  type="text"
+                  value={duplicateForm.name}
+                  onChange={(e) => { setDuplicateForm({ ...duplicateForm, name: e.target.value }); setDuplicateNameError(null); }}
+                  className={inputClass}
+                  placeholder={`e.g. ${repo?.name ?? 'my-repo'} (new destination)`}
+                  autoFocus
+                />
+                {duplicateNameError && (
+                  <p className="mt-1 text-xs text-red-400">{duplicateNameError}</p>
+                )}
+              </div>
+
+              {/* Git destination */}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Git provider <span className="text-red-400">*</span></label>
+                  <select
+                    value={duplicateForm.git_provider}
+                    onChange={(e) => setDuplicateForm({ ...duplicateForm, git_provider: e.target.value })}
+                    className={selectClass}
+                  >
+                    <option value="github">github</option>
+                    <option value="gitea">gitea</option>
+                    <option value="gitlab">gitlab</option>
+                    <option value="custom">custom</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Branch</label>
+                  <input
+                    type="text"
+                    value={duplicateForm.git_branch}
+                    onChange={(e) => setDuplicateForm({ ...duplicateForm, git_branch: e.target.value })}
+                    className={inputClass}
+                    placeholder={repo?.git_branch || 'main'}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Git API URL <span className="text-red-400">*</span></label>
+                <input
+                  type="text"
+                  value={duplicateForm.git_api_url}
+                  onChange={(e) => setDuplicateForm({ ...duplicateForm, git_api_url: e.target.value })}
+                  className={inputClass}
+                  placeholder="https://api.github.com  |  http://gitea.local:3001/api/v1"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Git repo path <span className="text-red-400">*</span></label>
+                <input
+                  type="text"
+                  value={duplicateForm.git_repo}
+                  onChange={(e) => setDuplicateForm({ ...duplicateForm, git_repo: e.target.value })}
+                  className={inputClass}
+                  placeholder="owner/repo"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Git token (optional)</label>
+                <input
+                  type="password"
+                  value={duplicateForm.git_token}
+                  onChange={(e) => setDuplicateForm({ ...duplicateForm, git_token: e.target.value })}
+                  className={inputClass}
+                  placeholder="Can be added later via the credentials panel"
+                />
+              </div>
+
+              {/* Options */}
+              <div className="space-y-2 pt-2 border-t border-gray-700">
+                <label className="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={duplicateForm.start_import}
+                    onChange={(e) => setDuplicateForm({ ...duplicateForm, start_import: e.target.checked })}
+                    className="rounded bg-gray-700 border-gray-600"
+                  />
+                  Start initial import immediately
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={duplicateForm.enabled}
+                    onChange={(e) => setDuplicateForm({ ...duplicateForm, enabled: e.target.checked })}
+                    className="rounded bg-gray-700 border-gray-600"
+                  />
+                  Enable the new pair for ongoing sync after import
+                </label>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 p-4 border-t border-gray-700">
+              <button
+                onClick={closeDuplicateModal}
+                className="px-4 py-2 rounded-lg border border-gray-600 hover:border-gray-500 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDuplicateSubmit}
+                disabled={duplicateMutation.isPending}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+              >
+                <Copy className="w-4 h-4" />
+                {duplicateMutation.isPending ? 'Creating…' : 'Duplicate'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Add Branch Pair Modal */}
       {showBranchModal && (

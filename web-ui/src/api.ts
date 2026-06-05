@@ -319,6 +319,34 @@ export const api = {
     fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteRepo: (id: string) =>
     fetchJson<void>(`/repos/${id}`, { method: 'DELETE' }),
+
+  /**
+   * Duplicate an existing sync pair to a new git destination. Creates a
+   * new repository row mirroring the source's SVN configuration, then
+   * returns it. Pair with `startRepoImport` if the caller wants the
+   * initial replay to begin immediately.
+   */
+  duplicateRepo: (
+    sourceId: string,
+    data: {
+      name: string;
+      git_provider: string;
+      git_api_url: string;
+      git_repo: string;
+      git_branch?: string;
+      git_token?: string;
+      enabled?: boolean;
+    },
+  ) => fetchJson<Repository>(`/repos/${sourceId}/duplicate`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+
+  /** Kick off the initial SVN → git import for a fresh sync pair. */
+  startRepoImport: (id: string) =>
+    fetchJson<{ ok: boolean; message?: string }>(`/repos/${id}/import`, {
+      method: 'POST',
+    }),
   createBranchPair: (repoId: string, data: {
     svn_branch: string;
     git_branch: string;
