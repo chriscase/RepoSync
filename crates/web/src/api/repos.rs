@@ -926,6 +926,58 @@ async fn start_repo_import(
         }
     };
 
+    // 7b. Align HEAD with the configured branch on an empty clone.
+    //
+    // libgit2's `Repository::clone` against a completely empty remote (e.g. a
+    // freshly created Gitea repo with no commits) leaves the local HEAD on its
+    // own default branch — typically `refs/heads/master` — rather than picking
+    // up the remote's default (which Gitea exposes via the `HEAD` symref but
+    // libgit2 may not honour when there are no refs to walk). The import then
+    // creates every commit on `master`, and the final push of the configured
+    // branch is a no-op because that branch has no commits locally. The result
+    // looks like a successful import with an empty destination — exactly the
+    // symptom we hit on the first real migration.
+    //
+    // Safeguard: only rewrite HEAD when the repository has no commits yet. Once
+    // any history exists, HEAD already points at the correct branch from the
+    // clone's actual ref walk, and we must not disturb it.
+    {
+        let head_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+            .current_dir(&git_repo_path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !head_exists {
+            match std::process::Command::new("git")
+                .args(["symbolic-ref", "HEAD", &format!("refs/heads/{}", repo.git_branch)])
+                .current_dir(&git_repo_path)
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    info!(
+                        branch = %repo.git_branch,
+                        "aligned HEAD with configured branch on empty clone"
+                    );
+                }
+                Ok(o) => {
+                    warn!(
+                        branch = %repo.git_branch,
+                        stderr = %String::from_utf8_lossy(&o.stderr),
+                        "git symbolic-ref failed to align HEAD on empty clone; first commit may land on the wrong branch"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        branch = %repo.git_branch,
+                        error = %e,
+                        "could not spawn git symbolic-ref to align HEAD on empty clone"
+                    );
+                }
+            }
+        }
+    }
+
     // 8. Configure git remote credentials
     git_client
         .ensure_remote_credentials("origin", git_token.as_deref())
