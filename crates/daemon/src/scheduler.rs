@@ -20,6 +20,7 @@ use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::import::{ImportPhase, ImportProgress};
+use reposync_core::operator_hints::{classify_sync_error, Severity};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
@@ -584,6 +585,51 @@ impl Scheduler {
                             error = %e,
                             "per-repo sync cycle failed"
                         );
+
+                        // Operator hint: pattern-match common error families
+                        // (filesystem-permission, SVN/Git auth, push race,
+                        // network, disk-full, pre-receive hook) and surface a
+                        // categorised, actionable message in the log + audit
+                        // table. Unrecognised errors return None and continue
+                        // to surface only as the raw `error!` above.
+                        let mirror_guess = std::path::PathBuf::from(format!(
+                            "/opt/reposync/repos/{}/git-repo",
+                            repo_id
+                        ));
+                        let error_text_for_classify = e.to_string();
+                        if let Some(hint) = classify_sync_error(
+                            &error_text_for_classify,
+                            Some(mirror_guess.as_path()),
+                        ) {
+                            // Structured WARN so log aggregators can route by
+                            // category and severity. The body of the message
+                            // contains the human-readable explanation.
+                            warn!(
+                                repo_name = %repo_name,
+                                repo_id = %repo_id,
+                                category = %hint.category,
+                                severity = %hint.severity.as_str(),
+                                suggested_fix = %hint.suggested_fix,
+                                "operator hint for sync error: {}",
+                                hint.message
+                            );
+                            // Persist to audit_log so the UI's audit panel
+                            // shows the operator-friendly message alongside
+                            // (not instead of) the raw error. `success=false`
+                            // for any non-transient hint; transient hints
+                            // (e.g. push race) are informational.
+                            let success_flag = matches!(hint.severity, Severity::Transient);
+                            let _ = engine_db.insert_audit_log_with_repo(
+                                "sync_error_hint",
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(&hint.render_details()),
+                                success_flag,
+                                Some(&repo_id),
+                            );
+                        }
 
                         // Circuit breaker: only count permanent errors
                         if e.is_permanent() {

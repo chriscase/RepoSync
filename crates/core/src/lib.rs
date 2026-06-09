@@ -18,6 +18,7 @@ pub mod ldap_auth;
 pub mod lfs;
 pub mod models;
 pub mod notify;
+pub mod operator_hints;
 pub mod personal_config;
 pub mod svn;
 pub mod sync_engine;
