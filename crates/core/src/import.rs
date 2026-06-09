@@ -729,13 +729,17 @@ pub async fn run_full_import(
                 );
                 log(&progress, &ws_broadcast, log_line).await;
 
-                // Record in DB (commit_map for bidirectional mapping)
-                db.insert_commit_map(
+                // Record in DB (commit_map for bidirectional mapping).
+                // Tag with repo_id so the dashboard can resolve the entry
+                // to a repository name; without this every commit_map row
+                // surfaces as "(unknown)" on the UI.
+                db.insert_commit_map_with_repo(
                     rev,
                     &sha,
                     "svn_to_git",
                     &entry.author,
                     &format!("{} <{}>", author_name, author_email),
+                    repo_id.as_deref(),
                 )
                 .ok();
 
