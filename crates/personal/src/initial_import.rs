@@ -178,6 +178,11 @@ impl<'a> InitialImport<'a> {
         );
 
         let git_client = self.git_client.lock().unwrap();
+        // No SVN date here: this is the initial snapshot commit that
+        // represents a snapshot of HEAD at import time, not a specific
+        // historical SVN revision. Wallclock is the correct author
+        // date for this one. Per-revision commits below pass the
+        // SVN date through.
         let oid = git_client
             .commit(
                 &message,
@@ -185,6 +190,7 @@ impl<'a> InitialImport<'a> {
                 &self.config.developer.email,
                 &self.config.developer.name,
                 &self.config.developer.email,
+                None,
             )
             .context("failed to create initial commit")?;
 
@@ -358,12 +364,15 @@ impl<'a> InitialImport<'a> {
             };
 
             let git_client = self.git_client.lock().unwrap();
+            // Preserve the SVN commit timestamp as the git author date
+            // so per-revision imports show real authoring times.
             match git_client.commit(
                 &message,
                 &author_name,
                 &author_email,
                 &self.config.developer.name,
                 &self.config.developer.email,
+                Some(&entry.date),
             ) {
                 Ok(oid) => {
                     let sha = oid.to_string();

@@ -166,6 +166,7 @@ fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
             "test@example.com",
             "Test User",
             "test@example.com",
+            None,
         )
         .expect("failed to create initial commit");
 
@@ -365,6 +366,7 @@ async fn test_team_mode_git_to_svn_sync() {
             "dev@example.com",
             "Dev User",
             "dev@example.com",
+            None,
         )
         .unwrap();
     git_client.push("origin", "main").unwrap();
@@ -433,6 +435,7 @@ async fn test_team_mode_bidirectional_sync() {
             "gituser@example.com",
             "Git User",
             "gituser@example.com",
+            None,
         )
         .unwrap();
     git_client.push("origin", "main").unwrap();
@@ -573,6 +576,7 @@ async fn test_team_mode_conflict_detection() {
             "gituser@example.com",
             "Git User",
             "gituser@example.com",
+            None,
         )
         .unwrap();
     git_client.push("origin", "main").unwrap();
@@ -693,6 +697,7 @@ async fn test_team_mode_git_to_svn_multi_commit_order() {
             "dev@example.com",
             "Dev",
             "dev@example.com",
+            None,
         )
         .unwrap();
 
@@ -704,6 +709,7 @@ async fn test_team_mode_git_to_svn_multi_commit_order() {
             "dev@example.com",
             "Dev",
             "dev@example.com",
+            None,
         )
         .unwrap();
 
@@ -715,6 +721,7 @@ async fn test_team_mode_git_to_svn_multi_commit_order() {
             "dev@example.com",
             "Dev",
             "dev@example.com",
+            None,
         )
         .unwrap();
 

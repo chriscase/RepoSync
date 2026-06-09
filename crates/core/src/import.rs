@@ -702,12 +702,15 @@ pub async fn run_full_import(
                     Some(&entry.date),
                 )
             } else {
+                // Same timestamp-preservation as the LFS path above; this
+                // is the libgit2 fallback used for LFS-free revisions.
                 git_client_guard.commit(
                     &message,
                     &author_name,
                     &author_email,
                     &import_config.committer_name,
                     &import_config.committer_email,
+                    Some(&entry.date),
                 )
             };
             (result, rp)

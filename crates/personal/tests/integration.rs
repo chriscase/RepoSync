@@ -301,6 +301,7 @@ fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
             "test@example.com",
             "Test User",
             "test@example.com",
+            None,
         )
         .expect("failed to create initial commit");
 
@@ -909,6 +910,7 @@ async fn test_git_to_svn_basic_replay() {
             "test@example.com",
             "Test User",
             "test@example.com",
+            None,
         )
         .unwrap();
 
@@ -921,6 +923,7 @@ async fn test_git_to_svn_basic_replay() {
             "test@example.com",
             "Test User",
             "test@example.com",
+            None,
         )
         .unwrap();
     let git_sha = git_oid.to_string();
@@ -1452,6 +1455,7 @@ fn test_git_client_init_commit_push() {
             "alice@test.com",
             "Alice",
             "alice@test.com",
+            None,
         )
         .unwrap();
     assert!(!oid.is_zero());
@@ -2509,6 +2513,7 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
             "test@example.com",
             "Test User",
             "test@example.com",
+            None,
         )
         .expect("git commit failed");
     let commit_sha = oid.to_string();
@@ -2660,6 +2665,7 @@ async fn test_replay_path_normal_content_written_to_svn() {
             "test@example.com",
             "Test User",
             "test@example.com",
+            None,
         )
         .expect("git commit failed");
     let commit_sha = oid.to_string();

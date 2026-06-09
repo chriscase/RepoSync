@@ -266,6 +266,18 @@ impl GitClient {
 
     /// Stage all changes and create a commit.
     #[instrument(skip(self, message))]
+    /// Create a commit via libgit2.
+    ///
+    /// `author_date`, when supplied, sets the resulting commit's **author
+    /// date** to the given timestamp. Mirrors the same convention as
+    /// [`Self::commit_via_cli`]: author date = when the change was
+    /// originally made (SVN commit time), committer date = wallclock.
+    /// Together the two make any sync delay visible in `git log`.
+    ///
+    /// Accepts an RFC-3339 / ISO-8601 string. SVN's `<date>` element
+    /// emits this format directly (e.g. `2026-06-08T19:46:08.685000Z`).
+    /// If parsing fails the wallclock is used and a warning is logged,
+    /// so a malformed timestamp never blocks the commit.
     pub fn commit(
         &self,
         message: &str,
@@ -273,6 +285,7 @@ impl GitClient {
         author_email: &str,
         committer_name: &str,
         committer_email: &str,
+        author_date: Option<&str>,
     ) -> Result<Oid, GitError> {
         // Remove stale index.lock if present
         if let Some(workdir) = self.repo.workdir() {
@@ -287,7 +300,33 @@ impl GitClient {
         index.write()?;
         let tree_oid = index.write_tree()?;
         let tree = self.repo.find_tree(tree_oid)?;
-        let author = Signature::now(author_name, author_email)?;
+
+        // Build the author signature. If an explicit date is supplied
+        // (the SVN commit's timestamp), parse it into a `git2::Time` and
+        // use `Signature::new`; otherwise fall back to wallclock via
+        // `Signature::now`. A parse failure falls back to wallclock with
+        // a warning rather than aborting the commit.
+        let author = match author_date.and_then(|d| {
+            match chrono::DateTime::parse_from_rfc3339(d) {
+                Ok(dt) => Some(dt),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        date = %d,
+                        "failed to parse SVN author date; falling back to wallclock"
+                    );
+                    None
+                }
+            }
+        }) {
+            Some(dt) => {
+                let secs = dt.timestamp();
+                let offset_mins = (dt.offset().local_minus_utc() / 60) as i32;
+                let time = git2::Time::new(secs, offset_mins);
+                Signature::new(author_name, author_email, &time)?
+            }
+            None => Signature::now(author_name, author_email)?,
+        };
         let committer = Signature::now(committer_name, committer_email)?;
         let parent_commit = match self.repo.head() {
             Ok(head) => Some(head.peel_to_commit()?),
@@ -784,6 +823,7 @@ mod tests {
                 "test@test.com",
                 "Test",
                 "test@test.com",
+                None,
             )
             .unwrap();
         assert!(!oid.is_zero());
@@ -797,7 +837,7 @@ mod tests {
         let client = GitClient::new(dir.path()).unwrap();
         std::fs::write(dir.path().join("f.txt"), "c").unwrap();
         let oid = client
-            .commit("init", "T", "t@t.com", "T", "t@t.com")
+            .commit("init", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
         client.create_branch("feature", &oid.to_string()).unwrap();
         assert!(client
@@ -827,12 +867,12 @@ mod tests {
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         let oid1 = client
-            .commit("first", "T", "t@t.com", "T", "t@t.com")
+            .commit("first", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
         let oid2 = client
-            .commit("second", "T", "t@t.com", "T", "t@t.com")
+            .commit("second", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         // oid1 is ancestor of oid2
@@ -853,7 +893,7 @@ mod tests {
 
         std::fs::write(dir.path().join("f.txt"), "v1").unwrap();
         let oid1 = client
-            .commit("init", "T", "t@t.com", "T", "t@t.com")
+            .commit("init", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         client.create_branch("dev", &oid1.to_string()).unwrap();
@@ -861,7 +901,7 @@ mod tests {
 
         std::fs::write(dir.path().join("f.txt"), "v2").unwrap();
         let oid2 = client
-            .commit("update", "T", "t@t.com", "T", "t@t.com")
+            .commit("update", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         assert_eq!(client.get_head_sha().unwrap(), oid2.to_string());
@@ -879,7 +919,7 @@ mod tests {
 
         std::fs::write(dir.path().join("f.txt"), "c").unwrap();
         let oid = client
-            .commit("init", "T", "t@t.com", "T", "t@t.com")
+            .commit("init", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         // First commit has 0 parents
@@ -887,7 +927,7 @@ mod tests {
 
         std::fs::write(dir.path().join("g.txt"), "d").unwrap();
         let oid2 = client
-            .commit("second", "T", "t@t.com", "T", "t@t.com")
+            .commit("second", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         // Second commit has 1 parent
@@ -903,7 +943,7 @@ mod tests {
         // First commit: add a.txt
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let oid1 = client
-            .commit("add a", "T", "t@t.com", "T", "t@t.com")
+            .commit("add a", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         let files1 = client.get_changed_files(&oid1.to_string()).unwrap();
@@ -915,7 +955,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "modified").unwrap();
         std::fs::write(dir.path().join("b.txt"), "new file").unwrap();
         let oid2 = client
-            .commit("modify a, add b", "T", "t@t.com", "T", "t@t.com")
+            .commit("modify a, add b", "T", "t@t.com", "T", "t@t.com", None)
             .unwrap();
 
         let files2 = client.get_changed_files(&oid2.to_string()).unwrap();
@@ -932,10 +972,10 @@ mod tests {
         let client = GitClient::new(dir.path()).unwrap();
 
         std::fs::write(dir.path().join("data.txt"), "version 1").unwrap();
-        let oid1 = client.commit("v1", "T", "t@t.com", "T", "t@t.com").unwrap();
+        let oid1 = client.commit("v1", "T", "t@t.com", "T", "t@t.com", None).unwrap();
 
         std::fs::write(dir.path().join("data.txt"), "version 2").unwrap();
-        let oid2 = client.commit("v2", "T", "t@t.com", "T", "t@t.com").unwrap();
+        let oid2 = client.commit("v2", "T", "t@t.com", "T", "t@t.com", None).unwrap();
 
         // Read content at commit 1
         let content1 = client

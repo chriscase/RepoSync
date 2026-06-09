@@ -175,6 +175,10 @@ impl SvnToGitSync {
                 let committer_name = author_name.clone();
                 let committer_email = author_email.clone();
                 let msg = commit_message.clone();
+                // Clone the SVN date into the spawn_blocking closure so
+                // the resulting git commit's author date matches the
+                // SVN commit time rather than wallclock at sync time.
+                let svn_date = entry.date.clone();
                 let gc = self.git_client.clone();
 
                 tokio::task::spawn_blocking(move || {
@@ -185,6 +189,7 @@ impl SvnToGitSync {
                         &author_email,
                         &committer_name,
                         &committer_email,
+                        Some(&svn_date),
                     )
                 })
                 .await

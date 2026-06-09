@@ -358,7 +358,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 12);
+        // Assert the schema reaches the latest declared migration, derived
+        // from the MIGRATIONS array itself so the test doesn't go stale
+        // every time a new migration is added.
+        let target = MIGRATIONS.last().map(|m| m.0).unwrap_or(0);
+        assert_eq!(get_schema_version(&conn).unwrap(), target);
     }
 
     #[test]
