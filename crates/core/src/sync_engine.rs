@@ -825,12 +825,19 @@ impl SyncEngine {
                 // the git CLI's LFS clean filter runs.  libgit2 does not
                 // support LFS filters and will fail with "failed to read
                 // file into stream" when LFS-tracked files are present.
+                // Preserve the original SVN commit timestamp as the git
+                // author date so the visible commit history reflects when
+                // the change was actually made in SVN — not when reposync
+                // mirrored it. Without this, every commit on the git side
+                // looks like it happened at sync wallclock and any sync
+                // delay is invisible from `git log` / the Gitea dashboard.
                 let oid = match git.commit_via_cli(
                     &commit_message,
                     &git_identity.name,
                     &git_identity.email,
                     "reposync",
                     "sync@reposync.local",
+                    Some(&change.date),
                 ) {
                     Ok(oid) => oid,
                     // No-op revision: nothing staged (e.g. a delete of a path

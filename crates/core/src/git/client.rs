@@ -310,6 +310,22 @@ impl GitClient {
     ///
     /// Returns the commit SHA on success.
     #[instrument(skip(self, message))]
+    /// Create a commit via the `git` CLI (LFS-filter-aware).
+    ///
+    /// `author_date`, when supplied, sets the resulting commit's **author
+    /// date** to the given timestamp via `git commit --date`. This is how
+    /// we preserve the original SVN commit time when reposync materialises
+    /// an SVN revision into a git commit — without it, both the author
+    /// date and the committer date default to the wallclock at sync time
+    /// and any sync delay becomes invisible in the git history. Accepts
+    /// any string git's `--date` parser understands; ISO-8601 from SVN
+    /// (e.g. `2026-06-08T19:46:08.685Z`) works directly.
+    ///
+    /// The **committer date** is intentionally left at the wallclock so
+    /// `git log`'s default view still shows when this commit physically
+    /// landed in the mirror — together the two dates make any sync delay
+    /// visible (author date = when the change was originally made,
+    /// committer date = when reposync mirrored it).
     pub fn commit_via_cli(
         &self,
         message: &str,
@@ -317,6 +333,7 @@ impl GitClient {
         author_email: &str,
         committer_name: &str,
         committer_email: &str,
+        author_date: Option<&str>,
     ) -> Result<Oid, GitError> {
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
 
@@ -372,8 +389,19 @@ impl GitClient {
 
         // Build the commit via git CLI with explicit author/committer.
         let author_str = format!("{} <{}>", author_name, author_email);
+        let mut commit_args: Vec<&str> =
+            vec!["commit", "-m", message, "--author", &author_str];
+        // If the caller supplied an author date (typically the original SVN
+        // commit timestamp), thread it through with `--date`. Without this,
+        // git defaults to the wallclock and the resulting commit's author
+        // date silently shifts to sync time — masking any sync delay in
+        // the visible history.
+        if let Some(date) = author_date {
+            commit_args.push("--date");
+            commit_args.push(date);
+        }
         let commit_output = std::process::Command::new("git")
-            .args(["commit", "-m", message, "--author", &author_str])
+            .args(&commit_args)
             .current_dir(repo_path)
             .env("GIT_COMMITTER_NAME", committer_name)
             .env("GIT_COMMITTER_EMAIL", committer_email)

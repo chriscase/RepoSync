@@ -686,12 +686,20 @@ pub async fn run_full_import(
                     lfs_count = copy_stats.lfs_tracked,
                     "using git CLI for commit (LFS files present)"
                 );
+                // Preserve the original SVN commit timestamp as the git
+                // author date so historical imports show real authoring
+                // times rather than the moment the import ran. Without
+                // this, every imported commit looks like it happened at
+                // import wallclock, defeating heatmaps and any time-based
+                // analysis. See also sync_engine.rs for the same wiring
+                // on the incremental sync path.
                 git_client_guard.commit_via_cli(
                     &message,
                     &author_name,
                     &author_email,
                     &import_config.committer_name,
                     &import_config.committer_email,
+                    Some(&entry.date),
                 )
             } else {
                 git_client_guard.commit(
