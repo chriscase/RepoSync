@@ -17,7 +17,8 @@ MANDATORY = {
     "diagnostics": {"R02_R03_ROUTE", "R06_CHECKPOINT"},
     "candidate": {"R09_ORIGINAL", "R09_REPLACEMENT", "R09_AMEND", "R01_LINEAR",
                   "R10_L_EQUALS_R", "R01_SVN_PENDING", "R16_MISSING_BRANCH",
-                  "R16_TRANSPORT", "R10_MISSING_OBJECT", "R10_AMBIGUOUS",
+                  "R16_TRANSPORT", "R16_AUTH", "R16_FETCH", "R10_MISSING_OBJECT",
+                  "R10_MISSING_CURSOR", "R10_AMBIGUOUS",
                   "R10_SHALLOW", "R10_ANCESTRY_ERROR", "R09_LOCAL", "R10_MERGE",
                   "R10_OVERFLOW", "R17_SCOPE"},
 }

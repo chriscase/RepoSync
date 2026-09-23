@@ -447,8 +447,15 @@ impl SyncEngine {
         let git = self.git_client.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = git.repo_path();
         let branch = &self.config.github.default_branch;
+        // Debug-only fault injection lets the isolated integration suite
+        // distinguish a valid negative ancestry result from command failure.
+        #[cfg(debug_assertions)]
+        let git_program = std::env::var_os("REPOSYNC_TEST_GIT_EXECUTABLE")
+            .unwrap_or_else(|| std::ffi::OsString::from("git"));
+        #[cfg(not(debug_assertions))]
+        let git_program = std::ffi::OsString::from("git");
         let run = |args: &[&str]| -> std::io::Result<Output> {
-            Command::new("git")
+            Command::new(&git_program)
                 .args(args)
                 .current_dir(path)
                 .env("GIT_TERMINAL_PROMPT", "0")
@@ -482,10 +489,19 @@ impl SyncEngine {
             blocked!("local_dirty", "bridge index or worktree has unpublished changes");
         }
 
-        let remote_tracking = format!("refs/remotes/origin/{}^{{commit}}", branch);
-        if let Ok(output) = run(&["rev-parse", "--verify", &remote_tracking]) {
+        let inspection_ref = "refs/reposync/inspection/incoming";
+        let prior_inspection = format!("{}^{{commit}}", inspection_ref);
+        if let Ok(output) = run(&["rev-parse", "--verify", &prior_inspection]) {
             if output.status.success() {
                 o = Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+        }
+        if o.is_none() {
+            let remote_tracking = format!("refs/remotes/origin/{}^{{commit}}", branch);
+            if let Ok(output) = run(&["rev-parse", "--verify", &remote_tracking]) {
+                if output.status.success() {
+                    o = Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                }
             }
         }
         let remote_branch = format!("refs/heads/{}", branch);
@@ -511,7 +527,6 @@ impl SyncEngine {
             blocked!("ambiguous_remote_ref", "remote branch result is malformed");
         }
 
-        let inspection_ref = "refs/reposync/inspection/incoming";
         let refspec = format!("+{}:{}", remote_branch, inspection_ref);
         match run(&["fetch", "--no-tags", "--no-write-fetch-head", "origin", &refspec]) {
             Ok(output) if output.status.success() => (),

@@ -393,6 +393,8 @@ impl QualifiedPair {
         let mapping_count: i64 = self.engine.db().conn().query_row(
             "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair'", [], |row| row.get(0)).unwrap();
         let repo_sync_count = self.engine.db().get_repository("pair").unwrap().unwrap().total_syncs;
+        let bridge_status = git_output(&self.bridge, &["status", "--porcelain"]);
+        let bridge_index = std::fs::read(self.bridge.join(".git/index")).unwrap();
         PairSnapshot {
             svn_rev,
             svn_origin: std::fs::read_to_string(export.join("origin.txt")).unwrap(),
@@ -401,8 +403,8 @@ impl QualifiedPair {
             remote_tree: git_output(&self.bare, &["rev-parse", "refs/heads/main^{tree}"]),
             bridge_sha: get_head_sha(&self.bridge),
             bridge_tree: git_output(&self.bridge, &["rev-parse", "HEAD^{tree}"]),
-            bridge_index: std::fs::read(self.bridge.join(".git/index")).unwrap(),
-            bridge_status: git_output(&self.bridge, &["status", "--porcelain"]),
+            bridge_index,
+            bridge_status,
             bridge_feature: std::fs::read_to_string(self.bridge.join("feature.txt")).ok(),
             watermark: self.engine.db().get_repo_watermark("pair").unwrap(),
             kv_cursor: self.engine.db().get_state("last_git_sha_pair").unwrap(),
@@ -821,12 +823,67 @@ async fn candidate_r16_remote_transport_failure_blocks_without_reset() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r16_auth_denial_is_distinct_from_transport() {
+    let fixture = QualifiedPair::new().await;
+    let wrapper = fixture.tmp.path().join("auth-git");
+    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = ls-remote ]; then echo 'fatal: Authentication failed' >&2; exit 128; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("REPOSYNC_TEST_GIT_EXECUTABLE", &wrapper);
+    let before = fixture.snapshot().await;
+    let result = fixture.engine.run_sync_cycle().await;
+    std::env::remove_var("REPOSYNC_TEST_GIT_EXECUTABLE");
+    assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_auth_failed"),
+        "synthetic auth denial must be distinct from transport: {result:?}");
+    assert_eq!(fixture.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R16_AUTH", "reason":"remote_auth_failed",
+        "bridge_before_after":before.bridge_sha, "svn_revision_before_after":before.svn_rev,
+        "mapping_count_before_after":before.mapping_count
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r16_fetch_failure_does_not_use_stale_ref() {
+    let fixture = QualifiedPair::new().await;
+    git_cli(&fixture.bridge, &["fetch", "origin", "main"]);
+    let wrapper = fixture.tmp.path().join("fetch-git");
+    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = fetch ]; then exit 128; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::set_var("REPOSYNC_TEST_GIT_EXECUTABLE", &wrapper);
+    let before = fixture.snapshot().await;
+    let result = fixture.engine.run_sync_cycle().await;
+    std::env::remove_var("REPOSYNC_TEST_GIT_EXECUTABLE");
+    assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_fetch_failed"),
+        "failed fresh fetch must not use stale tracking ref: {result:?}");
+    assert_eq!(fixture.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R16_FETCH", "reason":"remote_fetch_failed",
+        "bridge_before_after":before.bridge_sha, "svn_revision_before_after":before.svn_rev,
+        "mapping_count_before_after":before.mapping_count
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_missing_checkpoint_object_blocks() {
     let fixture = QualifiedPair::new().await;
     let absent = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let repo_rev = fixture.engine.db().get_repo_watermark("pair").unwrap().0;
     fixture.engine.db().update_repo_watermark("pair", repo_rev, absent).unwrap();
     assert_pair_blocked_without_damage(&fixture, "missing_checkpoint_object").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_missing_repository_cursor_does_not_borrow_global() {
+    let fixture = QualifiedPair::new().await;
+    fixture.engine.db().set_state("last_git_hash", &fixture.imported_base).unwrap();
+    fixture.engine.db().update_repo_watermark("pair", 2, "").unwrap();
+    assert_pair_blocked_without_damage(&fixture, "missing_checkpoint").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -855,14 +912,18 @@ async fn candidate_r10_ancestry_command_error_is_not_rewrite() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let old_path = std::env::var("PATH").unwrap();
-    std::env::set_var("PATH", format!("{}:{}", wrapper.display(), old_path));
+    std::env::set_var("REPOSYNC_TEST_GIT_EXECUTABLE", &script);
     let before = fixture.snapshot().await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::set_var("PATH", old_path);
+    std::env::remove_var("REPOSYNC_TEST_GIT_EXECUTABLE");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ancestry_command_failed"),
         "git command error must be unknown, not a valid negative ancestry: {result:?}");
     assert_eq!(fixture.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_ANCESTRY_ERROR", "reason":"ancestry_command_failed",
+        "bridge_before_after":before.bridge_sha, "svn_revision_before_after":before.svn_rev,
+        "mapping_count_before_after":before.mapping_count
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
