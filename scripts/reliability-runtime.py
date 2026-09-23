@@ -151,9 +151,50 @@ def run_case(case, binaries):
     return evidence
 
 
+def run_baseline(binaries):
+    import re
+    results = {}
+    totals = {"passed": 0, "failed": 0, "ignored": 0, "filtered_out": 0}
+    for name, filename in sorted(binaries.items()):
+        binary = TESTS / filename
+        result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
+                                capture_output=True, text=True, timeout=300)
+        output = result.stdout + result.stderr
+        if SECRET in output:
+            raise AssertionError(f"synthetic fixture secret leaked in {name} output")
+        (OUTPUT / f"baseline-{name}.log").write_text(output)
+        count_rows = re.findall(
+            r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out",
+            output,
+        )
+        if len(count_rows) != 1:
+            raise AssertionError(f"missing baseline counts for {name}")
+        passed, failed, ignored, _, filtered = map(int, count_rows[0])
+        for key, count in zip(("passed", "failed", "ignored", "filtered_out"),
+                              (passed, failed, ignored, filtered)):
+            totals[key] += count
+        matched = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)(?:, [^\n]+)?$", output, re.M)
+        if len(matched) != passed + failed + ignored:
+            raise AssertionError(f"baseline test catalog/count mismatch for {name}: {len(matched)} vs {passed + failed + ignored}")
+        for test_name, status in matched:
+            results[f"{name}::{test_name}"] = status
+        print(json.dumps({"binary": name, "exit_code": result.returncode,
+                          "passed": passed, "failed": failed, "ignored": ignored}), flush=True)
+    if totals["passed"] + totals["failed"] == 0:
+        raise AssertionError("baseline executed zero tests")
+    report = {"mode": "baseline", "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
+              "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
+              "lock_sha256": os.environ["REPOSYNC_LOCK_SHA256"],
+              "goal_sha256": os.environ["REPOSYNC_GOAL_SHA256"],
+              "totals": totals, "tests": results}
+    (OUTPUT / "baseline-results.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"mode": "baseline", "source_head": report["source_head"],
+                      "totals": totals, "catalog_count": len(results)}), flush=True)
+
+
 def main():
     mode = sys.argv[1]
-    assert mode in ("diagnostics", "candidate", "all"), mode
+    assert mode in ("diagnostics", "candidate", "all", "baseline"), mode
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
     assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
     assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
@@ -163,6 +204,13 @@ def main():
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")
     manifest = json.loads(Path("/opt/reliability/required-cases.json").read_text())
     binaries = json.loads((TESTS / "binaries.json").read_text())
+    if mode == "baseline":
+        run_baseline(binaries)
+        versions = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+        versions += subprocess.run(["svn", "--version", "--quiet"], capture_output=True, text=True, check=True).stdout
+        versions += (TESTS / "build-toolchain.txt").read_text()
+        (OUTPUT / "tool-versions.txt").write_text(versions)
+        return
     for tier, mandatory in MANDATORY.items():
         actual = {c["id"] for c in manifest[tier]}
         assert mandatory <= actual, f"required {tier} case omitted: {sorted(mandatory - actual)}"

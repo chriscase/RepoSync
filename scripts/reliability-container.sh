@@ -5,21 +5,22 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 mode="${1:---diagnostics}"
 case "$mode" in
-  --diagnostics|--candidate|--all) ;;
-  *) echo "Usage: $0 [--diagnostics|--candidate|--all]" >&2; exit 2 ;;
+  --diagnostics|--candidate|--all|--baseline) ;;
+  *) echo "Usage: $0 [--diagnostics|--candidate|--all|--baseline]" >&2; exit 2 ;;
 esac
 command -v docker >/dev/null || { echo "NOT RUN: Docker unavailable" >&2; exit 2; }
 docker info >/dev/null || { echo "NOT RUN: Docker daemon unavailable" >&2; exit 2; }
-source_head="$(git rev-parse HEAD)"
-source_tree="$(git rev-parse HEAD^{tree})"
+source_head="${REPOSYNC_SOURCE_HEAD_OVERRIDE:-$(git rev-parse HEAD)}"
+source_tree="${REPOSYNC_SOURCE_TREE_OVERRIDE:-$(git rev-parse HEAD^{tree})}"
+context_root="${REPOSYNC_BUILD_CONTEXT:-$repo_root}"
 goal_hash="$(shasum -a 256 docs/reliability/GOAL.md | awk '{print $1}')"
 lock_hash="$(shasum -a 256 docs/reliability/fixtures/Cargo.lock | awk '{print $1}')"
 [[ "$goal_hash" == 16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8 ]] || {
   echo "FAIL: original GOAL.md changed" >&2; exit 1;
 }
 image="reposync-reliability:$source_head"
-docker build --file Dockerfile.reliability --tag "$image" .
-artifact_dir="$repo_root/artifacts/reliability-phase0/$(date -u +%Y%m%dT%H%M%SZ)-${mode#--}"
+docker build --file "$context_root/Dockerfile.reliability" --tag "$image" "$context_root"
+artifact_dir="${REPOSYNC_ARTIFACT_DIR:-$repo_root/artifacts/reliability-phase0/$(date -u +%Y%m%dT%H%M%SZ)-${mode#--}}"
 mkdir -p "$artifact_dir"
 chmod 1777 "$artifact_dir"
 host_private="$(mktemp -d "${TMPDIR:-/tmp}/reposync-host-private.XXXXXX")"

@@ -16,13 +16,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Run fixture-only real-engine and API diagnostics
         run: scripts/reliability-container.sh --all
+      - name: Compare exact reviewed base with matching dependencies
+        run: scripts/reliability-compare.sh
       - name: Preserve fixture-only evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: reliability-phase0-${{ github.sha }}
-          path: artifacts/reliability-phase0/
+          path: |
+            artifacts/reliability-phase0/
+            artifacts/reliability-compare/
           retention-days: 14
           if-no-files-found: warn
