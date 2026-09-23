@@ -125,6 +125,8 @@ fn svn_commit_file(wc_path: &Path, filename: &str, content: &str, message: &str)
             "-m",
             message,
             wc_path.to_str().unwrap(),
+            "--username",
+            "fixture",
             "--non-interactive",
         ])
         .output()
