@@ -1278,6 +1278,11 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
         "svnadmin required"
     );
     let (addr, state, server, tmp) = build_test_server_full().await;
+    if let Ok(root) = std::env::var("REPOSYNC_FIXTURE_ROOT") {
+        let root = std::path::Path::new(&root).canonicalize().unwrap();
+        let target = tmp.path().canonicalize().unwrap();
+        assert!(target.starts_with(root), "API fixture target escaped owned root");
+    }
     let svn_repo = tmp.path().join("svn-fixture");
     let created = Command::new("svnadmin")
         .args(["create", svn_repo.to_str().unwrap()])
@@ -1374,6 +1379,7 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
     }));
     let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider_addr = provider_listener.local_addr().unwrap();
+    assert!(provider_addr.ip().is_loopback(), "provider endpoint must be enrolled loopback");
     let provider_handle = tokio::spawn(async move { axum::serve(provider_listener, provider).await.unwrap(); });
 
     let client = authed_client();

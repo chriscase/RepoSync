@@ -50,6 +50,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --mount "type=bind,src=$artifact_dir,dst=/evidence,readonly=false" \
   --workdir /fixture \
   --env HOME=/fixture/home --env TMPDIR=/fixture/tmp \
+  --env REPOSYNC_FIXTURE_ROOT=/fixture/tmp \
   --env XDG_CONFIG_HOME=/fixture/config --env GIT_CONFIG_NOSYSTEM=1 \
   --env GIT_CONFIG_GLOBAL=/dev/null --env GIT_TERMINAL_PROMPT=0 \
   --env GIT_ASKPASS=/usr/bin/false --env GIT_SSH_COMMAND=/usr/bin/false \

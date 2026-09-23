@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 FIXTURE = Path("/fixture")
 OUTPUT = Path("/evidence")
@@ -30,6 +31,20 @@ def probe_connection(address):
         return False
 
 
+def enrolled_file_target(url):
+    parsed = urlsplit(url)
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+        raise ValueError("not an enrolled local file target")
+    path = Path(unquote(parsed.path))
+    if not path.is_absolute():
+        raise ValueError("relative file target")
+    root = (FIXTURE / "tmp").resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(root):
+        raise ValueError("file target escapes fixture root")
+    return resolved
+
+
 def boundary_canaries():
     FIXTURE.joinpath("tmp").mkdir(parents=True, exist_ok=True)
     FIXTURE.joinpath("home").mkdir(exist_ok=True)
@@ -37,6 +52,23 @@ def boundary_canaries():
     owned = FIXTURE / "canary.txt"
     owned.write_text("fixture-owned\n")
     assert owned.read_text() == "fixture-owned\n"
+    assert enrolled_file_target((FIXTURE / "tmp").as_uri()) == (FIXTURE / "tmp")
+    for bad in ("file:///etc/passwd", "file:///fixture/tmp/../../etc/passwd", "https://example.invalid/"):
+        try:
+            enrolled_file_target(bad)
+        except (ValueError, FileNotFoundError):
+            pass
+        else:
+            raise AssertionError(f"non-fixture target admitted: {bad}")
+    escape = FIXTURE / "tmp" / "escape"
+    escape.symlink_to("/etc")
+    try:
+        enrolled_file_target(escape.as_uri())
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("symlink escape admitted")
+    escape.unlink()
 
     host_path = Path(os.environ["REPOSYNC_HOST_CANARY_PATH"])
     assert not host_path.exists(), "host-private canary was mounted into runtime"
@@ -67,6 +99,7 @@ def boundary_canaries():
         "fixture_loopback": "PASS",
         "host_loopback_denied": "PASS",
         "external_egress_denied": "PASS",
+        "file_target_traversal_and_symlink_denied": "PASS",
     }
 
 
@@ -114,6 +147,7 @@ def main():
     assert not Path("/src").exists(), "source checkout was mounted into runtime"
     assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
     canaries = boundary_canaries()
+    (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")
     manifest = json.loads(Path("/opt/reliability/required-cases.json").read_text())
     binaries = json.loads((TESTS / "binaries.json").read_text())
     for tier, mandatory in MANDATORY.items():

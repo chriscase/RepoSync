@@ -47,7 +47,16 @@ fn svn_available() -> bool {
     svn_ok && svnadmin_ok
 }
 
+fn assert_fixture_owned(path: &Path) {
+    if let Ok(root) = std::env::var("REPOSYNC_FIXTURE_ROOT") {
+        let root = Path::new(&root).canonicalize().unwrap();
+        let target = path.canonicalize().unwrap();
+        assert!(target.starts_with(&root), "fixture target escaped owned root: {}", target.display());
+    }
+}
+
 fn create_svn_repo(dir: &Path) -> String {
+    assert_fixture_owned(dir);
     let repo_dir = dir.join("svn_repo");
     let status = Command::new("svnadmin")
         .args(["create", repo_dir.to_str().unwrap()])
@@ -153,6 +162,8 @@ fn svn_commit_file(wc_path: &Path, filename: &str, content: &str, message: &str)
 }
 
 fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
+    assert_fixture_owned(work_dir.parent().unwrap());
+    assert_fixture_owned(bare_dir.parent().unwrap());
     git2::Repository::init_bare(bare_dir).expect("failed to init bare repo");
     let git_client = GitClient::init(work_dir).expect("failed to init git repo");
 
