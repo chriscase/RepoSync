@@ -265,6 +265,275 @@ fn get_git_commit_message(repo_path: &Path, index: usize) -> String {
     commit.message().unwrap_or("").to_string()
 }
 
+fn git_cli(repo_path: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture Developer")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture Developer")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .expect("git fixture command");
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// R09 baseline diagnostic. Every URL here is a temporary file:// repository.
+/// This test records the unsafe outcome so a future containment change must
+/// replace the assertion with a zero-write, reconciliation-required assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_r09_rewritten_paired_tip_replays_into_svn() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+
+    let git_dir = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git = setup_git_with_bare_origin(&git_dir, &bare);
+    let db = setup_db(&tmp.path().join("sync.db"));
+    db.set_state("last_svn_rev", "1").unwrap();
+    db.set_state("last_git_hash", &get_head_sha(&git_dir))
+        .unwrap();
+    let mut config = make_app_config(&svn_url, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git,
+        Arc::new(make_identity_mapper()),
+    );
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let proven_base = get_head_sha(&git_dir);
+
+    std::fs::write(git_dir.join("feature.txt"), "first version\n").unwrap();
+    git_cli(&git_dir, &["add", "feature.txt"]);
+    git_cli(&git_dir, &["commit", "-m", "First Git change"]);
+    git_cli(&git_dir, &["push", "origin", "main"]);
+    let old_synced = get_head_sha(&git_dir);
+    assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    let before = SvnClient::new(&svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let old_record: i64 = engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE git_sha = ?1 AND svn_rev = ?2 AND direction = 'git_to_svn'",
+        rusqlite::params![old_synced, before], |row| row.get(0)).unwrap();
+    assert_eq!(old_record, 1);
+    let original_export = tmp.path().join("original_export");
+    SvnClient::new(&svn_url, "", "").export("", before, &original_export).await.unwrap();
+    assert_eq!(std::fs::read_to_string(original_export.join("feature.txt")).unwrap(), "first version\n");
+    assert_eq!(
+        std::fs::read_to_string(wc.join("origin.txt")).unwrap(),
+        "SVN origin\n"
+    );
+
+    git_cli(&git_dir, &["reset", "--hard", &proven_base]);
+    std::fs::write(git_dir.join("feature.txt"), "rewritten version\n").unwrap();
+    git_cli(&git_dir, &["add", "feature.txt"]);
+    git_cli(&git_dir, &["commit", "-m", "Rewritten Git change"]);
+    git_cli(&git_dir, &["push", "--force", "origin", "main"]);
+    let rewritten = get_head_sha(&git_dir);
+    assert_ne!(old_synced, rewritten);
+    let ancestry = Command::new("git")
+        .arg("-C")
+        .arg(&git_dir)
+        .args(["merge-base", "--is-ancestor", &old_synced, &rewritten])
+        .status()
+        .unwrap();
+    assert!(
+        !ancestry.success(),
+        "fixture must actually rewrite already-synced history"
+    );
+
+    let result = engine.run_sync_cycle().await;
+    let after = SvnClient::new(&svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    assert!(
+        after > before,
+        "baseline did not reproduce unsafe SVN replay: {result:?}"
+    );
+    let exported = tmp.path().join("rewritten_export");
+    SvnClient::new(&svn_url, "", "")
+        .export("", after, &exported)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(exported.join("feature.txt")).unwrap(),
+        "rewritten version\n"
+    );
+    let rewritten_record: i64 = engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE git_sha = ?1 AND svn_rev = ?2 AND direction = 'git_to_svn'",
+        rusqlite::params![rewritten, after], |row| row.get(0)).unwrap();
+    assert_eq!(rewritten_record, 1);
+    assert_eq!(engine.db().get_state("last_git_hash").unwrap(), Some(rewritten.clone()));
+    eprintln!("EXPECTED BASELINE FAILURE R09: already-synced Git tip {old_synced} was replaced by {rewritten}; SVN advanced r{before}->r{after}");
+}
+
+/// R06 baseline diagnostic: the skip-import checkpoint used by late pairing
+/// acknowledges two unprocessed Git commits. The branch is descended from an
+/// actual SVN-import commit, not an unrelated Git-first history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_r06_late_pair_checkpoint_omits_existing_git_work() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let git_dir = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git = setup_git_with_bare_origin(&git_dir, &bare);
+    let db = setup_db(&tmp.path().join("sync.db"));
+    db.set_state("last_svn_rev", "1").unwrap();
+    db.set_state("last_git_hash", &get_head_sha(&git_dir))
+        .unwrap();
+    let mut config = make_app_config(&svn_url, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let parent_engine = SyncEngine::new(
+        config.clone(),
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git,
+        Arc::new(make_identity_mapper()),
+    );
+    assert_eq!(
+        parent_engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    let imported_base = get_head_sha(&git_dir);
+
+    git_cli(&git_dir, &["checkout", "-b", "feature"]);
+    std::fs::write(git_dir.join("feature.txt"), "step one\n").unwrap();
+    git_cli(&git_dir, &["add", "feature.txt"]);
+    git_cli(&git_dir, &["commit", "-m", "Feature step one"]);
+    std::fs::write(git_dir.join("feature.txt"), "step two\n").unwrap();
+    git_cli(&git_dir, &["commit", "-am", "Feature step two"]);
+    git_cli(&git_dir, &["push", "origin", "feature"]);
+    let feature_tip = get_head_sha(&git_dir);
+    assert_ne!(feature_tip, imported_base);
+    let pending = Command::new("git").arg("-C").arg(&git_dir)
+        .args(["rev-list", "--count", &format!("{imported_base}..{feature_tip}")])
+        .output().unwrap();
+    assert!(pending.status.success());
+    assert_eq!(String::from_utf8_lossy(&pending.stdout).trim(), "2");
+
+    // A disposable SVN target with the same SVN-origin file baseline.
+    let target_url = format!("{svn_url}/feature");
+    let output = Command::new("svn")
+        .args([
+            "mkdir",
+            &target_url,
+            "-m",
+            "Create feature target",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn mkdir: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let source_file = format!("{svn_url}/origin.txt");
+    let target_file = format!("{target_url}/origin.txt");
+    let output = Command::new("svn")
+        .args([
+            "copy",
+            &source_file,
+            &target_file,
+            "-m",
+            "Copy verified origin",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn copy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let target = SvnClient::new(&target_url, "", "");
+    let target_rev = target.info().await.unwrap().latest_rev;
+
+    // This is the exact checkpoint transition performed by the existing
+    // create_branch_pair(skip_import) path after provider/SVN HEAD lookup.
+    let child_db = setup_db(&tmp.path().join("child.db"));
+    // The team engine reads the per-repo KV checkpoint when no repository row
+    // is present, matching the legacy transition after pair creation.
+    child_db
+        .set_state("last_svn_rev_child", &target_rev.to_string())
+        .unwrap();
+    child_db
+        .set_state("last_git_sha_child", &feature_tip)
+        .unwrap();
+    config.svn.url = target_url.clone();
+    config.github.default_branch = "feature".into();
+    let mut child_engine = SyncEngine::new(
+        config,
+        child_db,
+        target,
+        GitClient::new(&git_dir).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+    child_engine.set_repo_id("child".into());
+    let before = SvnClient::new(&target_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let stats = child_engine.run_sync_cycle().await.unwrap();
+    let after = SvnClient::new(&target_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    assert_eq!(stats.git_to_svn_count, 0);
+    assert_eq!(before, after);
+    let child_records: i64 = child_engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE git_sha = ?1",
+        [&feature_tip], |row| row.get(0)).unwrap();
+    assert_eq!(child_records, 0);
+    assert_eq!(child_engine.db().get_state("last_git_sha_child").unwrap(), Some(feature_tip.clone()));
+    let exported = tmp.path().join("feature_export");
+    SvnClient::new(&target_url, "", "")
+        .export("", after, &exported)
+        .await
+        .unwrap();
+    assert!(
+        !exported.join("feature.txt").exists(),
+        "pending Git work unexpectedly reached SVN"
+    );
+    eprintln!("EXPECTED BASELINE FAILURE R06: SVN-derived feature commits {imported_base}..{feature_tip} were acknowledged without SVN emission at r{after}");
+}
+
 // ===========================================================================
 // Test 1: SVN → Git sync via SyncEngine
 // ===========================================================================

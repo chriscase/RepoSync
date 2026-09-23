@@ -1,0 +1,21 @@
+# Phase 0 isolated validation
+
+Run `scripts/reliability-phase0.sh --diagnostics` from any directory. On macOS it prepares Rust dependencies, creates a private HOME/config/temp directory, proves a loopback connection succeeds and a documentation-only external target is rejected, then runs the real team sync engine and local Axum API diagnostics inside a `sandbox-exec` policy that denies non-loopback outbound traffic. The test process receives only explicit fixture credentials; ambient SSH agents, Git helpers/config, SVN auth caches, user notifications and other environment secrets are not inherited. Git and SVN targets are created in `TempDir` paths and use bare Git and `file://` SVN. The Gitea-shaped provider fixture binds `127.0.0.1` and returns the SHA read from a disposable Git ref. There are no production mounts, host Docker socket, or live endpoints.
+
+The entry point is intentionally fail-closed when `sandbox-exec`, SVN tools or the network probe is unavailable. It does not run `tests/e2e_api_test.sh`, `validate-ghe-live`, enterprise soak or Docker Compose. The existing `tests/docker-compose.yml` publishes ports on all interfaces as written and includes a container notification hook; it needs loopback and network/mount hardening before use for this epic. The real-engine diagnostics extend `crates/core/tests/team_mode_e2e.rs`; the API/provider diagnostic extends `crates/web/tests/server_freeze.rs`. Existing E2E zero-test and CI LFS gates remain in place.
+
+`--baseline` runs the workspace Rust tests in the same guard; `--baseline-personal` and `--baseline-web` allow package-specific completion if an earlier workspace package fails. Every invocation writes `summary.json`, `test-output.log`, and `tool-versions.txt` to ignored `artifacts/reliability-phase0/<UTC timestamp>-<mode>/`. A zero-test result fails. The workflow `.github/workflows/reliability-phase0.yml` runs the diagnostics on a macOS PR merge ref and retains these sanitized logs for 14 days. The existing Ubuntu CI/E2E workflows still run their original gates. The workflow artifact name contains `${{ github.sha }}`, which is a PR merge SHA for pull-request events, so it must be reported separately from the feature branch head.
+
+The diagnostic tests assert **observed baseline bugs**, and print `EXPECTED BASELINE FAILURE`. A passing diagnostic test is evidence that the unsafe baseline behavior occurred; it is **not** an acceptance PASS. When a fix is reviewed, convert the corresponding test to assert the safe result and retain its scenario ID. The fixture graph is synthetic and documents only the specific sequence in the tests; it does not claim to reproduce the coworker's exact incident graph.
+
+Current initial observations:
+
+| ID | Tier | Baseline observation | Candidate acceptance |
+| --- | --- | --- | --- |
+| R02 | Local API + real SVN/Git remotes | Root DELETE keeps the registration disabled; both remote histories remain unchanged. This confirms legacy behavior and the absence of an explicit remove workflow. | PARTIAL: new managed removal, cleanup and dependency cases not implemented. |
+| R03 | Local API | Per-repo import status can report importing but `/import/cancel` returns 404. No durable operation was created. | PARTIAL: actual in-flight cancellation and child-process boundaries not yet reproduced. |
+| R06 | Actual team engine + local HTTP provider/API | Two Git commits descended from an SVN import remain absent from the SVN target after the skip-import checkpoint. The API independently records the provider's real tip without a mapping. | EXPECTED BASELINE FAILURE; safe late-pair reconciliation not implemented. |
+| R09 | Actual team engine | Replacing an already-synced Git tip with a non-descendant causes another SVN revision. Pre/post exported SVN content and `sync_records` map both Git SHAs to distinct SVN revisions. | EXPECTED BASELINE FAILURE; rewrite containment not implemented. |
+| R20 | Browser | No browser test runner is configured in `web-ui/package.json`; source lead only. | NOT RUN: current-page deletion navigation remains to reproduce. |
+
+The other R01–R24 acceptance rows in GOAL.md remain open unless separately evidenced. The Phase 0 tests do not qualify cancellation after a remote write, migration, upgrades, snapshot, refresh, 1,000-commit backlog, missing history, or active installations.
