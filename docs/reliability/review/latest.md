@@ -1,5 +1,7 @@
 # Phase 0 review handoff
 
+**Independent-review correction (2026-09-23):** This file records the earlier Phase 0 submission. [The posted review](phase0-independent-review.md) found that its macOS policy was only a network guard, not a complete isolation boundary, and that its R06 language combined two separate partial fixtures. The core R06 test manually established a child checkpoint; the API fixture began from unrelated Git-first history and is an R08 admission lead. R03 remains synthetic route coverage. The artifact logs were not independently proved sanitized at this gate. See [sandbox.md](../sandbox.md) and [scenarios.json](../scenarios.json) for corrected coverage; earlier wording below is retained as historical submission evidence.
+
 **STATUS:** READY_FOR_REVIEW
 **EPIC / ISSUES:** #61; Phase 0 #62 and design portions of #63/#64/#66; diagnostic leads for #65/#67/#70; #41 remains the later release gate.
 **BRANCH / PR:** `feature/reposync-reliability` / [draft PR #72](https://github.com/chriscase/RepoSync/pull/72)

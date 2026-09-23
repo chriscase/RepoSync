@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Fixture-only test runner, executed inside the disposable Docker namespace."""
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+FIXTURE = Path("/fixture")
+OUTPUT = Path("/evidence")
+TESTS = Path("/opt/reliability-tests")
+SECRET = "REPOSYNC_SYNTHETIC_SECRET_CANARY_72"
+MANDATORY = {
+    "diagnostics": {"R02_R03_ROUTE", "R06_CHECKPOINT", "R09_REPLAY"},
+    "candidate": set(),
+}
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def probe_connection(address):
+    try:
+        with socket.create_connection(address, timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def boundary_canaries():
+    FIXTURE.joinpath("tmp").mkdir(parents=True, exist_ok=True)
+    FIXTURE.joinpath("home").mkdir(exist_ok=True)
+    FIXTURE.joinpath("config").mkdir(exist_ok=True)
+    owned = FIXTURE / "canary.txt"
+    owned.write_text("fixture-owned\n")
+    assert owned.read_text() == "fixture-owned\n"
+
+    host_path = Path(os.environ["REPOSYNC_HOST_CANARY_PATH"])
+    assert not host_path.exists(), "host-private canary was mounted into runtime"
+    try:
+        host_path.read_bytes()
+    except (FileNotFoundError, PermissionError):
+        pass
+    else:
+        raise AssertionError("host-private read was allowed")
+    try:
+        host_path.write_text("unexpected write")
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    else:
+        raise AssertionError("host-private write was allowed")
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    assert probe_connection(listener.getsockname()), "fixture loopback failed"
+    listener.close()
+    host_port = int(os.environ["REPOSYNC_HOST_LISTENER_PORT"])
+    assert not probe_connection(("127.0.0.1", host_port)), "unrelated host loopback reachable"
+    assert not probe_connection(("192.0.2.1", 80)), "external egress reachable"
+    return {
+        "fixture_read_write": "PASS",
+        "host_private_read_write_denied": "PASS",
+        "fixture_loopback": "PASS",
+        "host_loopback_denied": "PASS",
+        "external_egress_denied": "PASS",
+    }
+
+
+def run_case(case, binaries):
+    binary = TESTS / binaries[case["binary"]]
+    test_name = case["test"]
+    listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True)
+    matches = [line for line in listing.stdout.splitlines() if line.startswith(test_name + ": test")]
+    if len(matches) != 1:
+        raise AssertionError(f"required test missing or ambiguous: {case['id']} {test_name}")
+    cmd = [str(binary), test_name, "--exact", "--nocapture", "--test-threads=1"]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    output = result.stdout + result.stderr
+    if SECRET in output:
+        raise AssertionError(f"synthetic fixture secret leaked in {case['id']} output")
+    (OUTPUT / f"{case['id']}.log").write_text(output)
+    import re
+    counts = re.findall(
+        r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out",
+        output,
+    )
+    if len(counts) != 1:
+        raise AssertionError(f"missing result counts for {case['id']}")
+    passed, failed, ignored, _, filtered = map(int, counts[0])
+    if result.returncode or (passed, failed, ignored) != (1, 0, 0):
+        raise AssertionError(f"required test {case['id']} failed/ignored: exit={result.returncode}, counts={counts[0]}\n{output}")
+    evidence = {
+        "id": case["id"], "tier": case["tier"], "test": test_name,
+        "binary_sha256": digest(binary.read_bytes()),
+        "exit_code": result.returncode, "passed": passed, "failed": failed,
+        "ignored": ignored, "filtered_out": filtered, "output_sha256": digest(output.encode()),
+        "outcome": "BASELINE_DEFECT_OBSERVED" if case["tier"] == "baseline_observation" else "CANDIDATE_SUBCASE_PASS",
+    }
+    (OUTPUT / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    print(json.dumps(evidence), flush=True)
+    return evidence
+
+
+def main():
+    mode = sys.argv[1]
+    assert mode in ("diagnostics", "candidate", "all"), mode
+    assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
+    assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
+    assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
+    assert not Path("/src").exists(), "source checkout was mounted into runtime"
+    assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
+    canaries = boundary_canaries()
+    manifest = json.loads(Path("/opt/reliability/required-cases.json").read_text())
+    binaries = json.loads((TESTS / "binaries.json").read_text())
+    for tier, mandatory in MANDATORY.items():
+        actual = {c["id"] for c in manifest[tier]}
+        assert mandatory <= actual, f"required {tier} case omitted: {sorted(mandatory - actual)}"
+    omitted_r09 = {c["id"] for c in manifest["diagnostics"] if c["id"] != "R09_REPLAY"}
+    assert not MANDATORY["diagnostics"] <= omitted_r09, "omission self-test failed"
+    required = (manifest["diagnostics"] if mode in ("diagnostics", "all") else []) + \
+               (manifest["candidate"] if mode in ("candidate", "all") else [])
+    assert required, "zero required cases"
+    assert len({c["id"] for c in required}) == len(required), "duplicate case IDs"
+    cases = [run_case(case, binaries) for case in required]
+    summary = {
+        "mode": mode, "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
+        "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
+        "goal_sha256": os.environ["REPOSYNC_GOAL_SHA256"],
+        "lock_sha256": os.environ["REPOSYNC_LOCK_SHA256"],
+        "manifest_sha256": digest(Path("/opt/reliability/required-cases.json").read_bytes()),
+        "required_ids": [c["id"] for c in required], "executed_ids": [c["id"] for c in cases],
+        "baseline_observations": sum(c["tier"] == "baseline_observation" for c in cases),
+        "candidate_regressions": sum(c["tier"] == "candidate_regression" for c in cases),
+        "passed": sum(c["passed"] for c in cases), "failed": sum(c["failed"] for c in cases),
+        "ignored": sum(c["ignored"] for c in cases),
+        "filtered_out": sum(c["filtered_out"] for c in cases),
+        "canaries": canaries,
+        "required_r09_omission_rejected": True,
+    }
+    (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    versions = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+    versions += subprocess.run(["svn", "--version", "--quiet"], capture_output=True, text=True, check=True).stdout
+    versions += (TESTS / "build-toolchain.txt").read_text()
+    (OUTPUT / "tool-versions.txt").write_text(versions)
+    print(json.dumps(summary), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        raise

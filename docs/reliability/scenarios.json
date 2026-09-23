@@ -44,10 +44,10 @@
     },
     {
       "id": "R06",
-      "baseline": "FAIL",
+      "baseline": "PARTIAL",
       "candidate": "NOT RUN",
-      "tier": "actual_engine_and_local_provider",
-      "evidence": "Two SVN-import-descended Git commits are skipped after late-pair checkpoint; local provider API independently records their real tip without mapping.",
+      "tier": "actual_engine_checkpoint_consequence",
+      "evidence": "The core fixture manually sets a child checkpoint after an actual SVN import and shows two descendant Git commits skipped. It does not call the API or populate a child repository row. Integrated SVN-origin API-to-child-engine coverage is NOT RUN.",
       "diagnostic_expected_baseline_failure": true
     },
     {
@@ -60,10 +60,10 @@
     },
     {
       "id": "R08",
-      "baseline": "NOT RUN",
+      "baseline": "PARTIAL",
       "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "tier": "local_api_unrelated_git_first",
+      "evidence": "The separate API fixture accepts a Git-first feature branch and records its real provider tip. It does not prove a valid SVN-derived R06 late pair or complete R08 admission criteria.",
       "diagnostic_expected_baseline_failure": false
     },
     {

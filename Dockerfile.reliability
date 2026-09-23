@@ -1,0 +1,24 @@
+FROM rust:1.98.1-bookworm AS build
+ENV CARGO_BUILD_JOBS=2
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git subversion pkg-config libssl-dev python3 && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml ./
+COPY crates ./crates
+COPY docs/reliability/fixtures/Cargo.lock ./Cargo.lock
+COPY scripts/reliability-prep.py /usr/local/bin/reliability-prep
+RUN cargo test --workspace --no-run --locked --message-format=json \
+    > /tmp/cargo-preparation.jsonl && \
+    python3 /usr/local/bin/reliability-prep /tmp/cargo-preparation.jsonl /opt/reliability-tests && \
+    rustc --version > /opt/reliability-tests/build-toolchain.txt && \
+    cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
+    sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
+
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git subversion libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /opt/reliability-tests /opt/reliability-tests
+COPY scripts/reliability-runtime.py /usr/local/bin/reliability-runtime
+COPY docs/reliability/required-cases.json /opt/reliability/required-cases.json
+USER 65532:65532
+ENTRYPOINT ["python3", "/usr/local/bin/reliability-runtime"]

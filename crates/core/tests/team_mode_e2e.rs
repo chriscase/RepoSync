@@ -286,6 +286,19 @@ fn git_cli(repo_path: &Path, args: &[&str]) {
     );
 }
 
+fn git_output(repo_path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git fixture query");
+    assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
 /// R09 baseline diagnostic. Every URL here is a temporary file:// repository.
 /// This test records the unsafe outcome so a future containment change must
 /// replace the assertion with a zero-write, reconciliation-required assertion.
@@ -320,12 +333,22 @@ async fn diagnostic_r09_rewritten_paired_tip_replays_into_svn() {
     );
     assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
     let proven_base = get_head_sha(&git_dir);
+    let import_record: i64 = engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE direction = 'svn_to_git' AND git_sha = ?1 AND svn_rev = 2",
+        [&proven_base], |row| row.get(0)).unwrap();
+    assert_eq!(import_record, 1, "SVN-origin baseline must have a production sync mapping");
+    assert_eq!(std::fs::read_to_string(git_dir.join("origin.txt")).unwrap(), "SVN origin\n");
 
-    std::fs::write(git_dir.join("feature.txt"), "first version\n").unwrap();
-    git_cli(&git_dir, &["add", "feature.txt"]);
-    git_cli(&git_dir, &["commit", "-m", "First Git change"]);
-    git_cli(&git_dir, &["push", "origin", "main"]);
-    let old_synced = get_head_sha(&git_dir);
+    let developer = tmp.path().join("developer");
+    let clone = Command::new("git").args(["clone", "-b", "main", bare.to_str().unwrap(), developer.to_str().unwrap()]).output().unwrap();
+    assert!(clone.status.success(), "developer clone: {}", String::from_utf8_lossy(&clone.stderr));
+    assert_eq!(get_head_sha(&developer), proven_base);
+
+    std::fs::write(developer.join("feature.txt"), "first version\n").unwrap();
+    git_cli(&developer, &["add", "feature.txt"]);
+    git_cli(&developer, &["commit", "-m", "First Git change"]);
+    git_cli(&developer, &["push", "origin", "main"]);
+    let old_synced = get_head_sha(&developer);
     assert_eq!(engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
     let before = SvnClient::new(&svn_url, "", "")
         .info()
@@ -344,23 +367,27 @@ async fn diagnostic_r09_rewritten_paired_tip_replays_into_svn() {
         "SVN origin\n"
     );
 
-    git_cli(&git_dir, &["reset", "--hard", &proven_base]);
-    std::fs::write(git_dir.join("feature.txt"), "rewritten version\n").unwrap();
-    git_cli(&git_dir, &["add", "feature.txt"]);
-    git_cli(&git_dir, &["commit", "-m", "Rewritten Git change"]);
-    git_cli(&git_dir, &["push", "--force", "origin", "main"]);
-    let rewritten = get_head_sha(&git_dir);
+    git_cli(&developer, &["reset", "--hard", &proven_base]);
+    std::fs::write(developer.join("feature.txt"), "rewritten version\n").unwrap();
+    git_cli(&developer, &["add", "feature.txt"]);
+    git_cli(&developer, &["commit", "-m", "Rewritten Git change"]);
+    git_cli(&developer, &["push", "--force", "origin", "main"]);
+    let rewritten = get_head_sha(&developer);
     assert_ne!(old_synced, rewritten);
     let ancestry = Command::new("git")
         .arg("-C")
-        .arg(&git_dir)
+        .arg(&developer)
         .args(["merge-base", "--is-ancestor", &old_synced, &rewritten])
         .status()
         .unwrap();
-    assert!(
-        !ancestry.success(),
-        "fixture must actually rewrite already-synced history"
-    );
+    assert_eq!(ancestry.code(), Some(1), "fixture must show valid negative ancestry, not a command error");
+    assert_eq!(get_head_sha(&git_dir), old_synced, "developer rewrite must not pre-reset the bridge");
+    assert_eq!(git_output(&git_dir, &["status", "--porcelain"]), "");
+    let bridge_tree_before = git_output(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+    let bridge_index_before = git_output(&git_dir, &["write-tree"]);
+    let remote_tree_before = git_output(&developer, &["rev-parse", "HEAD^{tree}"]);
+    let checkpoint_before = engine.db().get_state("last_git_hash").unwrap();
+    let mapping_count_before = engine.db().count_sync_records().unwrap();
 
     let result = engine.run_sync_cycle().await;
     let after = SvnClient::new(&svn_url, "", "")
@@ -386,7 +413,7 @@ async fn diagnostic_r09_rewritten_paired_tip_replays_into_svn() {
         rusqlite::params![rewritten, after], |row| row.get(0)).unwrap();
     assert_eq!(rewritten_record, 1);
     assert_eq!(engine.db().get_state("last_git_hash").unwrap(), Some(rewritten.clone()));
-    eprintln!("EXPECTED BASELINE FAILURE R09: already-synced Git tip {old_synced} was replaced by {rewritten}; SVN advanced r{before}->r{after}");
+    eprintln!("EXPECTED BASELINE FAILURE R09: developer rewrote already-synced {old_synced} to {rewritten}; bridge {old_synced}/{bridge_tree_before}/{bridge_index_before} was intact before engine; remote tree {remote_tree_before}; checkpoint {checkpoint_before:?}; records {mapping_count_before}; SVN advanced r{before}->r{after}");
 }
 
 /// R06 baseline diagnostic: the skip-import checkpoint used by late pairing

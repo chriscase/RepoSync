@@ -1,0 +1,8 @@
+{
+  "diagnostics": [
+    {"id": "R02_R03_ROUTE", "binary": "server_freeze", "test": "diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing", "tier": "baseline_observation"},
+    {"id": "R06_CHECKPOINT", "binary": "team_mode_e2e", "test": "diagnostic_r06_late_pair_checkpoint_omits_existing_git_work", "tier": "baseline_observation"},
+    {"id": "R09_REPLAY", "binary": "team_mode_e2e", "test": "diagnostic_r09_rewritten_paired_tip_replays_into_svn", "tier": "baseline_observation"}
+  ],
+  "candidate": []
+}
