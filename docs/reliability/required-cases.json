@@ -1,8 +1,24 @@
 {
   "diagnostics": [
     {"id": "R02_R03_ROUTE", "binary": "server_freeze", "test": "diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing", "tier": "baseline_observation"},
-    {"id": "R06_CHECKPOINT", "binary": "team_mode_e2e", "test": "diagnostic_r06_late_pair_checkpoint_omits_existing_git_work", "tier": "baseline_observation"},
-    {"id": "R09_REPLAY", "binary": "team_mode_e2e", "test": "diagnostic_r09_rewritten_paired_tip_replays_into_svn", "tier": "baseline_observation"}
+    {"id": "R06_CHECKPOINT", "binary": "team_mode_e2e", "test": "diagnostic_r06_late_pair_checkpoint_omits_existing_git_work", "tier": "baseline_observation"}
   ],
-  "candidate": []
+  "candidate": [
+    {"id": "R09_ORIGINAL", "binary": "team_mode_e2e", "test": "candidate_r09_original_replacement_fixture_rejected", "tier": "candidate_regression"},
+    {"id": "R09_REPLACEMENT", "binary": "team_mode_e2e", "test": "candidate_r09_changed_content_rewrite_rejected", "tier": "candidate_regression"},
+    {"id": "R09_AMEND", "binary": "team_mode_e2e", "test": "candidate_r09_metadata_amend_rejected", "tier": "candidate_regression"},
+    {"id": "R01_LINEAR", "binary": "team_mode_e2e", "test": "candidate_r01_two_pending_git_commits_sync_once", "tier": "candidate_regression"},
+    {"id": "R10_L_EQUALS_R", "binary": "team_mode_e2e", "test": "candidate_r10_caught_up_bridge_lagging_cursor_replays", "tier": "candidate_regression"},
+    {"id": "R01_SVN_PENDING", "binary": "team_mode_e2e", "test": "candidate_r01_unchanged_git_still_admits_new_svn_work", "tier": "candidate_admission"},
+    {"id": "R16_MISSING_BRANCH", "binary": "team_mode_e2e", "test": "candidate_r16_missing_remote_branch_blocks_stale_tracking_ref", "tier": "candidate_regression"},
+    {"id": "R16_TRANSPORT", "binary": "team_mode_e2e", "test": "candidate_r16_remote_transport_failure_blocks_without_reset", "tier": "candidate_regression"},
+    {"id": "R10_MISSING_OBJECT", "binary": "team_mode_e2e", "test": "candidate_r10_missing_checkpoint_object_blocks", "tier": "candidate_regression"},
+    {"id": "R10_AMBIGUOUS", "binary": "team_mode_e2e", "test": "candidate_r10_ambiguous_repository_cursor_blocks", "tier": "candidate_regression"},
+    {"id": "R10_SHALLOW", "binary": "team_mode_e2e", "test": "candidate_r10_shallow_history_blocks", "tier": "candidate_regression"},
+    {"id": "R10_ANCESTRY_ERROR", "binary": "team_mode_e2e", "test": "candidate_r10_ancestry_command_error_is_not_rewrite", "tier": "candidate_regression"},
+    {"id": "R09_LOCAL", "binary": "team_mode_e2e", "test": "candidate_r09_local_dirty_index_and_unpublished_commit_preserved", "tier": "candidate_regression"},
+    {"id": "R10_MERGE", "binary": "team_mode_e2e", "test": "candidate_r10_merge_dag_rejected_before_replay", "tier": "candidate_regression"},
+    {"id": "R10_OVERFLOW", "binary": "team_mode_e2e", "test": "candidate_r10_over_1000_pending_commits_rejected", "tier": "candidate_regression"},
+    {"id": "R17_SCOPE", "binary": "team_mode_e2e", "test": "candidate_r17_repository_cursors_remain_scoped", "tier": "candidate_regression"}
+  ]
 }

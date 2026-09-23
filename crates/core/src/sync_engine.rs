@@ -13,8 +13,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::process::{Command, Output};
 
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
@@ -96,6 +98,16 @@ pub struct SyncStats {
 
 /// Marker string embedded in sync-generated commit messages for echo detection.
 const SYNC_MARKER: &str = "[reposync]";
+
+/// Inputs admitted for one team cycle. The Git replay cursor is P, not L or O.
+struct TeamHistoryAdmission {
+    checkpoint: String,
+    remote_tip: String,
+}
+
+fn is_full_git_oid(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 /// The bidirectional sync engine.
 pub struct SyncEngine {
@@ -249,6 +261,8 @@ impl SyncEngine {
                     stats.svn_to_git_count, stats.git_to_svn_count, stats.conflicts_detected
                 ),
             ),
+            Err(e @ SyncError::HistoryBlocked { .. }) =>
+                ("reconciliation_required", format!("sync blocked: {}", e)),
             Err(e) => ("error", format!("sync failed: {}", e)),
         };
 
@@ -271,6 +285,10 @@ impl SyncEngine {
             AuditEntry::failure("sync_cycle", &details)
         };
         let _ = self.db.insert_audit_entry(&audit);
+
+        if result.is_ok() {
+            let _ = self.db.set_state(&self.history_block_key(), "");
+        }
 
         // Lock is released by _guard drop (happens here at scope end).
         result.map(|()| stats)
@@ -334,10 +352,236 @@ impl SyncEngine {
     // Inner sync cycle logic
     // -----------------------------------------------------------------------
 
+    fn history_block_key(&self) -> String {
+        match self.effective_repo_id() {
+            Some(id) => format!("team_history_block_{}", id),
+            None => "team_history_block_global".to_string(),
+        }
+    }
+
+    fn record_history_block(
+        &self,
+        reason: &str,
+        detail: &str,
+        p: Option<&str>,
+        o: Option<&str>,
+        r: Option<&str>,
+        l: Option<&str>,
+    ) -> SyncError {
+        let record = serde_json::json!({
+            "state": "reconciliation_required",
+            "reason": reason,
+            "detail": detail,
+            "repo_id": self.effective_repo_id(),
+            "p_handled": p,
+            "o_prior_observed": o,
+            "r_fresh_remote": r,
+            "l_bridge": l,
+            "observed_at": Utc::now().to_rfc3339(),
+        });
+        match self.db.set_state(&self.history_block_key(), &record.to_string()) {
+            Ok(()) => SyncError::HistoryBlocked {
+                reason: reason.to_string(),
+                detail: detail.to_string(),
+            },
+            Err(error) => SyncError::DatabaseError(error),
+        }
+    }
+
+    /// Read a repository-owned legacy Git cursor without borrowing another
+    /// pair's global maximum. A missing or conflicting cursor is not a new
+    /// baseline. The schema transition remains #63.
+    fn team_git_checkpoint(&self) -> Result<Option<String>, SyncError> {
+        if let Some(rid) = self.effective_repo_id() {
+            let column: Option<String> = {
+                let conn = self.db.conn();
+                conn.query_row(
+                    "SELECT last_git_sha FROM repositories WHERE id = ?1",
+                    [rid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(crate::errors::DatabaseError::from)?
+            };
+            let column = column.filter(|value| !value.is_empty());
+            let kv = self
+                .db
+                .get_state(&format!("last_git_sha_{}", rid))
+                .map_err(SyncError::DatabaseError)?
+                .filter(|value| !value.is_empty());
+            if column.is_some() && kv.is_some() && column != kv {
+                return Err(self.record_history_block(
+                    "ambiguous_checkpoint",
+                    "repository column and repository-scoped legacy cursor disagree",
+                    column.as_deref(), None, None, None,
+                ));
+            }
+            return Ok(column.or(kv));
+        }
+
+        // Older single-repository callers use a global key. It is never
+        // borrowed when multiple repository rows can own that key.
+        let registered: i64 = {
+            let conn = self.db.conn();
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))
+                .map_err(crate::errors::DatabaseError::from)?
+        };
+        if registered > 1 {
+            return Err(self.record_history_block(
+                "ambiguous_checkpoint",
+                "global legacy cursor has multiple possible repository owners",
+                None, None, None, None,
+            ));
+        }
+        self.db
+            .get_state("last_git_hash")
+            .map_err(SyncError::DatabaseError)
+            .map(|value| value.filter(|sha| !sha.is_empty()))
+    }
+
+    /// Fetch the exact configured branch into an inspection ref and admit
+    /// only a complete, linear path from the durably handled P to fresh R.
+    /// This runs before SVN legacy adoption or any checkout reset.
+    fn inspect_team_history(&self) -> Result<TeamHistoryAdmission, SyncError> {
+        let p = self.team_git_checkpoint()?;
+        let git = self.git_client.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = git.repo_path();
+        let branch = &self.config.github.default_branch;
+        let run = |args: &[&str]| -> std::io::Result<Output> {
+            Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+        };
+        let mut o: Option<String> = None;
+        let mut r: Option<String> = None;
+        let mut l: Option<String> = None;
+        macro_rules! blocked {
+            ($reason:expr, $detail:expr) => {{
+                return Err(self.record_history_block(
+                    $reason, $detail, p.as_deref(), o.as_deref(), r.as_deref(), l.as_deref(),
+                ));
+            }};
+        }
+
+        let branch_check = run(&["check-ref-format", "--branch", branch]);
+        if !branch_check.is_ok_and(|output| output.status.success()) {
+            blocked!("invalid_branch", "configured Git branch is not a valid branch name");
+        }
+        let local = match run(&["rev-parse", "--verify", "HEAD^{commit}"]) {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            _ => blocked!("unknown_local_tip", "bridge HEAD is missing or unreadable"),
+        };
+        l = Some(local.clone());
+        let status = match run(&["status", "--porcelain", "--untracked-files=all"]) {
+            Ok(output) if output.status.success() => output,
+            _ => blocked!("local_status_error", "bridge index/worktree could not be inspected"),
+        };
+        if !status.stdout.is_empty() {
+            blocked!("local_dirty", "bridge index or worktree has unpublished changes");
+        }
+
+        let remote_tracking = format!("refs/remotes/origin/{}^{{commit}}", branch);
+        if let Ok(output) = run(&["rev-parse", "--verify", &remote_tracking]) {
+            if output.status.success() {
+                o = Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+        }
+        let remote_branch = format!("refs/heads/{}", branch);
+        let advertised = match run(&["ls-remote", "--exit-code", "--heads", "origin", &remote_branch]) {
+            Ok(output) if output.status.success() => output,
+            Ok(output) if output.status.code() == Some(2) => blocked!("remote_branch_missing", "configured remote branch is absent"),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+                if stderr.contains("authentication") || stderr.contains("could not read username") || stderr.contains("401") {
+                    blocked!("remote_auth_failed", "remote branch inspection was denied");
+                }
+                blocked!("remote_transport_failed", "remote branch inspection failed");
+            }
+            Err(_) => blocked!("inspection_command_failed", "git ls-remote could not start"),
+        };
+        let advertised_text = String::from_utf8_lossy(&advertised.stdout);
+        let lines: Vec<&str> = advertised_text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+        if lines.len() != 1 {
+            blocked!("ambiguous_remote_ref", "remote returned an unexpected branch result");
+        }
+        let advertised_sha = lines[0].split_whitespace().next().unwrap_or("");
+        if !is_full_git_oid(advertised_sha) || !lines[0].ends_with(&remote_branch) {
+            blocked!("ambiguous_remote_ref", "remote branch result is malformed");
+        }
+
+        let inspection_ref = "refs/reposync/inspection/incoming";
+        let refspec = format!("+{}:{}", remote_branch, inspection_ref);
+        match run(&["fetch", "--no-tags", "--no-write-fetch-head", "origin", &refspec]) {
+            Ok(output) if output.status.success() => (),
+            Ok(_) => blocked!("remote_fetch_failed", "fresh branch fetch failed after advertisement"),
+            Err(_) => blocked!("inspection_command_failed", "git fetch could not start"),
+        }
+        let fetched_ref = format!("{}^{{commit}}", inspection_ref);
+        let fetched = match run(&["rev-parse", "--verify", &fetched_ref]) {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            _ => blocked!("inspection_object_missing", "fresh fetch did not produce a commit"),
+        };
+        r = Some(fetched.clone());
+        if fetched != advertised_sha {
+            blocked!("remote_changed_during_inspection", "remote branch moved between advertisement and fetch");
+        }
+
+        let checkpoint = match p.as_deref() {
+            Some(sha) if is_full_git_oid(sha) => sha,
+            Some(_) => blocked!("ambiguous_checkpoint", "stored Git cursor is not a full object ID"),
+            None => blocked!("missing_checkpoint", "no repository-owned handled Git cursor exists"),
+        };
+        let checkpoint_expr = format!("{}^{{commit}}", checkpoint);
+        if !run(&["cat-file", "-e", &checkpoint_expr]).is_ok_and(|output| output.status.success()) {
+            blocked!("missing_checkpoint_object", "handled Git cursor object is absent or invalid");
+        }
+        match run(&["rev-parse", "--is-shallow-repository"]) {
+            Ok(output) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "false" => (),
+            Ok(output) if output.status.success() => blocked!("incomplete_history", "bridge is shallow; ancestry is incomplete"),
+            _ => blocked!("inspection_command_failed", "shallow-history inspection failed"),
+        }
+        match run(&["merge-base", "--is-ancestor", checkpoint, &fetched]) {
+            Ok(output) if output.status.code() == Some(0) => (),
+            Ok(output) if output.status.code() == Some(1) => blocked!("non_fast_forward", "fresh remote tip does not descend from handled Git cursor"),
+            _ => blocked!("ancestry_command_failed", "Git ancestry could not be established"),
+        }
+        for (ancestor, descendant) in [(checkpoint, local.as_str()), (local.as_str(), fetched.as_str())] {
+            match run(&["merge-base", "--is-ancestor", ancestor, descendant]) {
+                Ok(output) if output.status.code() == Some(0) => (),
+                Ok(output) if output.status.code() == Some(1) => blocked!("unpublished_local_history", "bridge tip is outside the handled-to-remote path"),
+                _ => blocked!("ancestry_command_failed", "bridge ancestry could not be established"),
+            }
+        }
+        let range = format!("{}..{}", checkpoint, fetched);
+        let pending = match run(&["rev-list", "--count", &range]) {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().parse::<usize>().ok(),
+            _ => blocked!("selection_command_failed", "pending Git commits could not be counted"),
+        };
+        let pending = match pending {
+            Some(count) => count,
+            None => blocked!("selection_command_failed", "pending Git count was invalid"),
+        };
+        if pending > 1000 {
+            blocked!("unsupported_backlog", "more than 1000 pending Git commits require a reviewed continuation algorithm");
+        }
+        match run(&["rev-list", "--min-parents=2", &range]) {
+            Ok(output) if output.status.success() && output.stdout.is_empty() => (),
+            Ok(output) if output.status.success() => blocked!("unsupported_merge_dag", "pending Git history contains a merge commit"),
+            _ => blocked!("selection_command_failed", "pending Git topology could not be inspected"),
+        }
+        Ok(TeamHistoryAdmission { checkpoint: checkpoint.to_string(), remote_tip: fetched })
+    }
+
     async fn do_sync_cycle(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
+        // SVN inspection may adopt a legacy checkpoint. Admit Git history
+        // before that call, not merely before the later destructive reset.
+        let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
+
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
-        let git_changes = self.fetch_git_changes().await?;
+        let git_changes = self.fetch_git_changes(&admission).await?;
 
         // 2. Detect conflicts.
         let conflicts = self.detect_conflicts_internal(&svn_changes, &git_changes);
@@ -1454,50 +1698,34 @@ impl SyncEngine {
         Ok(change_sets)
     }
 
-    async fn fetch_git_changes(&self) -> Result<Vec<GitChangeSet>, SyncError> {
+    async fn fetch_git_changes(&self, admission: &TeamHistoryAdmission) -> Result<Vec<GitChangeSet>, SyncError> {
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Wrap the blocking git pull in block_in_place to avoid starving
-        // the Tokio runtime while holding the lock for network I/O.
-        let token = self.config.github.token.as_deref();
-        let branch = &self.config.github.default_branch;
-        tokio::task::block_in_place(|| {
-            git.pull("origin", branch, token)
-                .map_err(SyncError::GitError)
-        })?;
+        // Reset only to the commit fetched and inspected above. A second pull
+        // of a mutable branch would invalidate the admission decision.
+        let reset = tokio::task::block_in_place(|| {
+            Command::new("git")
+                .args(["reset", "--hard", &admission.remote_tip])
+                .current_dir(git.repo_path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+        }).map_err(crate::errors::GitError::IoError)?;
+        if !reset.status.success() {
+            return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
+                git2::Error::from_str("git reset to inspected remote commit failed"),
+            )));
+        }
+        if git.head_sha().map_err(SyncError::GitError)? != admission.remote_tip {
+            return Err(SyncError::HistoryBlocked {
+                reason: "post_reset_tip_mismatch".into(),
+                detail: "bridge did not reach the admitted Git commit".into(),
+            });
+        }
 
-        // Check per-repo key first, then global key, then commit_map fallback.
-        let per_repo_key = self.effective_repo_id()
-            .map(|rid| format!("last_git_sha_{}", rid));
-        let repo_table_sha = self.effective_repo_id()
-            .and_then(|rid| self.db.get_repo_watermark(rid).ok())
-            .map(|(_, sha)| sha)
-            .filter(|s| !s.is_empty());
-
-        let last_hash = if let Some(sha) = repo_table_sha {
-            // Best source: repositories table (set by sync engine + import)
-            Some(sha)
-        } else if let Some(ref key) = per_repo_key {
-            // Per-repo kv_state key
-            match self.db.get_state(key).map_err(SyncError::DatabaseError)? {
-                Some(s) if !s.is_empty() => Some(s),
-                _ => match self.db.get_state("last_git_hash").map_err(SyncError::DatabaseError)? {
-                    Some(s) if !s.is_empty() => Some(s),
-                    _ => self.db.get_last_git_hash().map_err(SyncError::DatabaseError)?,
-                },
-            }
-        } else {
-            // Global fallback
-            match self.db.get_state("last_git_hash").map_err(SyncError::DatabaseError)? {
-                Some(s) if !s.is_empty() => Some(s),
-                _ => self.db.get_last_git_hash().map_err(SyncError::DatabaseError)?,
-            }
-        };
-
-        info!(since_sha = ?last_hash, "fetching Git changes");
+        info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
 
         let commits = git
-            .get_commits_since(last_hash.as_deref(), None)
+            .get_commits_since(Some(&admission.checkpoint), None)
             .map_err(SyncError::GitError)?;
 
         let mut change_sets: Vec<GitChangeSet> = Vec::new();

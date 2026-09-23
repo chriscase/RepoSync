@@ -14,8 +14,12 @@ OUTPUT = Path("/evidence")
 TESTS = Path("/opt/reliability-tests")
 SECRET = "REPOSYNC_SYNTHETIC_SECRET_CANARY_72"
 MANDATORY = {
-    "diagnostics": {"R02_R03_ROUTE", "R06_CHECKPOINT", "R09_REPLAY"},
-    "candidate": set(),
+    "diagnostics": {"R02_R03_ROUTE", "R06_CHECKPOINT"},
+    "candidate": {"R09_ORIGINAL", "R09_REPLACEMENT", "R09_AMEND", "R01_LINEAR",
+                  "R10_L_EQUALS_R", "R01_SVN_PENDING", "R16_MISSING_BRANCH",
+                  "R16_TRANSPORT", "R10_MISSING_OBJECT", "R10_AMBIGUOUS",
+                  "R10_SHALLOW", "R10_ANCESTRY_ERROR", "R09_LOCAL", "R10_MERGE",
+                  "R10_OVERFLOW", "R17_SCOPE"},
 }
 
 
@@ -124,14 +128,22 @@ def run_case(case, binaries):
     if len(counts) != 1:
         raise AssertionError(f"missing result counts for {case['id']}")
     passed, failed, ignored, _, filtered = map(int, counts[0])
-    if result.returncode or (passed, failed, ignored) != (1, 0, 0):
-        raise AssertionError(f"required test {case['id']} failed/ignored: exit={result.returncode}, counts={counts[0]}\n{output}")
+    succeeded = result.returncode == 0 and (passed, failed, ignored) == (1, 0, 0)
+    proofs = []
+    for line in output.splitlines():
+        marker = "RELIABILITY_EVIDENCE "
+        if marker in line:
+            proofs.append(json.loads(line.split(marker, 1)[1]))
     evidence = {
         "id": case["id"], "tier": case["tier"], "test": test_name,
         "binary_sha256": digest(binary.read_bytes()),
         "exit_code": result.returncode, "passed": passed, "failed": failed,
         "ignored": ignored, "filtered_out": filtered, "output_sha256": digest(output.encode()),
-        "outcome": "BASELINE_DEFECT_OBSERVED" if case["tier"] == "baseline_observation" else "CANDIDATE_SUBCASE_PASS",
+        "outcome": ("FAIL" if not succeeded else
+                    "BASELINE_DEFECT_OBSERVED" if case["tier"] == "baseline_observation"
+                    else "GATE_ADMISSION_ONLY" if case["tier"] == "candidate_admission"
+                    else "CANDIDATE_SUBCASE_PASS"),
+        "proofs": proofs,
     }
     (OUTPUT / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
@@ -153,8 +165,8 @@ def main():
     for tier, mandatory in MANDATORY.items():
         actual = {c["id"] for c in manifest[tier]}
         assert mandatory <= actual, f"required {tier} case omitted: {sorted(mandatory - actual)}"
-    omitted_r09 = {c["id"] for c in manifest["diagnostics"] if c["id"] != "R09_REPLAY"}
-    assert not MANDATORY["diagnostics"] <= omitted_r09, "omission self-test failed"
+    omitted_r09 = {c["id"] for c in manifest["candidate"] if c["id"] != "R09_REPLACEMENT"}
+    assert not MANDATORY["candidate"] <= omitted_r09, "R09 omission self-test failed"
     required = (manifest["diagnostics"] if mode in ("diagnostics", "all") else []) + \
                (manifest["candidate"] if mode in ("candidate", "all") else [])
     assert required, "zero required cases"
@@ -181,6 +193,8 @@ def main():
     versions += (TESTS / "build-toolchain.txt").read_text()
     (OUTPUT / "tool-versions.txt").write_text(versions)
     print(json.dumps(summary), flush=True)
+    if any(case["outcome"] == "FAIL" for case in cases):
+        raise SystemExit("one or more exact required cases failed")
 
 
 if __name__ == "__main__":
