@@ -825,16 +825,10 @@ async fn candidate_r16_remote_transport_failure_blocks_without_reset() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r16_auth_denial_is_distinct_from_transport() {
     let fixture = QualifiedPair::new().await;
-    let wrapper = fixture.tmp.path().join("auth-git");
-    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = ls-remote ]; then echo 'fatal: Authentication failed' >&2; exit 128; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::set_var("REPOSYNC_TEST_GIT_EXECUTABLE", &wrapper);
+    std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", "remote_auth");
     let before = fixture.snapshot().await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var("REPOSYNC_TEST_GIT_EXECUTABLE");
+    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_auth_failed"),
         "synthetic auth denial must be distinct from transport: {result:?}");
     assert_eq!(fixture.snapshot().await, before);
@@ -849,16 +843,10 @@ async fn candidate_r16_auth_denial_is_distinct_from_transport() {
 async fn candidate_r16_fetch_failure_does_not_use_stale_ref() {
     let fixture = QualifiedPair::new().await;
     git_cli(&fixture.bridge, &["fetch", "origin", "main"]);
-    let wrapper = fixture.tmp.path().join("fetch-git");
-    std::fs::write(&wrapper, "#!/bin/sh\nif [ \"$1\" = fetch ]; then exit 128; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::set_var("REPOSYNC_TEST_GIT_EXECUTABLE", &wrapper);
+    std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", "remote_fetch");
     let before = fixture.snapshot().await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var("REPOSYNC_TEST_GIT_EXECUTABLE");
+    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_fetch_failed"),
         "failed fresh fetch must not use stale tracking ref: {result:?}");
     assert_eq!(fixture.snapshot().await, before);
@@ -904,18 +892,10 @@ async fn candidate_r10_shallow_history_blocks() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_ancestry_command_error_is_not_rewrite() {
     let fixture = QualifiedPair::new().await;
-    let wrapper = fixture.tmp.path().join("git-wrapper");
-    std::fs::create_dir(&wrapper).unwrap();
-    let script = wrapper.join("git");
-    std::fs::write(&script, "#!/bin/sh\nif [ \"$1\" = merge-base ]; then exit 128; fi\nexec /usr/bin/git \"$@\"\n").unwrap();
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    std::env::set_var("REPOSYNC_TEST_GIT_EXECUTABLE", &script);
+    std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", "ancestry_exit_128");
     let before = fixture.snapshot().await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var("REPOSYNC_TEST_GIT_EXECUTABLE");
+    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ancestry_command_failed"),
         "git command error must be unknown, not a valid negative ancestry: {result:?}");
     assert_eq!(fixture.snapshot().await, before);

@@ -447,15 +447,23 @@ impl SyncEngine {
         let git = self.git_client.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = git.repo_path();
         let branch = &self.config.github.default_branch;
-        // Debug-only fault injection lets the isolated integration suite
-        // distinguish a valid negative ancestry result from command failure.
-        #[cfg(debug_assertions)]
-        let git_program = std::env::var_os("REPOSYNC_TEST_GIT_EXECUTABLE")
-            .unwrap_or_else(|| std::ffi::OsString::from("git"));
-        #[cfg(not(debug_assertions))]
-        let git_program = std::ffi::OsString::from("git");
         let run = |args: &[&str]| -> std::io::Result<Output> {
-            Command::new(&git_program)
+            // Faults are available only in debug builds and only at the
+            // subprocess boundary exercised by isolated integration tests.
+            #[cfg(debug_assertions)]
+            match (std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok().as_deref(), args.first().copied()) {
+                (Some("remote_auth"), Some("ls-remote")) => {
+                    let mut output = Command::new("false").output()?;
+                    output.stderr = b"fatal: Authentication failed".to_vec();
+                    return Ok(output);
+                }
+                (Some("remote_fetch"), Some("fetch")) => return Command::new("false").output(),
+                (Some("ancestry_exit_128"), Some("merge-base")) => {
+                    return Command::new("sh").args(["-c", "exit 128"]).output();
+                }
+                _ => (),
+            }
+            Command::new("git")
                 .args(args)
                 .current_dir(path)
                 .env("GIT_TERMINAL_PROMPT", "0")
