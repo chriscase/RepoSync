@@ -60,7 +60,7 @@ CREATE TABLE pair_lineages (
   svn_root_url TEXT NOT NULL CHECK (length(svn_root_url) > 0),
   svn_branch_path TEXT NOT NULL,
   source_svn_uuid TEXT NOT NULL CHECK (length(source_svn_uuid) > 0),
-  source_svn_path TEXT NOT NULL CHECK (length(source_svn_path) > 0),
+  source_svn_path TEXT NOT NULL, -- empty denotes the SVN repository root
   source_svn_rev INTEGER NOT NULL CHECK (source_svn_rev > 0),
   copy_from_path TEXT,
   copy_from_rev INTEGER,
@@ -137,12 +137,14 @@ CREATE TABLE legacy_evidence_links (
   legacy_key TEXT NOT NULL,
   interpretation TEXT NOT NULL,
   PRIMARY KEY (repo_id,generation,legacy_table,legacy_key),
+  UNIQUE (legacy_table,legacy_key), -- one proved generation may claim an old row
   FOREIGN KEY (repo_id,generation) REFERENCES pair_lineages(repo_id,generation) ON DELETE RESTRICT
 );
 -- Future runner: load reviewed, complete migration-plan decisions with bound
 -- parameters; assert one repo_migration_state row per repositories row.
 -- Insert pair_lineages/frontiers/outcomes/links only for independently proved
--- pairs; validate all FK/index/row-preservation assertions.
+-- pairs; require each 'qualified' disposition to own a proved generation;
+-- validate all FK/index/row-preservation assertions.
 -- Future runner: PRAGMA user_version = 14; COMMIT.
 ```
 
