@@ -30,6 +30,11 @@
     {"id": "R09_IGNORED_DIRECTORY_COLLISION", "binary": "team_mode_e2e", "test": "candidate_r09_ignored_directory_collision_preserved", "tier": "candidate_regression"},
     {"id": "R09_READONLY_INDEX", "binary": "team_mode_e2e", "test": "candidate_r09_rejection_preserves_raw_index_before_status", "tier": "candidate_regression"},
     {"id": "R01_IGNORED_NONCOLLISION", "binary": "team_mode_e2e", "test": "candidate_r01_ignored_noncollision_allows_qualified_sync", "tier": "candidate_regression"},
+    {"id": "R01_FAILED_APPLY_BARRIER", "binary": "team_mode_e2e", "test": "candidate_r01_failed_apply_stops_before_later_revision", "tier": "candidate_regression"},
+    {"id": "R01_FAILED_APPLY_RETRY", "binary": "team_mode_e2e", "test": "candidate_r01_failed_apply_retries_pending_revisions_once", "tier": "candidate_regression"},
+    {"id": "R01_METADATA_ONLY", "binary": "team_mode_e2e", "test": "candidate_r01_property_only_revision_has_explicit_no_target_checkpoint", "tier": "candidate_regression"},
+    {"id": "R19_UNTOUCHED_TREE", "binary": "team_mode_e2e", "test": "candidate_r19_untouched_top_level_tree_survives_deltas", "tier": "candidate_regression"},
+    {"id": "R19_EXPLICIT_DELETE", "binary": "team_mode_e2e", "test": "candidate_r19_explicit_svn_delete_only_removes_target", "tier": "candidate_regression"},
     {"id": "EVIDENCE_SCAN_CLEAN", "binary": "evidence_scan", "test": "evidence_scan_clean", "tier": "candidate_regression"},
     {"id": "EVIDENCE_SCAN_CANARY", "binary": "evidence_scan", "test": "evidence_scan_canary", "tier": "candidate_regression"},
     {"id": "EVIDENCE_SCAN_ERROR", "binary": "evidence_scan", "test": "evidence_scan_error", "tier": "candidate_regression"}

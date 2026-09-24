@@ -864,7 +864,7 @@ impl SyncEngine {
 
         // 3. Apply SVN -> Git.
         let _ = self.db.set_state("sync_state", "applying");
-        stats.svn_to_git_count = self.sync_svn_to_git(&svn_changes).await?;
+        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count).await?;
 
         // 4. Apply Git -> SVN.
         stats.git_to_svn_count = self.sync_git_to_svn(&git_changes).await?;
@@ -926,8 +926,7 @@ impl SyncEngine {
     /// 3. Commit with the mapped Git identity and a `[reposync]` marker.
     /// 4. Push to the remote.
     /// 5. Only then record the sync in the database.
-    async fn sync_svn_to_git(&self, svn_changes: &[SvnChangeSet]) -> Result<usize, SyncError> {
-        let mut count = 0;
+    async fn sync_svn_to_git(&self, svn_changes: &[SvnChangeSet], applied: &mut usize) -> Result<(), SyncError> {
 
         for change in svn_changes {
             if self.is_echo_commit(&change.message) {
@@ -989,8 +988,9 @@ impl SyncEngine {
                 "SVN diff converted for git apply"
             );
 
+            let mut apply_error = None;
             let diff_applied = if !git_diff.trim().is_empty() {
-                let result = apply_diff_to_path(&repo_path, &git_diff).await;
+                let result = apply_diff_to_path_revision(&repo_path, &git_diff, Some(change.revision)).await;
                 if result.is_ok() {
                     // Verify: check that files were created at the correct paths
                     for cf in &change.changed_files {
@@ -1002,6 +1002,7 @@ impl SyncEngine {
                         }
                     }
                 } else {
+                    apply_error = Some(result.as_ref().unwrap_err().to_string());
                     warn!(
                         rev = change.revision,
                         error = %result.as_ref().unwrap_err(),
@@ -1013,65 +1014,67 @@ impl SyncEngine {
                 false
             };
 
-            // If the diff is empty AND the changeset has no changed files,
-            // this is a metadata-only revision (branch creation, property
-            // change, svn:mergeinfo update, etc.). Skip it — there's nothing
-            // to commit and falling back to a full SVN export would create a
-            // massive commit touching every file, which can trigger remote
-            // pre-receive hook rejections and OOM on push.
-            if !diff_applied && processed_diff.trim().is_empty() && change.changed_files.is_empty() {
+            // SVN properties and empty directories have no Git file-content
+            // delta. Prove that separately using SVN's content-only diff;
+            // a failed nonempty patch may never be treated as filtered work.
+            let no_target_content = if !diff_applied {
+                svn.diff_content_only(change.revision)
+                    .await.map_err(SyncError::SvnError)?.trim().is_empty()
+            } else {
+                false
+            };
+            if !diff_applied && no_target_content {
                 info!(
                     rev = change.revision,
-                    "skipping SVN revision with empty diff and no changed files (metadata-only)"
+                    "recording SVN revision with no Git target content (metadata-only)"
                 );
                 // Advance the watermark so we don't re-process this revision.
                 let per_repo_key = self.effective_repo_id()
                     .map(|rid| format!("last_svn_rev_{}", rid));
                 if let Some(ref key) = per_repo_key {
-                    let _ = self.db.set_state(key, &change.revision.to_string());
+                    self.db.set_state(key, &change.revision.to_string())
+                        .map_err(SyncError::DatabaseError)?;
                 }
                 if let Some(ref rid) = self.repo_id {
-                    let _ = self.db.advance_svn_watermark(rid, change.revision);
+                    self.db.advance_svn_watermark(rid, change.revision)
+                        .map_err(SyncError::DatabaseError)?;
                 }
+                self.db.insert_audit_log_with_repo(
+                    "svn_to_git_metadata_only", Some("svn_to_git"), Some(change.revision),
+                    None, Some(&change.author), Some("No target file delta; SVN metadata only"),
+                    true, self.effective_repo_id(),
+                ).map_err(SyncError::DatabaseError)?;
                 continue;
             }
 
             if !diff_applied {
-                // git apply failed for this SVN revision.  During incremental
-                // sync we MUST NOT fall back to a full SVN export because:
-                //   1. It replaces LFS pointers with raw binary content → push rejected
-                //   2. It creates massive commits (hundreds of files) → OOM / pre-receive hook
-                //   3. It can introduce rogue directory paths
-                //
-                // Instead, skip this revision and advance the watermark.
-                // The revision's changes are already in SVN; a future
-                // reimport can reconcile any drift.
+                // A nonempty revision that failed to apply remains pending.
+                // Stop at this revision: continuing could acknowledge later
+                // dependent work while leaving this tree change unapplied.
                 warn!(
                     rev = change.revision,
                     message = %change.message,
                     files = change.changed_files.len(),
-                    "git apply failed for SVN revision — skipping (export fallback disabled for incremental sync)"
+                    "git apply failed for SVN revision; stopping at durable frontier"
                 );
-
-                if let Some(ref rid) = self.repo_id {
-                    let _ = self.db.advance_svn_watermark(rid, change.revision);
-                }
-
                 let _ = self.db.insert_audit_log_with_repo(
-                    "svn_to_git_skip",
+                    "svn_to_git_apply_failed",
                     Some("svn_to_git"),
                     Some(change.revision),
                     None,
                     Some(&change.author),
                     Some(&format!(
-                        "Skipped r{}: git apply failed, export fallback disabled. Message: {}",
+                        "Stopped at unapplied r{}: git apply failed. Message: {}",
                         change.revision,
                         change.message.lines().next().unwrap_or("")
                     )),
                     false,
                     self.effective_repo_id(),
                 );
-                continue;
+                return Err(SyncError::GitError(crate::errors::GitError::ApplyFailed(
+                    format!("SVN r{} could not be applied; later revisions remain pending: {}",
+                        change.revision, apply_error.unwrap_or_else(|| "nonempty SVN change produced no Git patch".to_string())),
+                )));
             }
 
             // 2b. LFS enforcement: after applying changes, scan modified files
@@ -1126,49 +1129,10 @@ impl SyncEngine {
                 }
             }
 
-            // 2c. Clean up rogue top-level entries in the git working tree.
-            // The git history may contain files at wrong paths (e.g. SLS/
-            // instead of source/SLS/) from earlier bugs. git reset --hard
-            // restores them every pull. We must remove them before commit
-            // so git add --all doesn't re-stage them.
-            //
-            // Approach: the SVN diff paths tell us what top-level dirs are
-            // legitimate (e.g. source/, config/). Any top-level dir that
-            // doesn't match the first component of ANY changed file path
-            // AND isn't a known standard directory is rogue.
-            {
-                // Collect legitimate top-level prefixes from the SVN diff
-                let mut legit_toplevel: std::collections::HashSet<String> = change
-                    .changed_files
-                    .iter()
-                    .filter_map(|f| {
-                        let p = f.path.trim_start_matches('/');
-                        p.split('/').next().map(|s| s.to_string())
-                    })
-                    .collect();
-                // Always keep source and config as legitimate
-                legit_toplevel.insert("source".to_string());
-                legit_toplevel.insert("config".to_string());
-
-                if let Ok(entries) = std::fs::read_dir(&repo_path) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') {
-                            continue;
-                        }
-                        if !legit_toplevel.contains(&name) {
-                            let rogue = entry.path();
-                            if rogue.is_dir() {
-                                info!(path = %rogue.display(), "removing rogue directory from git working tree");
-                                let _ = std::fs::remove_dir_all(&rogue);
-                            } else if !name.ends_with(".gitattributes") {
-                                info!(path = %rogue.display(), "removing rogue file from git working tree");
-                                let _ = std::fs::remove_file(&rogue);
-                            }
-                        }
-                    }
-                }
-            }
+            // A revision's changed paths are a delta, not a full-tree keep
+            // list. Only the explicit SVN delete operations in git_diff may
+            // remove tracked content; old wrong-path history needs separate
+            // reviewed reconciliation.
 
             // 3. Commit with identity and sync marker.
             let commit_message = format!(
@@ -1276,7 +1240,7 @@ impl SyncEngine {
                     .map_err(SyncError::DatabaseError)?;
             }
 
-            count += 1;
+            *applied += 1;
 
             // Audit log for successful sync
             let _ = self.db.insert_audit_log_with_repo(
@@ -1304,7 +1268,7 @@ impl SyncEngine {
             );
         }
 
-        Ok(count)
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2271,6 +2235,14 @@ pub async fn apply_diff_to_path(
     repo_path: &std::path::Path,
     diff_content: &str,
 ) -> Result<(), crate::errors::GitError> {
+    apply_diff_to_path_revision(repo_path, diff_content, None).await
+}
+
+async fn apply_diff_to_path_revision(
+    repo_path: &std::path::Path,
+    diff_content: &str,
+    revision: Option<i64>,
+) -> Result<(), crate::errors::GitError> {
     use std::process::Stdio;
     use tokio::process::Command;
     let mut cmd = Command::new("git");
@@ -2279,6 +2251,18 @@ pub async fn apply_diff_to_path(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Only debug fixture runs may replace one exact SVN revision's patch
+    // bytes. The production git-apply subprocess and error path still run.
+    #[cfg(debug_assertions)]
+    let injected = std::env::var("REPOSYNC_TEST_SVN_APPLY_FAULT")
+        .ok()
+        .and_then(|value| value.split_once('|').map(|(rev, path)| (rev.to_string(), path.to_string())))
+        .is_some_and(|(rev, path)| revision.is_some_and(|actual| rev == actual.to_string())
+            && std::path::Path::new(&path) == repo_path);
+    #[cfg(not(debug_assertions))]
+    let _ = revision;
+    #[cfg(not(debug_assertions))]
+    let injected = false;
     let mut child = cmd.spawn().map_err(crate::errors::GitError::IoError)?;
     // Write diff to stdin and explicitly close it so git apply sees EOF
     // and begins processing. Without closing, git apply may hang forever.
@@ -2291,7 +2275,7 @@ pub async fn apply_diff_to_path(
             ))?;
         use tokio::io::AsyncWriteExt;
         stdin
-            .write_all(diff_content.as_bytes())
+            .write_all(if injected { b"invalid fixture patch\n" } else { diff_content.as_bytes() })
             .await
             .map_err(crate::errors::GitError::IoError)?;
         // stdin is dropped here, closing the pipe

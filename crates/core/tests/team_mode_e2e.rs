@@ -13,6 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::collections::BTreeMap;
 use sha2::Digest;
 
 use tempfile::TempDir;
@@ -166,6 +167,94 @@ fn svn_commit_file(wc_path: &Path, filename: &str, content: &str, message: &str)
         }
     }
     panic!("could not parse committed revision from: {}", stdout);
+}
+
+fn tracked_tree_at(repo: &Path, revision: &str) -> BTreeMap<String, Vec<u8>> {
+    let listing = Command::new("git").arg("-C").arg(repo)
+        .args(["ls-tree", "-r", "--name-only", "-z", revision])
+        .output().unwrap();
+    assert!(listing.status.success());
+    let mut files = BTreeMap::new();
+    for name in listing.stdout.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
+        let name = std::str::from_utf8(name).unwrap();
+        let output = Command::new("git").arg("-C").arg(repo)
+            .args(["show", &format!("{revision}:{name}")]).output().unwrap();
+        assert!(output.status.success(), "cannot read tracked {name}");
+        files.insert(name.to_string(), output.stdout);
+    }
+    files
+}
+
+fn tracked_tree(repo: &Path) -> BTreeMap<String, Vec<u8>> {
+    tracked_tree_at(repo, "HEAD")
+}
+
+fn fixture_tree() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([
+        (".gitkeep".into(), Vec::new()),
+        ("origin.txt".into(), b"SVN origin\n".to_vec()),
+        ("loose.txt".into(), b"untouched top-level\n".to_vec()),
+        ("notes/keep.txt".into(), b"untouched directory\n".to_vec()),
+    ])
+}
+
+fn tree_hashes(tree: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
+    tree.iter().map(|(name, bytes)|
+        (name.clone(), hex::encode(sha2::Sha256::digest(bytes)))).collect()
+}
+
+fn exported_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn visit(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                visit(root, &path, files);
+            } else {
+                assert!(entry.file_type().unwrap().is_file());
+                let name = path.strip_prefix(root).unwrap().to_str().unwrap().replace('\\', "/");
+                files.insert(name, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+async fn svn_tree(fixture: &QualifiedPair, revision: i64) -> BTreeMap<String, Vec<u8>> {
+    let destination = fixture.tmp.path().join(format!("tree-{}-{}", revision, uuid::Uuid::new_v4()));
+    SvnClient::new(&fixture.svn_url, "", "").export("", revision, &destination).await.unwrap();
+    exported_tree(&destination)
+}
+
+fn svn_delete_file(wc: &Path, name: &str, message: &str) -> i64 {
+    let output = Command::new("svn").args(["rm", wc.join(name).to_str().unwrap()]).output().unwrap();
+    assert!(output.status.success(), "svn rm: {}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("svn").args([
+        "commit", "-m", message, wc.to_str().unwrap(), "--username", "fixture", "--non-interactive",
+    ]).output().unwrap();
+    assert!(output.status.success(), "svn delete commit: {}", String::from_utf8_lossy(&output.stderr));
+    let line = String::from_utf8_lossy(&output.stdout);
+    line.lines().find_map(|line| line.strip_prefix("Committed revision "))
+        .unwrap().trim_end_matches('.').parse().unwrap()
+}
+
+fn svn_property_only_revision(wc: &Path) -> i64 {
+    let update = Command::new("svn").args(["update", wc.to_str().unwrap()]).output().unwrap();
+    assert!(update.status.success(), "svn update: {}", String::from_utf8_lossy(&update.stderr));
+    let output = Command::new("svn")
+        .args(["propset", "svn:ignore", "*.cache", wc.to_str().unwrap()])
+        .output().unwrap();
+    assert!(output.status.success(), "svn propset: {}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("svn").args([
+        "commit", "-m", "Property-only revision", wc.to_str().unwrap(),
+        "--username", "fixture", "--non-interactive",
+    ]).output().unwrap();
+    assert!(output.status.success(), "svn property commit: {}", String::from_utf8_lossy(&output.stderr));
+    let line = String::from_utf8_lossy(&output.stdout);
+    line.lines().find_map(|line| line.strip_prefix("Committed revision "))
+        .unwrap().trim_end_matches('.').parse().unwrap()
 }
 
 fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
@@ -1181,6 +1270,224 @@ async fn candidate_r01_ignored_noncollision_allows_qualified_sync() {
         "case":"R01_IGNORED_NONCOLLISION", "p":before.watermark.1,
         "r":pending, "svn_revision":after.svn_rev,
         "cache_preserved":true, "bridge_tree":after.bridge_tree
+    }));
+}
+
+struct TestApplyFault {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl TestApplyFault {
+    async fn new(revision: i64, bridge: &Path) -> Self {
+        static FAULT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let guard = FAULT_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        std::env::set_var("REPOSYNC_TEST_SVN_APPLY_FAULT", format!("{}|{}", revision, bridge.display()));
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for TestApplyFault {
+    fn drop(&mut self) {
+        std::env::remove_var("REPOSYNC_TEST_SVN_APPLY_FAULT");
+    }
+}
+
+async fn run_failed_apply_barrier(retry: bool) {
+    let fixture = QualifiedPair::new().await;
+    let before = fixture.snapshot().await;
+    let verified = svn_commit_file(&fixture.wc, "origin.txt", "verified N-1\n", "Verified prior revision");
+    let failed = svn_commit_file(&fixture.wc, "origin.txt", "failed N\n", "Faulted revision");
+    let later = svn_commit_file(&fixture.wc, "origin.txt", "queued N+1\n", "Later revision");
+    assert_eq!((verified, failed, later), (before.svn_rev + 1, before.svn_rev + 2, before.svn_rev + 3));
+    let fault = TestApplyFault::new(failed, &fixture.bridge).await;
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(matches!(&result, Err(SyncError::GitError(reposync_core::errors::GitError::ApplyFailed(message)))
+        if message.contains(&format!("r{failed}"))), "failed N must stop cycle: {result:?}");
+    drop(fault);
+    let frontier = fixture.snapshot().await;
+    assert_eq!(frontier.watermark.0, verified);
+    assert_eq!(frontier.svn_rev, later);
+    assert_eq!(frontier.svn_origin, "queued N+1\n");
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "verified N-1\n");
+    assert_eq!(frontier.remote_sha, frontier.bridge_sha);
+    assert_eq!(frontier.remote_tree, frontier.bridge_tree);
+    assert_eq!(frontier.mapping_count, before.mapping_count + 1);
+    assert_eq!(frontier.repo_sync_count, before.repo_sync_count + 1);
+    for revision in [failed, later] {
+        let count: i64 = fixture.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND svn_rev = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
+            [revision], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "unapplied r{revision} must have no successful mapping");
+    }
+    let verified_sha = frontier.bridge_sha.clone();
+    assert_eq!(git_output(&fixture.bridge, &["show", &format!("{verified_sha}:origin.txt")]), "verified N-1");
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_FAILED_APPLY_BARRIER", "svn_source_head":later,
+        "frontier_revision":verified, "failed_revision":failed,
+        "queued_revision":later, "frontier_git":verified_sha,
+        "frontier_tree":frontier.bridge_tree, "remote_tree":frontier.remote_tree,
+        "mapping_before":before.mapping_count, "mapping_at_frontier":frontier.mapping_count,
+        "success_before":before.repo_sync_count, "success_at_frontier":frontier.repo_sync_count,
+        "fault":"debug-only exact-revision invalid patch to real git apply"
+    }));
+    if !retry { return; }
+
+    let applied = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 0));
+    let after = fixture.snapshot().await;
+    assert_eq!(after.watermark.0, later);
+    assert_eq!(after.mapping_count, frontier.mapping_count + 2);
+    assert_eq!(after.repo_sync_count, frontier.repo_sync_count + 2);
+    assert_eq!(after.remote_sha, after.bridge_sha);
+    assert_eq!(after.remote_tree, after.bridge_tree);
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "queued N+1\n");
+    for (revision, expected) in [(failed, "failed N"), (later, "queued N+1")] {
+        let mapped: String = fixture.engine.db().conn().query_row(
+            "SELECT git_sha FROM sync_records WHERE repo_id = 'pair' AND svn_rev = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
+            [revision], |row| row.get(0)).unwrap();
+        assert_eq!(git_output(&fixture.bridge, &["show", &format!("{mapped}:origin.txt")]), expected);
+    }
+    let repeat = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(fixture.snapshot().await, after);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_FAILED_APPLY_RETRY", "frontier_git":verified_sha,
+        "final_git":after.bridge_sha, "final_tree":after.bridge_tree,
+        "watermark":after.watermark, "mapping_after":after.mapping_count,
+        "success_after":after.repo_sync_count, "repeat_noop":true
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_failed_apply_stops_before_later_revision() {
+    run_failed_apply_barrier(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_failed_apply_retries_pending_revisions_once() {
+    run_failed_apply_barrier(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_property_only_revision_has_explicit_no_target_checkpoint() {
+    let fixture = QualifiedPair::new().await;
+    let before = fixture.snapshot().await;
+    let revision = svn_property_only_revision(&fixture.wc);
+    assert_eq!(revision, before.svn_rev + 1);
+    let content_only = SvnClient::new(&fixture.svn_url, "", "")
+        .diff_content_only(revision).await.unwrap();
+    assert!(content_only.trim().is_empty(), "fixture must have no target file delta: {content_only}");
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 0));
+    let after = fixture.snapshot().await;
+    assert_eq!(after.watermark.0, revision);
+    assert_eq!(after.watermark.1, before.watermark.1);
+    assert_eq!(after.bridge_tree, before.bridge_tree);
+    assert_eq!(after.remote_tree, before.remote_tree);
+    assert_eq!(after.mapping_count, before.mapping_count);
+    assert_eq!(after.repo_sync_count, before.repo_sync_count);
+    let recorded: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE repo_id = 'pair' AND action = 'svn_to_git_metadata_only' AND svn_rev = ?1 AND success = 1",
+        [revision], |row| row.get(0)).unwrap();
+    assert_eq!(recorded, 1);
+    let repeat = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(fixture.snapshot().await, after);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_METADATA_ONLY", "revision":revision,
+        "bridge_tree_before_after":before.bridge_tree,
+        "remote_tree_before_after":before.remote_tree,
+        "mapping_before_after":before.mapping_count,
+        "recorded_no_target_checkpoint":recorded,
+        "repeat_noop":true
+    }));
+}
+
+async fn prepare_r19_tree(fixture: &QualifiedPair) -> (i64, BTreeMap<String, Vec<u8>>) {
+    let loose = svn_commit_file(&fixture.wc, "loose.txt", "untouched top-level\n", "Add top-level survivor");
+    let notes = svn_commit_file(&fixture.wc, "notes/keep.txt", "untouched directory\n", "Add directory survivor");
+    assert_eq!(notes, loose + 1);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 2);
+    let expected = fixture_tree();
+    assert_eq!(tracked_tree(&fixture.bridge), expected);
+    assert_eq!(svn_tree(fixture, notes).await, expected);
+    (notes, expected)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r19_untouched_top_level_tree_survives_deltas() {
+    let fixture = QualifiedPair::new().await;
+    let (before_rev, mut expected) = prepare_r19_tree(&fixture).await;
+    let before_tree = git_output(&fixture.bridge, &["rev-parse", "HEAD^{tree}"]);
+    let added = svn_commit_file(&fixture.wc, "added.txt", "new path\n", "Add path");
+    let modified = svn_commit_file(&fixture.wc, "origin.txt", "modified origin\n", "Modify path");
+    assert_eq!((added, modified), (before_rev + 1, before_rev + 2));
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 2);
+    expected.insert("added.txt".into(), b"new path\n".to_vec());
+    let added_sha: String = fixture.engine.db().conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = 'pair' AND svn_rev = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
+        [added], |row| row.get(0)).unwrap();
+    assert_eq!(tracked_tree_at(&fixture.bridge, &added_sha), expected);
+    assert_eq!(svn_tree(&fixture, added).await, expected);
+    expected.insert("origin.txt".into(), b"modified origin\n".to_vec());
+    assert_eq!(tracked_tree(&fixture.bridge), expected);
+    assert_eq!(svn_tree(&fixture, modified).await, expected);
+    let after = fixture.snapshot().await;
+    assert_eq!(after.watermark.0, modified);
+    assert_eq!(after.remote_tree, after.bridge_tree);
+    let after_tree = after.bridge_tree.clone();
+    let repeat = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(fixture.snapshot().await, after);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R19_UNTOUCHED_TREE", "before_revision":before_rev,
+        "added_revision":added, "modified_revision":modified,
+        "before_tree":before_tree, "added_commit":added_sha,
+        "before_full_tree_content_sha256":tree_hashes(&fixture_tree()),
+        "after_tree":after_tree, "expected_paths":expected.keys().collect::<Vec<_>>(),
+        "full_tree_content_sha256":tree_hashes(&expected),
+        "expected_sha256":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&expected).unwrap())),
+        "repeat_noop":true
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r19_explicit_svn_delete_only_removes_target() {
+    let fixture = QualifiedPair::new().await;
+    let (_, mut expected) = prepare_r19_tree(&fixture).await;
+    let added = svn_commit_file(&fixture.wc, "remove-me.txt", "delete target\n", "Add delete target");
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    expected.insert("remove-me.txt".into(), b"delete target\n".to_vec());
+    assert_eq!(tracked_tree(&fixture.bridge), expected);
+    let before_head = get_head_sha(&fixture.bridge);
+    let deleted = svn_delete_file(&fixture.wc, "remove-me.txt", "Explicit deletion");
+    assert_eq!(deleted, added + 1);
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    expected.remove("remove-me.txt");
+    assert_eq!(tracked_tree(&fixture.bridge), expected);
+    assert_eq!(svn_tree(&fixture, deleted).await, expected);
+    let diff = git_output(&fixture.bridge, &["diff", "--name-status", &before_head, "HEAD"]);
+    assert_eq!(diff, "D\tremove-me.txt");
+    let after = fixture.snapshot().await;
+    assert_eq!(after.watermark.0, deleted);
+    assert_eq!(after.remote_tree, after.bridge_tree);
+    let mapping: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND svn_rev = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
+        [deleted], |row| row.get(0)).unwrap();
+    assert_eq!(mapping, 1);
+    let repeat = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(fixture.snapshot().await, after);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R19_EXPLICIT_DELETE", "added_revision":added,
+        "deleted_revision":deleted, "before_git":before_head,
+        "after_git":after.bridge_sha, "after_tree":after.bridge_tree,
+        "git_change":diff, "expected_paths":expected.keys().collect::<Vec<_>>(),
+        "full_tree_content_sha256":tree_hashes(&expected),
+        "expected_sha256":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&expected).unwrap())),
+        "mapping":mapping, "repeat_noop":true
     }));
 }
 

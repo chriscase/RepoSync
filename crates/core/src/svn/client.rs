@@ -110,6 +110,17 @@ impl SvnClient {
         self.run_svn(&["diff", "-r", &rev_range, &peg_url]).await
     }
 
+    /// Inspect file-content changes without SVN properties when deciding
+    /// whether a revision has any Git-representable target delta.
+    pub async fn diff_content_only(&self, rev: i64) -> Result<String, SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let rev_range = format!("{}:{}", rev - 1, rev);
+        let peg_url = format!("{}@{}", self.url, rev);
+        self.run_svn(&["diff", "--ignore-properties", "-r", &rev_range, &peg_url]).await
+    }
+
     #[instrument(skip(self), fields(url = %self.url, rev))]
     pub async fn checkout(&self, path: &Path, rev: i64) -> Result<(), SvnError> {
         let rev_str = rev.to_string();
