@@ -36,6 +36,7 @@ COPY --from=build /opt/reliability-old-tests /opt/reliability-old-tests
 COPY scripts/reliability-runtime.py /usr/local/bin/reliability-runtime
 COPY scripts/reliability_scan.py /usr/local/bin/reliability_scan.py
 COPY scripts/reliability-inventory.py /usr/local/bin/reliability-inventory.py
+COPY scripts/reliability-inventory-probes.py /usr/local/bin/reliability-inventory-probes.py
 COPY docs/reliability/required-cases.json /opt/reliability/required-cases.json
 USER 65532:65532
 ENTRYPOINT ["python3", "/usr/local/bin/reliability-runtime"]

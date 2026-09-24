@@ -42,6 +42,7 @@ MANDATORY["candidate"].update({
     "R01_VERIFIED_NO_DELTA", "R10_PINNED_OLD_TOPOLOGY_INVENTORY",
     "R01_REPRESENTED_CONTENT",
     "R01_TARGET_MISMATCH",
+    "R10_INVENTORY_AUTHORITY_CONFINEMENT",
 })
 MANDATORY["candidate"].update({
     "R01_FAILED_APPLY_BARRIER", "R01_FAILED_APPLY_RETRY",
@@ -326,6 +327,7 @@ def main():
     assert old_generator.is_file(), "pinned old import generator missing"
     os.environ["REPOSYNC_OLD_GENERATOR"] = str(old_generator)
     os.environ["REPOSYNC_INVENTORY_SCRIPT"] = "/usr/local/bin/reliability-inventory.py"
+    os.environ["REPOSYNC_INVENTORY_PROBES_SCRIPT"] = "/usr/local/bin/reliability-inventory-probes.py"
     (OUTPUT / "old-generator-provenance.json").write_text(json.dumps({
         "old_code_sha": "87379741779a6259f7eeb52a68cc6f061174e5ef",
         "generator_sha256": digest(old_generator.read_bytes()),

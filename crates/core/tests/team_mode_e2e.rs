@@ -3742,3 +3742,45 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
         "production_eligibility":"NOT_ESTABLISHED"
     }));
 }
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_inventory_authority_and_confined_reads() {
+    let tmp = TempDir::new().unwrap();
+    assert_fixture_owned(tmp.path());
+    let old_root = tmp.path().join("pinned-old-authority");
+    let generator = std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
+    let generated = Command::new(&generator)
+        .args(["generate_legacy_topology", "--exact", "--nocapture", "--test-threads=1"])
+        .env("REPOSYNC_OLD_TOPOLOGY_DIR", &old_root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture Developer")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture Developer")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output().unwrap();
+    assert!(generated.status.success(), "pinned old topology generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr));
+    let inventory = std::env::var("REPOSYNC_INVENTORY_SCRIPT")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reliability-inventory.py").to_string());
+    let probes = std::env::var("REPOSYNC_INVENTORY_PROBES_SCRIPT")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reliability-inventory-probes.py").to_string());
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("python3")).find(|path| path.is_file())
+        .expect("fixture Python interpreter");
+    let work = tmp.path().join("inventory-overlays");
+    let result = Command::new(python)
+        .args([&probes, "--inventory-script", &inventory,
+               "--old-install", old_root.join("install").to_str().unwrap(),
+               "--work", work.to_str().unwrap()])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PATH", "/nonexistent")
+        .output().unwrap();
+    assert!(result.status.success(), "inventory probes: {}", String::from_utf8_lossy(&result.stderr));
+    let evidence: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(evidence["case"], "R10_INVENTORY_AUTHORITY_CONFINEMENT");
+    assert_eq!(evidence["outside_canary_open_count"], 0);
+    assert!(evidence["reports"].as_object().unwrap().len() >= 14);
+    eprintln!("RELIABILITY_EVIDENCE {}", evidence);
+}

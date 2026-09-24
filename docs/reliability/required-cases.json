@@ -51,6 +51,7 @@
     {"id": "R01_VERIFIED_NO_DELTA", "binary": "team_mode_e2e", "test": "candidate_r01_nonempty_already_represented_delta_is_verified", "tier": "candidate_regression"},
     {"id": "R01_REPRESENTED_CONTENT", "binary": "team_mode_e2e", "test": "candidate_r01_regular_content_already_represented_is_verified", "tier": "candidate_regression"},
     {"id": "R01_TARGET_MISMATCH", "binary": "team_mode_e2e", "test": "candidate_r01_target_changes_during_no_delta_proof_blocks_successor", "tier": "candidate_regression"},
-    {"id": "R10_PINNED_OLD_TOPOLOGY_INVENTORY", "binary": "team_mode_e2e", "test": "candidate_r10_pinned_old_topology_read_safe_inventory", "tier": "candidate_regression"}
+    {"id": "R10_PINNED_OLD_TOPOLOGY_INVENTORY", "binary": "team_mode_e2e", "test": "candidate_r10_pinned_old_topology_read_safe_inventory", "tier": "candidate_regression"},
+    {"id": "R10_INVENTORY_AUTHORITY_CONFINEMENT", "binary": "team_mode_e2e", "test": "candidate_r10_inventory_authority_and_confined_reads", "tier": "candidate_regression"}
   ]
 }
