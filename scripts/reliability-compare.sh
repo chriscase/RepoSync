@@ -27,7 +27,7 @@ p.write_text(source.replace(needle,
 PY
 mkdir -p "$base_context/docs/reliability/fixtures"
 cp Dockerfile.reliability .dockerignore "$base_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py "$base_context/scripts/"
+cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py "$base_context/scripts/"
 cp docs/reliability/fixtures/Cargo.lock "$base_context/docs/reliability/fixtures/"
 cp docs/reliability/required-cases.json "$base_context/docs/reliability/"
 shasum -a 256 "$base_context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256"

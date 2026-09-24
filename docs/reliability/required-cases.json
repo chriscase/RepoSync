@@ -22,6 +22,16 @@
     {"id": "R09_LOCAL", "binary": "team_mode_e2e", "test": "candidate_r09_local_dirty_index_and_unpublished_commit_preserved", "tier": "candidate_regression"},
     {"id": "R10_MERGE", "binary": "team_mode_e2e", "test": "candidate_r10_merge_dag_rejected_before_replay", "tier": "candidate_regression"},
     {"id": "R10_OVERFLOW", "binary": "team_mode_e2e", "test": "candidate_r10_over_1000_pending_commits_rejected", "tier": "candidate_regression"},
-    {"id": "R17_SCOPE", "binary": "team_mode_e2e", "test": "candidate_r17_repository_cursors_remain_scoped", "tier": "candidate_regression"}
+    {"id": "R17_SCOPE", "binary": "team_mode_e2e", "test": "candidate_r17_repository_cursors_remain_scoped", "tier": "candidate_regression"},
+    {"id": "R01_ALTERNATING_DUAL_CURSOR", "binary": "team_mode_e2e", "test": "candidate_r01_alternating_directional_cursors_survive_restart", "tier": "candidate_regression"},
+    {"id": "R01_PENDING_BOTH_DIRECTIONS", "binary": "team_mode_e2e", "test": "candidate_r01_pending_both_directions_after_legacy_split", "tier": "candidate_regression"},
+    {"id": "R10_LEGACY_STALE_COPY", "binary": "team_mode_e2e", "test": "candidate_r10_legacy_stale_copy_requires_mapped_transition", "tier": "candidate_regression"},
+    {"id": "R09_IGNORED_FILE_COLLISION", "binary": "team_mode_e2e", "test": "candidate_r09_ignored_file_collision_preserved", "tier": "candidate_regression"},
+    {"id": "R09_IGNORED_DIRECTORY_COLLISION", "binary": "team_mode_e2e", "test": "candidate_r09_ignored_directory_collision_preserved", "tier": "candidate_regression"},
+    {"id": "R09_READONLY_INDEX", "binary": "team_mode_e2e", "test": "candidate_r09_rejection_preserves_raw_index_before_status", "tier": "candidate_regression"},
+    {"id": "R01_IGNORED_NONCOLLISION", "binary": "team_mode_e2e", "test": "candidate_r01_ignored_noncollision_allows_qualified_sync", "tier": "candidate_regression"},
+    {"id": "EVIDENCE_SCAN_CLEAN", "binary": "evidence_scan", "test": "evidence_scan_clean", "tier": "candidate_regression"},
+    {"id": "EVIDENCE_SCAN_CANARY", "binary": "evidence_scan", "test": "evidence_scan_canary", "tier": "candidate_regression"},
+    {"id": "EVIDENCE_SCAN_ERROR", "binary": "evidence_scan", "test": "evidence_scan_error", "tier": "candidate_regression"}
   ]
 }

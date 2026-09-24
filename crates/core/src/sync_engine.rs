@@ -414,6 +414,42 @@ impl SyncEngine {
                 .map_err(SyncError::DatabaseError)?
                 .filter(|value| !value.is_empty());
             if column.is_some() && kv.is_some() && column != kv {
+                let (emitted, handled) = {
+                    let conn = self.db.conn();
+                    let emitted: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                        rusqlite::params![rid, column.as_deref()], |row| row.get(0),
+                    ).map_err(crate::errors::DatabaseError::from)?;
+                    let handled: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn' AND status = 'applied'",
+                        rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
+                    ).map_err(crate::errors::DatabaseError::from)?;
+                    (emitted, handled)
+                };
+                // The column is also used by the old SVN->Git writer to hold
+                // its emitted tip. That is not the inbound handled cursor P.
+                // Keep the older, mapped Git->SVN cursor when its ancestry to
+                // the mapped emitted tip is provable. This admits pending Git
+                // work between them instead of acknowledging it silently.
+                if emitted > 0 && handled > 0
+                    && is_full_git_oid(column.as_deref().unwrap())
+                    && is_full_git_oid(kv.as_deref().unwrap())
+                {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    let ancestry = Command::new("git")
+                        .args(["merge-base", "--is-ancestor", kv.as_deref().unwrap(), column.as_deref().unwrap()])
+                        .current_dir(git.repo_path())
+                        .output();
+                    match ancestry {
+                        Ok(output) if output.status.code() == Some(0) => return Ok(kv),
+                        Ok(output) if output.status.code() == Some(1) => (),
+                        _ => return Err(self.record_history_block(
+                            "ancestry_command_failed",
+                            "repository cursor copies could not be reconciled",
+                            kv.as_deref(), None, None, column.as_deref(),
+                        )),
+                    }
+                }
                 return Err(self.record_history_block(
                     "ambiguous_checkpoint",
                     "repository column and repository-scoped legacy cursor disagree",
@@ -422,6 +458,50 @@ impl SyncEngine {
                     None,
                     None,
                 ));
+            }
+            if let Some(ref emitted_tip) = column {
+                if kv.is_none() {
+                    let (emitted, last_handled): (i64, Option<String>) = {
+                        let conn = self.db.conn();
+                        let emitted = conn.query_row(
+                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                            rusqlite::params![rid, emitted_tip], |row| row.get(0),
+                        ).map_err(crate::errors::DatabaseError::from)?;
+                        let last_handled = conn.query_row(
+                            "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
+                            [rid], |row| row.get(0),
+                        ).optional().map_err(crate::errors::DatabaseError::from)?;
+                        (emitted, last_handled)
+                    };
+                    if emitted > 0 {
+                        if let Some(handled) = last_handled {
+                            if !is_full_git_oid(&handled) || !is_full_git_oid(emitted_tip) {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint", "mapped legacy cursor is malformed",
+                                    Some(&handled), None, None, Some(emitted_tip),
+                                ));
+                            }
+                            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                            let ancestry = Command::new("git")
+                                .args(["merge-base", "--is-ancestor", &handled, emitted_tip])
+                                .current_dir(git.repo_path()).output();
+                            match ancestry {
+                                Ok(output) if output.status.code() == Some(0) => return Ok(Some(handled)),
+                                Ok(output) if output.status.code() == Some(1) => return Err(self.record_history_block(
+                                    "ambiguous_checkpoint", "mapped legacy cursor is unrelated to emitted tip",
+                                    Some(&handled), None, None, Some(emitted_tip),
+                                )),
+                                _ => return Err(self.record_history_block(
+                                    "ancestry_command_failed", "mapped legacy cursor ancestry could not be established",
+                                    Some(&handled), None, None, Some(emitted_tip),
+                                )),
+                            }
+                        }
+                        // An SVN-origin first import has no handled Git
+                        // mapping yet. Its own mapped tip is the initial P.
+                        return Ok(column);
+                    }
+                }
             }
             return Ok(column.or(kv));
         }
@@ -520,7 +600,7 @@ impl SyncEngine {
             _ => blocked!("unknown_local_tip", "bridge HEAD is missing or unreadable"),
         };
         l = Some(local.clone());
-        let status = match run(&["status", "--porcelain", "--untracked-files=all"]) {
+        let status = match run(&["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"]) {
             Ok(output) if output.status.success() => output,
             _ => blocked!(
                 "local_status_error",
@@ -622,6 +702,31 @@ impl SyncEngine {
                 "remote_changed_during_inspection",
                 "remote branch moved between advertisement and fetch"
             );
+        }
+
+        // Porcelain status deliberately omits ignored paths. A subsequent
+        // reset can nevertheless replace an ignored file or directory when
+        // the incoming commit tracks that name (including either prefix of a
+        // file/directory collision). Inspect the target tree before reset.
+        let ignored = match run(&["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]) {
+            Ok(output) if output.status.success() => output.stdout,
+            _ => blocked!("local_status_error", "ignored bridge paths could not be inspected"),
+        };
+        let target = match run(&["ls-tree", "-r", "--name-only", "-z", &fetched]) {
+            Ok(output) if output.status.success() => output.stdout,
+            _ => blocked!("inspection_command_failed", "incoming Git tree could not be inspected"),
+        };
+        let ignored_paths = ignored.split(|byte| *byte == 0).filter(|path| !path.is_empty());
+        let target_paths: Vec<&[u8]> = target.split(|byte| *byte == 0).filter(|path| !path.is_empty()).collect();
+        for ignored in ignored_paths {
+            let ignored = ignored.strip_suffix(b"/").unwrap_or(ignored);
+            if target_paths.iter().any(|tracked| {
+                *tracked == ignored
+                    || (tracked.starts_with(ignored) && tracked.get(ignored.len()) == Some(&b'/'))
+                    || (ignored.starts_with(tracked) && ignored.get(tracked.len()) == Some(&b'/'))
+            }) {
+                blocked!("ignored_path_collision", "incoming tracked paths overlap ignored bridge data");
+            }
         }
 
         let checkpoint = match p.as_deref() {
@@ -1155,9 +1260,9 @@ impl SyncEngine {
             );
 
             // Update the SVN watermark (dual-write: kv_state + repo table).
-            let _ = self
-                .db
-                .set_state(&self.svn_rev_key(), &change.revision.to_string());
+            self.db
+                .set_state(&self.svn_rev_key(), &change.revision.to_string())
+                .map_err(SyncError::DatabaseError)?;
             if let Some(rid) = self.effective_repo_id() {
                 debug!(
                     repo_id = %rid,
@@ -1165,8 +1270,10 @@ impl SyncEngine {
                     new_git_sha = %&git_sha[..12.min(git_sha.len())],
                     "watermark updated"
                 );
-                let _ = self.db.update_repo_watermark(rid, change.revision, &git_sha);
-                let _ = self.db.increment_repo_sync_count(rid);
+                self.db.update_repo_watermark(rid, change.revision, &git_sha)
+                    .map_err(SyncError::DatabaseError)?;
+                self.db.increment_repo_sync_count(rid)
+                    .map_err(SyncError::DatabaseError)?;
             }
 
             count += 1;
@@ -1286,13 +1393,12 @@ impl SyncEngine {
 
             if file_contents.is_empty() {
                 // All files were filtered out — advance watermark and skip
-                let _ = self.db.set_state("last_git_hash", &change.sha);
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                    let current_svn_rev = self.db.get_repo_watermark(rid)
-                        .map(|(rev, _)| rev)
-                        .unwrap_or(0);
-                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    self.db.advance_all_watermarks(rid, &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
+                } else {
+                    self.db.set_state("last_git_hash", &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
                 }
                 continue;
             }
@@ -1479,13 +1585,12 @@ impl SyncEngine {
                 );
                 // Still advance the Git watermark so we don't retry this
                 // commit on the next cycle.
-                let _ = self.db.set_state("last_git_hash", &change.sha);
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                    // Preserve existing SVN watermark — only update git_sha
-                    let current_svn_rev = self.db.get_repo_watermark(rid)
-                        .map(|(rev, _)| rev).unwrap_or(0);
-                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    self.db.advance_all_watermarks(rid, &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
+                } else {
+                    self.db.set_state("last_git_hash", &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
                 }
                 continue;
             }
@@ -1646,13 +1751,12 @@ impl SyncEngine {
                         "svn commit: nothing to commit — files already in sync, advancing watermark"
                     );
                     // Advance git watermark so we don't retry this commit
-                    let _ = self.db.set_state("last_git_hash", &change.sha);
                     if let Some(rid) = self.effective_repo_id() {
-                        let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                        let current_svn_rev = self.db.get_repo_watermark(rid)
-                            .map(|(rev, _)| rev)
-                            .unwrap_or(0);
-                        let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                        self.db.advance_all_watermarks(rid, &change.sha)
+                            .map_err(SyncError::DatabaseError)?;
+                    } else {
+                        self.db.set_state("last_git_hash", &change.sha)
+                            .map_err(SyncError::DatabaseError)?;
                     }
                     continue;
                 }
@@ -1682,15 +1786,14 @@ impl SyncEngine {
             // SVN→Git revisions. If we set last_svn_rev here, we'd skip
             // SVN commits that were made between our fetch and our commit
             // (bidirectional race condition / data loss).
-            let _ = self.db.set_state("last_git_hash", &change.sha);
             if let Some(rid) = self.effective_repo_id() {
-                let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                // Only advance git SHA in repo table; preserve SVN rev watermark
-                let current_svn_rev = self.db.get_repo_watermark(rid)
-                    .map(|(rev, _)| rev)
-                    .unwrap_or(0);
-                let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
-                let _ = self.db.increment_repo_sync_count(rid);
+                self.db.advance_all_watermarks(rid, &change.sha)
+                    .map_err(SyncError::DatabaseError)?;
+                self.db.increment_repo_sync_count(rid)
+                    .map_err(SyncError::DatabaseError)?;
+            } else {
+                self.db.set_state("last_git_hash", &change.sha)
+                    .map_err(SyncError::DatabaseError)?;
             }
 
             count += 1;

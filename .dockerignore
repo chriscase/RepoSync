@@ -5,6 +5,7 @@
 !scripts/
 !scripts/reliability-prep.py
 !scripts/reliability-runtime.py
+!scripts/reliability_scan.py
 !docs/
 !docs/reliability/
 !docs/reliability/fixtures/

@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git subversion libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
 COPY scripts/reliability-runtime.py /usr/local/bin/reliability-runtime
+COPY scripts/reliability_scan.py /usr/local/bin/reliability_scan.py
 COPY docs/reliability/required-cases.json /opt/reliability/required-cases.json
 USER 65532:65532
 ENTRYPOINT ["python3", "/usr/local/bin/reliability-runtime"]

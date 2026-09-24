@@ -964,6 +964,227 @@ async fn candidate_r01_two_pending_git_commits_sync_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_alternating_directional_cursors_survive_restart() {
+    let fixture = QualifiedPair::new().await;
+    let git_sha = fixture.developer_commit("config", "from Git\n", "First direction");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, git_sha);
+    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(git_sha.clone()));
+
+    let svn_rev = svn_commit_file(&fixture.wc, "origin.txt", "Second direction\n", "Second direction");
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let emitted = get_head_sha(&fixture.bridge);
+    assert_ne!(emitted, git_sha);
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (svn_rev, emitted.clone()));
+    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(git_sha.clone()));
+    let mapped: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND svn_rev = ?1 AND git_sha = ?2 AND status = 'applied'",
+        rusqlite::params![svn_rev, emitted], |row| row.get(0)).unwrap();
+    assert_eq!(mapped, 1);
+
+    let db = Database::new(&fixture.db_path).unwrap();
+    db.initialize().unwrap();
+    let mut restarted = SyncEngine::new(
+        fixture.engine.config().clone(), db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).unwrap(), Arc::new(make_identity_mapper()));
+    restarted.set_repo_id("pair".into());
+    let repeat = restarted.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let further_git = fixture.developer_commit("config", "further Git\n", "Further Git direction");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(restarted.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(restarted.db().get_repo_watermark("pair").unwrap().1, further_git);
+    assert_eq!(restarted.db().get_state("last_git_sha_pair").unwrap(), Some(further_git.clone()));
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("config")).unwrap(), "further Git\n");
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "Second direction\n");
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_ALTERNATING_DUAL_CURSOR", "git_handled":git_sha,
+        "svn_emitted":emitted, "svn_revision":svn_rev,
+        "legacy_copy":fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        "restarted_noop":true, "further_git":further_git, "mapped":mapped
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_pending_both_directions_after_legacy_split() {
+    let fixture = QualifiedPair::new().await;
+    let handled = fixture.developer_commit("config", "first Git\n", "Handled Git direction");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    let emitted_rev = svn_commit_file(&fixture.wc, "origin.txt", "prior SVN\n", "Prior SVN direction");
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let emitted_sha = get_head_sha(&fixture.bridge);
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, emitted_sha);
+    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(handled.clone()));
+
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let pending_git = fixture.developer_commit("config", "pending Git\n", "Pending Git direction");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let pending_svn = svn_commit_file(&fixture.wc, "origin.txt", "pending SVN\n", "Pending SVN direction");
+    assert_eq!(pending_svn, emitted_rev + 1);
+    let before_mapping = fixture.engine.db().count_sync_records().unwrap();
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 1));
+    let after_mapping = fixture.engine.db().count_sync_records().unwrap();
+    assert_eq!(after_mapping, before_mapping + 2);
+    let git_mapped: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'git_to_svn' AND git_sha = ?1 AND status = 'applied'",
+        [&pending_git], |row| row.get(0)).unwrap();
+    let svn_mapped: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND svn_rev = ?1 AND status = 'applied'",
+        [pending_svn], |row| row.get(0)).unwrap();
+    assert_eq!((git_mapped, svn_mapped), (1, 1));
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("config")).unwrap(), "pending Git\n");
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "pending SVN\n");
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_PENDING_BOTH_DIRECTIONS", "handled_git":handled,
+        "prior_emitted":emitted_sha, "pending_git":pending_git,
+        "pending_svn":pending_svn, "git_mapping":git_mapped,
+        "svn_mapping":svn_mapped, "mapping_before":before_mapping,
+        "mapping_after":after_mapping
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
+    let fixture = QualifiedPair::new().await;
+    // Reproduce the pinned legacy writers with actual engine operations:
+    // Git->SVN stores the handled Git SHA in both copies, then SVN->Git
+    // advances only the repository column to its emitted Git SHA.
+    let handled = fixture.developer_commit("config", "legacy Git\n", "Legacy handled Git");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    let revision = svn_commit_file(&fixture.wc, "origin.txt", "legacy SVN\n", "Legacy emitted SVN");
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let emitted = get_head_sha(&fixture.bridge);
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (revision, emitted.clone()));
+    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(handled.clone()));
+    let before = fixture.snapshot().await;
+    let repeat = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.git_to_svn_count, repeat.svn_to_git_count), (0, 0));
+    assert_eq!(fixture.snapshot().await, before);
+    fixture.engine.db().conn().execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", []).unwrap();
+    let missing_kv = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((missing_kv.git_to_svn_count, missing_kv.svn_to_git_count), (0, 0));
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (revision, emitted.clone()));
+    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), None);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_LEGACY_STALE_COPY", "handled_git":handled,
+        "emitted_git":emitted, "svn_revision":revision,
+        "reconciled_without_new_mapping":true, "missing_kv_reconciled":true
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_unmapped_stale_copy_rejected() {
+    let fixture = QualifiedPair::new().await;
+    let before = fixture.snapshot().await;
+    let false_cursor = "a".repeat(40);
+    fixture.engine.db().set_state("last_git_sha_pair", &false_cursor).unwrap();
+    assert_pair_blocked_without_damage(&fixture, "ambiguous_checkpoint").await;
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), before.watermark);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_UNMAPPED_STALE_COPY", "column":before.watermark.1,
+        "unmapped_copy":false_cursor, "blocked":true
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_ignored_file_collision_preserved() {
+    let fixture = QualifiedPair::new().await;
+    std::fs::write(fixture.bridge.join(".git/info/exclude"), "cache.dat\n").unwrap();
+    std::fs::write(fixture.bridge.join("cache.dat"), "private cache\n").unwrap();
+    fixture.developer_commit("cache.dat", "remote content\n", "Tracked collision");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let before = fixture.snapshot().await;
+    assert_pair_blocked_without_damage(&fixture, "ignored_path_collision").await;
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("cache.dat")).unwrap(), "private cache\n");
+    assert_eq!(fixture.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R09_IGNORED_FILE_COLLISION", "protected_tree":before.bridge_tree,
+        "protected_index_sha256":hex::encode(sha2::Sha256::digest(&before.bridge_index)),
+        "protected_cache":true, "checkpoint":before.watermark
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_ignored_directory_collision_preserved() {
+    let fixture = QualifiedPair::new().await;
+    std::fs::write(fixture.bridge.join(".git/info/exclude"), "cache/\n").unwrap();
+    std::fs::create_dir(fixture.bridge.join("cache")).unwrap();
+    std::fs::write(fixture.bridge.join("cache/private.dat"), "private cache\n").unwrap();
+    fixture.developer_commit("cache", "remote file\n", "Directory collision");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let before = fixture.snapshot().await;
+    assert_pair_blocked_without_damage(&fixture, "ignored_path_collision").await;
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("cache/private.dat")).unwrap(), "private cache\n");
+    assert_eq!(fixture.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R09_IGNORED_DIRECTORY_COLLISION", "protected_tree":before.bridge_tree,
+        "protected_index_sha256":hex::encode(sha2::Sha256::digest(&before.bridge_index)),
+        "protected_cache":true, "checkpoint":before.watermark
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_rejection_preserves_raw_index_before_status() {
+    let fixture = QualifiedPair::new().await;
+    let initial = fixture.developer_commit("feature.txt", "version one\n", "Handled version");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, initial);
+    git_cli(&fixture.developer, &["commit", "--amend", "-m", "Rewritten metadata"]);
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    // Change only a tracked file's metadata, then capture raw bytes before
+    // any status/snapshot helper can refresh the index stat cache.
+    let tracked = fixture.bridge.join("origin.txt");
+    let touch = Command::new("touch").args(["-m", "-t", "202001010000"]).arg(&tracked).status().unwrap();
+    assert!(touch.success());
+    let index_before = std::fs::read(fixture.bridge.join(".git/index")).unwrap();
+    let bridge_before = get_head_sha(&fixture.bridge);
+    let cursor_before = fixture.engine.db().get_repo_watermark("pair").unwrap();
+    let mapping_before = fixture.engine.db().count_sync_records().unwrap();
+    let svn_before = SvnClient::new(&fixture.svn_url, "", "").info().await.unwrap().latest_rev;
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(matches!(result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "non_fast_forward"));
+    assert_eq!(std::fs::read(fixture.bridge.join(".git/index")).unwrap(), index_before);
+    assert_eq!(get_head_sha(&fixture.bridge), bridge_before);
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), cursor_before);
+    assert_eq!(fixture.engine.db().count_sync_records().unwrap(), mapping_before);
+    assert_eq!(SvnClient::new(&fixture.svn_url, "", "").info().await.unwrap().latest_rev, svn_before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R09_READONLY_INDEX", "index_sha256":hex::encode(sha2::Sha256::digest(&index_before)),
+        "bridge":bridge_before, "checkpoint":cursor_before, "svn_revision":svn_before,
+        "mapping_count":mapping_before
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_ignored_noncollision_allows_qualified_sync() {
+    let fixture = QualifiedPair::new().await;
+    std::fs::write(fixture.bridge.join(".git/info/exclude"), "cache.dat\n").unwrap();
+    std::fs::write(fixture.bridge.join("cache.dat"), "private cache\n").unwrap();
+    let pending = fixture.developer_commit("feature.txt", "ordinary change\n", "Ordinary sync");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let before = fixture.snapshot().await;
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("cache.dat")).unwrap(), "private cache\n");
+    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, pending);
+    let after = fixture.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev + 1);
+    assert_eq!(after.svn_feature.as_deref(), Some("ordinary change\n"));
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_IGNORED_NONCOLLISION", "p":before.watermark.1,
+        "r":pending, "svn_revision":after.svn_rev,
+        "cache_preserved":true, "bridge_tree":after.bridge_tree
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_caught_up_bridge_lagging_cursor_replays() {
     let fixture = QualifiedPair::new().await;
     let first = fixture.developer_commit("feature.txt", "first\n", "First pending Git commit");

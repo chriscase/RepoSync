@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -21,6 +22,19 @@ MANDATORY = {
                   "R10_MISSING_CURSOR", "R10_AMBIGUOUS",
                   "R10_SHALLOW", "R10_ANCESTRY_ERROR", "R09_LOCAL", "R10_MERGE",
                   "R10_OVERFLOW", "R17_SCOPE"},
+}
+MANDATORY["candidate"].update({"EVIDENCE_SCAN_CLEAN", "EVIDENCE_SCAN_CANARY",
+                               "EVIDENCE_SCAN_ERROR"})
+MANDATORY["candidate"].update({
+    "R01_ALTERNATING_DUAL_CURSOR", "R01_PENDING_BOTH_DIRECTIONS",
+    "R10_LEGACY_STALE_COPY", "R09_IGNORED_FILE_COLLISION",
+    "R09_IGNORED_DIRECTORY_COLLISION", "R09_READONLY_INDEX",
+    "R01_IGNORED_NONCOLLISION",
+})
+SCANNER_CASES = {
+    "EVIDENCE_SCAN_CLEAN": "evidence_scan_clean",
+    "EVIDENCE_SCAN_CANARY": "evidence_scan_canary",
+    "EVIDENCE_SCAN_ERROR": "evidence_scan_error",
 }
 
 
@@ -109,6 +123,8 @@ def boundary_canaries():
 
 
 def run_case(case, binaries):
+    if case["binary"] == "evidence_scan":
+        return run_scan_case(case)
     binary = TESTS / binaries[case["binary"]]
     test_name = case["test"]
     listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True)
@@ -149,6 +165,71 @@ def run_case(case, binaries):
     (OUTPUT / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
     return evidence
+
+
+def run_scan_case(case):
+    if SCANNER_CASES.get(case["id"]) != case["test"]:
+        raise AssertionError(f"required scanner case renamed: {case['id']}")
+    scanner = Path("/usr/local/bin/reliability_scan.py")
+    with tempfile.TemporaryDirectory(prefix="evidence-scan-", dir=FIXTURE / "tmp") as temporary:
+        root = Path(temporary)
+        evidence_dir = root / "evidence"
+        evidence_dir.mkdir()
+        status = root / "status.json"
+
+        def invoke():
+            result = subprocess.run(
+                [sys.executable, str(scanner), "--scan", str(evidence_dir),
+                 "--status-file", str(status)], capture_output=True, text=True, timeout=15)
+            output = result.stdout + result.stderr
+            if SECRET in output:
+                raise AssertionError("scanner output exposed synthetic canary")
+            return result.returncode, json.loads(status.read_text()), output
+
+        outcomes = []
+        if case["id"] == "EVIDENCE_SCAN_CLEAN":
+            (evidence_dir / "safe.txt").write_text("fixture evidence\n")
+            outcomes.append(invoke())
+            succeeded = outcomes[0][0] == 0 and outcomes[0][1]["result"] == "PASS"
+        elif case["id"] == "EVIDENCE_SCAN_CANARY":
+            (evidence_dir / "canary.txt").write_text(SECRET)
+            outcomes.append(invoke())
+            succeeded = (outcomes[0][0] != 0 and outcomes[0][1].get("reason") ==
+                         "synthetic_canary_found")
+        else:
+            (evidence_dir / "escape").symlink_to("/etc")
+            outcomes.append(invoke())
+            (evidence_dir / "escape").unlink()
+            status.unlink()
+            unreadable = evidence_dir / "unreadable.txt"
+            unreadable.write_text("fixture evidence\n")
+            unreadable.chmod(0)
+            outcomes.append(invoke())
+            missing = subprocess.run(
+                [sys.executable, str(root / "missing-scanner.py"), "--scan", str(evidence_dir)],
+                capture_output=True, text=True, timeout=15)
+            outcomes.append((missing.returncode,
+                             {"result": "FAIL", "reason": "scanner_unavailable"},
+                             "scanner unavailable\n"))
+            succeeded = (all(code != 0 for code, _, _ in outcomes) and
+                         outcomes[0][1].get("reason") == "symlink_in_evidence" and
+                         outcomes[1][1].get("reason") == "file_read_error" and
+                         outcomes[2][1].get("reason") == "scanner_unavailable")
+        output = "".join(outcome[2] for outcome in outcomes)
+        (OUTPUT / f"{case['id']}.log").write_text(output)
+        proof = [{"exit_code": code, "scan_result": state["result"],
+                  "reason": state.get("reason")} for code, state, _ in outcomes]
+    result = {
+        "id": case["id"], "tier": case["tier"], "test": case["test"],
+        "binary_sha256": digest(scanner.read_bytes()),
+        "exit_code": 0 if succeeded else 1, "passed": int(succeeded),
+        "failed": int(not succeeded), "ignored": 0, "filtered_out": 0,
+        "output_sha256": digest(output.encode()),
+        "outcome": "CANDIDATE_SUBCASE_PASS" if succeeded else "FAIL", "proofs": proof,
+    }
+    (OUTPUT / f"{case['id']}.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result), flush=True)
+    return result
 
 
 def run_baseline(binaries):

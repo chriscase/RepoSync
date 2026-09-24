@@ -21,13 +21,18 @@ jobs:
         run: scripts/reliability-container.sh --all
       - name: Compare exact reviewed base with matching dependencies
         run: scripts/reliability-compare.sh
+      - name: Verify complete evidence before publication
+        run: |
+          python3 scripts/reliability_scan.py --scan artifacts \
+            --status-file artifacts/evidence-scan-status.json
       - name: Preserve fixture-only evidence
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: reliability-phase0-${{ github.sha }}
           path: |
             artifacts/reliability-phase0/
             artifacts/reliability-compare/
+            artifacts/evidence-scan-status.json
           retention-days: 14
           if-no-files-found: warn

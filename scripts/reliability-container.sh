@@ -44,6 +44,7 @@ trap 'kill "$listener_pid" 2>/dev/null || true; rm -rf "$host_private"' EXIT
 for _ in {1..50}; do [[ -s "$listener_info" ]] && break; sleep 0.1; done
 [[ -s "$listener_info" ]] || { echo "FAIL: host canary listener unavailable" >&2; exit 1; }
 
+runtime_status=0
 docker run --rm --network none --read-only --cap-drop ALL \
   --security-opt no-new-privileges --pids-limit 256 \
   --tmpfs /fixture:rw,nosuid,nodev,size=2g,mode=1777 \
@@ -61,11 +62,13 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --env REPOSYNC_HOST_LISTENER_PORT="$(cat "$listener_info")" \
   --env REPOSYNC_SOURCE_HEAD="$source_head" --env REPOSYNC_SOURCE_TREE="$source_tree" \
   --env REPOSYNC_GOAL_SHA256="$goal_hash" --env REPOSYNC_LOCK_SHA256="$lock_hash" \
-  "$image" "${mode#--}"
+  "$image" "${mode#--}" || runtime_status=$?
 [[ "$(cat "$host_private/canary")" == 'synthetic host-private file' ]] || {
   echo "FAIL: host-private canary changed" >&2; exit 1;
 }
-if rg -l 'REPOSYNC_SYNTHETIC_SECRET_CANARY_72' "$artifact_dir"; then
-  echo "FAIL: synthetic secret canary appeared in exported evidence" >&2; exit 1
-fi
+command -v python3 >/dev/null || { echo "FAIL: evidence scanner interpreter unavailable" >&2; exit 1; }
+[[ -f scripts/reliability_scan.py ]] || { echo "FAIL: evidence scanner unavailable" >&2; exit 1; }
+python3 scripts/reliability_scan.py --scan "$artifact_dir" \
+  --status-file "$artifact_dir/scan-status.json" --summary-file "$artifact_dir/summary.json"
+[[ "$runtime_status" -eq 0 ]] || exit "$runtime_status"
 echo "Artifact: $artifact_dir"
