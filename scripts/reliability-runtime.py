@@ -173,7 +173,19 @@ def run_baseline(binaries):
         for key, count in zip(("passed", "failed", "ignored", "filtered_out"),
                               (passed, failed, ignored, filtered)):
             totals[key] += count
-        matched = re.findall(r"^test (\S+) \.\.\. (ok|FAILED|ignored)(?:, [^\n]+)?$", output, re.M)
+        # With --nocapture, SVN/Git fixture output can appear between the
+        # harness's `test name ... ` prefix and its result (sometimes on the
+        # following line). The run is single-threaded, so delimit by the next
+        # test prefix and require one standalone harness status in each chunk.
+        starts = list(re.finditer(r"^test (\S+) \.\.\. ", output, re.M))
+        matched = []
+        for index, start in enumerate(starts):
+            end = starts[index + 1].start() if index + 1 < len(starts) else output.find("test result:", start.end())
+            chunk = output[start.end():end]
+            statuses = re.findall(r"(?m)^(ok|FAILED|ignored)(?:, [^\n]*)?$", chunk)
+            if len(statuses) != 1:
+                raise AssertionError(f"ambiguous baseline result for {name}::{start.group(1)}")
+            matched.append((start.group(1), statuses[0]))
         if len(matched) != passed + failed + ignored:
             raise AssertionError(f"baseline test catalog/count mismatch for {name}: {len(matched)} vs {passed + failed + ignored}")
         for test_name, status in matched:
