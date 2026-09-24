@@ -261,8 +261,9 @@ impl SyncEngine {
                     stats.svn_to_git_count, stats.git_to_svn_count, stats.conflicts_detected
                 ),
             ),
-            Err(e @ SyncError::HistoryBlocked { .. }) =>
-                ("reconciliation_required", format!("sync blocked: {}", e)),
+            Err(e @ SyncError::HistoryBlocked { .. }) => {
+                ("reconciliation_required", format!("sync blocked: {}", e))
+            }
             Err(e) => ("error", format!("sync failed: {}", e)),
         };
 
@@ -379,7 +380,10 @@ impl SyncEngine {
             "l_bridge": l,
             "observed_at": Utc::now().to_rfc3339(),
         });
-        match self.db.set_state(&self.history_block_key(), &record.to_string()) {
+        match self
+            .db
+            .set_state(&self.history_block_key(), &record.to_string())
+        {
             Ok(()) => SyncError::HistoryBlocked {
                 reason: reason.to_string(),
                 detail: detail.to_string(),
@@ -413,7 +417,10 @@ impl SyncEngine {
                 return Err(self.record_history_block(
                     "ambiguous_checkpoint",
                     "repository column and repository-scoped legacy cursor disagree",
-                    column.as_deref(), None, None, None,
+                    column.as_deref(),
+                    None,
+                    None,
+                    None,
                 ));
             }
             return Ok(column.or(kv));
@@ -430,7 +437,10 @@ impl SyncEngine {
             return Err(self.record_history_block(
                 "ambiguous_checkpoint",
                 "global legacy cursor has multiple possible repository owners",
-                None, None, None, None,
+                None,
+                None,
+                None,
+                None,
             ));
         }
         self.db
@@ -444,7 +454,10 @@ impl SyncEngine {
     /// This runs before SVN legacy adoption or any checkout reset.
     fn inspect_team_history(&self) -> Result<TeamHistoryAdmission, SyncError> {
         let p = self.team_git_checkpoint()?;
-        let git = self.git_client.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let git = self
+            .git_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let path = git.repo_path();
         let branch = &self.config.github.default_branch;
         let run = |args: &[&str]| -> std::io::Result<Output> {
@@ -453,7 +466,8 @@ impl SyncEngine {
             #[cfg(debug_assertions)]
             let fault = std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok();
             #[cfg(debug_assertions)]
-            let fixture_fault = fault.as_deref()
+            let fixture_fault = fault
+                .as_deref()
                 .and_then(|value| value.split_once('|'))
                 .filter(|(_, fixture_path)| std::path::Path::new(fixture_path) == path)
                 .map(|(kind, _)| kind);
@@ -482,26 +496,42 @@ impl SyncEngine {
         macro_rules! blocked {
             ($reason:expr, $detail:expr) => {{
                 return Err(self.record_history_block(
-                    $reason, $detail, p.as_deref(), o.as_deref(), r.as_deref(), l.as_deref(),
+                    $reason,
+                    $detail,
+                    p.as_deref(),
+                    o.as_deref(),
+                    r.as_deref(),
+                    l.as_deref(),
                 ));
             }};
         }
 
         let branch_check = run(&["check-ref-format", "--branch", branch]);
         if !branch_check.is_ok_and(|output| output.status.success()) {
-            blocked!("invalid_branch", "configured Git branch is not a valid branch name");
+            blocked!(
+                "invalid_branch",
+                "configured Git branch is not a valid branch name"
+            );
         }
         let local = match run(&["rev-parse", "--verify", "HEAD^{commit}"]) {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
             _ => blocked!("unknown_local_tip", "bridge HEAD is missing or unreadable"),
         };
         l = Some(local.clone());
         let status = match run(&["status", "--porcelain", "--untracked-files=all"]) {
             Ok(output) if output.status.success() => output,
-            _ => blocked!("local_status_error", "bridge index/worktree could not be inspected"),
+            _ => blocked!(
+                "local_status_error",
+                "bridge index/worktree could not be inspected"
+            ),
         };
         if !status.stdout.is_empty() {
-            blocked!("local_dirty", "bridge index or worktree has unpublished changes");
+            blocked!(
+                "local_dirty",
+                "bridge index or worktree has unpublished changes"
+            );
         }
 
         let inspection_ref = "refs/reposync/inspection/incoming";
@@ -520,12 +550,24 @@ impl SyncEngine {
             }
         }
         let remote_branch = format!("refs/heads/{}", branch);
-        let advertised = match run(&["ls-remote", "--exit-code", "--heads", "origin", &remote_branch]) {
+        let advertised = match run(&[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &remote_branch,
+        ]) {
             Ok(output) if output.status.success() => output,
-            Ok(output) if output.status.code() == Some(2) => blocked!("remote_branch_missing", "configured remote branch is absent"),
+            Ok(output) if output.status.code() == Some(2) => blocked!(
+                "remote_branch_missing",
+                "configured remote branch is absent"
+            ),
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-                if stderr.contains("authentication") || stderr.contains("could not read username") || stderr.contains("401") {
+                if stderr.contains("authentication")
+                    || stderr.contains("could not read username")
+                    || stderr.contains("401")
+                {
                     blocked!("remote_auth_failed", "remote branch inspection was denied");
                 }
                 blocked!("remote_transport_failed", "remote branch inspection failed");
@@ -533,9 +575,16 @@ impl SyncEngine {
             Err(_) => blocked!("inspection_command_failed", "git ls-remote could not start"),
         };
         let advertised_text = String::from_utf8_lossy(&advertised.stdout);
-        let lines: Vec<&str> = advertised_text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+        let lines: Vec<&str> = advertised_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
         if lines.len() != 1 {
-            blocked!("ambiguous_remote_ref", "remote returned an unexpected branch result");
+            blocked!(
+                "ambiguous_remote_ref",
+                "remote returned an unexpected branch result"
+            );
         }
         let advertised_sha = lines[0].split_whitespace().next().unwrap_or("");
         if !is_full_git_oid(advertised_sha) || !lines[0].ends_with(&remote_branch) {
@@ -543,65 +592,135 @@ impl SyncEngine {
         }
 
         let refspec = format!("+{}:{}", remote_branch, inspection_ref);
-        match run(&["fetch", "--no-tags", "--no-write-fetch-head", "origin", &refspec]) {
+        match run(&[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            &refspec,
+        ]) {
             Ok(output) if output.status.success() => (),
-            Ok(_) => blocked!("remote_fetch_failed", "fresh branch fetch failed after advertisement"),
+            Ok(_) => blocked!(
+                "remote_fetch_failed",
+                "fresh branch fetch failed after advertisement"
+            ),
             Err(_) => blocked!("inspection_command_failed", "git fetch could not start"),
         }
         let fetched_ref = format!("{}^{{commit}}", inspection_ref);
         let fetched = match run(&["rev-parse", "--verify", &fetched_ref]) {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            _ => blocked!("inspection_object_missing", "fresh fetch did not produce a commit"),
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => blocked!(
+                "inspection_object_missing",
+                "fresh fetch did not produce a commit"
+            ),
         };
         r = Some(fetched.clone());
         if fetched != advertised_sha {
-            blocked!("remote_changed_during_inspection", "remote branch moved between advertisement and fetch");
+            blocked!(
+                "remote_changed_during_inspection",
+                "remote branch moved between advertisement and fetch"
+            );
         }
 
         let checkpoint = match p.as_deref() {
             Some(sha) if is_full_git_oid(sha) => sha,
-            Some(_) => blocked!("ambiguous_checkpoint", "stored Git cursor is not a full object ID"),
-            None => blocked!("missing_checkpoint", "no repository-owned handled Git cursor exists"),
+            Some(_) => blocked!(
+                "ambiguous_checkpoint",
+                "stored Git cursor is not a full object ID"
+            ),
+            None => blocked!(
+                "missing_checkpoint",
+                "no repository-owned handled Git cursor exists"
+            ),
         };
         let checkpoint_expr = format!("{}^{{commit}}", checkpoint);
         if !run(&["cat-file", "-e", &checkpoint_expr]).is_ok_and(|output| output.status.success()) {
-            blocked!("missing_checkpoint_object", "handled Git cursor object is absent or invalid");
+            blocked!(
+                "missing_checkpoint_object",
+                "handled Git cursor object is absent or invalid"
+            );
         }
         match run(&["rev-parse", "--is-shallow-repository"]) {
-            Ok(output) if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "false" => (),
-            Ok(output) if output.status.success() => blocked!("incomplete_history", "bridge is shallow; ancestry is incomplete"),
-            _ => blocked!("inspection_command_failed", "shallow-history inspection failed"),
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == "false" =>
+            {
+                ()
+            }
+            Ok(output) if output.status.success() => blocked!(
+                "incomplete_history",
+                "bridge is shallow; ancestry is incomplete"
+            ),
+            _ => blocked!(
+                "inspection_command_failed",
+                "shallow-history inspection failed"
+            ),
         }
         match run(&["merge-base", "--is-ancestor", checkpoint, &fetched]) {
             Ok(output) if output.status.code() == Some(0) => (),
-            Ok(output) if output.status.code() == Some(1) => blocked!("non_fast_forward", "fresh remote tip does not descend from handled Git cursor"),
-            _ => blocked!("ancestry_command_failed", "Git ancestry could not be established"),
+            Ok(output) if output.status.code() == Some(1) => blocked!(
+                "non_fast_forward",
+                "fresh remote tip does not descend from handled Git cursor"
+            ),
+            _ => blocked!(
+                "ancestry_command_failed",
+                "Git ancestry could not be established"
+            ),
         }
-        for (ancestor, descendant) in [(checkpoint, local.as_str()), (local.as_str(), fetched.as_str())] {
+        for (ancestor, descendant) in [
+            (checkpoint, local.as_str()),
+            (local.as_str(), fetched.as_str()),
+        ] {
             match run(&["merge-base", "--is-ancestor", ancestor, descendant]) {
                 Ok(output) if output.status.code() == Some(0) => (),
-                Ok(output) if output.status.code() == Some(1) => blocked!("unpublished_local_history", "bridge tip is outside the handled-to-remote path"),
-                _ => blocked!("ancestry_command_failed", "bridge ancestry could not be established"),
+                Ok(output) if output.status.code() == Some(1) => blocked!(
+                    "unpublished_local_history",
+                    "bridge tip is outside the handled-to-remote path"
+                ),
+                _ => blocked!(
+                    "ancestry_command_failed",
+                    "bridge ancestry could not be established"
+                ),
             }
         }
         let range = format!("{}..{}", checkpoint, fetched);
         let pending = match run(&["rev-list", "--count", &range]) {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).trim().parse::<usize>().ok(),
-            _ => blocked!("selection_command_failed", "pending Git commits could not be counted"),
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok(),
+            _ => blocked!(
+                "selection_command_failed",
+                "pending Git commits could not be counted"
+            ),
         };
         let pending = match pending {
             Some(count) => count,
             None => blocked!("selection_command_failed", "pending Git count was invalid"),
         };
         if pending > 1000 {
-            blocked!("unsupported_backlog", "more than 1000 pending Git commits require a reviewed continuation algorithm");
+            blocked!(
+                "unsupported_backlog",
+                "more than 1000 pending Git commits require a reviewed continuation algorithm"
+            );
         }
         match run(&["rev-list", "--min-parents=2", &range]) {
             Ok(output) if output.status.success() && output.stdout.is_empty() => (),
-            Ok(output) if output.status.success() => blocked!("unsupported_merge_dag", "pending Git history contains a merge commit"),
-            _ => blocked!("selection_command_failed", "pending Git topology could not be inspected"),
+            Ok(output) if output.status.success() => blocked!(
+                "unsupported_merge_dag",
+                "pending Git history contains a merge commit"
+            ),
+            _ => blocked!(
+                "selection_command_failed",
+                "pending Git topology could not be inspected"
+            ),
         }
-        Ok(TeamHistoryAdmission { checkpoint: checkpoint.to_string(), remote_tip: fetched })
+        Ok(TeamHistoryAdmission {
+            checkpoint: checkpoint.to_string(),
+            remote_tip: fetched,
+        })
     }
 
     async fn do_sync_cycle(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
@@ -1728,7 +1847,10 @@ impl SyncEngine {
         Ok(change_sets)
     }
 
-    async fn fetch_git_changes(&self, admission: &TeamHistoryAdmission) -> Result<Vec<GitChangeSet>, SyncError> {
+    async fn fetch_git_changes(
+        &self,
+        admission: &TeamHistoryAdmission,
+    ) -> Result<Vec<GitChangeSet>, SyncError> {
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
 
         // Reset only to the commit fetched and inspected above. A second pull
@@ -1739,7 +1861,8 @@ impl SyncEngine {
                 .current_dir(git.repo_path())
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
-        }).map_err(crate::errors::GitError::IoError)?;
+        })
+        .map_err(crate::errors::GitError::IoError)?;
         if !reset.status.success() {
             return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
                 git2::Error::from_str("git reset to inspected remote commit failed"),
