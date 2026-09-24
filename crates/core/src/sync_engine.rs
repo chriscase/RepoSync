@@ -741,14 +741,10 @@ impl SyncEngine {
 
     #[cfg(debug_assertions)]
     async fn test_outbound_pause(&self, key: &str, sha: &str) -> Result<(), SyncError> {
-        let Some(value) = std::env::var(key).ok() else { return Ok(()); };
-        let mut parts = value.splitn(3, '|');
-        let (Some(expected_sha), Some(expected_bridge), Some(dir)) = (parts.next(), parts.next(), parts.next()) else {
-            return Ok(());
-        };
         let bridge = self.git_client.lock().unwrap_or_else(|p| p.into_inner()).repo_path().to_string_lossy().to_string();
-        if sha != expected_sha || bridge != expected_bridge { return Ok(()); }
-        let dir = std::path::Path::new(dir);
+        let scoped_key = format!("{key}_{sha}_{}", hex::encode(Sha256::digest(bridge.as_bytes())));
+        let Some(dir) = std::env::var(&scoped_key).ok() else { return Ok(()); };
+        let dir = std::path::Path::new(&dir);
         std::fs::write(dir.join("ready"), b"").map_err(|error|
             SyncError::GitError(crate::errors::GitError::IoError(error)))?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);

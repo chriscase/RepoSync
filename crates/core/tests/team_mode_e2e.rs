@@ -3340,15 +3340,16 @@ impl Drop for TestOutboundFault {
     fn drop(&mut self) { std::env::remove_var(self.0); }
 }
 
-struct TestOutboundPause(&'static str);
+struct TestOutboundPause(String);
 impl TestOutboundPause {
     fn new(key: &'static str, sha: &str, bridge: &Path, dir: &Path) -> Self {
-        std::env::set_var(key, format!("{}|{}|{}", sha, bridge.display(), dir.display()));
-        Self(key)
+        let scoped_key = format!("{key}_{sha}_{}", hex::encode(sha2::Sha256::digest(bridge.to_string_lossy().as_bytes())));
+        std::env::set_var(&scoped_key, dir);
+        Self(scoped_key)
     }
 }
 impl Drop for TestOutboundPause {
-    fn drop(&mut self) { std::env::remove_var(self.0); }
+    fn drop(&mut self) { std::env::remove_var(&self.0); }
 }
 
 async fn wait_outbound_pause(dir: &Path) {
