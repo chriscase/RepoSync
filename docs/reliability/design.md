@@ -63,10 +63,10 @@ This gate contains unsafe replay but does not prove full SVN-origin lineage, dis
 
 | Tier | Baseline source | Phase 0 status | Missing proof |
 | --- | --- | --- | --- |
-| Current reviewed main | `87379741779a6259f7eeb52a68cc6f061174e5ef`, schema 12 | Source inspected; actual local diagnostic tests added | No migration implementation, provider/UI matrix incomplete |
+| Current reviewed main | `87379741779a6259f7eeb52a68cc6f061174e5ef`, schema 12 | Source inspected; baseline diagnostics and bounded candidate engine subcases added | No migration implementation or complete scenario acceptance |
 | Synthetic legacy | Pinned old executable/schema fixture | NOT RUN | Version selection, generated state, upgrade and restore |
 | Actual deployed installation | Not established | NOT RUN | Version/schema inventory from Chris; no credentials needed in chat |
-| Local provider/API/UI | Disposable loopback provider | NOT RUN | API pairing, cancellation/delete, browser navigation |
+| Local provider/API/UI | Disposable loopback provider | PARTIAL | R02 root DELETE and R03 route observation only; integrated SVN-origin pairing, real in-flight cancellation and browser navigation remain open |
 | Enterprise/active environment | #41 release gate | NOT AUTHORIZED | Candidate qualification and later explicit acceptance |
 
-The first implementation slice proposed after review is a fail-closed pre-reset Git ancestry gate for the team engine, backed by the real-engine R09 diagnostic converted into a future-facing zero-write assertion. It should classify equal, fast-forward, rewrite, missing object/ref and untrusted baseline, and preserve old refs. Durable schema/operation changes should follow the approved lineage contract rather than be inferred from these diagnostics.
+The bounded pre-reset team-history gate now implements the P/O/R/L inspection and blocks unsupported history before SVN fetch or bridge reset. Real-engine tests cover positive linear replay and the named rejection cases. This remains containment rather than a lineage certificate, migration or durable recovery system. The next reviewed slice should target the existing SVN apply-failure path that can advance its checkpoint past unapplied work (#62), with a precise no-advance-on-failure test and post-write recovery contract; complete #63/#64 schema and operation work remains behind legacy inventory and migration qualification.

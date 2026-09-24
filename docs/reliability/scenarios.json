@@ -1,13 +1,13 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "scope": "Phase 0 baseline observations; no runtime fix or migration implemented",
+  "scope": "Phase 0 observations plus bounded pre-reset team-history containment subcases; no complete scenario acceptance or migration implemented",
   "scenarios": [
     {
       "id": "R01",
       "baseline": "PARTIAL",
-      "candidate": "NOT RUN",
+      "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Existing Git\u2192SVN team tests pass; several SVN\u2192Git team E2E tests fail at reviewed main. Full intermediate tree/mapping oracle incomplete.",
+      "evidence": "Required real-engine R01_LINEAR admits two pending Git commits with intermediate SVN trees/mappings and no-op repeat; R01_SVN_PENDING admits new SVN work when P=R. Existing four team SVN\u2192Git/bidirectional failures remain; full round-trip acceptance is open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -69,17 +69,17 @@
     {
       "id": "R09",
       "baseline": "FAIL",
-      "candidate": "NOT RUN",
+      "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Replaced already-synced Git tip causes a second SVN revision; exported trees and sync_records show both effects.",
+      "evidence": "Baseline replacement writes an extra SVN revision. Candidate original, independent changed-content replacement and metadata-only amend are rejected before reset with explicit non_fast_forward; repeat/reopen and bridge/remote/SVN/checkpoint/mapping preservation subcases pass. Full recovery and lineage acceptance remain open.",
       "diagnostic_expected_baseline_failure": true
     },
     {
       "id": "R10",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "Required subcases cover L=R with lagging P, missing/ambiguous cursor, missing object, shallow history, ancestry command failure, merge DAG and >1000 pending commits. Complete selection/recovery semantics remain open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -125,17 +125,17 @@
     {
       "id": "R16",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "Required subcases distinguish missing configured branch with stale tracking ref, transport failure, synthetic auth denial and fetch failure before mutation. Broader credential/remote lifecycle acceptance remains open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R17",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "Required two-pair fixture keeps repository cursors scoped and allows an unrelated healthy pair while one is blocked. Full multi-repository lineage/migration acceptance remains open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
