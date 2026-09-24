@@ -451,7 +451,14 @@ impl SyncEngine {
             // Faults are available only in debug builds and only at the
             // subprocess boundary exercised by isolated integration tests.
             #[cfg(debug_assertions)]
-            match (std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok().as_deref(), args.first().copied()) {
+            let fault = std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok();
+            #[cfg(debug_assertions)]
+            let fixture_fault = fault.as_deref()
+                .and_then(|value| value.split_once('|'))
+                .filter(|(_, fixture_path)| std::path::Path::new(fixture_path) == path)
+                .map(|(kind, _)| kind);
+            #[cfg(debug_assertions)]
+            match (fixture_fault, args.first().copied()) {
                 (Some("remote_auth"), Some("ls-remote")) => {
                     let mut output = Command::new("false").output()?;
                     output.stderr = b"fatal: Authentication failed".to_vec();

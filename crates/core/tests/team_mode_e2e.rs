@@ -822,13 +822,34 @@ async fn candidate_r16_remote_transport_failure_blocks_without_reset() {
     assert_pair_blocked_without_damage(&fixture, "remote_transport_failed").await;
 }
 
+// Fault cases share a process environment in the broad E2E runner. Scope the
+// injected command failure to one bridge and keep simultaneous fault cases
+// from overwriting each other's setting.
+struct TestInspectionFault {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl TestInspectionFault {
+    async fn new(kind: &str, bridge: &Path) -> Self {
+        static FAULT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let guard = FAULT_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+        std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", format!("{}|{}", kind, bridge.display()));
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for TestInspectionFault {
+    fn drop(&mut self) {
+        std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r16_auth_denial_is_distinct_from_transport() {
     let fixture = QualifiedPair::new().await;
-    std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", "remote_auth");
     let before = fixture.snapshot().await;
+    let _fault = TestInspectionFault::new("remote_auth", &fixture.bridge).await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_auth_failed"),
         "synthetic auth denial must be distinct from transport: {result:?}");
     assert_eq!(fixture.snapshot().await, before);
@@ -843,10 +864,9 @@ async fn candidate_r16_auth_denial_is_distinct_from_transport() {
 async fn candidate_r16_fetch_failure_does_not_use_stale_ref() {
     let fixture = QualifiedPair::new().await;
     git_cli(&fixture.bridge, &["fetch", "origin", "main"]);
-    std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", "remote_fetch");
     let before = fixture.snapshot().await;
+    let _fault = TestInspectionFault::new("remote_fetch", &fixture.bridge).await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_fetch_failed"),
         "failed fresh fetch must not use stale tracking ref: {result:?}");
     assert_eq!(fixture.snapshot().await, before);
@@ -892,10 +912,9 @@ async fn candidate_r10_shallow_history_blocks() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_ancestry_command_error_is_not_rewrite() {
     let fixture = QualifiedPair::new().await;
-    std::env::set_var("REPOSYNC_TEST_INSPECTION_FAULT", "ancestry_exit_128");
     let before = fixture.snapshot().await;
+    let _fault = TestInspectionFault::new("ancestry_exit_128", &fixture.bridge).await;
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ancestry_command_failed"),
         "git command error must be unknown, not a valid negative ancestry: {result:?}");
     assert_eq!(fixture.snapshot().await, before);
