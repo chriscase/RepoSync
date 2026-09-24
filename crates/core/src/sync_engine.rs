@@ -461,7 +461,7 @@ impl SyncEngine {
             }
             if let Some(ref emitted_tip) = column {
                 if kv.is_none() {
-                    let (emitted, last_handled): (i64, Option<String>) = {
+                    let (emitted, last_handled, first_emitted): (i64, Option<String>, Option<String>) = {
                         let conn = self.db.conn();
                         let emitted = conn.query_row(
                             "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
@@ -471,10 +471,19 @@ impl SyncEngine {
                             "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
                             [rid], |row| row.get(0),
                         ).optional().map_err(crate::errors::DatabaseError::from)?;
-                        (emitted, last_handled)
+                        let first_emitted = conn.query_row(
+                            "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND status = 'applied' ORDER BY rowid ASC LIMIT 1",
+                            [rid], |row| row.get(0),
+                        ).optional().map_err(crate::errors::DatabaseError::from)?;
+                        (emitted, last_handled, first_emitted)
                     };
                     if emitted > 0 {
-                        if let Some(handled) = last_handled {
+                        // With no Git->SVN mapping, the first SVN-origin
+                        // mapping is the only proven handled Git baseline.
+                        // A later SVN publication may have landed on top of
+                        // pending Git work just before an apply failure, so
+                        // the latest emitted tip is not an inbound cursor.
+                        if let Some(handled) = last_handled.or(first_emitted) {
                             if !is_full_git_oid(&handled) || !is_full_git_oid(emitted_tip) {
                                 return Err(self.record_history_block(
                                     "ambiguous_checkpoint", "mapped legacy cursor is malformed",
@@ -497,9 +506,10 @@ impl SyncEngine {
                                 )),
                             }
                         }
-                        // An SVN-origin first import has no handled Git
-                        // mapping yet. Its own mapped tip is the initial P.
-                        return Ok(column);
+                        return Err(self.record_history_block(
+                            "ambiguous_checkpoint", "emitted tip has no proven handled Git baseline",
+                            None, None, None, Some(emitted_tip),
+                        ));
                     }
                 }
             }
@@ -1040,8 +1050,8 @@ impl SyncEngine {
                         .map_err(SyncError::DatabaseError)?;
                 }
                 self.db.insert_audit_log_with_repo(
-                    "svn_to_git_metadata_only", Some("svn_to_git"), Some(change.revision),
-                    None, Some(&change.author), Some("No target file delta; SVN metadata only"),
+                    "svn_to_git_no_target", Some("svn_to_git"), Some(change.revision),
+                    None, Some(&change.author), Some("No file-content delta under active SVN path"),
                     true, self.effective_repo_id(),
                 ).map_err(SyncError::DatabaseError)?;
                 continue;

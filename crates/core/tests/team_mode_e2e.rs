@@ -1294,6 +1294,8 @@ impl Drop for TestApplyFault {
 
 async fn run_failed_apply_barrier(retry: bool) {
     let fixture = QualifiedPair::new().await;
+    let pending_git = fixture.developer_commit("config", "pending outgoing\n", "Pending outgoing Git");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
     let before = fixture.snapshot().await;
     let verified = svn_commit_file(&fixture.wc, "origin.txt", "verified N-1\n", "Verified prior revision");
     let failed = svn_commit_file(&fixture.wc, "origin.txt", "failed N\n", "Faulted revision");
@@ -1311,6 +1313,7 @@ async fn run_failed_apply_barrier(retry: bool) {
     assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "verified N-1\n");
     assert_eq!(frontier.remote_sha, frontier.bridge_sha);
     assert_eq!(frontier.remote_tree, frontier.bridge_tree);
+    assert!(frontier.bridge_status.is_empty(), "failed git apply left bridge dirty");
     assert_eq!(frontier.mapping_count, before.mapping_count + 1);
     assert_eq!(frontier.repo_sync_count, before.repo_sync_count + 1);
     for revision in [failed, later] {
@@ -1319,6 +1322,10 @@ async fn run_failed_apply_barrier(retry: bool) {
             [revision], |row| row.get(0)).unwrap();
         assert_eq!(count, 0, "unapplied r{revision} must have no successful mapping");
     }
+    let outgoing_at_barrier: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+        [&pending_git], |row| row.get(0)).unwrap();
+    assert_eq!(outgoing_at_barrier, 0, "outgoing Git must wait behind failed incoming SVN");
     let verified_sha = frontier.bridge_sha.clone();
     assert_eq!(git_output(&fixture.bridge, &["show", &format!("{verified_sha}:origin.txt")]), "verified N-1");
     eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
@@ -1326,18 +1333,27 @@ async fn run_failed_apply_barrier(retry: bool) {
         "frontier_revision":verified, "failed_revision":failed,
         "queued_revision":later, "frontier_git":verified_sha,
         "frontier_tree":frontier.bridge_tree, "remote_tree":frontier.remote_tree,
+        "frontier_index_sha256":hex::encode(sha2::Sha256::digest(&frontier.bridge_index)),
+        "frontier_status":frontier.bridge_status,
         "mapping_before":before.mapping_count, "mapping_at_frontier":frontier.mapping_count,
         "success_before":before.repo_sync_count, "success_at_frontier":frontier.repo_sync_count,
+        "pending_git":pending_git, "outgoing_mapping_at_barrier":outgoing_at_barrier,
         "fault":"debug-only exact-revision invalid patch to real git apply"
     }));
     if !retry { return; }
 
     let applied = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 0));
+    assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 1));
     let after = fixture.snapshot().await;
     assert_eq!(after.watermark.0, later);
-    assert_eq!(after.mapping_count, frontier.mapping_count + 2);
-    assert_eq!(after.repo_sync_count, frontier.repo_sync_count + 2);
+    assert_eq!(after.mapping_count, frontier.mapping_count + 3);
+    assert_eq!(after.repo_sync_count, frontier.repo_sync_count + 3);
+    assert_eq!(after.svn_rev, later + 1);
+    assert_eq!(std::fs::read_to_string(fixture.bridge.join("config")).unwrap(), "pending outgoing\n");
+    let outgoing_mapped: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+        [&pending_git], |row| row.get(0)).unwrap();
+    assert_eq!(outgoing_mapped, 1);
     assert_eq!(after.remote_sha, after.bridge_sha);
     assert_eq!(after.remote_tree, after.bridge_tree);
     assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "queued N+1\n");
@@ -1354,7 +1370,8 @@ async fn run_failed_apply_barrier(retry: bool) {
         "case":"R01_FAILED_APPLY_RETRY", "frontier_git":verified_sha,
         "final_git":after.bridge_sha, "final_tree":after.bridge_tree,
         "watermark":after.watermark, "mapping_after":after.mapping_count,
-        "success_after":after.repo_sync_count, "repeat_noop":true
+        "success_after":after.repo_sync_count, "outgoing_mapping":outgoing_mapped,
+        "repeat_noop":true
     }));
 }
 
@@ -1387,7 +1404,7 @@ async fn candidate_r01_property_only_revision_has_explicit_no_target_checkpoint(
     assert_eq!(after.mapping_count, before.mapping_count);
     assert_eq!(after.repo_sync_count, before.repo_sync_count);
     let recorded: i64 = fixture.engine.db().conn().query_row(
-        "SELECT COUNT(*) FROM audit_log WHERE repo_id = 'pair' AND action = 'svn_to_git_metadata_only' AND svn_rev = ?1 AND success = 1",
+        "SELECT COUNT(*) FROM audit_log WHERE repo_id = 'pair' AND action = 'svn_to_git_no_target' AND svn_rev = ?1 AND success = 1",
         [revision], |row| row.get(0)).unwrap();
     assert_eq!(recorded, 1);
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
