@@ -3213,3 +3213,200 @@ async fn test_team_mode_forced_failure_persists_audit_entry() {
         "sync_state should be 'error' after failed cycle"
     );
 }
+
+// Review 5: receipt policy must be checked before admitting any cursor shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("handled.txt", "ordinary baseline\n", "Establish applied outbound cursor");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    pair.engine.set_path_rules(vec!["allow".into()], vec![]);
+    let filtered = pair.developer_commit("blocked.txt", "filtered content\n", "Nonempty filtered Git commit");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, filtered);
+    assert_eq!(pair.engine.db().get_state("last_git_sha_pair").unwrap(), Some(filtered.clone()));
+    let receipt_key = format!("handled_git_no_target_pair_{filtered}");
+    let receipt: serde_json::Value = serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
+    assert_eq!(receipt["outcome"], "filtered");
+    let before = pair.snapshot().await;
+    let db = Database::new(&pair.db_path).unwrap();
+    let mut changed = SyncEngine::new(pair.engine.config().clone(), db,
+        SvnClient::new(&pair.svn_url, "", ""), GitClient::new(&pair.bridge).unwrap(),
+        Arc::new(make_identity_mapper()));
+    changed.set_repo_id("pair".into());
+    changed.set_path_rules(vec!["blocked".into()], vec![]);
+    assert!(matches!(changed.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
+    assert_eq!(pair.snapshot().await, before);
+    drop(changed);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    let allowed = pair.developer_commit("allow.txt", "ordinary work\n", "Ordinary work under unchanged policy");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, allowed);
+    let svn_rev = SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev;
+    let tree = svn_tree(&pair, svn_rev).await;
+    assert_eq!(tree.get("allow.txt"), Some(&b"ordinary work\n".to_vec()));
+    assert!(!tree.contains_key("blocked.txt"));
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_POLICY_EQUAL_CURSOR", "filtered":filtered,
+        "receipt":receipt, "changed_policy_block":"receipt_policy_changed",
+        "prewrite_snapshot_preserved":true, "same_policy_successor":allowed,
+        "same_policy_applied_once":1, "svn_tree":tree_hashes(&tree)
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("handled.txt", "ordinary baseline\n", "Establish applied outbound cursor");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    pair.engine.set_path_rules(vec!["allow".into()], vec![]);
+    let filtered = pair.developer_commit("blocked.txt", "filtered content\n", "Filtered before SVN publication");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    let svn_rev = svn_commit_file(&pair.wc, "origin.txt", "SVN after filtered Git\n", "Incoming after filtered Git");
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_ne!(pair.engine.db().get_repo_watermark("pair").unwrap().1, filtered);
+    assert_eq!(pair.engine.db().get_state("last_git_sha_pair").unwrap(), Some(filtered.clone()));
+    let before = pair.snapshot().await;
+    let db = Database::new(&pair.db_path).unwrap();
+    let mut changed = SyncEngine::new(pair.engine.config().clone(), db,
+        SvnClient::new(&pair.svn_url, "", ""), GitClient::new(&pair.bridge).unwrap(),
+        Arc::new(make_identity_mapper()));
+    changed.set_repo_id("pair".into());
+    changed.set_path_rules(vec!["blocked".into()], vec![]);
+    assert!(matches!(changed.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
+    assert_eq!(pair.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_POLICY_SPLIT_CURSOR", "filtered":filtered,
+        "svn_revision":svn_rev, "emitted":before.watermark.1,
+        "kv":before.kv_cursor, "changed_policy_block":"receipt_policy_changed",
+        "prewrite_snapshot_preserved":true
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_policy_kv_only_filtered_commit_rejected() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("handled.txt", "ordinary baseline\n", "Establish applied outbound cursor");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    pair.engine.set_path_rules(vec!["allow".into()], vec![]);
+    let filtered = pair.developer_commit("blocked.txt", "filtered content\n", "Filtered before KV-only overlay");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    // Explicit synthetic legacy overlay: the pinned old generator does not
+    // create this absent-column shape.
+    pair.engine.db().conn().execute("UPDATE repositories SET last_git_sha = '' WHERE id = 'pair'", []).unwrap();
+    assert_eq!(pair.engine.db().get_state("last_git_sha_pair").unwrap(), Some(filtered.clone()));
+    let before = pair.snapshot().await;
+    let db = Database::new(&pair.db_path).unwrap();
+    let mut changed = SyncEngine::new(pair.engine.config().clone(), db,
+        SvnClient::new(&pair.svn_url, "", ""), GitClient::new(&pair.bridge).unwrap(),
+        Arc::new(make_identity_mapper()));
+    changed.set_repo_id("pair".into());
+    changed.set_path_rules(vec!["blocked".into()], vec![]);
+    assert!(matches!(changed.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
+    assert_eq!(pair.snapshot().await, before);
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_POLICY_KV_ONLY", "filtered":filtered,
+        "synthetic_column_absent":true, "kv":before.kv_cursor,
+        "changed_policy_block":"receipt_policy_changed", "prewrite_snapshot_preserved":true
+    }));
+}
+
+struct TestOutboundFault(&'static str);
+impl TestOutboundFault {
+    fn new(kind: &'static str, sha: &str, bridge: &Path) -> Self {
+        let name = match kind { "read" => "REPOSYNC_TEST_GIT_CONTENT_FAULT", "stage" => "REPOSYNC_TEST_SVN_STAGE_FAULT", _ => panic!("unknown fault") };
+        std::env::set_var(name, format!("{}|{}", sha, bridge.display()));
+        Self(name)
+    }
+}
+impl Drop for TestOutboundFault {
+    fn drop(&mut self) { std::env::remove_var(self.0); }
+}
+
+async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str) {
+    let pair = QualifiedPair::new().await;
+    let first = pair.developer_commit("fault.txt", "must not vanish\n", "First queued Git change");
+    let second = pair.developer_commit("later.txt", "later work\n", "Second queued Git change");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    let fault = TestOutboundFault::new(kind, &first, &pair.bridge);
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(result.is_err(), "{kind} fault was incorrectly treated as no-target proof");
+    drop(fault);
+    assert_eq!(pair.snapshot().await, before);
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, pair.imported_base);
+    for sha in [&first, &second] {
+        assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
+        let count: i64 = pair.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+            [sha], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+    let retry = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(retry.git_to_svn_count, 2);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, second);
+    for sha in [&first, &second] {
+        let count: i64 = pair.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+            [sha], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+    }
+    let rev = SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev;
+    let svn = svn_tree(&pair, rev).await;
+    assert_eq!(svn, tracked_tree(&pair.bridge));
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":case, "fault":kind, "first":first, "queued_successor":second,
+        "failed_without_receipt_or_advance":true, "retry_applied_each_once":true,
+        "final_svn_revision":rev, "final_svn_tree":tree_hashes(&svn),
+        "final_git_tree":tree_hashes(&tracked_tree(&pair.bridge))
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_no_target_read_failure_preserves_pending_successor() {
+    assert_outbound_fault_stops_and_retries("read", "R01_NO_TARGET_READ_FAILURE").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_no_target_stage_failure_preserves_pending_successor() {
+    assert_outbound_fault_stops_and_retries("stage", "R01_NO_TARGET_STAGE_FAILURE").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_nonempty_already_represented_delta_is_verified() {
+    let pair = QualifiedPair::new().await;
+    let rev = SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev;
+    git_cli(&pair.developer, &["update-index", "--chmod=+x", "origin.txt"]);
+    git_cli(&pair.developer, &["commit", "-m", "Git mode-only delta with represented content"]);
+    let mode_sha = get_head_sha(&pair.developer);
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let cycle = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((cycle.svn_to_git_count, cycle.git_to_svn_count), (0, 0));
+    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, rev);
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, mode_sha);
+    let receipt: serde_json::Value = serde_json::from_str(&pair.engine.db().get_state(
+        &format!("handled_git_no_target_pair_{mode_sha}")).unwrap().unwrap()).unwrap();
+    assert_eq!(receipt["outcome"], "no_svn_delta");
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["target_svn_rev"], rev);
+    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    let svn = svn_tree(&pair, rev).await;
+    assert_eq!(svn, tracked_tree(&pair.bridge));
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_VERIFIED_NO_DELTA", "source_commit":mode_sha,
+        "receipt":receipt, "pinned_svn_revision":rev,
+        "full_target_tree":tree_hashes(&svn), "full_git_tree":tree_hashes(&tracked_tree(&pair.bridge))
+    }));
+}

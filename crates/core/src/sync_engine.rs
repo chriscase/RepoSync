@@ -1424,7 +1424,18 @@ impl SyncEngine {
                     .map(|f| {
                         let (action, path) = (&f.action, &f.path);
                         let content = if action != "D" {
-                            git.get_file_content_at_commit(&change.sha, path)
+                            #[cfg(debug_assertions)]
+                            let fault = std::env::var("REPOSYNC_TEST_GIT_CONTENT_FAULT").ok()
+                                .is_some_and(|value| value == format!("{}|{}", change.sha, git.repo_path().display()));
+                            #[cfg(debug_assertions)]
+                            let read = if fault {
+                                Err(crate::errors::GitError::RefNotFound(path.clone()))
+                            } else {
+                                git.get_file_content_at_commit(&change.sha, path)
+                            };
+                            #[cfg(not(debug_assertions))]
+                            let read = git.get_file_content_at_commit(&change.sha, path);
+                            read
                                 .ok()
                                 .flatten()
                         } else {
@@ -1618,6 +1629,12 @@ impl SyncEngine {
 
                 // Now add the actual files — parents are guaranteed registered.
                 for file in &added_files {
+                    #[cfg(debug_assertions)]
+                    let fault = std::env::var("REPOSYNC_TEST_SVN_STAGE_FAULT").ok()
+                        .is_some_and(|value| value == format!("{}|{}", change.sha,
+                            self.git_client.lock().unwrap_or_else(|p| p.into_inner()).repo_path().display()));
+                    #[cfg(debug_assertions)]
+                    if fault { continue; }
                     let _ = svn.run_svn_in_dir_public(
                         svn_wc_dir.path(),
                         &["add", "--force", file],
