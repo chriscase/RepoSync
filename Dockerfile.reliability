@@ -8,14 +8,17 @@ COPY Cargo.toml ./
 COPY crates ./crates
 COPY docs/reliability/fixtures/Cargo.lock ./Cargo.lock
 COPY scripts/reliability-prep.py /usr/local/bin/reliability-prep
-RUN cargo test --workspace --no-run --locked --message-format=json \
-    > /tmp/cargo-preparation.jsonl && \
+ARG RELIABILITY_INCLUDE_OLD=1
+RUN if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
+      cargo test --workspace --no-run --locked --features reposync-core/reliability-fixture --message-format=json > /tmp/cargo-preparation.jsonl; \
+    else \
+      cargo test --workspace --no-run --locked --message-format=json > /tmp/cargo-preparation.jsonl; \
+    fi && \
     python3 /usr/local/bin/reliability-prep /tmp/cargo-preparation.jsonl /opt/reliability-tests && \
     rustc --version > /opt/reliability-tests/build-toolchain.txt && \
     cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
 COPY legacy-old /old-src
-ARG RELIABILITY_INCLUDE_OLD=1
 RUN mkdir -p /opt/reliability-old-tests && \
     if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cd /old-src && cargo test -p reposync-web --test legacy_import_generator --no-run --locked --message-format=json \

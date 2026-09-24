@@ -222,6 +222,7 @@ fn exported_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     files
 }
 
+#[cfg(feature = "reliability-fixture")]
 fn copy_install_tree(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
@@ -1182,6 +1183,7 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
     }));
 }
 
+#[cfg(feature = "reliability-fixture")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     let tmp = TempDir::new().unwrap();
