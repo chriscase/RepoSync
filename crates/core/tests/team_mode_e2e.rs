@@ -3437,3 +3437,192 @@ async fn candidate_r01_nonempty_already_represented_delta_is_verified() {
         "full_target_tree":tree_hashes(&svn), "full_git_tree":tree_hashes(&tracked_tree(&pair.bridge))
     }));
 }
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
+    let tmp = TempDir::new().unwrap();
+    assert_fixture_owned(tmp.path());
+    let old_root = tmp.path().join("pinned-old-topology");
+    let generator = std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
+    let generation = Command::new(&generator)
+        .args(["generate_legacy_topology", "--exact", "--nocapture", "--test-threads=1"])
+        .env("REPOSYNC_OLD_TOPOLOGY_DIR", &old_root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture Developer")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture Developer")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output().unwrap();
+    assert!(generation.status.success(), "pinned old topology: {} {}",
+        String::from_utf8_lossy(&generation.stdout), String::from_utf8_lossy(&generation.stderr));
+    let old_evidence = String::from_utf8_lossy(&generation.stderr).lines()
+        .find_map(|line| line.strip_prefix("OLD_TOPOLOGY_EVIDENCE "))
+        .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
+        .expect("old production topology evidence missing");
+    assert_eq!(old_evidence["pair"]["svn_rev"], 2);
+    assert_eq!(old_evidence["pair_two"]["svn_rev"], 2);
+    assert_ne!(old_evidence["pair"]["git_sha"], old_evidence["pair_two"]["git_sha"]);
+    assert_eq!(old_evidence["disabled"]["enabled"], false);
+    let original = old_root.join("install");
+    let copy = tmp.path().join("quiesced-copy");
+    copy_install_tree(&original, &copy);
+    assert_eq!(tree_hashes(&exported_tree(&original)), tree_hashes(&exported_tree(&copy)));
+    let inventory_script = std::env::var("REPOSYNC_INVENTORY_SCRIPT")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reliability-inventory.py").to_string());
+    let python_bin = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join("python3")).find(|path| path.is_file())
+        .expect("fixture Python interpreter");
+    let python = |args: &[&str]| {
+        Command::new(&python_bin).arg(&inventory_script).args(args)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PATH", "/nonexistent")
+            .output().unwrap()
+    };
+    let seal_output = python(&["--seal-copy", copy.to_str().unwrap()]);
+    assert!(seal_output.status.success(), "seal: {}", String::from_utf8_lossy(&seal_output.stderr));
+    let seal_path = tmp.path().join("seal.json");
+    std::fs::write(&seal_path, &seal_output.stdout).unwrap();
+    let report_output = python(&["--copy", copy.to_str().unwrap(), "--manifest", seal_path.to_str().unwrap()]);
+    assert!(report_output.status.success(), "inventory: {}", String::from_utf8_lossy(&report_output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&report_output.stdout).unwrap();
+    let repositories = report["repositories"].as_array().unwrap();
+    assert_eq!(repositories.len(), 3);
+    for (id, classification) in [
+        ("pair", "qualified_fixture_shape"),
+        ("pair_two", "qualified_fixture_shape"),
+        ("pair_disabled", "not_qualified"),
+    ] {
+        let row = repositories.iter().find(|row| row["id"] == id).unwrap();
+        assert_eq!(row["classification"], classification);
+        assert_eq!(row["source"]["svn_uuid"], "UNKNOWN_LOCAL_ONLY");
+        assert_eq!(row["credentials"]["repo_svn_secret_present"], true);
+        assert_eq!(row["credentials"]["repo_git_secret_present"], true);
+        if id != "pair_disabled" {
+            assert_eq!(row["checkpoints"]["repository_svn_revision"], 2);
+            assert_eq!(row["checkpoints"]["scoped_git_kv"], row["checkpoints"]["repository_git_column"]);
+            assert_eq!(row["target"]["local_ref"], row["checkpoints"]["repository_git_column"]);
+            assert!(row["applied_mappings"].as_array().unwrap().iter().any(|entry|
+                entry["svn_rev"] == 2 && entry["git_sha"] == row["checkpoints"]["repository_git_column"]));
+        }
+    }
+    let report_text = String::from_utf8(report_output.stdout.clone()).unwrap();
+    for secret in ["synthetic-svn-pair", "synthetic-git-pair", "synthetic-svn-pair_two",
+                   "synthetic-git-pair_two", "synthetic-svn-pair_disabled", "synthetic-git-pair_disabled"] {
+        assert!(!report_text.contains(secret), "inventory leaked a synthetic credential");
+    }
+    let repeated = python(&["--copy", copy.to_str().unwrap(), "--manifest", seal_path.to_str().unwrap()]);
+    assert!(repeated.status.success());
+    assert_eq!(repeated.stdout, report_output.stdout, "inventory is not deterministic");
+    let after_seal = python(&["--seal-copy", copy.to_str().unwrap()]);
+    assert_eq!(after_seal.stdout, seal_output.stdout, "input hashes or permissions changed");
+    assert_eq!(tree_hashes(&exported_tree(&original)), tree_hashes(&exported_tree(&copy)));
+
+    // These are explicit synthetic fault overlays, not states claimed to have
+    // been emitted by unchanged old production code.
+    let degraded = tmp.path().join("synthetic-pruned-overlay");
+    copy_install_tree(&original, &degraded);
+    {
+        let db = rusqlite::Connection::open(degraded.join("reposync.db")).unwrap();
+        assert_eq!(db.execute("DELETE FROM sync_records WHERE repo_id = 'pair' AND svn_rev = 2 AND direction = 'svn_to_git'", []).unwrap(), 1);
+    }
+    let degraded_seal = python(&["--seal-copy", degraded.to_str().unwrap()]);
+    assert!(degraded_seal.status.success());
+    let degraded_manifest = tmp.path().join("pruned-seal.json");
+    std::fs::write(&degraded_manifest, degraded_seal.stdout).unwrap();
+    let degraded_report = python(&["--copy", degraded.to_str().unwrap(), "--manifest", degraded_manifest.to_str().unwrap()]);
+    assert!(degraded_report.status.success());
+    let degraded_json: serde_json::Value = serde_json::from_slice(&degraded_report.stdout).unwrap();
+    assert_eq!(degraded_json["repositories"][0]["classification"], "needs_reconciliation");
+
+    let missing_receipt = tmp.path().join("synthetic-missing-receipt-overlay");
+    copy_install_tree(&original, &missing_receipt);
+    let synthetic_cursor = "a".repeat(40);
+    {
+        let db = rusqlite::Connection::open(missing_receipt.join("reposync.db")).unwrap();
+        db.execute("UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'", [&synthetic_cursor]).unwrap();
+        db.execute("UPDATE kv_state SET value = ?1 WHERE key = 'last_git_sha_pair'", [&synthetic_cursor]).unwrap();
+    }
+    let missing_seal = python(&["--seal-copy", missing_receipt.to_str().unwrap()]);
+    assert!(missing_seal.status.success());
+    let missing_manifest = tmp.path().join("missing-seal.json");
+    std::fs::write(&missing_manifest, missing_seal.stdout).unwrap();
+    let missing_report = python(&["--copy", missing_receipt.to_str().unwrap(), "--manifest", missing_manifest.to_str().unwrap()]);
+    assert!(missing_report.status.success());
+    let missing_json: serde_json::Value = serde_json::from_slice(&missing_report.stdout).unwrap();
+    assert_eq!(missing_json["repositories"][0]["classification"], "needs_reconciliation");
+    assert!(missing_json["repositories"][0]["missing_proof"].as_array().unwrap().iter()
+        .any(|entry| entry == "no_target_receipt_or_applied_mapping_missing"));
+
+    let unverified_receipt = tmp.path().join("synthetic-v1-receipt-overlay");
+    copy_install_tree(&original, &unverified_receipt);
+    {
+        let db = rusqlite::Connection::open(unverified_receipt.join("reposync.db")).unwrap();
+        let sha = old_evidence["pair"]["git_sha"].as_str().unwrap();
+        let value = serde_json::json!({"version":1,"repo_id":"pair","git_sha":sha,
+            "outcome":"no_svn_delta","projection":"{\"allowed_paths\":[],\"blocked_patterns\":[]}"});
+        db.execute("INSERT INTO kv_state (key,value,updated_at) VALUES (?1,?2,'')",
+            rusqlite::params![format!("handled_git_no_target_pair_{sha}"), value.to_string()]).unwrap();
+    }
+    let receipt_seal = python(&["--seal-copy", unverified_receipt.to_str().unwrap()]);
+    assert!(receipt_seal.status.success());
+    let receipt_manifest = tmp.path().join("receipt-seal.json");
+    std::fs::write(&receipt_manifest, receipt_seal.stdout).unwrap();
+    let receipt_report = python(&["--copy", unverified_receipt.to_str().unwrap(), "--manifest", receipt_manifest.to_str().unwrap()]);
+    assert!(receipt_report.status.success());
+    let receipt_json: serde_json::Value = serde_json::from_slice(&receipt_report.stdout).unwrap();
+    assert_eq!(receipt_json["repositories"][0]["classification"], "needs_reconciliation");
+    assert_eq!(receipt_json["repositories"][0]["no_target_receipts"][0]["target_proof_present"], false);
+
+    let unknown = tmp.path().join("synthetic-effect-unknown-overlay");
+    copy_install_tree(&original, &unknown);
+    {
+        let db = rusqlite::Connection::open(unknown.join("reposync.db")).unwrap();
+        db.execute("INSERT INTO kv_state (key,value,updated_at) VALUES ('effect_unknown_pair','synthetic-test-only','')", []).unwrap();
+    }
+    let unknown_seal = python(&["--seal-copy", unknown.to_str().unwrap()]);
+    assert!(unknown_seal.status.success());
+    let unknown_manifest = tmp.path().join("unknown-seal.json");
+    std::fs::write(&unknown_manifest, unknown_seal.stdout).unwrap();
+    let unknown_report = python(&["--copy", unknown.to_str().unwrap(), "--manifest", unknown_manifest.to_str().unwrap()]);
+    assert!(unknown_report.status.success());
+    let unknown_json: serde_json::Value = serde_json::from_slice(&unknown_report.stdout).unwrap();
+    assert_eq!(unknown_json["repositories"][0]["classification"], "external_effect_unknown");
+
+    let wal_copy = tmp.path().join("synthetic-incomplete-wal-overlay");
+    copy_install_tree(&original, &wal_copy);
+    std::fs::write(wal_copy.join("reposync.db-wal"), b"synthetic incomplete WAL").unwrap();
+    assert!(!python(&["--seal-copy", wal_copy.to_str().unwrap()]).status.success());
+    let wrong_schema = tmp.path().join("synthetic-future-schema-overlay");
+    copy_install_tree(&original, &wrong_schema);
+    {
+        let db = rusqlite::Connection::open(wrong_schema.join("reposync.db")).unwrap();
+        db.execute_batch("PRAGMA user_version = 13").unwrap();
+    }
+    let wrong_seal = python(&["--seal-copy", wrong_schema.to_str().unwrap()]);
+    assert!(wrong_seal.status.success());
+    let wrong_manifest = tmp.path().join("wrong-seal.json");
+    std::fs::write(&wrong_manifest, wrong_seal.stdout).unwrap();
+    assert!(!python(&["--copy", wrong_schema.to_str().unwrap(), "--manifest", wrong_manifest.to_str().unwrap()]).status.success());
+
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R10_PINNED_OLD_TOPOLOGY_INVENTORY", "old_generation":old_evidence,
+        "old_generator_sha256":hex::encode(sha2::Sha256::digest(std::fs::read(&generator).unwrap())),
+        "original_copy_file_count":report["file_count"],
+        "input_hashes_and_permissions_unchanged":true,
+        "repeated_report_equal":true, "no_git_or_svn_cli_on_inventory_path":true,
+        "credential_values_redacted":true,
+        "classifications":repositories.iter().map(|row| serde_json::json!({
+            "id":row["id"], "classification":row["classification"],
+            "svn_revision":row["checkpoints"]["repository_svn_revision"],
+            "mapped_rows":row["applied_mappings"].as_array().unwrap().len()
+        })).collect::<Vec<_>>(),
+        "synthetic_pruned_reconciliation":true,
+        "synthetic_missing_receipt_reconciliation":true,
+        "synthetic_v1_unverified_receipt_reconciliation":true,
+        "synthetic_external_effect_unknown":true,
+        "incomplete_wal_refused":true, "future_schema_refused":true,
+        "production_eligibility":"NOT_ESTABLISHED"
+    }));
+}

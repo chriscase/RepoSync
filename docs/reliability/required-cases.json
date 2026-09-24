@@ -48,6 +48,7 @@
     {"id": "R10_POLICY_KV_ONLY", "binary": "team_mode_e2e", "test": "candidate_r10_policy_kv_only_filtered_commit_rejected", "tier": "candidate_regression"},
     {"id": "R01_NO_TARGET_READ_FAILURE", "binary": "team_mode_e2e", "test": "candidate_r01_no_target_read_failure_preserves_pending_successor", "tier": "candidate_regression"},
     {"id": "R01_NO_TARGET_STAGE_FAILURE", "binary": "team_mode_e2e", "test": "candidate_r01_no_target_stage_failure_preserves_pending_successor", "tier": "candidate_regression"},
-    {"id": "R01_VERIFIED_NO_DELTA", "binary": "team_mode_e2e", "test": "candidate_r01_nonempty_already_represented_delta_is_verified", "tier": "candidate_regression"}
+    {"id": "R01_VERIFIED_NO_DELTA", "binary": "team_mode_e2e", "test": "candidate_r01_nonempty_already_represented_delta_is_verified", "tier": "candidate_regression"},
+    {"id": "R10_PINNED_OLD_TOPOLOGY_INVENTORY", "binary": "team_mode_e2e", "test": "candidate_r10_pinned_old_topology_read_safe_inventory", "tier": "candidate_regression"}
   ]
 }

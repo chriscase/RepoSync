@@ -37,6 +37,11 @@ MANDATORY["candidate"].update({
     "R10_PRIOR_PRUNED_BASELINE",
 })
 MANDATORY["candidate"].update({
+    "R10_POLICY_EQUAL_CURSOR", "R10_POLICY_SPLIT_CURSOR", "R10_POLICY_KV_ONLY",
+    "R01_NO_TARGET_READ_FAILURE", "R01_NO_TARGET_STAGE_FAILURE",
+    "R01_VERIFIED_NO_DELTA", "R10_PINNED_OLD_TOPOLOGY_INVENTORY",
+})
+MANDATORY["candidate"].update({
     "R01_FAILED_APPLY_BARRIER", "R01_FAILED_APPLY_RETRY",
     "R01_METADATA_ONLY", "R19_UNTOUCHED_TREE", "R19_EXPLICIT_DELETE",
 })
@@ -318,6 +323,7 @@ def main():
     old_generator = old_tests / old_binaries["legacy_import_generator"]
     assert old_generator.is_file(), "pinned old import generator missing"
     os.environ["REPOSYNC_OLD_GENERATOR"] = str(old_generator)
+    os.environ["REPOSYNC_INVENTORY_SCRIPT"] = "/usr/local/bin/reliability-inventory.py"
     (OUTPUT / "old-generator-provenance.json").write_text(json.dumps({
         "old_code_sha": "87379741779a6259f7eeb52a68cc6f061174e5ef",
         "generator_sha256": digest(old_generator.read_bytes()),
