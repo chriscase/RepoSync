@@ -1,5 +1,6 @@
 FROM rust:1.98.1-bookworm AS build
 ENV CARGO_BUILD_JOBS=2
+ENV CARGO_TARGET_DIR=/src/target
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git subversion pkg-config libssl-dev python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /src

@@ -53,6 +53,41 @@ Fresh inspection distinguishes an absent branch, transport/auth failure, missing
 
 This gate contains unsafe replay but does not prove full SVN-origin lineage, distributed atomicity, exclusive ownership against another writer, or recovery after a partial external effect. Those remain #63/#64/#66 follow-up work. Never infer equivalence from a forged trailer, timestamp, short SHA, patch ID or equal-looking final tree. Normal SVN merges append revisions and mergeinfo; deletion/recreation or changed UUID/copy origin is a separate identity event. When proof is incomplete, preserve both histories and require reconciliation.
 
+## Review 4: pinned old import, checkpoint authority and retention (#63/#64)
+
+The fixture generator in `scripts/legacy_import_generator.rs` is a test-only driver compiled against original production crates at `87379741779a6259f7eeb52a68cc6f061174e5ef`. It calls the unchanged per-repository import route, `run_full_import` and that route's completion writer. The only source overlay is the driver. A synthetic empty Git root is created so the original route can clone its configured `main` branch; SVN revisions imported by production code follow that root and carry the actual SVN→Git mappings. The old writer exits before the candidate opens a copy of its installation. This qualifies that pinned source version and fixture, not the unknown deployed binary.
+
+The current-schema correction keeps three forms of handled Git evidence separate:
+
+- An applied, repository-scoped Git→SVN row proves an outbound Git commit was applied. Its SVN revision is the effect of that direction, not an incoming SVN frontier.
+- A repository-scoped SVN→Git applied row for the scoped KV cursor, at or before the repository SVN watermark, permits the old import completion cursor. The old completion writer sets both copies; a later SVN publication may update only the column. Full Git object IDs and handled→emitted ancestry are still required. The row alone never authorizes treating a later emitted tip as handled.
+- A versioned repository/SHA/projection receipt in `kv_state` marks an intentionally handled Git commit with no SVN target. The receipt is written in the same SQLite transaction as the two Git cursor copies and the legacy global copy. Empty commits, policy-filtered commits and verified no-SVN-delta outcomes have distinct reasons. A missing or malformed receipt does not become an applied SVN row. A policy change invalidates a filtered receipt until reconciled under that policy.
+
+For an absent KV cursor, the reader now requires a durable `handled_git_baseline_<repo>` receipt bound to a particular applied SVN→Git revision/SHA, repository and projection. A successful candidate SVN publication can create that receipt only when the pre-publication remote Git tip had no pending commits; an admitted old import with equal column/KV and a scoped applied mapping can also materialize it. It is never created from the first surviving `sync_records` row. The latest retained applied Git→SVN row, when present and descended from the baseline, can advance the handled frontier; otherwise the baseline remains the conservative frontier. Applied mapping rows remain correctness-critical and `run_maintenance(90)` prunes only old non-applied diagnostic rows. A preexisting installation whose baseline row/receipt was already pruned or cannot be verified blocks locally with `ambiguous_checkpoint`, leaving pending work and external tips intact. This is a reconciliation case, not an automatic upgrade or a checkpoint reset.
+
+### Next permanent #63 record and old-state disposition
+
+The next schema design should use `(repository_id, generation)` as the owner of a lineage. A generation must pin SVN UUID, root URL, branch-relative path, path incarnation/copy origin, verified baseline revision and projected tree; Git provider/repository identity, full ref and baseline object ID; and a projection/policy version. Directional handled and emitted frontiers are separate, with an explicit no-target outcome carrying source SHA/revision, reason, policy and verification. The current small receipts are compatibility proof, not a replacement for generation ownership.
+
+| Existing state | Proposed disposition before DDL |
+| --- | --- |
+| Pinned old import with equal scoped column/KV, applied mapping and verified SVN/Git identities | Materialize its baseline on the copy; preserve both cursor values and configuration. The fixture proves this shape. |
+| Applied outbound mapping, then SVN-emitted column / older KV | Preserve the KV handled frontier after repository mapping and ancestry checks; keep both directional meanings. |
+| Current no-target receipt with matching repository, full SHA and policy | Map to an explicit no-target outcome, never to an applied remote revision. |
+| Old no-target cursor lacking a receipt | Reconcile from actual policy, Git ancestry and SVN effect evidence; do not invent an applied row. |
+| Absent KV with verified durable baseline and retained applied rows | Keep the conservative baseline or later proved outbound frontier. Do not select the first retained diagnostic row. |
+| Absent KV with already-pruned baseline proof, conflicting copies, missing applied row, unknown Git ref or SVN identity | Read-safe `reconciliation_required` for that repository. Do not infer from row order, a message or final-tree equality. |
+| Disabled repository | Preserve disabled status, endpoint/configuration and credential ownership; no automatic poll. |
+| Several repositories or inherited credentials | Keep pair IDs and global/per-repository ownership separate; never borrow a global maximum. Verify each repository's source path and credential inheritance independently. |
+
+The current `import_progress` singleton is not sufficient repository-scoped authority. Import mappings and completion cursors must agree with the actual SVN UUID/path and Git ref before a later migration marks a generation proven. Existing fixtures do not establish all copy-origin and policy shapes. Coordinate #54's nullable mapping outcome and table rebuild before any migration DDL. A migration should quiesce one writer, reject future schema versions, create a consistent WAL-aware backup with configuration and encryption-key ownership, and apply version plus data changes in one SQLite transaction. Repeated startup must be idempotent, and only proven pairs leave read-safe mode. The present runner and import completion have separate writes; this pass does not claim them atomic.
+
+### #64 external-effect recovery contract
+
+For one concrete SVN commit, persist operation ID, pair generation, source Git SHA/parent/tree, target SVN UUID/path and pre-write revision/tree, projection and intended SVN effect **before** the commit call. If SVN accepts the commit but the reply or local checkpoint write fails, restart with the operation in `effect_unknown`. Re-read the exact SVN target and compare UUID/path, revision ancestry, changed paths/tree and a stable operation identity against the durable intent. A message trailer or matching final tree alone is insufficient. If the effect is uniquely verified, atomically write the applied mapping, directionally correct checkpoint and terminal result. If the effect is absent with a stable pre-write target, the worker may resume the planned write. If evidence is conflicting or unavailable, keep `reconciliation_required` and prohibit a blind retry. The same rule applies to a Git push whose reply or local persistence fails: inspect the pinned remote ref parent and exact pushed object before deciding whether another push is safe. Neither a DB rollback after a remote write nor reimport is recovery.
+
+The smallest next implementation slice is a read-only #63 inventory and generation-ownership migration proposal on additional pinned old shapes, followed by a separately reviewed transactional schema step coordinated with #54. The general #64 operation service, deployed-version qualification and active acceptance remain later gates.
+
 ## Later workflow admission (design only)
 
 - Snapshot import (#68): pin SVN UUID/path and revision R, verify exact projected tree at R and source history boundary, then record the import Git baseline and directional cursors only after remote publication verifies. SVN advancing after R remains pending. Default full-history import is untouched.
@@ -64,9 +99,11 @@ This gate contains unsafe replay but does not prove full SVN-origin lineage, dis
 | Tier | Baseline source | Phase 0 status | Missing proof |
 | --- | --- | --- | --- |
 | Current reviewed main | `87379741779a6259f7eeb52a68cc6f061174e5ef`, schema 12 | Source inspected; baseline diagnostics and bounded candidate engine subcases added | No migration implementation or complete scenario acceptance |
-| Synthetic legacy | Pinned old executable/schema fixture | NOT RUN | Version selection, generated state, upgrade and restore |
+| Synthetic legacy | Original code `8737974` import route and completion writer; candidate copy | PASS for this bounded fixture | Other historical code versions, policy/copy ancestry shapes and active installation inventory remain unqualified |
 | Actual deployed installation | Not established | NOT RUN | Version/schema inventory from Chris; no credentials needed in chat |
 | Local provider/API/UI | Disposable loopback provider | PARTIAL | R02 root DELETE and R03 route observation only; integrated SVN-origin pairing, real in-flight cancellation and browser navigation remain open |
 | Enterprise/active environment | #41 release gate | NOT AUTHORIZED | Candidate qualification and later explicit acceptance |
 
 The bounded pre-reset team-history gate implements the P/O/R/L inspection and blocks unsupported history before SVN fetch or bridge reset. Real-engine tests cover positive linear replay, directional cursor splits, missing-KV retry, ignored-path/index preservation and the named rejection cases. The bounded SVN apply correction stops at the first failed nonempty revision and leaves later SVN and outbound Git work pending; a content-only SVN diff justifies a separately audited no-target checkpoint. The delta application no longer deletes top-level content based on its absence from one revision's changed-path list. These are containment and content-safety corrections, not a lineage certificate, migration or durable recovery system. Complete #63/#64 schema/operation work and post-external-write reconciliation remain behind legacy inventory and separate qualification.
+
+Review 4 additionally exercises one pinned old production import, then idle/restart and ordinary changes in both directions on an installation copy. H01/H02 cases check a no-target Git receipt, both cursor shapes under actual maintenance, and a safe block when earlier baseline proof has already been lost. This is still a bounded fixture result; it does not establish the deployed version or authorize a schema migration.
