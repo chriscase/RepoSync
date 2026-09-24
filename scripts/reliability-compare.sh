@@ -20,10 +20,10 @@ from pathlib import Path
 import sys
 p = Path(sys.argv[1])
 source = p.read_text()
-needle = '            wc_path.to_str().unwrap(),\n            "--non-interactive",'
+needle = '            message,\n            wc_path.to_str().unwrap(),\n            "--non-interactive",'
 assert source.count(needle) == 1, 'reviewed-base fixture shape changed'
 p.write_text(source.replace(needle,
-    '            wc_path.to_str().unwrap(),\n            "--username",\n            "fixture",\n            "--non-interactive",'))
+    '            message,\n            wc_path.to_str().unwrap(),\n            "--username",\n            "fixture",\n            "--non-interactive",'))
 PY
 mkdir -p "$base_context/docs/reliability/fixtures"
 cp Dockerfile.reliability .dockerignore "$base_context/"
