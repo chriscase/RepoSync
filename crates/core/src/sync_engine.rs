@@ -18,6 +18,7 @@ use std::process::{Command, Output};
 use chrono::Utc;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AppConfig, SvnLayout};
@@ -413,6 +414,15 @@ impl SyncEngine {
                 .get_state(&format!("last_git_sha_{}", rid))
                 .map_err(SyncError::DatabaseError)?
                 .filter(|value| !value.is_empty());
+            // A no-target decision is authority for the handled frontier even
+            // when the old cursor copies happen to agree. Check every present
+            // copy before choosing between equal, split, or KV-only shapes.
+            if let Some(ref sha) = column {
+                self.checked_no_target_receipt(rid, sha)?;
+            }
+            let kv_no_target = if let Some(ref sha) = kv {
+                self.checked_no_target_receipt(rid, sha)?
+            } else { false };
             if column.is_some() && kv.is_some() && column != kv {
                 let (emitted, applied_outbound, svn_origin) = {
                     let conn = self.db.conn();
@@ -430,17 +440,6 @@ impl SyncEngine {
                     ).map_err(crate::errors::DatabaseError::from)?;
                     (emitted, applied_outbound, svn_origin)
                 };
-                let no_target = if let Some(ref handled_sha) = kv {
-                    let receipt = self.db.get_state(&format!("handled_git_no_target_{}_{}", rid, handled_sha))
-                        .map_err(SyncError::DatabaseError)?;
-                    receipt.and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                        .is_some_and(|record| {
-                            record["version"] == 1 && record["repo_id"] == rid &&
-                            record["git_sha"] == handled_sha.as_str() &&
-                            record["projection"] == self.no_target_projection() &&
-                            matches!(record["outcome"].as_str(), Some("empty_commit" | "filtered" | "no_svn_delta"))
-                        })
-                } else { false };
                 // The column is also used by the old SVN->Git writer to hold
                 // its emitted tip. That is not the inbound handled cursor P.
                 // Keep the older handled cursor when its outcome (applied
@@ -448,7 +447,7 @@ impl SyncEngine {
                 // ancestry to the emitted tip are both proved. Pending Git
                 // ancestors remain in the replay range.
                 let old_import_projection = self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
-                if emitted > 0 && (applied_outbound > 0 || (old_import_projection && svn_origin > 0) || no_target)
+                if emitted > 0 && (applied_outbound > 0 || (old_import_projection && svn_origin > 0) || kv_no_target)
                     && is_full_git_oid(column.as_deref().unwrap())
                     && is_full_git_oid(kv.as_deref().unwrap())
                 {
@@ -586,6 +585,100 @@ impl SyncEngine {
 
     fn no_target_projection(&self) -> String {
         serde_json::json!({"allowed_paths": self.allowed_paths, "blocked_patterns": self.blocked_patterns}).to_string()
+    }
+
+    fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
+        let key = format!("handled_git_no_target_{}_{}", rid, sha);
+        let Some(raw) = self.db.get_state(&key).map_err(SyncError::DatabaseError)? else {
+            return Ok(false);
+        };
+        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        let Some(record) = receipt else {
+            return Err(self.record_history_block("unverified_no_target_receipt",
+                "no-target receipt is malformed; reconcile before replay", Some(sha), None, None, None));
+        };
+        if record["repo_id"] != rid || record["git_sha"] != sha || !is_full_git_oid(sha) {
+            return Err(self.record_history_block("unverified_no_target_receipt",
+                "no-target receipt does not identify this repository and Git commit", Some(sha), None, None, None));
+        }
+        if record["projection"] != self.no_target_projection() {
+            let reason = if record["outcome"] == "empty_commit" {
+                // Preserve the accepted legacy empty-commit rejection shape.
+                "ambiguous_checkpoint"
+            } else { "receipt_policy_changed" };
+            return Err(self.record_history_block(reason,
+                "no-target decision belongs to a different path policy; reconcile before writes", Some(sha), None, None, None));
+        }
+        let accepted = match (record["version"].as_u64(), record["outcome"].as_str()) {
+            (Some(1), Some("empty_commit" | "filtered")) => true,
+            (Some(2), Some("no_svn_delta")) => {
+                let target = &record["target"];
+                target["svn_revision"].as_i64().is_some_and(|rev| rev > 0)
+                    && target["svn_uuid"].as_str().is_some_and(|v| !v.is_empty())
+                    && target["svn_url"].as_str().is_some_and(|v| !v.is_empty())
+                    && target["paths"].as_object().is_some_and(|paths| !paths.is_empty()
+                        && paths.values().all(|hash| hash.is_null()
+                            || hash.as_str().is_some_and(is_full_git_oid)))
+            }
+            // Old v1 no_svn_delta receipts did not attest target content.
+            _ => false,
+        };
+        if !accepted {
+            return Err(self.record_history_block("unverified_no_target_receipt",
+                "no-target receipt lacks verified outcome evidence", Some(sha), None, None, None));
+        }
+        Ok(true)
+    }
+
+    /// A clean working-copy status is not proof that a nonempty Git delta is
+    /// represented by SVN. Compare the exact selected paths with an exported,
+    /// pinned target revision before creating durable handled evidence.
+    async fn verify_no_svn_delta(
+        &self, svn: &SvnClient, files: &[(String, String, Option<Vec<u8>>)], sha: &str,
+    ) -> Result<serde_json::Value, SyncError> {
+        let before = svn.info().await.map_err(SyncError::SvnError)?;
+        let snapshot = tempfile::tempdir()
+            .map_err(|error| SyncError::SvnError(crate::errors::SvnError::IoError(error)))?;
+        let target = snapshot.path().join("target");
+        svn.export("", before.latest_rev, &target).await.map_err(SyncError::SvnError)?;
+        let mut paths = serde_json::Map::new();
+        for (action, path, content) in files {
+            let relative = std::path::Path::new(path);
+            if relative.components().any(|part| !matches!(part, std::path::Component::Normal(_))) {
+                return Err(self.record_history_block("unverified_no_target",
+                    "Git delta contains a non-relative target path", Some(sha), None, None, None));
+            }
+            let actual = target.join(relative);
+            if action == "D" {
+                if actual.exists() {
+                    return Err(self.record_history_block("unverified_no_target",
+                        "deleted Git path still exists at pinned SVN target", Some(sha), None, None, None));
+                }
+                paths.insert(path.clone(), serde_json::Value::Null);
+            } else {
+                let Some(expected) = content else {
+                    return Err(self.record_history_block("unverified_no_target",
+                        "non-delete Git content is missing", Some(sha), None, None, None));
+                };
+                let actual_bytes = std::fs::read(&actual).map_err(|_| self.record_history_block(
+                    "unverified_no_target", "Git path is absent or unreadable at pinned SVN target",
+                    Some(sha), None, None, None))?;
+                if actual_bytes != *expected {
+                    return Err(self.record_history_block("unverified_no_target",
+                        "pinned SVN target content differs from Git delta", Some(sha), None, None, None));
+                }
+                paths.insert(path.clone(), serde_json::Value::String(hex::encode(Sha256::digest(expected))));
+            }
+        }
+        let after = svn.info().await.map_err(SyncError::SvnError)?;
+        if before.uuid != after.uuid || before.url != after.url || before.latest_rev != after.latest_rev {
+            return Err(self.record_history_block("target_changed_during_verification",
+                "SVN target changed while no-delta proof was checked", Some(sha), None, None, None));
+        }
+        Ok(serde_json::json!({
+            "svn_revision": before.latest_rev, "svn_uuid": before.uuid,
+            "svn_url": before.url, "paths": paths,
+        }))
     }
 
     fn materialize_git_baseline(&self, sha: &str, revision: i64) -> Result<(), SyncError> {
@@ -1418,10 +1511,10 @@ impl SyncEngine {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 // Use the pre-populated changed_files from fetch_git_changes
                 // instead of re-calling get_changed_files (P5 optimization).
-                let contents: Vec<(String, String, Option<Vec<u8>>)> = change
+                let contents: Result<Vec<(String, String, Option<Vec<u8>>)>, SyncError> = change
                     .changed_files
                     .iter()
-                    .map(|f| {
+                    .map(|f| -> Result<_, SyncError> {
                         let (action, path) = (&f.action, &f.path);
                         let content = if action != "D" {
                             #[cfg(debug_assertions)]
@@ -1435,16 +1528,16 @@ impl SyncEngine {
                             };
                             #[cfg(not(debug_assertions))]
                             let read = git.get_file_content_at_commit(&change.sha, path);
-                            read
-                                .ok()
-                                .flatten()
+                            Some(read.map_err(SyncError::GitError)?
+                                .ok_or_else(|| SyncError::GitError(
+                                    crate::errors::GitError::RefNotFound(path.clone())))?)
                         } else {
                             None
                         };
-                        (action.clone(), path.clone(), content)
+                        Ok((action.clone(), path.clone(), content))
                     })
                     .collect();
-                contents
+                contents?
             };
 
             // 1b. EARLY filter: remove files that don't match allowed_paths
@@ -1587,11 +1680,9 @@ impl SyncEngine {
             // parent-node issues. The --force flag makes it a no-op for
             // already-versioned items.
             //
-            // NOTE: We ignore errors from this command because `svn add`
-            // emits W155010 warnings (and exits non-zero) for nodes that
-            // are not found in the WC — but it still successfully adds
-            // everything it can. The subsequent `svn status` check will
-            // verify that changes were actually staged.
+            // A failed add is an operational failure, even if some other
+            // nodes were staged. Status alone cannot turn that into a
+            // durable no-target outcome.
             if !added_files.is_empty() {
                 debug!(sha = %change.sha, count = added_files.len(), "staging additions");
 
@@ -1620,10 +1711,10 @@ impl SyncEngine {
                 for dir in &dirs_to_add {
                     let full = svn_wc_dir.path().join(dir);
                     if full.is_dir() {
-                        let _ = svn.run_svn_in_dir_public(
+                        svn.run_svn_in_dir_public(
                             svn_wc_dir.path(),
                             &["add", "--force", "--depth", "empty", dir],
-                        ).await;
+                        ).await.map_err(SyncError::SvnError)?;
                     }
                 }
 
@@ -1634,11 +1725,13 @@ impl SyncEngine {
                         .is_some_and(|value| value == format!("{}|{}", change.sha,
                             self.git_client.lock().unwrap_or_else(|p| p.into_inner()).repo_path().display()));
                     #[cfg(debug_assertions)]
-                    if fault { continue; }
-                    let _ = svn.run_svn_in_dir_public(
-                        svn_wc_dir.path(),
-                        &["add", "--force", file],
-                    ).await;
+                    if fault {
+                        return Err(SyncError::SvnError(crate::errors::SvnError::WorkingCopyError {
+                            path: file.to_string(), detail: "injected SVN staging failure".into(),
+                        }));
+                    }
+                    svn.run_svn_in_dir_public(svn_wc_dir.path(),
+                        &["add", "--force", file]).await.map_err(SyncError::SvnError)?;
                 }
             }
             if !deleted_files.is_empty() {
@@ -1672,10 +1765,9 @@ impl SyncEngine {
                     "no pending SVN changes after copying files — skipping commit \
                      (files may already be in sync or paths may be misaligned)"
                 );
-                // Still advance the Git watermark so we don't retry this
-                // commit on the next cycle.
+                let proof = self.verify_no_svn_delta(&svn, &file_contents, &change.sha).await?;
                 if let Some(rid) = self.effective_repo_id() {
-                    self.db.advance_no_target_watermarks(rid, &change.sha, "no_svn_delta", &self.no_target_projection())
+                    self.db.advance_verified_no_delta_watermarks(rid, &change.sha, &self.no_target_projection(), &proof)
                         .map_err(SyncError::DatabaseError)?;
                 } else {
                     self.db.set_state("last_git_hash", &change.sha)
@@ -1797,7 +1889,7 @@ impl SyncEngine {
             // previous commit in this batch advanced the server HEAD.
             {
                 let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let _ = svn.update(svn_wc_dir.path()).await;
+                svn.update(svn_wc_dir.path()).await.map_err(SyncError::SvnError)?;
             }
 
             let commit_message = format!(
@@ -1819,7 +1911,7 @@ impl SyncEngine {
                         "svn commit got 'out of date' — updating WC and retrying"
                     );
                     let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    let _ = svn.update(svn_wc_dir.path()).await;
+                    svn.update(svn_wc_dir.path()).await.map_err(SyncError::SvnError)?;
                     svn_commit_result = svn
                         .commit(svn_wc_dir.path(), &commit_message, &svn_username)
                         .await;
@@ -1836,9 +1928,9 @@ impl SyncEngine {
                         sha = %change.sha,
                         "svn commit: nothing to commit — files already in sync, advancing watermark"
                     );
-                    // Advance git watermark so we don't retry this commit
+                    let proof = self.verify_no_svn_delta(&svn, &file_contents, &change.sha).await?;
                     if let Some(rid) = self.effective_repo_id() {
-                        self.db.advance_no_target_watermarks(rid, &change.sha, "no_svn_delta", &self.no_target_projection())
+                        self.db.advance_verified_no_delta_watermarks(rid, &change.sha, &self.no_target_projection(), &proof)
                             .map_err(SyncError::DatabaseError)?;
                     } else {
                         self.db.set_state("last_git_hash", &change.sha)

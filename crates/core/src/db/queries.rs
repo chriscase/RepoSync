@@ -1099,11 +1099,30 @@ impl Database {
     pub fn advance_no_target_watermarks(
         &self, repo_id: &str, git_sha: &str, outcome: &str, projection: &str,
     ) -> Result<(), DatabaseError> {
-        self.advance_git_watermarks(repo_id, git_sha, Some((outcome, projection)))
+        if !matches!(outcome, "empty_commit" | "filtered") {
+            return Err(DatabaseError::Other("nonempty no-target outcome requires target verification".into()));
+        }
+        let receipt = serde_json::json!({
+            "version": 1, "repo_id": repo_id, "git_sha": git_sha,
+            "outcome": outcome, "projection": projection,
+        });
+        self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
+    }
+
+    pub fn advance_verified_no_delta_watermarks(
+        &self, repo_id: &str, git_sha: &str, projection: &str,
+        target: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let receipt = serde_json::json!({
+            "version": 2, "repo_id": repo_id, "git_sha": git_sha,
+            "outcome": "no_svn_delta", "projection": projection,
+            "target": target,
+        });
+        self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
     fn advance_git_watermarks(
-        &self, repo_id: &str, git_sha: &str, no_target: Option<(&str, &str)>,
+        &self, repo_id: &str, git_sha: &str, no_target: Option<serde_json::Value>,
     ) -> Result<(), DatabaseError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1128,12 +1147,8 @@ impl Database {
             params![git_sha, now],
         )?;
 
-        if let Some((outcome, projection)) = no_target {
+        if let Some(receipt) = no_target {
             let key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
-            let receipt = serde_json::json!({
-                "version": 1, "repo_id": repo_id, "git_sha": git_sha,
-                "outcome": outcome, "projection": projection,
-            });
             tx.execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
                 params![key, receipt.to_string(), now],

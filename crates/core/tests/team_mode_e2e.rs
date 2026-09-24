@@ -3241,6 +3241,12 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
     assert_eq!(pair.snapshot().await, before);
     drop(changed);
+    let saved_receipt = pair.engine.db().get_state(&receipt_key).unwrap().unwrap();
+    pair.engine.db().set_state(&receipt_key, "{malformed").unwrap();
+    assert!(matches!(pair.engine.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
+    assert_eq!(pair.snapshot().await, before);
+    pair.engine.db().set_state(&receipt_key, &saved_receipt).unwrap();
     assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
     let allowed = pair.developer_commit("allow.txt", "ordinary work\n", "Ordinary work under unchanged policy");
     git_cli(&pair.developer, &["push", "origin", "main"]);
@@ -3344,7 +3350,16 @@ async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str)
     let result = pair.engine.run_sync_cycle().await;
     assert!(result.is_err(), "{kind} fault was incorrectly treated as no-target proof");
     drop(fault);
-    assert_eq!(pair.snapshot().await, before);
+    let after_failure = pair.snapshot().await;
+    assert_eq!(after_failure.svn_rev, before.svn_rev);
+    assert_eq!(after_failure.svn_origin, before.svn_origin);
+    assert_eq!(after_failure.remote_sha, before.remote_sha);
+    assert_eq!(after_failure.remote_tree, before.remote_tree);
+    assert_eq!(after_failure.watermark, before.watermark);
+    assert_eq!(after_failure.kv_cursor, before.kv_cursor);
+    assert_eq!(after_failure.mapping_count, before.mapping_count);
+    assert_eq!(after_failure.bridge_sha, second);
+    assert!(after_failure.bridge_status.is_empty());
     assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, pair.imported_base);
     for sha in [&first, &second] {
         assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
@@ -3400,7 +3415,19 @@ async fn candidate_r01_nonempty_already_represented_delta_is_verified() {
         &format!("handled_git_no_target_pair_{mode_sha}")).unwrap().unwrap()).unwrap();
     assert_eq!(receipt["outcome"], "no_svn_delta");
     assert_eq!(receipt["version"], 2);
-    assert_eq!(receipt["target_svn_rev"], rev);
+    assert_eq!(receipt["target"]["svn_revision"], rev);
+    assert!(receipt["target"]["paths"]["origin.txt"].as_str().is_some());
+    let receipt_key = format!("handled_git_no_target_pair_{mode_sha}");
+    let current_receipt = pair.engine.db().get_state(&receipt_key).unwrap().unwrap();
+    let legacy_unverified = serde_json::json!({
+        "version":1, "repo_id":"pair", "git_sha":mode_sha,
+        "outcome":"no_svn_delta", "projection":receipt["projection"]
+    });
+    pair.engine.db().set_state(&receipt_key, &legacy_unverified.to_string()).unwrap();
+    assert!(matches!(pair.engine.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, mode_sha);
+    pair.engine.db().set_state(&receipt_key, &current_receipt).unwrap();
     assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
     let svn = svn_tree(&pair, rev).await;
     assert_eq!(svn, tracked_tree(&pair.bridge));
