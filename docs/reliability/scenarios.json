@@ -1,13 +1,13 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "scope": "Phase 0 observations plus bounded pre-reset team-history containment subcases; no complete scenario acceptance or migration implemented",
+  "scope": "Phase 0 observations plus bounded history, SVN apply and tree-preservation subcases; no complete scenario acceptance or migration implemented",
   "scenarios": [
     {
       "id": "R01",
       "baseline": "PARTIAL",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Required real-engine R01_LINEAR admits two pending Git commits with intermediate SVN trees/mappings and no-op repeat; R01_SVN_PENDING admits new SVN work when P=R. Existing four team SVN\u2192Git/bidirectional failures remain; full round-trip acceptance is open.",
+      "evidence": "Required real-engine R01_LINEAR, R01_ALTERNATING_DUAL_CURSOR, R01_PENDING_BOTH_DIRECTIONS, R01_FAILED_APPLY_BARRIER, R01_FAILED_APPLY_RETRY and R01_METADATA_ONLY prove bounded directional replay, mapped/stale cursor handling, stop-and-retry at failed SVN apply, explicit no-target checkpoint and no-op repeats. The four formerly failing team tests now pass after the narrow content-preservation correction. Full round-trip, post-write recovery and deployed-version acceptance remain open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -149,9 +149,9 @@
     {
       "id": "R19",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "R19_UNTOUCHED_TREE and R19_EXPLICIT_DELETE compare full SVN exports with Git trees across addition, modification and explicit deletion while retaining unrelated top-level bytes. Broader path policy, binary/LFS and deployed-version qualification remain open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
