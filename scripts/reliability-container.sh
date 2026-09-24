@@ -69,6 +69,6 @@ docker run --rm --network none --read-only --cap-drop ALL \
 command -v python3 >/dev/null || { echo "FAIL: evidence scanner interpreter unavailable" >&2; exit 1; }
 [[ -f scripts/reliability_scan.py ]] || { echo "FAIL: evidence scanner unavailable" >&2; exit 1; }
 python3 scripts/reliability_scan.py --scan "$artifact_dir" \
-  --status-file "$artifact_dir/scan-status.json" --summary-file "$artifact_dir/summary.json"
+  --status-file "$artifact_dir/scan-status.json"
 [[ "$runtime_status" -eq 0 ]] || exit "$runtime_status"
 echo "Artifact: $artifact_dir"

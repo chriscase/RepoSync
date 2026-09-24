@@ -334,6 +334,18 @@ def main():
     versions += subprocess.run(["svn", "--version", "--quiet"], capture_output=True, text=True, check=True).stdout
     versions += (TESTS / "build-toolchain.txt").read_text()
     (OUTPUT / "tool-versions.txt").write_text(versions)
+    # The container owns summary.json; the host runner may read it but cannot
+    # rewrite it. Record the internal verified scan here, then require a
+    # separate host scan of the complete mounted evidence after container exit.
+    scanned = subprocess.run(
+        [sys.executable, "/usr/local/bin/reliability_scan.py", "--scan", str(OUTPUT),
+         "--status-file", str(OUTPUT / "internal-scan-status.json"),
+         "--summary-file", str(OUTPUT / "summary.json")],
+        capture_output=True, text=True, timeout=30)
+    if scanned.returncode != 0:
+        raise RuntimeError("internal evidence scan failed")
+    summary = json.loads((OUTPUT / "summary.json").read_text())
+    assert summary["evidence_scan"]["result"] == "PASS"
     print(json.dumps(summary), flush=True)
     if any(case["outcome"] == "FAIL" for case in cases):
         raise SystemExit("one or more exact required cases failed")
