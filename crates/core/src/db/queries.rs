@@ -1091,11 +1091,25 @@ impl Database {
     /// Updates repositories table, per-repo kv_state, and global kv_state.
     /// Used by "skip commit" and path validation to move past a failing commit.
     pub fn advance_all_watermarks(&self, repo_id: &str, git_sha: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        conn.execute_batch("BEGIN TRANSACTION")?;
+        self.advance_git_watermarks(repo_id, git_sha, None)
+    }
+
+    /// Persist an intentional no-target Git outcome with its handled cursor.
+    /// The receipt is repository-owned and survives sync-record retention.
+    pub fn advance_no_target_watermarks(
+        &self, repo_id: &str, git_sha: &str, outcome: &str, projection: &str,
+    ) -> Result<(), DatabaseError> {
+        self.advance_git_watermarks(repo_id, git_sha, Some((outcome, projection)))
+    }
+
+    fn advance_git_watermarks(
+        &self, repo_id: &str, git_sha: &str, no_target: Option<(&str, &str)>,
+    ) -> Result<(), DatabaseError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
 
         // 1. Update repositories table
-        conn.execute(
+        tx.execute(
             "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
             params![git_sha, repo_id],
         )?;
@@ -1103,18 +1117,29 @@ impl Database {
         // 2. Update per-repo kv_state key
         let kv_key = format!("last_git_sha_{}", repo_id);
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
             params![kv_key, git_sha, now],
         )?;
 
         // 3. Update global kv_state key
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
             params![git_sha, now],
         )?;
 
-        conn.execute_batch("COMMIT")?;
+        if let Some((outcome, projection)) = no_target {
+            let key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+            let receipt = serde_json::json!({
+                "version": 1, "repo_id": repo_id, "git_sha": git_sha,
+                "outcome": outcome, "projection": projection,
+            });
+            tx.execute(
+                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                params![key, receipt.to_string(), now],
+            )?;
+        }
+        tx.commit()?;
         info!(repo_id, git_sha, "advanced all watermarks atomically");
         Ok(())
     }
@@ -2378,7 +2403,8 @@ impl Database {
 
     // -- maintenance / retention -----------------------------------------------
 
-    /// Run periodic maintenance: prune old audit log, sync records, and commit map entries.
+    /// Prune old audit and non-applied sync diagnostics. Applied mappings are
+    /// retained while the legacy checkpoint reader relies on them.
     pub fn run_maintenance(&self, retention_days: u32) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let cutoff = format!("-{} days", retention_days);
@@ -2387,8 +2413,11 @@ impl Database {
             "DELETE FROM audit_log WHERE created_at < datetime('now', ?1)",
             params![cutoff],
         )?;
+        // Applied mappings are checkpoint proof for existing installations.
+        // They cannot be treated as expiring diagnostics while legacy readers
+        // still consult them. Only non-applied diagnostic rows expire here.
         let sync_deleted: usize = conn.execute(
-            "DELETE FROM sync_records WHERE synced_at < datetime('now', ?1)",
+            "DELETE FROM sync_records WHERE status <> 'applied' AND synced_at < datetime('now', ?1)",
             params![cutoff],
         )?;
 
