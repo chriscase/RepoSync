@@ -1209,6 +1209,9 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     let restored = tmp.path().join("restored-prewrite-install");
     copy_install_tree(&original, &candidate);
     copy_install_tree(&original, &restored);
+    let original_manifest = tree_hashes(&exported_tree(&original));
+    assert_eq!(tree_hashes(&exported_tree(&restored)), original_manifest);
+    assert_eq!(tree_hashes(&exported_tree(&candidate)), original_manifest);
     let original_db_hash = hex::encode(sha2::Sha256::digest(std::fs::read(original.join("reposync.db")).unwrap()));
     assert_eq!(original_db_hash, hex::encode(sha2::Sha256::digest(std::fs::read(restored.join("reposync.db")).unwrap())));
     let svn_url = format!("file://{}/trunk", old_root.join("svn_repo").display());
@@ -1224,10 +1227,16 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
     let db_path = candidate.join("reposync.db");
     let db = Database::new(&db_path).unwrap();
+    let old_schema: i64 = db.conn().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
     db.initialize().unwrap();
+    let new_schema: i64 = db.conn().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!((old_schema, new_schema), (12, 12));
     let old_repo = db.get_repository("pair").unwrap().unwrap();
     assert_eq!(old_repo.last_git_sha, old_tip);
     assert_eq!(db.get_state("last_git_sha_pair").unwrap(), Some(old_tip.clone()));
+    assert_eq!(db.get_state("secret_svn_password_pair").unwrap().as_deref(), Some("fixture-only-svn-secret"));
+    assert_eq!(db.get_state("secret_git_token_pair").unwrap().as_deref(), Some("fixture-only-git-secret"));
+    assert_eq!(std::fs::read(candidate.join("config.toml")).unwrap(), std::fs::read(original.join("config.toml")).unwrap());
     let old_svn_rev = old_repo.last_svn_rev;
     let mut engine = SyncEngine::new(config.clone(), db, SvnClient::new(&svn_url, "", ""),
         GitClient::new(&bridge).unwrap(), Arc::new(make_identity_mapper()));
@@ -1238,10 +1247,25 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(tracked_tree(&bridge), old_tree);
     assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), old_tip);
     assert_eq!(engine.db().get_repo_watermark("pair").unwrap(), (old_svn_rev, old_tip.clone()));
+    let baseline_receipt: serde_json::Value = serde_json::from_str(
+        &engine.db().get_state("handled_git_baseline_pair").unwrap().unwrap()).unwrap();
+    assert_eq!(baseline_receipt["git_sha"], old_tip);
+    assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
     let restored_db = Database::new(&restored.join("reposync.db")).unwrap();
     assert_eq!(restored_db.get_repo_watermark("pair").unwrap(), (old_svn_rev, old_tip.clone()));
+    assert_eq!(restored_db.get_state("secret_svn_password_pair").unwrap().as_deref(), Some("fixture-only-svn-secret"));
+    let mut restore_config = make_app_config(&svn_url, &restored);
+    restore_config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut restore_engine = SyncEngine::new(restore_config, restored_db,
+        SvnClient::new(&svn_url,"",""), GitClient::new(&restored_bridge).unwrap(),
+        Arc::new(make_identity_mapper()));
+    restore_engine.set_repo_id("pair".into());
+    let restore_idle = restore_engine.run_sync_cycle().await.unwrap();
+    assert_eq!((restore_idle.svn_to_git_count, restore_idle.git_to_svn_count), (0, 0));
+    assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), old_tip);
+    drop(restore_engine);
 
     let source_wc = old_root.join("source-wc");
     let svn_only_rev = svn_commit_file(&source_wc, "origin.txt", "post-upgrade SVN\n", "SVN-only after old import");
@@ -1283,16 +1307,35 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     let final_export = tmp.path().join("final-upgrade-export");
     SvnClient::new(&svn_url,"","").export("", final_rev, &final_export).await.unwrap();
     assert_eq!(exported_tree(&final_export), tracked_tree(&bridge));
+    let mapped_rows: Vec<(i64, String, String, String)> = {
+        let conn = reopened.db().conn();
+        let mut statement = conn.prepare(
+            "SELECT COALESCE(svn_rev, 0), COALESCE(git_sha, ''), direction, status FROM sync_records WHERE repo_id = 'pair' ORDER BY rowid").unwrap();
+        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .unwrap().map(|row| row.unwrap()).collect()
+    };
+    let final_install_manifest = tree_hashes(&exported_tree(&candidate));
+    let svn_uuid_output = Command::new("svnlook")
+        .args(["uuid", old_root.join("svn_repo").to_str().unwrap()]).output().unwrap();
+    assert!(svn_uuid_output.status.success());
+    let svn_uuid = String::from_utf8(svn_uuid_output.stdout).unwrap().trim().to_string();
     eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
         "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
         "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
         "old_db_sha256":original_db_hash, "old_generation":old_generation,
-        "old_svn_rev":old_svn_rev, "old_git":old_tip,
-        "old_tree":tree_hashes(&old_tree), "prewrite_restore_verified":true,
+        "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
+        "schema_before":old_schema, "schema_after":new_schema,
+        "verified_baseline_receipt":baseline_receipt,
+        "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
+        "old_install_manifest":original_manifest,
+        "prewrite_restore_verified":true, "restore_noop":true,
+        "configuration_and_synthetic_credentials_preserved":true,
         "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
         "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
         "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
         "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
+        "post_upgrade_install_manifest":final_install_manifest,
+        "repository_mapping_rows":mapped_rows,
     }));
 }
 

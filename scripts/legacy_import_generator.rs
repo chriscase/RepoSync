@@ -42,6 +42,7 @@ async fn generate_legacy_import() {
     run("git", &["-C", bootstrap.to_str().unwrap(), "push", "origin", "main"]);
 
     let config_str = format!("[daemon]\ndata_dir = '{}'\n[svn]\nurl = '{}'\nusername = 'fixture'\npassword_env = 'REPOSYNC_TEST_SVN_PW'\n[github]\nrepo = 'fixture/old-origin'\ntoken_env = 'REPOSYNC_TEST_GH_TOKEN'\n", install.display(), source_url);
+    std::fs::write(install.join("config.toml"), &config_str).unwrap();
     let mut config: AppConfig = toml::from_str(&config_str).unwrap();
     config.web.admin_password = Some("synthetic-only".into());
     config.svn.password = Some(String::new());
@@ -49,6 +50,8 @@ async fn generate_legacy_import() {
     let db_path = install.join("reposync.db");
     let web_db = Database::new(&db_path).unwrap();
     web_db.initialize().unwrap();
+    web_db.set_state("secret_svn_password_pair", "fixture-only-svn-secret").unwrap();
+    web_db.set_state("secret_git_token_pair", "fixture-only-git-secret").unwrap();
     let now = chrono::Utc::now().to_rfc3339();
     web_db.insert_repository(&Repository {
         id: "pair".into(), name: "pinned old import".into(), svn_url: source_url.clone(),

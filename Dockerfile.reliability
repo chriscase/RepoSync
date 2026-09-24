@@ -15,11 +15,15 @@ RUN cargo test --workspace --no-run --locked --message-format=json \
     cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
 COPY legacy-old /old-src
-RUN cd /old-src && cargo test -p reposync-web --test legacy_import_generator --no-run --locked --message-format=json \
-    > /tmp/old-preparation.jsonl && \
-    python3 /usr/local/bin/reliability-prep /tmp/old-preparation.jsonl /opt/reliability-old-tests && \
-    sha256sum /opt/reliability-old-tests/legacy_import_generator-* > /opt/reliability-old-tests/generator.sha256 && \
-    sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256
+ARG RELIABILITY_INCLUDE_OLD=1
+RUN mkdir -p /opt/reliability-old-tests && \
+    if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
+      cd /old-src && cargo test -p reposync-web --test legacy_import_generator --no-run --locked --message-format=json \
+        > /tmp/old-preparation.jsonl && \
+      python3 /usr/local/bin/reliability-prep /tmp/old-preparation.jsonl /opt/reliability-old-tests && \
+      sha256sum /opt/reliability-old-tests/legacy_import_generator-* > /opt/reliability-old-tests/generator.sha256 && \
+      sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256; \
+    fi
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -27,7 +27,10 @@ lock_hash="$(shasum -a 256 docs/reliability/fixtures/Cargo.lock | awk '{print $1
   echo "FAIL: original GOAL.md changed" >&2; exit 1;
 }
 image="reposync-reliability:$source_head"
-docker build --file "$prepared_context/Dockerfile.reliability" --tag "$image" "$prepared_context"
+include_old=1
+[[ "$mode" == --baseline ]] && include_old=0
+docker build --build-arg "RELIABILITY_INCLUDE_OLD=$include_old" \
+  --file "$prepared_context/Dockerfile.reliability" --tag "$image" "$prepared_context"
 artifact_dir="${REPOSYNC_ARTIFACT_DIR:-$repo_root/artifacts/reliability-phase0/$(date -u +%Y%m%dT%H%M%SZ)-${mode#--}}"
 mkdir -p "$artifact_dir"
 chmod 1777 "$artifact_dir"
