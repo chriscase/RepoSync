@@ -654,8 +654,29 @@ impl SyncEngine {
                     "Git delta contains a non-relative target path", Some(sha), None, None, None));
             }
             let actual = target.join(relative);
+            // An SVN special file may export as a symlink. Check every existing
+            // component before any read or absence decision so the verifier
+            // cannot follow an exported link outside the pinned snapshot.
+            let mut checked = target.clone();
+            for component in relative.components() {
+                checked.push(component.as_os_str());
+                match std::fs::symlink_metadata(&checked) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(self.record_history_block("unverified_no_target",
+                            "pinned SVN target contains unsupported symlink semantics",
+                            Some(sha), None, None, None));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) => {
+                        return Err(self.record_history_block("unverified_no_target",
+                            "pinned SVN target metadata is unreadable",
+                            Some(sha), None, None, None));
+                    }
+                }
+            }
             if action == "D" {
-                if actual.exists() {
+                if std::fs::symlink_metadata(&actual).is_ok() {
                     return Err(self.record_history_block("unverified_no_target",
                         "deleted Git path still exists at pinned SVN target", Some(sha), None, None, None));
                 }
@@ -665,18 +686,18 @@ impl SyncEngine {
                     return Err(self.record_history_block("unverified_no_target",
                         "non-delete Git content is missing", Some(sha), None, None, None));
                 };
+                if !std::fs::symlink_metadata(&actual).map_err(|_| self.record_history_block(
+                    "unverified_no_target", "pinned target type is unreadable",
+                    Some(sha), None, None, None))?.file_type().is_file() {
+                    return Err(self.record_history_block("unverified_no_target",
+                        "pinned SVN target is not a regular file", Some(sha), None, None, None));
+                }
                 let actual_bytes = std::fs::read(&actual).map_err(|_| self.record_history_block(
                     "unverified_no_target", "Git path is absent or unreadable at pinned SVN target",
                     Some(sha), None, None, None))?;
                 if actual_bytes != *expected {
                     return Err(self.record_history_block("unverified_no_target",
                         "pinned SVN target content differs from Git delta", Some(sha), None, None, None));
-                }
-                if !std::fs::symlink_metadata(&actual).map_err(|_| self.record_history_block(
-                    "unverified_no_target", "pinned target type is unreadable",
-                    Some(sha), None, None, None))?.file_type().is_file() {
-                    return Err(self.record_history_block("unverified_no_target",
-                        "pinned SVN target is not a regular file", Some(sha), None, None, None));
                 }
                 let props = svn.file_properties_at_rev(path, before.latest_rev).await
                     .map_err(SyncError::SvnError)?;
