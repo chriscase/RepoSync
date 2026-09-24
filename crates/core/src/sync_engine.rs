@@ -611,16 +611,19 @@ impl SyncEngine {
         }
         let accepted = match (record["version"].as_u64(), record["outcome"].as_str()) {
             (Some(1), Some("empty_commit" | "filtered")) => true,
-            (Some(2), Some("no_svn_delta")) => {
+            (Some(3), Some("no_svn_delta")) => {
                 let target = &record["target"];
                 target["svn_revision"].as_i64().is_some_and(|rev| rev > 0)
                     && target["svn_uuid"].as_str().is_some_and(|v| !v.is_empty())
                     && target["svn_url"].as_str().is_some_and(|v| !v.is_empty())
+                    && target["semantic_projection"] == "regular_file_bytes_no_properties_v1"
                     && target["paths"].as_object().is_some_and(|paths| !paths.is_empty()
-                        && paths.values().all(|hash| hash.is_null()
-                            || hash.as_str().is_some_and(is_full_git_oid)))
+                        && paths.values().all(|entry| entry.is_null()
+                            || (entry["sha256"].as_str().is_some_and(is_full_git_oid)
+                                && entry["git_mode"] == 33188
+                                && entry["svn_executable"] == false)))
             }
-            // Old v1 no_svn_delta receipts did not attest target content.
+            // Old v1 and v2 receipts did not attest semantic target state.
             _ => false,
         };
         if !accepted {
@@ -636,6 +639,8 @@ impl SyncEngine {
     async fn verify_no_svn_delta(
         &self, svn: &SvnClient, files: &[(String, String, Option<Vec<u8>>)], sha: &str,
     ) -> Result<serde_json::Value, SyncError> {
+        #[cfg(debug_assertions)]
+        self.test_outbound_pause("REPOSYNC_TEST_BEFORE_NO_TARGET_VERIFY", sha).await?;
         let before = svn.info().await.map_err(SyncError::SvnError)?;
         let snapshot = tempfile::tempdir()
             .map_err(|error| SyncError::SvnError(crate::errors::SvnError::IoError(error)))?;
@@ -667,7 +672,38 @@ impl SyncEngine {
                     return Err(self.record_history_block("unverified_no_target",
                         "pinned SVN target content differs from Git delta", Some(sha), None, None, None));
                 }
-                paths.insert(path.clone(), serde_json::Value::String(hex::encode(Sha256::digest(expected))));
+                if !std::fs::symlink_metadata(&actual).map_err(|_| self.record_history_block(
+                    "unverified_no_target", "pinned target type is unreadable",
+                    Some(sha), None, None, None))?.file_type().is_file() {
+                    return Err(self.record_history_block("unverified_no_target",
+                        "pinned SVN target is not a regular file", Some(sha), None, None, None));
+                }
+                let props = svn.file_properties_at_rev(path, before.latest_rev).await
+                    .map_err(SyncError::SvnError)?;
+                if props.contains("<property ") || props.contains("<property>") {
+                    return Err(self.record_history_block("unverified_no_target",
+                        "pinned SVN target has file properties outside the regular-byte projection",
+                        Some(sha), None, None, None));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(&actual).map_err(|_| self.record_history_block(
+                        "unverified_no_target", "pinned target metadata is unreadable",
+                        Some(sha), None, None, None))?.permissions().mode() & 0o111 != 0 {
+                        return Err(self.record_history_block("unverified_no_target",
+                            "pinned SVN target has executable semantics absent from Git regular file",
+                            Some(sha), None, None, None));
+                    }
+                }
+                #[cfg(not(unix))]
+                return Err(self.record_history_block("unverified_no_target",
+                    "SVN executable semantics are unqualified on this platform",
+                    Some(sha), None, None, None));
+                paths.insert(path.clone(), serde_json::json!({
+                    "sha256": hex::encode(Sha256::digest(expected)),
+                    "git_mode": 33188, "svn_executable": false,
+                }));
             }
         }
         let after = svn.info().await.map_err(SyncError::SvnError)?;
@@ -678,7 +714,31 @@ impl SyncEngine {
         Ok(serde_json::json!({
             "svn_revision": before.latest_rev, "svn_uuid": before.uuid,
             "svn_url": before.url, "paths": paths,
+            "semantic_projection": "regular_file_bytes_no_properties_v1",
         }))
+    }
+
+    #[cfg(debug_assertions)]
+    async fn test_outbound_pause(&self, key: &str, sha: &str) -> Result<(), SyncError> {
+        let Some(value) = std::env::var(key).ok() else { return Ok(()); };
+        let mut parts = value.splitn(3, '|');
+        let (Some(expected_sha), Some(expected_bridge), Some(dir)) = (parts.next(), parts.next(), parts.next()) else {
+            return Ok(());
+        };
+        let bridge = self.git_client.lock().unwrap_or_else(|p| p.into_inner()).repo_path().to_string_lossy().to_string();
+        if sha != expected_sha || bridge != expected_bridge { return Ok(()); }
+        let dir = std::path::Path::new(dir);
+        std::fs::write(dir.join("ready"), b"").map_err(|error|
+            SyncError::GitError(crate::errors::GitError::IoError(error)))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !dir.join("release").exists() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SyncError::GitError(crate::errors::GitError::IoError(
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "test outbound pause timed out"))));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     fn materialize_git_baseline(&self, sha: &str, revision: i64) -> Result<(), SyncError> {
@@ -1566,6 +1626,23 @@ impl SyncEngine {
                 file_contents
             };
 
+            // The current bridge maps regular-file bytes only. Mode, type,
+            // symlink and executable changes cannot be acknowledged by an
+            // empty SVN status or by a content-only no-target receipt.
+            {
+                let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                for (_, path, _) in &file_contents {
+                    let (previous, current) = git.changed_entry_modes(&change.sha, path)
+                        .map_err(SyncError::GitError)?;
+                    if (previous.is_none() && current.is_none())
+                        || previous.into_iter().chain(current).any(|mode| mode != 33188) {
+                        return Err(self.record_history_block("unsupported_git_semantics",
+                            "changed Git tree entry has mode or type unsupported by the SVN byte bridge",
+                            Some(&change.sha), None, None, None));
+                    }
+                }
+            }
+
             if file_contents.is_empty() {
                 // All files were filtered out — advance watermark and skip
                 if let Some(rid) = self.effective_repo_id() {
@@ -1578,6 +1655,9 @@ impl SyncEngine {
                 }
                 continue;
             }
+
+            #[cfg(debug_assertions)]
+            self.test_outbound_pause("REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT", &change.sha).await?;
 
             // 2. Prepare SVN working copy: checkout on first use, update thereafter.
             let svn_url_for_log;

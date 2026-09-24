@@ -304,6 +304,14 @@ impl SvnClient {
         Ok(())
     }
 
+    /// Enumerate properties on one file at a pinned revision. The no-target
+    /// verifier conservatively refuses any property until its mapping is
+    /// explicitly defined; export alone does not include property evidence.
+    pub async fn file_properties_at_rev(&self, path: &str, rev: i64) -> Result<String, SvnError> {
+        let url = format!("{}/{}@{}", self.url.trim_end_matches('/'), path, rev);
+        self.run_svn(&["proplist", "--xml", "-r", &rev.to_string(), &url]).await
+    }
+
     /// Export at a given depth (e.g. "immediates" for top-level only).
     #[instrument(skip(self), fields(url = %self.url, rev, depth))]
     pub async fn export_depth(

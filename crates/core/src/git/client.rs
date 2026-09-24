@@ -684,6 +684,17 @@ impl GitClient {
         Ok(changes)
     }
 
+    /// Tree-entry modes on both sides of a changed path. A missing side is
+    /// an add or delete, not evidence that its surviving side is a regular file.
+    pub fn changed_entry_modes(&self, sha: &str, path: &str) -> Result<(Option<i32>, Option<i32>), GitError> {
+        let commit = self.repo.find_commit(Oid::from_str(sha)?)?;
+        let current = commit.tree()?.get_path(std::path::Path::new(path)).ok().map(|entry| entry.filemode());
+        let previous = if commit.parent_count() > 0 {
+            commit.parent(0)?.tree()?.get_path(std::path::Path::new(path)).ok().map(|entry| entry.filemode())
+        } else { None };
+        Ok((previous, current))
+    }
+
     /// Get the content of a file at a specific commit.
     ///
     /// Returns `None` if the file does not exist in that commit's tree.

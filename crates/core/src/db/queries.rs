@@ -1114,7 +1114,7 @@ impl Database {
         target: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
         let receipt = serde_json::json!({
-            "version": 2, "repo_id": repo_id, "git_sha": git_sha,
+            "version": 3, "repo_id": repo_id, "git_sha": git_sha,
             "outcome": "no_svn_delta", "projection": projection,
             "target": target,
         });

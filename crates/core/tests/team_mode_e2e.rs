@@ -3340,6 +3340,25 @@ impl Drop for TestOutboundFault {
     fn drop(&mut self) { std::env::remove_var(self.0); }
 }
 
+struct TestOutboundPause(&'static str);
+impl TestOutboundPause {
+    fn new(key: &'static str, sha: &str, bridge: &Path, dir: &Path) -> Self {
+        std::env::set_var(key, format!("{}|{}|{}", sha, bridge.display(), dir.display()));
+        Self(key)
+    }
+}
+impl Drop for TestOutboundPause {
+    fn drop(&mut self) { std::env::remove_var(self.0); }
+}
+
+async fn wait_outbound_pause(dir: &Path) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !dir.join("ready").exists() {
+        assert!(tokio::time::Instant::now() < deadline, "outbound test boundary not reached");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str) {
     let pair = QualifiedPair::new().await;
     let first = pair.developer_commit("fault.txt", "must not vanish\n", "First queued Git change");
@@ -3406,35 +3425,132 @@ async fn candidate_r01_nonempty_already_represented_delta_is_verified() {
     git_cli(&pair.developer, &["update-index", "--chmod=+x", "origin.txt"]);
     git_cli(&pair.developer, &["commit", "-m", "Git mode-only delta with represented content"]);
     let mode_sha = get_head_sha(&pair.developer);
+    let successor = pair.developer_commit("later.txt", "queued after mode change\n", "Queued successor");
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    let cycle = pair.engine.run_sync_cycle().await.unwrap();
-    assert_eq!((cycle.svn_to_git_count, cycle.git_to_svn_count), (0, 0));
-    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, rev);
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, mode_sha);
-    let receipt: serde_json::Value = serde_json::from_str(&pair.engine.db().get_state(
-        &format!("handled_git_no_target_pair_{mode_sha}")).unwrap().unwrap()).unwrap();
-    assert_eq!(receipt["outcome"], "no_svn_delta");
-    assert_eq!(receipt["version"], 2);
-    assert_eq!(receipt["target"]["svn_revision"], rev);
-    assert!(receipt["target"]["paths"]["origin.txt"].as_str().is_some());
-    let receipt_key = format!("handled_git_no_target_pair_{mode_sha}");
-    let current_receipt = pair.engine.db().get_state(&receipt_key).unwrap().unwrap();
-    let legacy_unverified = serde_json::json!({
-        "version":1, "repo_id":"pair", "git_sha":mode_sha,
-        "outcome":"no_svn_delta", "projection":receipt["projection"]
-    });
-    pair.engine.db().set_state(&receipt_key, &legacy_unverified.to_string()).unwrap();
+    let before = pair.snapshot().await;
     assert!(matches!(pair.engine.run_sync_cycle().await,
-        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, mode_sha);
-    pair.engine.db().set_state(&receipt_key, &current_receipt).unwrap();
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
-    let svn = svn_tree(&pair, rev).await;
-    assert_eq!(svn, tracked_tree(&pair.bridge));
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unsupported_git_semantics"));
+    let after = pair.snapshot().await;
+    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, rev);
+    assert_eq!(after.svn_origin, before.svn_origin);
+    assert_eq!(after.watermark, before.watermark);
+    assert_eq!(after.kv_cursor, before.kv_cursor);
+    assert_eq!(after.mapping_count, before.mapping_count);
+    assert_eq!(after.remote_sha, before.remote_sha);
+    for sha in [&mode_sha, &successor] {
+        assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
+        let count: i64 = pair.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+            [sha], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
     eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
         "case":"R01_VERIFIED_NO_DELTA", "source_commit":mode_sha,
-        "receipt":receipt, "pinned_svn_revision":rev,
-        "full_target_tree":tree_hashes(&svn), "full_git_tree":tree_hashes(&tracked_tree(&pair.bridge))
+        "queued_successor":successor, "old_oracle":"v2_byte_only_receipt_success",
+        "new_oracle":"unsupported_git_semantics_before_write",
+        "pinned_svn_revision":rev, "checkpoint_unchanged":true,
+        "target_byte_tree":tree_hashes(&svn_tree(&pair, rev).await),
+        "source_git_entry":git_output(&pair.developer, &["ls-tree", &mode_sha, "origin.txt"])
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_regular_content_already_represented_is_verified() {
+    let pair = QualifiedPair::new().await;
+    let source_sha = pair.developer_commit("origin.txt", "same regular content\n", "Regular content delta");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let pause_dir = pair.tmp.path().join("before-outbound-checkout");
+    std::fs::create_dir(&pause_dir).unwrap();
+    let pause = TestOutboundPause::new("REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT", &source_sha, &pair.bridge, &pause_dir);
+    let (cycle, represented_rev) = tokio::join!(pair.engine.run_sync_cycle(), async {
+        wait_outbound_pause(&pause_dir).await;
+        let rev = svn_commit_file(&pair.wc, "origin.txt", "same regular content\n", "Independent matching SVN content");
+        std::fs::write(pause_dir.join("release"), b"").unwrap();
+        rev
+    });
+    drop(pause);
+    let cycle = cycle.unwrap();
+    assert_eq!(cycle.git_to_svn_count, 0);
+    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, represented_rev);
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, source_sha);
+    let key = format!("handled_git_no_target_pair_{source_sha}");
+    let receipt: serde_json::Value = serde_json::from_str(
+        &pair.engine.db().get_state(&key).unwrap().expect("semantic no-target receipt")).unwrap();
+    assert_eq!(receipt["version"], 3);
+    assert_eq!(receipt["outcome"], "no_svn_delta");
+    assert_eq!(receipt["target"]["svn_revision"], represented_rev);
+    assert_eq!(receipt["target"]["semantic_projection"], "regular_file_bytes_no_properties_v1");
+    assert_eq!(receipt["target"]["paths"]["origin.txt"]["git_mode"], 33188);
+    assert_eq!(receipt["target"]["paths"]["origin.txt"]["svn_executable"], false);
+    let old_v2 = serde_json::json!({
+        "version":2,"repo_id":"pair","git_sha":source_sha,
+        "outcome":"no_svn_delta","projection":receipt["projection"],
+        "target":{"svn_revision":represented_rev,"svn_uuid":receipt["target"]["svn_uuid"],
+                  "svn_url":receipt["target"]["svn_url"],"paths":{"origin.txt":receipt["target"]["paths"]["origin.txt"]["sha256"]}}
+    });
+    let v3 = pair.engine.db().get_state(&key).unwrap().unwrap();
+    pair.engine.db().set_state(&key, &old_v2.to_string()).unwrap();
+    assert!(matches!(pair.engine.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
+    pair.engine.db().set_state(&key, &v3).unwrap();
+    assert_eq!(pair.engine.db().get_state(&key).unwrap(), Some(v3));
+    let svn = svn_tree(&pair, represented_rev).await;
+    assert_eq!(svn, tracked_tree(&pair.developer));
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_REPRESENTED_CONTENT", "source_commit":source_sha,
+        "pinned_svn_revision":represented_rev, "semantic_receipt":receipt,
+        "old_v2_unverified":true, "full_svn_bytes":tree_hashes(&svn),
+        "full_git_bytes":tree_hashes(&tracked_tree(&pair.developer)),
+        "git_entry":git_output(&pair.developer, &["ls-tree", &source_sha, "origin.txt"])
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r01_target_changes_during_no_delta_proof_blocks_successor() {
+    let pair = QualifiedPair::new().await;
+    let first = pair.developer_commit("origin.txt", "represented first\n", "Regular content first");
+    let successor = pair.developer_commit("later.txt", "queued successor\n", "Queued after first");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let checkout_pause = pair.tmp.path().join("before-checkout");
+    let verify_pause = pair.tmp.path().join("before-verify");
+    std::fs::create_dir(&checkout_pause).unwrap();
+    std::fs::create_dir(&verify_pause).unwrap();
+    let checkout_guard = TestOutboundPause::new("REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT", &first, &pair.bridge, &checkout_pause);
+    let verify_guard = TestOutboundPause::new("REPOSYNC_TEST_BEFORE_NO_TARGET_VERIFY", &first, &pair.bridge, &verify_pause);
+    let old_checkpoint = pair.engine.db().get_repo_watermark("pair").unwrap();
+    let old_mapping_count = pair.snapshot().await.mapping_count;
+    let (result, (represented_rev, mismatched_rev)) = tokio::join!(pair.engine.run_sync_cycle(), async {
+        wait_outbound_pause(&checkout_pause).await;
+        let represented = svn_commit_file(&pair.wc, "origin.txt", "represented first\n", "Independent representation");
+        std::fs::write(checkout_pause.join("release"), b"").unwrap();
+        wait_outbound_pause(&verify_pause).await;
+        let mismatch = svn_commit_file(&pair.wc, "origin.txt", "different newer target\n", "Intervening target change");
+        std::fs::write(verify_pause.join("release"), b"").unwrap();
+        (represented, mismatch)
+    });
+    drop(checkout_guard);
+    drop(verify_guard);
+    assert!(matches!(result,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target"));
+    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap(), old_checkpoint);
+    assert_eq!(pair.snapshot().await.mapping_count, old_mapping_count);
+    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, mismatched_rev);
+    assert_eq!(mismatched_rev, represented_rev + 1);
+    for sha in [&first, &successor] {
+        assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
+        let count: i64 = pair.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+            [sha], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+    let svn = svn_tree(&pair, mismatched_rev).await;
+    assert_eq!(svn["origin.txt"], b"different newer target\n");
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
+        "case":"R01_TARGET_MISMATCH", "first":first, "queued_successor":successor,
+        "represented_revision":represented_rev, "mismatched_revision":mismatched_rev,
+        "failed_without_receipt_or_checkpoint_advance":true,
+        "target_byte_tree":tree_hashes(&svn),
+        "source_git_entry":git_output(&pair.developer, &["ls-tree", &first, "origin.txt"])
     }));
 }
 
