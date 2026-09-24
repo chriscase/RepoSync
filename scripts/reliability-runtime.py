@@ -32,6 +32,11 @@ MANDATORY["candidate"].update({
     "R01_IGNORED_NONCOLLISION",
 })
 MANDATORY["candidate"].update({
+    "R01_OLD_INSTALL_UPGRADE", "R01_NO_TARGET_GIT_CURSOR",
+    "R10_RETENTION_FRONTIER", "R10_RETENTION_PRESENT_KV",
+    "R10_PRIOR_PRUNED_BASELINE",
+})
+MANDATORY["candidate"].update({
     "R01_FAILED_APPLY_BARRIER", "R01_FAILED_APPLY_RETRY",
     "R01_METADATA_ONLY", "R19_UNTOUCHED_TREE", "R19_EXPLICIT_DELETE",
 })
@@ -308,6 +313,17 @@ def main():
         versions += (TESTS / "build-toolchain.txt").read_text()
         (OUTPUT / "tool-versions.txt").write_text(versions)
         return
+    old_tests = Path("/opt/reliability-old-tests")
+    old_binaries = json.loads((old_tests / "binaries.json").read_text())
+    old_generator = old_tests / old_binaries["legacy_import_generator"]
+    assert old_generator.is_file(), "pinned old import generator missing"
+    os.environ["REPOSYNC_OLD_GENERATOR"] = str(old_generator)
+    (OUTPUT / "old-generator-provenance.json").write_text(json.dumps({
+        "old_code_sha": "87379741779a6259f7eeb52a68cc6f061174e5ef",
+        "generator_sha256": digest(old_generator.read_bytes()),
+        "adapter_sha256": (old_tests / "overlay.sha256").read_text().split()[0],
+        "lock_sha256": os.environ["REPOSYNC_LOCK_SHA256"],
+    }, indent=2) + "\n")
     for tier, mandatory in MANDATORY.items():
         actual = {c["id"] for c in manifest[tier]}
         assert mandatory <= actual, f"required {tier} case omitted: {sorted(mandatory - actual)}"

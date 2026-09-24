@@ -11,3 +11,5 @@
 !docs/reliability/fixtures/
 !docs/reliability/fixtures/Cargo.lock
 !docs/reliability/required-cases.json
+!legacy-old/
+!legacy-old/**

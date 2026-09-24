@@ -13,18 +13,26 @@ docker info >/dev/null || { echo "NOT RUN: Docker daemon unavailable" >&2; exit 
 source_head="${REPOSYNC_SOURCE_HEAD_OVERRIDE:-$(git rev-parse HEAD)}"
 source_tree="${REPOSYNC_SOURCE_TREE_OVERRIDE:-$(git rev-parse HEAD^{tree})}"
 context_root="${REPOSYNC_BUILD_CONTEXT:-$repo_root}"
+prepared_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-build-context.XXXXXX")"
+trap 'rm -rf "$prepared_context"' EXIT
+cp "$context_root/Cargo.toml" "$context_root/Dockerfile.reliability" "$context_root/.dockerignore" "$prepared_context/"
+cp -R "$context_root/crates" "$context_root/docs" "$context_root/scripts" "$prepared_context/"
+mkdir "$prepared_context/legacy-old"
+git archive 87379741779a6259f7eeb52a68cc6f061174e5ef | tar -x -C "$prepared_context/legacy-old"
+cp "$repo_root/docs/reliability/fixtures/Cargo.lock" "$prepared_context/legacy-old/Cargo.lock"
+cp "$repo_root/scripts/legacy_import_generator.rs" "$prepared_context/legacy-old/crates/web/tests/legacy_import_generator.rs"
 goal_hash="$(shasum -a 256 docs/reliability/GOAL.md | awk '{print $1}')"
 lock_hash="$(shasum -a 256 docs/reliability/fixtures/Cargo.lock | awk '{print $1}')"
 [[ "$goal_hash" == 16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8 ]] || {
   echo "FAIL: original GOAL.md changed" >&2; exit 1;
 }
 image="reposync-reliability:$source_head"
-docker build --file "$context_root/Dockerfile.reliability" --tag "$image" "$context_root"
+docker build --file "$prepared_context/Dockerfile.reliability" --tag "$image" "$prepared_context"
 artifact_dir="${REPOSYNC_ARTIFACT_DIR:-$repo_root/artifacts/reliability-phase0/$(date -u +%Y%m%dT%H%M%SZ)-${mode#--}}"
 mkdir -p "$artifact_dir"
 chmod 1777 "$artifact_dir"
 host_private="$(mktemp -d "${TMPDIR:-/tmp}/reposync-host-private.XXXXXX")"
-trap 'rm -rf "$host_private"' EXIT
+trap 'rm -rf "$host_private" "$prepared_context"' EXIT
 printf 'synthetic host-private file\n' > "$host_private/canary"
 
 # A real listener in the host namespace must remain unreachable inside the
@@ -40,7 +48,7 @@ with open(sys.argv[1], "w") as output:
 time.sleep(300)
 PY
 listener_pid=$!
-trap 'kill "$listener_pid" 2>/dev/null || true; rm -rf "$host_private"' EXIT
+trap 'kill "$listener_pid" 2>/dev/null || true; rm -rf "$host_private" "$prepared_context"' EXIT
 for _ in {1..50}; do [[ -s "$listener_info" ]] && break; sleep 0.1; done
 [[ -s "$listener_info" ]] || { echo "FAIL: host canary listener unavailable" >&2; exit 1; }
 
