@@ -1279,6 +1279,17 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(engine.db().get_repo_watermark("pair").unwrap(), (svn_only_rev, emitted.clone()));
     assert_eq!(engine.db().get_state("last_git_sha_pair").unwrap(), Some(old_tip.clone()));
     assert_eq!(std::fs::read_to_string(bridge.join("origin.txt")).unwrap(), "post-upgrade SVN\n");
+    let wrong_db = Database::new(&db_path).unwrap();
+    let mut wrong_projection = SyncEngine::new(config.clone(), wrong_db,
+        SvnClient::new(&svn_url, "", ""), GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()));
+    wrong_projection.set_repo_id("pair".into());
+    wrong_projection.set_path_rules(vec!["restricted/".into()], vec![]);
+    assert!(matches!(wrong_projection.run_sync_cycle().await,
+        Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"));
+    assert_eq!(wrong_projection.db().get_repo_watermark("pair").unwrap(), (svn_only_rev, emitted.clone()));
+    assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), emitted);
+    drop(wrong_projection);
     let after_incoming = engine.run_sync_cycle().await.unwrap();
     assert_eq!((after_incoming.svn_to_git_count, after_incoming.git_to_svn_count), (0, 0));
     drop(engine);
@@ -1332,6 +1343,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         "old_install_manifest":original_manifest,
         "prewrite_restore_verified":true, "restore_noop":true,
         "configuration_and_synthetic_credentials_preserved":true,
+        "changed_projection_rejected_without_remote_write":true,
         "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
         "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
         "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),

@@ -447,7 +447,8 @@ impl SyncEngine {
                 // outbound, imported SVN origin, or no-target receipt) and
                 // ancestry to the emitted tip are both proved. Pending Git
                 // ancestors remain in the replay range.
-                if emitted > 0 && (applied_outbound > 0 || svn_origin > 0 || no_target)
+                let old_import_projection = self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
+                if emitted > 0 && (applied_outbound > 0 || (old_import_projection && svn_origin > 0) || no_target)
                     && is_full_git_oid(column.as_deref().unwrap())
                     && is_full_git_oid(kv.as_deref().unwrap())
                 {
@@ -589,6 +590,10 @@ impl SyncEngine {
 
     fn materialize_git_baseline(&self, sha: &str, revision: i64) -> Result<(), SyncError> {
         let Some(rid) = self.effective_repo_id() else { return Ok(()); };
+        // The pinned old import route used the unfiltered projection. Old
+        // applied rows do not encode a policy, so a changed projection cannot
+        // inherit an import baseline without a separate qualification.
+        if !self.allowed_paths.is_empty() || !self.blocked_patterns.is_empty() { return Ok(()); }
         if !is_full_git_oid(sha) || revision <= 0 { return Ok(()); }
         let key = format!("handled_git_baseline_{}", rid);
         if self.db.get_state(&key).map_err(SyncError::DatabaseError)?.is_some() {
