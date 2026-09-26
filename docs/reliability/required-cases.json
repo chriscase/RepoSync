@@ -1,0 +1,474 @@
+{
+  "diagnostics": [
+    {
+      "id": "R02_R03_ROUTE",
+      "binary": "server_freeze",
+      "test": "diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing",
+      "tier": "baseline_observation"
+    },
+    {
+      "id": "R06_CHECKPOINT",
+      "binary": "team_mode_e2e",
+      "test": "diagnostic_r06_late_pair_checkpoint_omits_existing_git_work",
+      "tier": "baseline_observation"
+    }
+  ],
+  "candidate": [
+    {
+      "id": "R09_ORIGINAL",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_original_replacement_fixture_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_REPLACEMENT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_changed_content_rewrite_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_AMEND",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_metadata_amend_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_LINEAR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_two_pending_git_commits_sync_once",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_L_EQUALS_R",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_caught_up_bridge_lagging_cursor_replays",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_SVN_PENDING",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_unchanged_git_still_admits_new_svn_work",
+      "tier": "candidate_admission"
+    },
+    {
+      "id": "R16_MISSING_BRANCH",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r16_missing_remote_branch_blocks_stale_tracking_ref",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R16_TRANSPORT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r16_remote_transport_failure_blocks_without_reset",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R16_AUTH",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r16_auth_denial_is_distinct_from_transport",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R16_FETCH",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r16_fetch_failure_does_not_use_stale_ref",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_MISSING_OBJECT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_missing_checkpoint_object_blocks",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_MISSING_CURSOR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_missing_repository_cursor_does_not_borrow_global",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_AMBIGUOUS",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_ambiguous_repository_cursor_blocks",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_SHALLOW",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_shallow_history_blocks",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_ANCESTRY_ERROR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_ancestry_command_error_is_not_rewrite",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_LOCAL",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_local_dirty_index_and_unpublished_commit_preserved",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_MERGE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_merge_dag_rejected_before_replay",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_OVERFLOW",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_over_1000_pending_commits_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R17_SCOPE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r17_repository_cursors_remain_scoped",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_ALTERNATING_DUAL_CURSOR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_alternating_directional_cursors_survive_restart",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_PENDING_BOTH_DIRECTIONS",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_pending_both_directions_after_legacy_split",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_LEGACY_STALE_COPY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_legacy_stale_copy_requires_mapped_transition",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_OLD_INSTALL_UPGRADE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_NO_TARGET_GIT_CURSOR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_empty_git_no_target_cursor_survives_svn_publication",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_RETENTION_FRONTIER",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_retention_preserves_missing_kv_pending_frontier",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_PRIOR_PRUNED_BASELINE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_prior_pruned_baseline_blocks_without_guessing",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_RETENTION_PRESENT_KV",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_retention_preserves_present_kv_applied_mapping",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_IGNORED_FILE_COLLISION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_ignored_file_collision_preserved",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_IGNORED_DIRECTORY_COLLISION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_ignored_directory_collision_preserved",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_READONLY_INDEX",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_rejection_preserves_raw_index_before_status",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_IGNORED_NONCOLLISION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_ignored_noncollision_allows_qualified_sync",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_FAILED_APPLY_BARRIER",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_failed_apply_stops_before_later_revision",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_FAILED_APPLY_RETRY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_failed_apply_retries_pending_revisions_once",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_METADATA_ONLY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_property_only_revision_has_explicit_no_target_checkpoint",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R19_UNTOUCHED_TREE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r19_untouched_top_level_tree_survives_deltas",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R19_EXPLICIT_DELETE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r19_explicit_svn_delete_only_removes_target",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "EVIDENCE_SCAN_CLEAN",
+      "binary": "evidence_scan",
+      "test": "evidence_scan_clean",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "EVIDENCE_SCAN_CANARY",
+      "binary": "evidence_scan",
+      "test": "evidence_scan_canary",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "EVIDENCE_SCAN_ERROR",
+      "binary": "evidence_scan",
+      "test": "evidence_scan_error",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_POLICY_EQUAL_CURSOR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_policy_equal_cursor_filtered_commit_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_POLICY_SPLIT_CURSOR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_policy_split_cursor_filtered_commit_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_POLICY_KV_ONLY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_policy_kv_only_filtered_commit_rejected",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_NO_TARGET_READ_FAILURE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_no_target_read_failure_preserves_pending_successor",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_NO_TARGET_STAGE_FAILURE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_no_target_stage_failure_preserves_pending_successor",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_VERIFIED_NO_DELTA",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_nonempty_already_represented_delta_is_verified",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_REPRESENTED_CONTENT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_regular_content_already_represented_is_verified",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R01_TARGET_MISMATCH",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r01_target_changes_during_no_delta_proof_blocks_successor",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_PINNED_OLD_TOPOLOGY_INVENTORY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_pinned_old_topology_read_safe_inventory",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_INVENTORY_AUTHORITY_CONFINEMENT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_inventory_authority_and_confined_reads",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "K01_VALID",
+      "binary": "reposync_core",
+      "test": "db::candidate_authority::tests::valid_baseline_and_resolved_frontiers",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "K01_REJECTION",
+      "binary": "reposync_core",
+      "test": "db::candidate_authority::tests::invalid_frontier_evidence_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "K03_ORIGIN",
+      "binary": "reposync_core",
+      "test": "db::candidate_authority::tests::copy_origin_null_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V13_NEVER_USED",
+      "binary": "copy_migration",
+      "test": "v13_never_used",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V13_ROWS",
+      "binary": "copy_migration",
+      "test": "v13_rows",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V13_SPARSE_HIGH",
+      "binary": "copy_migration",
+      "test": "v13_sparse_deleted_high",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V13_EMPTY_USED",
+      "binary": "copy_migration",
+      "test": "v13_empty_used",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V13_LARGE_SEQUENCE",
+      "binary": "copy_migration",
+      "test": "v13_large_sequence",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V13_ROLLBACK",
+      "binary": "copy_migration",
+      "test": "v13_failure_rollback_retry",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V14_OLD_TOPOLOGY",
+      "binary": "copy_migration",
+      "test": "v14_old_topology_qualification",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V14_RESTART",
+      "binary": "copy_migration",
+      "test": "v14_partial_conversion_restart",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "V14_UNQUALIFIED",
+      "binary": "copy_migration",
+      "test": "unqualified_states_preserved",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "MIGRATION_CRASH",
+      "binary": "copy_migration",
+      "test": "migration_crash_restart_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "MIGRATION_WRITE_FAILURE",
+      "binary": "copy_migration",
+      "test": "migration_write_and_constraint_failure",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "MIGRATION_FORGED",
+      "binary": "copy_migration",
+      "test": "migration_forged_shape_and_future",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "COPY_BOUNDARY",
+      "binary": "copy_migration",
+      "test": "copy_boundary_canaries",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "MAPPING_NULL",
+      "binary": "copy_migration",
+      "test": "mapping_null_semantics",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "PINNED_UNQUALIFIED",
+      "binary": "copy_migration",
+      "test": "pinned_unqualified_overlays",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "STARTUP_V12",
+      "binary": "startup_schema",
+      "test": "ordinary_startup_stays_v12",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "L01_STORAGE",
+      "binary": "copy_migration",
+      "test": "copy_storage_alias_rejection",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "L02_ADMISSION",
+      "binary": "copy_migration",
+      "test": "actual_legacy_admission_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "L03_HISTORY",
+      "binary": "reposync_core",
+      "test": "db::candidate_authority::tests::git_baseline_return_and_historical_immutability",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_LOOKUP",
+      "binary": "copy_migration",
+      "test": "typed_reader_lookup_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_LIST",
+      "binary": "copy_migration",
+      "test": "typed_reader_list_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_STATUS",
+      "binary": "copy_migration",
+      "test": "typed_reader_status_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_EMITTED",
+      "binary": "copy_migration",
+      "test": "typed_reader_emitted_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_READONLY",
+      "binary": "copy_migration",
+      "test": "typed_reader_no_write_matrix",
+      "tier": "candidate_regression"
+    }
+  ]
+}

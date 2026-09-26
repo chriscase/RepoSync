@@ -1,0 +1,15 @@
+*
+!Cargo.toml
+!crates/
+!crates/**
+!scripts/
+!scripts/reliability-prep.py
+!scripts/reliability-runtime.py
+!scripts/reliability_scan.py
+!docs/
+!docs/reliability/
+!docs/reliability/fixtures/
+!docs/reliability/fixtures/Cargo.lock
+!docs/reliability/required-cases.json
+!legacy-old/
+!legacy-old/**

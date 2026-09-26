@@ -239,6 +239,10 @@ pub enum SyncError {
     #[error("sync already in progress (started at {started_at})")]
     AlreadyRunning { started_at: String },
 
+    /// A repository-scoped team history inspection refused unsafe replay.
+    #[error("team history reconciliation required ({reason}): {detail}")]
+    HistoryBlocked { reason: String, detail: String },
+
     /// The sync detected an unresolvable conflict.
     #[error("unresolvable conflict on '{file_path}': {detail}")]
     UnresolvableConflict { file_path: String, detail: String },

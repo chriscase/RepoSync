@@ -110,6 +110,17 @@ impl SvnClient {
         self.run_svn(&["diff", "-r", &rev_range, &peg_url]).await
     }
 
+    /// Inspect file-content changes without SVN properties when deciding
+    /// whether a revision has any Git-representable target delta.
+    pub async fn diff_content_only(&self, rev: i64) -> Result<String, SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let rev_range = format!("{}:{}", rev - 1, rev);
+        let peg_url = format!("{}@{}", self.url, rev);
+        self.run_svn(&["diff", "--ignore-properties", "-r", &rev_range, &peg_url]).await
+    }
+
     #[instrument(skip(self), fields(url = %self.url, rev))]
     pub async fn checkout(&self, path: &Path, rev: i64) -> Result<(), SvnError> {
         let rev_str = rev.to_string();
@@ -291,6 +302,14 @@ impl SvnClient {
             .await?;
         info!(dest = %dest.display(), rev, "svn export completed");
         Ok(())
+    }
+
+    /// Enumerate properties on one file at a pinned revision. The no-target
+    /// verifier conservatively refuses any property until its mapping is
+    /// explicitly defined; export alone does not include property evidence.
+    pub async fn file_properties_at_rev(&self, path: &str, rev: i64) -> Result<String, SvnError> {
+        let url = format!("{}/{}@{}", self.url.trim_end_matches('/'), path, rev);
+        self.run_svn(&["proplist", "--xml", "-r", &rev.to_string(), &url]).await
     }
 
     /// Export at a given depth (e.g. "immediates" for top-level only).

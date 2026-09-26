@@ -1265,3 +1265,196 @@ async fn test_commit_map_no_repo_id_does_not_deadlock() {
         }
     }
 }
+
+/// R02/R03 baseline API diagnostic with real disposable SVN and Git remotes.
+/// The import progress represents the actual per-repository route's in-memory
+/// state; import subprocess cancellation stages remain outside this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing() {
+    use std::process::Command;
+    use reposync_core::import::ImportPhase;
+    assert!(
+        Command::new("svnadmin").arg("--version").output().is_ok(),
+        "svnadmin required"
+    );
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    if let Ok(root) = std::env::var("REPOSYNC_FIXTURE_ROOT") {
+        let root = std::path::Path::new(&root).canonicalize().unwrap();
+        let target = tmp.path().canonicalize().unwrap();
+        assert!(target.starts_with(root), "API fixture target escaped owned root");
+    }
+    let svn_repo = tmp.path().join("svn-fixture");
+    let created = Command::new("svnadmin")
+        .args(["create", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let svn_url = format!("file://{}", svn_repo.display());
+    let created = Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/trunk"),
+            "-m",
+            "SVN fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let git_work = tmp.path().join("git-fixture");
+    let git_bare = tmp.path().join("git-origin.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", git_bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["init", "-b", "main", git_work.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(git_work.join("fixture.txt"), "preserve remote history\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&git_work)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["add", "fixture.txt"]);
+    git(&["commit", "-m", "Fixture"]);
+    git(&["remote", "add", "origin", git_bare.to_str().unwrap()]);
+    git(&["push", "origin", "main"]);
+    let git_before = Command::new("git")
+        .args([
+            "--git-dir",
+            git_bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(git_before.status.success());
+
+    // The provider is a loopback-only HTTP fixture. Its SHA is read from the
+    // actual disposable bare Git ref rather than a made-up response value.
+    git(&["checkout", "-b", "feature"]);
+    std::fs::write(git_work.join("feature.txt"), "step one\n").unwrap();
+    git(&["add", "feature.txt"]);
+    git(&["commit", "-m", "Feature step one"]);
+    std::fs::write(git_work.join("feature.txt"), "step two\n").unwrap();
+    git(&["commit", "-am", "Feature step two"]);
+    git(&["push", "origin", "feature"]);
+    let feature_tip = Command::new("git").args(["--git-dir", git_bare.to_str().unwrap(), "rev-parse", "refs/heads/feature"]).output().unwrap();
+    assert!(feature_tip.status.success());
+    let feature_tip = String::from_utf8_lossy(&feature_tip.stdout).trim().to_string();
+    let branches_url = format!("{svn_url}/branches");
+    let target_url = format!("{branches_url}/feature");
+    let out = Command::new("svn").args(["mkdir", &branches_url, "-m", "Branches", "--non-interactive"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("svn").args(["copy", &format!("{svn_url}/trunk"), &target_url, "-m", "Feature target", "--non-interactive"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let svn_before = Command::new("svnlook").args(["youngest", svn_repo.to_str().unwrap()]).output().unwrap();
+    assert!(svn_before.status.success());
+    let provider_sha = feature_tip.clone();
+    let provider = axum::Router::new().route("/api/v1/repos/local/fixture/branches/feature", axum::routing::get(move || {
+        let sha = provider_sha.clone();
+        async move { axum::Json(serde_json::json!({"commit":{"id":sha}})) }
+    }));
+    let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_addr = provider_listener.local_addr().unwrap();
+    assert!(provider_addr.ip().is_loopback(), "provider endpoint must be enrolled loopback");
+    let provider_handle = tokio::spawn(async move { axum::serve(provider_listener, provider).await.unwrap(); });
+
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let response = client.post(format!("{base}/api/repos"))
+        .json(&serde_json::json!({"name":"fixture", "svn_url":svn_url, "svn_branch":"trunk", "git_provider":"gitea", "git_api_url":format!("http://{provider_addr}/api/v1"), "git_repo":"local/fixture", "git_branch":"main"}))
+        .send().await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "create: {}",
+        response.status()
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    let id = body["id"].as_str().unwrap();
+
+    let pair = client.post(format!("{base}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({"svn_branch":"branches/feature", "git_branch":"feature", "skip_import":true, "auto_create_svn_branch":false, "auto_create_git_branch":false}))
+        .send().await.unwrap();
+    assert!(pair.status().is_success(), "late pair: {}", pair.text().await.unwrap());
+    let pair: serde_json::Value = pair.json().await.unwrap();
+    assert_eq!(pair["last_git_sha"], feature_tip);
+    assert!(pair["last_svn_rev"].as_i64().unwrap() > 0);
+    let pair_id = pair["id"].as_str().unwrap();
+    assert_eq!(state.db.get_repo_watermark(pair_id).unwrap().1, feature_tip);
+    assert!(state.db.list_commit_map(100).unwrap().is_empty());
+    let svn_tree = Command::new("svn").args(["list", &target_url, "--non-interactive"]).output().unwrap();
+    assert!(svn_tree.status.success());
+    assert!(!String::from_utf8_lossy(&svn_tree.stdout).contains("feature.txt"));
+    eprintln!("EXPECTED BASELINE FAILURE R06 API: skip_import recorded provider ref {feature_tip} while disposable SVN target had no feature.txt and no mapping");
+
+    let progress = state.get_repo_import_progress(id).await;
+    progress.write().await.phase = ImportPhase::Importing;
+    let cancel = client
+        .post(format!("{base}/api/repos/{id}/import/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), reqwest::StatusCode::NOT_FOUND);
+    let status: serde_json::Value = client
+        .get(format!("{base}/api/repos/{id}/import/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["phase"], "importing");
+    assert!(!progress.read().await.cancel_requested);
+
+    let delete = client
+        .delete(format!("{base}/api/repos/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(delete.status().is_success());
+    let delete_body: serde_json::Value = delete.json().await.unwrap();
+    assert_eq!(delete_body["message"], "repository disabled");
+    assert!(!state.db.get_repository(id).unwrap().unwrap().enabled);
+    assert!(state.db.get_repository(id).unwrap().is_some());
+    let svn_after = Command::new("svnlook")
+        .args(["youngest", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let git_after = Command::new("git")
+        .args([
+            "--git-dir",
+            git_bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(svn_before.stdout, svn_after.stdout);
+    assert_eq!(git_before.stdout, git_after.stdout);
+    eprintln!("BASELINE OBSERVATION R02/R03: root DELETE retained disabled registration; per-repo cancel returned 404 while progress remained importing. Remote SVN r{} and Git ref {} unchanged.", String::from_utf8_lossy(&svn_after.stdout).trim(), String::from_utf8_lossy(&git_after.stdout).trim());
+    server.abort();
+    provider_handle.abort();
+}

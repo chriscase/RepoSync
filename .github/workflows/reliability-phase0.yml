@@ -1,0 +1,42 @@
+name: Reliability Phase 0 diagnostics
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Run fixture-only real-engine and API diagnostics
+        run: scripts/reliability-container.sh --all
+      - name: Compare exact reviewed base with matching dependencies
+        run: scripts/reliability-compare.sh
+      - name: Verify complete evidence before publication
+        id: evidence_scan
+        if: always()
+        run: |
+          cp docs/reliability/review/review-8-reproductions.json artifacts/review8-reproductions.json
+          python3 scripts/reliability_scan.py --scan artifacts \
+            --status-file artifacts/evidence-scan-status.json
+      - name: Preserve fixture-only evidence
+        if: always() && steps.evidence_scan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-phase0-${{ github.sha }}
+          path: |
+            artifacts/reliability-phase0/
+            artifacts/reliability-compare/
+            artifacts/evidence-scan-status.json
+            artifacts/review8-reproductions.json
+          retention-days: 14
+          if-no-files-found: warn
