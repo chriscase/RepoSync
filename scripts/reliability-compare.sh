@@ -7,15 +7,19 @@ base_sha=87379741779a6259f7eeb52a68cc6f061174e5ef
 previous_sha=f74fce855a1f1d80dd631397f436ba33906272e6
 base_tree="$(git rev-parse "$base_sha^{tree}")"
 previous_tree="$(git rev-parse "$previous_sha^{tree}")"
+immediate_sha=9f6330e1e3dad7d8917b432d9d367665641a5227
+immediate_tree="$(git rev-parse "$immediate_sha^{tree}")"
 candidate_sha="$(git rev-parse HEAD)"
 candidate_tree="$(git rev-parse HEAD^{tree})"
 comparison_dir="$repo_root/artifacts/reliability-compare/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$comparison_dir/base" "$comparison_dir/previous" "$comparison_dir/candidate"
+mkdir -p "$comparison_dir/base" "$comparison_dir/previous" "$comparison_dir/immediate" "$comparison_dir/candidate"
 base_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-reviewed-base.XXXXXX")"
 previous_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-previous-head.XXXXXX")"
-trap 'rm -rf "$base_context" "$previous_context"' EXIT
+immediate_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-immediate-reviewed.XXXXXX")"
+trap 'rm -rf "$base_context" "$previous_context" "$immediate_context"' EXIT
 git archive "$base_sha" | tar -x -C "$base_context"
 git archive "$previous_sha" | tar -x -C "$previous_context"
+git archive "$immediate_sha" | tar -x -C "$immediate_context"
 
 # This overlay changes no base runtime source. The old test fixture needs an
 # explicit synthetic SVN author when running as the container's numeric user.
@@ -40,6 +44,11 @@ cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliabilit
 cp docs/reliability/fixtures/Cargo.lock "$previous_context/docs/reliability/fixtures/"
 cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$previous_context/docs/reliability/"
 
+cp Dockerfile.reliability .dockerignore "$immediate_context/"
+cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py "$immediate_context/scripts/"
+cp docs/reliability/fixtures/Cargo.lock "$immediate_context/docs/reliability/fixtures/"
+cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$immediate_context/docs/reliability/"
+
 REPOSYNC_BUILD_CONTEXT="$base_context" \
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$base_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$base_tree" \
@@ -50,6 +59,11 @@ REPOSYNC_SOURCE_HEAD_OVERRIDE="$previous_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$previous_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/previous" \
   scripts/reliability-container.sh --baseline
+REPOSYNC_BUILD_CONTEXT="$immediate_context" \
+REPOSYNC_SOURCE_HEAD_OVERRIDE="$immediate_sha" \
+REPOSYNC_SOURCE_TREE_OVERRIDE="$immediate_tree" \
+REPOSYNC_ARTIFACT_DIR="$comparison_dir/immediate" \
+  scripts/reliability-container.sh --baseline
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$candidate_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$candidate_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/candidate" \
@@ -59,3 +73,5 @@ python3 scripts/reliability-compare.py "$comparison_dir/base/baseline-results.js
 python3 scripts/reliability-compare.py "$comparison_dir/previous/baseline-results.json" \
   "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/previous-comparison.json"
 echo "Matched comparison artifact: $comparison_dir"
+python3 scripts/reliability-compare.py "$comparison_dir/immediate/baseline-results.json" \
+  "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/immediate-comparison.json"

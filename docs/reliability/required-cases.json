@@ -421,6 +421,54 @@
       "binary": "startup_schema",
       "test": "ordinary_startup_stays_v12",
       "tier": "candidate_regression"
+    },
+    {
+      "id": "L01_STORAGE",
+      "binary": "copy_migration",
+      "test": "copy_storage_alias_rejection",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "L02_ADMISSION",
+      "binary": "copy_migration",
+      "test": "actual_legacy_admission_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "L03_HISTORY",
+      "binary": "reposync_core",
+      "test": "db::candidate_authority::tests::git_baseline_return_and_historical_immutability",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_LOOKUP",
+      "binary": "copy_migration",
+      "test": "typed_reader_lookup_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_LIST",
+      "binary": "copy_migration",
+      "test": "typed_reader_list_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_STATUS",
+      "binary": "copy_migration",
+      "test": "typed_reader_status_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_EMITTED",
+      "binary": "copy_migration",
+      "test": "typed_reader_emitted_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "T54_READONLY",
+      "binary": "copy_migration",
+      "test": "typed_reader_no_write_matrix",
+      "tier": "candidate_regression"
     }
   ]
 }

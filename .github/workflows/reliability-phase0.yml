@@ -25,6 +25,7 @@ jobs:
         id: evidence_scan
         if: always()
         run: |
+          cp docs/reliability/review/review-8-reproductions.json artifacts/review8-reproductions.json
           python3 scripts/reliability_scan.py --scan artifacts \
             --status-file artifacts/evidence-scan-status.json
       - name: Preserve fixture-only evidence
@@ -36,5 +37,6 @@ jobs:
             artifacts/reliability-phase0/
             artifacts/reliability-compare/
             artifacts/evidence-scan-status.json
+            artifacts/review8-reproductions.json
           retention-days: 14
           if-no-files-found: warn
