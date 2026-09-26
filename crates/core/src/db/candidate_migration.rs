@@ -148,7 +148,7 @@ fn expected_shape(v: i64) -> Result<Vec<String>> {
     }
     shape(&c)
 }
-fn check_shape(c: &Connection, v: i64) -> Result<()> {
+pub(crate) fn check_shape(c: &Connection, v: i64) -> Result<()> {
     ensure!(
         [12, 13, 14].contains(&v),
         "unsupported candidate version {v}"
@@ -165,7 +165,7 @@ pub struct FileSeal {
     pub sha256: String,
     pub mode: u32,
 }
-fn manifest(root: &Path, allow_sidecars: bool) -> Result<BTreeMap<String, FileSeal>> {
+pub(crate) fn manifest(root: &Path, allow_sidecars: bool) -> Result<BTreeMap<String, FileSeal>> {
     fn visit(
         root: &Path,
         p: &Path,
@@ -232,7 +232,7 @@ fn owned_root(path: &Path) -> Result<PathBuf> {
     }
     Ok(canonical)
 }
-fn source_db(path: &Path) -> Result<Connection> {
+pub(crate) fn source_db(path: &Path) -> Result<Connection> {
     ensure!(
         !path
             .to_str()
@@ -276,6 +276,7 @@ pub struct CopySession {
     source: PathBuf,
     copy: PathBuf,
     storage: (StorageIdentity, StorageIdentity),
+    v14_shape: Vec<String>,
     seal: BTreeMap<String, FileSeal>,
     legacy: Legacy,
     names: Vec<String>,
@@ -310,6 +311,7 @@ impl CopySession {
             source,
             copy,
             storage,
+            v14_shape: expected_shape(14)?,
             seal,
             legacy,
             names,
@@ -319,6 +321,9 @@ impl CopySession {
         session.check_files()?;
         Ok(session)
     }
+    pub(crate) fn copy_path(&self)->&Path { &self.copy }
+    pub(crate) fn check_reader_shape(&self,c:&Connection)->Result<()> { ensure!(shape(c)?==self.v14_shape,"typed reader physical schema mismatch"); Ok(()) }
+    pub fn readers(&self)->Result<super::candidate_readers::CopyReaders<'_>> { super::candidate_readers::CopyReaders::open(self) }
     pub fn source_seal(&self) -> &BTreeMap<String, FileSeal> {
         &self.seal
     }
@@ -329,7 +334,7 @@ impl CopySession {
         );
         Ok(())
     }
-    fn check_files(&self) -> Result<()> {
+    pub(crate) fn check_files(&self) -> Result<()> {
         ensure!(independent_storage(&self.source,&self.copy)? == self.storage, "sealed DB storage replaced");
         self.source_unchanged()?;
         let mut actual = manifest(&self.copy, true)?;
@@ -1027,7 +1032,9 @@ pub enum MappingLookup {
     LegacyOwnerless,
     Missing,
 }
-/// #54's distinct read semantics, scoped to an explicitly named generation.
+/// Retained prototype/display compatibility for the original MAPPING_NULL case.
+/// `Mapped` here is a legacy display value, never generation-qualified authority.
+/// Canonical #54 consumers must use CopySession::readers().lookup instead.
 /// This does not change legacy operational readers or activate candidate DBs.
 pub fn lookup_mapping(
     c: &Connection,

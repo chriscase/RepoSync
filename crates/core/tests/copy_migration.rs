@@ -827,3 +827,118 @@ fn actual_legacy_admission_matrix() {
     assert_eq!(fs::read(original.join("reposync.db")).unwrap(),original_bytes); assert_eq!(endpoint_files(&root),endpoints);
     eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"L02_ADMISSION","overlays":matrix,"exact_prefix_ownership":true,"benign_global_not_authority":true,"original_and_endpoints_unchanged":true}));
 }
+
+use reposync_core::db::candidate_readers::{Canonical, Direction, Raw, Scope, Source, Target};
+fn reader_fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf, CopySession, String) {
+    use reposync_core::db::candidate_authority::{advance_frontier,ResolvedTransition};
+    let (t,root,provenance)=old_topology();let source=root.join("install");let target=t.path().join("reader-copy");copy(&source,&target);
+    let session=qualified(&source,&target,&root);session.migrate(14,&mut |_,_,_|Ok(())).unwrap();
+    let mut c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let policy:String=c.query_row("SELECT policy_sha256 FROM pair_lineages WHERE repo_id='pair' AND generation=1",[],|r|r.get(0)).unwrap();
+    let baseline=provenance["pair"]["git_sha"].as_str().unwrap().to_string();
+    for (id,dir,pre,svn,git,outcome,target_git,target_svn) in [
+        ("read-in-applied","svn_to_git","svn:2".to_string(),Some(3),None,"applied_verified",Some("d".repeat(40)),None),
+        ("read-in-empty","svn_to_git","svn:3".to_string(),Some(4),None,"empty_no_target",None,None),
+        ("read-out-applied","git_to_svn",format!("git:{baseline}"),None,Some("e".repeat(40)),"applied_verified",None,Some(3)),
+        ("read-out-empty","git_to_svn",format!("git:{}","e".repeat(40)),None,Some("f".repeat(40)),"semantic_no_delta",None,None),
+    ] {
+        advance_frontier(&mut c,&ResolvedTransition{id:id.into(),repo_id:"pair".into(),generation:1,direction:dir.into(),predecessor_source_key:pre,source_svn_rev:svn,source_git_sha:git,outcome:outcome.into(),target_git_sha:target_git,target_svn_rev:target_svn,projection_version:1,policy_sha256:policy.clone(),evidence_json:"{\"labeled_structural_fixture_evidence\":true}".into()}).unwrap();
+        if id=="read-in-applied" || id=="read-out-applied" {
+            for (oid,key,rev,sha,kind,pred) in if dir=="svn_to_git" {
+                vec![("pending-in","svn:5".into(),Some(5),None,"pending","svn:3".into()),("unknown-in","svn:8".into(),Some(8),None,"effect_unknown","svn:3".into())]
+            }else{vec![("pending-out",format!("git:{}","a".repeat(40)),None,Some("a".repeat(40)),"pending",format!("git:{}","e".repeat(40))),("unknown-out",format!("git:{}","c".repeat(40)),None,Some("c".repeat(40)),"effect_unknown",format!("git:{}","e".repeat(40)))]} {
+                c.execute("INSERT INTO pair_outcomes VALUES(?1,'pair',1,?2,?3,?4,?5,?6,?7,NULL,NULL,1,?8,'{}')",rusqlite::params![oid,dir,key,pred,rev,sha,kind,policy]).unwrap();
+            }
+        }
+    }
+    for (id,rev,sha,dir,interpretation) in [
+        (200,3,Some("d".repeat(40)),"svn_to_git",Some("proved_typed_applied")),
+        (201,4,None,"svn_to_git",Some("proved_typed_no_target")),
+        (202,3,Some("e".repeat(40)),"git_to_svn",Some("proved_typed_applied")),
+        (203,5,None,"svn_to_git",None),
+        (204,6,Some("malformed-retained-display".into()),"svn_to_git",None),
+    ]{
+        c.execute("INSERT INTO commit_map(id,svn_rev,git_sha,direction,synced_at,repo_id) VALUES(?1,?2,?3,?4,'t','pair')",rusqlite::params![id,rev,sha,dir]).unwrap();
+        if let Some(i)=interpretation{c.execute("INSERT INTO legacy_evidence_links VALUES('pair',1,'commit_map',?1,?2)",rusqlite::params![id.to_string(),i]).unwrap();}
+    }
+    c.execute("INSERT INTO commit_map(id,svn_rev,git_sha,direction,synced_at,repo_id) VALUES(205,7,NULL,'svn_to_git','t',NULL)",[]).unwrap();
+    drop(c);(t,root,target,session,baseline)
+}
+fn reader_proof(id:&str,root:&Path,target:&Path,session:&CopySession,run:impl FnOnce(&reposync_core::db::candidate_readers::CopyReaders<'_>)) {
+    let db_bytes=fs::read(target.join("reposync.db")).unwrap();let endpoints=endpoint_files(root);let source_seal=session.source_seal().clone();
+    let readers=session.readers().unwrap();run(&readers);drop(readers);
+    assert!(fs::read(target.join("reposync.db")).unwrap()==db_bytes);assert_eq!(version(target),14);session.source_unchanged().unwrap();assert_eq!(session.source_seal(),&source_seal);assert_eq!(endpoint_files(root),endpoints);
+    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":id,"copy_db_bytes_and_version_unchanged":true,"sealed_source_config_refs_unchanged":true,"endpoints_unchanged":true,"explicit_generation":true,"read_only_immutable_connection":true}));
+}
+#[test]
+fn typed_reader_lookup_matrix(){
+    let (_t,root,target,session,baseline)=reader_fixture();
+    reader_proof("T54_LOOKUP",&root,&target,&session,|r|{
+        let incoming=r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(3)).unwrap();
+        assert_eq!(incoming.canonical,Canonical::Mapped{target:Target::Git("d".repeat(40)),authority:"read-in-applied".into()});assert_eq!(incoming.legacy.len(),1);
+        let outgoing=r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Git("e".repeat(40))).unwrap();assert_eq!(outgoing.canonical,Canonical::Mapped{target:Target::Svn(3),authority:"read-out-applied".into()});assert_eq!(outgoing.legacy.len(),1);
+        assert_eq!(r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap().canonical,Canonical::NoTarget{outcome:"empty_no_target".into(),authority:"read-in-empty".into()});
+        assert_eq!(r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Git("f".repeat(40))).unwrap().canonical,Canonical::NoTarget{outcome:"semantic_no_delta".into(),authority:"read-out-empty".into()});
+        for generation in [None,Some(2)]{let got=r.lookup("pair",generation,Direction::SvnToGit,&Source::Svn(3)).unwrap();assert_eq!(got.scope,Scope::MissingGeneration(generation));assert!(matches!(got.canonical,Canonical::Unresolved(_)));assert_eq!(got.legacy[0].values[2],Raw::Text("d".repeat(40)));}
+        assert_eq!(r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Git(baseline.clone())).unwrap().canonical,Canonical::HandledBaselineWithoutEmittedEffect);
+        assert!(matches!(r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(5)).unwrap().canonical,Canonical::Unresolved(_)));
+        assert_eq!(r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(8)).unwrap().canonical,Canonical::Missing);
+        assert_eq!(r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(99)).unwrap().canonical,Canonical::Missing);
+        assert_eq!(r.lookup("pair_two",Some(1),Direction::SvnToGit,&Source::Svn(3)).unwrap().canonical,Canonical::Missing);
+        let malformed=r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(6)).unwrap();assert!(matches!(malformed.canonical,Canonical::Unresolved(_)));assert_eq!(malformed.legacy[0].values[2],Raw::Text("malformed-retained-display".into()));
+        assert!(matches!(r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(7)).unwrap().canonical,Canonical::Unresolved(_)));
+        assert!(r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Svn(3)).is_err());
+    });
+    // Explicitly revoke the fixture link and introduce a duplicate, in labeled
+    // copied state only. Both remain displayable and cannot be selected as truth.
+    let db=Connection::open(target.join("reposync.db")).unwrap();db.execute("UPDATE commit_map SET git_sha='contradicts-linked-outcome' WHERE id=200",[]).unwrap();drop(db);
+    assert!(matches!(session.readers().unwrap().lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(3)).unwrap().canonical,Canonical::Unresolved(_)));
+    let db=Connection::open(target.join("reposync.db")).unwrap();db.execute("UPDATE commit_map SET git_sha=?1 WHERE id=200",["d".repeat(40)]).unwrap();db.execute("DELETE FROM legacy_evidence_links WHERE legacy_table='commit_map' AND legacy_key IN ('200','201')",[]).unwrap();drop(db);
+    assert!(matches!(session.readers().unwrap().lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap().canonical,Canonical::Unresolved(_)));
+    assert!(matches!(session.readers().unwrap().lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(3)).unwrap().canonical,Canonical::Unresolved(_)));
+    let db=Connection::open(target.join("reposync.db")).unwrap();db.execute("INSERT INTO commit_map(svn_rev,git_sha,direction,synced_at,repo_id) VALUES(4,NULL,'svn_to_git','t','pair')",[]).unwrap();drop(db);
+    let got=session.readers().unwrap().lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap();assert_eq!(got.legacy.len(),2);assert_eq!(got.canonical,Canonical::Unresolved("ambiguous_owned_legacy_rows".into()));
+}
+#[test]
+fn typed_reader_list_matrix(){
+    let (_t,root,target,session,_)=reader_fixture();
+    let db=Connection::open(target.join("reposync.db")).unwrap();let expected:Vec<i64>=db.prepare("SELECT id FROM commit_map ORDER BY id").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();drop(db);
+    reader_proof("T54_LIST",&root,&target,&session,|r|{
+        let mut actual=Vec::new();let mut after=0;
+        loop{let p=r.legacy_page(after,2).unwrap();if p.is_empty(){break}after=p.last().unwrap().id;actual.extend(p.into_iter().map(|r|r.id));}assert_eq!(actual,expected);
+        let p=r.list("pair",Some(1),Direction::SvnToGit,199,2).unwrap();assert_eq!(p.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![200,201]);assert_eq!(p.next_after_id,Some(201));assert!(matches!(p.rows[1].canonical,Canonical::NoTarget{..}));
+        let p2=r.list("pair",Some(1),Direction::SvnToGit,201,2).unwrap();assert_eq!(p2.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![203,204]);assert!(p2.rows.iter().all(|x|matches!(x.canonical,Canonical::Unresolved(_))));
+        let p3=r.list("pair",Some(1),Direction::SvnToGit,204,2).unwrap();assert_eq!(p3.rows.len(),1);assert_eq!(p3.rows[0].legacy.id,205);assert_eq!(p3.rows[0].legacy.values[2],Raw::Null);assert!(matches!(p3.rows[0].canonical,Canonical::Unresolved(_)));
+        assert!(r.legacy_page(0,0).is_err());assert!(r.list("pair",None,Direction::SvnToGit,0,201).is_err());
+    });
+}
+#[test]
+fn typed_reader_status_matrix(){
+    let (_t,root,target,session,_)=reader_fixture();
+    reader_proof("T54_STATUS",&root,&target,&session,|r|{
+        let status=r.status("pair",Some(1)).unwrap();assert_eq!(status.scope,Scope::Qualified(1));assert_eq!(status.enabled,Some(true));assert_eq!(status.frontiers.len(),2);
+        let incoming=&status.frontiers[0];assert_eq!(incoming.handled,Source::Svn(4));assert_eq!(incoming.current_target,None);assert_eq!(incoming.last_emitted.target,Some(Target::Git("d".repeat(40))));
+        let outgoing=&status.frontiers[1];assert_eq!(outgoing.handled,Source::Git("f".repeat(40)));assert_eq!(outgoing.current_target,None);assert_eq!(outgoing.last_emitted.target,Some(Target::Svn(3)));
+        assert_eq!(r.status("pair_disabled",Some(1)).unwrap().scope,Scope::Disabled);
+        for g in [None,Some(99)]{let status=r.status("pair",g).unwrap();assert_eq!(status.scope,Scope::MissingGeneration(g));assert!(status.frontiers.is_empty());}
+        assert_eq!(r.status("missing",Some(1)).unwrap().scope,Scope::MissingRepository);
+    });
+    let db=Connection::open(target.join("reposync.db")).unwrap();db.execute("UPDATE repo_migration_state SET disposition='needs_reconciliation' WHERE repo_id='pair'",[]).unwrap();drop(db);
+    let status=session.readers().unwrap().status("pair",Some(1)).unwrap();assert_eq!(status.scope,Scope::NotQualified("needs_reconciliation".into()));assert!(status.frontiers.is_empty());
+}
+#[test]
+fn typed_reader_emitted_matrix(){
+    let (_t,root,target,session,_)=reader_fixture();
+    reader_proof("T54_EMITTED",&root,&target,&session,|r|{
+        for (d,target,authority,nonhandled) in [(Direction::SvnToGit,Target::Git("d".repeat(40)),"read-in-applied",vec![("pending-in".into(),"pending".into()),("unknown-in".into(),"effect_unknown".into())]),(Direction::GitToSvn,Target::Svn(3),"read-out-applied",vec![("pending-out".into(),"pending".into()),("unknown-out".into(),"effect_unknown".into())])]{let emitted=r.last_emitted("pair",Some(1),d).unwrap();assert_eq!(emitted.target,Some(target));assert_eq!(emitted.authority.as_deref(),Some(authority));assert_eq!(emitted.nonhandled_records,nonhandled);}
+        assert_eq!(r.last_emitted("pair_two",Some(1),Direction::GitToSvn).unwrap().target,None);
+        assert!(matches!(r.last_emitted("pair_two",Some(1),Direction::SvnToGit).unwrap().target,Some(Target::Git(_))));
+        assert_eq!(r.last_emitted("pair",Some(2),Direction::SvnToGit).unwrap().target,None);
+    });
+}
+#[test]
+fn typed_reader_no_write_matrix(){
+    let (_t,root,target,session,_)=reader_fixture();
+    reader_proof("T54_READONLY",&root,&target,&session,|r|{for _ in 0..2{r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap();r.list("pair",Some(1),Direction::SvnToGit,0,200).unwrap();r.legacy_page(0,200).unwrap();r.status("pair",Some(1)).unwrap();r.last_emitted("pair",Some(1),Direction::GitToSvn).unwrap();}});
+    let before=fs::read(target.join("reposync.db")).unwrap();fs::write(target.join("reposync.db-journal"),b"not-quiescent").unwrap();assert!(session.readers().is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==before);session.source_unchanged().unwrap();
+}
