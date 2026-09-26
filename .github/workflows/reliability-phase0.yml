@@ -22,11 +22,13 @@ jobs:
       - name: Compare exact reviewed base with matching dependencies
         run: scripts/reliability-compare.sh
       - name: Verify complete evidence before publication
+        id: evidence_scan
+        if: always()
         run: |
           python3 scripts/reliability_scan.py --scan artifacts \
             --status-file artifacts/evidence-scan-status.json
       - name: Preserve fixture-only evidence
-        if: success()
+        if: always() && steps.evidence_scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: reliability-phase0-${{ github.sha }}
