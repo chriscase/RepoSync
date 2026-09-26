@@ -86,6 +86,9 @@ impl ResolvedTransition {
 /// Single checked writer for a later frontier. This offline component does not
 /// qualify external effects or select an active generation. Callers must name
 /// the exact generation and supply separately verified, pinned evidence.
+/// A matching predecessor label is structural continuity, not a Git ancestry
+/// proof. Unknown Git ancestry/backward order must be rejected by that separate
+/// qualification before calling this writer; no ancestry graph is inferred here.
 pub fn advance_frontier(c: &mut Connection, r: &ResolvedTransition) -> Result<()> {
     ensure!(
         c.pragma_query_value::<i64, _>(None, "foreign_keys", |row| row.get(0))? == 1,
@@ -110,6 +113,9 @@ pub fn advance_frontier(c: &mut Connection, r: &ResolvedTransition) -> Result<()
     ensure!(current == r.predecessor_source_key, "stale predecessor");
     let source = r.source_key()?;
     ensure!(source != current, "source already handled");
+    let baseline:String=tx.query_row("SELECT CASE ?3 WHEN 'git_to_svn' THEN 'git:'||baseline_git_sha ELSE 'svn:'||baseline_svn_rev END FROM pair_lineages WHERE repo_id=?1 AND generation=?2",params![r.repo_id,r.generation,r.direction],|row|row.get(0))?;
+    ensure!(source!=baseline,"source already handled by baseline");
+    ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM pair_outcomes WHERE repo_id=?1 AND generation=?2 AND direction=?3 AND source_key=?4)",params![r.repo_id,r.generation,r.direction,source],|row|row.get::<_,bool>(0))?,"source already recorded");
     tx.execute(
         "INSERT INTO pair_outcomes VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
@@ -292,6 +298,7 @@ mod tests {
                 }
                 _ => {}
             }
+            if failure == "predecessor" { t.predecessor_source_key="svn:1".into(); }
             let source = t.source_key().unwrap();
             let inserted = c.execute(
                 "INSERT INTO pair_outcomes VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
@@ -323,13 +330,6 @@ mod tests {
             } else {
                 "outcome"
             };
-            if failure == "predecessor" {
-                c.execute(
-                    "UPDATE pair_outcomes SET predecessor_source_key='svn:1'",
-                    [],
-                )
-                .unwrap();
-            }
             let rejected=c.execute("UPDATE pair_frontiers SET source_key='svn:3',handled_svn_rev=3,emitted_git_sha=?1,authority_kind=?2,evidence_outcome_id=?3 WHERE repo_id='one' AND generation=1 AND direction='svn_to_git'",params!["d".repeat(40),authority,evidence]).is_err();
             assert!(rejected, "{failure}; inserted={inserted:?}");
             assert_eq!(snapshot(&c), before, "{failure}");
@@ -389,4 +389,25 @@ mod tests {
             serde_json::json!({"case":"K03_ORIGIN","matrix":results,"mandatory_null_rejected":true})
         );
     }
+    #[test]
+    fn git_baseline_return_and_historical_immutability() {
+        let mut c=db();
+        let mut t=transition();t.direction="git_to_svn".into();t.source_svn_rev=None;t.target_git_sha=None;t.target_svn_rev=Some(3);
+        t.predecessor_source_key=format!("git:{}","b".repeat(40));t.source_git_sha=Some("e".repeat(40));t.id="forward-e".into();
+        advance_frontier(&mut c,&t).unwrap();
+        let mut second=t.clone();second.id="forward-f".into();second.predecessor_source_key=t.source_key().unwrap();second.source_git_sha=Some("f".repeat(40));second.target_svn_rev=Some(4);
+        advance_frontier(&mut c,&second).unwrap();
+        let before=snapshot(&c);
+        let mut back=second.clone();back.id="return-baseline".into();back.predecessor_source_key=second.source_key().unwrap();back.source_git_sha=Some("b".repeat(40));back.target_svn_rev=Some(5);
+        assert!(advance_frontier(&mut c,&back).is_err(),"baseline return accepted");
+        assert_eq!(snapshot(&c),before);
+        assert_eq!(c.query_row("SELECT count(*) FROM pair_outcomes",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert!(c.execute("INSERT INTO pair_outcomes SELECT 'raw-return',repo_id,generation,direction,?1,?2,NULL,?3,outcome,NULL,5,projection_version,policy_sha256,evidence_json FROM pair_outcomes WHERE id='forward-f'",params![format!("git:{}","b".repeat(40)),second.source_key().unwrap(),"b".repeat(40)]).is_err());
+        for sql in ["UPDATE pair_outcomes SET evidence_json='{\"changed\":true}' WHERE id='forward-e'", "DELETE FROM pair_outcomes WHERE id='forward-e'", "INSERT OR REPLACE INTO pair_outcomes SELECT * FROM pair_outcomes WHERE id='forward-e'"] {assert!(c.execute(sql,[]).is_err(),"historical mutation accepted: {sql}");}
+        assert!(c.execute("INSERT OR REPLACE INTO pair_outcomes SELECT 'replacement-id',repo_id,generation,direction,source_key,predecessor_source_key,source_svn_rev,source_git_sha,outcome,target_git_sha,target_svn_rev,projection_version,policy_sha256,evidence_json FROM pair_outcomes WHERE id='forward-e'",[]).is_err());
+        let mut repeat=second.clone();repeat.id="resurrect-e".into();repeat.predecessor_source_key=second.source_key().unwrap();repeat.source_git_sha=t.source_git_sha.clone();assert!(advance_frontier(&mut c,&repeat).is_err());
+        assert!(advance_frontier(&mut c,&t).is_err());assert_eq!(snapshot(&c),before);
+        eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"L03_HISTORY","two_step_forward":true,"baseline_return_writer_and_sql_rejected":true,"historical_update_delete_replace_rejected":true,"stale_and_repeated_source_rejected":true,"false_outcome_not_committed":true,"ancestry_not_inferred_from_labels":true}));
+    }
+
 }

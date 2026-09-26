@@ -77,6 +77,8 @@ END;
 CREATE TRIGGER frontier_advance BEFORE UPDATE ON pair_frontiers BEGIN
  SELECT CASE WHEN NEW.authority_kind!='outcome' OR NEW.repo_id!=OLD.repo_id OR NEW.generation!=OLD.generation OR NEW.direction!=OLD.direction OR
  NOT EXISTS(SELECT 1 FROM pair_outcomes o WHERE o.id=NEW.evidence_outcome_id AND o.repo_id=NEW.repo_id AND o.generation=NEW.generation AND o.direction=NEW.direction AND o.source_key=NEW.source_key AND o.predecessor_source_key=OLD.source_key AND o.projection_version=NEW.projection_version AND o.policy_sha256=NEW.policy_sha256 AND o.outcome IN ('applied_verified','filtered_no_target','empty_no_target','semantic_no_delta') AND o.target_git_sha IS NEW.emitted_git_sha AND o.target_svn_rev IS NEW.emitted_svn_rev)
+ OR NEW.source_key=OLD.source_key
+ OR EXISTS(SELECT 1 FROM pair_lineages l WHERE l.repo_id=NEW.repo_id AND l.generation=NEW.generation AND NEW.direction='git_to_svn' AND NEW.handled_git_sha=l.baseline_git_sha)
  OR (NEW.direction='svn_to_git' AND NEW.handled_svn_rev<=OLD.handled_svn_rev)
  THEN RAISE(ABORT,'frontier requires matching resolved outcome transition') END;
 END;
@@ -85,3 +87,20 @@ CREATE TRIGGER outcome_cited_immutable BEFORE UPDATE ON pair_outcomes WHEN EXIST
 
 CREATE TRIGGER lineage_no_replace BEFORE INSERT ON pair_lineages WHEN EXISTS(SELECT 1 FROM pair_lineages WHERE repo_id=NEW.repo_id AND generation=NEW.generation) BEGIN SELECT RAISE(ABORT,'lineage cannot be replaced'); END;
 CREATE TRIGGER outcome_cited_no_replace BEFORE INSERT ON pair_outcomes WHEN EXISTS(SELECT 1 FROM pair_frontiers WHERE evidence_outcome_id=NEW.id) BEGIN SELECT RAISE(ABORT,'cited outcome cannot be replaced'); END;
+
+-- The baseline reserves its source identity without inventing an external effect.
+CREATE TRIGGER outcome_not_baseline BEFORE INSERT ON pair_outcomes WHEN EXISTS(
+ SELECT 1 FROM pair_lineages l WHERE l.repo_id=NEW.repo_id AND l.generation=NEW.generation AND
+ ((NEW.direction='git_to_svn' AND NEW.source_git_sha=l.baseline_git_sha) OR
+  (NEW.direction='svn_to_git' AND NEW.source_svn_rev<=l.baseline_svn_rev)))
+ BEGIN SELECT RAISE(ABORT,'source already handled by lineage baseline'); END;
+CREATE TRIGGER outcome_resolved_immutable BEFORE UPDATE ON pair_outcomes WHEN OLD.outcome IN ('applied_verified','filtered_no_target','empty_no_target','semantic_no_delta')
+ BEGIN SELECT RAISE(ABORT,'resolved historical evidence is immutable'); END;
+CREATE TRIGGER outcome_resolved_no_delete BEFORE DELETE ON pair_outcomes WHEN OLD.outcome IN ('applied_verified','filtered_no_target','empty_no_target','semantic_no_delta')
+ BEGIN SELECT RAISE(ABORT,'resolved historical evidence cannot be deleted'); END;
+-- REPLACE's implicit DELETE does not reliably execute DELETE triggers. Protect
+-- both conflict keys before insertion, even with recursive_triggers disabled.
+CREATE TRIGGER outcome_resolved_no_replace BEFORE INSERT ON pair_outcomes WHEN EXISTS(
+ SELECT 1 FROM pair_outcomes o WHERE o.outcome IN ('applied_verified','filtered_no_target','empty_no_target','semantic_no_delta') AND
+ (o.id=NEW.id OR (o.repo_id=NEW.repo_id AND o.generation=NEW.generation AND o.direction=NEW.direction AND o.source_key=NEW.source_key)))
+ BEGIN SELECT RAISE(ABORT,'resolved historical evidence cannot be replaced'); END;
