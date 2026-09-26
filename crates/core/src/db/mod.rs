@@ -6,6 +6,9 @@
 pub mod queries;
 pub mod schema;
 
+#[cfg(feature = "reliability-fixture")]
+pub mod candidate_authority;
+
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
