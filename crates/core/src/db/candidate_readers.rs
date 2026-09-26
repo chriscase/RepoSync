@@ -397,13 +397,14 @@ impl<'a> CopyReaders<'a> {
         self.read(|| self.lookup_inner(repo, g, d, s))
     }
     /// Every retained row is available for display in deterministic ID order.
+    /// None starts at the first stored ID, including explicit zero/negative IDs.
     /// This global display list never provides canonical authority.
-    pub fn legacy_page(&self, after: i64, limit: usize) -> Result<Vec<LegacyRow>> {
+    pub fn legacy_page(&self, after: Option<i64>, limit: usize) -> Result<Vec<LegacyRow>> {
         self.read(|| {
             ensure!((1..=200).contains(&limit), "page size out of bounds");
             legacy(
                 &self.c,
-                "SELECT * FROM commit_map WHERE id>?1 ORDER BY id LIMIT ?2",
+                "SELECT * FROM commit_map WHERE (?1 IS NULL OR id>?1) ORDER BY id LIMIT ?2",
                 params![after, limit as i64],
             )
         })
@@ -413,12 +414,12 @@ impl<'a> CopyReaders<'a> {
         repo: &str,
         g: Option<i64>,
         d: Direction,
-        after: i64,
+        after: Option<i64>,
         limit: usize,
     ) -> Result<Page> {
         self.read(||{
         ensure!((1..=200).contains(&limit),"page size out of bounds");
-        let raw=legacy(&self.c,"SELECT * FROM commit_map WHERE (repo_id=?1 OR repo_id IS NULL) AND direction=?2 AND id>?3 ORDER BY id LIMIT ?4",params![repo,d.sql(),after,limit as i64])?;
+        let raw=legacy(&self.c,"SELECT * FROM commit_map WHERE (repo_id=?1 OR repo_id IS NULL) AND direction=?2 AND (?3 IS NULL OR id>?3) ORDER BY id LIMIT ?4",params![repo,d.sql(),after,limit as i64])?;
         let next=raw.last().map(|r|r.id);let mut items=Vec::new();
         for row in raw{let canonical=if row.repo()!=Some(repo){Canonical::Unresolved("legacy_ownerless".into())}else if let Some(source)=row.source(d){self.lookup_inner(repo,g,d,&source)?.canonical}else{Canonical::Unresolved("malformed_legacy_source".into())};items.push(ListItem{legacy:row,canonical});}
         Ok(Page{scope:self.scope(repo,g)?,rows:items,next_after_id:next})

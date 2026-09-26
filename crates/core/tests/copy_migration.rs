@@ -902,14 +902,15 @@ fn typed_reader_lookup_matrix(){
 #[test]
 fn typed_reader_list_matrix(){
     let (_t,root,target,session,_)=reader_fixture();
-    let db=Connection::open(target.join("reposync.db")).unwrap();let expected:Vec<i64>=db.prepare("SELECT id FROM commit_map ORDER BY id").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();drop(db);
+    let db=Connection::open(target.join("reposync.db")).unwrap();db.execute("INSERT INTO commit_map(id,svn_rev,git_sha,direction,synced_at,repo_id) VALUES(-10,10,NULL,'svn_to_git','t',NULL),(0,11,NULL,'svn_to_git','t',NULL)",[]).unwrap();let expected:Vec<i64>=db.prepare("SELECT id FROM commit_map ORDER BY id").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();drop(db);
     reader_proof("T54_LIST",&root,&target,&session,|r|{
-        let mut actual=Vec::new();let mut after=0;
-        loop{let p=r.legacy_page(after,2).unwrap();if p.is_empty(){break}after=p.last().unwrap().id;actual.extend(p.into_iter().map(|r|r.id));}assert_eq!(actual,expected);
-        let p=r.list("pair",Some(1),Direction::SvnToGit,199,2).unwrap();assert_eq!(p.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![200,201]);assert_eq!(p.next_after_id,Some(201));assert!(matches!(p.rows[1].canonical,Canonical::NoTarget{..}));
-        let p2=r.list("pair",Some(1),Direction::SvnToGit,201,2).unwrap();assert_eq!(p2.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![203,204]);assert!(p2.rows.iter().all(|x|matches!(x.canonical,Canonical::Unresolved(_))));
-        let p3=r.list("pair",Some(1),Direction::SvnToGit,204,2).unwrap();assert_eq!(p3.rows.len(),1);assert_eq!(p3.rows[0].legacy.id,205);assert_eq!(p3.rows[0].legacy.values[2],Raw::Null);assert!(matches!(p3.rows[0].canonical,Canonical::Unresolved(_)));
-        assert!(r.legacy_page(0,0).is_err());assert!(r.list("pair",None,Direction::SvnToGit,0,201).is_err());
+        let mut actual=Vec::new();let mut after=None;
+        loop{let p=r.legacy_page(after,2).unwrap();if p.is_empty(){break}after=Some(p.last().unwrap().id);actual.extend(p.into_iter().map(|r|r.id));}assert_eq!(actual,expected);
+        let first=r.list("pair",Some(1),Direction::SvnToGit,None,2).unwrap();assert_eq!(first.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![-10,0]);assert!(first.rows.iter().all(|x|matches!(x.canonical,Canonical::Unresolved(_))));
+        let p=r.list("pair",Some(1),Direction::SvnToGit,Some(199),2).unwrap();assert_eq!(p.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![200,201]);assert_eq!(p.next_after_id,Some(201));assert!(matches!(p.rows[1].canonical,Canonical::NoTarget{..}));
+        let p2=r.list("pair",Some(1),Direction::SvnToGit,Some(201),2).unwrap();assert_eq!(p2.rows.iter().map(|x|x.legacy.id).collect::<Vec<_>>(),vec![203,204]);assert!(p2.rows.iter().all(|x|matches!(x.canonical,Canonical::Unresolved(_))));
+        let p3=r.list("pair",Some(1),Direction::SvnToGit,Some(204),2).unwrap();assert_eq!(p3.rows.len(),1);assert_eq!(p3.rows[0].legacy.id,205);assert_eq!(p3.rows[0].legacy.values[2],Raw::Null);assert!(matches!(p3.rows[0].canonical,Canonical::Unresolved(_)));
+        assert!(r.legacy_page(None,0).is_err());assert!(r.list("pair",None,Direction::SvnToGit,None,201).is_err());
     });
 }
 #[test]
@@ -939,6 +940,6 @@ fn typed_reader_emitted_matrix(){
 #[test]
 fn typed_reader_no_write_matrix(){
     let (_t,root,target,session,_)=reader_fixture();
-    reader_proof("T54_READONLY",&root,&target,&session,|r|{for _ in 0..2{r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap();r.list("pair",Some(1),Direction::SvnToGit,0,200).unwrap();r.legacy_page(0,200).unwrap();r.status("pair",Some(1)).unwrap();r.last_emitted("pair",Some(1),Direction::GitToSvn).unwrap();}});
+    reader_proof("T54_READONLY",&root,&target,&session,|r|{for _ in 0..2{r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap();r.list("pair",Some(1),Direction::SvnToGit,None,200).unwrap();r.legacy_page(None,200).unwrap();r.status("pair",Some(1)).unwrap();r.last_emitted("pair",Some(1),Direction::GitToSvn).unwrap();}});
     let before=fs::read(target.join("reposync.db")).unwrap();fs::write(target.join("reposync.db-journal"),b"not-quiescent").unwrap();assert!(session.readers().is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==before);session.source_unchanged().unwrap();
 }

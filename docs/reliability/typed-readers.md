@@ -44,7 +44,7 @@ Only `CopySession::readers()` constructs the model, after storage/source checks 
 
 `lookup` requires repository, explicit optional generation, direction and directional source identity. The two directions may share an SVN number without becoming duplicates. No maximum generation is selected. Canonical interpretation follows only the explicit frontier/predecessor chain back to the lineage baseline, not timestamps, lexical hashes or last row IDs.
 
-`list` uses ID-based deterministic pagination for display, with per-row canonical classification and ambiguity. `legacy_page` represents **every** old row and SQL value (including NULL/malformed/ownerless) globally, and grants no authority. `status` separates enabled/disposition/requested generation, current handled sources, current outcome targets and last actual emitted targets.
+`list` uses ID-based deterministic pagination with an explicit `None` first-page cursor (including zero and negative retained IDs) for display, with per-row canonical classification and ambiguity. `legacy_page` represents **every** old row and SQL value (including NULL/malformed/ownerless) globally, and grants no authority. `status` separates enabled/disposition/requested generation, current handled sources, current outcome targets and last actual emitted targets.
 
 `last_emitted` traverses the handled chain to the last applied effect; a later no-target source does not erase that object. Incoming import baseline is a real initial Git target; outgoing imported baseline has no invented SVN target. Intervening pending/effect-unknown rows do not move a frontier or become emitted history. Both directions are tested.
 

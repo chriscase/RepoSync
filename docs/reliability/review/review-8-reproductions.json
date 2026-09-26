@@ -39,6 +39,20 @@
         "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.01s"
       ],
       "private_raw_log_sha256": "9d1159a5e0b0fa7cd7d21cc9113e74a8c0b7594ac56e558f33034d87c1f9a151"
+    },
+    {
+      "case": "T54_LIST first-page retention",
+      "runtime_head": "de7b7512c84260edde92d044cbc98da55ab768f4",
+      "execution": "actual local copy reader with additional explicit IDs -10 and 0; not isolated-container execution",
+      "command": "REPOSYNC_OLD_GENERATOR=<pinned original generator> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration typed_reader_list_matrix -- --exact --nocapture",
+      "result": "0 passed /1 failed /0 ignored",
+      "failure_excerpt": [
+        "thread 'typed_reader_list_matrix' (17073398) panicked at crates/core/tests/copy_migration.rs:908:144:",
+        "  left: [1, 2, 3, 4, 200, 201, 202, 203, 204, 205]",
+        " right: [-10, 0, 1, 2, 3, 4, 200, 201, 202, 203, 204, 205]",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 7.14s"
+      ],
+      "private_raw_log_sha256": "256a9f4d624406d17abab7c7e44eca7a24953d8bc84d22fa4382d931900e3982"
     }
   ]
 }

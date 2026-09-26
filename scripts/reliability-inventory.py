@@ -274,7 +274,7 @@ def inspect(root, expected):
                 "SELECT direction, svn_rev, git_sha FROM commit_map WHERE repo_id = ? ORDER BY svn_rev, git_sha", (rid,))]
             receipts = [receipt_view(raw, rid, key[len(VOCABULARY["no_target_prefix"] + rid + "_"):], policy)
                         for key, raw in sorted(keys.items()) if receipt_owner(key, rows_by_id) == rid]
-            baseline_raw = keys.get("handled_git_baseline_" + rid)
+            baseline_raw = keys.get(VOCABULARY["baseline_prefix"] + rid)
             baseline = None
             if baseline_raw is not None:
                 try:
@@ -291,8 +291,8 @@ def inspect(root, expected):
                                    and x["git_sha"] == column for x in mappings)
             ref, ref_storage = local_ref(root, expected["files"], rid, row["git_branch"])
             scoped_svn = keys.get(VOCABULARY["scoped_svn_prefix"] + rid)
-            global_svn = keys.get("last_svn_rev")
-            global_git = keys.get("last_git_hash")
+            global_svn = keys.get(VOCABULARY["global_svn_key"])
+            global_git = keys.get(VOCABULARY["global_git_key"])
             source_disagreements = []
             if scoped_svn is not None and str(row["last_svn_rev"]) != scoped_svn:
                 source_disagreements.append({"sources": ["repositories.last_svn_rev", "kv_state.last_svn_rev_<repo>"],
