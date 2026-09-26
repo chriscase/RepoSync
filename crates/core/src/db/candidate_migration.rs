@@ -247,11 +247,35 @@ fn source_db(path: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?)
 }
+// Unix is the supported fixture platform. Unknown storage identity is not
+// admitted. Callers must keep these private directories quiescent: this is not
+// a fencing mechanism against concurrent replacement by another host process.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StorageIdentity { device: u64, inode: u64 }
+fn private_file(path: &Path) -> Result<StorageIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let m=fs::symlink_metadata(path)?;
+    ensure!(m.is_file() && !m.file_type().is_symlink(), "mutable DB is not a regular private file");
+    ensure!(m.nlink()==1, "mutable DB/sidecar has shared hard-link storage");
+    ensure!(m.ino()!=0, "unknown mutable storage identity");
+    Ok(StorageIdentity {device:m.dev(),inode:m.ino()})
+}
+fn independent_storage(source: &Path, copy: &Path) -> Result<(StorageIdentity,StorageIdentity)> {
+    let source_id=private_file(&source.join("reposync.db"))?;
+    let copy_id=private_file(&copy.join("reposync.db"))?;
+    ensure!(source_id!=copy_id, "source and copy share DB storage");
+    for suffix in ["-wal","-shm","-journal"] {
+        let path=copy.join(format!("reposync.db{suffix}"));
+        if path.try_exists()? { private_file(&path)?; }
+    }
+    Ok((source_id,copy_id))
+}
 /// Seal an already-quiesced v12 source and its independent copy. No source
 /// writer is opened. Repeated calls may resume a structurally valid v13 copy.
 pub struct CopySession {
     source: PathBuf,
     copy: PathBuf,
+    storage: (StorageIdentity, StorageIdentity),
     seal: BTreeMap<String, FileSeal>,
     legacy: Legacy,
     names: Vec<String>,
@@ -266,6 +290,7 @@ impl CopySession {
             source != copy && !source.starts_with(&copy) && !copy.starts_with(&source),
             "source/copy overlap"
         );
+        let storage = independent_storage(&source, &copy)?;
         let seal = manifest(&source, false)?;
         ensure!(seal.contains_key("reposync.db"), "missing source DB");
         let c = source_db(&source.join("reposync.db"))?;
@@ -284,6 +309,7 @@ impl CopySession {
         let session = Self {
             source,
             copy,
+            storage,
             seal,
             legacy,
             names,
@@ -304,6 +330,7 @@ impl CopySession {
         Ok(())
     }
     fn check_files(&self) -> Result<()> {
+        ensure!(independent_storage(&self.source,&self.copy)? == self.storage, "sealed DB storage replaced");
         self.source_unchanged()?;
         let mut actual = manifest(&self.copy, true)?;
         let mut source = self.seal.clone();
@@ -319,6 +346,8 @@ impl CopySession {
     ) -> Result<MigrationReport> {
         self.check_files()?;
         let result = (|| {
+            // Revalidate immediately before SQLite can recover a journal or write.
+            self.check_files()?;
             let mut c = Connection::open_with_flags(
                 self.copy.join("reposync.db"),
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,

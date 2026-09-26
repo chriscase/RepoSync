@@ -742,3 +742,39 @@ fn endpoint_files(root: &Path) -> std::collections::BTreeMap<String, String> {
     }
     files
 }
+
+#[test]
+fn copy_storage_alias_rejection() {
+    let mut matrix = Vec::new();
+    for kind in ["source_hardlink", "outside_hardlink", "replace_after_seal"] {
+        let (t, source, target) = fixture(&[1], &[]);
+        let source_bytes = fs::read(source.join("reposync.db")).unwrap();
+        let canary = t.path().join("outside-canary");
+        fs::create_dir(&canary).unwrap();
+        fs::copy(source.join("reposync.db"), canary.join("reposync.db")).unwrap();
+        let before = fs::read(canary.join("reposync.db")).unwrap();
+        let session = if kind == "replace_after_seal" {
+            Some(CopySession::seal(&source, &target).unwrap())
+        } else { None };
+        fs::remove_file(target.join("reposync.db")).unwrap();
+        fs::hard_link(if kind == "source_hardlink" { source.join("reposync.db") } else { canary.join("reposync.db") }, target.join("reposync.db")).unwrap();
+        let rejected = match session {
+            Some(session) => session.migrate(14, &mut |_, _, _| Ok(())).is_err(),
+            None => match CopySession::seal(&source, &target) {
+                Err(_) => true,
+                Ok(session) => session.migrate(14, &mut |_, _, _| Ok(())).is_err(),
+            },
+        };
+        assert!(rejected, "{kind}");
+        assert!(fs::read(source.join("reposync.db")).unwrap() == source_bytes, "source damage: {kind}");
+        assert!(fs::read(canary.join("reposync.db")).unwrap() == before, "canary damage: {kind}");
+        assert_eq!(version(&source), 12);
+        assert_eq!(version(&canary), 12);
+        matrix.push(kind);
+    }
+    let (_t, s, c) = fixture(&[1], &[]);
+    let session = CopySession::seal(&s, &c).unwrap();
+    assert_eq!(session.migrate(14, &mut |_, _, _| Ok(())).unwrap().final_version, 14);
+    session.source_unchanged().unwrap();
+    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({"case":"L01_STORAGE","rejected":matrix,"source_and_canary_bytes_and_version_unchanged":true,"independent_copy_success":true}));
+}
