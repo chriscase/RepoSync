@@ -525,6 +525,19 @@ impl CopySession {
         git_remote: &Path,
     ) -> Result<Lineage> {
         self.source_unchanged()?;
+        ensure!(
+            !repo.is_empty()
+                && repo.len() <= 128
+                && repo
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "unsafe fixture repository ID"
+        );
+        let original_svn_url = format!("file://{}", svn_root.display());
+        let original_git_parent = git_remote
+            .parent()
+            .context("fixture remote parent")?
+            .to_path_buf();
         let svn_root = owned_root(svn_root)?;
         let git_remote = owned_root(git_remote)?;
         let c = source_db(&self.source.join("reposync.db"))?;
@@ -534,24 +547,26 @@ impl CopySession {
             "disabled/filtered policy unqualified"
         );
         ensure!(
-            PathBuf::from(
-                url.strip_prefix("file://")
-                    .context("not a fixture SVN endpoint")?
-            )
-            .canonicalize()?
-                == svn_root
+            (url == original_svn_url || url == format!("file://{}", svn_root.display()))
                 && branch == "trunk"
                 && provider == "local",
             "fixture SVN identity mismatch or unsupported topology"
         );
-        let expected_remote = PathBuf::from(
-            api.strip_prefix("file://")
-                .context("not a fixture Git endpoint")?,
-        )
-        .join(format!("{git_repo}.git"))
-        .canonicalize()?;
         ensure!(
-            expected_remote == git_remote,
+            (api == format!("file://{}", original_git_parent.display())
+                || api
+                    == format!(
+                        "file://{}",
+                        git_remote
+                            .parent()
+                            .context("canonical remote parent")?
+                            .display()
+                    ))
+                && git_remote
+                    .file_name()
+                    .context("fixture remote name")?
+                    .to_str()
+                    == Some(&format!("{git_repo}.git")),
             "fixture Git identity mismatch"
         );
         ensure!(
@@ -574,11 +589,9 @@ impl CopySession {
             "split/missing directional cursor"
         );
         ensure!(c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND svn_rev=?2 AND git_sha=?3 AND status='applied'",rusqlite::params![repo,rev,sha],|r|r.get::<_,i64>(0))?==1,"missing/ambiguous import evidence");
-        ensure!(rev==2 && c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND status='applied' AND svn_rev IN (1,2)",[repo],|r|r.get::<_,i64>(0))?==2 && c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1",[repo],|r|r.get::<_,i64>(0))?==2,"only complete pinned original two-revision imports qualified; pruned/later topology needs proof");
-        let complete_maps:i64=c.query_row("SELECT count(*) FROM sync_records s WHERE s.repo_id=?1 AND (SELECT count(*) FROM commit_map m WHERE m.svn_rev=s.svn_rev AND m.git_sha=s.git_sha AND m.direction='svn_to_git' AND (m.repo_id IS NULL OR m.repo_id=s.repo_id))=1",[repo],|r|r.get(0))?;
         ensure!(
-            complete_maps == 2,
-            "pruned/ambiguous mapping history requires separate proof"
+            rev == 2,
+            "only pinned original two-revision source topology qualified"
         );
         let unresolved:i64=c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND (status!='applied' OR git_sha IS NULL)",[repo],|r|r.get(0))?;
         ensure!(unresolved == 0, "unknown/pruned/filtered evidence");
@@ -630,6 +643,175 @@ impl CopySession {
             .trim()
                 == sha,
             "remote baseline replaced"
+        );
+
+        // The original importer legitimately skips an empty revision when its
+        // commit reports no tree delta. Prove retained applied history against
+        // actual pinned Git objects, not an assumed record count or a trailer
+        // alone. Missing rows for an extant import commit still mean pruning.
+        let history = command(
+            "git",
+            &[
+                "-C",
+                bridge.to_str().unwrap(),
+                "rev-list",
+                "--reverse",
+                &sha,
+            ],
+        )?;
+        let commits: Vec<_> = history.lines().collect();
+        ensure!(
+            (2..=3).contains(&commits.len()),
+            "unsupported import history"
+        );
+        let bootstrap = commits[0];
+        ensure!(
+            command(
+                "git",
+                &[
+                    "-C",
+                    bridge.to_str().unwrap(),
+                    "show",
+                    "-s",
+                    "--format=%B",
+                    bootstrap
+                ]
+            )?
+            .trim()
+                == "Synthetic empty remote root"
+                && command(
+                    "git",
+                    &["-C", bridge.to_str().unwrap(), "ls-tree", "-r", bootstrap]
+                )?
+                .is_empty(),
+            "bootstrap identity/tree unproved"
+        );
+        let root_parents = command(
+            "git",
+            &[
+                "-C",
+                bridge.to_str().unwrap(),
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                bootstrap,
+            ],
+        )?;
+        ensure!(
+            root_parents.split_whitespace().count() == 1,
+            "bootstrap not a root"
+        );
+        let mut imported = Vec::new();
+        let mut previous = bootstrap;
+        for oid in &commits[1..] {
+            let parents = command(
+                "git",
+                &[
+                    "-C",
+                    bridge.to_str().unwrap(),
+                    "rev-list",
+                    "--parents",
+                    "-n",
+                    "1",
+                    oid,
+                ],
+            )?;
+            ensure!(
+                parents.split_whitespace().collect::<Vec<_>>() == vec![*oid, previous],
+                "nonlinear/replaced import ancestry"
+            );
+            let message = command(
+                "git",
+                &[
+                    "-C",
+                    bridge.to_str().unwrap(),
+                    "show",
+                    "-s",
+                    "--format=%B",
+                    oid,
+                ],
+            )?;
+            let imported_rev = if message
+                .lines()
+                .any(|l| l == "[reposync] imported from SVN r1")
+            {
+                1
+            } else if message
+                .lines()
+                .any(|l| l == "[reposync] imported from SVN r2")
+            {
+                2
+            } else {
+                anyhow::bail!("unknown import commit")
+            };
+            ensure!(
+                imported
+                    .last()
+                    .map_or(true, |previous_rev| imported_rev > *previous_rev),
+                "duplicate/unordered import revision"
+            );
+            ensure!(c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",rusqlite::params![repo,imported_rev,oid],|r|r.get::<_,i64>(0))?==1,"pruned/ambiguous applied history");
+            ensure!(c.query_row("SELECT count(*) FROM commit_map WHERE svn_rev=?1 AND git_sha=?2 AND direction='svn_to_git' AND (repo_id IS NULL OR repo_id=?3)",rusqlite::params![imported_rev,oid,repo],|r|r.get::<_,i64>(0))?==1,"pruned/ambiguous legacy mapping history");
+            if imported_rev == 1 {
+                ensure!(
+                    command(
+                        "git",
+                        &["-C", bridge.to_str().unwrap(), "ls-tree", "-r", oid]
+                    )?
+                    .is_empty(),
+                    "unexpected r1 tree"
+                );
+            }
+            imported.push(imported_rev);
+            previous = oid;
+        }
+        ensure!(
+            imported.last() == Some(&2)
+                && c.query_row(
+                    "SELECT count(*) FROM sync_records WHERE repo_id=?1",
+                    [repo],
+                    |r| r.get::<_, i64>(0)
+                )? == imported.len() as i64,
+            "extra/unproved applied history"
+        );
+        // Confirm r1 is genuinely empty with no SVN property projection. This
+        // proves a baseline shape; it creates no historical no-target receipt.
+        let empty = tempfile::tempdir()?;
+        let empty_export = empty.path().join("r1");
+        let r1 = format!("{url}/{branch}@1");
+        command(
+            "svn",
+            &[
+                "export",
+                "--non-interactive",
+                "--no-auth-cache",
+                "-r",
+                "1",
+                &r1,
+                empty_export.to_str().context("r1 export path")?,
+            ],
+        )?;
+        ensure!(
+            manifest(&empty_export, false)?.is_empty(),
+            "r1 projection is not empty"
+        );
+        ensure!(
+            !command(
+                "svn",
+                &[
+                    "proplist",
+                    "--non-interactive",
+                    "--no-auth-cache",
+                    "--xml",
+                    "-R",
+                    "-r",
+                    "1",
+                    &r1
+                ]
+            )?
+            .contains("<property "),
+            "r1 property projection unproved"
         );
         let pinned = format!("{url}/{branch}@{rev}");
         let rev_str = rev.to_string();

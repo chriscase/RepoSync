@@ -212,6 +212,25 @@ fn v14_old_topology_qualification() {
     assert_eq!(report.canonical["pair_frontiers"].len(), 4);
     assert_eq!(report.canonical["pair_outcomes"].len(), 0);
     let c = Connection::open(target.join("reposync.db")).unwrap();
+    for repo in ["pair", "pair_two"] {
+        let expected = provenance[repo]["git_sha"].as_str().unwrap();
+        let baseline:(i64,String)=c.query_row("SELECT baseline_svn_rev,baseline_git_sha FROM pair_lineages WHERE repo_id=?1 AND generation=1",[repo],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(baseline, (2, expected.to_string()));
+        let incoming:(i64,String,String)=c.query_row("SELECT handled_svn_rev,emitted_git_sha,authority_kind FROM pair_frontiers WHERE repo_id=?1 AND generation=1 AND direction='svn_to_git'",[repo],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(incoming, (2, expected.to_string(), "baseline".into()));
+        let outgoing:(String,Option<i64>,Option<String>)=c.query_row("SELECT handled_git_sha,emitted_svn_rev,evidence_outcome_id FROM pair_frontiers WHERE repo_id=?1 AND generation=1 AND direction='git_to_svn'",[repo],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(outgoing, (expected.to_string(), None, None));
+    }
+    assert_eq!(c.query_row("SELECT count(*) FROM legacy_evidence_links e JOIN sync_records s ON e.legacy_table='sync_records' AND e.legacy_key=s.id WHERE e.repo_id!=s.repo_id",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    assert_eq!(
+        c.query_row(
+            "SELECT count(*) FROM legacy_evidence_links WHERE legacy_table='commit_map'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
     assert_eq!(
         c.query_row(
             "SELECT count(*) FROM pair_lineages WHERE repo_id='pair_disabled'",
@@ -621,12 +640,12 @@ fn pinned_unqualified_overlays() {
     for (index, (name, sql, state)) in [
         (
             "pruned",
-            "DELETE FROM sync_records WHERE repo_id='pair' AND svn_rev=1",
+            "DELETE FROM sync_records WHERE repo_id='pair' AND svn_rev=(SELECT MIN(svn_rev) FROM sync_records WHERE repo_id='pair')",
             "needs_reconciliation",
         ),
         (
             "pruned_mapping",
-            "DELETE FROM commit_map WHERE svn_rev=1",
+            "DELETE FROM commit_map WHERE git_sha=(SELECT git_sha FROM sync_records WHERE repo_id='pair' ORDER BY svn_rev LIMIT 1)",
             "needs_reconciliation",
         ),
         (
@@ -641,7 +660,7 @@ fn pinned_unqualified_overlays() {
         ),
         (
             "historical_filtered",
-            "UPDATE sync_records SET git_sha=NULL WHERE repo_id='pair' AND svn_rev=1",
+            "UPDATE sync_records SET git_sha=NULL WHERE repo_id='pair' AND svn_rev=(SELECT MIN(svn_rev) FROM sync_records WHERE repo_id='pair')",
             "needs_reconciliation",
         ),
         (
@@ -651,7 +670,7 @@ fn pinned_unqualified_overlays() {
         ),
         (
             "effect_unknown",
-            "UPDATE sync_records SET status='effect_unknown' WHERE repo_id='pair' AND svn_rev=1",
+            "UPDATE sync_records SET status='effect_unknown' WHERE repo_id='pair' AND svn_rev=(SELECT MIN(svn_rev) FROM sync_records WHERE repo_id='pair')",
             "external_effect_unknown",
         ),
     ]
