@@ -340,6 +340,7 @@ impl CopySession {
                 .filter(|&&v| v > starting && v <= target)
             {
                 hook(v, "before_transaction", &c)?;
+                integrity(&c)?;
                 let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 check_shape(&tx, v - 1)?;
                 integrity(&tx)?;
@@ -574,6 +575,11 @@ impl CopySession {
         );
         ensure!(c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND svn_rev=?2 AND git_sha=?3 AND status='applied'",rusqlite::params![repo,rev,sha],|r|r.get::<_,i64>(0))?==1,"missing/ambiguous import evidence");
         ensure!(rev==2 && c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND status='applied' AND svn_rev IN (1,2)",[repo],|r|r.get::<_,i64>(0))?==2 && c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1",[repo],|r|r.get::<_,i64>(0))?==2,"only complete pinned original two-revision imports qualified; pruned/later topology needs proof");
+        let complete_maps:i64=c.query_row("SELECT count(*) FROM sync_records s WHERE s.repo_id=?1 AND (SELECT count(*) FROM commit_map m WHERE m.svn_rev=s.svn_rev AND m.git_sha=s.git_sha AND m.direction='svn_to_git' AND (m.repo_id IS NULL OR m.repo_id=s.repo_id))=1",[repo],|r|r.get(0))?;
+        ensure!(
+            complete_maps == 2,
+            "pruned/ambiguous mapping history requires separate proof"
+        );
         let unresolved:i64=c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND (status!='applied' OR git_sha IS NULL)",[repo],|r|r.get(0))?;
         ensure!(unresolved == 0, "unknown/pruned/filtered evidence");
         // Candidate receipt versions are not an old import baseline proof. Preserve
@@ -794,6 +800,7 @@ pub enum MappingLookup {
     Mapped(String),
     ProvedNoTarget(String),
     LegacyUnresolvedNull,
+    LegacyOwnerless,
     Missing,
 }
 /// #54's distinct read semantics, scoped to an explicitly named generation.
@@ -804,6 +811,14 @@ pub fn lookup_mapping(
     generation: i64,
     rev: i64,
 ) -> Result<MappingLookup> {
+    ensure!(
+        c.query_row(
+            "SELECT count(*) FROM commit_map WHERE repo_id=?1 AND svn_rev=?2",
+            rusqlite::params![repo, rev],
+            |r| r.get::<_, i64>(0)
+        )? <= 1,
+        "ambiguous scoped mapping"
+    );
     let mapped: Option<Option<String>> = c
         .query_row(
             "SELECT git_sha FROM commit_map WHERE repo_id=?1 AND svn_rev=?2 ORDER BY id LIMIT 1",
@@ -812,7 +827,18 @@ pub fn lookup_mapping(
         )
         .optional()?;
     match mapped {
-        None => Ok(MappingLookup::Missing),
+        None => {
+            let ownerless: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commit_map WHERE repo_id IS NULL AND svn_rev=?1)",
+                [rev],
+                |r| r.get(0),
+            )?;
+            Ok(if ownerless {
+                MappingLookup::LegacyOwnerless
+            } else {
+                MappingLookup::Missing
+            })
+        }
         Some(Some(sha)) => Ok(MappingLookup::Mapped(sha)),
         Some(None) => {
             let proof:Option<String>=c.query_row("SELECT o.outcome FROM pair_outcomes o JOIN legacy_evidence_links e ON e.repo_id=o.repo_id AND e.generation=o.generation JOIN commit_map m ON e.legacy_table='commit_map' AND e.legacy_key=CAST(m.id AS TEXT) WHERE m.repo_id=?1 AND m.svn_rev=?2 AND m.git_sha IS NULL AND o.repo_id=?1 AND o.generation=?3 AND o.direction='svn_to_git' AND o.source_svn_rev=?2 AND o.outcome IN ('filtered_no_target','empty_no_target','semantic_no_delta') AND e.interpretation='proved_typed_no_target'",rusqlite::params![repo,rev,generation],|r|r.get(0)).optional()?;

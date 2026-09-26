@@ -563,6 +563,11 @@ fn mapping_null_semantics() {
         lookup_mapping(&c, "pair", 1, 4).unwrap(),
         MappingLookup::Missing
     );
+    c.execute("INSERT INTO commit_map(svn_rev,git_sha,direction,synced_at,repo_id) VALUES(4,NULL,'svn_to_git','t',NULL)",[]).unwrap();
+    assert_eq!(
+        lookup_mapping(&c, "pair", 1, 4).unwrap(),
+        MappingLookup::LegacyOwnerless
+    );
     let policy: String = c
         .query_row(
             "SELECT policy_sha256 FROM pair_lineages WHERE repo_id='pair'",
@@ -599,10 +604,12 @@ fn mapping_null_semantics() {
         lookup_mapping(&c, "pair", 2, 3).unwrap(),
         MappingLookup::LegacyUnresolvedNull
     );
+    c.execute("INSERT INTO commit_map(svn_rev,git_sha,direction,synced_at,repo_id) VALUES(3,NULL,'svn_to_git','t','pair')",[]).unwrap();
+    assert!(lookup_mapping(&c, "pair", 1, 3).is_err());
     session.source_unchanged().unwrap();
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"MAPPING_NULL","mapped":true,"null_unresolved":true,"missing":true,"explicit_owned_no_target":true,"other_generation_unresolved":true})
+        serde_json::json!({"case":"MAPPING_NULL","mapped":true,"null_unresolved":true,"missing":true,"explicit_owned_no_target":true,"other_generation_unresolved":true,"ownerless_unresolved":true})
     );
 }
 #[test]
@@ -615,6 +622,11 @@ fn pinned_unqualified_overlays() {
         (
             "pruned",
             "DELETE FROM sync_records WHERE repo_id='pair' AND svn_rev=1",
+            "needs_reconciliation",
+        ),
+        (
+            "pruned_mapping",
+            "DELETE FROM commit_map WHERE svn_rev=1",
             "needs_reconciliation",
         ),
         (
