@@ -8,6 +8,8 @@ pub mod schema;
 
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;
+#[cfg(feature = "reliability-fixture")]
+pub mod candidate_migration;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
