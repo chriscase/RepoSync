@@ -1,6 +1,6 @@
 # Phase 0 design proposal: lineage, operations, and safe upgrade
 
-**Status:** current bounded compatibility and future migration contract at the receipt/inventory review gate. Runtime corrections in PR #72 cover only tested admission, apply and no-target paths; no generation schema migration or general operation service is implemented. This document covers #63, #64 and #66 and defines admission rules needed later by #65 and #67–#69. [GOAL.md](GOAL.md) and the existing issue bodies remain authoritative.
+**Status:** current bounded compatibility and future migration contract at the receipt/inventory review gate. Runtime corrections in PR #72 cover only tested admission, apply and no-target paths; candidate generation migrations now exist only behind the explicit sealed-copy entry point; no general operation service or normal startup activation is implemented. This document covers #63, #64 and #66 and defines admission rules needed later by #65 and #67–#69. [GOAL.md](GOAL.md) and the existing issue bodies remain authoritative.
 
 ## Evidence from reviewed main
 
@@ -18,7 +18,7 @@ Use one authoritative logical checkpoint per `(repository ID, generation, direct
 
 Mapping outcomes must be typed: `applied_and_verified`, `intentionally_filtered_no_target`, `pending`, `locally_published_not_remote`, and `unknown_reconciliation_required`. A no-target mapping has a reason/policy snapshot and a NULL target SHA or revision as appropriate. Do not make NULL and missing row synonymous. Retain source and target parents/trees or stable fingerprints sufficient to verify an external effect; commit messages and matching final trees alone are hints. Preserve all legacy rows and add scoped, generation-aware records rather than overwriting or deduplicating old rows on a guessed key.
 
-The current physical schema is only an input to migration. The review-only [migration proposal](migration-proposal.md) specifies candidate `pair_lineages`, `pair_frontiers`, and `pair_outcomes` keyed by pair/generation/source identity, with foreign keys and unique constraints. Its SQL must be reviewed against additional real legacy shapes before execution. Preserve numeric SVN revisions together with repository UUID and branch identity: revision 42 in two repositories is not the same source event. For a merge DAG, the Git cursor is a proven frontier, not simply whichever SHA a revwalk visited first. Unknown/unsupported DAGs block before writes.
+The current physical schema is only an input to migration. The copy-only [migration contract](migration-proposal.md) specifies candidate `pair_lineages`, `pair_frontiers`, and `pair_outcomes` keyed by pair/generation/source identity, with foreign keys and unique constraints. Its candidate SQL is executed only in sealed temporary fixtures; additional deployed/historical shapes and production activation require independent review. Preserve numeric SVN revisions together with repository UUID and branch identity: revision 42 in two repositories is not the same source event. For a merge DAG, the Git cursor is a proven frontier, not simply whichever SHA a revwalk visited first. Unknown/unsupported DAGs block before writes.
 
 ## Legacy inventory and migration sequence (#63, coordinated with #54)
 

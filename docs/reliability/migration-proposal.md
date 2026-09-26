@@ -1,160 +1,64 @@
-# Candidate #54-aligned #63 migration proposal (review only)
+# Candidate #54/#63 copy migration contract
 
-**Status:** proposed SQL and data contract. No DDL in this file has been executed by PR #72. The existing schema is version 12. The deployed executable/schema, remote SVN UUID and copy ancestry, and remote Git identity remain **NOT ESTABLISHED**. The sealed local inventory is a prerequisite, not an automatic qualification decision. [GOAL.md](GOAL.md) and issues [#54](https://github.com/chriscase/RepoSync/issues/54), [#63](https://github.com/chriscase/RepoSync/issues/63), and [#64](https://github.com/chriscase/RepoSync/issues/64) retain their acceptance criteria.
+**Status:** candidate v13/v14 are implemented only behind `reliability-fixture` and the explicit `CopySession` test entry point. Normal schema registration still ends at v12. Installer, daemon and scheduler activation is outside this review. The previous reviewed proposal is preserved byte-for-byte in [review-6-migration-proposal.md](review/review-6-migration-proposal.md); its illustrative SQL is superseded by the executable candidate SQL and writer. Original GOAL and issue acceptance criteria remain unchanged. No issue is closed by this prototype.
 
-## One migration sequence, conditional on review
+## One implementation and one future activation decision
 
-The repository actually stores ordered SQL in `crates/core/src/db/schema.rs::MIGRATIONS`. Today's `run_migrations` executes each SQL batch and updates `PRAGMA user_version` separately. It neither rejects a newer version nor makes a table rebuild and version update atomic. The implementation proposal is one coordinated sequence: **candidate v13** performs #54's nullable `commit_map.git_sha` rebuild; **candidate v14** adds #63 generation ownership and directional evidence. If #54 lands first with a different number, rebase these numbers and reuse that migration; never apply a second competing rebuild. None of these changes are in runtime code yet.
+`crates/core/src/db/candidate_migration.rs` owns the ordered candidate registry `[13,14]`, v13 rebuild, exact physical-schema validation, conversion, version updates and reports. `crates/core/src/db/candidate/v14.sql` owns v14 DDL and structural/trigger constraints. `candidate_authority.rs` owns the single resolved-transition writer. Tests invoke these implementations directly. They do not contain an alternate migration algorithm. Normal `schema::MIGRATIONS` is unchanged and never calls the candidate registry.
 
-Before applying any migration, the future runner must verify a known starting schema/column/index shape, refuse `user_version > supported`, quiesce and fence every writer of the data directory, make an access-controlled consistent SQLite backup including WAL plus configuration, encryption-key ownership and local refs/workdirs, and inventory remote identities through a separately reviewed read-only process. Use `BEGIN IMMEDIATE` for each ordered migration, execute the SQL and its data conversion, validate row counts/FKs/integrity, set `PRAGMA user_version` **inside the same transaction**, then commit. An error rolls back that version's SQL and version number. Restart repeats only unapplied versions; it must reject a partially modified shape even if a version marker was forged. No old/new daemon may write the directory together.
+Activation requires a separate reviewed change covering deployed executable/schema inventory, all writers and installer/daemon ownership, compatible typed readers, backups and remote lineage. If #54 lands with another migration number, coordinate/reuse its rebuild rather than introduce competing DDL. No down migration is implemented.
 
-### Candidate v13: #54 nullable mapping, preserving every old row
+## Candidate v13
 
-The following is a **candidate**, not an applied script. It preserves the existing v12 columns and primary IDs; only `git_sha` becomes nullable. It does not encode a filtered outcome retroactively.
+Starting version must be exactly supported v12/13/14 and its complete `sqlite_schema` table/index/trigger SQL must match the reference constructed by the same original registry and candidate implementation. Unknown/forged/future/partial shapes fail before conversion. v13 changes only `commit_map.git_sha` nullability. Every retained row, ID and value survives. All four mapping indexes are restored. Save the original `sqlite_sequence` entry before rebuild; after explicit-ID copy/drop/rename, restore its exact value or exact absence in the same transaction. Never replace historical sequence with `MAX(id)`. All other table sequence entries remain identical.
 
-```sql
--- Execute inside the future runner's BEGIN IMMEDIATE transaction.
-CREATE TABLE commit_map_v13 (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  svn_rev INTEGER NOT NULL,
-  git_sha TEXT,
-  direction TEXT NOT NULL CHECK (direction IN ('svn_to_git','git_to_svn')),
-  synced_at TEXT NOT NULL,
-  svn_author TEXT NOT NULL DEFAULT '',
-  git_author TEXT NOT NULL DEFAULT '',
-  repo_id TEXT
-);
-INSERT INTO commit_map_v13
-  (id,svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id)
-SELECT id,svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id
-FROM commit_map ORDER BY id;
--- Assert identical COUNT(*), id/column digest, and sqlite_sequence continuity.
-DROP TABLE commit_map;
-ALTER TABLE commit_map_v13 RENAME TO commit_map;
-CREATE INDEX idx_commit_map_svn_rev ON commit_map(svn_rev);
-CREATE INDEX idx_commit_map_git_sha ON commit_map(git_sha);
-CREATE INDEX idx_commit_map_repo_svn ON commit_map(repo_id,svn_rev);
-CREATE INDEX idx_commit_map_repo_git ON commit_map(repo_id,git_sha);
--- Future runner: PRAGMA user_version = 13; validate; COMMIT.
-```
+## Candidate v14 and K01 authority
 
-A *new* NULL `git_sha` means an SVN revision was intentionally handled without a Git commit **only when** a repository/generation-owned `filtered_no_target` outcome also records the exact active path policy and source SVN identity. A NULL in an old or ownerless row is unresolved; a missing row is not a filtered decision. #54 readers must use a typed result: `get_git_sha_for_svn_rev` returns `None` for NULL, `is_svn_rev_synced` counts the row, while `get_last_git_hash` must skip NULL outcomes rather than treating the last row as a Git frontier. Audit status API, conflict detector, mapping writers and legacy global fallback for this distinction. Test fresh/old databases, a NULL row surviving restart, and all retained legacy IDs and indexes. A down rebuild is allowed only if no NULL/new outcome or externally published effect would be lost; otherwise refuse and retain v13.
+Repository plus explicitly named generation owns lineage, source identity, baseline identity, projection JSON/version/hash, direction-specific frontiers, typed outcomes and preserved evidence links. No active generation selector exists in this slice; no `MAX(generation)` is used. Activation remains outside this pass.
 
-### Candidate v14: permanent ownership and typed outcomes
+Initial frontiers require the separately proved lineage baseline. SVN→Git handles the baseline SVN revision and records its baseline Git SHA. Git→SVN handles the imported Git baseline with **NULL emitted SVN revision**: an SVN import does not invent an outbound effect. Initial authority is `baseline`, with NULL evidence allowed only at this exact insert. An existing frontier cannot be replaced or deleted to reset authority.
 
-Only a **proved** pair receives a generation row. Equal revision numbers, names, message trailers, local byte trees or an inventory label alone cannot assign generation 1. Rows awaiting proof remain in the unchanged legacy tables and receive a repository-level read-safe disposition.
+Every later transition is `outcome`, with non-NULL evidence. Composite FKs bind repository, generation, direction, source key, outcome ID and policy/projection to the frontier. Triggers require a resolved outcome (`applied_verified`, `filtered_no_target`, `empty_no_target`, `semantic_no_delta`), exact previous source key and exact emitted targets. The transactional writer explicitly names the generation, rejects stale predecessors and unresolved statuses, and inserts outcome plus frontier update atomically. Pending, unknown, reconciliation, wrong owner/generation/direction/source/policy, missing and arbitrary NULL evidence are rejected. Cited outcomes and lineages cannot be edited/replaced. These constraints validate ownership of supplied evidence; they do not implement #64 external-effect qualification or recovery.
 
-```sql
-CREATE TABLE repo_migration_state (
-  repo_id TEXT PRIMARY KEY REFERENCES repositories(id) ON DELETE RESTRICT,
-  disposition TEXT NOT NULL CHECK (disposition IN
-    ('qualified','needs_reconciliation','external_effect_unknown','not_qualified')),
-  reason_code TEXT NOT NULL,
-  evidence_manifest_sha256 TEXT NOT NULL,
-  reviewed_at TEXT NOT NULL
-);
-CREATE TABLE pair_lineages (
-  repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE RESTRICT,
-  generation INTEGER NOT NULL CHECK (generation > 0),
-  svn_uuid TEXT NOT NULL CHECK (length(svn_uuid) > 0),
-  svn_root_url TEXT NOT NULL CHECK (length(svn_root_url) > 0),
-  svn_branch_path TEXT NOT NULL,
-  source_svn_uuid TEXT NOT NULL CHECK (length(source_svn_uuid) > 0),
-  source_svn_path TEXT NOT NULL, -- empty denotes the SVN repository root
-  source_svn_rev INTEGER NOT NULL CHECK (source_svn_rev > 0),
-  copy_from_path TEXT,
-  copy_from_rev INTEGER,
-  baseline_svn_rev INTEGER NOT NULL CHECK (baseline_svn_rev > 0),
-  baseline_svn_tree_sha256 TEXT NOT NULL CHECK (length(baseline_svn_tree_sha256) = 64),
-  git_provider TEXT NOT NULL CHECK (length(git_provider) > 0),
-  git_repo_identity TEXT NOT NULL CHECK (length(git_repo_identity) > 0),
-  git_ref TEXT NOT NULL CHECK (length(git_ref) > 0),
-  baseline_git_sha TEXT NOT NULL CHECK (length(baseline_git_sha) IN (40,64)),
-  projection_version INTEGER NOT NULL CHECK (projection_version > 0),
-  projection_json TEXT NOT NULL CHECK (json_valid(projection_json)),
-  created_at TEXT NOT NULL,
-  PRIMARY KEY (repo_id,generation),
-  CHECK ((copy_from_path IS NULL AND copy_from_rev IS NULL) OR
-         (copy_from_path IS NOT NULL AND copy_from_rev > 0))
-);
-CREATE TABLE pair_frontiers (
-  repo_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  direction TEXT NOT NULL CHECK (direction IN ('svn_to_git','git_to_svn')),
-  handled_svn_rev INTEGER,
-  handled_git_sha TEXT,
-  emitted_git_sha TEXT,
-  emitted_svn_rev INTEGER,
-  evidence_outcome_id TEXT,
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (repo_id,generation,direction),
-  FOREIGN KEY (repo_id,generation) REFERENCES pair_lineages(repo_id,generation) ON DELETE RESTRICT,
-  CHECK ((direction='svn_to_git' AND handled_svn_rev IS NOT NULL AND handled_svn_rev > 0
-          AND handled_git_sha IS NULL AND emitted_svn_rev IS NULL) OR
-         (direction='git_to_svn' AND handled_git_sha IS NOT NULL
-          AND length(handled_git_sha) IN (40,64) AND handled_svn_rev IS NULL
-          AND emitted_git_sha IS NULL)),
-  CHECK (emitted_svn_rev IS NULL OR emitted_svn_rev > 0),
-  CHECK (emitted_git_sha IS NULL OR length(emitted_git_sha) IN (40,64))
-);
-CREATE TABLE pair_outcomes (
-  id TEXT PRIMARY KEY,
-  repo_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  direction TEXT NOT NULL CHECK (direction IN ('svn_to_git','git_to_svn')),
-  source_svn_rev INTEGER,
-  source_git_sha TEXT,
-  outcome TEXT NOT NULL CHECK (outcome IN
-    ('applied_verified','filtered_no_target','empty_no_target',
-     'semantic_no_delta','pending','locally_published_not_remote',
-     'effect_unknown','reconciliation_required')),
-  target_git_sha TEXT,
-  target_svn_rev INTEGER,
-  projection_version INTEGER NOT NULL CHECK (projection_version > 0),
-  evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json)),
-  recorded_at TEXT NOT NULL,
-  FOREIGN KEY (repo_id,generation) REFERENCES pair_lineages(repo_id,generation) ON DELETE RESTRICT,
-  CHECK ((direction='svn_to_git' AND source_svn_rev IS NOT NULL AND source_svn_rev > 0
-          AND source_git_sha IS NULL AND target_svn_rev IS NULL) OR
-         (direction='git_to_svn' AND source_git_sha IS NOT NULL
-          AND length(source_git_sha) IN (40,64) AND source_svn_rev IS NULL
-          AND target_git_sha IS NULL)),
-  CHECK (outcome NOT IN ('filtered_no_target','empty_no_target','semantic_no_delta')
-         OR (target_git_sha IS NULL AND target_svn_rev IS NULL)),
-  CHECK (outcome != 'applied_verified' OR
-         (direction='svn_to_git' AND target_git_sha IS NOT NULL AND
-          length(target_git_sha) IN (40,64)) OR
-         (direction='git_to_svn' AND target_svn_rev IS NOT NULL AND target_svn_rev > 0))
-);
-CREATE UNIQUE INDEX uq_pair_svn_source ON pair_outcomes(repo_id,generation,source_svn_rev)
-  WHERE direction='svn_to_git';
-CREATE UNIQUE INDEX uq_pair_git_source ON pair_outcomes(repo_id,generation,source_git_sha)
-  WHERE direction='git_to_svn';
-CREATE TABLE legacy_evidence_links (
-  repo_id TEXT NOT NULL,
-  generation INTEGER NOT NULL,
-  legacy_table TEXT NOT NULL CHECK (legacy_table IN ('commit_map','sync_records','kv_state','watermarks','import_progress')),
-  legacy_key TEXT NOT NULL,
-  interpretation TEXT NOT NULL,
-  PRIMARY KEY (repo_id,generation,legacy_table,legacy_key),
-  UNIQUE (legacy_table,legacy_key), -- one proved generation may claim an old row
-  FOREIGN KEY (repo_id,generation) REFERENCES pair_lineages(repo_id,generation) ON DELETE RESTRICT
-);
--- Future runner: load reviewed, complete migration-plan decisions with bound
--- parameters; assert one repo_migration_state row per repositories row.
--- Insert pair_lineages/frontiers/outcomes/links only for independently proved
--- pairs; require each 'qualified' disposition to own a proved generation;
--- validate all FK/index/row-preservation assertions.
--- Future runner: PRAGMA user_version = 14; COMMIT.
-```
+## K03 nullable-constraint audit
 
-`pair_frontiers` distinguishes handled source from emitted target. A Git→SVN emission revision is **not** an incoming SVN cursor advance. The outcome and frontier advance must share one SQLite transaction. An operation journal and post-external-write recovery remain a later #64 migration; these tables do not claim cross-system atomicity. Keep `sync_records` applied rows and any legacy `commit_map` rows permanently until their new generation/outcome evidence is independently proved and a separate retention policy is reviewed. Only non-applied diagnostics may expire, so storage may grow in the interim.
+Copy ancestry is exactly `(path IS NULL AND rev IS NULL)` OR `(path IS NOT NULL AND rev IS NOT NULL AND rev > 0)`. Empty path with a positive revision remains valid SVN-root representation. Every introduced directional conditional explicitly requires its mandatory revision/SHA non-NULL, positive revisions and valid SHA shape; applied outcomes explicitly require an opposite-direction target. No-target outcomes require both targets NULL. Baseline/outcome authority explicitly pairs NULL/non-NULL evidence with its type. Optional target fields may be NULL deliberately; FK ownership fields are NOT NULL. None relies on a NULL CHECK result to require evidence.
+
+## Qualification and read-safe conversion
+
+Copy admission seals a quiesced v12 original and an independent temporary copy, rejects overlap/symlinks/special files/source journal sidecars, and compares all non-DB file hashes/modes. Only the copied DB is opened for writes. Source SQLite reads use immutable read-only connections; the source manifest is checked before and after every success/failure. A crashed copy's own journals may be recovered by SQLite; source journals are never dropped or recovered.
+
+The only automatic proof path in this prototype admits the pinned original **complete two-revision trunk import**, unrestricted regular-file projection, matching repository and scoped Git cursor, complete scoped incoming applied records and uniquely corroborating retained mapping rows. It verifies disposable enrolled local SVN UUID/root/path/revision/creation ancestry and absence of properties/copies, bridge and bare Git ref identities, and complete SVN-export versus Git-tree file hashes/types. SVN XML attribute order is canonicalized without dropping values. The importer process exits before any copy is sealed. Inventory's `qualified_fixture_shape` label grants no authority. More complex ancestry/projections/history require separate proof and remain unqualified.
+
+Only such proved pairs receive generation 1 and two initial frontiers. Legacy scoped row IDs are linked without reinterpreting their historical outcomes. Ownerless mappings remain unchanged and unclaimed. Other repositories keep all legacy bytes and `not_qualified`, `needs_reconciliation` or `external_effect_unknown` disposition, with no canonical frontiers. Explicit read-safe disposition cannot grant qualification. Migration never changes enabled state, parents, secret ownership, configuration, checkpoints, receipts, policy, Git refs, or SVN content.
+
+## Transactions, restart and idempotence
+
+For each version, check physical shape and foreign-key enforcement before `BEGIN IMMEDIATE`; repeat validation inside the checked transaction. Execute conversion, compare every legacy SQL value and exact sequence, validate indexes/schema/FKs/integrity and canonical plan, update `user_version` inside that transaction, then commit. Any failure returns an error and rolls back that version. A committed v13 followed by failed v14 remains **valid v13**, not a claimed 12→14 rollback. Reopen/retry validates shape and every sealed legacy value before proceeding. Repeated v14 validates exact canonical contents and proof/dispositions and performs no write. A changed plan cannot silently overwrite prior authority.
+
+Qualification covers injected errors and abrupt child-process exits at pre-transaction, create/copy/replace, validation and pre/post-version boundaries, plus v14 partial repository conversion; actual SQLite query-only/read-only, FK-off and NOT NULL failures; forged physical schemas/future versions; and v13-complete/v14-failed restart. Logical preservation is always checked; handled-error v13 failures additionally preserve exact DB bytes.
+
+## #54 reader audit and activation requirements
+
+The fixture-only `lookup_mapping(repo,generation,rev)` returns distinct `Mapped`, `ProvedNoTarget`, `LegacyUnresolvedNull`, `LegacyOwnerless` and `Missing` results. Proved no-target requires an explicitly linked mapping plus a matching generation-owned, policy-owned resolved source outcome. NULL/ownerless records never infer filtering. Ambiguous scoped rows are an error. The `MAPPING_NULL` case verifies the distinctions and wrong-generation refusal.
+
+| Existing operational reader/writer | Observed v12 behavior; requirement before activation |
+| --- | --- |
+| `get_git_sha_for_svn_rev` | Reads non-NULL String, and can error on NULL. Replace global optional lookup with the typed scoped result; NULL is not "missing" or proof. |
+| `CommitMapEntry` / `list_commit_map` | String field and row conversion reject NULL. Candidate activation needs nullable display data plus typed status; preserve every ID. |
+| Web `sync_history::CommitMapEntryView`, scoped/raw SQL and unscoped list | Same String contract. Coordinate nullable UI/API representation and explicit outcome status. |
+| `get_last_git_hash` and unscoped `SyncEngine` fallback | Latest mapping reads String. Skip NULL for an emitted hash, but never infer handled authority from global maximum/latest row. Replace operational frontier reads with explicit owned direction/generation. |
+| `is_svn_rev_synced` / `is_git_sha_synced` | Existence/SHA predicates are legacy compatibility queries, not typed resolved authority. Do not authorize replay decisions from nullable row existence. |
+| `get_last_svn_rev` fallback | Global MAX is not canonical handled source. Keep outside activation until a scoped qualified adapter is reviewed. |
+| Existing mapping inserts / conflict and sync-record readers | Mapping inserts require SHA; separate sync-record/conflict SHA fields already optional. Future typed no-target writes must atomically own outcomes/frontiers and explicitly link nullable rows. |
+
+These operational readers are intentionally unchanged in this copy-only pass. No candidate database is admitted to a running scheduler. Reader activation tests, fresh operational null cases, installer/daemon activation and deployed compatibility are remaining production gates, not evidence claimed by this prototype.
 
 ## Exact legacy classification-to-row proposal
 
 | Inventoried shape | Proposed v14 disposition and conversion |
 | --- | --- |
-| Pinned old single import: equal scoped Git copies, scoped applied SVN→Git row, matching SVN cursor, verified SVN UUID/path/source ancestry, remote Git ref ancestry and policy | Assign generation 1 **only after those remote proofs**; copy observed handled/emitted frontiers and link original row IDs. No tip change or replay. The current local fixture has only `qualified_fixture_shape`; it does not itself satisfy remote proof. |
+| Pinned old single import: equal scoped Git copies, scoped applied SVN→Git row, matching SVN cursor, verified SVN UUID/path/source ancestry, remote Git ref ancestry and policy | Assign generation 1 **only after those remote proofs**; copy observed handled/emitted frontiers and link original row IDs. No tip change or replay. The copy-only proof path now verifies the enrolled pinned two-revision local fixture; inventory alone still does not satisfy proof. |
 | Two independent imports both at SVN r2 | Separate `(repo_id,1)` lineages only after each own UUID/path/ref/source proof. Never use global r2 or last imported Git SHA as the other's authority. Preserve each old mapping and credential owner. |
 | Disabled third repository | Preserve `enabled=0`, configuration, parent and secrets. `not_qualified` is not reactivation; no scheduler poll. A future generation needs its own proof. |
 | Column SVN=2, scoped SVN=999, global SVN=888, import watermark=777 | Record all four and import progress independently. Reader column precedence explains which current code uses, but conversion is `needs_reconciliation` until the mismatched scoped/import claims and pending work are checked. Never choose 999 or another maximum. |
@@ -167,10 +71,11 @@ CREATE TABLE legacy_evidence_links (
 
 The new inventory reports actual repository columns, scoped SVN/Git KV, global SVN/Git references, import `watermarks`, singleton `import_progress`, scoped and global mapping fallback references, schema columns/indexes/FKs, and credential ownership references. It keeps full sanitized reports for the pinned fixture and explicitly synthetic overlays. It cannot establish remote UUID/copy/ref identity or the installed binary. Any unknown legacy schema, historical copy shape, or inheritance path is read-safe, never auto-normalized.
 
-## Preservation and interruption assertions required before implementation review
 
-For each pinned old fixture and each synthetic overlay, record a private pre/post manifest of DB, WAL, config, secret/key ownership, refs/workdirs, content hashes, modes and owner. A sanitized review artifact records row counts and ID-keyed digests for `repositories`, `commit_map`, `sync_records`, `kv_state`, `watermarks`, `import_progress`, audit/conflict tables and new tables; all old row IDs/bytes remain reachable. Assert enabled flags, parent chains, credential-source references, endpoints/settings, policy JSON, old cursors, Git refs and SVN full trees unchanged. Assert `PRAGMA integrity_check=ok`, `foreign_key_check` empty, unique indexes effective, `user_version` correct, no outbound call, and equal result on restart. Fault after each v13 rebuild substep and each v14 insert/version boundary: either the pre-version state survives intact or the complete version is visible. Read-only/disk-write failures must leave no reported success.
+## Retention and #64 recovery contract
 
-Before any new external effect, restoring the old executable with the consistent pre-upgrade snapshot can be tested. After SVN accepts a commit or Git accepts a push, an old DB snapshot is stale: preserve the new data, stop writers, inspect actual remote UUID/path/revision or ref parent/tree and reconcile/roll forward using durable intent. This later #64 path is **design only**; no rollback, reimport or checkpoint reset is a substitute. A down migration must refuse if typed/NULL outcomes or external effects cannot be represented losslessly by the old schema.
+Keep applied legacy rows, imported baselines, no-target receipt bytes, lineage, resolved outcomes/frontiers and evidence links until a separately reviewed retention policy proves that removing them cannot erase pending-work boundaries or historical policy. Only non-applied diagnostics may expire under the current policy. Storage growth is accepted meanwhile.
 
-**Next approval boundary:** review this proposal, qualify additional historical/deployed shapes and the actual installer/daemon ownership path, then separately authorize and test an implementation. PR #72 does not execute schema SQL.
+Before external writes, a consistent pre-upgrade snapshot plus old executable may be a rollback option. After SVN/Git publication, that snapshot is stale: stop writers, retain evidence, inspect actual pinned target identity/ref ancestry/tree/revision and reconcile/roll forward from durable intent. Reimport, checkpoint reset, blind retry and database rollback cannot substitute for external-effect recovery. General #64 intent/publication/recovery service is design only here. A future down migration must refuse any lossy typed/NULL/effect state.
+
+**Next gate:** independent review of the copy-only implementation and downloadable evidence. No merge, deployment or startup activation is authorized by a passing fixture run.

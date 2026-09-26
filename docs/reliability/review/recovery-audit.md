@@ -27,3 +27,9 @@ Inspected on 2026-09-26. Reviewed boundary: `c52dea6554a629efb7725ea620659501ad6
 | Ordinary startup v13/v14 nonactivation | DONE AND VERIFIED by source registry ending at v12; new regression still required |
 
 The latest posted independent review is #5311615743, at c52. It authorizes copy-only execution; ordinary startup activation remains outside this slice. The exact new user request is preserved in `pr72-recovery-copy-migration-goal.md`. Original GOAL/prior brief bytes remain unchanged.
+
+## Additional Grok evidence found after the preservation commit
+
+The immutable read-only Grok worktree registry `/Users/chriscase/.grok/worktrees.db` contains no RepoSync worktree entry. The local RepoSync session summary in `.grok/sessions/%2FUsers%2Fchriscase%2FDocuments%2FGitHub%2FRepoSync/01a0cf34-31b9-74f1-bc20-4e52bfc585d6/summary.json` names `/Users/chriscase/Documents/GitHub/RepoSync`, `main` at `bfbee349f453fdcdd9b66738234e34831168307b`, with title/summary `exirt` and five messages. The corresponding transcript contains startup reminders and that user text, with no migration goal, implementation or code-tool turn. Logs corroborate the checkout path. Authentication/configuration secrets were not read. This identifies the accessible Grok session checkout; it does **not** establish an interrupted K01–K03 implementation elsewhere. No unique migration code was found to transfer. The older main checkout and unrelated local branch remain untouched.
+
+The cached metadata-only source-index preservation patch SHA-256 is `8e23b809895fa2d38267bc9fb5104696381438bd0875a07c95c75c90ee2d823e`. The original reviewed migration proposal is additionally preserved under `review-6-migration-proposal.md` before its contract update.
