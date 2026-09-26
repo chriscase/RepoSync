@@ -1,0 +1,44 @@
+{
+  "source": "executed local before-fix evidence; curated excerpts only, raw fixture byte dump withheld",
+  "cases": [
+    {
+      "case": "L01_STORAGE",
+      "runtime_head": "9f6330e1e3dad7d8917b432d9d367665641a5227",
+      "execution": "actual local Rust API with new regression test overlay; not an isolated-container run",
+      "command": "cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration copy_storage_alias_rejection -- --exact --nocapture",
+      "result": "0 passed /1 failed /0 ignored",
+      "failure_excerpt": [
+        "thread 'copy_storage_alias_rejection' (16942226) panicked at crates/core/tests/copy_migration.rs:769:9:",
+        "assertion `left == right` failed: source damage: source_hardlink",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.11s"
+      ],
+      "private_raw_log_sha256": "a9d6cc5bc0355ad36a0b37d25cf32ac2eec9d9fef94f4cccfc495d8e2170f3f9"
+    },
+    {
+      "case": "L02_ADMISSION",
+      "runtime_head": "9f6330e1e3dad7d8917b432d9d367665641a5227",
+      "execution": "actual local Rust API with new regression test overlay; not an isolated-container run",
+      "command": "REPOSYNC_OLD_GENERATOR=<pinned original generator> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration actual_legacy_admission_matrix -- --exact --nocapture",
+      "result": "0 passed /1 failed /0 ignored",
+      "failure_excerpt": [
+        "thread 'actual_legacy_admission_matrix' (16943595) panicked at crates/core/tests/copy_migration.rs:807:9:",
+        "admitted combined",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 16 filtered out; finished in 6.81s"
+      ],
+      "private_raw_log_sha256": "fc0131f87f8704b2c7546fdd121ef2a8c3dc2817fa578e122db8824ca8629aaf"
+    },
+    {
+      "case": "L03_HISTORY",
+      "runtime_head": "9f6330e1e3dad7d8917b432d9d367665641a5227",
+      "execution": "actual local Rust API with new regression test overlay; not an isolated-container run",
+      "command": "cargo test -p reposync-core --features reliability-fixture --locked --lib git_baseline_return_and_historical_immutability -- --nocapture",
+      "result": "0 passed /1 failed /0 ignored",
+      "failure_excerpt": [
+        "thread 'db::candidate_authority::tests::git_baseline_return_and_historical_immutability' (16942767) panicked at crates/core/src/db/candidate_authority.rs:402:9:",
+        "baseline return accepted",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 223 filtered out; finished in 0.01s"
+      ],
+      "private_raw_log_sha256": "9d1159a5e0b0fa7cd7d21cc9113e74a8c0b7594ac56e558f33034d87c1f9a151"
+    }
+  ]
+}
