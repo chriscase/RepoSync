@@ -242,6 +242,11 @@ mod tests {
             3
         );
         assert_eq!(c.query_row("SELECT source_key FROM pair_frontiers WHERE repo_id='one' AND generation=2 AND direction='svn_to_git'",[],|r|r.get::<_,String>(0)).unwrap(),"svn:2");
+        let before = snapshot(&c);
+        assert!(c.execute("INSERT OR REPLACE INTO pair_frontiers SELECT repo_id,generation,direction,'svn:2',2,NULL,?1,NULL,'baseline',NULL,projection_version,policy_sha256 FROM pair_frontiers WHERE repo_id='one' AND generation=1 AND direction='svn_to_git'",["b".repeat(40)]).is_err());
+        assert!(c.execute("INSERT OR REPLACE INTO pair_lineages SELECT * FROM pair_lineages WHERE repo_id='one' AND generation=1",[]).is_err());
+        assert!(c.execute("INSERT OR REPLACE INTO pair_outcomes SELECT * FROM pair_outcomes WHERE id='no-target'",[]).is_err());
+        assert_eq!(snapshot(&c), before);
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"K01_VALID","baselines":6,"resolved_transitions":3,"explicit_generation":true,"fk_check":"empty"})
