@@ -554,6 +554,19 @@ impl CopySession {
         git_remote: &Path,
     ) -> Result<Lineage> {
         self.source_unchanged()?;
+        let c=source_db(&self.source.join("reposync.db"))?;
+        let (rev,sha):(i64,String)=c.query_row("SELECT last_svn_rev,last_git_sha FROM repositories WHERE id=?1",[repo],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let decision=super::candidate_evidence::imported_evidence(&c,repo,rev,&sha)?;
+        if decision.disposition!="qualified" {
+            self.disposition(repo,&decision.disposition,&decision.reasons.join(";"))?;
+            anyhow::bail!("legacy admission refused: {}",decision.reasons.join(";"));
+        }
+        let result=self.qualify_imported_pair_inner(repo,svn_root,git_remote);
+        if result.is_err() {self.disposition(repo,"needs_reconciliation","endpoint_or_retained_history_unproved")?;}
+        result
+    }
+    fn qualify_imported_pair_inner(&mut self,repo:&str,svn_root:&Path,git_remote:&Path)->Result<Lineage> {
+        self.source_unchanged()?;
         ensure!(
             !repo.is_empty()
                 && repo.len() <= 128

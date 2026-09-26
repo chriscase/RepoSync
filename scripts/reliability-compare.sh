@@ -33,12 +33,12 @@ mkdir -p "$base_context/docs/reliability/fixtures"
 cp Dockerfile.reliability .dockerignore "$base_context/"
 cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py "$base_context/scripts/"
 cp docs/reliability/fixtures/Cargo.lock "$base_context/docs/reliability/fixtures/"
-cp docs/reliability/required-cases.json "$base_context/docs/reliability/"
+cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$base_context/docs/reliability/"
 shasum -a 256 "$base_context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256"
 cp Dockerfile.reliability .dockerignore "$previous_context/"
 cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py "$previous_context/scripts/"
 cp docs/reliability/fixtures/Cargo.lock "$previous_context/docs/reliability/fixtures/"
-cp docs/reliability/required-cases.json "$previous_context/docs/reliability/"
+cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$previous_context/docs/reliability/"
 
 REPOSYNC_BUILD_CONTEXT="$base_context" \
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$base_sha" \

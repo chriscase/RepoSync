@@ -16,6 +16,17 @@ import sys
 import tomllib
 from urllib.parse import quote, urlsplit
 
+VOCABULARY_PATH = Path(__file__).with_name("legacy-evidence-vocabulary.json")
+if not VOCABULARY_PATH.exists():
+    VOCABULARY_PATH = Path(__file__).resolve().parent.parent / "docs/reliability/legacy-evidence-vocabulary.json"
+VOCABULARY = json.loads(VOCABULARY_PATH.read_text())
+
+
+def receipt_owner(key, repo_ids):
+    owners = [rid for rid in repo_ids if key.startswith(VOCABULARY["no_target_prefix"] + rid + "_")]
+    return max(owners, key=len) if owners else None
+
+
 PINNED_SOURCE = "87379741779a6259f7eeb52a68cc6f061174e5ef"
 EXPECTED_SCHEMA = 12
 OID = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
@@ -253,7 +264,7 @@ def inspect(root, expected):
         for row in rows:
             rid = row["id"]
             column = row["last_git_sha"] or None
-            scoped = keys.get("last_git_sha_" + rid) or None
+            scoped = keys.get(VOCABULARY["scoped_git_prefix"] + rid) or None
             policy = json.dumps({"allowed_paths": json.loads(row["allowed_paths"] or "[]"),
                                  "blocked_patterns": json.loads(row["blocked_patterns"] or "[]")},
                                 separators=(",", ":"), sort_keys=True)
@@ -261,8 +272,8 @@ def inspect(root, expected):
                 "SELECT direction, status, svn_rev, git_sha FROM sync_records WHERE repo_id = ? ORDER BY svn_rev, git_sha, direction", (rid,))]
             old_maps = [dict(x) for x in db.execute(
                 "SELECT direction, svn_rev, git_sha FROM commit_map WHERE repo_id = ? ORDER BY svn_rev, git_sha", (rid,))]
-            receipts = [receipt_view(raw, rid, key[len("handled_git_no_target_" + rid + "_"):], policy)
-                        for key, raw in sorted(keys.items()) if key.startswith("handled_git_no_target_" + rid + "_")]
+            receipts = [receipt_view(raw, rid, key[len(VOCABULARY["no_target_prefix"] + rid + "_"):], policy)
+                        for key, raw in sorted(keys.items()) if receipt_owner(key, rows_by_id) == rid]
             baseline_raw = keys.get("handled_git_baseline_" + rid)
             baseline = None
             if baseline_raw is not None:
@@ -279,7 +290,7 @@ def inspect(root, expected):
             applied_outbound = any(x["direction"] == "git_to_svn" and x["status"] == "applied"
                                    and x["git_sha"] == column for x in mappings)
             ref, ref_storage = local_ref(root, expected["files"], rid, row["git_branch"])
-            scoped_svn = keys.get("last_svn_rev_" + rid)
+            scoped_svn = keys.get(VOCABULARY["scoped_svn_prefix"] + rid)
             global_svn = keys.get("last_svn_rev")
             global_git = keys.get("last_git_hash")
             source_disagreements = []
@@ -324,7 +335,7 @@ def inspect(root, expected):
                 config.get("github", {}).get("token_env"))
             if svn_owner["source"] == "UNKNOWN_PARENT_CHAIN" or git_owner["source"] == "UNKNOWN_PARENT_CHAIN":
                 missing.append("credential_parent_chain_unqualified")
-            if keys.get("effect_unknown_" + rid):
+            if keys.get(VOCABULARY["unknown_effect_prefix"] + rid):
                 classification = "external_effect_unknown"
             elif not row["enabled"]:
                 classification = "not_qualified"

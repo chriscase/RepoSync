@@ -778,3 +778,52 @@ fn copy_storage_alias_rejection() {
     session.source_unchanged().unwrap();
     eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({"case":"L01_STORAGE","rejected":matrix,"source_and_canary_bytes_and_version_unchanged":true,"independent_copy_success":true}));
 }
+
+#[test]
+fn actual_legacy_admission_matrix() {
+    let (t, root, provenance) = old_topology();
+    let original = root.join("install");
+    let original_bytes = fs::read(original.join("reposync.db")).unwrap();
+    let endpoints = endpoint_files(&root);
+    let sha = provenance["pair"]["git_sha"].as_str().unwrap();
+    let mut matrix = Vec::new();
+    let cases = vec![
+        ("combined", "INSERT OR REPLACE INTO kv_state VALUES('last_svn_rev_pair','999','t'); INSERT OR REPLACE INTO kv_state VALUES('last_svn_rev','888','t'); INSERT OR REPLACE INTO watermarks VALUES('svn_rev','777','t')".to_string()),
+        ("progress", "UPDATE import_progress SET repo_id='pair',current_rev=666".to_string()),
+        ("ambiguous_progress", "UPDATE import_progress SET repo_id=NULL,current_rev=666".to_string()),
+        ("unknown_effect", "INSERT INTO kv_state VALUES('effect_unknown_pair','{\"state\":\"unknown\"}','t')".to_string()),
+        ("actual_v1", format!("INSERT INTO kv_state VALUES('handled_git_no_target_pair_{sha}','{{\"version\":1,\"outcome\":\"no_svn_delta\"}}','t')")),
+        ("actual_v2", format!("INSERT INTO kv_state VALUES('handled_git_no_target_pair_{sha}','{{\"version\":2,\"outcome\":\"no_svn_delta\"}}','t')")),
+        ("actual_filtered", format!("INSERT INTO kv_state VALUES('handled_git_no_target_pair_{sha}','{{\"version\":2,\"outcome\":\"filtered\"}}','t')")),
+        ("actual_v3", format!("INSERT INTO kv_state VALUES('handled_git_no_target_pair_{sha}','{{\"version\":3,\"outcome\":\"no_svn_delta\"}}','t')")),
+    ];
+    for (index, (name, sql)) in cases.into_iter().enumerate() {
+        let source = t.path().join(format!("real-vocabulary-{index}"));
+        let target = t.path().join(format!("real-copy-{index}"));
+        copy(&original, &source);
+        Connection::open(source.join("reposync.db")).unwrap().execute_batch(&sql).unwrap();
+        copy(&source, &target);
+        let mut session = CopySession::seal(&source, &target).unwrap();
+        assert!(session.qualify_imported_pair("pair", &root.join("svn-one"), &root.join("origin-one.git")).is_err(), "admitted {name}");
+        // The real admission call must set the read-safe disposition itself.
+        let report = session.migrate(14, &mut |_, _, _| Ok(())).unwrap();
+        assert!(report.canonical["pair_lineages"].is_empty(), "{name}");
+        let db = Connection::open(target.join("reposync.db")).unwrap();
+        let state: String = db.query_row("SELECT disposition FROM repo_migration_state WHERE repo_id='pair'", [], |r| r.get(0)).unwrap();
+        assert_eq!(state, if name=="unknown_effect" {"external_effect_unknown"} else {"needs_reconciliation"}, "{name}");
+        session.source_unchanged().unwrap();
+        matrix.push(serde_json::json!({"name":name,"state":state,"no_authority":true,"raw_legacy_preserved":report.legacy}));
+    }
+    // Unowned global references and similarly prefixed repository receipts are
+    // not borrowed as this pair's directional authority.
+    let source = t.path().join("benign-global"); let target = t.path().join("benign-copy");
+    copy(&original, &source);
+    Connection::open(source.join("reposync.db")).unwrap().execute_batch(&format!("INSERT OR REPLACE INTO kv_state VALUES('last_svn_rev','888','t'); INSERT INTO kv_state VALUES('handled_git_no_target_pair_two_{sha}','{{\"version\":1}}','t')")).unwrap();
+    copy(&source,&target);
+    let mut session=CopySession::seal(&source,&target).unwrap();
+    session.qualify_imported_pair("pair",&root.join("svn-one"),&root.join("origin-one.git")).unwrap();
+    assert!(session.qualify_imported_pair("pair_two",&root.join("svn-two"),&root.join("origin-two.git")).is_err());
+    let report=session.migrate(14,&mut |_,_,_|Ok(())).unwrap(); assert_eq!(report.canonical["pair_lineages"].len(),1);
+    assert_eq!(fs::read(original.join("reposync.db")).unwrap(),original_bytes); assert_eq!(endpoint_files(&root),endpoints);
+    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"L02_ADMISSION","overlays":matrix,"exact_prefix_ownership":true,"benign_global_not_authority":true,"original_and_endpoints_unchanged":true}));
+}
