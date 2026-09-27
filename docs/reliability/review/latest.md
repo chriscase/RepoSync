@@ -1,63 +1,45 @@
-# PR72 review8 compact delta handoff
+# PR72 review9 compact delta handoff
 
-Bounded correction and typed-reader candidate for independent review. Starting reviewed head: `9f6330e1e3dad7d8917b432d9d367665641a5227`; the exact functional head, including the first-page retention correction, is reported in the PR body/return receipt. Final documentation SHA is the commit containing this file; exact final/remote/PR merge/tree and final CI receipts are recorded in PR72's body and return handoff, without recursive documentation receipt commits. PR remains draft.
+Bounded M01 correction plus nullable DTO/historical-reader qualification. PR remains draft on `feature/reposync-reliability`. Starting reviewed head `a934fa80a11840a92097269b9fd0e425112cbd5a`; original base `87379741779a6259f7eeb52a68cc6f061174e5ef`; retained f74 anchor `f74fce855a1f1d80dd631397f436ba33906272e6` is not the immediate predecessor. Exact functional/final/remote/CI merge/tree and downloaded receipts are reported in PR72 and the return, without recursive receipt-only commits.
 
-Original base `87379741779a6259f7eeb52a68cc6f061174e5ef`; retained f74 anchor `f74fce855a1f1d80dd631397f436ba33906272e6` is not the immediate predecessor. The immediate reviewed9f head is now also executed as a matched comparison under the same locked methodology. Broad default-feature catalogs do not prove the feature-gated candidate cases.
+## Preservation and correction
 
-## Preserved bytes and scope
+Original GOAL SHA-256 `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`; dependency lock `9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05`; exact current brief `66ec0ec28b1e88f7f753792238abcb5b8a05882bff6f75a155ba84939633f6de`; previous brief `7f108a2d3ad8c212cc0db4049d1a8672e9dd750c6107ca9bf7856e8257a6e8f0`. Original/prior briefs and [previous handoff](review-8-handoff.md) remain byte-exact. Acceptance criteria and issues are unchanged. Accessible recovery search was not repeated.
 
-- Original GOAL: `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`.
-- Dependency lock: `9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05`.
-- Exact copied current brief: `7f108a2d3ad8c212cc0db4049d1a8672e9dd750c6107ca9bf7856e8257a6e8f0`.
-- Exact attached review7: `38b6cb47fe467d52e4116397301a9f55f2e1805b208a2a09562031c791702993`.
-- All prior briefs/reviews preserved. Prior latest.md is byte-exact [review7 handoff](review-7-handoff.md).
-- Accessible recovery search remains complete within its recorded limits. No repeat search and no claim of recovered Grok code.
-- No production/active repositories/credentials, resets, reimport recovery, operational activation, force push, merge, release or deployment. Normal startup/daemon/installer/scheduler stay12; general #64 service is not implemented.
+Actual before-fix Rust test on reviewed runtime committed a source-key UPDATE OR REPLACE from pending to applied r99. Reopened actual CopyReaders lookup and last_emitted returned r99 rather than historical r3. [Curated failing reproduction](review-9-reproduction.json) retains command, runtime/SQL identity, result0/1/0 and raw-log hash; no large DB dumps are published. Reviewer exact-schema/transcribed-query probes are [separate evidence](review-8-independent-probes.json), not substituted for the Rust integration.
 
-## Finding delta and executed evidence
+M01 uses a prospective resolved-victim BEFORE UPDATE guard, independent of recursive-trigger configuration. Existing direct UPDATE/DELETE and INSERT guards remain. **160 rejections** cover two recursive settings × four resolved kinds × current/historical victims × both conflict keys × both replacement states/methods, plus direct UPDATE/DELETE. Exact guard-error checks prevent unrelated SQL errors satisfying the replacement oracle. Every rejection preserves complete rows/evidence/frontiers/counts and DB bytes, and real reopened lookup/status/emitted results retain r3. Transaction rollback stays usable; nonconflicting pending bookkeeping and ordinary forward transitions pass. Superseded prototype shape refuses migration/read without repair. Source/config/refs and endpoints remain unchanged.
 
-[Before-fix excerpts](review-8-reproductions.json) record actual **local Rust API** failures against reviewed runtime9f plus new regression tests. These are executed local proofs, not claimed container runs; raw log hashes are retained, huge raw fixture byte dumps are withheld. The final complete scanned CI archive includes these excerpts alongside the required after-fix evidence.
+## DTO and exact cases
 
-| Finding | Actual before-fix result | Corrected control |
-| --- | --- | --- |
-| L01 | Hard-linked copy mutated source despite eventual error | Source/copy and outside-canary aliases, including replacement after seal, reject before mutable open/recovery; full bytes/version12 unchanged. Independent copy reaches14 |
-| L02 | Combined2/999/888/777 was admitted | Actual-key v1/v2/filtered/v3, scoped and ambiguous progress, unknown-effect overlays refuse through real qualifier and14 conversion, preserve raw rows/sequences and automatically set read-safe state. Clean pairs/disabled and exact prefix ownership retained; benign global888 is display-only |
-| L03 | Public writer accepted B→E→F→B | Baseline return through writer and SQL rejects with no false committed outcome; two-step forward control passes; stale/replayed sources reject; earlier resolved UPDATE/DELETE/REPLACE through either conflict key reject |
+[Copy DTO contract/decision matrix](../serialization-contract.md) uses `reposync.copy_read.v1` over the existing readers, compiled only with `reliability-fixture`. [26 literal payloads](../../../crates/core/tests/fixtures/copy-reader-v1.json), SHA-256 `0ac640a1899881fc195ec6d21bbc6df765b92ca96f08d5b2ac29c67bbca7edc9`, are independent expected data. Actual payload equality, consumer decode and reserialization are asserted.
 
-Stage A controls passed before reader implementation: full copy suite **17/0/0**, authority **4/0/0**, default startup **1/0/0**. The original K01 predecessor negative was constructed before insertion rather than mutating immutable resolved evidence; its rejection/no-damage oracle and all70 case objects remain unchanged.
-
-## Typed readers
-
-See [entry, decision matrix, source-order boundary and remaining limitations](../typed-readers.md). Only `CopySession::readers()` constructs the immutable read-only model. New canonical readers never call the legacy prototype's non-NULL display fast path. Explicit generation, repository, direction, source and handled-chain evidence are required; missing/wrong generation, disabled/not-qualified, pending/unknown, unlinked/malformed/ownerless/duplicate evidence stays visibly unqualified.
-
-Targeted reader suite **5/0/0**; final reader-constructor/no-write check **1/0/0**. Tests prove both directions sharing an SVN number, linked applied/no-target and missing links/contradictions, wrong/missing generation, raw malformed/NULL display, deterministic complete ID pagination (including explicit zero/negative IDs after an additional reproduced-and-fixed first-page gap), disabled/read-safe status, and actual last emitted objects after no-target plus intervening pending/unknown records. Reader calls preserve complete DB bytes/version14, sealed original/config/ref files and enrolled endpoint manifests. Sidecars refuse before immutable open. No installation/in-memory initialization or migration is performed by the readers.
-
-Git predecessor strings prove structural continuity only. The authority unit test is an actual writer/SQL structural control with synthetic hashes, not actual Git-ancestry qualification. Pinned old imported lineages retain their separate actual SVN/Git proof. Arbitrary future Git ancestry/external effects remain unqualified; no general rebase/operation engine is claimed.
-
-## Required gate and commands
-
-All **70** prior required identities/oracles retained; **8** added, total **78**:
-
-| Added ID | Test |
+| Added ID | Test / delta |
 | --- | --- |
-| L01_STORAGE | copy_storage_alias_rejection |
-| L02_ADMISSION | actual_legacy_admission_matrix |
-| L03_HISTORY | git_baseline_return_and_historical_immutability |
-| T54_LOOKUP | typed_reader_lookup_matrix |
-| T54_LIST | typed_reader_list_matrix |
-| T54_STATUS | typed_reader_status_matrix |
-| T54_EMITTED | typed_reader_emitted_matrix |
-| T54_READONLY | typed_reader_no_write_matrix |
+| M01_HISTORY | m01_conflict_history_preservation: SQL matrix, full preservation, reopened reader results and ordinary controls |
+| S54_JSON_LOOKUP | nullable_dto_lookup_matrix: qualified mapped/no-target versus unresolved NULL/ownerless/malformed; wrong/missing generation, disabled/not-qualified; missing still exposes pending/unknown |
+| S54_JSON_HISTORY | nullable_dto_historical_matrix: both directional histories, current target versus last recorded target, pending/effect-unknown; failed M01 mutation cannot change DTO history |
+| S54_JSON_PAGE | nullable_dto_pagination_matrix: signed/zero IDs, NULL/blob/finite/infinite REAL, duplicates/ownerless, every retained ID and deterministic empty page |
+| S54_JSON_READONLY | nullable_dto_readonly_matrix: repeated DTO/consumer/error paths preserve copy/source/endpoint bytes/version; bad schema/operation/null mapped target refuse |
 
+All78 prior required ID/test/tier objects and strict source oracles remain; added5, total83. Initial new literal author expectations were corrected from NULL to the unchanged schema's NOT NULL empty-text default; no old test or runtime behavior was weakened. Targeted DTO4/0/0, read-safe lookup phase1/0/0, authority4/0/0, retained L02 admission1/0/0 and default startup1/0/0 passed. Final complete required qualification and accurately named original/f74/immediate-a934 comparisons are reported from downloaded final-tree CI evidence.
+
+`Canonical::Missing` is absence of proved handled authority, not absence of pending work or permission to retry. Unqualified scope makes nonhandled visibility unavailable. NULL remains explicitly tagged, separate from empty text; target absence is JSON null, not zero/empty SHA. Blob hex and IEEE-754 bit tags preserve unusual raw values. No new authority algorithm, remote commands, migration or operational routes are added by serialization.
+
+## Commands and publication
+
+- `REPOSYNC_OLD_GENERATOR=<pinned original873> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration m01_conflict_history_preservation -- --exact --nocapture --test-threads=1`
+- Same generator: `cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration nullable_dto -- --nocapture --test-threads=1`
 - `cargo test -p reposync-core --features reliability-fixture --locked --lib candidate_authority -- --nocapture --test-threads=1`
-- With pinned original `REPOSYNC_OLD_GENERATOR`, `cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration -- --nocapture --test-threads=1`; targeted filters were used during iteration.
 - `cargo test -p reposync-core --locked --test startup_schema -- --nocapture`
-- `scripts/reliability-container.sh --all`: full exact78, six sandbox canaries and internal evidence scan.
-- `scripts/reliability-compare.sh`: original873, retainedf74, immediate9f and candidate, same lock/method; failures and ignored tests remain visible.
-- Complete publication scan, ZIP digest recomputation and independent downloaded scan; final results, IDs/hashes/expiry in PR72 and return receipt.
+- `scripts/reliability-container.sh --all`: full exact83 plus six sandbox canaries and internal scan.
+- `scripts/reliability-compare.sh`: original873, retainedf74, immediate-a934, candidate under the same lock/overlays/method. Feature-gated paths are proved by the exact suite, not default catalogs.
+- Complete host/publication and independent downloaded evidence scans; ZIP digest plus key-file hashes in PR72/return. Literal JSON and local before-fix excerpt are downloadable with the CI evidence.
 
-The pinned old generator/driver and original K02 sequence/K03 origin/rollback/crash proofs remain required; see unchanged [prior evidence](review-7-handoff.md). Broad E2E/S7/LFS and ordinary CI are reported from final-head jobs. The known integration failure, ignored conflict test and ordinary formatting failure remain explicit.
+Known integration failure `integration::test_full_svn_to_git_cycle_with_metadata`, ignored `team_mode_e2e::test_team_mode_conflict_detection`, and ordinary CI formatting failure remain visible. Earlier evidence is referenced through the archived handoff rather than repasted here.
 
-## Remaining boundary / next slice
+## Boundary and next review
 
-Deployed versions, arbitrary old histories/policies, remote production identity, fencing/backup ownership, inherited/rotated/encrypted credential variants, installer/daemon/scheduler/API activation, live acceptance, down migration and general #64 recovery remain unqualified. #54/#63 acceptance criteria and issue state are unchanged. Smallest proposed next slice after independent review: additional copy-only historical evidence and nullable API serialization qualification for the typed readers. Activation requires a separately reviewed boundary. Stop here.
+Normal startup, operational API, daemon, installer and scheduler remain at reviewed v12. L01/L02, baseline-return and direct historical guards, original readers and copy-only migration remain. Structural later fixture hashes/targets qualify SQL/reader/DTO behavior, not new external effects or arbitrary Git ancestry. No production, resets/reimport recovery, general64 service, force push, merge, release or deployment.
+
+Deployed installations, arbitrary historical topology/policy/ancestry, production identity, concurrent writer fencing/backup ownership, credential variants, live acceptance, down migration and general64 recovery remain unqualified. Smallest proposed next slice after review: additional copy-only historical-topology DTO qualification; operational activation requires its own reviewed boundary. Stop at independent review.

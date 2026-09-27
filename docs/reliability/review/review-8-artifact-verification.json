@@ -1,0 +1,163 @@
+{
+  "artifact_id": 10915369356,
+  "run_id": 36271915102,
+  "archive_sha256": "13e3450b478e3545dfaf2a48bd8773682f7e04bc6e286436440a65becad20a65",
+  "file_count": 224,
+  "uncompressed_bytes": 1102859,
+  "feature_head": "a934fa80a11840a92097269b9fd0e425112cbd5a",
+  "merge_head": "008a572019b8c2a78aceff8284dfd18a958c6308",
+  "tree": "13ce5fdf8a2fd0ce803ebd98221459e27789ae43",
+  "exact_required_and_executed_ids_match": true,
+  "passed": 78,
+  "failed": 0,
+  "ignored": 0,
+  "case_tiers": {
+    "candidate_regression": 75,
+    "candidate_admission": 1,
+    "baseline_observation": 2
+  },
+  "retained_prior_case_id_test_tier_count": 70,
+  "retained_identity_changes": [],
+  "comparisons_recomputed": {
+    "base": {
+      "head": "87379741779a6259f7eeb52a68cc6f061174e5ef",
+      "tree": "f383bb9b123f3f75b2dde7f17f7311a264946abd",
+      "totals": {
+        "failed": 5,
+        "filtered_out": 0,
+        "ignored": 1,
+        "passed": 324
+      },
+      "recounted_catalog": {
+        "ok": 324,
+        "FAILED": 5,
+        "ignored": 1
+      },
+      "regressions_recomputed": []
+    },
+    "previous": {
+      "head": "f74fce855a1f1d80dd631397f436ba33906272e6",
+      "tree": "2819ed3cd27d0dad13847e481e18f550aac15d06",
+      "totals": {
+        "failed": 1,
+        "filtered_out": 0,
+        "ignored": 1,
+        "passed": 362
+      },
+      "recounted_catalog": {
+        "ok": 362,
+        "FAILED": 1,
+        "ignored": 1
+      },
+      "regressions_recomputed": []
+    },
+    "immediate": {
+      "head": "9f6330e1e3dad7d8917b432d9d367665641a5227",
+      "tree": "674a0d669852d20527df1502e39059c35ccdd851",
+      "totals": {
+        "failed": 1,
+        "filtered_out": 0,
+        "ignored": 1,
+        "passed": 375
+      },
+      "recounted_catalog": {
+        "ok": 375,
+        "FAILED": 1,
+        "ignored": 1
+      },
+      "regressions_recomputed": []
+    }
+  },
+  "candidate_totals": {
+    "failed": 1,
+    "filtered_out": 0,
+    "ignored": 1,
+    "passed": 375
+  },
+  "all_catalog_goals_equal": true,
+  "all_catalog_locks_equal": true,
+  "publication_scan": {
+    "executed": true,
+    "result": "PASS",
+    "files_scanned": 223,
+    "bytes_scanned": 1102764
+  },
+  "canaries": {
+    "fixture_read_write": "PASS",
+    "host_private_read_write_denied": "PASS",
+    "fixture_loopback": "PASS",
+    "host_loopback_denied": "PASS",
+    "external_egress_denied": "PASS",
+    "file_target_traversal_and_symlink_denied": "PASS"
+  },
+  "independent_exact_canary_scan": {
+    "token": "REPOSYNC_SYNTHETIC_SECRET_CANARY_72",
+    "matches": [],
+    "files_scanned": 224,
+    "not_a_comprehensive_secret_audit": true
+  },
+  "key_files": {
+    "summary.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/summary.json",
+      "sha256": "6d69e8ccbc20beb18f1070b00f62f7b43cf0ff697693fd4bca2d6c38861e3aaa"
+    },
+    "comparison.json": {
+      "path": "reliability-compare/20260926T211334Z/comparison.json",
+      "sha256": "9489f10f890a86b503412944d014c7e842eea8aa1ad1b9412ed17876f7820db1"
+    },
+    "previous-comparison.json": {
+      "path": "reliability-compare/20260926T211334Z/previous-comparison.json",
+      "sha256": "97c7e5d341b1f275fc5ddc7e35f36673ce405588fcf56440a432ae19f88ff8e0"
+    },
+    "immediate-comparison.json": {
+      "path": "reliability-compare/20260926T211334Z/immediate-comparison.json",
+      "sha256": "b04a7b63a8815c1481f2b58ea5d2235e874945010dad48852525b543c5ff4495"
+    },
+    "evidence-scan-status.json": {
+      "path": "evidence-scan-status.json",
+      "sha256": "02ee43bca3af1671d6f9992abe6d35b07ec0cadf688073546efdda6ab18a7f86"
+    },
+    "review8-reproductions.json": {
+      "path": "review8-reproductions.json",
+      "sha256": "e3ed306cedf38cea17caff46b38b1a979c56c8185d97d2d44ef0670898c27ef2"
+    },
+    "L01_STORAGE.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/L01_STORAGE.json",
+      "sha256": "5e1a0817b657ff216dbd618c7330584a715bc375b9e7792c35db8f4332243ebf"
+    },
+    "L02_ADMISSION.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/L02_ADMISSION.json",
+      "sha256": "4093d62a4922017f490af93dd4d6553549d67f6b3030b41aed4761891f9efca9"
+    },
+    "L03_HISTORY.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/L03_HISTORY.json",
+      "sha256": "fba42369685c389636a83da57cf8ba7c228c0627c104afc73412b523c1d73876"
+    },
+    "T54_EMITTED.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/T54_EMITTED.json",
+      "sha256": "d35ffd641612556fddb42fa3ef139607d82a69a53570570957990c63e479a414"
+    },
+    "T54_LIST.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/T54_LIST.json",
+      "sha256": "0b9fb65e004fb27856374b9cef2d1caeecb0a643cf7e5818ae3d5d7de5a39f69"
+    },
+    "T54_LOOKUP.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/T54_LOOKUP.json",
+      "sha256": "4c4ebe1a76be614730ecb1424511a61ab3040b0c204800457df5c122ebd52eb6"
+    },
+    "T54_READONLY.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/T54_READONLY.json",
+      "sha256": "0f75a19f239101a2a500a14d46428e5afde21688162e198835aa6d70887c3013"
+    },
+    "T54_STATUS.json": {
+      "path": "reliability-phase0/20260926T211203Z-all/T54_STATUS.json",
+      "sha256": "ed46cd9d43acbea619aeb3d261b491f0319266ea7ee5ce611b1845ea7bb15375"
+    }
+  },
+  "limits": [
+    "No independent Cargo/SVN/Docker rerun.",
+    "CI step conclusions checked separately via GitHub metadata.",
+    "Before-fix Rust excerpts in artifact remain implementing-agent evidence, not reviewer executions.",
+    "Exact-case retention checked as ID/test/tier; individual source assertions assessed in selected source paths, not claimed wholesale identical."
+  ]
+}

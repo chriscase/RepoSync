@@ -1,0 +1,35 @@
+{
+  "reviewed_runtime_head": "a934fa80a11840a92097269b9fd0e425112cbd5a",
+  "sql_git_blob": "7895b10d4463c395aef0ff74ca6ac89b50808297",
+  "test": "m01_conflict_history_preservation",
+  "tier": "executed_local_Rust_candidate_and_reopened_CopyReaders_not_container_before_run",
+  "command": "REPOSYNC_OLD_GENERATOR=<pinned original873 binary> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration m01_conflict_history_preservation -- --exact --nocapture --test-threads=1",
+  "exit_code": 101,
+  "counts": {
+    "passed": 0,
+    "failed": 1,
+    "ignored": 0
+  },
+  "raw_log_sha256": "3b8392203dc17078254e20b2044d824fda23fc6ec96966d34d3a38ae36a2455d",
+  "excerpt": [
+    "test m01_conflict_history_preservation ... M01_BEFORE actual Rust UPDATE OR REPLACE source_key applied_verified: accepted; reopened last_emitted=Ok(Emitted { scope: Qualified(1), target: Some(Svn(99)), authority: Some(\"pending-P\"), nonhandled_records: [] }); lookup=Ok(Lookup { scope: Qualified(1), canonical: Mapped { target: Svn(99), authority: \"pending-P\" }, legacy: [] })",
+    "resolved historical victim overwritten: recursive=0 kind=applied_verified historical=true UPDATE OR REPLACE source_key applied_verified",
+    "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 7.28s"
+  ],
+  "assertion": "Actual Rust writer established applied SVN r3 then no-target history. An unresolved-row source-key replacement committed fake r99; reopened lookup and last_emitted both returned r99. Required regression failed.",
+  "targeted_iteration": {
+    "counts_before_fixture_precision_correction": [
+      0,
+      4,
+      0
+    ],
+    "raw_log_sha256": "32707cd4ebe4386a149c4965ccffb53ea72306103d99438c45b35ef510b3dafd",
+    "cause": "New literal expectations used NULL authors; unchanged v13 mapping schema has NOT NULL empty-text author defaults. Corrected only those new expected values; strict full-payload equality and all78 existing oracles retained.",
+    "counts_after": [
+      4,
+      0,
+      0
+    ],
+    "raw_log_after_sha256": "1ac93d8bca705f0196a3aa39cbe8f6387f4979847c19dd27b81161190b2c68ce"
+  }
+}
