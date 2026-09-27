@@ -469,6 +469,36 @@
       "binary": "copy_migration",
       "test": "typed_reader_no_write_matrix",
       "tier": "candidate_regression"
+    },
+    {
+      "id": "M01_HISTORY",
+      "binary": "copy_migration",
+      "test": "m01_conflict_history_preservation",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "S54_JSON_LOOKUP",
+      "binary": "copy_migration",
+      "test": "nullable_dto_lookup_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "S54_JSON_HISTORY",
+      "binary": "copy_migration",
+      "test": "nullable_dto_historical_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "S54_JSON_PAGE",
+      "binary": "copy_migration",
+      "test": "nullable_dto_pagination_matrix",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "S54_JSON_READONLY",
+      "binary": "copy_migration",
+      "test": "nullable_dto_readonly_matrix",
+      "tier": "candidate_regression"
     }
   ]
 }

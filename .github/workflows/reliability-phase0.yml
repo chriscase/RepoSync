@@ -26,6 +26,8 @@ jobs:
         if: always()
         run: |
           cp docs/reliability/review/review-8-reproductions.json artifacts/review8-reproductions.json
+          cp docs/reliability/review/review-9-reproduction.json artifacts/review9-reproduction.json
+          cp crates/core/tests/fixtures/copy-reader-v1.json artifacts/copy-reader-v1.json
           python3 scripts/reliability_scan.py --scan artifacts \
             --status-file artifacts/evidence-scan-status.json
       - name: Preserve fixture-only evidence
@@ -38,5 +40,7 @@ jobs:
             artifacts/reliability-compare/
             artifacts/evidence-scan-status.json
             artifacts/review8-reproductions.json
+            artifacts/review9-reproduction.json
+            artifacts/copy-reader-v1.json
           retention-days: 14
           if-no-files-found: warn
