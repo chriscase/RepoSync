@@ -976,6 +976,7 @@ fn m01_conflict_history_preservation() {
         let mut c = Connection::open(target.join("reposync.db")).unwrap();
         c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive};")).unwrap();
         assert_eq!(c.pragma_query_value::<i64,_>(None,"recursive_triggers",|r|r.get(0)).unwrap(),recursive);
+        assert_eq!(c.query_row("SELECT wr FROM pragma_table_list WHERE name='pair_outcomes'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         let policy:String = c.query_row("SELECT policy_sha256 FROM pair_lineages WHERE repo_id='pair' AND generation=1",[],|r|r.get(0)).unwrap();
         let mut predecessor = format!("git:{}",provenance["pair"]["git_sha"].as_str().unwrap());
         for (id,sha,k) in [("prior","d","applied_verified"),("victim","e",kind),("later","f","empty_no_target")] {
@@ -990,7 +991,7 @@ fn m01_conflict_history_preservation() {
         let model = preserved_history_readers(&session);
         let bytes = fs::read(target.join("reposync.db")).unwrap();
         let mut rejected = Vec::new();
-        for op in ["UPDATE OR REPLACE","INSERT OR REPLACE"] { for key in ["source_key","id"] { for replacement in ["applied_verified","pending"] {
+        for op in ["UPDATE OR REPLACE","INSERT OR REPLACE"] { for key in ["rowid","source_key","id"] { for replacement in ["applied_verified","pending"] {
             let c = Connection::open(target.join("reposync.db")).unwrap();
             c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive}; BEGIN IMMEDIATE;")).unwrap();
             let new_id=if key=="id" {"victim"}else{"pending-P"};
@@ -999,7 +1000,11 @@ fn m01_conflict_history_preservation() {
             } else {
                 format!("{op} INTO pair_outcomes VALUES(?1,'pair',1,'git_to_svn',?2,?4,NULL,?3,?5,NULL,?6,1,?7,'{{\"replacement\":true}}')")
             };
-            let source_sha=if key=="id" {"a".repeat(40)}else{"e".repeat(40)};
+            let source_sha=if key=="source_key" {"e".repeat(40)}else{"a".repeat(40)};
+            let sql=if key=="rowid" {
+                if op=="UPDATE OR REPLACE" {sql.replace("SET id=?1,","SET rowid=(SELECT rowid FROM pair_outcomes WHERE id='victim'),id=?1,")}
+                else {sql.replace("INTO pair_outcomes VALUES(","INTO pair_outcomes(rowid,id,repo_id,generation,direction,source_key,predecessor_source_key,source_svn_rev,source_git_sha,outcome,target_git_sha,target_svn_rev,projection_version,policy_sha256,evidence_json) VALUES((SELECT rowid FROM pair_outcomes WHERE id='victim'),")}
+            }else{sql};
             let p=rusqlite::params![new_id,format!("git:{source_sha}"),source_sha,format!("git:{}","d".repeat(40)),replacement,if replacement=="applied_verified" {Some(99i64)}else{None},policy];
             let result=if op=="UPDATE OR REPLACE" {c.execute(&sql,&p[..6])}else{c.execute(&sql,p)};
             if result.is_ok() {
@@ -1009,7 +1014,7 @@ fn m01_conflict_history_preservation() {
                 panic!("resolved historical victim overwritten: recursive={recursive} kind={kind} historical={historical} {op} {key} {replacement}");
             }
             let error=result.unwrap_err().to_string();
-            assert!(error.contains(if op=="UPDATE OR REPLACE" {"update cannot replace resolved evidence"}else{"resolved historical evidence cannot be replaced"}),"unexpected rejection: {error}");
+            assert!(error.contains(if key=="rowid" {"rowid"}else if op=="UPDATE OR REPLACE" {"update cannot replace resolved evidence"}else{"resolved historical evidence cannot be replaced"}),"unexpected rejection: {error}");
             c.execute_batch("ROLLBACK").unwrap();
             assert_eq!(outcome_snapshot(&c),rows);
             assert_eq!(c.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
@@ -1026,14 +1031,14 @@ fn m01_conflict_history_preservation() {
             let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive};")).unwrap();assert!(c.execute(sql,[]).is_err());assert_eq!(outcome_snapshot(&c),rows);drop(c);
             assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);assert_eq!(preserved_history_readers(&session),model);rejected.push(sql.into());
         }
-        let c=Connection::open(target.join("reposync.db")).unwrap();c.execute("UPDATE pair_outcomes SET evidence_json='{\"bookkeeping\":true}' WHERE id='pending-P'",[]).unwrap();assert_eq!(c.query_row("SELECT evidence_json FROM pair_outcomes WHERE id='pending-P'",[],|r|r.get::<_,String>(0)).unwrap(),"{\"bookkeeping\":true}");drop(c);
+        let c=Connection::open(target.join("reposync.db")).unwrap();c.execute("UPDATE OR REPLACE pair_outcomes SET evidence_json='{\"bookkeeping\":true}' WHERE id='pending-P'",[]).unwrap();assert_eq!(c.query_row("SELECT evidence_json FROM pair_outcomes WHERE id='pending-P'",[],|r|r.get::<_,String>(0)).unwrap(),"{\"bookkeeping\":true}");drop(c);
         assert_eq!(preserved_history_readers(&session),model);
         matrix.push(serde_json::json!({"recursive_triggers":recursive,"victim_kind":kind,"historical":historical,"rejected":rejected,"full_rows_evidence_frontier_counts_and_copy_bytes_unchanged":true,"reopened_lookup_status_last_emitted_unchanged":true,"last_emitted_svn":3,"pending_bookkeeping_success":true,"transaction_usable":true}));
     }}}
     let target=t.path().join("superseded-shape");copy(&source,&target);let session=qualified(&source,&target,&root);session.migrate(14,&mut |_,_,_|Ok(())).unwrap();
     let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("DROP TRIGGER outcome_resolved_update_conflict").unwrap();drop(c);
     let bytes=fs::read(target.join("reposync.db")).unwrap();assert!(session.readers().is_err());assert!(session.migrate(14,&mut |_,_,_|Ok(())).is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
-    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"M01_HISTORY","matrix":matrix,"superseded_schema_refused_without_repair":true,"source_config_refs_and_endpoints_unchanged":true,"ordinary_forward_transitions":true,"structural_evidence_not_external_effect_proof":true}));
+    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"M01_HISTORY","outcome_storage":"without_rowid","matrix":matrix,"superseded_schema_refused_without_repair":true,"source_config_refs_and_endpoints_unchanged":true,"ordinary_forward_transitions":true,"structural_evidence_not_external_effect_proof":true}));
 }
 
 fn assert_dto(name: &'static str, response: reposync_core::db::candidate_dto::Response, checks: &mut Vec<&'static str>) {

@@ -31,5 +31,24 @@
       0
     ],
     "raw_log_after_sha256": "1ac93d8bca705f0196a3aa39cbe8f6387f4979847c19dd27b81161190b2c68ce"
+  },
+  "residual_hidden_rowid": {
+    "runtime_head": "71c43ce05efab5c48806db7fd5d578f3008259b9",
+    "tier": "executed_local_Rust_candidate_and_reopened_CopyReaders",
+    "test": "m01_conflict_history_preservation with added hidden-rowid derivative",
+    "exit_code": 101,
+    "counts": [
+      0,
+      1,
+      0
+    ],
+    "raw_log_sha256": "93fa56b383da19b64a5cca38d83124f5930c035008a796c8aa87cd4291bae198",
+    "excerpt": [
+      "test m01_conflict_history_preservation ... M01_BEFORE actual Rust UPDATE OR REPLACE rowid applied_verified: accepted; reopened last_emitted=Err(Query returned no rows); lookup=Err(Query returned no rows)",
+      "resolved historical victim overwritten: recursive=0 kind=applied_verified historical=true UPDATE OR REPLACE rowid applied_verified",
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 26 filtered out; finished in 6.97s"
+    ],
+    "assertion": "Hidden rowid replacement deleted the historical resolved source despite the explicit-key guard; actual reopened lookup and last_emitted failed with Query returned no rows.",
+    "correction": "Candidate-only outcome storage WITHOUT ROWID eliminates the implicit identity; explicit ID/scoped-source guards remain. No legacy commit_map ID/sequence change or v12 activation."
   }
 }

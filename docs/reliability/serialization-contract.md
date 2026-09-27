@@ -42,7 +42,7 @@ Only mapping/read-model business fields are emitted. SQL schema dumps, raw outco
 
 | Required ID | Test and proof |
 | --- | --- |
-| M01_HISTORY | 160 SQL rejections: two recursive-trigger settings × four resolved kinds × current/historical victims × eight replacement and two direct mutation attempts; full row/evidence/frontier/count and DB-byte equality, real reopened lookup/status/emitted, last SVN r3, forward/bookkeeping/rollback usability; superseded schema refusal |
+| M01_HISTORY | 224 SQL rejections: two recursive-trigger settings × four resolved kinds × current/historical victims × twelve replacement and two direct mutation attempts; full row/evidence/frontier/count and DB-byte equality, real reopened lookup/status/emitted, last SVN r3, forward/bookkeeping/rollback usability; superseded schema refusal |
 | S54_JSON_LOOKUP | Literal mapping/no-target/unresolved/scope decisions; clean and needs-reconciliation phases each preserve all bytes/manifests |
 | S54_JSON_HISTORY | Both directions after applied then no-target; pending/unknown separate; rejected M01 overwrite cannot change serialized historical mapping/status/last target |
 | S54_JSON_PAGE | Signed/zero cursor, NULL/ownerless/duplicate rows, exact blobs and finite/infinite REAL bits; all retained IDs survive consumer pagination |
@@ -52,7 +52,7 @@ Tests use the existing pinned original-code installation and disposable migrated
 
 ## M01 enforcement and limits
 
-A BEFORE UPDATE structural guard examines resolved victims of either prospective unique conflict key while they still exist. It prevents implicit replacement through an unresolved row regardless of recursive_triggers or the replacement's resulting state. Existing direct UPDATE/DELETE and BEFORE INSERT guards remain. All four resolved kinds, current/historical victims, INSERT OR REPLACE and UPDATE OR REPLACE, and both recursive settings are tested. Nonconflicting pending bookkeeping and ordinary public-writer forward transitions remain usable; no baseline effect is invented.
+Candidate-only `pair_outcomes` uses `WITHOUT ROWID`, so the two declared ID/scoped-source identities are its only conflict keys; attempts to address a hidden rowid refuse before mutation. This also closes the locally reproduced residual rowid overwrite on intermediate71c. Legacy commit_map IDs and sequence storage remain unchanged. A BEFORE UPDATE structural guard examines resolved victims of either prospective unique conflict key while they still exist. It prevents implicit replacement through an unresolved row regardless of recursive_triggers or the replacement's resulting state. Existing direct UPDATE/DELETE and BEFORE INSERT guards remain. All four resolved kinds, current/historical victims, INSERT OR REPLACE and UPDATE OR REPLACE, and both recursive settings are tested. Nonconflicting pending UPDATE OR REPLACE bookkeeping and ordinary public-writer forward transitions remain usable; no baseline effect is invented.
 
 Actual local before-fix Rust evidence is [curated separately](review/review-9-reproduction.json): a pending source-key replacement committed r99, and real reopened lookup/last-emitted returned r99 instead of r3. This is not a container before-run or a reviewer Rust execution. The independent review's exact-schema/transcribed-query evidence remains separately archived.
 

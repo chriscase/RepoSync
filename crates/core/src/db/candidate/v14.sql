@@ -41,7 +41,10 @@ CREATE TABLE pair_outcomes (
  CHECK(target_svn_rev IS NULL OR target_svn_rev>0),
  CHECK(outcome NOT IN ('filtered_no_target','empty_no_target','semantic_no_delta') OR (target_git_sha IS NULL AND target_svn_rev IS NULL)),
  CHECK(outcome!='applied_verified' OR (direction='svn_to_git' AND target_git_sha IS NOT NULL) OR (direction='git_to_svn' AND target_svn_rev IS NOT NULL))
-);
+) WITHOUT ROWID;
+-- Outcomes have only their declared ID and scoped source identities. Removing
+-- the implicit rowid prevents replacement through an otherwise unguarded key;
+-- legacy commit_map ID/sequence storage remains unchanged.
 CREATE TABLE pair_frontiers (
  repo_id TEXT NOT NULL, generation INTEGER NOT NULL,
  direction TEXT NOT NULL CHECK(direction IN ('svn_to_git','git_to_svn')),
