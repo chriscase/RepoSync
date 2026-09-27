@@ -1,0 +1,1437 @@
+{
+  "incoming_mapped": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 3
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "mapped",
+        "target": {
+          "kind": "git",
+          "value": "dddddddddddddddddddddddddddddddddddddddd"
+        },
+        "authority": "read-in-applied"
+      },
+      "legacy": [
+        {
+          "id": 200,
+          "svn_rev": {
+            "type": "integer",
+            "value": 3
+          },
+          "git_sha": {
+            "type": "text",
+            "value": "dddddddddddddddddddddddddddddddddddddddd"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "outgoing_mapped": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "git_to_svn",
+      "source": {
+        "kind": "git",
+        "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "mapped",
+        "target": {
+          "kind": "svn",
+          "value": 3
+        },
+        "authority": "read-out-applied"
+      },
+      "legacy": [
+        {
+          "id": 202,
+          "svn_rev": {
+            "type": "integer",
+            "value": 3
+          },
+          "git_sha": {
+            "type": "text",
+            "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          },
+          "direction": {
+            "type": "text",
+            "value": "git_to_svn"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-out",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-out",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "incoming_no_target": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 4
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "no_target",
+        "outcome": "empty_no_target",
+        "authority": "read-in-empty"
+      },
+      "legacy": [
+        {
+          "id": 201,
+          "svn_rev": {
+            "type": "integer",
+            "value": 4
+          },
+          "git_sha": {
+            "type": "null"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "outgoing_no_target": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "git_to_svn",
+      "source": {
+        "kind": "git",
+        "value": "ffffffffffffffffffffffffffffffffffffffff"
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "no_target",
+        "outcome": "semantic_no_delta",
+        "authority": "read-out-empty"
+      },
+      "legacy": [],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-out",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-out",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "unresolved_null": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 5
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "unlinked_or_conflicting_legacy_evidence"
+      },
+      "legacy": [
+        {
+          "id": 203,
+          "svn_rev": {
+            "type": "integer",
+            "value": 5
+          },
+          "git_sha": {
+            "type": "null"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "malformed": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 6
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "unlinked_or_conflicting_legacy_evidence"
+      },
+      "legacy": [
+        {
+          "id": 204,
+          "svn_rev": {
+            "type": "integer",
+            "value": 6
+          },
+          "git_sha": {
+            "type": "text",
+            "value": "malformed-retained-display"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "ownerless": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 7
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "legacy_ownerless"
+      },
+      "legacy": [
+        {
+          "id": 205,
+          "svn_rev": {
+            "type": "integer",
+            "value": 7
+          },
+          "git_sha": {
+            "type": "null"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "null"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "missing_with_unknown": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 8
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "missing"
+      },
+      "legacy": [],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "missing_unrecorded": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 99
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "canonical": {
+        "state": "missing"
+      },
+      "legacy": [],
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "wrong_generation": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 2,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 3
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "missing_generation",
+        "requested_generation": 2
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "generation_not_qualified"
+      },
+      "legacy": [
+        {
+          "id": 200,
+          "svn_rev": {
+            "type": "integer",
+            "value": 3
+          },
+          "git_sha": {
+            "type": "text",
+            "value": "dddddddddddddddddddddddddddddddddddddddd"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "unqualified_scope",
+        "records": []
+      }
+    }
+  },
+  "missing_generation": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": null,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 3
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "missing_generation",
+        "requested_generation": null
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "generation_not_qualified"
+      },
+      "legacy": [
+        {
+          "id": 200,
+          "svn_rev": {
+            "type": "integer",
+            "value": 3
+          },
+          "git_sha": {
+            "type": "text",
+            "value": "dddddddddddddddddddddddddddddddddddddddd"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "unqualified_scope",
+        "records": []
+      }
+    }
+  },
+  "disabled": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair_disabled",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 8
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "disabled"
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "generation_not_qualified"
+      },
+      "legacy": [],
+      "nonhandled": {
+        "availability": "unqualified_scope",
+        "records": []
+      }
+    }
+  },
+  "missing_repository": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "missing",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 8
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "missing_repository"
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "generation_not_qualified"
+      },
+      "legacy": [],
+      "nonhandled": {
+        "availability": "unqualified_scope",
+        "records": []
+      }
+    }
+  },
+  "not_qualified": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "lookup",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "source": {
+        "kind": "svn",
+        "value": 3
+      }
+    },
+    "data": {
+      "kind": "lookup",
+      "scope": {
+        "state": "not_qualified",
+        "disposition": "needs_reconciliation"
+      },
+      "canonical": {
+        "state": "unresolved",
+        "reason": "generation_not_qualified"
+      },
+      "legacy": [
+        {
+          "id": 200,
+          "svn_rev": {
+            "type": "integer",
+            "value": 3
+          },
+          "git_sha": {
+            "type": "text",
+            "value": "dddddddddddddddddddddddddddddddddddddddd"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "text",
+            "value": "pair"
+          }
+        }
+      ],
+      "nonhandled": {
+        "availability": "unqualified_scope",
+        "records": []
+      }
+    }
+  },
+  "status_history": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "status",
+      "repository": "pair",
+      "generation": 1
+    },
+    "data": {
+      "kind": "status",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "enabled": true,
+      "migration_disposition": "qualified",
+      "nonhandled_availability": "qualified_generation",
+      "frontiers": [
+        {
+          "direction": "svn_to_git",
+          "handled": {
+            "kind": "svn",
+            "value": 4
+          },
+          "current_target": null,
+          "last_emitted": {
+            "scope": {
+              "state": "qualified",
+              "generation": 1
+            },
+            "target": {
+              "kind": "git",
+              "value": "dddddddddddddddddddddddddddddddddddddddd"
+            },
+            "authority": "read-in-applied",
+            "nonhandled": {
+              "availability": "qualified_generation",
+              "records": [
+                {
+                  "outcome_id": "pending-in",
+                  "state": "pending"
+                },
+                {
+                  "outcome_id": "unknown-in",
+                  "state": "effect_unknown"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "direction": "git_to_svn",
+          "handled": {
+            "kind": "git",
+            "value": "ffffffffffffffffffffffffffffffffffffffff"
+          },
+          "current_target": null,
+          "last_emitted": {
+            "scope": {
+              "state": "qualified",
+              "generation": 1
+            },
+            "target": {
+              "kind": "svn",
+              "value": 3
+            },
+            "authority": "read-out-applied",
+            "nonhandled": {
+              "availability": "qualified_generation",
+              "records": [
+                {
+                  "outcome_id": "pending-out",
+                  "state": "pending"
+                },
+                {
+                  "outcome_id": "unknown-out",
+                  "state": "effect_unknown"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "emitted_in": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "last_emitted",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git"
+    },
+    "data": {
+      "kind": "last_emitted",
+      "result": {
+        "scope": {
+          "state": "qualified",
+          "generation": 1
+        },
+        "target": {
+          "kind": "git",
+          "value": "dddddddddddddddddddddddddddddddddddddddd"
+        },
+        "authority": "read-in-applied",
+        "nonhandled": {
+          "availability": "qualified_generation",
+          "records": [
+            {
+              "outcome_id": "pending-in",
+              "state": "pending"
+            },
+            {
+              "outcome_id": "unknown-in",
+              "state": "effect_unknown"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "emitted_out": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "last_emitted",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "git_to_svn"
+    },
+    "data": {
+      "kind": "last_emitted",
+      "result": {
+        "scope": {
+          "state": "qualified",
+          "generation": 1
+        },
+        "target": {
+          "kind": "svn",
+          "value": 3
+        },
+        "authority": "read-out-applied",
+        "nonhandled": {
+          "availability": "qualified_generation",
+          "records": [
+            {
+              "outcome_id": "pending-out",
+              "state": "pending"
+            },
+            {
+              "outcome_id": "unknown-out",
+              "state": "effect_unknown"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "status_missing_generation": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "status",
+      "repository": "pair",
+      "generation": null
+    },
+    "data": {
+      "kind": "status",
+      "scope": {
+        "state": "missing_generation",
+        "requested_generation": null
+      },
+      "enabled": true,
+      "migration_disposition": "qualified",
+      "nonhandled_availability": "unqualified_scope",
+      "frontiers": []
+    }
+  },
+  "status_disabled": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "status",
+      "repository": "pair_disabled",
+      "generation": 1
+    },
+    "data": {
+      "kind": "status",
+      "scope": {
+        "state": "disabled"
+      },
+      "enabled": false,
+      "migration_disposition": "not_qualified",
+      "nonhandled_availability": "unqualified_scope",
+      "frontiers": []
+    }
+  },
+  "status_missing_repository": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "status",
+      "repository": "missing",
+      "generation": 1
+    },
+    "data": {
+      "kind": "status",
+      "scope": {
+        "state": "missing_repository"
+      },
+      "enabled": null,
+      "migration_disposition": null,
+      "nonhandled_availability": "unqualified_scope",
+      "frontiers": []
+    }
+  },
+  "status_not_qualified": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "status",
+      "repository": "pair",
+      "generation": 1
+    },
+    "data": {
+      "kind": "status",
+      "scope": {
+        "state": "not_qualified",
+        "disposition": "needs_reconciliation"
+      },
+      "enabled": true,
+      "migration_disposition": "needs_reconciliation",
+      "nonhandled_availability": "unqualified_scope",
+      "frontiers": []
+    }
+  },
+  "signed_first_page": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "legacy_page",
+      "after_id": null,
+      "limit": 2
+    },
+    "data": {
+      "kind": "legacy_page",
+      "rows": [
+        {
+          "id": -10,
+          "svn_rev": {
+            "type": "integer",
+            "value": 10
+          },
+          "git_sha": {
+            "type": "blob_hex",
+            "value": "00ff"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "null"
+          }
+        },
+        {
+          "id": 0,
+          "svn_rev": {
+            "type": "integer",
+            "value": 11
+          },
+          "git_sha": {
+            "type": "null"
+          },
+          "direction": {
+            "type": "text",
+            "value": "svn_to_git"
+          },
+          "synced_at": {
+            "type": "text",
+            "value": "t"
+          },
+          "svn_author": {
+            "type": "text",
+            "value": ""
+          },
+          "git_author": {
+            "type": "text",
+            "value": ""
+          },
+          "repo_id": {
+            "type": "null"
+          }
+        }
+      ],
+      "next_after_id": 0
+    }
+  },
+  "duplicate_page": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "list",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "after_id": 199,
+      "limit": 2
+    },
+    "data": {
+      "kind": "list",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "rows": [
+        {
+          "legacy": {
+            "id": 200,
+            "svn_rev": {
+              "type": "integer",
+              "value": 3
+            },
+            "git_sha": {
+              "type": "text",
+              "value": "dddddddddddddddddddddddddddddddddddddddd"
+            },
+            "direction": {
+              "type": "text",
+              "value": "svn_to_git"
+            },
+            "synced_at": {
+              "type": "text",
+              "value": "t"
+            },
+            "svn_author": {
+              "type": "text",
+              "value": ""
+            },
+            "git_author": {
+              "type": "text",
+              "value": ""
+            },
+            "repo_id": {
+              "type": "text",
+              "value": "pair"
+            }
+          },
+          "canonical": {
+            "state": "mapped",
+            "target": {
+              "kind": "git",
+              "value": "dddddddddddddddddddddddddddddddddddddddd"
+            },
+            "authority": "read-in-applied"
+          }
+        },
+        {
+          "legacy": {
+            "id": 201,
+            "svn_rev": {
+              "type": "integer",
+              "value": 4
+            },
+            "git_sha": {
+              "type": "null"
+            },
+            "direction": {
+              "type": "text",
+              "value": "svn_to_git"
+            },
+            "synced_at": {
+              "type": "text",
+              "value": "t"
+            },
+            "svn_author": {
+              "type": "text",
+              "value": ""
+            },
+            "git_author": {
+              "type": "text",
+              "value": ""
+            },
+            "repo_id": {
+              "type": "text",
+              "value": "pair"
+            }
+          },
+          "canonical": {
+            "state": "unresolved",
+            "reason": "ambiguous_owned_legacy_rows"
+          }
+        }
+      ],
+      "next_after_id": 201,
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "ownerless_duplicate_page": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "list",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "after_id": 204,
+      "limit": 2
+    },
+    "data": {
+      "kind": "list",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "rows": [
+        {
+          "legacy": {
+            "id": 205,
+            "svn_rev": {
+              "type": "integer",
+              "value": 7
+            },
+            "git_sha": {
+              "type": "null"
+            },
+            "direction": {
+              "type": "text",
+              "value": "svn_to_git"
+            },
+            "synced_at": {
+              "type": "text",
+              "value": "t"
+            },
+            "svn_author": {
+              "type": "text",
+              "value": ""
+            },
+            "git_author": {
+              "type": "text",
+              "value": ""
+            },
+            "repo_id": {
+              "type": "null"
+            }
+          },
+          "canonical": {
+            "state": "unresolved",
+            "reason": "legacy_ownerless"
+          }
+        },
+        {
+          "legacy": {
+            "id": 206,
+            "svn_rev": {
+              "type": "integer",
+              "value": 4
+            },
+            "git_sha": {
+              "type": "null"
+            },
+            "direction": {
+              "type": "text",
+              "value": "svn_to_git"
+            },
+            "synced_at": {
+              "type": "text",
+              "value": "t"
+            },
+            "svn_author": {
+              "type": "text",
+              "value": ""
+            },
+            "git_author": {
+              "type": "text",
+              "value": ""
+            },
+            "repo_id": {
+              "type": "text",
+              "value": "pair"
+            }
+          },
+          "canonical": {
+            "state": "unresolved",
+            "reason": "ambiguous_owned_legacy_rows"
+          }
+        }
+      ],
+      "next_after_id": 206,
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "unusual_values_page": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "list",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "after_id": 206,
+      "limit": 2
+    },
+    "data": {
+      "kind": "list",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "rows": [
+        {
+          "legacy": {
+            "id": 207,
+            "svn_rev": {
+              "type": "real_bits",
+              "value": "4029000000000000"
+            },
+            "git_sha": {
+              "type": "null"
+            },
+            "direction": {
+              "type": "text",
+              "value": "svn_to_git"
+            },
+            "synced_at": {
+              "type": "text",
+              "value": "t"
+            },
+            "svn_author": {
+              "type": "text",
+              "value": ""
+            },
+            "git_author": {
+              "type": "text",
+              "value": ""
+            },
+            "repo_id": {
+              "type": "text",
+              "value": "pair"
+            }
+          },
+          "canonical": {
+            "state": "unresolved",
+            "reason": "malformed_legacy_source"
+          }
+        },
+        {
+          "legacy": {
+            "id": 208,
+            "svn_rev": {
+              "type": "real_bits",
+              "value": "7ff0000000000000"
+            },
+            "git_sha": {
+              "type": "null"
+            },
+            "direction": {
+              "type": "text",
+              "value": "svn_to_git"
+            },
+            "synced_at": {
+              "type": "text",
+              "value": "t"
+            },
+            "svn_author": {
+              "type": "text",
+              "value": ""
+            },
+            "git_author": {
+              "type": "text",
+              "value": ""
+            },
+            "repo_id": {
+              "type": "text",
+              "value": "pair"
+            }
+          },
+          "canonical": {
+            "state": "unresolved",
+            "reason": "malformed_legacy_source"
+          }
+        }
+      ],
+      "next_after_id": 208,
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  },
+  "empty_page": {
+    "schema": "reposync.copy_read.v1",
+    "request": {
+      "operation": "list",
+      "repository": "pair",
+      "generation": 1,
+      "direction": "svn_to_git",
+      "after_id": 208,
+      "limit": 2
+    },
+    "data": {
+      "kind": "list",
+      "scope": {
+        "state": "qualified",
+        "generation": 1
+      },
+      "rows": [],
+      "next_after_id": null,
+      "nonhandled": {
+        "availability": "qualified_generation",
+        "records": [
+          {
+            "outcome_id": "pending-in",
+            "state": "pending"
+          },
+          {
+            "outcome_id": "unknown-in",
+            "state": "effect_unknown"
+          }
+        ]
+      }
+    }
+  }
+}

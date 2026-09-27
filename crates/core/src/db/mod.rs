@@ -14,6 +14,8 @@ pub mod candidate_migration;
 pub mod candidate_evidence;
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_readers;
+#[cfg(feature = "reliability-fixture")]
+pub mod candidate_dto;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};

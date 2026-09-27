@@ -1008,6 +1008,8 @@ fn m01_conflict_history_preservation() {
                 eprintln!("M01_BEFORE actual Rust {op} {key} {replacement}: accepted; reopened last_emitted={:?}; lookup={:?}",r.last_emitted("pair",Some(1),Direction::GitToSvn),r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Git("e".repeat(40))));
                 panic!("resolved historical victim overwritten: recursive={recursive} kind={kind} historical={historical} {op} {key} {replacement}");
             }
+            let error=result.unwrap_err().to_string();
+            assert!(error.contains(if op=="UPDATE OR REPLACE" {"update cannot replace resolved evidence"}else{"resolved historical evidence cannot be replaced"}),"unexpected rejection: {error}");
             c.execute_batch("ROLLBACK").unwrap();
             assert_eq!(outcome_snapshot(&c),rows);
             assert_eq!(c.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
@@ -1032,4 +1034,95 @@ fn m01_conflict_history_preservation() {
     let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("DROP TRIGGER outcome_resolved_update_conflict").unwrap();drop(c);
     let bytes=fs::read(target.join("reposync.db")).unwrap();assert!(session.readers().is_err());assert!(session.migrate(14,&mut |_,_,_|Ok(())).is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
     eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"M01_HISTORY","matrix":matrix,"superseded_schema_refused_without_repair":true,"source_config_refs_and_endpoints_unchanged":true,"ordinary_forward_transitions":true,"structural_evidence_not_external_effect_proof":true}));
+}
+
+fn assert_dto(name: &'static str, response: reposync_core::db::candidate_dto::Response, checks: &mut Vec<&'static str>) {
+    use reposync_core::db::candidate_dto::Response;
+    let literals:serde_json::Value=serde_json::from_str(include_str!("fixtures/copy-reader-v1.json")).unwrap();
+    let expected=literals.get(name).expect("literal case missing");
+    assert_eq!(&serde_json::to_value(&response).unwrap(),expected,"literal JSON {name}");
+    let consumer=Response::decode(&serde_json::to_vec(expected).unwrap()).unwrap();
+    assert_eq!(consumer,response,"consumer parsing {name}");
+    assert_eq!(serde_json::to_value(consumer).unwrap(),*expected);
+    checks.push(name);
+}
+fn dto_proof(id:&str,root:&Path,target:&Path,session:&CopySession,run:impl FnOnce(&reposync_core::db::candidate_readers::CopyReaders<'_>,&mut Vec<&'static str>)) {
+    use sha2::{Digest,Sha256};
+    let bytes=fs::read(target.join("reposync.db")).unwrap();let endpoints=endpoint_files(root);let source_seal=session.source_seal().clone();let mut checks=Vec::new();
+    let r=session.readers().unwrap();run(&r,&mut checks);drop(r);
+    assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);assert_eq!(version(target),14);session.source_unchanged().unwrap();assert_eq!(session.source_seal(),&source_seal);assert_eq!(endpoint_files(root),endpoints);
+    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":id,"schema":"reposync.copy_read.v1","literal_payloads_and_consumer_decode":checks,"literal_fixture_sha256":hex::encode(Sha256::digest(include_bytes!("fixtures/copy-reader-v1.json"))),"copy_db_bytes_and_version_unchanged":true,"sealed_source_config_refs_unchanged":true,"endpoints_unchanged":true,"explicit_generation":true,"read_only_immutable_connection":true,"no_operational_router_or_authority_algorithm":true}));
+}
+#[test]
+fn nullable_dto_lookup_matrix() {
+    let (_t,root,target,session,_)=reader_fixture();
+    dto_proof("S54_JSON_LOOKUP",&root,&target,&session,|r,checks|{
+        for (name,d,s) in [
+            ("incoming_mapped",Direction::SvnToGit,Source::Svn(3)),
+            ("outgoing_mapped",Direction::GitToSvn,Source::Git("e".repeat(40))),
+            ("incoming_no_target",Direction::SvnToGit,Source::Svn(4)),
+            ("outgoing_no_target",Direction::GitToSvn,Source::Git("f".repeat(40))),
+            ("unresolved_null",Direction::SvnToGit,Source::Svn(5)),
+            ("malformed",Direction::SvnToGit,Source::Svn(6)),
+            ("ownerless",Direction::SvnToGit,Source::Svn(7)),
+            ("missing_with_unknown",Direction::SvnToGit,Source::Svn(8)),
+            ("missing_unrecorded",Direction::SvnToGit,Source::Svn(99)),
+        ] { assert_dto(name,r.lookup_dto("pair",Some(1),d,&s).unwrap(),checks); }
+        assert_dto("wrong_generation",r.lookup_dto("pair",Some(2),Direction::SvnToGit,&Source::Svn(3)).unwrap(),checks);
+        assert_dto("missing_generation",r.lookup_dto("pair",None,Direction::SvnToGit,&Source::Svn(3)).unwrap(),checks);
+        assert_dto("disabled",r.lookup_dto("pair_disabled",Some(1),Direction::SvnToGit,&Source::Svn(8)).unwrap(),checks);
+        assert_dto("missing_repository",r.lookup_dto("missing",Some(1),Direction::SvnToGit,&Source::Svn(8)).unwrap(),checks);
+        assert!(r.lookup_dto("pair",Some(1),Direction::GitToSvn,&Source::Svn(3)).is_err());
+    });
+    let c=Connection::open(target.join("reposync.db")).unwrap();c.execute("UPDATE repo_migration_state SET disposition='needs_reconciliation' WHERE repo_id='pair'",[]).unwrap();drop(c);
+    dto_proof("S54_JSON_LOOKUP",&root,&target,&session,|r,checks|{assert_dto("not_qualified",r.lookup_dto("pair",Some(1),Direction::SvnToGit,&Source::Svn(3)).unwrap(),checks);assert_dto("status_not_qualified",r.status_dto("pair",Some(1)).unwrap(),checks);});
+}
+#[test]
+fn nullable_dto_historical_matrix() {
+    let (_t,root,target,session,_)=reader_fixture();
+    let before=fs::read(target.join("reposync.db")).unwrap();
+    let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=OFF; BEGIN IMMEDIATE;").unwrap();let rows=outcome_snapshot(&c);
+    assert!(c.execute("UPDATE OR REPLACE pair_outcomes SET source_key=?1,source_git_sha=?2,outcome='applied_verified',target_svn_rev=99 WHERE id='pending-out'",rusqlite::params![format!("git:{}","e".repeat(40)),"e".repeat(40)]).is_err());c.execute_batch("ROLLBACK").unwrap();assert_eq!(outcome_snapshot(&c),rows);drop(c);assert!(fs::read(target.join("reposync.db")).unwrap()==before);
+    dto_proof("S54_JSON_HISTORY",&root,&target,&session,|r,checks|{
+        assert_dto("status_history",r.status_dto("pair",Some(1)).unwrap(),checks);
+        assert_dto("emitted_in",r.last_emitted_dto("pair",Some(1),Direction::SvnToGit).unwrap(),checks);
+        assert_dto("emitted_out",r.last_emitted_dto("pair",Some(1),Direction::GitToSvn).unwrap(),checks);
+        assert_dto("outgoing_mapped",r.lookup_dto("pair",Some(1),Direction::GitToSvn,&Source::Git("e".repeat(40))).unwrap(),checks);
+        assert_dto("outgoing_no_target",r.lookup_dto("pair",Some(1),Direction::GitToSvn,&Source::Git("f".repeat(40))).unwrap(),checks);
+        assert_dto("missing_with_unknown",r.lookup_dto("pair",Some(1),Direction::SvnToGit,&Source::Svn(8)).unwrap(),checks);
+        assert_dto("status_missing_generation",r.status_dto("pair",None).unwrap(),checks);
+        assert_dto("status_disabled",r.status_dto("pair_disabled",Some(1)).unwrap(),checks);
+        assert_dto("status_missing_repository",r.status_dto("missing",Some(1)).unwrap(),checks);
+    });
+}
+#[test]
+fn nullable_dto_pagination_matrix() {
+    let (_t,root,target,session,_)=reader_fixture();
+    let c=Connection::open(target.join("reposync.db")).unwrap();
+    c.execute("INSERT INTO commit_map(id,svn_rev,git_sha,direction,synced_at,repo_id) VALUES(-10,10,?1,'svn_to_git','t',NULL),(0,11,NULL,'svn_to_git','t',NULL),(206,4,NULL,'svn_to_git','t','pair')",[vec![0u8,255]]).unwrap();
+    for (id,rev) in [(207,12.5),(208,f64::INFINITY)] {c.execute("INSERT INTO commit_map(id,svn_rev,git_sha,direction,synced_at,repo_id) VALUES(?1,?2,NULL,'svn_to_git','t','pair')",rusqlite::params![id,rev]).unwrap();}
+    let ids:Vec<i64>=c.prepare("SELECT id FROM commit_map ORDER BY id").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();drop(c);
+    dto_proof("S54_JSON_PAGE",&root,&target,&session,|r,checks|{
+        assert_dto("signed_first_page",r.legacy_page_dto(None,2).unwrap(),checks);
+        assert_dto("duplicate_page",r.list_dto("pair",Some(1),Direction::SvnToGit,Some(199),2).unwrap(),checks);
+        assert_dto("ownerless_duplicate_page",r.list_dto("pair",Some(1),Direction::SvnToGit,Some(204),2).unwrap(),checks);
+        assert_dto("unusual_values_page",r.list_dto("pair",Some(1),Direction::SvnToGit,Some(206),2).unwrap(),checks);
+        assert_dto("empty_page",r.list_dto("pair",Some(1),Direction::SvnToGit,Some(208),2).unwrap(),checks);
+        let mut actual=Vec::new();let mut cursor=None;
+        loop {let response=r.legacy_page_dto(cursor,2).unwrap();let consumer=reposync_core::db::candidate_dto::Response::decode(&serde_json::to_vec(&response).unwrap()).unwrap();let reposync_core::db::candidate_dto::Data::LegacyPage{rows,next_after_id}=consumer.data else {panic!("wrong consumer page")};if rows.is_empty(){assert_eq!(next_after_id,None);break;}actual.extend(rows.iter().map(|r|r.id));assert_eq!(next_after_id,rows.last().map(|r|r.id));cursor=next_after_id;}
+        assert_eq!(actual,ids);
+    });
+}
+#[test]
+fn nullable_dto_readonly_matrix() {
+    use reposync_core::db::candidate_dto::Response;
+    let (_t,root,target,session,_)=reader_fixture();
+    dto_proof("S54_JSON_READONLY",&root,&target,&session,|r,checks|{
+        for _ in 0..2 {assert_dto("incoming_no_target",r.lookup_dto("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap(),checks);assert_dto("status_history",r.status_dto("pair",Some(1)).unwrap(),checks);assert_dto("emitted_out",r.last_emitted_dto("pair",Some(1),Direction::GitToSvn).unwrap(),checks);r.list_dto("pair",Some(1),Direction::SvnToGit,None,200).unwrap();r.legacy_page_dto(None,200).unwrap();}
+        let literals:serde_json::Value=serde_json::from_str(include_str!("fixtures/copy-reader-v1.json")).unwrap();
+        let mut bad=literals["incoming_mapped"].clone();bad["schema"]=serde_json::json!("unsupported.v2");assert!(Response::decode(&serde_json::to_vec(&bad).unwrap()).is_err());
+        bad=literals["incoming_mapped"].clone();bad["request"]["operation"]=serde_json::json!("status");assert!(Response::decode(&serde_json::to_vec(&bad).unwrap()).is_err());
+        bad=literals["incoming_mapped"].clone();bad["data"]["canonical"]["target"]=serde_json::Value::Null;assert!(Response::decode(&serde_json::to_vec(&bad).unwrap()).is_err());
+        assert!(r.list_dto("pair",None,Direction::SvnToGit,None,0).is_err());assert!(r.legacy_page_dto(None,201).is_err());
+    });
 }
