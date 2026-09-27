@@ -943,3 +943,93 @@ fn typed_reader_no_write_matrix(){
     reader_proof("T54_READONLY",&root,&target,&session,|r|{for _ in 0..2{r.lookup("pair",Some(1),Direction::SvnToGit,&Source::Svn(4)).unwrap();r.list("pair",Some(1),Direction::SvnToGit,None,200).unwrap();r.legacy_page(None,200).unwrap();r.status("pair",Some(1)).unwrap();r.last_emitted("pair",Some(1),Direction::GitToSvn).unwrap();}});
     let before=fs::read(target.join("reposync.db")).unwrap();fs::write(target.join("reposync.db-journal"),b"not-quiescent").unwrap();assert!(session.readers().is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==before);session.source_unchanged().unwrap();
 }
+
+// Full SQL values, including evidence_json, not just FK/integrity success.
+fn outcome_snapshot(c: &Connection) -> Vec<Vec<Raw>> {
+    ["pair_outcomes", "pair_frontiers"].into_iter().flat_map(|table| {
+        let mut q = c.prepare(&format!("SELECT * FROM {table} ORDER BY 1,2,3")).unwrap();
+        let n = q.column_count();
+        q.query_map([], |r| (0..n).map(|i| r.get::<_,rusqlite::types::Value>(i).map(Raw::from)).collect())
+            .unwrap().collect::<rusqlite::Result<Vec<Vec<Raw>>>>().unwrap()
+    }).collect()
+}
+fn preserved_history_readers(session: &CopySession) -> serde_json::Value {
+    let r = session.readers().unwrap();
+    let lookup = r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Git("e".repeat(40))).unwrap();
+    let status = r.status("pair",Some(1)).unwrap();
+    let emitted = r.last_emitted("pair",Some(1),Direction::GitToSvn).unwrap();
+    assert_eq!(emitted.target,Some(Target::Svn(3)));
+    serde_json::json!({"lookup":lookup,"status":status,"last_emitted":emitted})
+}
+#[test]
+fn m01_conflict_history_preservation() {
+    use reposync_core::db::candidate_authority::{advance_frontier,ResolvedTransition};
+    let (t,root,provenance) = old_topology();
+    let source = root.join("install");
+    let endpoints = endpoint_files(&root);
+    let mut matrix = Vec::new();
+    for recursive in [0,1] { for kind in ["applied_verified","filtered_no_target","empty_no_target","semantic_no_delta"] { for historical in [true,false] {
+        let target = t.path().join(format!("history-{recursive}-{kind}-{historical}"));
+        copy(&source,&target);
+        let session = qualified(&source,&target,&root);
+        session.migrate(14,&mut |_,_,_|Ok(())).unwrap();
+        let mut c = Connection::open(target.join("reposync.db")).unwrap();
+        c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive};")).unwrap();
+        assert_eq!(c.pragma_query_value::<i64,_>(None,"recursive_triggers",|r|r.get(0)).unwrap(),recursive);
+        let policy:String = c.query_row("SELECT policy_sha256 FROM pair_lineages WHERE repo_id='pair' AND generation=1",[],|r|r.get(0)).unwrap();
+        let mut predecessor = format!("git:{}",provenance["pair"]["git_sha"].as_str().unwrap());
+        for (id,sha,k) in [("prior","d","applied_verified"),("victim","e",kind),("later","f","empty_no_target")] {
+            if id=="later" && !historical { break; }
+            let next = format!("git:{}",sha.repeat(40));
+            advance_frontier(&mut c,&ResolvedTransition{id:id.into(),repo_id:"pair".into(),generation:1,direction:"git_to_svn".into(),predecessor_source_key:predecessor,source_svn_rev:None,source_git_sha:Some(sha.repeat(40)),outcome:k.into(),target_git_sha:None,target_svn_rev:if k=="applied_verified" {Some(3)}else{None},projection_version:1,policy_sha256:policy.clone(),evidence_json:"{\"labeled_structural_fixture_evidence\":true}".into()}).unwrap();
+            predecessor=next;
+        }
+        c.execute("INSERT INTO pair_outcomes VALUES('pending-P','pair',1,'git_to_svn',?1,?2,NULL,?3,'pending',NULL,NULL,1,?4,'{\"pending\":true}')",rusqlite::params![format!("git:{}","a".repeat(40)),predecessor,"a".repeat(40),policy]).unwrap();
+        let rows = outcome_snapshot(&c);
+        drop(c);
+        let model = preserved_history_readers(&session);
+        let bytes = fs::read(target.join("reposync.db")).unwrap();
+        let mut rejected = Vec::new();
+        for op in ["UPDATE OR REPLACE","INSERT OR REPLACE"] { for key in ["source_key","id"] { for replacement in ["applied_verified","pending"] {
+            let c = Connection::open(target.join("reposync.db")).unwrap();
+            c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive}; BEGIN IMMEDIATE;")).unwrap();
+            let new_id=if key=="id" {"victim"}else{"pending-P"};
+            let sql=if op=="UPDATE OR REPLACE" {
+                format!("{op} pair_outcomes SET id=?1,source_key=?2,source_git_sha=?3,predecessor_source_key=?4,outcome=?5,target_svn_rev=?6,evidence_json='{{\"replacement\":true}}' WHERE id='pending-P'")
+            } else {
+                format!("{op} INTO pair_outcomes VALUES(?1,'pair',1,'git_to_svn',?2,?4,NULL,?3,?5,NULL,?6,1,?7,'{{\"replacement\":true}}')")
+            };
+            let source_sha=if key=="id" {"a".repeat(40)}else{"e".repeat(40)};
+            let p=rusqlite::params![new_id,format!("git:{source_sha}"),source_sha,format!("git:{}","d".repeat(40)),replacement,if replacement=="applied_verified" {Some(99i64)}else{None},policy];
+            let result=if op=="UPDATE OR REPLACE" {c.execute(&sql,&p[..6])}else{c.execute(&sql,p)};
+            if result.is_ok() {
+                c.execute_batch("COMMIT").unwrap();drop(c);
+                let r=session.readers().unwrap();
+                eprintln!("M01_BEFORE actual Rust {op} {key} {replacement}: accepted; reopened last_emitted={:?}; lookup={:?}",r.last_emitted("pair",Some(1),Direction::GitToSvn),r.lookup("pair",Some(1),Direction::GitToSvn,&Source::Git("e".repeat(40))));
+                panic!("resolved historical victim overwritten: recursive={recursive} kind={kind} historical={historical} {op} {key} {replacement}");
+            }
+            c.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(outcome_snapshot(&c),rows);
+            assert_eq!(c.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
+            assert!(c.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+            // A rolled-back rejected transaction leaves the connection usable.
+            c.execute_batch("BEGIN IMMEDIATE; UPDATE pair_outcomes SET evidence_json='{\"bookkeeping\":true}' WHERE id='pending-P'; ROLLBACK;").unwrap();
+            drop(c);
+            assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);
+            assert_eq!(preserved_history_readers(&session),model);
+            session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
+            rejected.push(format!("{op}:{key}:{replacement}"));
+        }}}
+        for sql in ["UPDATE pair_outcomes SET evidence_json='[]' WHERE id='victim'","DELETE FROM pair_outcomes WHERE id='victim'"] {
+            let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive};")).unwrap();assert!(c.execute(sql,[]).is_err());assert_eq!(outcome_snapshot(&c),rows);drop(c);
+            assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);assert_eq!(preserved_history_readers(&session),model);rejected.push(sql.into());
+        }
+        let c=Connection::open(target.join("reposync.db")).unwrap();c.execute("UPDATE pair_outcomes SET evidence_json='{\"bookkeeping\":true}' WHERE id='pending-P'",[]).unwrap();assert_eq!(c.query_row("SELECT evidence_json FROM pair_outcomes WHERE id='pending-P'",[],|r|r.get::<_,String>(0)).unwrap(),"{\"bookkeeping\":true}");drop(c);
+        assert_eq!(preserved_history_readers(&session),model);
+        matrix.push(serde_json::json!({"recursive_triggers":recursive,"victim_kind":kind,"historical":historical,"rejected":rejected,"full_rows_evidence_frontier_counts_and_copy_bytes_unchanged":true,"reopened_lookup_status_last_emitted_unchanged":true,"last_emitted_svn":3,"pending_bookkeeping_success":true,"transaction_usable":true}));
+    }}}
+    let target=t.path().join("superseded-shape");copy(&source,&target);let session=qualified(&source,&target,&root);session.migrate(14,&mut |_,_,_|Ok(())).unwrap();
+    let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("DROP TRIGGER outcome_resolved_update_conflict").unwrap();drop(c);
+    let bytes=fs::read(target.join("reposync.db")).unwrap();assert!(session.readers().is_err());assert!(session.migrate(14,&mut |_,_,_|Ok(())).is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
+    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"M01_HISTORY","matrix":matrix,"superseded_schema_refused_without_repair":true,"source_config_refs_and_endpoints_unchanged":true,"ordinary_forward_transitions":true,"structural_evidence_not_external_effect_proof":true}));
+}

@@ -104,3 +104,11 @@ CREATE TRIGGER outcome_resolved_no_replace BEFORE INSERT ON pair_outcomes WHEN E
  SELECT 1 FROM pair_outcomes o WHERE o.outcome IN ('applied_verified','filtered_no_target','empty_no_target','semantic_no_delta') AND
  (o.id=NEW.id OR (o.repo_id=NEW.repo_id AND o.generation=NEW.generation AND o.direction=NEW.direction AND o.source_key=NEW.source_key)))
  BEGIN SELECT RAISE(ABORT,'resolved historical evidence cannot be replaced'); END;
+-- UPDATE OR REPLACE can implicitly delete a different row without invoking
+-- INSERT or DELETE triggers. Check the prospective conflict victim while it
+-- still exists, independently of recursive_triggers or replacement kind.
+CREATE TRIGGER outcome_resolved_update_conflict BEFORE UPDATE ON pair_outcomes WHEN EXISTS(
+ SELECT 1 FROM pair_outcomes o WHERE o.id!=OLD.id AND
+ o.outcome IN ('applied_verified','filtered_no_target','empty_no_target','semantic_no_delta') AND
+ (o.id=NEW.id OR (o.repo_id=NEW.repo_id AND o.generation=NEW.generation AND o.direction=NEW.direction AND o.source_key=NEW.source_key)))
+ BEGIN SELECT RAISE(ABORT,'update cannot replace resolved evidence'); END;
