@@ -1,5 +1,9 @@
 # PR72 review11 compact delta handoff
 
+The current [merge closeout](merge-closeout.md) records the post-review
+formatting, lint, fixture, coverage, and nonactivation checks. The review11
+handoff below is preserved as the independently reviewed starting state.
+
 Starting reviewed head `ed2f1a4d73b63716c71b360115de321d7fa7f16c`; original base `87379741779a6259f7eeb52a68cc6f061174e5ef`; retained anchor `f74fce855a1f1d80dd631397f436ba33906272e6`. The [prior handoff](review-10-handoff.md) preserves accepted N01 and the 30-response diagnostic journey. This pass implements candidate-only exact-copy/repository grants and a distinct scoped visibility profile, then qualifies it through the real in-process transport and Node consumer. Functional/final/remote/test-merge/tree and downloaded artifact identities belong in the final PR handoff after CI publication, avoiding recursive SHA-only commits.
 
 The original GOAL SHA-256 remains `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`; locked graph `9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05`; the 26 literal DTO payloads `0ac640a1899881fc195ec6d21bbc6df765b92ca96f08d5b2ac29c67bbca7edc9`. The original GOAL, prior briefs, issue criteria and all 85 prior required ID/test/tier objects are unchanged. `S54_SCOPED_HTTP` makes 86 required exact cases.
