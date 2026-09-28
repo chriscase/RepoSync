@@ -109,14 +109,24 @@ async fn get_status(
         let active_conflicts = db.count_active_conflicts_for_repo(repo_id).unwrap_or(0);
 
         // Use 24h rolling window for errors (same as global status)
-        let errors_24h = db.count_errors_for_repo(repo_id).unwrap_or(repo.total_errors);
+        let errors_24h = db
+            .count_errors_for_repo(repo_id)
+            .unwrap_or(repo.total_errors);
         let last_error = db.last_error_at_for_repo(repo_id).unwrap_or(None);
 
         return Ok(Json(StatusResponse {
             state: repo.sync_status,
             last_sync_at: repo.last_sync_at,
-            last_svn_revision: if repo.last_svn_rev != 0 { Some(repo.last_svn_rev) } else { None },
-            last_git_hash: if repo.last_git_sha.is_empty() { None } else { Some(repo.last_git_sha) },
+            last_svn_revision: if repo.last_svn_rev != 0 {
+                Some(repo.last_svn_rev)
+            } else {
+                None
+            },
+            last_git_hash: if repo.last_git_sha.is_empty() {
+                None
+            } else {
+                Some(repo.last_git_sha)
+            },
             total_syncs: repo.total_syncs,
             total_conflicts: 0,
             active_conflicts,
@@ -127,12 +137,25 @@ async fn get_status(
     }
 
     // Global status (no repo_id) — read from the sync engine's kv_state.
-    let state_str = db.get_state("sync_state").unwrap_or(None).unwrap_or_else(|| "idle".into());
+    let state_str = db
+        .get_state("sync_state")
+        .unwrap_or(None)
+        .unwrap_or_else(|| "idle".into());
     let last_sync_str = db.get_state("last_sync_at").unwrap_or(None);
-    let last_sync_at = last_sync_str.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.to_rfc3339()));
-    let last_svn_rev = db.get_state("last_svn_rev").unwrap_or(None).and_then(|s| s.parse::<i64>().ok())
+    let last_sync_at = last_sync_str.and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.to_rfc3339())
+    });
+    let last_svn_rev = db
+        .get_state("last_svn_rev")
+        .unwrap_or(None)
+        .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| db.get_last_svn_revision().ok().flatten());
-    let last_git_hash = db.get_state("last_git_hash").unwrap_or(None).and_then(|s| if s.is_empty() { None } else { Some(s) })
+    let last_git_hash = db
+        .get_state("last_git_hash")
+        .unwrap_or(None)
+        .filter(|s| !s.is_empty())
         .or_else(|| db.get_last_git_hash().ok().flatten());
     let total_syncs = db.count_sync_records().unwrap_or(0);
     let total_conflicts = db.count_all_conflicts().unwrap_or(0);
@@ -183,8 +206,15 @@ async fn reset_errors(
         None,
         None,
         None,
-        Some(&format!("Cleared {} error entries{}", cleared,
-            query.repo_id.as_ref().map(|id| format!(" for repo {}", id)).unwrap_or_default())),
+        Some(&format!(
+            "Cleared {} error entries{}",
+            cleared,
+            query
+                .repo_id
+                .as_ref()
+                .map(|id| format!(" for repo {}", id))
+                .unwrap_or_default()
+        )),
         true,
     );
 
@@ -236,7 +266,10 @@ async fn get_system_metrics(
         let (net_bytes_sent, net_bytes_recv) = read_net_bytes();
 
         let (net_up_bytes_per_sec, net_down_bytes_per_sec) = {
-            let mut prev = state_clone.prev_net_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            let mut prev = state_clone
+                .prev_net_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let now = std::time::Instant::now();
             let rates = if let Some((prev_sent, prev_recv, prev_time)) = prev.as_ref() {
                 let dt = now.duration_since(*prev_time).as_secs_f64();
@@ -305,8 +338,8 @@ fn disk_usage(path: &Path) -> (u64, u64) {
         let mut buf = MaybeUninit::<libc::statvfs>::uninit();
         if libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) == 0 {
             let stat = buf.assume_init();
-            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-            let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+            let total = stat.f_blocks * stat.f_frsize;
+            let free = stat.f_bavail * stat.f_frsize;
             (free, total)
         } else {
             (0, 0)
@@ -369,7 +402,6 @@ fn process_rss() -> u64 {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             return rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -427,9 +459,7 @@ fn find_git_push_process() -> (bool, Option<u32>, Option<u64>) {
         if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
             // cmdline uses NUL separators; replace for easy matching.
             let cmdline_readable = cmdline.replace('\0', " ");
-            if cmdline_readable.contains("git push")
-                || cmdline_readable.contains("git-push")
-            {
+            if cmdline_readable.contains("git push") || cmdline_readable.contains("git-push") {
                 // Try to read process start time from /proc/<pid>/stat for elapsed.
                 let elapsed = process_elapsed_secs(pid);
                 return (true, Some(pid), elapsed);
@@ -593,8 +623,10 @@ impl axum::response::IntoResponse for AppError {
 
         let client_message = match self {
             AppError::Internal(_) => "internal server error".to_string(),
-            AppError::BadRequest(msg) | AppError::NotFound(msg) |
-            AppError::Unauthorized(msg) | AppError::Forbidden(msg) => msg,
+            AppError::BadRequest(msg)
+            | AppError::NotFound(msg)
+            | AppError::Unauthorized(msg)
+            | AppError::Forbidden(msg) => msg,
         };
 
         let body = serde_json::json!({ "error": client_message });

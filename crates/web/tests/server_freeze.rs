@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -90,15 +90,10 @@ async fn build_test_server() -> (
     let engine_db = Database::in_memory().expect("engine db");
     engine_db.initialize().expect("engine db init");
 
-    let svn_client = SvnClient::new(
-        "https://svn.test.invalid/repo",
-        "testuser",
-        "",
-    );
+    let svn_client = SvnClient::new("https://svn.test.invalid/repo", "testuser", "");
     let git_client = GitClient::new(&git_repo_path).expect("git client");
-    let identity_mapper = Arc::new(
-        IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"),
-    );
+    let identity_mapper =
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"));
 
     let sync_engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -137,7 +132,12 @@ async fn build_test_server() -> (
     let addr = listener.local_addr().expect("local_addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     // Pre-seed a test session so authenticated endpoints work.
@@ -188,15 +188,10 @@ async fn build_test_server_full() -> (
     let engine_db = Database::in_memory().expect("engine db");
     engine_db.initialize().expect("engine db init");
 
-    let svn_client = SvnClient::new(
-        "https://svn.test.invalid/repo",
-        "testuser",
-        "",
-    );
+    let svn_client = SvnClient::new("https://svn.test.invalid/repo", "testuser", "");
     let git_client = GitClient::new(&git_repo_path).expect("git client");
-    let identity_mapper = Arc::new(
-        IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"),
-    );
+    let identity_mapper =
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"));
 
     let sync_engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -238,7 +233,12 @@ async fn build_test_server_full() -> (
     let addr = listener.local_addr().expect("local_addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     // Pre-seed a test session so authenticated endpoints work.
@@ -277,8 +277,7 @@ async fn build_test_server_with_ldap(
     web_db.initialize().expect("web db init");
 
     // Insert a local user with known bcrypt password hash.
-    let password_hash = reposync_core::crypto::hash_password(test_password)
-        .expect("hash_password");
+    let password_hash = reposync_core::crypto::hash_password(test_password).expect("hash_password");
     let now = chrono::Utc::now().to_rfc3339();
     let user = reposync_core::models::User {
         id: "test-user-1".to_string(),
@@ -312,15 +311,10 @@ async fn build_test_server_with_ldap(
     let engine_db = Database::in_memory().expect("engine db");
     engine_db.initialize().expect("engine db init");
 
-    let svn_client = SvnClient::new(
-        "https://svn.test.invalid/repo",
-        "testuser",
-        "",
-    );
+    let svn_client = SvnClient::new("https://svn.test.invalid/repo", "testuser", "");
     let git_client = GitClient::new(&git_repo_path).expect("git client");
-    let identity_mapper = Arc::new(
-        IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"),
-    );
+    let identity_mapper =
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"));
 
     let sync_engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -359,7 +353,12 @@ async fn build_test_server_with_ldap(
     let addr = listener.local_addr().expect("local_addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     // Pre-seed a test session so authenticated endpoints work.
@@ -734,16 +733,8 @@ async fn test_sustained_load_under_sync_cycles() {
     let worst_health = max_health_latency.load(Ordering::Relaxed);
     let worst_other = max_other_latency.load(Ordering::Relaxed);
 
-    assert!(
-        total > 10,
-        "expected >10 total requests, got {}",
-        total
-    );
-    assert_eq!(
-        failed, 0,
-        "{} out of {} requests failed",
-        failed, total
-    );
+    assert!(total > 10, "expected >10 total requests, got {}", total);
+    assert_eq!(failed, 0, "{} out of {} requests failed", failed, total);
     assert!(
         worst_health < 200,
         "worst health latency {}ms >= 200ms",
@@ -763,8 +754,7 @@ async fn test_sustained_load_under_sync_cycles() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ldap_auth_timeout_under_load() {
     let test_password = "correct-horse-battery-staple";
-    let (addr, _state, _server, _tmp) =
-        build_test_server_with_ldap(test_password).await;
+    let (addr, _state, _server, _tmp) = build_test_server_with_ldap(test_password).await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -879,27 +869,26 @@ async fn test_database_wal_contention() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Reader helper: repeatedly call a DB method, track max latency.
-    let spawn_reader = |db: Database,
-                        done: Arc<std::sync::atomic::AtomicBool>,
-                        op: fn(&Database)| {
-        tokio::task::spawn_blocking(move || {
-            let mut max_ms: u64 = 0;
-            let mut count: u64 = 0;
-            while !done.load(Ordering::Acquire) || count < 10 {
-                let t = Instant::now();
-                op(&db);
-                let elapsed_ms = t.elapsed().as_millis() as u64;
-                if elapsed_ms > max_ms {
-                    max_ms = elapsed_ms;
+    let spawn_reader =
+        |db: Database, done: Arc<std::sync::atomic::AtomicBool>, op: fn(&Database)| {
+            tokio::task::spawn_blocking(move || {
+                let mut max_ms: u64 = 0;
+                let mut count: u64 = 0;
+                while !done.load(Ordering::Acquire) || count < 10 {
+                    let t = Instant::now();
+                    op(&db);
+                    let elapsed_ms = t.elapsed().as_millis() as u64;
+                    if elapsed_ms > max_ms {
+                        max_ms = elapsed_ms;
+                    }
+                    count += 1;
+                    if count > 500 {
+                        break; // safety valve
+                    }
                 }
-                count += 1;
-                if count > 500 {
-                    break; // safety valve
-                }
-            }
-            (max_ms, count)
-        })
-    };
+                (max_ms, count)
+            })
+        };
 
     fn read_count_errors(db: &Database) {
         let _ = db.count_errors();
@@ -931,11 +920,7 @@ async fn test_database_wal_contention() {
     .expect("readers timed out — possible WAL deadlock");
 
     for (name, (max_ms, count)) in &results {
-        assert!(
-            *count > 0,
-            "{} did not complete any reads",
-            name
-        );
+        assert!(*count > 0, "{} did not complete any reads", name);
         assert!(
             *max_ms < 100,
             "{} worst read latency was {}ms (expected < 100ms, {} reads)",
@@ -1151,10 +1136,7 @@ async fn test_no_resource_leak_after_many_requests() {
 
     for i in 0..1000 {
         let ep = endpoints[i % endpoints.len()];
-        let resp = client
-            .get(format!("{}{}", base_url, ep))
-            .send()
-            .await;
+        let resp = client.get(format!("{}{}", base_url, ep)).send().await;
         match resp {
             Ok(r) => assert!(
                 r.status().is_success(),
@@ -1225,9 +1207,7 @@ async fn test_commit_map_no_repo_id_does_not_deadlock() {
         let c = client.clone();
         let u = base_url.clone();
         handles.push(tokio::spawn(async move {
-            c.get(format!("{}/api/commit-map?limit=15", u))
-                .send()
-                .await
+            c.get(format!("{}/api/commit-map?limit=15", u)).send().await
         }));
 
         // The other 5 endpoints the frontend fires concurrently.
@@ -1264,4 +1244,255 @@ async fn test_commit_map_no_repo_id_does_not_deadlock() {
             );
         }
     }
+}
+
+/// R02/R03 baseline API diagnostic with real disposable SVN and Git remotes.
+/// The import progress represents the actual per-repository route's in-memory
+/// state; import subprocess cancellation stages remain outside this test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing() {
+    use reposync_core::import::ImportPhase;
+    use std::process::Command;
+    assert!(
+        Command::new("svnadmin").arg("--version").output().is_ok(),
+        "svnadmin required"
+    );
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    if let Ok(root) = std::env::var("REPOSYNC_FIXTURE_ROOT") {
+        let root = std::path::Path::new(&root).canonicalize().unwrap();
+        let target = tmp.path().canonicalize().unwrap();
+        assert!(
+            target.starts_with(root),
+            "API fixture target escaped owned root"
+        );
+    }
+    let svn_repo = tmp.path().join("svn-fixture");
+    let created = Command::new("svnadmin")
+        .args(["create", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(created.status.success());
+    let svn_url = format!("file://{}", svn_repo.display());
+    let created = Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/trunk"),
+            "-m",
+            "SVN fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let git_work = tmp.path().join("git-fixture");
+    let git_bare = tmp.path().join("git-origin.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", git_bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["init", "-b", "main", git_work.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(git_work.join("fixture.txt"), "preserve remote history\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&git_work)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["add", "fixture.txt"]);
+    git(&["commit", "-m", "Fixture"]);
+    git(&["remote", "add", "origin", git_bare.to_str().unwrap()]);
+    git(&["push", "origin", "main"]);
+    let git_before = Command::new("git")
+        .args([
+            "--git-dir",
+            git_bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(git_before.status.success());
+
+    // The provider is a loopback-only HTTP fixture. Its SHA is read from the
+    // actual disposable bare Git ref rather than a made-up response value.
+    git(&["checkout", "-b", "feature"]);
+    std::fs::write(git_work.join("feature.txt"), "step one\n").unwrap();
+    git(&["add", "feature.txt"]);
+    git(&["commit", "-m", "Feature step one"]);
+    std::fs::write(git_work.join("feature.txt"), "step two\n").unwrap();
+    git(&["commit", "-am", "Feature step two"]);
+    git(&["push", "origin", "feature"]);
+    let feature_tip = Command::new("git")
+        .args([
+            "--git-dir",
+            git_bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/feature",
+        ])
+        .output()
+        .unwrap();
+    assert!(feature_tip.status.success());
+    let feature_tip = String::from_utf8_lossy(&feature_tip.stdout)
+        .trim()
+        .to_string();
+    let branches_url = format!("{svn_url}/branches");
+    let target_url = format!("{branches_url}/feature");
+    let out = Command::new("svn")
+        .args([
+            "mkdir",
+            &branches_url,
+            "-m",
+            "Branches",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new("svn")
+        .args([
+            "copy",
+            &format!("{svn_url}/trunk"),
+            &target_url,
+            "-m",
+            "Feature target",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let svn_before = Command::new("svnlook")
+        .args(["youngest", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(svn_before.status.success());
+    let provider_sha = feature_tip.clone();
+    let provider = axum::Router::new().route(
+        "/api/v1/repos/local/fixture/branches/feature",
+        axum::routing::get(move || {
+            let sha = provider_sha.clone();
+            async move { axum::Json(serde_json::json!({"commit":{"id":sha}})) }
+        }),
+    );
+    let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_addr = provider_listener.local_addr().unwrap();
+    assert!(
+        provider_addr.ip().is_loopback(),
+        "provider endpoint must be enrolled loopback"
+    );
+    let provider_handle = tokio::spawn(async move {
+        axum::serve(provider_listener, provider).await.unwrap();
+    });
+
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let response = client.post(format!("{base}/api/repos"))
+        .json(&serde_json::json!({"name":"fixture", "svn_url":svn_url, "svn_branch":"trunk", "git_provider":"gitea", "git_api_url":format!("http://{provider_addr}/api/v1"), "git_repo":"local/fixture", "git_branch":"main"}))
+        .send().await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "create: {}",
+        response.status()
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    let id = body["id"].as_str().unwrap();
+
+    let pair = client.post(format!("{base}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({"svn_branch":"branches/feature", "git_branch":"feature", "skip_import":true, "auto_create_svn_branch":false, "auto_create_git_branch":false}))
+        .send().await.unwrap();
+    assert!(
+        pair.status().is_success(),
+        "late pair: {}",
+        pair.text().await.unwrap()
+    );
+    let pair: serde_json::Value = pair.json().await.unwrap();
+    assert_eq!(pair["last_git_sha"], feature_tip);
+    assert!(pair["last_svn_rev"].as_i64().unwrap() > 0);
+    let pair_id = pair["id"].as_str().unwrap();
+    assert_eq!(state.db.get_repo_watermark(pair_id).unwrap().1, feature_tip);
+    assert!(state.db.list_commit_map(100).unwrap().is_empty());
+    let svn_tree = Command::new("svn")
+        .args(["list", &target_url, "--non-interactive"])
+        .output()
+        .unwrap();
+    assert!(svn_tree.status.success());
+    assert!(!String::from_utf8_lossy(&svn_tree.stdout).contains("feature.txt"));
+    eprintln!("EXPECTED BASELINE FAILURE R06 API: skip_import recorded provider ref {feature_tip} while disposable SVN target had no feature.txt and no mapping");
+
+    let progress = state.get_repo_import_progress(id).await;
+    progress.write().await.phase = ImportPhase::Importing;
+    let cancel = client
+        .post(format!("{base}/api/repos/{id}/import/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), reqwest::StatusCode::NOT_FOUND);
+    let status: serde_json::Value = client
+        .get(format!("{base}/api/repos/{id}/import/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["phase"], "importing");
+    assert!(!progress.read().await.cancel_requested);
+
+    let delete = client
+        .delete(format!("{base}/api/repos/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(delete.status().is_success());
+    let delete_body: serde_json::Value = delete.json().await.unwrap();
+    assert_eq!(delete_body["message"], "repository disabled");
+    assert!(!state.db.get_repository(id).unwrap().unwrap().enabled);
+    assert!(state.db.get_repository(id).unwrap().is_some());
+    let svn_after = Command::new("svnlook")
+        .args(["youngest", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let git_after = Command::new("git")
+        .args([
+            "--git-dir",
+            git_bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(svn_before.stdout, svn_after.stdout);
+    assert_eq!(git_before.stdout, git_after.stdout);
+    eprintln!("BASELINE OBSERVATION R02/R03: root DELETE retained disabled registration; per-repo cancel returned 404 while progress remained importing. Remote SVN r{} and Git ref {} unchanged.", String::from_utf8_lossy(&svn_after.stdout).trim(), String::from_utf8_lossy(&git_after.stdout).trim());
+    server.abort();
+    provider_handle.abort();
 }

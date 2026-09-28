@@ -74,9 +74,9 @@ async fn list_audit(
 
     let db = &state.db;
 
-    let total_count = db
-        .count_audit_log()
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))? as usize;
+    let total_count =
+        db.count_audit_log()
+            .map_err(|e| AppError::Internal(format!("database error: {}", e)))? as usize;
 
     // Fetch audit entries, filtered by repo_id if provided
     let entries = if let Some(ref rid) = query.repo_id {
@@ -86,38 +86,52 @@ async fn list_audit(
             "SELECT id, action, direction, svn_rev, git_sha, author, details, created_at, success, repo_id
              FROM audit_log WHERE repo_id = ?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3"
         ).map_err(|e| AppError::Internal(format!("prepare: {}", e)))?;
-        let rows = stmt.query_map(rusqlite::params![rid, limit, offset], |row| {
-            Ok(AuditEntryView {
-                id: row.get(0)?,
-                action: row.get(1)?,
-                direction: row.get(2)?,
-                svn_rev: row.get(3)?,
-                git_sha: row.get(4)?,
-                author: row.get(5)?,
-                details: row.get(6)?,
-                created_at: row.get(7)?,
-                success: row.get(8)?,
-                repo_id: row.get(9)?,
+        let rows = stmt
+            .query_map(rusqlite::params![rid, limit, offset], |row| {
+                Ok(AuditEntryView {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    direction: row.get(2)?,
+                    svn_rev: row.get(3)?,
+                    git_sha: row.get(4)?,
+                    author: row.get(5)?,
+                    details: row.get(6)?,
+                    created_at: row.get(7)?,
+                    success: row.get(8)?,
+                    repo_id: row.get(9)?,
+                })
             })
-        }).map_err(|e| AppError::Internal(format!("query: {}", e)))?;
+            .map_err(|e| AppError::Internal(format!("query: {}", e)))?;
         rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
     } else {
         // No filter — return all entries
         let entries = db
             .list_audit_log(limit, offset)
             .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-        entries.into_iter().map(|e| AuditEntryView {
-            id: e.id, created_at: e.created_at, action: e.action,
-            details: e.details, author: e.author, direction: e.direction,
-            svn_rev: e.svn_rev, git_sha: e.git_sha, success: e.success,
-            repo_id: e.repo_id,
-        }).collect()
+        entries
+            .into_iter()
+            .map(|e| AuditEntryView {
+                id: e.id,
+                created_at: e.created_at,
+                action: e.action,
+                details: e.details,
+                author: e.author,
+                direction: e.direction,
+                svn_rev: e.svn_rev,
+                git_sha: e.git_sha,
+                success: e.success,
+                repo_id: e.repo_id,
+            })
+            .collect()
     };
     let views = entries;
 
     // Apply success filter if provided
     let views: Vec<AuditEntryView> = if let Some(success_val) = query.success {
-        views.into_iter().filter(|e| e.success == success_val).collect()
+        views
+            .into_iter()
+            .filter(|e| e.success == success_val)
+            .collect()
     } else {
         views
     };

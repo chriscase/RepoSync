@@ -11,17 +11,21 @@
 //!
 //! A lock mechanism prevents concurrent sync cycles.
 
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::Utc;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{AppConfig, SvnLayout};
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
+use crate::db::queries::AuditLogInput;
 use crate::db::Database;
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
@@ -97,6 +101,16 @@ pub struct SyncStats {
 /// Marker string embedded in sync-generated commit messages for echo detection.
 const SYNC_MARKER: &str = "[reposync]";
 
+/// Inputs admitted for one team cycle. The Git replay cursor is P, not L or O.
+struct TeamHistoryAdmission {
+    checkpoint: String,
+    remote_tip: String,
+}
+
+fn is_full_git_oid(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// The bidirectional sync engine.
 pub struct SyncEngine {
     config: AppConfig,
@@ -161,7 +175,10 @@ impl SyncEngine {
     }
 
     /// Validate file paths against allowed/blocked rules.
-    fn validate_file_paths(&self, files: &[(String, String, Option<Vec<u8>>)]) -> Result<(), Vec<String>> {
+    fn validate_file_paths(
+        &self,
+        files: &[(String, String, Option<Vec<u8>>)],
+    ) -> Result<(), Vec<String>> {
         validate_file_paths_impl(&self.allowed_paths, &self.blocked_patterns, files)
     }
 
@@ -249,6 +266,9 @@ impl SyncEngine {
                     stats.svn_to_git_count, stats.git_to_svn_count, stats.conflicts_detected
                 ),
             ),
+            Err(e @ SyncError::HistoryBlocked { .. }) => {
+                ("reconciliation_required", format!("sync blocked: {}", e))
+            }
             Err(e) => ("error", format!("sync failed: {}", e)),
         };
 
@@ -272,6 +292,10 @@ impl SyncEngine {
         };
         let _ = self.db.insert_audit_entry(&audit);
 
+        if result.is_ok() {
+            let _ = self.db.set_state(&self.history_block_key(), "");
+        }
+
         // Lock is released by _guard drop (happens here at scope end).
         result.map(|()| stats)
     }
@@ -280,7 +304,9 @@ impl SyncEngine {
     pub fn get_status(&self) -> Result<crate::models::SyncStatus, SyncError> {
         // Use the consolidated summary query to reduce mutex acquisitions
         // (1 query instead of 8+ separate queries).
-        let summary = self.db.get_status_summary(self.repo_id.as_deref())
+        let summary = self
+            .db
+            .get_status_summary(self.repo_id.as_deref())
             .map_err(SyncError::DatabaseError)?;
 
         let last_sync_at = summary.last_sync_at.and_then(|s| {
@@ -334,10 +360,1005 @@ impl SyncEngine {
     // Inner sync cycle logic
     // -----------------------------------------------------------------------
 
+    fn history_block_key(&self) -> String {
+        match self.effective_repo_id() {
+            Some(id) => format!("team_history_block_{}", id),
+            None => "team_history_block_global".to_string(),
+        }
+    }
+
+    fn record_history_block(
+        &self,
+        reason: &str,
+        detail: &str,
+        p: Option<&str>,
+        o: Option<&str>,
+        r: Option<&str>,
+        l: Option<&str>,
+    ) -> SyncError {
+        let record = serde_json::json!({
+            "state": "reconciliation_required",
+            "reason": reason,
+            "detail": detail,
+            "repo_id": self.effective_repo_id(),
+            "p_handled": p,
+            "o_prior_observed": o,
+            "r_fresh_remote": r,
+            "l_bridge": l,
+            "observed_at": Utc::now().to_rfc3339(),
+        });
+        match self
+            .db
+            .set_state(&self.history_block_key(), &record.to_string())
+        {
+            Ok(()) => SyncError::HistoryBlocked {
+                reason: reason.to_string(),
+                detail: detail.to_string(),
+            },
+            Err(error) => SyncError::DatabaseError(error),
+        }
+    }
+
+    /// Read a repository-owned legacy Git cursor without borrowing another
+    /// pair's global maximum. A missing or conflicting cursor is not a new
+    /// baseline. The schema transition remains #63.
+    fn team_git_checkpoint(&self) -> Result<Option<String>, SyncError> {
+        if let Some(rid) = self.effective_repo_id() {
+            let column: Option<String> = {
+                let conn = self.db.conn();
+                conn.query_row(
+                    "SELECT last_git_sha FROM repositories WHERE id = ?1",
+                    [rid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(crate::errors::DatabaseError::from)?
+            };
+            let column = column.filter(|value| !value.is_empty());
+            let kv = self
+                .db
+                .get_state(&format!("last_git_sha_{}", rid))
+                .map_err(SyncError::DatabaseError)?
+                .filter(|value| !value.is_empty());
+            // A no-target decision is authority for the handled frontier even
+            // when the old cursor copies happen to agree. Check every present
+            // copy before choosing between equal, split, or KV-only shapes.
+            if let Some(ref sha) = column {
+                self.checked_no_target_receipt(rid, sha)?;
+            }
+            let kv_no_target = if let Some(ref sha) = kv {
+                self.checked_no_target_receipt(rid, sha)?
+            } else {
+                false
+            };
+            if column.is_some() && kv.is_some() && column != kv {
+                let (emitted, applied_outbound, svn_origin) = {
+                    let conn = self.db.conn();
+                    let emitted: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                        rusqlite::params![rid, column.as_deref()], |row| row.get(0),
+                    ).map_err(crate::errors::DatabaseError::from)?;
+                    let applied_outbound: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn' AND status = 'applied'",
+                        rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
+                    ).map_err(crate::errors::DatabaseError::from)?;
+                    let svn_origin: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev <= (SELECT last_svn_rev FROM repositories WHERE id = ?1)",
+                        rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
+                    ).map_err(crate::errors::DatabaseError::from)?;
+                    (emitted, applied_outbound, svn_origin)
+                };
+                // The column is also used by the old SVN->Git writer to hold
+                // its emitted tip. That is not the inbound handled cursor P.
+                // Keep the older handled cursor when its outcome (applied
+                // outbound, imported SVN origin, or no-target receipt) and
+                // ancestry to the emitted tip are both proved. Pending Git
+                // ancestors remain in the replay range.
+                let old_import_projection =
+                    self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
+                if emitted > 0
+                    && (applied_outbound > 0
+                        || (old_import_projection && svn_origin > 0)
+                        || kv_no_target)
+                    && is_full_git_oid(column.as_deref().unwrap())
+                    && is_full_git_oid(kv.as_deref().unwrap())
+                {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    let ancestry = Command::new("git")
+                        .args([
+                            "merge-base",
+                            "--is-ancestor",
+                            kv.as_deref().unwrap(),
+                            column.as_deref().unwrap(),
+                        ])
+                        .current_dir(git.repo_path())
+                        .output();
+                    match ancestry {
+                        Ok(output) if output.status.code() == Some(0) => return Ok(kv),
+                        Ok(output) if output.status.code() == Some(1) => (),
+                        _ => {
+                            return Err(self.record_history_block(
+                                "ancestry_command_failed",
+                                "repository cursor copies could not be reconciled",
+                                kv.as_deref(),
+                                None,
+                                None,
+                                column.as_deref(),
+                            ))
+                        }
+                    }
+                }
+                return Err(self.record_history_block(
+                    "ambiguous_checkpoint",
+                    "repository column and repository-scoped legacy cursor disagree",
+                    column.as_deref(),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            if let Some(ref emitted_tip) = column {
+                if kv.is_none() {
+                    let (emitted, last_handled): (i64, Option<String>) = {
+                        let conn = self.db.conn();
+                        let emitted = conn.query_row(
+                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                            rusqlite::params![rid, emitted_tip], |row| row.get(0),
+                        ).map_err(crate::errors::DatabaseError::from)?;
+                        let last_handled = conn.query_row(
+                            "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
+                            [rid], |row| row.get(0),
+                        ).optional().map_err(crate::errors::DatabaseError::from)?;
+                        (emitted, last_handled)
+                    };
+                    if emitted > 0 {
+                        // A retained first row is not a baseline: maintenance
+                        // may already have deleted earlier applied rows.
+                        let baseline = self
+                            .db
+                            .get_state(&format!("handled_git_baseline_{}", rid))
+                            .map_err(SyncError::DatabaseError)?
+                            .and_then(|value| {
+                                serde_json::from_str::<serde_json::Value>(&value).ok()
+                            });
+                        let baseline_sha = baseline
+                            .as_ref()
+                            .and_then(|record| record["git_sha"].as_str());
+                        let baseline_revision = baseline
+                            .as_ref()
+                            .and_then(|record| record["svn_rev"].as_i64());
+                        let baseline_valid = baseline.as_ref().is_some_and(|record| {
+                            record["version"] == 1
+                                && record["repo_id"] == rid
+                                && record["projection"] == self.no_target_projection()
+                        }) && baseline_sha.is_some_and(is_full_git_oid)
+                            && baseline_revision.is_some_and(|rev| rev > 0);
+                        if !baseline_valid {
+                            return Err(self.record_history_block(
+                                "ambiguous_checkpoint",
+                                "missing durable handled Git baseline for absent repository cursor",
+                                None,
+                                None,
+                                None,
+                                Some(emitted_tip),
+                            ));
+                        }
+                        let baseline_sha = baseline_sha.unwrap();
+                        let baseline_revision = baseline_revision.unwrap();
+                        let baseline_mapping: i64 = {
+                            let conn = self.db.conn();
+                            conn.query_row(
+                                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND git_sha = ?3 AND direction = 'svn_to_git' AND status = 'applied'",
+                                rusqlite::params![rid, baseline_revision, baseline_sha], |row| row.get(0),
+                            ).map_err(crate::errors::DatabaseError::from)?
+                        };
+                        if baseline_mapping == 0 {
+                            return Err(self.record_history_block(
+                                "ambiguous_checkpoint",
+                                "durable baseline mapping is missing",
+                                Some(baseline_sha),
+                                None,
+                                None,
+                                Some(emitted_tip),
+                            ));
+                        }
+                        let handled = last_handled.unwrap_or_else(|| baseline_sha.to_string());
+                        if !is_full_git_oid(&handled) || !is_full_git_oid(emitted_tip) {
+                            return Err(self.record_history_block(
+                                "ambiguous_checkpoint",
+                                "mapped legacy cursor is malformed",
+                                Some(&handled),
+                                None,
+                                None,
+                                Some(emitted_tip),
+                            ));
+                        }
+                        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                        let baseline_ancestry = Command::new("git")
+                            .args(["merge-base", "--is-ancestor", baseline_sha, &handled])
+                            .current_dir(git.repo_path())
+                            .output();
+                        if !matches!(baseline_ancestry, Ok(ref output) if output.status.code() == Some(0))
+                        {
+                            return Err(self.record_history_block(
+                                "ambiguous_checkpoint",
+                                "handled Git row is not descended from verified baseline",
+                                Some(&handled),
+                                None,
+                                None,
+                                Some(emitted_tip),
+                            ));
+                        }
+                        let ancestry = Command::new("git")
+                            .args(["merge-base", "--is-ancestor", &handled, emitted_tip])
+                            .current_dir(git.repo_path())
+                            .output();
+                        match ancestry {
+                            Ok(output) if output.status.code() == Some(0) => {
+                                return Ok(Some(handled))
+                            }
+                            Ok(output) if output.status.code() == Some(1) => {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "mapped legacy cursor is unrelated to emitted tip",
+                                    Some(&handled),
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ))
+                            }
+                            _ => {
+                                return Err(self.record_history_block(
+                                    "ancestry_command_failed",
+                                    "mapped legacy cursor ancestry could not be established",
+                                    Some(&handled),
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(column.or(kv));
+        }
+
+        // Older single-repository callers use a global key. It is never
+        // borrowed when multiple repository rows can own that key.
+        let registered: i64 = {
+            let conn = self.db.conn();
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))
+                .map_err(crate::errors::DatabaseError::from)?
+        };
+        if registered > 1 {
+            return Err(self.record_history_block(
+                "ambiguous_checkpoint",
+                "global legacy cursor has multiple possible repository owners",
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        self.db
+            .get_state("last_git_hash")
+            .map_err(SyncError::DatabaseError)
+            .map(|value| value.filter(|sha| !sha.is_empty()))
+    }
+
+    fn no_target_projection(&self) -> String {
+        serde_json::json!({"allowed_paths": self.allowed_paths, "blocked_patterns": self.blocked_patterns}).to_string()
+    }
+
+    fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
+        let key = format!("handled_git_no_target_{}_{}", rid, sha);
+        let Some(raw) = self.db.get_state(&key).map_err(SyncError::DatabaseError)? else {
+            return Ok(false);
+        };
+        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        let Some(record) = receipt else {
+            return Err(self.record_history_block(
+                "unverified_no_target_receipt",
+                "no-target receipt is malformed; reconcile before replay",
+                Some(sha),
+                None,
+                None,
+                None,
+            ));
+        };
+        if record["repo_id"] != rid || record["git_sha"] != sha || !is_full_git_oid(sha) {
+            return Err(self.record_history_block(
+                "unverified_no_target_receipt",
+                "no-target receipt does not identify this repository and Git commit",
+                Some(sha),
+                None,
+                None,
+                None,
+            ));
+        }
+        if record["projection"] != self.no_target_projection() {
+            let reason = if record["outcome"] == "empty_commit" {
+                // Preserve the accepted legacy empty-commit rejection shape.
+                "ambiguous_checkpoint"
+            } else {
+                "receipt_policy_changed"
+            };
+            return Err(self.record_history_block(
+                reason,
+                "no-target decision belongs to a different path policy; reconcile before writes",
+                Some(sha),
+                None,
+                None,
+                None,
+            ));
+        }
+        let accepted = match (record["version"].as_u64(), record["outcome"].as_str()) {
+            (Some(1), Some("empty_commit" | "filtered")) => true,
+            (Some(3), Some("no_svn_delta")) => {
+                let target = &record["target"];
+                target["svn_revision"].as_i64().is_some_and(|rev| rev > 0)
+                    && target["svn_uuid"].as_str().is_some_and(|v| !v.is_empty())
+                    && target["svn_url"].as_str().is_some_and(|v| !v.is_empty())
+                    && target["semantic_projection"] == "regular_file_bytes_no_properties_v1"
+                    && target["paths"].as_object().is_some_and(|paths| {
+                        !paths.is_empty()
+                            && paths.values().all(|entry| {
+                                entry.is_null()
+                                    || (entry["sha256"].as_str().is_some_and(is_full_git_oid)
+                                        && entry["git_mode"] == 33188
+                                        && entry["svn_executable"] == false)
+                            })
+                    })
+            }
+            // Old v1 and v2 receipts did not attest semantic target state.
+            _ => false,
+        };
+        if !accepted {
+            return Err(self.record_history_block(
+                "unverified_no_target_receipt",
+                "no-target receipt lacks verified outcome evidence",
+                Some(sha),
+                None,
+                None,
+                None,
+            ));
+        }
+        Ok(true)
+    }
+
+    /// A clean working-copy status is not proof that a nonempty Git delta is
+    /// represented by SVN. Compare the exact selected paths with an exported,
+    /// pinned target revision before creating durable handled evidence.
+    async fn verify_no_svn_delta(
+        &self,
+        svn: &SvnClient,
+        files: &[(String, String, Option<Vec<u8>>)],
+        sha: &str,
+    ) -> Result<serde_json::Value, SyncError> {
+        #[cfg(debug_assertions)]
+        self.test_outbound_pause("REPOSYNC_TEST_BEFORE_NO_TARGET_VERIFY", sha)
+            .await?;
+        let before = svn.info().await.map_err(SyncError::SvnError)?;
+        let snapshot = tempfile::tempdir()
+            .map_err(|error| SyncError::SvnError(crate::errors::SvnError::IoError(error)))?;
+        let target = snapshot.path().join("target");
+        svn.export("", before.latest_rev, &target)
+            .await
+            .map_err(SyncError::SvnError)?;
+        let mut paths = serde_json::Map::new();
+        for (action, path, content) in files {
+            let relative = std::path::Path::new(path);
+            if relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(self.record_history_block(
+                    "unverified_no_target",
+                    "Git delta contains a non-relative target path",
+                    Some(sha),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            let actual = target.join(relative);
+            // An SVN special file may export as a symlink. Check every existing
+            // component before any read or absence decision so the verifier
+            // cannot follow an exported link outside the pinned snapshot.
+            let mut checked = target.clone();
+            for component in relative.components() {
+                checked.push(component.as_os_str());
+                match std::fs::symlink_metadata(&checked) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(self.record_history_block(
+                            "unverified_no_target",
+                            "pinned SVN target contains unsupported symlink semantics",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(_) => {
+                        return Err(self.record_history_block(
+                            "unverified_no_target",
+                            "pinned SVN target metadata is unreadable",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            if action == "D" {
+                if std::fs::symlink_metadata(&actual).is_ok() {
+                    return Err(self.record_history_block(
+                        "unverified_no_target",
+                        "deleted Git path still exists at pinned SVN target",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                paths.insert(path.clone(), serde_json::Value::Null);
+            } else {
+                let Some(expected) = content else {
+                    return Err(self.record_history_block(
+                        "unverified_no_target",
+                        "non-delete Git content is missing",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ));
+                };
+                if !std::fs::symlink_metadata(&actual)
+                    .map_err(|_| {
+                        self.record_history_block(
+                            "unverified_no_target",
+                            "pinned target type is unreadable",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        )
+                    })?
+                    .file_type()
+                    .is_file()
+                {
+                    return Err(self.record_history_block(
+                        "unverified_no_target",
+                        "pinned SVN target is not a regular file",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                let actual_bytes = std::fs::read(&actual).map_err(|_| {
+                    self.record_history_block(
+                        "unverified_no_target",
+                        "Git path is absent or unreadable at pinned SVN target",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    )
+                })?;
+                if actual_bytes != *expected {
+                    return Err(self.record_history_block(
+                        "unverified_no_target",
+                        "pinned SVN target content differs from Git delta",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                let props = svn
+                    .file_properties_at_rev(path, before.latest_rev)
+                    .await
+                    .map_err(SyncError::SvnError)?;
+                if props.contains("<property ") || props.contains("<property>") {
+                    return Err(self.record_history_block(
+                        "unverified_no_target",
+                        "pinned SVN target has file properties outside the regular-byte projection",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::metadata(&actual)
+                        .map_err(|_| {
+                            self.record_history_block(
+                                "unverified_no_target",
+                                "pinned target metadata is unreadable",
+                                Some(sha),
+                                None,
+                                None,
+                                None,
+                            )
+                        })?
+                        .permissions()
+                        .mode()
+                        & 0o111
+                        != 0
+                    {
+                        return Err(self.record_history_block("unverified_no_target",
+                            "pinned SVN target has executable semantics absent from Git regular file",
+                            Some(sha), None, None, None));
+                    }
+                }
+                #[cfg(not(unix))]
+                return Err(self.record_history_block(
+                    "unverified_no_target",
+                    "SVN executable semantics are unqualified on this platform",
+                    Some(sha),
+                    None,
+                    None,
+                    None,
+                ));
+                paths.insert(
+                    path.clone(),
+                    serde_json::json!({
+                        "sha256": hex::encode(Sha256::digest(expected)),
+                        "git_mode": 33188, "svn_executable": false,
+                    }),
+                );
+            }
+        }
+        let after = svn.info().await.map_err(SyncError::SvnError)?;
+        if before.uuid != after.uuid
+            || before.url != after.url
+            || before.latest_rev != after.latest_rev
+        {
+            return Err(self.record_history_block(
+                "target_changed_during_verification",
+                "SVN target changed while no-delta proof was checked",
+                Some(sha),
+                None,
+                None,
+                None,
+            ));
+        }
+        Ok(serde_json::json!({
+            "svn_revision": before.latest_rev, "svn_uuid": before.uuid,
+            "svn_url": before.url, "paths": paths,
+            "semantic_projection": "regular_file_bytes_no_properties_v1",
+        }))
+    }
+
+    #[cfg(debug_assertions)]
+    async fn test_outbound_pause(&self, key: &str, sha: &str) -> Result<(), SyncError> {
+        let bridge = self
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_string_lossy()
+            .to_string();
+        let scoped_key = format!(
+            "{key}_{sha}_{}",
+            hex::encode(Sha256::digest(bridge.as_bytes()))
+        );
+        let Some(dir) = std::env::var(&scoped_key).ok() else {
+            return Ok(());
+        };
+        let dir = std::path::Path::new(&dir);
+        std::fs::write(dir.join("ready"), b"")
+            .map_err(|error| SyncError::GitError(crate::errors::GitError::IoError(error)))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !dir.join("release").exists() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SyncError::GitError(crate::errors::GitError::IoError(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "test outbound pause timed out",
+                    ),
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    fn materialize_git_baseline(&self, sha: &str, revision: i64) -> Result<(), SyncError> {
+        let Some(rid) = self.effective_repo_id() else {
+            return Ok(());
+        };
+        // The pinned old import route used the unfiltered projection. Old
+        // applied rows do not encode a policy, so a changed projection cannot
+        // inherit an import baseline without a separate qualification.
+        if !self.allowed_paths.is_empty() || !self.blocked_patterns.is_empty() {
+            return Ok(());
+        }
+        if !is_full_git_oid(sha) || revision <= 0 {
+            return Ok(());
+        }
+        let key = format!("handled_git_baseline_{}", rid);
+        if self
+            .db
+            .get_state(&key)
+            .map_err(SyncError::DatabaseError)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let mapped: i64 = {
+            let conn = self.db.conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND git_sha = ?3 AND direction = 'svn_to_git' AND status = 'applied'",
+                rusqlite::params![rid, revision, sha], |row| row.get(0),
+            ).map_err(crate::errors::DatabaseError::from)?
+        };
+        if mapped != 1 {
+            return Ok(());
+        }
+        let value = serde_json::json!({
+            "version": 1, "repo_id": rid, "git_sha": sha,
+            "svn_rev": revision, "projection": self.no_target_projection(),
+        });
+        self.db
+            .set_state(&key, &value.to_string())
+            .map_err(SyncError::DatabaseError)
+    }
+
+    /// Fetch the exact configured branch into an inspection ref and admit
+    /// only a complete, linear path from the durably handled P to fresh R.
+    /// This runs before SVN legacy adoption or any checkout reset.
+    fn inspect_team_history(&self) -> Result<TeamHistoryAdmission, SyncError> {
+        let p = self.team_git_checkpoint()?;
+        let git = self
+            .git_client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = git.repo_path();
+        let branch = &self.config.github.default_branch;
+        let run = |args: &[&str]| -> std::io::Result<Output> {
+            // Faults are available only in debug builds and only at the
+            // subprocess boundary exercised by isolated integration tests.
+            #[cfg(debug_assertions)]
+            let fault = std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok();
+            #[cfg(debug_assertions)]
+            let fixture_fault = fault
+                .as_deref()
+                .and_then(|value| value.split_once('|'))
+                .filter(|(_, fixture_path)| std::path::Path::new(fixture_path) == path)
+                .map(|(kind, _)| kind);
+            #[cfg(debug_assertions)]
+            match (fixture_fault, args.first().copied()) {
+                (Some("remote_auth"), Some("ls-remote")) => {
+                    let mut output = Command::new("false").output()?;
+                    output.stderr = b"fatal: Authentication failed".to_vec();
+                    return Ok(output);
+                }
+                (Some("remote_fetch"), Some("fetch")) => return Command::new("false").output(),
+                (Some("ancestry_exit_128"), Some("merge-base")) => {
+                    return Command::new("sh").args(["-c", "exit 128"]).output();
+                }
+                _ => (),
+            }
+            Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+        };
+        let mut o: Option<String> = None;
+        let mut r: Option<String> = None;
+        let mut l: Option<String> = None;
+        macro_rules! blocked {
+            ($reason:expr, $detail:expr) => {{
+                return Err(self.record_history_block(
+                    $reason,
+                    $detail,
+                    p.as_deref(),
+                    o.as_deref(),
+                    r.as_deref(),
+                    l.as_deref(),
+                ));
+            }};
+        }
+
+        let branch_check = run(&["check-ref-format", "--branch", branch]);
+        if !branch_check.is_ok_and(|output| output.status.success()) {
+            blocked!(
+                "invalid_branch",
+                "configured Git branch is not a valid branch name"
+            );
+        }
+        let local = match run(&["rev-parse", "--verify", "HEAD^{commit}"]) {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => blocked!("unknown_local_tip", "bridge HEAD is missing or unreadable"),
+        };
+        l = Some(local.clone());
+        let status = match run(&[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ]) {
+            Ok(output) if output.status.success() => output,
+            _ => blocked!(
+                "local_status_error",
+                "bridge index/worktree could not be inspected"
+            ),
+        };
+        if !status.stdout.is_empty() {
+            blocked!(
+                "local_dirty",
+                "bridge index or worktree has unpublished changes"
+            );
+        }
+
+        let inspection_ref = "refs/reposync/inspection/incoming";
+        let prior_inspection = format!("{}^{{commit}}", inspection_ref);
+        if let Ok(output) = run(&["rev-parse", "--verify", &prior_inspection]) {
+            if output.status.success() {
+                o = Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+            }
+        }
+        if o.is_none() {
+            let remote_tracking = format!("refs/remotes/origin/{}^{{commit}}", branch);
+            if let Ok(output) = run(&["rev-parse", "--verify", &remote_tracking]) {
+                if output.status.success() {
+                    o = Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
+                }
+            }
+        }
+        let remote_branch = format!("refs/heads/{}", branch);
+        let advertised = match run(&[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &remote_branch,
+        ]) {
+            Ok(output) if output.status.success() => output,
+            Ok(output) if output.status.code() == Some(2) => blocked!(
+                "remote_branch_missing",
+                "configured remote branch is absent"
+            ),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+                if stderr.contains("authentication")
+                    || stderr.contains("could not read username")
+                    || stderr.contains("401")
+                {
+                    blocked!("remote_auth_failed", "remote branch inspection was denied");
+                }
+                blocked!("remote_transport_failed", "remote branch inspection failed");
+            }
+            Err(_) => blocked!("inspection_command_failed", "git ls-remote could not start"),
+        };
+        let advertised_text = String::from_utf8_lossy(&advertised.stdout);
+        let lines: Vec<&str> = advertised_text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if lines.len() != 1 {
+            blocked!(
+                "ambiguous_remote_ref",
+                "remote returned an unexpected branch result"
+            );
+        }
+        let advertised_sha = lines[0].split_whitespace().next().unwrap_or("");
+        if !is_full_git_oid(advertised_sha) || !lines[0].ends_with(&remote_branch) {
+            blocked!("ambiguous_remote_ref", "remote branch result is malformed");
+        }
+
+        let refspec = format!("+{}:{}", remote_branch, inspection_ref);
+        match run(&[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            &refspec,
+        ]) {
+            Ok(output) if output.status.success() => (),
+            Ok(_) => blocked!(
+                "remote_fetch_failed",
+                "fresh branch fetch failed after advertisement"
+            ),
+            Err(_) => blocked!("inspection_command_failed", "git fetch could not start"),
+        }
+        let fetched_ref = format!("{}^{{commit}}", inspection_ref);
+        let fetched = match run(&["rev-parse", "--verify", &fetched_ref]) {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => blocked!(
+                "inspection_object_missing",
+                "fresh fetch did not produce a commit"
+            ),
+        };
+        r = Some(fetched.clone());
+        if fetched != advertised_sha {
+            blocked!(
+                "remote_changed_during_inspection",
+                "remote branch moved between advertisement and fetch"
+            );
+        }
+
+        // Porcelain status deliberately omits ignored paths. A subsequent
+        // reset can nevertheless replace an ignored file or directory when
+        // the incoming commit tracks that name (including either prefix of a
+        // file/directory collision). Inspect the target tree before reset.
+        let ignored = match run(&[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ]) {
+            Ok(output) if output.status.success() => output.stdout,
+            _ => blocked!(
+                "local_status_error",
+                "ignored bridge paths could not be inspected"
+            ),
+        };
+        let target = match run(&["ls-tree", "-r", "--name-only", "-z", &fetched]) {
+            Ok(output) if output.status.success() => output.stdout,
+            _ => blocked!(
+                "inspection_command_failed",
+                "incoming Git tree could not be inspected"
+            ),
+        };
+        let ignored_paths = ignored
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty());
+        let target_paths: Vec<&[u8]> = target
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .collect();
+        for ignored in ignored_paths {
+            let ignored = ignored.strip_suffix(b"/").unwrap_or(ignored);
+            if target_paths.iter().any(|tracked| {
+                *tracked == ignored
+                    || (tracked.starts_with(ignored) && tracked.get(ignored.len()) == Some(&b'/'))
+                    || (ignored.starts_with(tracked) && ignored.get(tracked.len()) == Some(&b'/'))
+            }) {
+                blocked!(
+                    "ignored_path_collision",
+                    "incoming tracked paths overlap ignored bridge data"
+                );
+            }
+        }
+
+        let checkpoint = match p.as_deref() {
+            Some(sha) if is_full_git_oid(sha) => sha,
+            Some(_) => blocked!(
+                "ambiguous_checkpoint",
+                "stored Git cursor is not a full object ID"
+            ),
+            None => blocked!(
+                "missing_checkpoint",
+                "no repository-owned handled Git cursor exists"
+            ),
+        };
+        let checkpoint_expr = format!("{}^{{commit}}", checkpoint);
+        if !run(&["cat-file", "-e", &checkpoint_expr]).is_ok_and(|output| output.status.success()) {
+            blocked!(
+                "missing_checkpoint_object",
+                "handled Git cursor object is absent or invalid"
+            );
+        }
+        match run(&["rev-parse", "--is-shallow-repository"]) {
+            Ok(output)
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).trim() == "false" => {}
+            Ok(output) if output.status.success() => blocked!(
+                "incomplete_history",
+                "bridge is shallow; ancestry is incomplete"
+            ),
+            _ => blocked!(
+                "inspection_command_failed",
+                "shallow-history inspection failed"
+            ),
+        }
+        match run(&["merge-base", "--is-ancestor", checkpoint, &fetched]) {
+            Ok(output) if output.status.code() == Some(0) => (),
+            Ok(output) if output.status.code() == Some(1) => blocked!(
+                "non_fast_forward",
+                "fresh remote tip does not descend from handled Git cursor"
+            ),
+            _ => blocked!(
+                "ancestry_command_failed",
+                "Git ancestry could not be established"
+            ),
+        }
+        for (ancestor, descendant) in [
+            (checkpoint, local.as_str()),
+            (local.as_str(), fetched.as_str()),
+        ] {
+            match run(&["merge-base", "--is-ancestor", ancestor, descendant]) {
+                Ok(output) if output.status.code() == Some(0) => (),
+                Ok(output) if output.status.code() == Some(1) => blocked!(
+                    "unpublished_local_history",
+                    "bridge tip is outside the handled-to-remote path"
+                ),
+                _ => blocked!(
+                    "ancestry_command_failed",
+                    "bridge ancestry could not be established"
+                ),
+            }
+        }
+        let range = format!("{}..{}", checkpoint, fetched);
+        let pending = match run(&["rev-list", "--count", &range]) {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok(),
+            _ => blocked!(
+                "selection_command_failed",
+                "pending Git commits could not be counted"
+            ),
+        };
+        let pending = match pending {
+            Some(count) => count,
+            None => blocked!("selection_command_failed", "pending Git count was invalid"),
+        };
+        if pending > 1000 {
+            blocked!(
+                "unsupported_backlog",
+                "more than 1000 pending Git commits require a reviewed continuation algorithm"
+            );
+        }
+        match run(&["rev-list", "--min-parents=2", &range]) {
+            Ok(output) if output.status.success() && output.stdout.is_empty() => (),
+            Ok(output) if output.status.success() => blocked!(
+                "unsupported_merge_dag",
+                "pending Git history contains a merge commit"
+            ),
+            _ => blocked!(
+                "selection_command_failed",
+                "pending Git topology could not be inspected"
+            ),
+        }
+        Ok(TeamHistoryAdmission {
+            checkpoint: checkpoint.to_string(),
+            remote_tip: fetched,
+        })
+    }
+
     async fn do_sync_cycle(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
+        // SVN inspection may adopt a legacy checkpoint. Admit Git history
+        // before that call, not merely before the later destructive reset.
+        let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
+
+        // On a pinned old import, both legacy copies point to the imported
+        // SVN mapping. Materialize that verified baseline before diagnostics
+        // can expire; never derive it from a later retained row.
+        if let Some(rid) = self.effective_repo_id() {
+            let (revision, column) = self
+                .db
+                .get_repo_watermark(rid)
+                .map_err(SyncError::DatabaseError)?;
+            let kv = self
+                .db
+                .get_state(&format!("last_git_sha_{}", rid))
+                .map_err(SyncError::DatabaseError)?;
+            if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
+                self.materialize_git_baseline(&column, revision)?;
+            }
+        }
+
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
-        let git_changes = self.fetch_git_changes().await?;
+        let git_changes = self.fetch_git_changes(&admission).await?;
 
         // 2. Detect conflicts.
         let conflicts = self.detect_conflicts_internal(&svn_changes, &git_changes);
@@ -366,7 +1387,23 @@ impl SyncEngine {
 
         // 3. Apply SVN -> Git.
         let _ = self.db.set_state("sync_state", "applying");
-        stats.svn_to_git_count = self.sync_svn_to_git(&svn_changes).await?;
+        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count)
+            .await?;
+
+        // The exact remote Git tip had no pending commits before this SVN
+        // publication, so its newly mapped tip is a handled frontier.
+        if git_changes.is_empty()
+            && admission.checkpoint == admission.remote_tip
+            && stats.svn_to_git_count > 0
+        {
+            if let Some(rid) = self.effective_repo_id() {
+                let (revision, emitted) = self
+                    .db
+                    .get_repo_watermark(rid)
+                    .map_err(SyncError::DatabaseError)?;
+                self.materialize_git_baseline(&emitted, revision)?;
+            }
+        }
 
         // 4. Apply Git -> SVN.
         stats.git_to_svn_count = self.sync_git_to_svn(&git_changes).await?;
@@ -428,9 +1465,11 @@ impl SyncEngine {
     /// 3. Commit with the mapped Git identity and a `[reposync]` marker.
     /// 4. Push to the remote.
     /// 5. Only then record the sync in the database.
-    async fn sync_svn_to_git(&self, svn_changes: &[SvnChangeSet]) -> Result<usize, SyncError> {
-        let mut count = 0;
-
+    async fn sync_svn_to_git(
+        &self,
+        svn_changes: &[SvnChangeSet],
+        applied: &mut usize,
+    ) -> Result<(), SyncError> {
         for change in svn_changes {
             if self.is_echo_commit(&change.message) {
                 debug!(rev = change.revision, "skipping echo SVN revision");
@@ -443,7 +1482,11 @@ impl SyncEngine {
                 .map_err(SyncError::IdentityError)?;
 
             // 1. Get the SVN diff for this revision.
-            let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let svn = self
+                .svn_client
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
             let diff = svn
                 .diff_full(change.revision)
                 .await
@@ -464,13 +1507,8 @@ impl SyncEngine {
             let processed_diff = if self.config.svn.layout == SvnLayout::Standard {
                 let tp = self.config.svn.trunk_path.trim_matches('/');
                 if !tp.is_empty() {
-                    diff.replace(
-                        &format!("a/{}/", tp),
-                        "a/",
-                    ).replace(
-                        &format!("b/{}/", tp),
-                        "b/",
-                    )
+                    diff.replace(&format!("a/{}/", tp), "a/")
+                        .replace(&format!("b/{}/", tp), "b/")
                 } else {
                     diff
                 }
@@ -491,8 +1529,10 @@ impl SyncEngine {
                 "SVN diff converted for git apply"
             );
 
+            let mut apply_error = None;
             let diff_applied = if !git_diff.trim().is_empty() {
-                let result = apply_diff_to_path(&repo_path, &git_diff).await;
+                let result =
+                    apply_diff_to_path_revision(&repo_path, &git_diff, Some(change.revision)).await;
                 if result.is_ok() {
                     // Verify: check that files were created at the correct paths
                     for cf in &change.changed_files {
@@ -503,10 +1543,11 @@ impl SyncEngine {
                             warn!(path = %cf.path, "git apply succeeded but file NOT at expected path");
                         }
                     }
-                } else {
+                } else if let Err(error) = &result {
+                    apply_error = Some(error.to_string());
                     warn!(
                         rev = change.revision,
-                        error = %result.as_ref().unwrap_err(),
+                        error = %error,
                         "git apply failed"
                     );
                 }
@@ -515,65 +1556,85 @@ impl SyncEngine {
                 false
             };
 
-            // If the diff is empty AND the changeset has no changed files,
-            // this is a metadata-only revision (branch creation, property
-            // change, svn:mergeinfo update, etc.). Skip it — there's nothing
-            // to commit and falling back to a full SVN export would create a
-            // massive commit touching every file, which can trigger remote
-            // pre-receive hook rejections and OOM on push.
-            if !diff_applied && processed_diff.trim().is_empty() && change.changed_files.is_empty() {
+            // SVN properties and empty directories have no Git file-content
+            // delta. Prove that separately using SVN's content-only diff;
+            // a failed nonempty patch may never be treated as filtered work.
+            let no_target_content = if !diff_applied {
+                svn.diff_content_only(change.revision)
+                    .await
+                    .map_err(SyncError::SvnError)?
+                    .trim()
+                    .is_empty()
+            } else {
+                false
+            };
+            if !diff_applied && no_target_content {
                 info!(
                     rev = change.revision,
-                    "skipping SVN revision with empty diff and no changed files (metadata-only)"
+                    "recording SVN revision with no Git target content (metadata-only)"
                 );
                 // Advance the watermark so we don't re-process this revision.
-                let per_repo_key = self.effective_repo_id()
+                let per_repo_key = self
+                    .effective_repo_id()
                     .map(|rid| format!("last_svn_rev_{}", rid));
                 if let Some(ref key) = per_repo_key {
-                    let _ = self.db.set_state(key, &change.revision.to_string());
+                    self.db
+                        .set_state(key, &change.revision.to_string())
+                        .map_err(SyncError::DatabaseError)?;
                 }
                 if let Some(ref rid) = self.repo_id {
-                    let _ = self.db.advance_svn_watermark(rid, change.revision);
+                    self.db
+                        .advance_svn_watermark(rid, change.revision)
+                        .map_err(SyncError::DatabaseError)?;
                 }
+                self.db
+                    .insert_audit_log_with_repo(AuditLogInput {
+                        action: "svn_to_git_no_target",
+                        direction: Some("svn_to_git"),
+                        svn_rev: Some(change.revision),
+                        git_sha: None,
+                        author: Some(&change.author),
+                        details: Some("No file-content delta under active SVN path"),
+                        success: true,
+                        repo_id: self.effective_repo_id(),
+                    })
+                    .map_err(SyncError::DatabaseError)?;
                 continue;
             }
 
             if !diff_applied {
-                // git apply failed for this SVN revision.  During incremental
-                // sync we MUST NOT fall back to a full SVN export because:
-                //   1. It replaces LFS pointers with raw binary content → push rejected
-                //   2. It creates massive commits (hundreds of files) → OOM / pre-receive hook
-                //   3. It can introduce rogue directory paths
-                //
-                // Instead, skip this revision and advance the watermark.
-                // The revision's changes are already in SVN; a future
-                // reimport can reconcile any drift.
+                // A nonempty revision that failed to apply remains pending.
+                // Stop at this revision: continuing could acknowledge later
+                // dependent work while leaving this tree change unapplied.
                 warn!(
                     rev = change.revision,
                     message = %change.message,
                     files = change.changed_files.len(),
-                    "git apply failed for SVN revision — skipping (export fallback disabled for incremental sync)"
+                    "git apply failed for SVN revision; stopping at durable frontier"
                 );
-
-                if let Some(ref rid) = self.repo_id {
-                    let _ = self.db.advance_svn_watermark(rid, change.revision);
-                }
-
-                let _ = self.db.insert_audit_log_with_repo(
-                    "svn_to_git_skip",
-                    Some("svn_to_git"),
-                    Some(change.revision),
-                    None,
-                    Some(&change.author),
-                    Some(&format!(
-                        "Skipped r{}: git apply failed, export fallback disabled. Message: {}",
+                let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                    action: "svn_to_git_apply_failed",
+                    direction: Some("svn_to_git"),
+                    svn_rev: Some(change.revision),
+                    git_sha: None,
+                    author: Some(&change.author),
+                    details: Some(&format!(
+                        "Stopped at unapplied r{}: git apply failed. Message: {}",
                         change.revision,
                         change.message.lines().next().unwrap_or("")
                     )),
-                    false,
-                    self.effective_repo_id(),
-                );
-                continue;
+                    success: false,
+                    repo_id: self.effective_repo_id(),
+                });
+                return Err(SyncError::GitError(crate::errors::GitError::ApplyFailed(
+                    format!(
+                        "SVN r{} could not be applied; later revisions remain pending: {}",
+                        change.revision,
+                        apply_error.unwrap_or_else(
+                            || "nonempty SVN change produced no Git patch".to_string()
+                        )
+                    ),
+                )));
             }
 
             // 2b. LFS enforcement: after applying changes, scan modified files
@@ -587,7 +1648,8 @@ impl SyncEngine {
                         let path = if self.config.svn.layout == SvnLayout::Standard {
                             let tp = self.config.svn.trunk_path.trim_matches('/');
                             if !tp.is_empty() {
-                                cf.path.strip_prefix(&format!("/{}/", tp))
+                                cf.path
+                                    .strip_prefix(&format!("/{}/", tp))
                                     .or_else(|| cf.path.strip_prefix(&format!("{}/", tp)))
                                     .unwrap_or(&cf.path)
                             } else {
@@ -597,7 +1659,11 @@ impl SyncEngine {
                             &cf.path
                         };
                         let clean = path.trim_start_matches('/');
-                        if clean.is_empty() { None } else { Some(clean.to_string()) }
+                        if clean.is_empty() {
+                            None
+                        } else {
+                            Some(clean.to_string())
+                        }
                     })
                     .collect();
 
@@ -628,49 +1694,10 @@ impl SyncEngine {
                 }
             }
 
-            // 2c. Clean up rogue top-level entries in the git working tree.
-            // The git history may contain files at wrong paths (e.g. SLS/
-            // instead of source/SLS/) from earlier bugs. git reset --hard
-            // restores them every pull. We must remove them before commit
-            // so git add --all doesn't re-stage them.
-            //
-            // Approach: the SVN diff paths tell us what top-level dirs are
-            // legitimate (e.g. source/, config/). Any top-level dir that
-            // doesn't match the first component of ANY changed file path
-            // AND isn't a known standard directory is rogue.
-            {
-                // Collect legitimate top-level prefixes from the SVN diff
-                let mut legit_toplevel: std::collections::HashSet<String> = change
-                    .changed_files
-                    .iter()
-                    .filter_map(|f| {
-                        let p = f.path.trim_start_matches('/');
-                        p.split('/').next().map(|s| s.to_string())
-                    })
-                    .collect();
-                // Always keep source and config as legitimate
-                legit_toplevel.insert("source".to_string());
-                legit_toplevel.insert("config".to_string());
-
-                if let Ok(entries) = std::fs::read_dir(&repo_path) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') {
-                            continue;
-                        }
-                        if !legit_toplevel.contains(&name) {
-                            let rogue = entry.path();
-                            if rogue.is_dir() {
-                                info!(path = %rogue.display(), "removing rogue directory from git working tree");
-                                let _ = std::fs::remove_dir_all(&rogue);
-                            } else if !name.ends_with(".gitattributes") {
-                                info!(path = %rogue.display(), "removing rogue file from git working tree");
-                                let _ = std::fs::remove_file(&rogue);
-                            }
-                        }
-                    }
-                }
-            }
+            // A revision's changed paths are a delta, not a full-tree keep
+            // list. Only the explicit SVN delete operations in git_diff may
+            // remove tracked content; old wrong-path history needs separate
+            // reviewed reconciliation.
 
             // 3. Commit with identity and sync marker.
             let commit_message = format!(
@@ -762,9 +1789,9 @@ impl SyncEngine {
             );
 
             // Update the SVN watermark (dual-write: kv_state + repo table).
-            let _ = self
-                .db
-                .set_state(&self.svn_rev_key(), &change.revision.to_string());
+            self.db
+                .set_state(&self.svn_rev_key(), &change.revision.to_string())
+                .map_err(SyncError::DatabaseError)?;
             if let Some(rid) = self.effective_repo_id() {
                 debug!(
                     repo_id = %rid,
@@ -772,27 +1799,31 @@ impl SyncEngine {
                     new_git_sha = %&git_sha[..12.min(git_sha.len())],
                     "watermark updated"
                 );
-                let _ = self.db.update_repo_watermark(rid, change.revision, &git_sha);
-                let _ = self.db.increment_repo_sync_count(rid);
+                self.db
+                    .update_repo_watermark(rid, change.revision, &git_sha)
+                    .map_err(SyncError::DatabaseError)?;
+                self.db
+                    .increment_repo_sync_count(rid)
+                    .map_err(SyncError::DatabaseError)?;
             }
 
-            count += 1;
+            *applied += 1;
 
             // Audit log for successful sync
-            let _ = self.db.insert_audit_log_with_repo(
-                "sync_cycle",
-                Some("svn_to_git"),
-                Some(change.revision),
-                Some(&git_sha),
-                Some(&change.author),
-                Some(&format!(
+            let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                action: "sync_cycle",
+                direction: Some("svn_to_git"),
+                svn_rev: Some(change.revision),
+                git_sha: Some(&git_sha),
+                author: Some(&change.author),
+                details: Some(&format!(
                     "synced SVN r{} -> Git {}",
                     change.revision,
                     &git_sha[..8.min(git_sha.len())]
                 )),
-                true,
-                self.repo_id.as_deref(),
-            );
+                success: true,
+                repo_id: self.repo_id.as_deref(),
+            });
 
             info!(
                 rev = change.revision,
@@ -804,7 +1835,7 @@ impl SyncEngine {
             );
         }
 
-        Ok(count)
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -847,67 +1878,129 @@ impl SyncEngine {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 // Use the pre-populated changed_files from fetch_git_changes
                 // instead of re-calling get_changed_files (P5 optimization).
-                let contents: Vec<(String, String, Option<Vec<u8>>)> = change
+                let contents: Result<Vec<_>, SyncError> = change
                     .changed_files
                     .iter()
-                    .map(|f| {
+                    .map(|f| -> Result<_, SyncError> {
                         let (action, path) = (&f.action, &f.path);
                         let content = if action != "D" {
-                            git.get_file_content_at_commit(&change.sha, path)
+                            #[cfg(debug_assertions)]
+                            let fault = std::env::var("REPOSYNC_TEST_GIT_CONTENT_FAULT")
                                 .ok()
-                                .flatten()
+                                .is_some_and(|value| {
+                                    value == format!("{}|{}", change.sha, git.repo_path().display())
+                                });
+                            #[cfg(debug_assertions)]
+                            let read = if fault {
+                                Err(crate::errors::GitError::RefNotFound(path.clone()))
+                            } else {
+                                git.get_file_content_at_commit(&change.sha, path)
+                            };
+                            #[cfg(not(debug_assertions))]
+                            let read = git.get_file_content_at_commit(&change.sha, path);
+                            Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
+                                SyncError::GitError(crate::errors::GitError::RefNotFound(
+                                    path.clone(),
+                                ))
+                            })?)
                         } else {
                             None
                         };
-                        (action.clone(), path.clone(), content)
+                        Ok((action.clone(), path.clone(), content))
                     })
                     .collect();
-                contents
+                contents?
             };
 
             // 1b. EARLY filter: remove files that don't match allowed_paths
             // BEFORE copying to SVN WC. This prevents svn add from failing
             // on paths like SLS/ that don't exist in the SVN branch structure.
-            let file_contents: Vec<(String, String, Option<Vec<u8>>)> = if !self.allowed_paths.is_empty() {
-                file_contents
-                    .into_iter()
-                    .filter(|(action, path, _)| {
-                        if action == "D" {
-                            // Allow deletes even for blocked paths
-                            true
-                        } else if self.allowed_paths.iter().any(|prefix| path.starts_with(prefix)) {
-                            true
-                        } else {
-                            debug!(
-                                sha = %change.sha,
-                                path = %path,
-                                "early filter: skipping file not under allowed_paths"
-                            );
-                            false
-                        }
-                    })
-                    .collect()
-            } else {
-                file_contents
-            };
+            let file_contents: Vec<(String, String, Option<Vec<u8>>)> =
+                if !self.allowed_paths.is_empty() {
+                    file_contents
+                        .into_iter()
+                        .filter(|(action, path, _)| {
+                            if action == "D" {
+                                // Allow deletes even for blocked paths
+                                true
+                            } else if self
+                                .allowed_paths
+                                .iter()
+                                .any(|prefix| path.starts_with(prefix))
+                            {
+                                true
+                            } else {
+                                debug!(
+                                    sha = %change.sha,
+                                    path = %path,
+                                    "early filter: skipping file not under allowed_paths"
+                                );
+                                false
+                            }
+                        })
+                        .collect()
+                } else {
+                    file_contents
+                };
+
+            // The current bridge maps regular-file bytes only. Mode, type,
+            // symlink and executable changes cannot be acknowledged by an
+            // empty SVN status or by a content-only no-target receipt.
+            {
+                let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                for (_, path, _) in &file_contents {
+                    let (previous, current) = git
+                        .changed_entry_modes(&change.sha, path)
+                        .map_err(SyncError::GitError)?;
+                    if (previous.is_none() && current.is_none())
+                        || previous
+                            .into_iter()
+                            .chain(current)
+                            .any(|mode| mode != 33188)
+                    {
+                        return Err(self.record_history_block("unsupported_git_semantics",
+                            "changed Git tree entry has mode or type unsupported by the SVN byte bridge",
+                            Some(&change.sha), None, None, None));
+                    }
+                }
+            }
 
             if file_contents.is_empty() {
                 // All files were filtered out — advance watermark and skip
-                let _ = self.db.set_state("last_git_hash", &change.sha);
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                    let current_svn_rev = self.db.get_repo_watermark(rid)
-                        .map(|(rev, _)| rev)
-                        .unwrap_or(0);
-                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    let outcome = if change.changed_files.is_empty() {
+                        "empty_commit"
+                    } else {
+                        "filtered"
+                    };
+                    self.db
+                        .advance_no_target_watermarks(
+                            rid,
+                            &change.sha,
+                            outcome,
+                            &self.no_target_projection(),
+                        )
+                        .map_err(SyncError::DatabaseError)?;
+                } else {
+                    self.db
+                        .set_state("last_git_hash", &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
                 }
                 continue;
             }
 
+            #[cfg(debug_assertions)]
+            self.test_outbound_pause("REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT", &change.sha)
+                .await?;
+
             // 2. Prepare SVN working copy: checkout on first use, update thereafter.
             let svn_url_for_log;
             {
-                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let svn = self
+                    .svn_client
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                 svn_url_for_log = svn.url().to_string();
                 if !svn_wc_initialized {
                     debug!(
@@ -997,7 +2090,11 @@ impl SyncEngine {
             }
 
             // 4. Stage changes in SVN.
-            let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let svn = self
+                .svn_client
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
 
             // Stage ALL changes at once using `svn add --force .` from the
             // WC root. This recursively adds every unversioned file and
@@ -1005,11 +2102,9 @@ impl SyncEngine {
             // parent-node issues. The --force flag makes it a no-op for
             // already-versioned items.
             //
-            // NOTE: We ignore errors from this command because `svn add`
-            // emits W155010 warnings (and exits non-zero) for nodes that
-            // are not found in the WC — but it still successfully adds
-            // everything it can. The subsequent `svn status` check will
-            // verify that changes were actually staged.
+            // A failed add is an operational failure, even if some other
+            // nodes were staged. Status alone cannot turn that into a
+            // durable no-target outcome.
             if !added_files.is_empty() {
                 debug!(sha = %change.sha, count = added_files.len(), "staging additions");
 
@@ -1022,7 +2117,9 @@ impl SyncEngine {
                     let p = std::path::Path::new(file_path);
                     let mut cur = p.parent();
                     while let Some(dir) = cur {
-                        if dir.as_os_str().is_empty() { break; }
+                        if dir.as_os_str().is_empty() {
+                            break;
+                        }
                         let ds = dir.to_string_lossy().to_string();
                         if !dirs_to_add.contains(&ds) {
                             dirs_to_add.push(ds);
@@ -1038,19 +2135,44 @@ impl SyncEngine {
                 for dir in &dirs_to_add {
                     let full = svn_wc_dir.path().join(dir);
                     if full.is_dir() {
-                        let _ = svn.run_svn_in_dir_public(
+                        svn.run_svn_in_dir_public(
                             svn_wc_dir.path(),
                             &["add", "--force", "--depth", "empty", dir],
-                        ).await;
+                        )
+                        .await
+                        .map_err(SyncError::SvnError)?;
                     }
                 }
 
                 // Now add the actual files — parents are guaranteed registered.
                 for file in &added_files {
-                    let _ = svn.run_svn_in_dir_public(
-                        svn_wc_dir.path(),
-                        &["add", "--force", file],
-                    ).await;
+                    #[cfg(debug_assertions)]
+                    let fault = std::env::var("REPOSYNC_TEST_SVN_STAGE_FAULT")
+                        .ok()
+                        .is_some_and(|value| {
+                            value
+                                == format!(
+                                    "{}|{}",
+                                    change.sha,
+                                    self.git_client
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .repo_path()
+                                        .display()
+                                )
+                        });
+                    #[cfg(debug_assertions)]
+                    if fault {
+                        return Err(SyncError::SvnError(
+                            crate::errors::SvnError::WorkingCopyError {
+                                path: file.to_string(),
+                                detail: "injected SVN staging failure".into(),
+                            },
+                        ));
+                    }
+                    svn.run_svn_in_dir_public(svn_wc_dir.path(), &["add", "--force", file])
+                        .await
+                        .map_err(SyncError::SvnError)?;
                 }
             }
             if !deleted_files.is_empty() {
@@ -1071,7 +2193,7 @@ impl SyncEngine {
                 let trimmed = line.trim();
                 !trimmed.is_empty()
                     && !trimmed.starts_with('?')  // unversioned
-                    && !trimmed.starts_with('X')  // externals
+                    && !trimmed.starts_with('X') // externals
             });
             if !has_changes {
                 warn!(
@@ -1084,15 +2206,22 @@ impl SyncEngine {
                     "no pending SVN changes after copying files — skipping commit \
                      (files may already be in sync or paths may be misaligned)"
                 );
-                // Still advance the Git watermark so we don't retry this
-                // commit on the next cycle.
-                let _ = self.db.set_state("last_git_hash", &change.sha);
+                let proof = self
+                    .verify_no_svn_delta(&svn, &file_contents, &change.sha)
+                    .await?;
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                    // Preserve existing SVN watermark — only update git_sha
-                    let current_svn_rev = self.db.get_repo_watermark(rid)
-                        .map(|(rev, _)| rev).unwrap_or(0);
-                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    self.db
+                        .advance_verified_no_delta_watermarks(
+                            rid,
+                            &change.sha,
+                            &self.no_target_projection(),
+                            &proof,
+                        )
+                        .map_err(SyncError::DatabaseError)?;
+                } else {
+                    self.db
+                        .set_state("last_git_hash", &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
                 }
                 continue;
             }
@@ -1112,21 +2241,28 @@ impl SyncEngine {
                 let violating_paths: Vec<String> = file_contents
                     .iter()
                     .filter(|(action, path, _)| {
-                        if action == "D" { return false; }
-                        if !self.allowed_paths.is_empty() {
-                            if !self.allowed_paths.iter().any(|prefix| path.starts_with(prefix)) {
-                                return true;
-                            }
+                        if action == "D" {
+                            return false;
+                        }
+                        if !self.allowed_paths.is_empty()
+                            && !self
+                                .allowed_paths
+                                .iter()
+                                .any(|prefix| path.starts_with(prefix))
+                        {
+                            return true;
                         }
                         for pattern in &self.blocked_patterns {
-                            let matches = if pattern.starts_with('*') {
-                                path.ends_with(&pattern[1..])
+                            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
+                                path.ends_with(suffix)
                             } else if pattern.ends_with('/') {
                                 path.starts_with(pattern)
                             } else {
                                 path == pattern || path.starts_with(&format!("{}/", pattern))
                             };
-                            if matches { return true; }
+                            if matches {
+                                return true;
+                            }
                         }
                         false
                     })
@@ -1148,34 +2284,41 @@ impl SyncEngine {
                     // ALL files violate — skip entire commit
                     warn!(sha = %change.sha, "skipping entire commit: all files violate path rules");
                     if let Some(rid) = self.effective_repo_id() {
-                        let _ = self.db.advance_all_watermarks(rid, &change.sha);
+                        self.db
+                            .advance_no_target_watermarks(
+                                rid,
+                                &change.sha,
+                                "filtered",
+                                &self.no_target_projection(),
+                            )
+                            .map_err(SyncError::DatabaseError)?;
                     }
-                    let _ = self.db.insert_audit_log_with_repo(
-                        "path_violation_skipped",
-                        Some("git_to_svn"),
-                        None,
-                        Some(&change.sha),
-                        Some(&change.author_name),
-                        Some(&format!(
+                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                        action: "path_violation_skipped",
+                        direction: Some("git_to_svn"),
+                        svn_rev: None,
+                        git_sha: Some(&change.sha),
+                        author: Some(&change.author_name),
+                        details: Some(&format!(
                             "Skipped entire commit {}: {}",
                             &change.sha[..8.min(change.sha.len())],
                             violations.join("; ")
                         )),
-                        false,
-                        self.effective_repo_id(),
-                    );
+                        success: false,
+                        repo_id: self.effective_repo_id(),
+                    });
                     continue;
                 }
 
                 // Revert violating files from SVN working copy
                 let revert_paths: Vec<&str> = violating_paths.iter().map(|s| s.as_str()).collect();
-                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let svn = self
+                    .svn_client
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                 if let Err(e) = svn.revert_files(svn_wc_dir.path(), &revert_paths).await {
-                    warn!(error = %e, "failed to revert violating files, skipping commit");
-                    if let Some(rid) = self.effective_repo_id() {
-                        let _ = self.db.advance_all_watermarks(rid, &change.sha);
-                    }
-                    continue;
+                    return Err(SyncError::SvnError(e));
                 }
                 // Also remove the files from disk if they were newly added
                 for path in &violating_paths {
@@ -1189,22 +2332,22 @@ impl SyncEngine {
                     "reverted violating files, proceeding with valid files only"
                 );
 
-                let _ = self.db.insert_audit_log_with_repo(
-                    "path_violation_filtered",
-                    Some("git_to_svn"),
-                    None,
-                    Some(&change.sha),
-                    Some(&change.author_name),
-                    Some(&format!(
+                let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+    action: "path_violation_filtered",
+    direction: Some("git_to_svn"),
+    svn_rev: None,
+    git_sha: Some(&change.sha),
+    author: Some(&change.author_name),
+    details: Some(&format!(
                         "Commit {} filtered: removed {} violating file(s), synced {} valid file(s). Violations: {}",
                         &change.sha[..8.min(change.sha.len())],
                         violating_paths.len(),
                         valid_count,
                         violations.join("; ")
                     )),
-                    true,
-                    self.effective_repo_id(),
-                );
+    success: true,
+    repo_id: self.effective_repo_id(),
+});
             }
 
             // 5. Commit to SVN.
@@ -1212,8 +2355,14 @@ impl SyncEngine {
             // for E155011 "out of date" errors. The WC may be stale if a
             // previous commit in this batch advanced the server HEAD.
             {
-                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let _ = svn.update(svn_wc_dir.path()).await;
+                let svn = self
+                    .svn_client
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                svn.update(svn_wc_dir.path())
+                    .await
+                    .map_err(SyncError::SvnError)?;
             }
 
             let commit_message = format!(
@@ -1234,8 +2383,14 @@ impl SyncEngine {
                         sha = %change.sha,
                         "svn commit got 'out of date' — updating WC and retrying"
                     );
-                    let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                    let _ = svn.update(svn_wc_dir.path()).await;
+                    let svn = self
+                        .svn_client
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    svn.update(svn_wc_dir.path())
+                        .await
+                        .map_err(SyncError::SvnError)?;
                     svn_commit_result = svn
                         .commit(svn_wc_dir.path(), &commit_message, &svn_username)
                         .await;
@@ -1252,14 +2407,22 @@ impl SyncEngine {
                         sha = %change.sha,
                         "svn commit: nothing to commit — files already in sync, advancing watermark"
                     );
-                    // Advance git watermark so we don't retry this commit
-                    let _ = self.db.set_state("last_git_hash", &change.sha);
+                    let proof = self
+                        .verify_no_svn_delta(&svn, &file_contents, &change.sha)
+                        .await?;
                     if let Some(rid) = self.effective_repo_id() {
-                        let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                        let current_svn_rev = self.db.get_repo_watermark(rid)
-                            .map(|(rev, _)| rev)
-                            .unwrap_or(0);
-                        let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
+                        self.db
+                            .advance_verified_no_delta_watermarks(
+                                rid,
+                                &change.sha,
+                                &self.no_target_projection(),
+                                &proof,
+                            )
+                            .map_err(SyncError::DatabaseError)?;
+                    } else {
+                        self.db
+                            .set_state("last_git_hash", &change.sha)
+                            .map_err(SyncError::DatabaseError)?;
                     }
                     continue;
                 }
@@ -1289,34 +2452,36 @@ impl SyncEngine {
             // SVN→Git revisions. If we set last_svn_rev here, we'd skip
             // SVN commits that were made between our fetch and our commit
             // (bidirectional race condition / data loss).
-            let _ = self.db.set_state("last_git_hash", &change.sha);
             if let Some(rid) = self.effective_repo_id() {
-                let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                // Only advance git SHA in repo table; preserve SVN rev watermark
-                let current_svn_rev = self.db.get_repo_watermark(rid)
-                    .map(|(rev, _)| rev)
-                    .unwrap_or(0);
-                let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
-                let _ = self.db.increment_repo_sync_count(rid);
+                self.db
+                    .advance_all_watermarks(rid, &change.sha)
+                    .map_err(SyncError::DatabaseError)?;
+                self.db
+                    .increment_repo_sync_count(rid)
+                    .map_err(SyncError::DatabaseError)?;
+            } else {
+                self.db
+                    .set_state("last_git_hash", &change.sha)
+                    .map_err(SyncError::DatabaseError)?;
             }
 
             count += 1;
 
             // Audit log for successful sync
-            let _ = self.db.insert_audit_log_with_repo(
-                "sync_cycle",
-                Some("git_to_svn"),
-                Some(svn_rev),
-                Some(&change.sha),
-                Some(&change.author_name),
-                Some(&format!(
+            let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                action: "sync_cycle",
+                direction: Some("git_to_svn"),
+                svn_rev: Some(svn_rev),
+                git_sha: Some(&change.sha),
+                author: Some(&change.author_name),
+                details: Some(&format!(
                     "synced Git {} -> SVN r{}",
                     &change.sha[..8.min(change.sha.len())],
                     svn_rev
                 )),
-                true,
-                self.repo_id.as_deref(),
-            );
+                success: true,
+                repo_id: self.repo_id.as_deref(),
+            });
 
             info!(
                 sha = %change.sha,
@@ -1374,7 +2539,9 @@ impl SyncEngine {
                     detected_rev = detected,
                     "Auto-detected last synced revision from existing git history"
                 );
-                let _ = self.db.set_state(&self.svn_rev_key(), &detected.to_string());
+                let _ = self
+                    .db
+                    .set_state(&self.svn_rev_key(), &detected.to_string());
                 // Also persist to the repo table if available
                 if let Some(rid) = self.effective_repo_id() {
                     let _ = self.db.update_repo_watermark(rid, detected, "");
@@ -1385,7 +2552,11 @@ impl SyncEngine {
 
         info!(since_rev = last_rev, "fetching SVN changes");
 
-        let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         let svn_info = svn.info().await.map_err(SyncError::SvnError)?;
         let head_rev = svn_info.latest_rev;
 
@@ -1427,14 +2598,11 @@ impl SyncEngine {
                         // When using standard layout, only sync files under trunk/
                         // and strip the trunk prefix so git paths are repo-relative.
                         let mapped_path = if let Some(ref prefix) = trunk_prefix {
-                            if let Some(rest) = raw.strip_prefix(prefix.as_str()) {
-                                if rest.is_empty() {
-                                    return None; // skip bare trunk/ directory entry
-                                }
-                                rest.to_string()
-                            } else {
-                                return None; // skip non-trunk paths (branches/, tags/)
+                            let rest = raw.strip_prefix(prefix.as_str())?;
+                            if rest.is_empty() {
+                                return None; // skip bare trunk/ directory entry
                             }
+                            rest.to_string()
                         } else {
                             raw.to_string()
                         };
@@ -1454,50 +2622,38 @@ impl SyncEngine {
         Ok(change_sets)
     }
 
-    async fn fetch_git_changes(&self) -> Result<Vec<GitChangeSet>, SyncError> {
+    async fn fetch_git_changes(
+        &self,
+        admission: &TeamHistoryAdmission,
+    ) -> Result<Vec<GitChangeSet>, SyncError> {
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Wrap the blocking git pull in block_in_place to avoid starving
-        // the Tokio runtime while holding the lock for network I/O.
-        let token = self.config.github.token.as_deref();
-        let branch = &self.config.github.default_branch;
-        tokio::task::block_in_place(|| {
-            git.pull("origin", branch, token)
-                .map_err(SyncError::GitError)
-        })?;
+        // Reset only to the commit fetched and inspected above. A second pull
+        // of a mutable branch would invalidate the admission decision.
+        let reset = tokio::task::block_in_place(|| {
+            Command::new("git")
+                .args(["reset", "--hard", &admission.remote_tip])
+                .current_dir(git.repo_path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+        })
+        .map_err(crate::errors::GitError::IoError)?;
+        if !reset.status.success() {
+            return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
+                git2::Error::from_str("git reset to inspected remote commit failed"),
+            )));
+        }
+        if git.head_sha().map_err(SyncError::GitError)? != admission.remote_tip {
+            return Err(SyncError::HistoryBlocked {
+                reason: "post_reset_tip_mismatch".into(),
+                detail: "bridge did not reach the admitted Git commit".into(),
+            });
+        }
 
-        // Check per-repo key first, then global key, then commit_map fallback.
-        let per_repo_key = self.effective_repo_id()
-            .map(|rid| format!("last_git_sha_{}", rid));
-        let repo_table_sha = self.effective_repo_id()
-            .and_then(|rid| self.db.get_repo_watermark(rid).ok())
-            .map(|(_, sha)| sha)
-            .filter(|s| !s.is_empty());
-
-        let last_hash = if let Some(sha) = repo_table_sha {
-            // Best source: repositories table (set by sync engine + import)
-            Some(sha)
-        } else if let Some(ref key) = per_repo_key {
-            // Per-repo kv_state key
-            match self.db.get_state(key).map_err(SyncError::DatabaseError)? {
-                Some(s) if !s.is_empty() => Some(s),
-                _ => match self.db.get_state("last_git_hash").map_err(SyncError::DatabaseError)? {
-                    Some(s) if !s.is_empty() => Some(s),
-                    _ => self.db.get_last_git_hash().map_err(SyncError::DatabaseError)?,
-                },
-            }
-        } else {
-            // Global fallback
-            match self.db.get_state("last_git_hash").map_err(SyncError::DatabaseError)? {
-                Some(s) if !s.is_empty() => Some(s),
-                _ => self.db.get_last_git_hash().map_err(SyncError::DatabaseError)?,
-            }
-        };
-
-        info!(since_sha = ?last_hash, "fetching Git changes");
+        info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
 
         let commits = git
-            .get_commits_since(last_hash.as_deref(), None)
+            .get_commits_since(Some(&admission.checkpoint), None)
             .map_err(SyncError::GitError)?;
 
         let mut change_sets: Vec<GitChangeSet> = Vec::new();
@@ -1787,6 +2943,14 @@ pub async fn apply_diff_to_path(
     repo_path: &std::path::Path,
     diff_content: &str,
 ) -> Result<(), crate::errors::GitError> {
+    apply_diff_to_path_revision(repo_path, diff_content, None).await
+}
+
+async fn apply_diff_to_path_revision(
+    repo_path: &std::path::Path,
+    diff_content: &str,
+    revision: Option<i64>,
+) -> Result<(), crate::errors::GitError> {
     use std::process::Stdio;
     use tokio::process::Command;
     let mut cmd = Command::new("git");
@@ -1795,19 +2959,40 @@ pub async fn apply_diff_to_path(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Only debug fixture runs may replace one exact SVN revision's patch
+    // bytes. The production git-apply subprocess and error path still run.
+    #[cfg(debug_assertions)]
+    let injected = std::env::var("REPOSYNC_TEST_SVN_APPLY_FAULT")
+        .ok()
+        .and_then(|value| {
+            value
+                .split_once('|')
+                .map(|(rev, path)| (rev.to_string(), path.to_string()))
+        })
+        .is_some_and(|(rev, path)| {
+            revision.is_some_and(|actual| rev == actual.to_string())
+                && std::path::Path::new(&path) == repo_path
+        });
+    #[cfg(not(debug_assertions))]
+    let _ = revision;
+    #[cfg(not(debug_assertions))]
+    let injected = false;
     let mut child = cmd.spawn().map_err(crate::errors::GitError::IoError)?;
     // Write diff to stdin and explicitly close it so git apply sees EOF
     // and begins processing. Without closing, git apply may hang forever.
     {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| crate::errors::GitError::IoError(
-                std::io::Error::new(std::io::ErrorKind::Other, "failed to open git apply stdin")
-            ))?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            crate::errors::GitError::IoError(std::io::Error::other(
+                "failed to open git apply stdin",
+            ))
+        })?;
         use tokio::io::AsyncWriteExt;
         stdin
-            .write_all(diff_content.as_bytes())
+            .write_all(if injected {
+                b"invalid fixture patch\n"
+            } else {
+                diff_content.as_bytes()
+            })
             .await
             .map_err(crate::errors::GitError::IoError)?;
         // stdin is dropped here, closing the pipe
@@ -1885,16 +3070,21 @@ pub(crate) fn validate_file_paths_impl(
     }
     let mut violations = Vec::new();
     for (action, path, _) in files {
-        if action == "D" { continue; }
+        if action == "D" {
+            continue;
+        }
         if !allowed_paths.is_empty() {
             let allowed = allowed_paths.iter().any(|prefix| path.starts_with(prefix));
             if !allowed {
-                violations.push(format!("'{}' not under allowed paths {:?}", path, allowed_paths));
+                violations.push(format!(
+                    "'{}' not under allowed paths {:?}",
+                    path, allowed_paths
+                ));
             }
         }
         for pattern in blocked_patterns {
-            let matches = if pattern.starts_with('*') {
-                path.ends_with(&pattern[1..])
+            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
+                path.ends_with(suffix)
             } else if pattern.ends_with('/') {
                 path.starts_with(pattern)
             } else {
@@ -1905,7 +3095,11 @@ pub(crate) fn validate_file_paths_impl(
             }
         }
     }
-    if violations.is_empty() { Ok(()) } else { Err(violations) }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
 }
 
 #[cfg(test)]

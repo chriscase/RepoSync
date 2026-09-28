@@ -81,32 +81,45 @@ async fn github_webhook(
     body: Bytes,
 ) -> Result<Json<WebhookResponse>, AppError> {
     // Determine provider from headers
-    let is_gitea = headers.contains_key("x-gitea-event") || headers.contains_key("x-gitea-signature");
+    let is_gitea =
+        headers.contains_key("x-gitea-event") || headers.contains_key("x-gitea-signature");
 
     // Verify webhook signature if a secret is configured
     if state.config.github.webhook_secret.is_none() {
-        tracing::warn!("GitHub webhook secret not configured - webhook payloads are not authenticated");
+        tracing::warn!(
+            "GitHub webhook secret not configured - webhook payloads are not authenticated"
+        );
     }
     if state.config.github.webhook_secret.is_some() {
         let (signature, provider) = if is_gitea {
-            let sig = headers.get("x-gitea-signature")
+            let sig = headers
+                .get("x-gitea-signature")
                 .and_then(|v| v.to_str().ok())
                 .ok_or_else(|| AppError::Unauthorized("missing X-Gitea-Signature header".into()))?;
             (sig.to_string(), GitProvider::Gitea)
         } else {
-            let sig = headers.get("x-hub-signature-256")
+            let sig = headers
+                .get("x-hub-signature-256")
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| AppError::Unauthorized("missing X-Hub-Signature-256 header".into()))?;
+                .ok_or_else(|| {
+                    AppError::Unauthorized("missing X-Hub-Signature-256 header".into())
+                })?;
             (sig.to_string(), GitProvider::GitHub)
         };
 
-        let secret = state.config.github.webhook_secret.as_deref()
+        let secret = state
+            .config
+            .github
+            .webhook_secret
+            .as_deref()
             .ok_or_else(|| AppError::Unauthorized("webhook secret not configured".into()))?;
 
         if !reposync_core::git::github::GitHubClient::verify_webhook_signature(
             &body, &signature, secret, &provider,
         ) {
-            return Err(AppError::Unauthorized("webhook signature verification failed".into()));
+            return Err(AppError::Unauthorized(
+                "webhook signature verification failed".into(),
+            ));
         }
     }
 
@@ -174,7 +187,9 @@ async fn svn_webhook(
 ) -> Result<Json<WebhookResponse>, AppError> {
     // Verify shared secret if configured
     if state.config.svn.webhook_secret.is_none() {
-        tracing::warn!("SVN webhook secret not configured - webhook payloads are not authenticated");
+        tracing::warn!(
+            "SVN webhook secret not configured - webhook payloads are not authenticated"
+        );
     }
     if let Some(ref secret) = state.config.svn.webhook_secret {
         let provided = headers
@@ -220,5 +235,3 @@ async fn svn_webhook(
         message: format!("SVN revision {} received, sync triggered", payload.revision),
     }))
 }
-
-

@@ -563,7 +563,13 @@ mod tests {
         // A .bin file should get LfsTrack.
         let d = policy.evaluate("model.bin", 42);
         assert!(
-            matches!(d, FilePolicyDecision::LfsTrack { size: 42, threshold: 0 }),
+            matches!(
+                d,
+                FilePolicyDecision::LfsTrack {
+                    size: 42,
+                    threshold: 0
+                }
+            ),
             "expected LfsTrack from pattern-only config, got {:?}",
             d
         );
@@ -589,7 +595,13 @@ mod tests {
 
         // Large .txt → LfsTrack via threshold.
         let d2 = policy.evaluate("data.txt", 2000);
-        assert!(matches!(d2, FilePolicyDecision::LfsTrack { size: 2000, threshold: 1000 }));
+        assert!(matches!(
+            d2,
+            FilePolicyDecision::LfsTrack {
+                size: 2000,
+                threshold: 1000
+            }
+        ));
 
         // Small .txt → Allow.
         assert_eq!(policy.evaluate("small.txt", 100), FilePolicyDecision::Allow);

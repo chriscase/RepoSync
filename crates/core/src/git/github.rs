@@ -114,15 +114,25 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    pub fn new(api_url: impl Into<String>, token: impl Into<String>, provider: GitProvider) -> Self {
+    pub fn new(
+        api_url: impl Into<String>,
+        token: impl Into<String>,
+        provider: GitProvider,
+    ) -> Self {
         let api_url = api_url.into().trim_end_matches('/').to_string();
         let token = token.into();
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static("reposync/0.1"));
         match provider {
             GitProvider::GitHub => {
-                headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github+json"));
-                headers.insert("X-GitHub-Api-Version", HeaderValue::from_static("2022-11-28"));
+                headers.insert(
+                    ACCEPT,
+                    HeaderValue::from_static("application/vnd.github+json"),
+                );
+                headers.insert(
+                    "X-GitHub-Api-Version",
+                    HeaderValue::from_static("2022-11-28"),
+                );
             }
             GitProvider::Gitea => {
                 headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -158,13 +168,15 @@ impl GitHubClient {
     ) -> Result<Vec<GitHubCommit>, GitHubError> {
         let first_url = format!("{}/repos/{}/commits", self.api_url, repo);
         let since_sha = since_sha.map(|s| s.to_string());
-        let resp = self.retry_request(|| {
-            let mut req = self.auth(self.http.get(&first_url));
-            if let Some(ref sha) = since_sha {
-                req = req.query(&[("sha", sha.as_str())]);
-            }
-            req.query(&[("per_page", "100")])
-        }).await?;
+        let resp = self
+            .retry_request(|| {
+                let mut req = self.auth(self.http.get(&first_url));
+                if let Some(ref sha) = since_sha {
+                    req = req.query(&[("sha", sha.as_str())]);
+                }
+                req.query(&[("per_page", "100")])
+            })
+            .await?;
 
         let mut next_link = Self::parse_next_link(resp.headers());
         let mut all_commits: Vec<GitHubCommit> = resp.json().await?;
@@ -176,7 +188,9 @@ impl GitHubClient {
                 break;
             }
             let url_clone = url.clone();
-            let resp = self.retry_request(|| self.auth(self.http.get(&url_clone))).await?;
+            let resp = self
+                .retry_request(|| self.auth(self.http.get(&url_clone)))
+                .await?;
             next_link = Self::parse_next_link(resp.headers());
             let page: Vec<GitHubCommit> = resp.json().await?;
             all_commits.extend(page);
@@ -199,12 +213,7 @@ impl GitHubClient {
             "name": "web", "active": true, "events": ["push", "pull_request"],
             "config": { "url": callback_url, "content_type": "json", "secret": secret, "insecure_ssl": "0" }
         });
-        let resp = self.auth(self
-                .http
-                .post(&url))
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
         let resp = self.check_response(resp).await?;
         let hook: serde_json::Value = resp.json().await?;
         info!(hook_id = %hook["id"], "created webhook");
@@ -212,17 +221,20 @@ impl GitHubClient {
     }
 
     /// Verify a GitHub/Gitea webhook signature.
-    pub fn verify_webhook_signature(payload: &[u8], signature: &str, secret: &str, provider: &GitProvider) -> bool {
+    pub fn verify_webhook_signature(
+        payload: &[u8],
+        signature: &str,
+        secret: &str,
+        provider: &GitProvider,
+    ) -> bool {
         let hex_sig = match provider {
-            GitProvider::GitHub => {
-                match signature.strip_prefix("sha256=") {
-                    Some(s) => s,
-                    None => {
-                        warn!("webhook signature missing sha256= prefix");
-                        return false;
-                    }
+            GitProvider::GitHub => match signature.strip_prefix("sha256=") {
+                Some(s) => s,
+                None => {
+                    warn!("webhook signature missing sha256= prefix");
+                    return false;
                 }
-            }
+            },
             GitProvider::Gitea => signature, // Gitea sends raw hex, no prefix
         };
         let expected_bytes = match hex::decode(hex_sig) {
@@ -255,9 +267,8 @@ impl GitHubClient {
         let url = format!("{}/repos/{}/pulls", self.api_url, repo);
         let payload =
             serde_json::json!({ "title": title, "body": body, "head": head, "base": base });
-        let resp = self.auth(self
-                .http
-                .post(&url))
+        let resp = self
+            .auth(self.http.post(&url))
             .json(&payload)
             .send()
             .await?;
@@ -271,12 +282,7 @@ impl GitHubClient {
     pub async fn merge_pull_request(&self, repo: &str, pr_number: u64) -> Result<(), GitHubError> {
         let url = format!("{}/repos/{}/pulls/{}/merge", self.api_url, repo, pr_number);
         let payload = serde_json::json!({ "merge_method": "merge" });
-        let resp = self.auth(self
-                .http
-                .put(&url))
-            .json(&payload)
-            .send()
-            .await?;
+        let resp = self.auth(self.http.put(&url)).json(&payload).send().await?;
         let _resp = self.check_response(resp).await?;
         info!(pr_number, "merged pull request");
         Ok(())
@@ -302,9 +308,8 @@ impl GitHubClient {
     ) -> Result<(), GitHubError> {
         let url = format!("{}/repos/{}/statuses/{}", self.api_url, repo, sha);
         let payload = serde_json::json!({ "state": state.to_string(), "description": description, "context": "reposync" });
-        let resp = self.auth(self
-                .http
-                .post(&url))
+        let resp = self
+            .auth(self.http.post(&url))
             .json(&payload)
             .send()
             .await?;
@@ -326,17 +331,19 @@ impl GitHubClient {
         let first_url = format!("{}/repos/{}/pulls", self.api_url, repo);
         let base = base.to_string();
         let since = since.map(|s| s.to_string());
-        let resp = self.retry_request(|| {
-            let mut req = self.auth(self.http.get(&first_url)).query(&[
-                ("state", "closed"),
-                ("base", base.as_str()),
-                ("per_page", "100"),
-            ]);
-            if since.is_some() {
-                req = req.query(&[("sort", "updated"), ("direction", "desc")]);
-            }
-            req
-        }).await?;
+        let resp = self
+            .retry_request(|| {
+                let mut req = self.auth(self.http.get(&first_url)).query(&[
+                    ("state", "closed"),
+                    ("base", base.as_str()),
+                    ("per_page", "100"),
+                ]);
+                if since.is_some() {
+                    req = req.query(&[("sort", "updated"), ("direction", "desc")]);
+                }
+                req
+            })
+            .await?;
 
         let mut next_link = Self::parse_next_link(resp.headers());
         let mut all_prs: Vec<PullRequest> = resp.json().await?;
@@ -344,11 +351,16 @@ impl GitHubClient {
 
         while let Some(ref url) = next_link {
             if pages >= 10 {
-                warn!(pages, "reached GitHub pagination limit for get_merged_pull_requests");
+                warn!(
+                    pages,
+                    "reached GitHub pagination limit for get_merged_pull_requests"
+                );
                 break;
             }
             let url_clone = url.clone();
-            let resp = self.retry_request(|| self.auth(self.http.get(&url_clone))).await?;
+            let resp = self
+                .retry_request(|| self.auth(self.http.get(&url_clone)))
+                .await?;
             next_link = Self::parse_next_link(resp.headers());
             let page: Vec<PullRequest> = resp.json().await?;
             all_prs.extend(page);
@@ -385,9 +397,8 @@ impl GitHubClient {
             "{}/repos/{}/pulls/{}/commits",
             self.api_url, repo, pr_number
         );
-        let resp = self.auth(self
-                .http
-                .get(&url))
+        let resp = self
+            .auth(self.http.get(&url))
             .query(&[("per_page", "100")])
             .send()
             .await?;
@@ -454,9 +465,8 @@ impl GitHubClient {
             "description": description,
             "auto_init": false,
         });
-        let resp = self.auth(self
-                .http
-                .post(&url))
+        let resp = self
+            .auth(self.http.post(&url))
             .json(&payload)
             .send()
             .await?;
@@ -486,10 +496,7 @@ impl GitHubClient {
                     "new_branch_name": branch_name,
                     "old_branch_name": from_branch,
                 });
-                let resp = self
-                    .auth(self.http.post(&url).json(&body))
-                    .send()
-                    .await?;
+                let resp = self.auth(self.http.post(&url).json(&body)).send().await?;
                 if resp.status().as_u16() == 409 {
                     // Branch already exists
                     return Ok(());
@@ -509,16 +516,12 @@ impl GitHubClient {
                     .as_str()
                     .ok_or_else(|| GitHubError::ApiError {
                         status: 500,
-                        body: format!(
-                            "could not resolve SHA for branch '{}'",
-                            from_branch
-                        ),
+                        body: format!("could not resolve SHA for branch '{}'", from_branch),
                     })?
                     .to_string();
 
                 // Step 2: Create the new ref
-                let refs_url =
-                    format!("{}/repos/{}/git/refs", self.api_url, repo);
+                let refs_url = format!("{}/repos/{}/git/refs", self.api_url, repo);
                 let body = serde_json::json!({
                     "ref": format!("refs/heads/{}", branch_name),
                     "sha": sha,
@@ -534,22 +537,13 @@ impl GitHubClient {
                 self.check_response(resp).await?;
             }
         }
-        info!(
-            repo,
-            branch_name,
-            from_branch,
-            "created remote branch"
-        );
+        info!(repo, branch_name, from_branch, "created remote branch");
         Ok(())
     }
 
     /// Get the HEAD SHA of a branch.
     #[instrument(skip(self), fields(repo, branch))]
-    pub async fn get_branch_sha(
-        &self,
-        repo: &str,
-        branch: &str,
-    ) -> Result<String, GitHubError> {
+    pub async fn get_branch_sha(&self, repo: &str, branch: &str) -> Result<String, GitHubError> {
         // URL-encode the branch name so slashes (e.g., dev/james-wilson)
         // are passed correctly in the URL path.
         let encoded_branch = branch.replace('/', "%2F");
@@ -572,10 +566,7 @@ impl GitHubClient {
                     })
             }
             GitProvider::GitHub => {
-                let ref_url = format!(
-                    "{}/repos/{}/git/ref/heads/{}",
-                    self.api_url, repo, branch
-                );
+                let ref_url = format!("{}/repos/{}/git/ref/heads/{}", self.api_url, repo, branch);
                 let resp = self.auth(self.http.get(&ref_url)).send().await?;
                 let resp = self.check_response(resp).await?;
                 let data: serde_json::Value = resp.json().await?;
@@ -592,17 +583,10 @@ impl GitHubClient {
 
     /// Delete a branch in the remote repository.
     #[instrument(skip(self))]
-    pub async fn delete_branch(
-        &self,
-        repo: &str,
-        branch_name: &str,
-    ) -> Result<(), GitHubError> {
+    pub async fn delete_branch(&self, repo: &str, branch_name: &str) -> Result<(), GitHubError> {
         match self.provider {
             GitProvider::Gitea => {
-                let url = format!(
-                    "{}/repos/{}/branches/{}",
-                    self.api_url, repo, branch_name
-                );
+                let url = format!("{}/repos/{}/branches/{}", self.api_url, repo, branch_name);
                 let resp = self.auth(self.http.delete(&url)).send().await?;
                 if resp.status().as_u16() == 404 {
                     return Ok(()); // already deleted
@@ -641,7 +625,8 @@ impl GitHubClient {
         let resp = self.auth(self.http.get(&url)).send().await?;
         let resp = self.check_response(resp).await?;
         let data: serde_json::Value = resp.json().await?;
-        let ahead = data["ahead_by"].as_u64()
+        let ahead = data["ahead_by"]
+            .as_u64()
             .or_else(|| data["commits"].as_array().map(|a| a.len() as u64))
             .unwrap_or(0);
         Ok(ahead)
@@ -712,7 +697,10 @@ impl GitHubClient {
                 1u64 << attempt
             };
 
-            warn!(status = status.as_u16(), attempt, wait_secs, "GitHub API transient error; retrying");
+            warn!(
+                status = status.as_u16(),
+                attempt, wait_secs, "GitHub API transient error; retrying"
+            );
             sleep(std::time::Duration::from_secs(wait_secs)).await;
             attempt += 1;
         }
@@ -808,8 +796,7 @@ impl GitHubClient {
         let redacted = re_ghp.replace_all(input, "[REDACTED_TOKEN]");
 
         // Gitea tokens: 40-character hex strings (standalone, not part of a longer word).
-        let re_hex_token =
-            regex_lite::Regex::new(r"\b[0-9a-f]{40}\b").expect("valid regex");
+        let re_hex_token = regex_lite::Regex::new(r"\b[0-9a-f]{40}\b").expect("valid regex");
         let redacted = re_hex_token.replace_all(&redacted, "[REDACTED_HEX_TOKEN]");
 
         // Bearer <token> in headers dumped into error bodies.
@@ -834,7 +821,10 @@ mod tests {
         let hex_sig = hex::encode(mac.finalize().into_bytes());
         let signature = format!("sha256={}", hex_sig);
         assert!(GitHubClient::verify_webhook_signature(
-            payload, &signature, secret, &GitProvider::GitHub
+            payload,
+            &signature,
+            secret,
+            &GitProvider::GitHub
         ));
     }
 

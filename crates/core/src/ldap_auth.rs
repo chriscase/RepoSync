@@ -114,8 +114,7 @@ impl LdapConfig {
         let tls_connector = tls_builder
             .build()
             .map_err(|e| LdapAuthError::ConnectionFailed(format!("TLS setup failed: {}", e)))?;
-        let settings = LdapConnSettings::new()
-            .set_connector(tls_connector);
+        let settings = LdapConnSettings::new().set_connector(tls_connector);
         let (conn, mut ldap) = LdapConnAsync::with_settings(settings, &self.url)
             .await
             .map_err(|e| LdapAuthError::ConnectionFailed(e.to_string()))?;
@@ -136,9 +135,14 @@ impl LdapConfig {
                 .await
                 .map_err(|e| LdapAuthError::BindFailed(format!("service account bind: {}", e)))?
                 .success()
-                .map_err(|e| LdapAuthError::BindFailed(format!("service account bind rejected: {}", e)))?;
+                .map_err(|e| {
+                    LdapAuthError::BindFailed(format!("service account bind rejected: {}", e))
+                })?;
 
-            debug!("LDAP: bound as service account, searching for user '{}'", username);
+            debug!(
+                "LDAP: bound as service account, searching for user '{}'",
+                username
+            );
 
             let (entries, _result) = ldap
                 .search(&self.base_dn, Scope::Subtree, &search_filter, vec!["dn"])
@@ -157,9 +161,14 @@ impl LdapConfig {
             // No service account — try common AD bind formats.
             // AD supports UPN (user@domain), DOMAIN\user, and DN-based bind.
             // Extract domain from base_dn: dc=mgc,dc=mentorg,dc=com → mgc.mentorg.com
-            let domain = self.base_dn
+            let domain = self
+                .base_dn
                 .split(',')
-                .filter_map(|part| part.trim().strip_prefix("dc=").or_else(|| part.trim().strip_prefix("DC=")))
+                .filter_map(|part| {
+                    part.trim()
+                        .strip_prefix("dc=")
+                        .or_else(|| part.trim().strip_prefix("DC="))
+                })
                 .collect::<Vec<_>>()
                 .join(".");
 
@@ -175,11 +184,12 @@ impl LdapConfig {
             if bind_result.rc == 0 {
                 // UPN bind succeeded — now search for user attributes
                 let (entries, _) = ldap
-                    .search(&self.base_dn, Scope::Subtree, &search_filter, vec![
-                        &self.display_name_attr,
-                        &self.email_attr,
-                        &self.group_attr,
-                    ])
+                    .search(
+                        &self.base_dn,
+                        Scope::Subtree,
+                        &search_filter,
+                        vec![&self.display_name_attr, &self.email_attr, &self.group_attr],
+                    )
                     .await
                     .map_err(|e| LdapAuthError::SearchFailed(e.to_string()))?
                     .success()
@@ -196,15 +206,21 @@ impl LdapConfig {
                 }
 
                 let entry = SearchEntry::construct(entries.into_iter().next().unwrap());
-                let display_name = entry.attrs.get(&self.display_name_attr)
+                let display_name = entry
+                    .attrs
+                    .get(&self.display_name_attr)
                     .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or_else(|| username.to_string());
-                let email = entry.attrs.get(&self.email_attr)
+                let email = entry
+                    .attrs
+                    .get(&self.email_attr)
                     .and_then(|v| v.first())
                     .cloned()
                     .unwrap_or_else(|| format!("{}@{}", username, domain));
-                let groups = entry.attrs.get(&self.group_attr)
+                let groups = entry
+                    .attrs
+                    .get(&self.group_attr)
                     .cloned()
                     .unwrap_or_default();
 
@@ -220,7 +236,10 @@ impl LdapConfig {
             // UPN failed — try DOMAIN\user format
             let netbios = domain.split('.').next().unwrap_or("DOMAIN").to_uppercase();
             let domain_user = format!("{}\\{}", netbios, username);
-            debug!("LDAP: UPN failed (rc={}), trying DOMAIN\\user: {}", bind_result.rc, domain_user);
+            debug!(
+                "LDAP: UPN failed (rc={}), trying DOMAIN\\user: {}",
+                bind_result.rc, domain_user
+            );
 
             // Need a fresh connection for the retry
             drop(ldap);
@@ -250,11 +269,12 @@ impl LdapConfig {
             // DOMAIN\user bind succeeded — search for attributes
             let search_filter2 = self.search_filter.replace("{0}", &escaped_username);
             let (entries, _) = ldap2
-                .search(&self.base_dn, Scope::Subtree, &search_filter2, vec![
-                    &self.display_name_attr,
-                    &self.email_attr,
-                    &self.group_attr,
-                ])
+                .search(
+                    &self.base_dn,
+                    Scope::Subtree,
+                    &search_filter2,
+                    vec![&self.display_name_attr, &self.email_attr, &self.group_attr],
+                )
                 .await
                 .map_err(|e| LdapAuthError::SearchFailed(e.to_string()))?
                 .success()
@@ -262,14 +282,30 @@ impl LdapConfig {
 
             let (display_name, email, groups) = if !entries.is_empty() {
                 let entry = SearchEntry::construct(entries.into_iter().next().unwrap());
-                let dn = entry.attrs.get(&self.display_name_attr)
-                    .and_then(|v| v.first()).cloned().unwrap_or_else(|| username.to_string());
-                let em = entry.attrs.get(&self.email_attr)
-                    .and_then(|v| v.first()).cloned().unwrap_or_else(|| format!("{}@{}", username, domain));
-                let gr = entry.attrs.get(&self.group_attr).cloned().unwrap_or_default();
+                let dn = entry
+                    .attrs
+                    .get(&self.display_name_attr)
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_else(|| username.to_string());
+                let em = entry
+                    .attrs
+                    .get(&self.email_attr)
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_else(|| format!("{}@{}", username, domain));
+                let gr = entry
+                    .attrs
+                    .get(&self.group_attr)
+                    .cloned()
+                    .unwrap_or_default();
                 (dn, em, gr)
             } else {
-                (username.to_string(), format!("{}@{}", username, domain), vec![])
+                (
+                    username.to_string(),
+                    format!("{}@{}", username, domain),
+                    vec![],
+                )
             };
 
             let _ = ldap2.unbind().await;
@@ -360,7 +396,9 @@ impl LdapConfig {
                 .await
                 .map_err(|e| LdapAuthError::BindFailed(format!("service account bind: {}", e)))?
                 .success()
-                .map_err(|e| LdapAuthError::BindFailed(format!("service account bind rejected: {}", e)))?;
+                .map_err(|e| {
+                    LdapAuthError::BindFailed(format!("service account bind rejected: {}", e))
+                })?;
         }
 
         let _ = ldap.unbind().await;

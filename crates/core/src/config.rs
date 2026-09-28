@@ -589,7 +589,8 @@ impl AppConfig {
             // Try encrypted secrets table first
             if let Ok(Some((ct, nonce))) = db.get_encrypted_secret(key) {
                 if let Ok(enc_key) = crate::crypto::get_or_create_encryption_key(db) {
-                    if let Ok(plaintext) = crate::crypto::decrypt_credential(&ct, &nonce, &enc_key) {
+                    if let Ok(plaintext) = crate::crypto::decrypt_credential(&ct, &nonce, &enc_key)
+                    {
                         return Some(plaintext);
                     }
                 }

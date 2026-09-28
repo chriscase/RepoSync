@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "scoped_svn_prefix": "last_svn_rev_",
+  "scoped_git_prefix": "last_git_sha_",
+  "no_target_prefix": "handled_git_no_target_",
+  "baseline_prefix": "handled_git_baseline_",
+  "unsupported_aggregate_prefix": "no_target_git_outcomes_",
+  "unknown_effect_prefix": "effect_unknown_",
+  "global_svn_key": "last_svn_rev",
+  "global_git_key": "last_git_hash",
+  "svn_watermark_sources": ["svn_rev", "svn"],
+  "global_reference_rule": "display_only_never_repository_authority",
+  "receipt_owner_rule": "longest_existing_repository_id_then_underscore_then_source_suffix",
+  "narrow_import_rule": "any_owned_receipt_or_unknown_effect_or_conflicting_incoming_progress_refuses_generation"
+}

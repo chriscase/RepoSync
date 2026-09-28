@@ -144,9 +144,10 @@ impl SvnToGitSync {
                 .with_context(|| format!("failed to export SVN revision r{}", rev))?;
 
             // 6. Copy exported files into the Git working tree (with policy).
-            let git_client = self.git_client.lock().unwrap();
-            let repo_path = git_client.repo_path().to_path_buf();
-            drop(git_client); // Release lock before blocking I/O.
+            let repo_path = {
+                let git_client = self.git_client.lock().unwrap();
+                git_client.repo_path().to_path_buf()
+            }; // Release lock before blocking I/O.
 
             let skipped =
                 Self::copy_tree_with_policy(export_dir.path(), &repo_path, &self.policy, &self.db)
@@ -385,8 +386,7 @@ impl SvnToGitSync {
                         // Ensure `.gitattributes` has the appropriate LFS tracking pattern.
                         // Use dst_root (the Git repo root) for .gitattributes placement.
                         let pattern = reposync_core::lfs::pattern_for_path(&rel);
-                        if let Err(e) = reposync_core::lfs::ensure_lfs_tracked(dst_root, &pattern)
-                        {
+                        if let Err(e) = reposync_core::lfs::ensure_lfs_tracked(dst_root, &pattern) {
                             warn!(
                                 path = rel.as_str(),
                                 pattern = pattern.as_str(),

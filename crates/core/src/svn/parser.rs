@@ -134,10 +134,7 @@ fn extract_tag_content(xml: &str, tag: &str) -> Option<String> {
                 continue;
             }
         }
-        let content_start = match after_open.find('>') {
-            Some(pos) => pos + 1,
-            None => return None,
-        };
+        let content_start = after_open.find('>')? + 1;
         let content = &after_open[content_start..];
         let end_pos = content.find(&close)?;
         return Some(xml_unescape(content[..end_pos].trim()));

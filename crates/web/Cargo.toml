@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "RepoSync web server and API"
 
+[features]
+reliability-fixture = ["reposync-core/reliability-fixture"]
+
 [dependencies]
 reposync-core = { path = "../core" }
 tokio = { workspace = true }

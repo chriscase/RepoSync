@@ -85,12 +85,11 @@ impl TeamsNotifier {
         };
 
         if let Some(body) = card_body {
-            let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("unknown");
-            info!(
-                event_type,
-                repo_name,
-                "sending Teams notification"
-            );
+            let repo_name = event
+                .get("repo_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            info!(event_type, repo_name, "sending Teams notification");
             if let Err(e) = self.send_card(body).await {
                 warn!(error = %e, event_type, repo_name, "failed to send Teams notification");
             } else {
@@ -124,15 +123,24 @@ impl TeamsNotifier {
     // --- Event formatters ---
 
     fn format_sync_completed(&self, event: &serde_json::Value) -> Option<serde_json::Value> {
-        let svn_to_git = event.get("svn_to_git").and_then(|v| v.as_i64()).unwrap_or(0);
-        let git_to_svn = event.get("git_to_svn").and_then(|v| v.as_i64()).unwrap_or(0);
+        let svn_to_git = event
+            .get("svn_to_git")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let git_to_svn = event
+            .get("git_to_svn")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
         // Skip no-change cycles to avoid flooding
         if svn_to_git == 0 && git_to_svn == 0 {
             return None;
         }
 
-        let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
+        let repo_name = event
+            .get("repo_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
         let conflicts = event.get("conflicts").and_then(|v| v.as_i64()).unwrap_or(0);
         let total_commits = svn_to_git + git_to_svn;
 
@@ -203,13 +211,29 @@ impl TeamsNotifier {
                 }));
 
                 for commit in commits.iter().take(10) {
-                    let author = commit.get("author").and_then(|v| v.as_str()).unwrap_or("Unknown");
+                    let author = commit
+                        .get("author")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
                     let message = commit.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    let rev_id = commit.get("revision_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let files_changed = commit.get("files_changed").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let direction = commit.get("direction").and_then(|v| v.as_str()).unwrap_or("");
+                    let rev_id = commit
+                        .get("revision_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let files_changed = commit
+                        .get("files_changed")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let direction = commit
+                        .get("direction")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
-                    let direction_icon = if direction == "svn_to_git" { "→Git" } else { "→SVN" };
+                    let direction_icon = if direction == "svn_to_git" {
+                        "→Git"
+                    } else {
+                        "→SVN"
+                    };
 
                     // First line as summary, rest as details
                     let first_line = message.lines().next().unwrap_or("(no message)");
@@ -286,9 +310,18 @@ impl TeamsNotifier {
     }
 
     fn format_sync_failed(&self, event: &serde_json::Value) -> serde_json::Value {
-        let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
-        let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
-        let is_permanent = event.get("is_permanent").and_then(|v| v.as_bool()).unwrap_or(false);
+        let repo_name = event
+            .get("repo_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+        let error = event
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown error");
+        let is_permanent = event
+            .get("is_permanent")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let (icon, title) = if is_permanent {
             ("🛑", "Sync failed — permanent error")
@@ -325,12 +358,21 @@ impl TeamsNotifier {
 
     fn format_import_progress(&self, event: &serde_json::Value) -> Option<serde_json::Value> {
         let phase = event.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-        let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("Repository");
+        let repo_name = event
+            .get("repo_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Repository");
 
         match phase {
             "completed" => {
-                let total_revs = event.get("total_revs").and_then(|v| v.as_i64()).unwrap_or(0);
-                let commits = event.get("commits_created").and_then(|v| v.as_i64()).unwrap_or(0);
+                let total_revs = event
+                    .get("total_revs")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let commits = event
+                    .get("commits_created")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
                 Some(json!([
                     {
@@ -385,7 +427,11 @@ impl TeamsNotifier {
 }
 
 /// Format a branch pair creation event as a Teams card body.
-pub fn format_branch_created(repo_name: &str, git_branch: &str, svn_branch: &str) -> serde_json::Value {
+pub fn format_branch_created(
+    repo_name: &str,
+    git_branch: &str,
+    svn_branch: &str,
+) -> serde_json::Value {
     json!([
         {
             "type": "TextBlock",
@@ -426,7 +472,11 @@ pub fn format_branch_deleted(repo_name: &str, git_branch: &str) -> serde_json::V
 }
 
 /// Format a path violation event as a Teams card body.
-pub fn format_path_violation(repo_name: &str, violations: &[String], skipped_all: bool) -> serde_json::Value {
+pub fn format_path_violation(
+    repo_name: &str,
+    violations: &[String],
+    skipped_all: bool,
+) -> serde_json::Value {
     let (icon, title) = if skipped_all {
         ("⚠️", "Commit skipped — all files violate path rules")
     } else {
@@ -435,7 +485,11 @@ pub fn format_path_violation(repo_name: &str, violations: &[String], skipped_all
 
     let violation_text = if violations.len() > 5 {
         let shown: Vec<&str> = violations.iter().take(5).map(|s| s.as_str()).collect();
-        format!("{}  \nand {} more", shown.join("  \n"), violations.len() - 5)
+        format!(
+            "{}  \nand {} more",
+            shown.join("  \n"),
+            violations.len() - 5
+        )
     } else {
         violations.join("  \n")
     };

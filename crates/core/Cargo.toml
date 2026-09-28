@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Core library for RepoSync bidirectional SVN/Git synchronization"
 
+[features]
+reliability-fixture = []
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }

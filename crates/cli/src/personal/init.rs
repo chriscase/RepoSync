@@ -393,10 +393,7 @@ auto_merge = true
     );
     println!();
     println!("  2. Validate the config:");
-    println!(
-        "       reposync personal validate --config {}",
-        output_path
-    );
+    println!("       reposync personal validate --config {}", output_path);
     println!();
     println!("  3. Start syncing:");
     println!("       reposync personal start --config {}", output_path);

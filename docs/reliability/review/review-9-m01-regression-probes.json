@@ -1,0 +1,444 @@
+{
+  "tier": "exact_committed_SQL_with_transcribed_reader_queries_not_Rust_or_remote_execution",
+  "sqlite_version": "3.46.1",
+  "sql_git_blob": "441cb08442a64564f9c6946a81822085d10e6d20",
+  "sql_sha256": "910132058001d14afdd02fa9f3cd2a2d46e568a7c7aa43ceed9044684fc4a994",
+  "positive_existing_controls": [
+    {
+      "sql": "UPDATE pair_outcomes SET evidence_json='[]' WHERE id='resolved-E'",
+      "rejected": true,
+      "unchanged": true,
+      "error": "resolved historical evidence is immutable"
+    },
+    {
+      "sql": "DELETE FROM pair_outcomes WHERE id='resolved-E'",
+      "rejected": true,
+      "unchanged": true,
+      "error": "resolved historical evidence cannot be deleted"
+    },
+    {
+      "sql": "INSERT OR REPLACE INTO pair_outcomes SELECT * FROM pair_outcomes WHERE id='resolved-E'",
+      "rejected": true,
+      "unchanged": true,
+      "error": "resolved historical evidence cannot be replaced"
+    }
+  ],
+  "update_or_replace_matrix": [
+    {
+      "conflict_key": "id",
+      "new_kind": "pending",
+      "sql": "UPDATE OR REPLACE pair_outcomes SET id='resolved-E',source_key=?,source_git_sha=?,predecessor_source_key=?,outcome=?,target_svn_rev=?,evidence_json='{\"replacement\":true}' WHERE id='pending-P'",
+      "accepted": false,
+      "error": "update cannot replace resolved evidence",
+      "recursive_triggers": 0,
+      "before": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "after": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "chain_before": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "chain_after": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "fk_check": [],
+      "integrity": "ok"
+    },
+    {
+      "conflict_key": "id",
+      "new_kind": "applied_verified",
+      "sql": "UPDATE OR REPLACE pair_outcomes SET id='resolved-E',source_key=?,source_git_sha=?,predecessor_source_key=?,outcome=?,target_svn_rev=?,evidence_json='{\"replacement\":true}' WHERE id='pending-P'",
+      "accepted": false,
+      "error": "update cannot replace resolved evidence",
+      "recursive_triggers": 0,
+      "before": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "after": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "chain_before": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "chain_after": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "fk_check": [],
+      "integrity": "ok"
+    },
+    {
+      "conflict_key": "source_key",
+      "new_kind": "pending",
+      "sql": "UPDATE OR REPLACE pair_outcomes SET source_key=?,source_git_sha=?,predecessor_source_key=?,outcome=?,target_svn_rev=?,evidence_json='{\"replacement\":true}' WHERE id='pending-P'",
+      "accepted": false,
+      "error": "update cannot replace resolved evidence",
+      "recursive_triggers": 0,
+      "before": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "after": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "chain_before": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "chain_after": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "fk_check": [],
+      "integrity": "ok"
+    },
+    {
+      "conflict_key": "source_key",
+      "new_kind": "applied_verified",
+      "sql": "UPDATE OR REPLACE pair_outcomes SET source_key=?,source_git_sha=?,predecessor_source_key=?,outcome=?,target_svn_rev=?,evidence_json='{\"replacement\":true}' WHERE id='pending-P'",
+      "accepted": false,
+      "error": "update cannot replace resolved evidence",
+      "recursive_triggers": 0,
+      "before": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "after": [
+        [
+          "pending-P",
+          "git:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pending",
+          null,
+          "{}"
+        ],
+        [
+          "resolved-E",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "applied_verified",
+          3,
+          "{}"
+        ],
+        [
+          "resolved-F",
+          "git:ffffffffffffffffffffffffffffffffffffffff",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "empty_no_target",
+          null,
+          "{}"
+        ]
+      ],
+      "chain_before": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "chain_after": {
+        "history": [
+          [
+            "resolved-F",
+            "git:ffffffffffffffffffffffffffffffffffffffff",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "empty_no_target",
+            null,
+            null
+          ],
+          [
+            "resolved-E",
+            "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "applied_verified",
+            null,
+            3
+          ]
+        ],
+        "last_applied_target": 3
+      },
+      "fk_check": [],
+      "integrity": "ok"
+    }
+  ]
+}

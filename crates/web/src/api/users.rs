@@ -157,10 +157,14 @@ async fn create_user(
         return Err(AppError::BadRequest("password is required".into()));
     }
     if body.password.len() < 8 {
-        return Err(AppError::BadRequest("password must be at least 8 characters".into()));
+        return Err(AppError::BadRequest(
+            "password must be at least 8 characters".into(),
+        ));
     }
     if body.password.len() > 72 {
-        return Err(AppError::BadRequest("password must not exceed 72 characters".into()));
+        return Err(AppError::BadRequest(
+            "password must not exceed 72 characters".into(),
+        ));
     }
     if !matches!(body.role.as_str(), "admin" | "user") {
         return Err(AppError::BadRequest(
@@ -269,7 +273,10 @@ async fn update_user(
     }
 
     // Update other fields
-    let display_name = body.display_name.as_deref().unwrap_or(&existing.display_name);
+    let display_name = body
+        .display_name
+        .as_deref()
+        .unwrap_or(&existing.display_name);
     let email = body.email.as_deref().unwrap_or(&existing.email);
     let user_role = body.role.as_deref().unwrap_or(&existing.role);
     let enabled = body.enabled.unwrap_or(existing.enabled);
@@ -377,13 +384,12 @@ async fn create_credential(
     let db = &state.db;
 
     // Get encryption key
-    let enc_key = reposync_core::crypto::get_or_create_encryption_key(&db)
+    let enc_key = reposync_core::crypto::get_or_create_encryption_key(db)
         .map_err(|e| AppError::Internal(format!("encryption key error: {}", e)))?;
 
     // Encrypt the credential value
-    let (encrypted_value, nonce) =
-        reposync_core::crypto::encrypt_credential(&body.value, &enc_key)
-            .map_err(|e| AppError::Internal(format!("encryption error: {}", e)))?;
+    let (encrypted_value, nonce) = reposync_core::crypto::encrypt_credential(&body.value, &enc_key)
+        .map_err(|e| AppError::Internal(format!("encryption error: {}", e)))?;
 
     let now = Utc::now().to_rfc3339();
     let cred = reposync_core::models::UserCredential {

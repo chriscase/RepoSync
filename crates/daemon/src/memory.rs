@@ -25,12 +25,7 @@ fn read_proc_rss() -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             // Format: "VmRSS:    123456 kB"
-            let kb: u64 = rest
-                .trim()
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * 1024); // convert kB to bytes
         }
     }
