@@ -7,7 +7,7 @@ base_sha=87379741779a6259f7eeb52a68cc6f061174e5ef
 previous_sha=f74fce855a1f1d80dd631397f436ba33906272e6
 base_tree="$(git rev-parse "$base_sha^{tree}")"
 previous_tree="$(git rev-parse "$previous_sha^{tree}")"
-immediate_sha=5e10a89db30dc742b32e43b0e0274f22c651f028
+immediate_sha=ed2f1a4d73b63716c71b360115de321d7fa7f16c
 immediate_tree="$(git rev-parse "$immediate_sha^{tree}")"
 candidate_sha="$(git rev-parse HEAD)"
 candidate_tree="$(git rev-parse HEAD^{tree})"
@@ -35,17 +35,17 @@ p.write_text(source.replace(needle,
 PY
 mkdir -p "$base_context/docs/reliability/fixtures"
 cp Dockerfile.reliability .dockerignore "$base_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs "$base_context/scripts/"
+cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$base_context/scripts/"
 cp docs/reliability/fixtures/Cargo.lock "$base_context/docs/reliability/fixtures/"
 cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$base_context/docs/reliability/"
 shasum -a 256 "$base_context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256"
 cp Dockerfile.reliability .dockerignore "$previous_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs "$previous_context/scripts/"
+cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$previous_context/scripts/"
 cp docs/reliability/fixtures/Cargo.lock "$previous_context/docs/reliability/fixtures/"
 cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$previous_context/docs/reliability/"
 
 cp Dockerfile.reliability .dockerignore "$immediate_context/"
-cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs "$immediate_context/scripts/"
+cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$immediate_context/scripts/"
 cp docs/reliability/fixtures/Cargo.lock "$immediate_context/docs/reliability/fixtures/"
 cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$immediate_context/docs/reliability/"
 

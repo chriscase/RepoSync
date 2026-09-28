@@ -32,6 +32,7 @@ jobs:
           cp docs/reliability/review/review-10-n01-after.log.gz artifacts/review10-n01-after.log.gz
           cp docs/reliability/review/review-10-http-local.log.gz artifacts/review10-http-local.log.gz
           cp scripts/reliability-copy-consumer.mjs artifacts/reliability-copy-consumer.mjs
+          cp scripts/reliability-scoped-consumer.mjs artifacts/reliability-scoped-consumer.mjs
           cp crates/core/tests/fixtures/copy-reader-v1.json artifacts/copy-reader-v1.json
           python3 scripts/reliability_scan.py --scan artifacts \
             --status-file artifacts/evidence-scan-status.json
@@ -51,6 +52,7 @@ jobs:
             artifacts/review10-n01-after.log.gz
             artifacts/review10-http-local.log.gz
             artifacts/reliability-copy-consumer.mjs
+            artifacts/reliability-scoped-consumer.mjs
             artifacts/copy-reader-v1.json
           retention-days: 14
           if-no-files-found: warn

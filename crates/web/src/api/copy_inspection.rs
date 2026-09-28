@@ -8,6 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use reposync_core::db::{
     candidate_dto::Response,
     candidate_migration::CopySession,
@@ -87,6 +88,11 @@ async fn authorize(state: &InspectionState, headers: &HeaderMap, repo: &str) -> 
     // closed even when an unrelated in-memory token has the same spelling.
     let session = state.auth.db.get_session(token).ok().flatten()
         .ok_or_else(|| refusal(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    let expires = DateTime::parse_from_rfc3339(&session.expires_at)
+        .map_err(|_| refusal(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+    if expires <= Utc::now() {
+        return Err(refusal(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
     let user = state.auth.db.get_user(&session.user_id).ok().flatten()
         .filter(|user| user.enabled)
         .ok_or_else(|| refusal(StatusCode::UNAUTHORIZED, "unauthorized"))?;

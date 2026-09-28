@@ -511,6 +511,12 @@
       "binary": "copy_inspection",
       "test": "copy_only_http_to_javascript_journey",
       "tier": "candidate_regression"
+    },
+    {
+      "id": "S54_SCOPED_HTTP",
+      "binary": "copy_inspection",
+      "test": "scoped_read_authorization_journey",
+      "tier": "candidate_regression"
     }
   ]
 }

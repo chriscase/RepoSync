@@ -51,7 +51,7 @@ MANDATORY["candidate"].update({
 MANDATORY["candidate"].update({'V13_EMPTY_USED', 'V14_UNQUALIFIED', 'V13_LARGE_SEQUENCE', 'V14_RESTART', 'K01_REJECTION', 'PINNED_UNQUALIFIED', 'V13_SPARSE_HIGH', 'MIGRATION_WRITE_FAILURE', 'MAPPING_NULL', 'K03_ORIGIN', 'MIGRATION_CRASH', 'K01_VALID', 'STARTUP_V12', 'MIGRATION_FORGED', 'V13_ROLLBACK', 'COPY_BOUNDARY', 'V13_ROWS', 'V14_OLD_TOPOLOGY', 'V13_NEVER_USED'})
 MANDATORY["candidate"].update({'T54_LIST', 'T54_EMITTED', 'L03_HISTORY', 'T54_LOOKUP', 'T54_STATUS', 'T54_READONLY', 'L02_ADMISSION', 'L01_STORAGE'})
 MANDATORY["candidate"].update({"M01_HISTORY", "S54_JSON_LOOKUP", "S54_JSON_HISTORY", "S54_JSON_PAGE", "S54_JSON_READONLY"})
-MANDATORY["candidate"].update({"N01_FRONTIER", "S54_HTTP_COPY"})
+MANDATORY["candidate"].update({"N01_FRONTIER", "S54_HTTP_COPY", "S54_SCOPED_HTTP"})
 SCANNER_CASES = {
     "EVIDENCE_SCAN_CLEAN": "evidence_scan_clean",
     "EVIDENCE_SCAN_CANARY": "evidence_scan_canary",
@@ -156,6 +156,8 @@ def run_case(case, binaries):
     environment = os.environ.copy()
     if case["id"] == "S54_HTTP_COPY":
         environment["REPOSYNC_COPY_WIRE_OUTPUT"] = str(OUTPUT / "S54_HTTP_COPY-wire.json")
+    if case["id"] == "S54_SCOPED_HTTP":
+        environment["REPOSYNC_SCOPED_WIRE_OUTPUT"] = str(OUTPUT / "S54_SCOPED_HTTP-wire.json")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
     output = result.stdout + result.stderr
     if SECRET in output:
