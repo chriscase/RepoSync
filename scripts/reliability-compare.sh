@@ -24,6 +24,10 @@ git archive "$base_sha" | tar -x -C "$base_context"
 git archive "$previous_sha" | tar -x -C "$previous_context"
 git archive "$immediate_sha" | tar -x -C "$immediate_context"
 git archive "$merged_sha" | tar -x -C "$merged_context"
+python3 scripts/reliability-lock-overlay.py "$base_context" > "$comparison_dir/base-lock-overlay.json"
+python3 scripts/reliability-lock-overlay.py "$previous_context" > "$comparison_dir/previous-lock-overlay.json"
+python3 scripts/reliability-lock-overlay.py "$immediate_context" > "$comparison_dir/immediate-lock-overlay.json"
+python3 scripts/reliability-lock-overlay.py "$merged_context" > "$comparison_dir/merged-lock-overlay.json"
 
 # This overlay changes no base runtime source. The old test fixture needs an
 # explicit synthetic SVN author when running as the container's numeric user.
