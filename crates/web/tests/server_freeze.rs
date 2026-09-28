@@ -2547,7 +2547,24 @@ async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
     assert!(start.status().is_success());
     let started: serde_json::Value = start.json().await.unwrap();
     let op_id = started["operation_id"].as_str().unwrap();
-    wait_for_file(&pid_file).await;
+    if tokio::time::timeout(Duration::from_secs(10), async {
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let status: serde_json::Value = client
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        panic!("stalled SVN child marker missing; durable status: {status}");
+    }
     let descendant = std::fs::read_to_string(&pid_file)
         .unwrap()
         .trim()

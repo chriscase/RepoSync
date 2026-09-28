@@ -51,9 +51,16 @@ impl SvnClient {
                     Path::new(&binary).canonicalize(),
                 ) {
                     if binary.starts_with(root) {
+                        eprintln!(
+                            "RELIABILITY_FIXTURE_SVN_BINARY selected {}",
+                            binary.display()
+                        );
                         return binary.to_string_lossy().into_owned();
                     }
                 }
+            }
+            if std::env::var_os("REPOSYNC_IMPORT_SVN_BINARY").is_some() {
+                eprintln!("RELIABILITY_FIXTURE_SVN_BINARY rejected by sealed-root check");
             }
         }
         "svn".into()
