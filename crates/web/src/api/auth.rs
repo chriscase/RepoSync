@@ -603,12 +603,24 @@ pub async fn validate_session_with_role(
         let db = &state.db;
         if let Ok(Some(session)) = db.get_session(token) {
             if let Ok(Some(user)) = db.get_user(&session.user_id) {
-                return Ok((user.id, user.role));
+                if user.enabled {
+                    return Ok((user.id, user.role));
+                }
+                return Err(AppError::Unauthorized("user disabled".into()));
             }
+            return Err(AppError::Unauthorized("session user unavailable".into()));
         }
     }
 
     // Fallback to in-memory sessions (backward compat — treat as admin)
+    if state
+        .db
+        .count_users()
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        > 0
+    {
+        return Err(AppError::Unauthorized("session expired or invalid".into()));
+    }
     let sessions = state.sessions.read().await;
     if let Some(expires_at) = sessions.get(token) {
         if *expires_at > Utc::now() {

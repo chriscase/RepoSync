@@ -7,11 +7,14 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use reposync_core::db::import_operations::ImportOperationState;
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::Database;
+use reposync_core::errors::DatabaseError;
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -191,6 +194,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id/sync", post(trigger_sync))
         .route("/api/repos/:id/import", post(start_repo_import))
         .route("/api/repos/:id/import/status", get(repo_import_status))
+        .route(
+            "/api/repos/:id/import/:operation_id/cancel",
+            post(cancel_repo_import),
+        )
+        .route(
+            "/api/repos/:id/import/cancel",
+            post(cancel_repo_import_without_id),
+        )
         .route("/api/repos/:id/credentials", get(get_credentials))
         .route("/api/repos/:id/credentials", post(save_credentials))
         .route("/api/repos/:id/branches", post(create_branch_pair))
@@ -345,6 +356,7 @@ async fn update_repo(
     }
 
     let db = &state.db;
+    reject_held_import(db, &id)?;
 
     let existing = db
         .get_repository(&id)
@@ -407,6 +419,7 @@ async fn delete_repo(
     }
 
     let db = &state.db;
+    reject_held_import(db, &id)?;
 
     // Soft delete: disable the repository rather than removing it.
     let existing = db
@@ -446,6 +459,8 @@ async fn trigger_sync(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
+    reject_held_import(db, &id)?;
+
     // Check import progress for this repo to give useful status.
     let progress = state.get_repo_import_progress(&id).await;
     let p = progress.read().await;
@@ -480,6 +495,69 @@ async fn trigger_sync(
 // Per-repo import
 // ---------------------------------------------------------------------------
 
+fn reject_held_import(db: &Database, repo_id: &str) -> Result<(), AppError> {
+    if db
+        .active_import_operation(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some()
+    {
+        Err(AppError::BadRequest(
+            "repository has active or unresolved import work".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn import_write_error(error: DatabaseError) -> AppError {
+    match error {
+        DatabaseError::Other(message) => AppError::BadRequest(message),
+        other => AppError::Internal(format!("import operation persistence failed: {other}")),
+    }
+}
+
+struct ImportPreparationGuard<'a> {
+    db: &'a Database,
+    repo_id: String,
+    operation_id: String,
+    reset: bool,
+    armed: bool,
+}
+
+impl Drop for ImportPreparationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let outcome = self
+            .db
+            .get_import_operation(&self.repo_id, &self.operation_id);
+        let (state, detail) = match outcome {
+            Ok(Some(op))
+                if op.cancel_requested
+                    && op.last_local_svn_rev.is_none()
+                    && op.intended_git_sha.is_none()
+                    && !self.reset =>
+            {
+                (
+                    ImportOperationState::Cancelled,
+                    "cancelled during quiesced preparation",
+                )
+            }
+            _ => (
+                ImportOperationState::ReconciliationRequired,
+                "preparation stopped before worker start; inspect local work and target",
+            ),
+        };
+        if let Err(e) =
+            self.db
+                .finish_import_operation(&self.repo_id, &self.operation_id, state, detail)
+        {
+            error!(repo_id = %self.repo_id, error = %e, "failed to persist import preparation outcome");
+        }
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 struct ImportQuery {
     #[serde(default)]
@@ -492,7 +570,7 @@ async fn start_repo_import(
     Path(id): Path<String>,
     axum::extract::Query(import_query): axum::extract::Query<ImportQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (_user_id, role) = validate_session_with_role(
+    let (user_id, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -503,12 +581,57 @@ async fn start_repo_import(
     }
 
     let db = &state.db;
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // 1. Load repo config from DB
     let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+
+    if let Some(previous) = db
+        .latest_import_operation(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        if previous.request_id == request_id && previous.initiator_id == user_id {
+            return Ok(Json(
+                serde_json::json!({"ok":true,"message":"Import request already recorded",
+                "operation_id":previous.id,"lifecycle":previous.state}),
+            ));
+        }
+    }
+    if db
+        .active_import_operation(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some()
+    {
+        return Err(AppError::BadRequest(
+            "repository import is active or held for reconciliation".into(),
+        ));
+    }
+    if repo.last_svn_rev > 0 && !import_query.reset {
+        return Err(AppError::BadRequest(
+            "repository already has a completed baseline; refusing implicit full replay".into(),
+        ));
+    }
+    let registrations = db
+        .list_repositories()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if registrations.iter().any(|other| {
+        other.id != id
+            && other.git_api_url == repo.git_api_url
+            && other.git_repo == repo.git_repo
+            && other.git_branch == repo.git_branch
+    }) {
+        return Err(AppError::BadRequest(
+            "another repository registration shares this Git target".into(),
+        ));
+    }
 
     // 2. Check if an import is already running for this repo
     let progress = state.get_repo_import_progress(&id).await;
@@ -530,6 +653,20 @@ async fn start_repo_import(
     let busy_guard = {
         let mut guard = None;
         for attempt in 0..30 {
+            if let Some(active) = db
+                .active_import_operation(&id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            {
+                if active.request_id == request_id && active.initiator_id == user_id {
+                    return Ok(Json(
+                        serde_json::json!({"ok":true,"message":"Import request already recorded",
+                        "operation_id":active.id,"lifecycle":active.state}),
+                    ));
+                }
+                return Err(AppError::BadRequest(
+                    "repository import is active or held".into(),
+                ));
+            }
             if let Some(g) = reposync_core::busy::try_acquire(&id) {
                 guard = Some(g);
                 break;
@@ -548,6 +685,34 @@ async fn start_repo_import(
                 })));
             }
         }
+    };
+
+    let workdir = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(&id)
+        .join("git-repo");
+    let fingerprint_source = serde_json::json!({
+        "svn_url":repo.svn_url, "svn_branch":repo.svn_branch,
+        "git_api_url":repo.git_api_url, "git_repo":repo.git_repo, "git_branch":repo.git_branch,
+        "workdir":workdir.display().to_string(), "allowed_paths":repo.allowed_paths,
+        "blocked_patterns":repo.blocked_patterns, "lfs_threshold_mb":repo.lfs_threshold_mb,
+        "sync_mode":repo.sync_mode, "auto_merge":repo.auto_merge,
+    })
+    .to_string();
+    let fingerprint = hex::encode(Sha256::digest(fingerprint_source.as_bytes()));
+    let operation = db
+        .create_import_operation(&id, &user_id, &request_id, &fingerprint)
+        .map_err(import_write_error)?;
+    let operation_id = operation.id.clone();
+    let mut preparation_guard = ImportPreparationGuard {
+        db,
+        repo_id: id.clone(),
+        operation_id: operation_id.clone(),
+        reset: import_query.reset,
+        armed: true,
     };
 
     // 3. Reset progress
@@ -601,7 +766,8 @@ async fn start_repo_import(
 
     info!(repo_id = %id, svn_import_url = %svn_import_url, reset = import_query.reset, "starting per-repo import");
 
-    let svn_client = SvnClient::new(&svn_import_url, &repo.svn_username, &svn_password);
+    let svn_client = SvnClient::new(&svn_import_url, &repo.svn_username, &svn_password)
+        .with_cancel_signal(progress.read().await.cancel_signal.clone());
 
     // 6. Build the git repo path: {data_dir}/repos/{repo_id}/git-repo
     let data_dir = state.config.daemon.data_dir.clone();
@@ -708,41 +874,82 @@ async fn start_repo_import(
         GitClient::new(&git_repo_path)
             .map_err(|e| AppError::Internal(format!("failed to open git repo: {}", e)))?
     } else {
-        match GitClient::clone_repo(&clone_url, &git_repo_path, git_token.as_deref()) {
-            Ok(client) => client,
-            Err(_) => {
-                info!("Clone failed, initializing empty repo with remote");
-                let output = std::process::Command::new("git")
-                    .args(["init", "--initial-branch", &repo.git_branch])
-                    .current_dir(&git_repo_path)
-                    .output()
-                    .map_err(|e| AppError::Internal(format!("git init failed: {}", e)))?;
-                if !output.status.success() {
-                    let _ = std::process::Command::new("git")
-                        .args(["init"])
-                        .current_dir(&git_repo_path)
-                        .output();
-                }
-                let _ = std::process::Command::new("git")
-                    .args(["remote", "add", "origin", &clone_url])
-                    .current_dir(&git_repo_path)
-                    .output();
-                GitClient::new(&git_repo_path)
-                    .map_err(|e| AppError::Internal(format!("git open failed: {}", e)))?
-            }
+        // A missing/unreachable target must never be replaced with a fresh
+        // local repository. Supervise the clone and its descendants.
+        let authenticated_url = match (
+            git_token.as_deref(),
+            clone_url.strip_prefix("https://"),
+            clone_url.strip_prefix("http://"),
+        ) {
+            (Some(token), Some(rest), _) => format!("https://x-access-token:{token}@{rest}"),
+            (Some(token), _, Some(rest)) => format!("http://x-access-token:{token}@{rest}"),
+            _ => clone_url.clone(),
+        };
+        let mut clone = tokio::process::Command::new("git");
+        clone
+            .arg("clone")
+            .arg("--")
+            .arg(&authenticated_url)
+            .arg(&git_repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let signal = progress.read().await.cancel_signal.clone();
+        let output =
+            reposync_core::process::run(clone, std::time::Duration::from_secs(300), Some(&signal))
+                .await
+                .map_err(|e| AppError::Internal(format!("Git clone stopped or timed out: {e}")))?;
+        if !output.status.success() {
+            return Err(AppError::BadRequest(format!(
+                "Git target could not be cloned (exit {:?}); import held for inspection",
+                output.status.code()
+            )));
         }
+        GitClient::new(&git_repo_path)
+            .map_err(|e| AppError::Internal(format!("failed to open cloned git repo: {e}")))?
     };
+
+    // An empty bare target often advertises master even when this managed
+    // repository is configured for main. Align unborn HEAD before replay.
+    git_client
+        .ensure_head_on_branch(&repo.git_branch)
+        .map_err(|e| AppError::Internal(format!("failed to select import branch: {e}")))?;
 
     // 8. Configure git remote credentials
     git_client
         .ensure_remote_credentials("origin", git_token.as_deref())
         .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
 
-    // Install git-lfs hooks if available
-    let _ = std::process::Command::new("git")
-        .args(["lfs", "install"])
-        .current_dir(&git_repo_path)
-        .output();
+    if !import_query.reset {
+        let mut inspect = tokio::process::Command::new("git");
+        inspect
+            .args([
+                "ls-remote",
+                "--exit-code",
+                "origin",
+                &format!("refs/heads/{}", repo.git_branch),
+            ])
+            .current_dir(&git_repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let signal = progress.read().await.cancel_signal.clone();
+        let remote =
+            reposync_core::process::run(inspect, std::time::Duration::from_secs(60), Some(&signal))
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Git target inspection stopped or timed out: {e}"))
+                })?;
+        match remote.status.code() {
+            Some(0) => {
+                return Err(AppError::BadRequest(
+                    "Git target branch already exists; import baseline requires review".into(),
+                ))
+            }
+            Some(2) => {}
+            _ => {
+                return Err(AppError::BadRequest(
+                    "Git target could not be inspected; import held for review".into(),
+                ))
+            }
+        }
+    }
 
     let git_client = Arc::new(std::sync::Mutex::new(git_client));
 
@@ -776,6 +983,8 @@ async fn start_repo_import(
 
     let ws_broadcast = Some(state.ws_broadcast.clone());
     let repo_id_clone = id.clone();
+    let worker_operation_id = operation_id.clone();
+    let cancel_signal = progress.read().await.cancel_signal.clone();
 
     // 12. Spawn the import task (tracked for graceful shutdown)
     let state_for_handle = state.clone();
@@ -783,65 +992,120 @@ async fn start_repo_import(
         // Hold the busy guard for the entire lifetime of the import so
         // the scheduler skips this repo until we're done.
         let _busy_guard = busy_guard;
-        let result = import::run_full_import(
-            &svn_client,
-            &git_client,
-            &identity_mapper,
-            &import_db,
-            &file_policy,
-            &import_config,
-            ImportRunState {
-                progress: progress.clone(),
-                ws_broadcast: ws_broadcast.clone(),
-                repo_id: Some(repo_id_clone.clone()),
-            },
-        )
-        .await;
-
-        let mut p = progress.write().await;
-        match result {
-            Ok(count) => {
-                if p.phase != ImportPhase::Cancelled {
-                    p.phase = ImportPhase::Completed;
+        let current = import_db.get_import_operation(&repo_id_clone, &worker_operation_id);
+        let result = match current {
+            Ok(Some(op)) if op.cancel_requested => {
+                Ok(import::ImportOutcome::Cancelled { commits: 0 })
+            }
+            Ok(Some(_)) => {
+                match import_db.start_import_operation(&repo_id_clone, &worker_operation_id) {
+                    Ok(_) => {
+                        import::run_full_import(
+                            &svn_client,
+                            &git_client,
+                            &identity_mapper,
+                            &import_db,
+                            &file_policy,
+                            &import_config,
+                            ImportRunState {
+                                progress: progress.clone(),
+                                ws_broadcast: ws_broadcast.clone(),
+                                repo_id: Some(repo_id_clone.clone()),
+                                operation_id: Some(worker_operation_id.clone()),
+                                cancel_signal: Some(cancel_signal),
+                            },
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e.into()),
                 }
-                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                p.push_log(format!("[info] Import complete: {} commits created", count));
-                info!(repo_id = %repo_id_clone, count, "per-repo import completed successfully");
-
-                // Update repo watermark so scheduler knows where import ended.
-                // Read from the watermarks table (where run_full_import writes)
-                // or fall back to the import progress total_revs.
-                let last_rev = import_db
-                    .get_watermark("svn_rev")
+            }
+            Ok(None) => Err(anyhow::anyhow!("operation disappeared before start")),
+            Err(e) => Err(e.into()),
+        };
+        let terminal = match result {
+            Ok(import::ImportOutcome::Completed {
+                commits,
+                svn_rev,
+                git_sha,
+            }) => {
+                match import_db.complete_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    svn_rev,
+                    &git_sha,
+                ) {
+                    Ok(_) => {
+                        info!(repo_id = %repo_id_clone, commits, "per-repo import completed and confirmed");
+                        ImportPhase::Completed
+                    }
+                    Err(e) => {
+                        error!(repo_id = %repo_id_clone, error = %e, "import finalization failed");
+                        let _ = import_db.finish_import_operation(
+                            &repo_id_clone,
+                            &worker_operation_id,
+                            ImportOperationState::ReconciliationRequired,
+                            &format!("finalization failed: {e}"),
+                        );
+                        ImportPhase::Failed
+                    }
+                }
+            }
+            Ok(import::ImportOutcome::Cancelled { commits }) => {
+                let op = import_db
+                    .get_import_operation(&repo_id_clone, &worker_operation_id)
                     .ok()
-                    .flatten()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or_else(|| p.total_revs); // fallback to total revisions
-                let head_sha = {
-                    let g = git_client.lock().unwrap_or_else(|p| p.into_inner());
-                    g.get_head_sha().unwrap_or_default()
+                    .flatten();
+                let uncertain = op.as_ref().is_some_and(|o| o.intended_git_sha.is_some());
+                let state = if uncertain {
+                    ImportOperationState::ReconciliationRequired
+                } else {
+                    ImportOperationState::Cancelled
                 };
-                if last_rev > 0 {
-                    let _ = import_db.update_repo_watermark(&repo_id_clone, last_rev, &head_sha);
-                    // Also write per-repo kv_state keys for backward compat
-                    let _ = import_db.set_state(
-                        &format!("last_svn_rev_{}", repo_id_clone),
-                        &last_rev.to_string(),
-                    );
-                    let _ =
-                        import_db.set_state(&format!("last_git_sha_{}", repo_id_clone), &head_sha);
-                    info!(repo_id = %repo_id_clone, last_rev, %head_sha, "updated repo watermark after import");
+                let detail = format!(
+                    "stopped after {commits} local commits; published history is not undone"
+                );
+                if let Err(e) = import_db.finish_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    state,
+                    &detail,
+                ) {
+                    error!(repo_id = %repo_id_clone, error = %e, "cancel finalization failed");
+                    ImportPhase::Failed
+                } else if uncertain {
+                    ImportPhase::Failed
+                } else {
+                    ImportPhase::Cancelled
                 }
+            }
+            Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
+                if let Err(e) = import_db.finish_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    ImportOperationState::ReconciliationRequired,
+                    &reason,
+                ) {
+                    error!(repo_id = %repo_id_clone, error = %e, "uncertain outcome persistence failed");
+                }
+                ImportPhase::Failed
             }
             Err(e) => {
-                p.phase = ImportPhase::Failed;
-                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                let msg = format!("[error] Import failed: {}", e);
-                p.push_log(msg.clone());
-                p.errors.push(msg);
-                error!(repo_id = %repo_id_clone, "per-repo import failed: {}", e);
+                let detail = format!("import stopped with error; inspect local work: {e}");
+                if let Err(write_error) = import_db.finish_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    ImportOperationState::Failed,
+                    &detail,
+                ) {
+                    error!(repo_id = %repo_id_clone, error = %write_error, "failure persistence failed");
+                }
+                ImportPhase::Failed
             }
-        }
+        };
+        let mut p = progress.write().await;
+        p.phase = terminal;
+        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
         if let Err(e) = import_db.persist_import_progress(&p) {
             tracing::warn!(
@@ -871,10 +1135,13 @@ async fn start_repo_import(
         handles.retain(|h| !h.is_finished());
         handles.push(handle);
     }
+    preparation_guard.armed = false;
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "message": "Import started",
+        "operation_id": operation_id,
+        "lifecycle": "queued",
     })))
 }
 
@@ -882,8 +1149,8 @@ async fn repo_import_status(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<ImportProgress>, AppError> {
-    validate_session(
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (user_id, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -891,14 +1158,148 @@ async fn repo_import_status(
 
     // Verify the repository exists
     let db = &state.db;
-    let _repo = db
+    let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
+    let op = db
+        .latest_import_operation(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if role != "admin" && op.as_ref().is_none_or(|o| o.initiator_id != user_id) {
+        return Err(AppError::Unauthorized(
+            "import status requires initiating context or admin".into(),
+        ));
+    }
     let progress = state.get_repo_import_progress(&id).await;
     let p = progress.read().await;
-    Ok(Json(p.clone()))
+    let mut value = serde_json::to_value(&*p).map_err(|e| AppError::Internal(e.to_string()))?;
+    value.as_object_mut().unwrap().insert(
+        "can_start".into(),
+        serde_json::json!(op.is_none() && repo.last_svn_rev == 0 && repo.last_sync_at.is_none()),
+    );
+    if let Some(op) = op {
+        let terminal_phase = match op.state {
+            ImportOperationState::Queued
+            | ImportOperationState::Running
+            | ImportOperationState::CancelRequested
+            | ImportOperationState::Cancelling => None,
+            ImportOperationState::Completed => Some("completed"),
+            ImportOperationState::Cancelled => Some("cancelled"),
+            ImportOperationState::Failed | ImportOperationState::ReconciliationRequired => {
+                Some("failed")
+            }
+        };
+        let object = value.as_object_mut().unwrap();
+        if let Some(phase) = terminal_phase {
+            object.insert("phase".into(), serde_json::json!(phase));
+        }
+        object.insert("operation_id".into(), serde_json::json!(op.id));
+        object.insert("lifecycle".into(), serde_json::to_value(&op.state).unwrap());
+        object.insert(
+            "current_rev".into(),
+            serde_json::json!(op.processed_revisions),
+        );
+        object.insert(
+            "total_revs".into(),
+            serde_json::json!(op.total_revisions.unwrap_or(0)),
+        );
+        object.insert(
+            "commits_created".into(),
+            serde_json::json!(op.local_commits),
+        );
+        object.insert(
+            "batches_pushed".into(),
+            serde_json::json!(op.confirmed_batches),
+        );
+        object.insert(
+            "last_local_svn_rev".into(),
+            serde_json::json!(op.last_local_svn_rev),
+        );
+        object.insert(
+            "last_local_git_sha".into(),
+            serde_json::json!(op.last_local_git_sha),
+        );
+        object.insert(
+            "last_confirmed_svn_rev".into(),
+            serde_json::json!(op.last_confirmed_svn_rev),
+        );
+        object.insert(
+            "last_confirmed_git_sha".into(),
+            serde_json::json!(op.last_confirmed_git_sha),
+        );
+        object.insert("intended_ref".into(), serde_json::json!(op.intended_ref));
+        object.insert(
+            "intended_git_sha".into(),
+            serde_json::json!(op.intended_git_sha),
+        );
+        object.insert(
+            "outcome_detail".into(),
+            serde_json::json!(op.outcome_detail),
+        );
+        object.insert("started_at".into(), serde_json::json!(op.created_at));
+        if op.state.is_terminal() {
+            object.insert("completed_at".into(), serde_json::json!(op.updated_at));
+        }
+    }
+    Ok(Json(value))
+}
+
+async fn cancel_repo_import(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, operation_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    state
+        .db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    let op = state
+        .db
+        .get_import_operation(&id, &operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("import operation not found for repository".into()))?;
+    if role != "admin" && op.initiator_id != user_id {
+        return Err(AppError::Unauthorized(
+            "import cancellation requires initiating context or admin".into(),
+        ));
+    }
+    let op = state
+        .db
+        .request_import_cancel(&id, &operation_id)
+        .map_err(import_write_error)?;
+    if !op.state.is_terminal() {
+        let progress = state.get_repo_import_progress(&id).await;
+        let mut p = progress.write().await;
+        p.cancel_requested = true;
+        p.cancel_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(Json(serde_json::json!({
+        "ok": true, "operation_id": operation_id, "lifecycle": op.state,
+        "message": if op.state.is_terminal() { "terminal outcome retained" } else { "cancellation durably requested; worker still stopping" },
+    })))
+}
+
+async fn cancel_repo_import_without_id(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    Err(AppError::BadRequest(
+        "exact operation ID required; use /api/repos/{id}/import/{operation_id}/cancel".into(),
+    ))
 }
 
 async fn get_credentials(
@@ -1101,6 +1502,7 @@ async fn create_branch_pair(
     }
 
     let db = &state.db;
+    reject_held_import(db, &id)?;
 
     // Load parent repo
     let parent = db
@@ -1544,6 +1946,7 @@ async fn delete_branch_pair(
     }
 
     // Acquire busy guard to prevent sync/import racing
+    reject_held_import(&state.db, &id)?;
     let _busy_guard = reposync_core::busy::try_acquire(&id).ok_or_else(|| {
         AppError::BadRequest("branch pair is currently busy (sync or import in progress)".into())
     })?;
@@ -1873,6 +2276,7 @@ async fn skip_commit(
     }
 
     let db = &state.db;
+    reject_held_import(db, &id)?;
     let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
@@ -1955,6 +2359,7 @@ async fn retry_repo(
     }
 
     let db = &state.db;
+    reject_held_import(db, &id)?;
     let _ = db.reset_consecutive_errors(&id);
     let _ = db.conn().execute(
         "UPDATE repositories SET sync_status = 'idle' WHERE id = ?1",

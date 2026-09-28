@@ -19,6 +19,7 @@ pub mod lfs;
 pub mod models;
 pub mod notify;
 pub mod personal_config;
+pub mod process;
 pub mod svn;
 pub mod sync_engine;
 

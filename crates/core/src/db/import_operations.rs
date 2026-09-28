@@ -33,7 +33,7 @@ impl ImportOperationState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportOperation {
     pub version: u8,
     pub id: String,
@@ -46,6 +46,14 @@ pub struct ImportOperation {
     pub updated_at: String,
     pub state: ImportOperationState,
     pub cancel_requested: bool,
+    #[serde(default)]
+    pub processed_revisions: u64,
+    #[serde(default)]
+    pub total_revisions: Option<u64>,
+    #[serde(default)]
+    pub local_commits: u64,
+    #[serde(default)]
+    pub confirmed_batches: u64,
     pub last_local_svn_rev: Option<i64>,
     pub last_local_git_sha: Option<String>,
     pub last_confirmed_svn_rev: Option<i64>,
@@ -88,6 +96,14 @@ fn parse(raw: &str) -> Result<ImportOperation, DatabaseError> {
 }
 
 impl Database {
+    pub fn has_any_active_import_operation(&self) -> Result<bool, DatabaseError> {
+        let conn = self.conn();
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key LIKE 'import_operation_v1:active:%')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? != 0)
+    }
     pub fn create_import_operation(
         &self,
         repo_id: &str,
@@ -115,6 +131,10 @@ impl Database {
                 updated_at: now,
                 state: ImportOperationState::Queued,
                 cancel_requested: false,
+                processed_revisions: 0,
+                total_revisions: None,
+                local_commits: 0,
+                confirmed_batches: 0,
                 last_local_svn_rev: None,
                 last_local_git_sha: None,
                 last_confirmed_svn_rev: None,
@@ -147,11 +167,11 @@ impl Database {
                 |r| r.get(0),
             )
             .optional()?;
-        raw.map(|v| parse(&v)).transpose().and_then(|op| {
+        raw.map(|v| parse(&v)).transpose().map(|op| {
             if op.as_ref().is_some_and(|o| o.repo_id != repo_id) {
-                Ok(None)
+                None
             } else {
-                Ok(op)
+                op
             }
         })
     }
@@ -177,7 +197,7 @@ impl Database {
     }
 
     /// Compare-and-update exact active identity; closure runs under the transaction.
-    pub fn update_import_operation<F>(
+    fn update_import_operation<F>(
         &self,
         repo_id: &str,
         op_id: &str,
@@ -202,7 +222,11 @@ impl Database {
                     "import operation repository mismatch".into(),
                 ));
             }
+            let original = op.clone();
             edit(&mut op)?;
+            if op == original {
+                return Ok(op);
+            }
             op.updated_at = Utc::now().to_rfc3339();
             write_value(tx, &document, &serde_json::to_string(&op).unwrap())?;
             if op.state == ImportOperationState::Completed {
@@ -255,6 +279,8 @@ impl Database {
         op_id: &str,
         svn_rev: i64,
         sha: &str,
+        processed_revisions: u64,
+        local_commits: u64,
     ) -> Result<ImportOperation, DatabaseError> {
         self.update_import_operation(repo_id, op_id, |op| {
             if !matches!(
@@ -270,8 +296,29 @@ impl Database {
             }
             op.last_local_svn_rev = Some(svn_rev);
             op.last_local_git_sha = Some(sha.into());
+            op.processed_revisions = processed_revisions;
+            op.local_commits = local_commits;
             Ok(())
         })
+    }
+
+    pub fn note_import_total(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        total: u64,
+    ) -> Result<(), DatabaseError> {
+        self.update_import_operation(repo_id, op_id, |op| {
+            if !matches!(
+                op.state,
+                ImportOperationState::Running | ImportOperationState::CancelRequested
+            ) {
+                return Err(DatabaseError::Other("import is not running".into()));
+            }
+            op.total_revisions = Some(total);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn begin_import_publication(
@@ -316,6 +363,7 @@ impl Database {
             }
             op.last_confirmed_svn_rev = op.last_local_svn_rev;
             op.last_confirmed_git_sha = Some(observed_sha.into());
+            op.confirmed_batches += 1;
             op.intended_ref = None;
             op.intended_git_sha = None;
             Ok(())
@@ -339,9 +387,12 @@ impl Database {
             return Err(DatabaseError::Other("invalid held terminal state".into()));
         }
         self.update_import_operation(repo_id, op_id, |op| {
-            if op.state == ImportOperationState::Completed {
+            if op.state.is_terminal() {
+                if op.state == state {
+                    return Ok(());
+                }
                 return Err(DatabaseError::Other(
-                    "completed import cannot be rewritten".into(),
+                    "terminal import outcome cannot be rewritten".into(),
                 ));
             }
             op.state = state;
@@ -365,7 +416,7 @@ impl Database {
             }
             let document = key("document", op_id);
             let mut op = parse(&read_value(tx, &document)?.ok_or_else(|| DatabaseError::Other("missing operation document".into()))?)?;
-            if op.repo_id != repo_id || op.state != ImportOperationState::Running || op.cancel_requested || op.intended_git_sha.is_some()
+            if op.repo_id != repo_id || !matches!(op.state, ImportOperationState::Running | ImportOperationState::CancelRequested) || op.intended_git_sha.is_some()
                 || op.last_local_svn_rev != Some(svn_rev) || op.last_confirmed_svn_rev != Some(svn_rev)
                 || op.last_local_git_sha.as_deref() != Some(sha) || op.last_confirmed_git_sha.as_deref() != Some(sha) {
                 return Err(DatabaseError::Other("import lacks a fully confirmed final tip".into()));
@@ -385,16 +436,29 @@ impl Database {
 
     /// Unfinished jobs cannot be mistaken for completed jobs after process restart.
     pub fn hold_interrupted_imports(&self) -> Result<(), DatabaseError> {
-        let repos = self.list_repositories()?;
-        for repo in repos {
-            if let Some(op) = self.active_import_operation(&repo.id)? {
-                if !op.state.is_terminal() {
-                    self.update_import_operation(&repo.id, &op.id, |o| {
-                        o.state = ImportOperationState::ReconciliationRequired;
-                        o.outcome_detail = Some("worker stopped before a verified terminal result; inspect local and remote refs".into());
-                        Ok(())
-                    })?;
-                }
+        let active = {
+            let conn = self.conn();
+            let mut query = conn.prepare(
+                "SELECT key,value FROM kv_state WHERE key LIKE 'import_operation_v1:active:%'",
+            )?;
+            let rows = query
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (active_key, id) in active {
+            let repo_id = active_key
+                .strip_prefix(&key("active", ""))
+                .ok_or_else(|| DatabaseError::Other("invalid active import key".into()))?;
+            let op = self.get_import_operation(repo_id, &id)?.ok_or_else(|| {
+                DatabaseError::Other("active import document missing or misowned".into())
+            })?;
+            if !op.state.is_terminal() {
+                self.update_import_operation(repo_id, &op.id, |o| {
+                    o.state = ImportOperationState::ReconciliationRequired;
+                    o.outcome_detail = Some("worker stopped before a verified terminal result; inspect local and remote refs".into());
+                    Ok(())
+                })?;
             }
         }
         Ok(())
@@ -432,8 +496,7 @@ mod tests {
         reopened.initialize().unwrap();
         reopened.hold_interrupted_imports().unwrap();
         let op = reopened.latest_import_operation("repo-a").unwrap().unwrap();
-        // No repository registration was added, so the journal remains held by its active pointer.
-        assert_eq!(op.state, ImportOperationState::CancelRequested);
+        assert_eq!(op.state, ImportOperationState::ReconciliationRequired);
         assert!(reopened
             .active_import_operation("repo-a")
             .unwrap()

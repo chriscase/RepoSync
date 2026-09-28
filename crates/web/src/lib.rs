@@ -94,6 +94,8 @@ impl WebServer {
         config_path: std::path::PathBuf,
         import_progress: Arc<tokio::sync::RwLock<ImportProgress>>,
     ) -> Self {
+        db.hold_interrupted_imports()
+            .expect("cannot safely start while import operation recovery state is unwritable");
         let (ws_tx, _) = broadcast::channel(256);
         let state = Arc::new(AppState {
             db,
