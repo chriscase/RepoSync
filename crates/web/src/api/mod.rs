@@ -4,6 +4,8 @@ pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod conflicts;
+#[cfg(feature = "reliability-fixture")]
+pub mod copy_inspection;
 pub mod repos;
 pub mod seed;
 pub mod setup;

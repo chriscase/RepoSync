@@ -5,6 +5,7 @@
 !scripts/
 !scripts/reliability-prep.py
 !scripts/reliability-runtime.py
+!scripts/reliability-copy-consumer.mjs
 !scripts/reliability_scan.py
 !docs/
 !docs/reliability/

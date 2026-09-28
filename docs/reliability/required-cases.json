@@ -499,6 +499,18 @@
       "binary": "copy_migration",
       "test": "nullable_dto_readonly_matrix",
       "tier": "candidate_regression"
+    },
+    {
+      "id": "N01_FRONTIER",
+      "binary": "copy_migration",
+      "test": "n01_frontier_identity_preservation",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "S54_HTTP_COPY",
+      "binary": "copy_inspection",
+      "test": "copy_only_http_to_javascript_journey",
+      "tier": "candidate_regression"
     }
   ]
 }
