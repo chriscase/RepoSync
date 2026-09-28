@@ -9,17 +9,21 @@ base_tree="$(git rev-parse "$base_sha^{tree}")"
 previous_tree="$(git rev-parse "$previous_sha^{tree}")"
 immediate_sha=ab097580d9415ae2f8df44bed4041f740a1b38f2
 immediate_tree="$(git rev-parse "$immediate_sha^{tree}")"
+merged_sha=6b4b3587f6f442ec40e9308b13f2b927bf84f19a
+merged_tree="$(git rev-parse "$merged_sha^{tree}")"
 candidate_sha="$(git rev-parse HEAD)"
 candidate_tree="$(git rev-parse HEAD^{tree})"
 comparison_dir="$repo_root/artifacts/reliability-compare/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$comparison_dir/base" "$comparison_dir/previous" "$comparison_dir/immediate" "$comparison_dir/candidate"
+mkdir -p "$comparison_dir/base" "$comparison_dir/previous" "$comparison_dir/immediate" "$comparison_dir/merged" "$comparison_dir/candidate"
 base_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-reviewed-base.XXXXXX")"
 previous_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-previous-head.XXXXXX")"
 immediate_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-immediate-reviewed.XXXXXX")"
-trap 'rm -rf "$base_context" "$previous_context" "$immediate_context"' EXIT
+merged_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-merged-start.XXXXXX")"
+trap 'rm -rf "$base_context" "$previous_context" "$immediate_context" "$merged_context"' EXIT
 git archive "$base_sha" | tar -x -C "$base_context"
 git archive "$previous_sha" | tar -x -C "$previous_context"
 git archive "$immediate_sha" | tar -x -C "$immediate_context"
+git archive "$merged_sha" | tar -x -C "$merged_context"
 
 # This overlay changes no base runtime source. The old test fixture needs an
 # explicit synthetic SVN author when running as the container's numeric user.
@@ -49,6 +53,11 @@ cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliabilit
 cp docs/reliability/fixtures/Cargo.lock "$immediate_context/docs/reliability/fixtures/"
 cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$immediate_context/docs/reliability/"
 
+cp Dockerfile.reliability .dockerignore "$merged_context/"
+cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py scripts/reliability-inventory.py scripts/reliability-inventory-probes.py scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$merged_context/scripts/"
+cp docs/reliability/fixtures/Cargo.lock "$merged_context/docs/reliability/fixtures/"
+cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$merged_context/docs/reliability/"
+
 REPOSYNC_BUILD_CONTEXT="$base_context" \
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$base_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$base_tree" \
@@ -64,6 +73,11 @@ REPOSYNC_SOURCE_HEAD_OVERRIDE="$immediate_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$immediate_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/immediate" \
   scripts/reliability-container.sh --baseline
+REPOSYNC_BUILD_CONTEXT="$merged_context" \
+REPOSYNC_SOURCE_HEAD_OVERRIDE="$merged_sha" \
+REPOSYNC_SOURCE_TREE_OVERRIDE="$merged_tree" \
+REPOSYNC_ARTIFACT_DIR="$comparison_dir/merged" \
+  scripts/reliability-container.sh --baseline
 REPOSYNC_SOURCE_HEAD_OVERRIDE="$candidate_sha" \
 REPOSYNC_SOURCE_TREE_OVERRIDE="$candidate_tree" \
 REPOSYNC_ARTIFACT_DIR="$comparison_dir/candidate" \
@@ -75,3 +89,5 @@ python3 scripts/reliability-compare.py "$comparison_dir/previous/baseline-result
 echo "Matched comparison artifact: $comparison_dir"
 python3 scripts/reliability-compare.py "$comparison_dir/immediate/baseline-results.json" \
   "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/immediate-comparison.json"
+python3 scripts/reliability-compare.py "$comparison_dir/merged/baseline-results.json" \
+  "$comparison_dir/candidate/baseline-results.json" "$comparison_dir/merged-comparison.json"
