@@ -116,7 +116,7 @@ impl GitClient {
     /// Hard-reset HEAD to a specific commit SHA.
     /// Used to roll back failed pushes so bad commits don't accumulate.
     pub fn reset_hard(&self, sha: &str) -> Result<(), GitError> {
-        let oid = git2::Oid::from_str(sha).map_err(|e| GitError::Git2Error(e))?;
+        let oid = git2::Oid::from_str(sha).map_err(GitError::Git2Error)?;
         let commit = self.repo.find_commit(oid).map_err(GitError::from)?;
         self.repo
             .reset(commit.as_object(), git2::ResetType::Hard, None)

@@ -144,9 +144,10 @@ impl SvnToGitSync {
                 .with_context(|| format!("failed to export SVN revision r{}", rev))?;
 
             // 6. Copy exported files into the Git working tree (with policy).
-            let git_client = self.git_client.lock().unwrap();
-            let repo_path = git_client.repo_path().to_path_buf();
-            drop(git_client); // Release lock before blocking I/O.
+            let repo_path = {
+                let git_client = self.git_client.lock().unwrap();
+                git_client.repo_path().to_path_buf()
+            }; // Release lock before blocking I/O.
 
             let skipped =
                 Self::copy_tree_with_policy(export_dir.path(), &repo_path, &self.policy, &self.db)

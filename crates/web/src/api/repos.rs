@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::Database;
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
-use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress};
+use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress, ImportRunState};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
@@ -789,9 +790,11 @@ async fn start_repo_import(
             &import_db,
             &file_policy,
             &import_config,
-            progress.clone(),
-            ws_broadcast.clone(),
-            Some(repo_id_clone.clone()),
+            ImportRunState {
+                progress: progress.clone(),
+                ws_broadcast: ws_broadcast.clone(),
+                repo_id: Some(repo_id_clone.clone()),
+            },
         )
         .await;
 
@@ -1618,19 +1621,19 @@ async fn delete_branch_pair(
         .map_err(|e| AppError::Internal(format!("database error during deletion: {}", e)))?;
 
     // Audit log (written to parent's audit trail since the child repo no longer exists)
-    let _ = db.insert_audit_log_with_repo(
-        "deleted_branch_pair",
-        None,
-        None,
-        None,
-        None,
-        Some(&format!(
+    let _ = db.insert_audit_log_with_repo(AuditLogInput {
+        action: "deleted_branch_pair",
+        direction: None,
+        svn_rev: None,
+        git_sha: None,
+        author: None,
+        details: Some(&format!(
             "Deleted branch pair '{}' (git: {}, svn: {})",
             repo_name, repo.git_branch, repo.svn_branch
         )),
-        true,
-        Some(parent_id),
-    );
+        success: true,
+        repo_id: Some(parent_id),
+    });
 
     info!(
         repo_id = %id,
@@ -1903,20 +1906,20 @@ async fn skip_commit(
         rusqlite::params![&id],
     );
 
-    let _ = db.insert_audit_log_with_repo(
-        "skip_commit",
-        None,
-        None,
-        Some(&head_sha),
-        None,
-        Some(&format!(
+    let _ = db.insert_audit_log_with_repo(AuditLogInput {
+        action: "skip_commit",
+        direction: None,
+        svn_rev: None,
+        git_sha: Some(&head_sha),
+        author: None,
+        details: Some(&format!(
             "Skipped from {} to HEAD {}",
             &old_sha[..8.min(old_sha.len())],
             &head_sha[..8.min(head_sha.len())]
         )),
-        true,
-        Some(&id),
-    );
+        success: true,
+        repo_id: Some(&id),
+    });
 
     info!(
         repo_id = %id,

@@ -287,9 +287,10 @@ impl<'a> InitialImport<'a> {
             .await
             .context("failed to get SVN log")?;
 
-        let git_client_guard = self.git_client.lock().unwrap();
-        let repo_path = git_client_guard.repo_path().to_path_buf();
-        drop(git_client_guard);
+        let repo_path = {
+            let git_client_guard = self.git_client.lock().unwrap();
+            git_client_guard.repo_path().to_path_buf()
+        };
 
         for entry in &log_entries {
             let rev = entry.revision;

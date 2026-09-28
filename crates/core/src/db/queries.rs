@@ -78,6 +78,18 @@ pub struct AuditLogEntry {
     pub repo_id: Option<String>,
 }
 
+/// Values to persist for one audit event, including its repository scope.
+pub struct AuditLogInput<'a> {
+    pub action: &'a str,
+    pub direction: Option<&'a str>,
+    pub svn_rev: Option<i64>,
+    pub git_sha: Option<&'a str>,
+    pub author: Option<&'a str>,
+    pub details: Option<&'a str>,
+    pub success: bool,
+    pub repo_id: Option<&'a str>,
+}
+
 // ---------------------------------------------------------------------------
 // Query implementations
 // ---------------------------------------------------------------------------
@@ -711,23 +723,33 @@ impl Database {
         details: Option<&str>,
         success: bool,
     ) -> Result<i64, DatabaseError> {
-        self.insert_audit_log_with_repo(
-            action, direction, svn_rev, git_sha, author, details, success, None,
-        )
+        self.insert_audit_log_with_repo(AuditLogInput {
+            action,
+            direction,
+            svn_rev,
+            git_sha,
+            author,
+            details,
+            success,
+            repo_id: None,
+        })
     }
 
     /// Insert an audit log entry tagged with an optional `repo_id`.
     pub fn insert_audit_log_with_repo(
         &self,
-        action: &str,
-        direction: Option<&str>,
-        svn_rev: Option<i64>,
-        git_sha: Option<&str>,
-        author: Option<&str>,
-        details: Option<&str>,
-        success: bool,
-        repo_id: Option<&str>,
+        input: AuditLogInput<'_>,
     ) -> Result<i64, DatabaseError> {
+        let AuditLogInput {
+            action,
+            direction,
+            svn_rev,
+            git_sha,
+            author,
+            details,
+            success,
+            repo_id,
+        } = input;
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
         conn.execute(
@@ -1535,17 +1557,19 @@ impl Database {
                     _ => crate::import::ImportPhase::Idle,
                 };
                 let errors: Vec<String> = serde_json::from_str(&errors_json).unwrap_or_default();
-                let mut progress = crate::import::ImportProgress::default();
-                progress.phase = phase;
-                progress.current_rev = current_rev;
-                progress.total_revs = total_revs;
-                progress.commits_created = commits_created as u64;
-                progress.batches_pushed = batches_pushed as u64;
-                progress.lfs_unique_count = lfs_unique_count as u64;
-                progress.files_skipped = files_skipped as u64;
-                progress.errors = errors;
-                progress.started_at = started_at;
-                progress.completed_at = completed_at;
+                let progress = crate::import::ImportProgress {
+                    phase,
+                    current_rev,
+                    total_revs,
+                    commits_created: commits_created as u64,
+                    batches_pushed: batches_pushed as u64,
+                    lfs_unique_count: lfs_unique_count as u64,
+                    files_skipped: files_skipped as u64,
+                    errors,
+                    started_at,
+                    completed_at,
+                    ..Default::default()
+                };
                 Ok(Some(progress))
             }
             Some(Err(e)) => Err(e.into()),

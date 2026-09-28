@@ -155,7 +155,7 @@ async fn get_status(
     let last_git_hash = db
         .get_state("last_git_hash")
         .unwrap_or(None)
-        .and_then(|s| if s.is_empty() { None } else { Some(s) })
+        .filter(|s| !s.is_empty())
         .or_else(|| db.get_last_git_hash().ok().flatten());
     let total_syncs = db.count_sync_records().unwrap_or(0);
     let total_conflicts = db.count_all_conflicts().unwrap_or(0);

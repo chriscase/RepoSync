@@ -665,7 +665,7 @@ async fn main() -> Result<()> {
     // This allows admin to configure via the Settings UI without restarting
     {
         let check_db =
-            reposync_core::db::Database::new(&config.daemon.data_dir.join("reposync.db")).ok();
+            reposync_core::db::Database::new(config.daemon.data_dir.join("reposync.db")).ok();
         let db_teams_url = check_db
             .and_then(|db| db.get_state("teams_webhook_url").ok().flatten())
             .filter(|v| !v.is_empty());

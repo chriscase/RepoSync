@@ -25,6 +25,7 @@ use crate::config::{AppConfig, SvnLayout};
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
+use crate::db::queries::AuditLogInput;
 use crate::db::Database;
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
@@ -1258,10 +1259,7 @@ impl SyncEngine {
         match run(&["rev-parse", "--is-shallow-repository"]) {
             Ok(output)
                 if output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).trim() == "false" =>
-            {
-                ()
-            }
+                    && String::from_utf8_lossy(&output.stdout).trim() == "false" => {}
             Ok(output) if output.status.success() => blocked!(
                 "incomplete_history",
                 "bridge is shallow; ancestry is incomplete"
@@ -1545,11 +1543,11 @@ impl SyncEngine {
                             warn!(path = %cf.path, "git apply succeeded but file NOT at expected path");
                         }
                     }
-                } else {
-                    apply_error = Some(result.as_ref().unwrap_err().to_string());
+                } else if let Err(error) = &result {
+                    apply_error = Some(error.to_string());
                     warn!(
                         rev = change.revision,
-                        error = %result.as_ref().unwrap_err(),
+                        error = %error,
                         "git apply failed"
                     );
                 }
@@ -1590,16 +1588,16 @@ impl SyncEngine {
                         .map_err(SyncError::DatabaseError)?;
                 }
                 self.db
-                    .insert_audit_log_with_repo(
-                        "svn_to_git_no_target",
-                        Some("svn_to_git"),
-                        Some(change.revision),
-                        None,
-                        Some(&change.author),
-                        Some("No file-content delta under active SVN path"),
-                        true,
-                        self.effective_repo_id(),
-                    )
+                    .insert_audit_log_with_repo(AuditLogInput {
+                        action: "svn_to_git_no_target",
+                        direction: Some("svn_to_git"),
+                        svn_rev: Some(change.revision),
+                        git_sha: None,
+                        author: Some(&change.author),
+                        details: Some("No file-content delta under active SVN path"),
+                        success: true,
+                        repo_id: self.effective_repo_id(),
+                    })
                     .map_err(SyncError::DatabaseError)?;
                 continue;
             }
@@ -1614,20 +1612,20 @@ impl SyncEngine {
                     files = change.changed_files.len(),
                     "git apply failed for SVN revision; stopping at durable frontier"
                 );
-                let _ = self.db.insert_audit_log_with_repo(
-                    "svn_to_git_apply_failed",
-                    Some("svn_to_git"),
-                    Some(change.revision),
-                    None,
-                    Some(&change.author),
-                    Some(&format!(
+                let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                    action: "svn_to_git_apply_failed",
+                    direction: Some("svn_to_git"),
+                    svn_rev: Some(change.revision),
+                    git_sha: None,
+                    author: Some(&change.author),
+                    details: Some(&format!(
                         "Stopped at unapplied r{}: git apply failed. Message: {}",
                         change.revision,
                         change.message.lines().next().unwrap_or("")
                     )),
-                    false,
-                    self.effective_repo_id(),
-                );
+                    success: false,
+                    repo_id: self.effective_repo_id(),
+                });
                 return Err(SyncError::GitError(crate::errors::GitError::ApplyFailed(
                     format!(
                         "SVN r{} could not be applied; later revisions remain pending: {}",
@@ -1812,20 +1810,20 @@ impl SyncEngine {
             *applied += 1;
 
             // Audit log for successful sync
-            let _ = self.db.insert_audit_log_with_repo(
-                "sync_cycle",
-                Some("svn_to_git"),
-                Some(change.revision),
-                Some(&git_sha),
-                Some(&change.author),
-                Some(&format!(
+            let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                action: "sync_cycle",
+                direction: Some("svn_to_git"),
+                svn_rev: Some(change.revision),
+                git_sha: Some(&git_sha),
+                author: Some(&change.author),
+                details: Some(&format!(
                     "synced SVN r{} -> Git {}",
                     change.revision,
                     &git_sha[..8.min(git_sha.len())]
                 )),
-                true,
-                self.repo_id.as_deref(),
-            );
+                success: true,
+                repo_id: self.repo_id.as_deref(),
+            });
 
             info!(
                 rev = change.revision,
@@ -1880,7 +1878,7 @@ impl SyncEngine {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 // Use the pre-populated changed_files from fetch_git_changes
                 // instead of re-calling get_changed_files (P5 optimization).
-                let contents: Result<Vec<(String, String, Option<Vec<u8>>)>, SyncError> = change
+                let contents: Result<Vec<_>, SyncError> = change
                     .changed_files
                     .iter()
                     .map(|f| -> Result<_, SyncError> {
@@ -2246,18 +2244,17 @@ impl SyncEngine {
                         if action == "D" {
                             return false;
                         }
-                        if !self.allowed_paths.is_empty() {
-                            if !self
+                        if !self.allowed_paths.is_empty()
+                            && !self
                                 .allowed_paths
                                 .iter()
                                 .any(|prefix| path.starts_with(prefix))
-                            {
-                                return true;
-                            }
+                        {
+                            return true;
                         }
                         for pattern in &self.blocked_patterns {
-                            let matches = if pattern.starts_with('*') {
-                                path.ends_with(&pattern[1..])
+                            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
+                                path.ends_with(suffix)
                             } else if pattern.ends_with('/') {
                                 path.starts_with(pattern)
                             } else {
@@ -2296,20 +2293,20 @@ impl SyncEngine {
                             )
                             .map_err(SyncError::DatabaseError)?;
                     }
-                    let _ = self.db.insert_audit_log_with_repo(
-                        "path_violation_skipped",
-                        Some("git_to_svn"),
-                        None,
-                        Some(&change.sha),
-                        Some(&change.author_name),
-                        Some(&format!(
+                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                        action: "path_violation_skipped",
+                        direction: Some("git_to_svn"),
+                        svn_rev: None,
+                        git_sha: Some(&change.sha),
+                        author: Some(&change.author_name),
+                        details: Some(&format!(
                             "Skipped entire commit {}: {}",
                             &change.sha[..8.min(change.sha.len())],
                             violations.join("; ")
                         )),
-                        false,
-                        self.effective_repo_id(),
-                    );
+                        success: false,
+                        repo_id: self.effective_repo_id(),
+                    });
                     continue;
                 }
 
@@ -2335,22 +2332,22 @@ impl SyncEngine {
                     "reverted violating files, proceeding with valid files only"
                 );
 
-                let _ = self.db.insert_audit_log_with_repo(
-                    "path_violation_filtered",
-                    Some("git_to_svn"),
-                    None,
-                    Some(&change.sha),
-                    Some(&change.author_name),
-                    Some(&format!(
+                let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+    action: "path_violation_filtered",
+    direction: Some("git_to_svn"),
+    svn_rev: None,
+    git_sha: Some(&change.sha),
+    author: Some(&change.author_name),
+    details: Some(&format!(
                         "Commit {} filtered: removed {} violating file(s), synced {} valid file(s). Violations: {}",
                         &change.sha[..8.min(change.sha.len())],
                         violating_paths.len(),
                         valid_count,
                         violations.join("; ")
                     )),
-                    true,
-                    self.effective_repo_id(),
-                );
+    success: true,
+    repo_id: self.effective_repo_id(),
+});
             }
 
             // 5. Commit to SVN.
@@ -2471,20 +2468,20 @@ impl SyncEngine {
             count += 1;
 
             // Audit log for successful sync
-            let _ = self.db.insert_audit_log_with_repo(
-                "sync_cycle",
-                Some("git_to_svn"),
-                Some(svn_rev),
-                Some(&change.sha),
-                Some(&change.author_name),
-                Some(&format!(
+            let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                action: "sync_cycle",
+                direction: Some("git_to_svn"),
+                svn_rev: Some(svn_rev),
+                git_sha: Some(&change.sha),
+                author: Some(&change.author_name),
+                details: Some(&format!(
                     "synced Git {} -> SVN r{}",
                     &change.sha[..8.min(change.sha.len())],
                     svn_rev
                 )),
-                true,
-                self.repo_id.as_deref(),
-            );
+                success: true,
+                repo_id: self.repo_id.as_deref(),
+            });
 
             info!(
                 sha = %change.sha,
@@ -2601,14 +2598,11 @@ impl SyncEngine {
                         // When using standard layout, only sync files under trunk/
                         // and strip the trunk prefix so git paths are repo-relative.
                         let mapped_path = if let Some(ref prefix) = trunk_prefix {
-                            if let Some(rest) = raw.strip_prefix(prefix.as_str()) {
-                                if rest.is_empty() {
-                                    return None; // skip bare trunk/ directory entry
-                                }
-                                rest.to_string()
-                            } else {
-                                return None; // skip non-trunk paths (branches/, tags/)
+                            let rest = raw.strip_prefix(prefix.as_str())?;
+                            if rest.is_empty() {
+                                return None; // skip bare trunk/ directory entry
                             }
+                            rest.to_string()
                         } else {
                             raw.to_string()
                         };
@@ -2988,8 +2982,7 @@ async fn apply_diff_to_path_revision(
     // and begins processing. Without closing, git apply may hang forever.
     {
         let mut stdin = child.stdin.take().ok_or_else(|| {
-            crate::errors::GitError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            crate::errors::GitError::IoError(std::io::Error::other(
                 "failed to open git apply stdin",
             ))
         })?;
@@ -3090,8 +3083,8 @@ pub(crate) fn validate_file_paths_impl(
             }
         }
         for pattern in blocked_patterns {
-            let matches = if pattern.starts_with('*') {
-                path.ends_with(&pattern[1..])
+            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
+                path.ends_with(suffix)
             } else if pattern.ends_with('/') {
                 path.starts_with(pattern)
             } else {

@@ -348,11 +348,7 @@ async fn test_git_connection(
         }));
     }
 
-    let check_url = if body.provider == "gitea" {
-        format!("{}/repos/{}", api_url, repo)
-    } else {
-        format!("{}/repos/{}", api_url, repo)
-    };
+    let check_url = format!("{}/repos/{}", api_url, repo);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -869,9 +865,11 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
             &import_db,
             &file_policy,
             &import_config,
-            progress.clone(),
-            ws_broadcast.clone(),
-            None, // setup wizard doesn't have a repo_id yet
+            import::ImportRunState {
+                progress: progress.clone(),
+                ws_broadcast: ws_broadcast.clone(),
+                repo_id: None, // setup wizard doesn't have a repo_id yet
+            },
         )
         .await;
 

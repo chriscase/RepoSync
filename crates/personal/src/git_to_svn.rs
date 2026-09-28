@@ -504,7 +504,7 @@ impl GitToSvnSync {
                         .with_context(|| {
                             format!(
                                 "failed to read file '{}' at commit {}",
-                                file_path, &commit.sha
+                                file_path, commit.sha
                             )
                         })?
                     {

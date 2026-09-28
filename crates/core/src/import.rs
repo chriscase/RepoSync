@@ -368,6 +368,12 @@ pub struct ImportConfig {
 ///
 /// Progress is updated in real-time via `progress` and optionally broadcast
 /// via `ws_broadcast` for the web UI.
+pub struct ImportRunState {
+    pub progress: Arc<RwLock<ImportProgress>>,
+    pub ws_broadcast: Option<broadcast::Sender<String>>,
+    pub repo_id: Option<String>,
+}
+
 pub async fn run_full_import(
     svn_client: &SvnClient,
     git_client: &Arc<std::sync::Mutex<GitClient>>,
@@ -375,10 +381,13 @@ pub async fn run_full_import(
     db: &Database,
     file_policy: &FilePolicy,
     import_config: &ImportConfig,
-    progress: Arc<RwLock<ImportProgress>>,
-    ws_broadcast: Option<broadcast::Sender<String>>,
-    repo_id: Option<String>,
+    run_state: ImportRunState,
 ) -> Result<u64> {
+    let ImportRunState {
+        progress,
+        ws_broadcast,
+        repo_id,
+    } = run_state;
     // Helper to push a log line and broadcast it.
     let log = |progress: &Arc<RwLock<ImportProgress>>,
                ws: &Option<broadcast::Sender<String>>,
