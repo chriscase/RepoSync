@@ -1,0 +1,33 @@
+# RS64-A: bounded full-import cancellation contract
+
+This increment starts from merged `main` at `6b4b3587f6f442ec40e9308b13f2b927bf84f19a`. Its assigned brief is preserved byte-for-byte in [RS64-A-goal.md](RS64-A-goal.md). The original [GOAL.md](GOAL.md) remains unchanged (SHA-256 `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`). #64 remains open after this slice.
+
+## Storage and authority
+
+Normal startup remains at SQLite `user_version=12`. `Database::import_operations` stores versioned JSON documents under `import_operation_v1:document:<UUID>` and repository-owned `active:<repo-id>` and `latest:<repo-id>` keys in the existing `kv_state` table. These are operation records, not SVN lineage or checkpoint authority. No generation, migration, or canonical origin is inferred by writing one. The active pointer and document are created or changed in one SQLite transaction; exact repository and operation IDs are checked before every mutation. A completed operation atomically changes its document, removes the active pointer, and updates the repository and per-repository `last_svn_rev_*`/`last_git_sha_*` cursor copies. No global watermark or UI total is used as completion proof.
+
+The document records the initiator and request identity, target/workdir/policy SHA-256 fingerprint, timestamps, processed count, local commit count and tip/revision, confirmed remote batch count and tip/revision, and outstanding intended ref/SHA. It contains no credential or token. `latest` retains terminal status across restart; `active` remains for cancelled, failed, or uncertain partial work. A missing operation document on an older healthy repository creates no hold and triggers no import.
+
+| From | Allowed next state | Meaning |
+| --- | --- | --- |
+| queued | running, cancel_requested, cancelled, reconciliation_required | No worker has entered replay; interrupted preparation is held if effects are unclear. |
+| running | cancel_requested, completed, failed, reconciliation_required | Completed requires every local revision and final Git ref confirmed, with checkpoint/document committed together. |
+| cancel_requested | cancelled, completed, failed, reconciliation_required | Completion can win only if all work was already published and verified. An issued push with unknown result requires reconciliation. |
+| completed | completed | Terminal; late cancel returns the completed record without changing history. |
+| cancelled / failed / reconciliation_required | same state only | Held terminal result; no automatic retry or scheduler pickup. |
+
+Duplicate cancellation returns the same durable state. A repeated start with the same `X-Request-ID` and initiator returns the same operation ID; a different request is refused while the repository is active or held. A delayed request for A cannot signal B. A failed SQLite write is returned as an error before the in-memory stop signal is set. On daemon startup, any `queued`, `running`, or `cancel_requested` pointer left by an absent worker becomes `reconciliation_required`; startup fails closed if that transition cannot persist. No routine version-12 DDL is added. The offline v13/v14 prototypes and inspection routes remain unactivated.
+
+## API, authorization and worker boundaries
+
+`POST /api/repos/{id}/import` retains `ok` and `message` and adds `operation_id` and `lifecycle`. `GET /api/repos/{id}/import/status` retains the legacy progress fields and adds the durable lifecycle, local/remote confirmed positions, outstanding publication intent, and outcome detail. `POST /api/repos/{id}/import/{operation_id}/cancel` requires the exact ID. The former no-ID path now returns a documented bad request after authentication. Start requires an admin; status/cancel require the initiator or a current admin. Legacy single-admin sessions work only when no named users exist. Expired, disabled and revoked named sessions cannot fall back to that mode.
+
+The importer checks the stop request before connection, each revision, local commit, each publication, and finalization. It never takes a progress read guard then awaits a write guard. Per-repository SVN commands and Git clone/push run under bounded child supervision (300 seconds); remote ref inspection and local CLI phases have shorter bounds. Unix children run in their own process groups, which are terminated on stop/timeout; the direct child is reaped. Local Git work is retained. A new import refuses an existing target branch rather than treating it as an empty destination. Its first push uses an empty-ref lease, so a branch created after preflight cannot be overwritten. Before each push the intended branch/SHA is persisted; a successful push is followed by a read-only `ls-remote` equality check. A lost reply, mismatched ref, or failed receipt keeps the operation held with its intent. No extra push is started to flush work after cancellation.
+
+The process-wide repository busy guard excludes same-ID sync/import workers while the daemon lives. The durable active pointer excludes scheduler and manual writer paths after restart. An import refuses another registration targeting the exact same Git repository and branch. The legacy singleton engine is conservatively paused while any import hold exists because it has no per-repository operation identity. Unrelated per-repository targets can continue. The original setup-wizard cancellation route remains separate and uses the shared outcome type without acquiring a per-repository operation ID.
+
+## Compatibility and operator recovery
+
+A cancelled import means **stop further work**, not undo commits already published. `last_local_*` can be ahead of `last_confirmed_*`; an unpublished local tip stays in the managed workdir. The active pointer blocks ordinary sync, duplicate import, update, disable/delete, branch pairing, skip and retry on that repository. Inspect the operation ID, local Git log/tree, remote Git ref/log/tree, SVN revisions and all per-repository cursor copies before any manual decision. Do not reset checkpoints or reimport to dismiss a hold. A `reconciliation_required` result is an unresolved external-effect record, not a failed test disguised as success.
+
+Quiesced old v12 installations can open without an operation record; their IDs, config, credential rows, refs, enabled states and existing checkpoints are not migrated by this slice. An older executable cannot interpret the active pointer and is not a safe concurrent writer or downgrade while an operation is active or unresolved. One daemon owns the data directory; cross-host fencing and automatic reconciliation are future #64 work. The known ignored conflict case remains #73, not passing coverage.
