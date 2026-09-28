@@ -1531,7 +1531,14 @@ async fn import_fixture() -> (
         .success());
     let svn_url = format!("file://{}", svn_repo.display());
     assert!(Command::new("svn")
-        .args(["mkdir", &format!("{svn_url}/trunk"), "-m", "trunk"])
+        .args([
+            "mkdir",
+            &format!("{svn_url}/trunk"),
+            "-m",
+            "trunk",
+            "--username",
+            "fixture",
+        ])
         .status()
         .unwrap()
         .success());
@@ -2505,6 +2512,27 @@ async fn candidate_64a_existing_git_target_is_preserved_before_replay() {
 async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+    let descendant_stopped = |pid: &str| {
+        if !Command::new("kill")
+            .args(["-0", pid])
+            .status()
+            .unwrap()
+            .success()
+        {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // The isolated container's PID 1 may defer reaping an orphaned
+            // grandchild. A zombie has stopped and cannot perform SVN work.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                return stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("Z ") || rest.starts_with("X "));
+            }
+        }
+        false
+    };
     let (addr, state, server, tmp, id, bare) = import_fixture().await;
     let wrapper = tmp.path().join("svn-stall-wrapper");
     let pid_file = tmp.path().join("svn-descendant.pid");
@@ -2553,12 +2581,7 @@ async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
         "cancelled"
     );
     tokio::time::timeout(Duration::from_secs(5), async {
-        while Command::new("kill")
-            .args(["-0", &descendant])
-            .status()
-            .unwrap()
-            .success()
-        {
+        while !descendant_stopped(&descendant) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })

@@ -67,6 +67,23 @@ fn kill_group(pid: Option<u32>) {
 mod tests {
     use super::*;
 
+    fn stopped(pid: i32) -> bool {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // A killed grandchild can remain a zombie until the container's
+            // PID 1 reaps it. It cannot execute or retain open descriptors.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                return stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("Z ") || rest.starts_with("X "));
+            }
+        }
+        false
+    }
+
     #[tokio::test]
     async fn cancelled_child_and_descendant_stop() {
         let temp = tempfile::tempdir().unwrap();
@@ -100,7 +117,7 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if unsafe { libc::kill(descendant, 0) } != 0 {
+                if stopped(descendant) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
