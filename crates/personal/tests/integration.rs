@@ -1201,17 +1201,19 @@ async fn test_full_svn_to_git_cycle_with_metadata() {
     // local user unless set via revprop. We'll set it after the commit.
     let rev = svn_commit_file(&wc_path, "bugfix.py", "print('fixed')", "fix bug #42");
 
-    // Set the svn:author revprop so the sync sees "alice".
-    let status = Command::new("svn")
+    // Set the synthetic author directly on this disposable repository. The
+    // isolated container cannot execute the test-only revprop hook, while
+    // svnadmin's default path does not invoke it.
+    let author_file = tmp.path().join("svn-author");
+    std::fs::write(&author_file, "alice").unwrap();
+    let status = Command::new("svnadmin")
         .args([
-            "propset",
-            "--revprop",
+            "setrevprop",
+            tmp.path().join("svn_repo").to_str().unwrap(),
             "-r",
             &rev.to_string(),
             "svn:author",
-            "alice",
-            &svn_url,
-            "--non-interactive",
+            author_file.to_str().unwrap(),
         ])
         .status()
         .unwrap();
