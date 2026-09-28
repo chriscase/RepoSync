@@ -6,6 +6,8 @@ This increment starts from merged `main` at `6b4b3587f6f442ec40e9308b13f2b927bf8
 
 Normal startup remains at SQLite `user_version=12`. `Database::import_operations` stores versioned JSON documents under `import_operation_v1:document:<UUID>` and repository-owned `active:<repo-id>` and `latest:<repo-id>` keys in the existing `kv_state` table. These are operation records, not SVN lineage or checkpoint authority. No generation, migration, or canonical origin is inferred by writing one. The active pointer and document are created or changed in one SQLite transaction; exact repository and operation IDs are checked before every mutation. A completed operation atomically changes its document, removes the active pointer, and updates the repository and per-repository `last_svn_rev_*`/`last_git_sha_*` cursor copies. No global watermark or UI total is used as completion proof.
 
+The fixture lock adds `libc` as a direct `reposync-core` dependency for Unix process-group termination. It was already present transitively: the locked package versions and checksums are unchanged. The lock-file hash changes by this one dependency edge, which is used identically for candidate and matched-base container runs.
+
 The document records the initiator and request identity, target/workdir/policy SHA-256 fingerprint, timestamps, processed count, local commit count and tip/revision, confirmed remote batch count and tip/revision, and outstanding intended ref/SHA. It contains no credential or token. `latest` retains terminal status across restart; `active` remains for cancelled, failed, or uncertain partial work. A missing operation document on an older healthy repository creates no hold and triggers no import.
 
 | From | Allowed next state | Meaning |

@@ -1844,6 +1844,7 @@ dependencies = [
  "hmac",
  "ldap3",
  "lettre",
+ "libc",
  "native-tls",
  "rand",
  "regex-lite",
