@@ -295,8 +295,8 @@ export default function RepoDetail() {
       });
       const result = await res.json();
       setSvnTestResult(result);
-    } catch (e: any) {
-      setSvnTestResult({ ok: false, message: e.message });
+    } catch (e: unknown) {
+      setSvnTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
     } finally {
       setSvnTesting(false);
     }
@@ -324,8 +324,8 @@ export default function RepoDetail() {
       });
       const result = await res.json();
       setGitTestResult(result);
-    } catch (e: any) {
-      setGitTestResult({ ok: false, message: e.message });
+    } catch (e: unknown) {
+      setGitTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
     } finally {
       setGitTesting(false);
     }
@@ -1050,7 +1050,7 @@ export default function RepoDetail() {
                 {(() => {
                   const v = branchForm.git_branch;
                   if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._\/-]/.test(v);
+                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
                   const hasTraversal = v.includes('..');
                   const hasDoubleSlash = v.includes('//');
                   const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
@@ -1077,7 +1077,7 @@ export default function RepoDetail() {
                 {(() => {
                   const v = branchForm.svn_branch;
                   if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._\/-]/.test(v);
+                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
                   const hasTraversal = v.includes('..');
                   const err = invalid ? 'Invalid characters' : hasTraversal ? 'Must not contain ".."' : null;
                   return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
@@ -1143,7 +1143,7 @@ export default function RepoDetail() {
               <button
                 onClick={() => branchMutation.mutate(branchForm)}
                 disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()
-                  || /[^a-zA-Z0-9._\/-]/.test(branchForm.git_branch) || /[^a-zA-Z0-9._\/-]/.test(branchForm.svn_branch)
+                  || /[^a-zA-Z0-9._/-]/.test(branchForm.git_branch) || /[^a-zA-Z0-9._/-]/.test(branchForm.svn_branch)
                   || branchForm.git_branch.includes('..') || branchForm.svn_branch.includes('..')
                   || branchForm.git_branch.includes('//') || branchForm.git_branch.startsWith('/') || branchForm.git_branch.endsWith('/')
                   || branchForm.git_branch.startsWith('-') || branchForm.git_branch === 'HEAD' || branchForm.git_branch.endsWith('.lock')

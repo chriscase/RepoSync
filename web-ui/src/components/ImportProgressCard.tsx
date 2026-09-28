@@ -1,6 +1,7 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Clock, ArrowRight, Terminal, CheckCircle2 } from 'lucide-react';
 import { api, type ImportStatus } from '../api';
+import { getStoredUser } from '../utils/auth';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -93,7 +94,9 @@ function PhaseDots({ phase }: { phase: string }) {
 // ---------------------------------------------------------------------------
 
 export default function ImportProgressCard({ repoId, repoName, hideIfIdle = false }: { repoId?: string; repoName?: string; hideIfIdle?: boolean } = {}) {
-  const { data: status } = useQuery<ImportStatus>({
+  const queryClient = useQueryClient();
+  const admin = getStoredUser()?.role === 'admin';
+  const { data: status, isError } = useQuery<ImportStatus>({
     queryKey: ['import-status', repoId || 'global'],
     queryFn: async () => {
       if (repoId) {
@@ -101,7 +104,7 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
         const res = await fetch(`/api/repos/${repoId}/import/status`, {
           headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         });
-        if (!res.ok) return api.getImportStatus();
+        if (!res.ok) throw new Error(`Import status unavailable (${res.status})`);
         return res.json();
       }
       return api.getImportStatus();
@@ -110,11 +113,33 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
     refetchIntervalInBackground: false,
   });
 
+  const start = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/repos/${repoId}/import`, {
+        method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}`,
+          'X-Request-ID': crypto.randomUUID() },
+      });
+      if (!res.ok) throw new Error((await res.json()).error || `Import start failed (${res.status})`);
+      return res.json() as Promise<{ operation_id: string }>;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['import-status', repoId] }),
+  });
+  const cancel = useMutation({
+    mutationFn: async (operationId: string) => {
+      const res = await fetch(`/api/repos/${repoId}/import/${operationId}/cancel`, {
+        method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` },
+      });
+      if (!res.ok) throw new Error((await res.json()).error || `Cancellation failed (${res.status})`);
+      return res.json();
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['import-status', repoId] }),
+  });
+
   // No data yet from API
   if (!status) {
     return (
       <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
-        <div className="text-sm text-gray-500 italic">Loading import status...</div>
+        <div className="text-sm text-gray-500 italic">{isError ? 'Import status unavailable' : 'Loading import status...'}</div>
       </div>
     );
   }
@@ -122,7 +147,7 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
   // Never ran an import — hide entirely if hideIfIdle
   const neverRan = status.phase === 'idle' && !status.started_at;
   if (neverRan) {
-    if (hideIfIdle) return null;
+    if (hideIfIdle && !status.can_start) return null;
     return (
       <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
         <div className="flex items-center justify-between">
@@ -131,6 +156,13 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
             SVN Import{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
           </h3>
             <p className="text-xs text-gray-500 mt-1">No import history</p>
+            {repoId && admin && status.can_start && (
+              <button type="button" onClick={() => start.mutate()} disabled={start.isPending}
+                className="mt-3 rounded bg-blue-600 px-3 py-1 text-xs text-white disabled:opacity-50">
+                {start.isPending ? 'Starting…' : 'Start full import'}
+              </button>
+            )}
+            {start.isError && <p className="mt-2 text-xs text-red-400">{start.error.message}</p>}
           </div>
           <a
             href="/repos"
@@ -214,7 +246,9 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
             SVN Import{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
           </h3>
           <span className="text-xs text-gray-400 bg-gray-700 px-2 py-0.5 rounded-full">
-            {phaseLabel(status.phase)}
+            {status.lifecycle === 'cancel_requested' || status.lifecycle === 'cancelling'
+              ? 'Cancellation requested — stopping' : status.lifecycle === 'reconciliation_required'
+                ? 'Reconciliation required' : phaseLabel(status.phase)}
           </span>
         </div>
         <div className="flex items-center space-x-1 text-xs text-gray-500">
@@ -246,6 +280,23 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
         <StatCell label="Batches" value={`${status.batches_pushed}`} />
         <StatCell label="LFS Files" value={`${status.lfs_unique_count}`} />
       </div>
+      {status.operation_id && <p className="mb-2 text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>}
+      {status.last_local_svn_rev != null && (
+        <p className="mb-2 text-xs text-gray-400">Local through SVN r{status.last_local_svn_rev};
+          remote confirmed through {status.last_confirmed_svn_rev == null ? 'none' : `r${status.last_confirmed_svn_rev}`}.</p>
+      )}
+      {status.outcome_detail && <p className="mb-2 text-xs text-yellow-300">{status.outcome_detail}</p>}
+      {(status.lifecycle === 'cancelled' || status.lifecycle === 'reconciliation_required') && (
+        <p className="mb-3 text-xs text-yellow-300">Stopping does not undo commits already published.
+          This repository stays held until its local and remote history is reconciled.</p>
+      )}
+      {repoId && admin && status.operation_id && (status.lifecycle === 'queued' || status.lifecycle === 'running') && (
+        <button type="button" onClick={() => cancel.mutate(status.operation_id!)} disabled={cancel.isPending}
+          className="mb-3 rounded border border-yellow-500 px-3 py-1 text-xs text-yellow-200 disabled:opacity-50">
+          {cancel.isPending ? 'Requesting stop…' : 'Stop import'}
+        </button>
+      )}
+      {cancel.isError && <p className="mb-3 text-xs text-red-400">{cancel.error.message}</p>}
 
       {/* Mini terminal */}
       {lastLogLines.length > 0 && (

@@ -549,4 +549,14 @@ export interface ImportStatus {
   log_lines: string[];
   started_at: string | null;
   completed_at: string | null;
+  operation_id?: string;
+  lifecycle?: 'queued' | 'running' | 'cancel_requested' | 'cancelling' | 'completed' | 'cancelled' | 'failed' | 'reconciliation_required';
+  can_start?: boolean;
+  last_local_svn_rev?: number | null;
+  last_local_git_sha?: string | null;
+  last_confirmed_svn_rev?: number | null;
+  last_confirmed_git_sha?: string | null;
+  intended_ref?: string | null;
+  intended_git_sha?: string | null;
+  outcome_detail?: string | null;
 }

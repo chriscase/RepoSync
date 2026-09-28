@@ -33,7 +33,7 @@ export default function ImportPhaseGraphic({ currentPhase }: { currentPhase: str
   const isCancelled = currentPhase === 'cancelled';
   const isIdle = currentPhase === 'idle';
 
-  const getNodeStyle = (idx: number, _phaseKey: string) => {
+  const getNodeStyle = (idx: number) => {
     if (isFailed && idx === currentIdx) {
       return 'bg-red-600/20 border-red-500 text-red-400 ring-2 ring-red-500/30';
     }
@@ -89,7 +89,7 @@ export default function ImportPhaseGraphic({ currentPhase }: { currentPhase: str
             {/* Node */}
             <div className="flex flex-col items-center">
               <div
-                className={`w-10 h-10 rounded-lg border-2 flex items-center justify-center transition-all duration-300 ${getNodeStyle(i, phase.key)}`}
+                className={`w-10 h-10 rounded-lg border-2 flex items-center justify-center transition-all duration-300 ${getNodeStyle(i)}`}
               >
                 {getIconForNode(i, phase)}
               </div>
@@ -117,7 +117,7 @@ export default function ImportPhaseGraphic({ currentPhase }: { currentPhase: str
         {PHASES.map((phase, i) => (
           <div key={phase.key} className="flex items-center space-x-3">
             <div
-              className={`w-8 h-8 rounded-lg border-2 flex items-center justify-center flex-shrink-0 transition-all duration-300 ${getNodeStyle(i, phase.key)}`}
+              className={`w-8 h-8 rounded-lg border-2 flex items-center justify-center flex-shrink-0 transition-all duration-300 ${getNodeStyle(i)}`}
             >
               {getIconForNode(i, phase)}
             </div>
