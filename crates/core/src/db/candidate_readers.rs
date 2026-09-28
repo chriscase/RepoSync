@@ -390,6 +390,12 @@ impl<'a> CopyReaders<'a> {
         } else {
             Canonical::Unresolved("generation_not_qualified".into())
         };
+        // Hiding ownerless diagnostics must never upgrade a scoped read into
+        // evidence of complete absence. This is a presentation qualification,
+        // not a change to the underlying handled-chain authority.
+        let canonical = if owned_only && canonical == Canonical::Missing {
+            Canonical::Unresolved("scoped_view_incomplete".into())
+        } else { canonical };
         Ok(Lookup {
             scope,
             canonical,

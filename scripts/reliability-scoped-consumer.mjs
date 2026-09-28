@@ -84,7 +84,7 @@ if (mode === 'next') {
     }
   }
   const ownerlessOnly = get('a_ownerless_only', 'lookup');
-  assert.equal(ownerlessOnly.data.canonical.state, 'missing');
+  assert.deepEqual(ownerlessOnly.data.canonical, { state: 'unresolved', reason: 'scoped_view_incomplete' });
   assert.deepEqual(ownerlessOnly.data.legacy, []);
   assert.doesNotMatch(byLabel.get('a_ownerless_only').body, /OWNERLESS_CANARY|B_CANARY/);
   assert.match(byLabel.get('operator_diagnostic').body, /OWNERLESS_CANARY/);
