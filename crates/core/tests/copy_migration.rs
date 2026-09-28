@@ -961,6 +961,23 @@ fn preserved_history_readers(session: &CopySession) -> serde_json::Value {
     assert_eq!(emitted.target,Some(Target::Svn(3)));
     serde_json::json!({"lookup":lookup,"status":status,"last_emitted":emitted})
 }
+fn frontier_reader_snapshot(session: &CopySession, generations: &[i64]) -> serde_json::Value {
+    let r = session.readers().unwrap();
+    let mut snapshots = Vec::new();
+    for repo in ["pair", "pair_two"] {
+        for &g in generations {
+            snapshots.push(serde_json::json!({
+                "repo":repo,"generation":g,
+                "status":r.status_dto(repo,Some(g)).unwrap(),
+                "incoming_lookup":r.lookup_dto(repo,Some(g),Direction::SvnToGit,&Source::Svn(2)).unwrap(),
+                "outgoing_lookup":r.lookup_dto(repo,Some(g),Direction::GitToSvn,&Source::Git("e".repeat(40))).unwrap(),
+                "incoming_emitted":r.last_emitted_dto(repo,Some(g),Direction::SvnToGit).unwrap(),
+                "outgoing_emitted":r.last_emitted_dto(repo,Some(g),Direction::GitToSvn).unwrap()
+            }));
+        }
+    }
+    serde_json::json!(snapshots)
+}
 #[test]
 fn m01_conflict_history_preservation() {
     use reposync_core::db::candidate_authority::{advance_frontier,ResolvedTransition};
@@ -1039,6 +1056,107 @@ fn m01_conflict_history_preservation() {
     let c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("DROP TRIGGER outcome_resolved_update_conflict").unwrap();drop(c);
     let bytes=fs::read(target.join("reposync.db")).unwrap();assert!(session.readers().is_err());assert!(session.migrate(14,&mut |_,_,_|Ok(())).is_err());assert!(fs::read(target.join("reposync.db")).unwrap()==bytes);session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
     eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"M01_HISTORY","outcome_storage":"without_rowid","matrix":matrix,"superseded_schema_refused_without_repair":true,"source_config_refs_and_endpoints_unchanged":true,"ordinary_forward_transitions":true,"structural_evidence_not_external_effect_proof":true}));
+}
+
+#[test]
+fn n01_frontier_identity_preservation() {
+    use reposync_core::db::candidate_authority::{advance_frontier, ResolvedTransition};
+    let (t, root, _) = old_topology();
+    let source = root.join("install");
+    let target = t.path().join("frontier-copy");
+    copy(&source, &target);
+    let session = qualified(&source, &target, &root);
+    session.migrate(14, &mut |_, _, _| Ok(())).unwrap();
+    let c = Connection::open(target.join("reposync.db")).unwrap();
+    c.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    // Additional generations are labeled structural rows, not new imports or
+    // claims about remote Git ancestry. The pinned old installation is intact.
+    for repo in ["pair", "pair_two"] {
+        c.execute("INSERT INTO pair_lineages SELECT repo_id,2,svn_uuid,svn_root_url,svn_branch_path,source_svn_uuid,source_svn_path,source_svn_rev,copy_from_path,copy_from_rev,baseline_svn_rev,baseline_svn_tree_sha256,git_provider,git_repo_identity,git_ref,baseline_git_sha,projection_version,projection_json,policy_sha256,proof_sha256 FROM pair_lineages WHERE repo_id=?1 AND generation=1",[repo]).unwrap();
+    }
+    for table in ["repo_migration_state","pair_lineages","pair_outcomes","pair_frontiers","legacy_evidence_links"] {
+        let wr: i64 = c.query_row("SELECT wr FROM pragma_table_list WHERE name=?1",[table],|r|r.get(0)).unwrap();
+        assert_eq!(wr,1,"{table} must expose only declared identities");
+        assert!(c.prepare(&format!("SELECT rowid FROM {table}")).is_err(),"{table} exposes a hidden rowid");
+    }
+    drop(c);
+    let endpoints=endpoint_files(&root);
+    let mut matrix=Vec::new();
+    for phase in ["initial","advance"] {
+        if phase=="advance" {
+            let c=Connection::open(target.join("reposync.db")).unwrap();
+            c.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+            for repo in ["pair","pair_two"] { for direction in ["svn_to_git","git_to_svn"] {
+                let (git,policy):(String,String)=c.query_row("SELECT baseline_git_sha,policy_sha256 FROM pair_lineages WHERE repo_id=?1 AND generation=2",[repo],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+                let (key,rev,handled_git,emitted_git)=if direction=="svn_to_git" {(String::from("svn:2"),Some(2),None,Some(git))}else{(format!("git:{git}"),None,Some(git),None)};
+                c.execute("INSERT INTO pair_frontiers VALUES(?1,2,?2,?3,?4,?5,?6,NULL,'baseline',NULL,1,?7)",rusqlite::params![repo,direction,key,rev,handled_git,emitted_git,policy]).unwrap();
+            }}
+        }
+        let generations: &[i64]=if phase=="initial" {&[1]} else {&[1,2]};
+        let c=Connection::open(target.join("reposync.db")).unwrap();
+        let phase_rows=outcome_snapshot(&c);
+        drop(c);
+        let phase_model=frontier_reader_snapshot(&session,generations);
+        let phase_bytes=fs::read(target.join("reposync.db")).unwrap();
+        for recursive in [0,1] {for direction in ["svn_to_git","git_to_svn"] {for (victim_repo,actor_repo) in [("pair","pair_two"),("pair","pair")] {for alias in ["rowid","oid","_rowid_"] {
+            let c=Connection::open(target.join("reposync.db")).unwrap();
+            c.execute_batch(&format!("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers={recursive};")).unwrap();
+            let (git,policy):(String,String)=c.query_row("SELECT baseline_git_sha,policy_sha256 FROM pair_lineages WHERE repo_id=?1 AND generation=2",[actor_repo],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            let (key,rev,handled_git,emitted_git)=if direction=="svn_to_git" {(String::from("svn:2"),Some(2),None,Some(git.clone()))}else{(format!("git:{git}"),None,Some(git.clone()),None)};
+            c.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            if phase=="advance" {
+                let id=format!("n01-{actor_repo}-{direction}");
+                let (next,svn,source_git,target_git,target_svn)=if direction=="svn_to_git" {("svn:3".into(),Some(3),None,Some("d".repeat(40)),None)}else{(format!("git:{}","e".repeat(40)),None,Some("e".repeat(40)),None,Some(3))};
+                c.execute("INSERT INTO pair_outcomes VALUES(?1,?2,2,?3,?4,?5,?6,?7,'applied_verified',?8,?9,1,?10,'{\"structural_fixture\":true}')",rusqlite::params![id,actor_repo,direction,next,key,svn,source_git,target_git,target_svn,policy]).unwrap();
+            }
+            let sql=if phase=="initial" {format!("INSERT OR REPLACE INTO pair_frontiers({alias},repo_id,generation,direction,source_key,handled_svn_rev,handled_git_sha,emitted_git_sha,emitted_svn_rev,authority_kind,evidence_outcome_id,projection_version,policy_sha256) VALUES(1,?1,2,?2,?3,?4,?5,?6,NULL,'baseline',NULL,1,?7)")} else {format!("UPDATE OR REPLACE pair_frontiers SET {alias}=1,source_key=?1,handled_svn_rev=?2,handled_git_sha=?3,emitted_git_sha=?4,emitted_svn_rev=?5,authority_kind='outcome',evidence_outcome_id=?6 WHERE repo_id=?7 AND generation=2 AND direction=?8")};
+            let result=if phase=="initial" {c.execute(&sql,rusqlite::params![actor_repo,direction,key,rev,handled_git,emitted_git,policy])} else {
+                let id=format!("n01-{actor_repo}-{direction}");
+                let (next,svn,source_git,target_git,target_svn)=if direction=="svn_to_git" {("svn:3".into(),Some(3),None,Some("d".repeat(40)),None)}else{(format!("git:{}","e".repeat(40)),None,Some("e".repeat(40)),None,Some(3))};
+                c.execute(&sql,rusqlite::params![next,svn,source_git,target_git,target_svn,id,actor_repo,direction])
+            };
+            let error=result.expect_err("N01: implicit frontier identity replaced another pair's checkpoint").to_string();
+            assert!(error.contains(alias),"unexpected N01 rejection: {error}");
+            c.execute_batch("ROLLBACK").unwrap();
+            assert_eq!(outcome_snapshot(&c),phase_rows);
+            assert_eq!(c.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(),"ok");
+            assert!(c.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+            c.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+            drop(c);
+            assert_eq!(fs::read(target.join("reposync.db")).unwrap(),phase_bytes);
+            assert_eq!(frontier_reader_snapshot(&session,generations),phase_model);
+            session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
+            matrix.push(serde_json::json!({"phase":phase,"recursive":recursive,"direction":direction,"victim_repo":victim_repo,"actor_repo":actor_repo,"alias":alias,"rejected":error}));
+        }}}}
+    }
+    let mut c=Connection::open(target.join("reposync.db")).unwrap();c.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    let policy:String=c.query_row("SELECT policy_sha256 FROM pair_lineages WHERE repo_id='pair_two' AND generation=2",[],|r|r.get(0)).unwrap();
+    let baseline:String=c.query_row("SELECT baseline_git_sha FROM pair_lineages WHERE repo_id='pair_two' AND generation=2",[],|r|r.get(0)).unwrap();
+    for (id,d,pre,svn,git,target_git,target_svn) in [
+        ("n01-forward-in","svn_to_git","svn:2".into(),Some(3),None,Some("d".repeat(40)),None),
+        ("n01-forward-out","git_to_svn",format!("git:{baseline}"),None,Some("e".repeat(40)),None,Some(3)),
+    ] {advance_frontier(&mut c,&ResolvedTransition{id:id.into(),repo_id:"pair_two".into(),generation:2,direction:d.into(),predecessor_source_key:pre,source_svn_rev:svn,source_git_sha:git,outcome:"applied_verified".into(),target_git_sha:target_git,target_svn_rev:target_svn,projection_version:1,policy_sha256:policy.clone(),evidence_json:"{\"structural_fixture\":true}".into()}).unwrap();}
+    drop(c);
+    let r=session.readers().unwrap();assert_eq!(r.status("pair_two",Some(2)).unwrap().frontiers.len(),2);
+    session.source_unchanged().unwrap();
+    drop(r);
+    let stale=t.path().join("superseded-frontier-shape");copy(&source,&stale);
+    let stale_session=qualified(&source,&stale,&root);stale_session.migrate(14,&mut |_,_,_|Ok(())).unwrap();
+    let c=Connection::open(stale.join("reposync.db")).unwrap();
+    let definition:String=c.query_row("SELECT sql FROM sqlite_master WHERE type='table' AND name='pair_frontiers'",[],|r|r.get(0)).unwrap();
+    let triggers:Vec<String>=c.prepare("SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='pair_frontiers' ORDER BY name").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    c.execute_batch("PRAGMA foreign_keys=OFF; CREATE TEMP TABLE saved_frontiers AS SELECT * FROM pair_frontiers; DROP TABLE pair_frontiers;").unwrap();
+    c.execute_batch(&definition.replace(" WITHOUT ROWID", "")).unwrap();
+    c.execute_batch("INSERT INTO pair_frontiers SELECT * FROM saved_frontiers; DROP TABLE saved_frontiers;").unwrap();
+    for trigger in triggers {c.execute_batch(&trigger).unwrap();}
+    c.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    assert_eq!(c.query_row("SELECT wr FROM pragma_table_list WHERE name='pair_frontiers'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    drop(c);
+    let stale_bytes=fs::read(stale.join("reposync.db")).unwrap();
+    assert!(stale_session.readers().is_err());assert!(stale_session.migrate(14,&mut |_,_,_|Ok(())).is_err());
+    assert_eq!(fs::read(stale.join("reposync.db")).unwrap(),stale_bytes);
+    stale_session.source_unchanged().unwrap();assert_eq!(endpoint_files(&root),endpoints);
+    eprintln!("RELIABILITY_EVIDENCE {}",serde_json::json!({"case":"N01_FRONTIER","matrix":matrix,"all_candidate_authority_tables_without_rowid":true,"actual_reopened_reader_and_dto_unchanged":true,"full_rows_and_bytes_unchanged":true,"baseline_and_forward_controls":true,"superseded_physical_shape_refused":true,"source_config_refs_and_endpoints_unchanged":true,"structural_generation_not_remote_effect_proof":true}));
 }
 
 fn assert_dto(name: &'static str, response: reposync_core::db::candidate_dto::Response, checks: &mut Vec<&'static str>) {

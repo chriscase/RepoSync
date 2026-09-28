@@ -2,7 +2,7 @@ CREATE TABLE repo_migration_state (
  repo_id TEXT PRIMARY KEY NOT NULL REFERENCES repositories(id) ON DELETE RESTRICT,
  disposition TEXT NOT NULL CHECK(disposition IN ('qualified','needs_reconciliation','external_effect_unknown','not_qualified')),
  reason_code TEXT NOT NULL, evidence_manifest_sha256 TEXT NOT NULL CHECK(length(evidence_manifest_sha256)=64)
-);
+) WITHOUT ROWID;
 CREATE TABLE pair_lineages (
  repo_id TEXT NOT NULL REFERENCES repositories(id) ON DELETE RESTRICT,
  generation INTEGER NOT NULL CHECK(generation>0),
@@ -22,7 +22,7 @@ CREATE TABLE pair_lineages (
  PRIMARY KEY(repo_id,generation), UNIQUE(repo_id,generation,projection_version,policy_sha256),
  CHECK((copy_from_path IS NULL AND copy_from_rev IS NULL) OR
        (copy_from_path IS NOT NULL AND copy_from_rev IS NOT NULL AND copy_from_rev>0))
-);
+) WITHOUT ROWID;
 CREATE TABLE pair_outcomes (
  id TEXT PRIMARY KEY NOT NULL, repo_id TEXT NOT NULL, generation INTEGER NOT NULL,
  direction TEXT NOT NULL CHECK(direction IN ('svn_to_git','git_to_svn')),
@@ -60,14 +60,16 @@ CREATE TABLE pair_frontiers (
        (direction='git_to_svn' AND handled_git_sha IS NOT NULL AND length(handled_git_sha) IN (40,64) AND handled_git_sha NOT GLOB '*[^0-9a-f]*' AND handled_svn_rev IS NULL AND emitted_git_sha IS NULL AND source_key='git:'||handled_git_sha)),
  CHECK(emitted_git_sha IS NULL OR (length(emitted_git_sha) IN (40,64) AND emitted_git_sha NOT GLOB '*[^0-9a-f]*')),
  CHECK(emitted_svn_rev IS NULL OR emitted_svn_rev>0)
-);
+) WITHOUT ROWID;
+-- A frontier has only its declared repository/generation/direction identity.
+-- REPLACE cannot remove another pair's checkpoint through an implicit rowid.
 CREATE TABLE legacy_evidence_links (
  repo_id TEXT NOT NULL, generation INTEGER NOT NULL,
  legacy_table TEXT NOT NULL CHECK(legacy_table IN ('commit_map','sync_records','kv_state','watermarks','import_progress')),
  legacy_key TEXT NOT NULL, interpretation TEXT NOT NULL,
  PRIMARY KEY(repo_id,generation,legacy_table,legacy_key), UNIQUE(legacy_table,legacy_key),
  FOREIGN KEY(repo_id,generation) REFERENCES pair_lineages(repo_id,generation) ON DELETE RESTRICT
-);
+) WITHOUT ROWID;
 CREATE TRIGGER lineage_immutable BEFORE UPDATE ON pair_lineages BEGIN SELECT RAISE(ABORT,'lineage is immutable'); END;
 CREATE TRIGGER frontier_initial BEFORE INSERT ON pair_frontiers BEGIN
  SELECT CASE WHEN EXISTS(SELECT 1 FROM pair_frontiers WHERE repo_id=NEW.repo_id AND generation=NEW.generation AND direction=NEW.direction) OR NEW.authority_kind!='baseline' OR NOT EXISTS(
