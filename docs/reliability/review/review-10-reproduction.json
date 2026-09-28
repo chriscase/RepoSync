@@ -1,0 +1,41 @@
+{
+  "finding": "N01",
+  "tier": "local actual Rust candidate test with pinned-old-generator fixture; not a reviewer rerun or final isolated CI",
+  "reviewed_start": "5e10a89db30dc742b32e43b0e0274f22c651f028",
+  "reviewed_sql_git_blob": "441cb08442a64564f9c6946a81822085d10e6d20",
+  "corrected_schema_commit": "ef94a597fb2a5e7a58d716d0609ff4aeca3f4f55",
+  "corrected_sql_git_blob": "7935d3d5e3081267d1bca8e20fe56329db46edf4",
+  "old_generator_source_overlay_sha256": "9a2485558f3f70677014007a3d45930eb2739c8d8b64aa854704bd681d9bad6c",
+  "local_old_generator_binary_sha256": "7c9be79b9f162f6daee91d7190a04b634798dd3a9c818be799556c84d04a83dc",
+  "before": {
+    "command": "REPOSYNC_OLD_GENERATOR=<local pinned-old generator> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration n01_frontier_identity_preservation -- --exact --nocapture --test-threads=1",
+    "log": "review-10-n01-before.log.gz",
+    "raw_log_sha256": "0fde4af0c353d0c6edbbdcd50ecbc01430a2a61511f307e2033a5f2bfdb610ac",
+    "compressed_sha256": "701ace265eea8414f36d057c28256d4a318e3e7d085299a4114467cc27757641",
+    "exit_code": 101,
+    "passed_failed_ignored": [0, 1, 0],
+    "observation": "With recursive triggers off, an INSERT OR REPLACE into a different pair's legitimate baseline used the victim's implicit rowid and committed, replacing its checkpoint. The exact candidate assertion failed. The preceding sandbox-only attempt could not bind the disposable old-importer loopback listener; it did not reach N01."
+  },
+  "after": {
+    "command": "REPOSYNC_OLD_GENERATOR=<local pinned-old generator> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration n01_frontier_identity_preservation -- --exact --nocapture --test-threads=1",
+    "log": "review-10-n01-after.log.gz",
+    "raw_log_sha256": "d671475995a4997d6dc38c41adbc6f91c8b2329aaea552aefc60f65dc90552f8",
+    "compressed_sha256": "c64484fa115536c0731150a0688be533173c059b752c19eadf05b3bc30ca532d",
+    "exit_code": 0,
+    "passed_failed_ignored": [1, 0, 0],
+    "rejected_attempts": 48,
+    "axes": ["INSERT OR REPLACE baseline and valid forward UPDATE OR REPLACE", "rowid, oid, _rowid_", "both directions", "separate repositories and same-repository generations", "recursive_triggers 0 and 1"],
+    "checks": ["all five new candidate authority tables WITHOUT ROWID", "full outcome and frontier values and copy bytes preserved after each refusal", "both pairs' actual reopened CopyReaders and DTO lookup/status/last-emitted unchanged", "legitimate baseline and checked forward controls", "superseded rowid physical frontier shape refused without repair", "source/config/refs/endpoints unchanged"]
+  },
+  "copy_http_consumer_local": {
+    "log": "review-10-http-local.log.gz",
+    "raw_log_sha256": "44e6d600cfdf90dae0514c6f2554c6a001314b0aae46c3589e69e33d6a9d0ef3",
+    "compressed_sha256": "919a2de9cd42b9658cd9893493be0f2532440f878b74a364775d7bb12d1f6cc4",
+    "passed_failed_ignored": [1, 0, 0],
+    "response_count": 30,
+    "local_wire_sha256": "39b651b35e8d7b1096a65c094094151493d2ef8e393124a61cc2dbbbd74e7be5",
+    "consumer_source_sha256": "225e74803fd8ff3e4fca317537ee92dde4960738fb4ed5964b7d35afe7bd6804",
+    "unsafe_i64_explicit_refusals": 2,
+    "note": "Final isolated CI independently rebuilds the old generator from the pinned original archive and publishes full in-process HTTP response bytes. Later structural fixture history is not remote-effect proof."
+  }
+}

@@ -1,0 +1,246 @@
+{
+  "tier": "exact_SQL_only_not_Rust_migration_or_reader_execution",
+  "sqlite_version": "3.46.1",
+  "sql_git_blob": "441cb08442a64564f9c6946a81822085d10e6d20",
+  "tests": [
+    {
+      "recursive_triggers": 0,
+      "operation": "insert_baseline_collision",
+      "sql": "INSERT OR REPLACE INTO pair_frontiers(rowid,repo_id,generation,direction,source_key,handled_svn_rev,handled_git_sha,emitted_git_sha,emitted_svn_rev,authority_kind,evidence_outcome_id,projection_version,policy_sha256) VALUES (?,'two',1,'git_to_svn',?,NULL,?,NULL,NULL,'baseline',NULL,1,?)",
+      "parameters": [
+        1,
+        "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+      ],
+      "accepted": true,
+      "error": null,
+      "before": [
+        [
+          1,
+          "one",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "after": [
+        [
+          1,
+          "two",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "foreign_key_check": [],
+      "integrity_check": "ok"
+    },
+    {
+      "recursive_triggers": 0,
+      "operation": "valid_advance_rowid_collision",
+      "sql": "UPDATE OR REPLACE pair_frontiers SET rowid=?,source_key=?,handled_git_sha=?,emitted_svn_rev=3,authority_kind='outcome',evidence_outcome_id='two-E' WHERE repo_id='two' AND generation=1 AND direction='git_to_svn'",
+      "parameters": [
+        1,
+        "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ],
+      "accepted": true,
+      "error": null,
+      "before": [
+        [
+          1,
+          "one",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ],
+        [
+          2,
+          "two",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "after": [
+        [
+          1,
+          "two",
+          1,
+          "git_to_svn",
+          "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          null,
+          "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          null,
+          3,
+          "outcome",
+          "two-E",
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "foreign_key_check": [],
+      "integrity_check": "ok"
+    },
+    {
+      "recursive_triggers": 1,
+      "operation": "insert_baseline_collision",
+      "sql": "INSERT OR REPLACE INTO pair_frontiers(rowid,repo_id,generation,direction,source_key,handled_svn_rev,handled_git_sha,emitted_git_sha,emitted_svn_rev,authority_kind,evidence_outcome_id,projection_version,policy_sha256) VALUES (?,'two',1,'git_to_svn',?,NULL,?,NULL,NULL,'baseline',NULL,1,?)",
+      "parameters": [
+        1,
+        "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+      ],
+      "accepted": false,
+      "error": "frontier cannot be deleted",
+      "before": [
+        [
+          1,
+          "one",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "after": [
+        [
+          1,
+          "one",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "foreign_key_check": [],
+      "integrity_check": "ok"
+    },
+    {
+      "recursive_triggers": 1,
+      "operation": "valid_advance_rowid_collision",
+      "sql": "UPDATE OR REPLACE pair_frontiers SET rowid=?,source_key=?,handled_git_sha=?,emitted_svn_rev=3,authority_kind='outcome',evidence_outcome_id='two-E' WHERE repo_id='two' AND generation=1 AND direction='git_to_svn'",
+      "parameters": [
+        1,
+        "git:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ],
+      "accepted": false,
+      "error": "frontier cannot be deleted",
+      "before": [
+        [
+          1,
+          "one",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ],
+        [
+          2,
+          "two",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "after": [
+        [
+          1,
+          "one",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ],
+        [
+          2,
+          "two",
+          1,
+          "git_to_svn",
+          "git:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          null,
+          null,
+          "baseline",
+          null,
+          1,
+          "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ]
+      ],
+      "foreign_key_check": [],
+      "integrity_check": "ok"
+    }
+  ]
+}
