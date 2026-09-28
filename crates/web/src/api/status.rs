@@ -338,8 +338,8 @@ fn disk_usage(path: &Path) -> (u64, u64) {
         let mut buf = MaybeUninit::<libc::statvfs>::uninit();
         if libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) == 0 {
             let stat = buf.assume_init();
-            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-            let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+            let total = stat.f_blocks * stat.f_frsize;
+            let free = stat.f_bavail * stat.f_frsize;
             (free, total)
         } else {
             (0, 0)
@@ -402,7 +402,6 @@ fn process_rss() -> u64 {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             return rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
