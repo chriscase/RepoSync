@@ -291,7 +291,14 @@ impl<'a> CopyReaders<'a> {
         }
         Ok(out)
     }
-    fn lookup_inner(&self, repo: &str, g: Option<i64>, d: Direction, s: &Source, owned_only: bool) -> Result<Lookup> {
+    fn lookup_inner(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: Direction,
+        s: &Source,
+        owned_only: bool,
+    ) -> Result<Lookup> {
         ensure!(
             matches!(
                 (d, s),
@@ -310,7 +317,11 @@ impl<'a> CopyReaders<'a> {
         };
         // The scoped transport selects owned rows in SQL, before a result or
         // page cursor is formed. Offline diagnostics retain ownerless rows.
-        let predicate = if owned_only { "repo_id=?1" } else { "(repo_id=?1 OR repo_id IS NULL)" };
+        let predicate = if owned_only {
+            "repo_id=?1"
+        } else {
+            "(repo_id=?1 OR repo_id IS NULL)"
+        };
         let raw=legacy(&self.c,&format!("SELECT * FROM commit_map WHERE {predicate} AND direction=?2 AND {column}=?3 ORDER BY id"),params![repo,d.sql(),value])?;
         let scope = self.scope(repo, g)?;
         let canonical = if let Scope::Qualified(g) = scope {
@@ -395,7 +406,9 @@ impl<'a> CopyReaders<'a> {
         // not a change to the underlying handled-chain authority.
         let canonical = if owned_only && canonical == Canonical::Missing {
             Canonical::Unresolved("scoped_view_incomplete".into())
-        } else { canonical };
+        } else {
+            canonical
+        };
         Ok(Lookup {
             scope,
             canonical,
@@ -407,7 +420,13 @@ impl<'a> CopyReaders<'a> {
     }
     /// Repository-owned visibility for the candidate HTTP profile. A missing
     /// result here is not a complete legacy diagnostic or permission to retry.
-    pub fn lookup_scoped(&self, repo: &str, g: Option<i64>, d: Direction, s: &Source) -> Result<Lookup> {
+    pub fn lookup_scoped(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: Direction,
+        s: &Source,
+    ) -> Result<Lookup> {
         self.read(|| self.lookup_inner(repo, g, d, s, true))
     }
     /// Every retained row is available for display in deterministic ID order.
@@ -433,10 +452,25 @@ impl<'a> CopyReaders<'a> {
     ) -> Result<Page> {
         self.list_visibility(repo, g, d, after, limit, false)
     }
-    pub fn list_scoped(&self, repo: &str, g: Option<i64>, d: Direction, after: Option<i64>, limit: usize) -> Result<Page> {
+    pub fn list_scoped(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: Direction,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Page> {
         self.list_visibility(repo, g, d, after, limit, true)
     }
-    fn list_visibility(&self, repo: &str, g: Option<i64>, d: Direction, after: Option<i64>, limit: usize, owned_only: bool) -> Result<Page> {
+    fn list_visibility(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: Direction,
+        after: Option<i64>,
+        limit: usize,
+        owned_only: bool,
+    ) -> Result<Page> {
         self.read(||{
         ensure!((1..=200).contains(&limit),"page size out of bounds");
         let predicate = if owned_only { "repo_id=?1" } else { "(repo_id=?1 OR repo_id IS NULL)" };

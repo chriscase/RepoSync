@@ -362,7 +362,9 @@ async fn update_repo(
         git_repo: body.git_repo.unwrap_or(existing.git_repo),
         git_branch: body.git_branch.unwrap_or(existing.git_branch),
         sync_mode: body.sync_mode.unwrap_or(existing.sync_mode),
-        poll_interval_secs: body.poll_interval_secs.unwrap_or(existing.poll_interval_secs),
+        poll_interval_secs: body
+            .poll_interval_secs
+            .unwrap_or(existing.poll_interval_secs),
         lfs_threshold_mb: body.lfs_threshold_mb.unwrap_or(existing.lfs_threshold_mb),
         auto_merge: body.auto_merge.unwrap_or(existing.auto_merge),
         enabled: body.enabled.unwrap_or(existing.enabled),
@@ -457,7 +459,10 @@ async fn trigger_sync(
         None,
         None,
         None,
-        Some(&format!("Manual sync triggered for repo '{}' ({})", repo.name, id)),
+        Some(&format!(
+            "Manual sync triggered for repo '{}' ({})",
+            repo.name, id
+        )),
         true,
     );
 
@@ -553,9 +558,12 @@ async fn start_repo_import(
     }
 
     // 4. Read credentials from kv_state
-    let svn_password_repo = db.get_state(&format!("secret_svn_password_{}", id)).unwrap_or(None);
+    let svn_password_repo = db
+        .get_state(&format!("secret_svn_password_{}", id))
+        .unwrap_or(None);
     let svn_password_global = db.get_state("secret_svn_password").unwrap_or(None);
-    let svn_password = svn_password_repo.clone()
+    let svn_password = svn_password_repo
+        .clone()
         .or(svn_password_global.clone())
         .unwrap_or_default();
     debug!(
@@ -564,7 +572,9 @@ async fn start_repo_import(
         "resolved SVN password for import"
     );
 
-    let git_token_repo = db.get_state(&format!("secret_git_token_{}", id)).unwrap_or(None);
+    let git_token_repo = db
+        .get_state(&format!("secret_git_token_{}", id))
+        .unwrap_or(None);
     let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
     let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
     debug!(
@@ -627,11 +637,20 @@ async fn start_repo_import(
         } else {
             base_clone_url.clone()
         };
-        let branch = if repo.git_branch.is_empty() { "main" } else { &repo.git_branch };
+        let branch = if repo.git_branch.is_empty() {
+            "main"
+        } else {
+            &repo.git_branch
+        };
 
         let init_cmds: Vec<Vec<&str>> = vec![
             vec!["init", "--initial-branch", branch],
-            vec!["commit", "--allow-empty", "-m", "Reset for full SVN reimport"],
+            vec![
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Reset for full SVN reimport",
+            ],
             vec!["remote", "add", "origin", &clone_url],
             vec!["push", "--force", "origin", branch],
         ];
@@ -667,7 +686,9 @@ async fn start_repo_import(
 
         {
             let mut p = progress.write().await;
-            p.push_log("[info] Reset: remote wiped, records cleared, starting fresh import...".into());
+            p.push_log(
+                "[info] Reset: remote wiped, records cleared, starting fresh import...".into(),
+            );
         }
         info!(repo_id = %id, "reset complete, git repo and remote wiped, stale records cleared");
     }
@@ -781,17 +802,16 @@ async fn start_repo_import(
                     p.phase = ImportPhase::Completed;
                 }
                 p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                p.push_log(format!(
-                    "[info] Import complete: {} commits created",
-                    count
-                ));
+                p.push_log(format!("[info] Import complete: {} commits created", count));
                 info!(repo_id = %repo_id_clone, count, "per-repo import completed successfully");
 
                 // Update repo watermark so scheduler knows where import ended.
                 // Read from the watermarks table (where run_full_import writes)
                 // or fall back to the import progress total_revs.
-                let last_rev = import_db.get_watermark("svn_rev")
-                    .ok().flatten()
+                let last_rev = import_db
+                    .get_watermark("svn_rev")
+                    .ok()
+                    .flatten()
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or_else(|| p.total_revs); // fallback to total revisions
                 let head_sha = {
@@ -805,10 +825,8 @@ async fn start_repo_import(
                         &format!("last_svn_rev_{}", repo_id_clone),
                         &last_rev.to_string(),
                     );
-                    let _ = import_db.set_state(
-                        &format!("last_git_sha_{}", repo_id_clone),
-                        &head_sha,
-                    );
+                    let _ =
+                        import_db.set_state(&format!("last_git_sha_{}", repo_id_clone), &head_sha);
                     info!(repo_id = %repo_id_clone, last_rev, %head_sha, "updated repo watermark after import");
                 }
             }
@@ -823,7 +841,11 @@ async fn start_repo_import(
         }
 
         if let Err(e) = import_db.persist_import_progress(&p) {
-            tracing::warn!("failed to persist import progress for repo {}: {}", repo_id_clone, e);
+            tracing::warn!(
+                "failed to persist import progress for repo {}: {}",
+                repo_id_clone,
+                e
+            );
         }
 
         if let Some(ref sender) = ws_broadcast {
@@ -1106,15 +1128,20 @@ async fn create_branch_pair(
 
     // Length limits
     if git_branch.len() > 200 {
-        return Err(AppError::BadRequest("git_branch exceeds 200 character limit".into()));
+        return Err(AppError::BadRequest(
+            "git_branch exceeds 200 character limit".into(),
+        ));
     }
     if svn_branch.len() > 200 {
-        return Err(AppError::BadRequest("svn_branch exceeds 200 character limit".into()));
+        return Err(AppError::BadRequest(
+            "svn_branch exceeds 200 character limit".into(),
+        ));
     }
 
     // Character validation: alphanumeric, dots, underscores, hyphens, slashes
     let valid_branch_chars = |s: &str| -> bool {
-        s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
     };
     if !valid_branch_chars(&git_branch) {
         return Err(AppError::BadRequest(
@@ -1129,28 +1156,37 @@ async fn create_branch_pair(
 
     // Path traversal prevention
     if git_branch.contains("..") || svn_branch.contains("..") {
-        return Err(AppError::BadRequest("branch names must not contain '..'".into()));
+        return Err(AppError::BadRequest(
+            "branch names must not contain '..'".into(),
+        ));
     }
 
     // Structural validation
     if git_branch.contains("//") || svn_branch.contains("//") {
-        return Err(AppError::BadRequest("branch names must not contain '//'".into()));
+        return Err(AppError::BadRequest(
+            "branch names must not contain '//'".into(),
+        ));
     }
-    if git_branch.starts_with('/') || git_branch.ends_with('/')
-        || svn_branch.starts_with('/') || svn_branch.ends_with('/')
+    if git_branch.starts_with('/')
+        || git_branch.ends_with('/')
+        || svn_branch.starts_with('/')
+        || svn_branch.ends_with('/')
     {
-        return Err(AppError::BadRequest("branch names must not start or end with '/'".into()));
+        return Err(AppError::BadRequest(
+            "branch names must not start or end with '/'".into(),
+        ));
     }
     if git_branch.starts_with('-') || svn_branch.starts_with('-') {
-        return Err(AppError::BadRequest("branch names must not start with '-'".into()));
+        return Err(AppError::BadRequest(
+            "branch names must not start with '-'".into(),
+        ));
     }
 
     // Git-specific reserved names
-    if git_branch.ends_with(".lock")
-        || git_branch == "HEAD"
-        || git_branch.starts_with("refs/")
-    {
-        return Err(AppError::BadRequest("git_branch uses a reserved name".into()));
+    if git_branch.ends_with(".lock") || git_branch == "HEAD" || git_branch.starts_with("refs/") {
+        return Err(AppError::BadRequest(
+            "git_branch uses a reserved name".into(),
+        ));
     }
 
     // Parent must be enabled
@@ -1179,11 +1215,7 @@ async fn create_branch_pair(
         let svn_password = db
             .resolve_credential_chain(&parent.id, "secret_svn_password")
             .unwrap_or_default();
-        let svn_client = SvnClient::new(
-            &parent.svn_url,
-            &parent.svn_username,
-            &svn_password,
-        );
+        let svn_client = SvnClient::new(&parent.svn_url, &parent.svn_username, &svn_password);
         // Get current HEAD rev for the copy
         let parent_svn_url = if parent.svn_branch.is_empty() {
             parent.svn_url.clone()
@@ -1205,7 +1237,12 @@ async fn create_branch_pair(
                     ("branches", svn_branch.as_str())
                 };
                 match svn_client
-                    .create_branch(branch_name, &parent.svn_branch, branches_path, info.latest_rev)
+                    .create_branch(
+                        branch_name,
+                        &parent.svn_branch,
+                        branches_path,
+                        info.latest_rev,
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -1223,7 +1260,8 @@ async fn create_branch_pair(
                             info!(branch = %svn_branch, "SVN branch already exists, continuing");
                         } else {
                             return Err(AppError::Internal(format!(
-                                "failed to create SVN branch: {}", e
+                                "failed to create SVN branch: {}",
+                                e
                             )));
                         }
                     }
@@ -1231,7 +1269,8 @@ async fn create_branch_pair(
             }
             Err(e) => {
                 return Err(AppError::Internal(format!(
-                    "failed to query SVN info for branch creation: {}", e
+                    "failed to query SVN info for branch creation: {}",
+                    e
                 )));
             }
         }
@@ -1264,11 +1303,14 @@ async fn create_branch_pair(
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("already exists") || err_str.contains("Reference already exists") {
+                if err_str.contains("already exists")
+                    || err_str.contains("Reference already exists")
+                {
                     info!(branch = %git_branch, "Git branch already exists, continuing");
                 } else {
                     return Err(AppError::Internal(format!(
-                        "failed to create Git branch: {}", e
+                        "failed to create Git branch: {}",
+                        e
                     )));
                 }
             }
@@ -1406,16 +1448,24 @@ async fn create_branch_pair(
     let _ = state.ws_broadcast.send(branch_event.to_string());
 
     // Send Teams notification directly (for events not in ws_broadcast listener)
-    let teams_url = db.get_state("teams_webhook_url").ok().flatten().filter(|v| !v.is_empty());
+    let teams_url = db
+        .get_state("teams_webhook_url")
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty());
     if let Some(url) = teams_url {
         let card = reposync_core::notify::teams::format_branch_created(
-            &created.name, &created.git_branch, &created.svn_branch,
+            &created.name,
+            &created.git_branch,
+            &created.svn_branch,
         );
         let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
         let _ = notifier.send_card(card).await;
     }
 
-    Ok(Json(serde_json::to_value(created).map_err(|e| AppError::Internal(format!("serialization error: {}", e)))?))
+    Ok(Json(serde_json::to_value(created).map_err(|e| {
+        AppError::Internal(format!("serialization error: {}", e))
+    })?))
 }
 
 async fn list_branch_pairs(
@@ -1491,8 +1541,9 @@ async fn delete_branch_pair(
     }
 
     // Acquire busy guard to prevent sync/import racing
-    let _busy_guard = reposync_core::busy::try_acquire(&id)
-        .ok_or_else(|| AppError::BadRequest("branch pair is currently busy (sync or import in progress)".into()))?;
+    let _busy_guard = reposync_core::busy::try_acquire(&id).ok_or_else(|| {
+        AppError::BadRequest("branch pair is currently busy (sync or import in progress)".into())
+    })?;
 
     // Load parent for credential resolution
     let parent = db
@@ -1516,7 +1567,10 @@ async fn delete_branch_pair(
             &git_token,
             provider,
         );
-        match github_client.delete_branch(&parent.git_repo, &repo.git_branch).await {
+        match github_client
+            .delete_branch(&parent.git_repo, &repo.git_branch)
+            .await
+        {
             Ok(()) => info!(branch = %repo.git_branch, "deleted Git branch"),
             Err(e) => {
                 let msg = format!("failed to delete Git branch '{}': {}", repo.git_branch, e);
@@ -1570,7 +1624,10 @@ async fn delete_branch_pair(
         None,
         None,
         None,
-        Some(&format!("Deleted branch pair '{}' (git: {}, svn: {})", repo_name, repo.git_branch, repo.svn_branch)),
+        Some(&format!(
+            "Deleted branch pair '{}' (git: {}, svn: {})",
+            repo_name, repo.git_branch, repo.svn_branch
+        )),
         true,
         Some(parent_id),
     );
@@ -1585,9 +1642,14 @@ async fn delete_branch_pair(
     );
 
     // Send Teams notification for deletion
-    let teams_url = db.get_state("teams_webhook_url").ok().flatten().filter(|v| !v.is_empty());
+    let teams_url = db
+        .get_state("teams_webhook_url")
+        .ok()
+        .flatten()
+        .filter(|v| !v.is_empty());
     if let Some(url) = teams_url {
-        let card = reposync_core::notify::teams::format_branch_deleted(&repo_name, &repo.git_branch);
+        let card =
+            reposync_core::notify::teams::format_branch_deleted(&repo_name, &repo.git_branch);
         let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
         let _ = notifier.send_card(card).await;
     }
@@ -1630,22 +1692,34 @@ async fn test_repo_svn(
     validate_session(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
-    ).await?;
+    )
+    .await?;
 
     let db = &state.db;
-    let repo = db.get_repository(&id)
+    let repo = db
+        .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("db error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repo not found".into()))?;
 
     let overrides = body.map(|Json(b)| b).unwrap_or_default();
 
     // Prefer form-supplied values; fall back to saved values.
-    let svn_url_base = overrides.svn_url.filter(|s| !s.is_empty()).unwrap_or(repo.svn_url);
-    let svn_branch = overrides.svn_branch.filter(|s| !s.is_empty()).unwrap_or(repo.svn_branch);
-    let svn_username = overrides.svn_username.filter(|s| !s.is_empty()).unwrap_or(repo.svn_username);
+    let svn_url_base = overrides
+        .svn_url
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo.svn_url);
+    let svn_branch = overrides
+        .svn_branch
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo.svn_branch);
+    let svn_username = overrides
+        .svn_username
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo.svn_username);
 
     // Password: prefer form value, then stored per-repo → parent → global.
-    let password = overrides.svn_password
+    let password = overrides
+        .svn_password
         .filter(|v| !v.is_empty())
         .or_else(|| db.resolve_credential_chain(&id, "secret_svn_password"))
         .unwrap_or_default();
@@ -1653,29 +1727,50 @@ async fn test_repo_svn(
     let svn_url = if svn_branch.is_empty() {
         svn_url_base
     } else {
-        format!("{}/{}", svn_url_base.trim_end_matches('/'), svn_branch.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            svn_url_base.trim_end_matches('/'),
+            svn_branch.trim_start_matches('/')
+        )
     };
 
     let result = tokio::process::Command::new("svn")
-        .args(["info", "--non-interactive", "--username", &svn_username, "--password", &password, &svn_url])
+        .args([
+            "info",
+            "--non-interactive",
+            "--username",
+            &svn_username,
+            "--password",
+            &password,
+            &svn_url,
+        ])
         .output()
         .await;
 
     match result {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let info = stdout.lines()
+            let info = stdout
+                .lines()
                 .find(|l| l.starts_with("Repository Root:") || l.starts_with("URL:"))
                 .unwrap_or("SVN server responded successfully");
-            Ok(Json(serde_json::json!({"ok": true, "message": info.trim()})))
+            Ok(Json(
+                serde_json::json!({"ok": true, "message": info.trim()}),
+            ))
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = stderr.lines().find(|l| l.contains("E1") || l.contains("Unable") || l.contains("Authentication"))
+            let msg = stderr
+                .lines()
+                .find(|l| l.contains("E1") || l.contains("Unable") || l.contains("Authentication"))
                 .unwrap_or("SVN command failed");
-            Ok(Json(serde_json::json!({"ok": false, "message": msg.trim()})))
+            Ok(Json(
+                serde_json::json!({"ok": false, "message": msg.trim()}),
+            ))
         }
-        Err(e) => Ok(Json(serde_json::json!({"ok": false, "message": format!("Failed to run svn: {}", e)}))),
+        Err(e) => Ok(Json(
+            serde_json::json!({"ok": false, "message": format!("Failed to run svn: {}", e)}),
+        )),
     }
 }
 
@@ -1689,20 +1784,29 @@ async fn test_repo_git(
     validate_session(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
-    ).await?;
+    )
+    .await?;
 
     let db = &state.db;
-    let repo = db.get_repository(&id)
+    let repo = db
+        .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("db error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repo not found".into()))?;
 
     let overrides = body.map(|Json(b)| b).unwrap_or_default();
 
-    let git_api_url = overrides.git_api_url.filter(|s| !s.is_empty()).unwrap_or(repo.git_api_url);
-    let git_repo = overrides.git_repo.filter(|s| !s.is_empty()).unwrap_or(repo.git_repo);
+    let git_api_url = overrides
+        .git_api_url
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo.git_api_url);
+    let git_repo = overrides
+        .git_repo
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo.git_repo);
 
     // Token: prefer form value, then stored per-repo → parent → global.
-    let token = overrides.git_token
+    let token = overrides
+        .git_token
         .filter(|v| !v.is_empty())
         .or_else(|| db.resolve_credential_chain(&id, "secret_git_token"));
 
@@ -1721,18 +1825,29 @@ async fn test_repo_git(
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
-                let name = json.get("full_name").or_else(|| json.get("name"))
-                    .and_then(|v| v.as_str()).unwrap_or(&git_repo);
-                Ok(Json(serde_json::json!({"ok": true, "message": format!("Repository found: {}", name)})))
+                let name = json
+                    .get("full_name")
+                    .or_else(|| json.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&git_repo);
+                Ok(Json(
+                    serde_json::json!({"ok": true, "message": format!("Repository found: {}", name)}),
+                ))
             } else {
-                Ok(Json(serde_json::json!({"ok": true, "message": "Repository is accessible"})))
+                Ok(Json(
+                    serde_json::json!({"ok": true, "message": "Repository is accessible"}),
+                ))
             }
         }
         Ok(resp) => {
             let status = resp.status();
-            Ok(Json(serde_json::json!({"ok": false, "message": format!("HTTP {} — check credentials and URL", status)})))
+            Ok(Json(
+                serde_json::json!({"ok": false, "message": format!("HTTP {} — check credentials and URL", status)}),
+            ))
         }
-        Err(e) => Ok(Json(serde_json::json!({"ok": false, "message": format!("Connection failed: {}", e)}))),
+        Err(e) => Ok(Json(
+            serde_json::json!({"ok": false, "message": format!("Connection failed: {}", e)}),
+        )),
     }
 }
 
@@ -1768,11 +1883,8 @@ async fn skip_commit(
         "gitea" => reposync_core::config::GitProvider::Gitea,
         _ => reposync_core::config::GitProvider::GitHub,
     };
-    let github_client = reposync_core::git::github::GitHubClient::new(
-        &repo.git_api_url,
-        &git_token,
-        provider,
-    );
+    let github_client =
+        reposync_core::git::github::GitHubClient::new(&repo.git_api_url, &git_token, provider);
     let head_sha = github_client
         .get_branch_sha(&repo.git_repo, &repo.git_branch)
         .await
@@ -1888,7 +2000,9 @@ async fn get_pre_commit_hook(
 
     let mut script = String::from("#!/bin/bash\n");
     script.push_str("# RepoSync pre-commit hook — validates file paths against SVN rules\n");
-    script.push_str("# Install: cp this file .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit\n");
+    script.push_str(
+        "# Install: cp this file .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit\n",
+    );
     script.push_str("# Or: mkdir -p .githooks && cp this file .githooks/pre-commit && git config core.hooksPath .githooks\n\n");
 
     if allowed.is_empty() && blocked.is_empty() {
@@ -1900,7 +2014,9 @@ async fn get_pre_commit_hook(
             script.push_str("# Allowed path prefixes\n");
             script.push_str("ALLOWED_PATHS=(");
             for (i, p) in allowed.iter().enumerate() {
-                if i > 0 { script.push(' '); }
+                if i > 0 {
+                    script.push(' ');
+                }
                 script.push_str(&format!("\"{}\"", p));
             }
             script.push_str(")\n\n");
@@ -1914,7 +2030,9 @@ async fn get_pre_commit_hook(
             script.push_str("    fi\n");
             script.push_str("  done\n");
             script.push_str("  if [ $ALLOWED -eq 0 ]; then\n");
-            script.push_str("    echo \"ERROR: '$file' is not under an allowed path: ${ALLOWED_PATHS[*]}\"\n");
+            script.push_str(
+                "    echo \"ERROR: '$file' is not under an allowed path: ${ALLOWED_PATHS[*]}\"\n",
+            );
             script.push_str("    ERRORS=$((ERRORS + 1))\n");
             script.push_str("  fi\n");
             script.push_str("done\n\n");
@@ -1941,11 +2059,7 @@ async fn get_pre_commit_hook(
     Ok(axum::response::Response::builder()
         .status(200)
         .header("Content-Type", "text/plain; charset=utf-8")
-        .header(
-            "Content-Disposition",
-            "attachment; filename=\"pre-commit\"",
-        )
+        .header("Content-Disposition", "attachment; filename=\"pre-commit\"")
         .body(axum::body::Body::from(script))
         .unwrap())
 }
-

@@ -238,7 +238,10 @@ impl Scheduler {
                 }
                 Err(e) => {
                     let errors = sched_stats.total_errors.fetch_add(1, Ordering::SeqCst) + 1;
-                    let consecutive = sched_stats.consecutive_errors.fetch_add(1, Ordering::SeqCst) + 1;
+                    let consecutive = sched_stats
+                        .consecutive_errors
+                        .fetch_add(1, Ordering::SeqCst)
+                        + 1;
                     error!(
                         cycle = cycle_num,
                         error = %e,
@@ -345,8 +348,12 @@ impl Scheduler {
 
             // Read credentials from kv_state.
             // Chain: repo_id → parent → grandparent → … → global
-            let svn_password = self.db.resolve_credential_chain(&repo.id, "secret_svn_password");
-            let git_token = self.db.resolve_credential_chain(&repo.id, "secret_git_token");
+            let svn_password = self
+                .db
+                .resolve_credential_chain(&repo.id, "secret_svn_password");
+            let git_token = self
+                .db
+                .resolve_credential_chain(&repo.id, "secret_git_token");
 
             debug!(
                 repo_name = %repo.name,
@@ -453,26 +460,22 @@ impl Scheduler {
             // cloning an empty remote, libgit2 may leave HEAD pointing
             // at the wrong default branch name (e.g. master instead of
             // main). This is a no-op once a real commit exists.
-            git_client
-                .ensure_head_on_branch(&repo.git_branch)
-                .ok();
+            git_client.ensure_head_on_branch(&repo.git_branch).ok();
 
             // Reuse cached identity mapper when possible (P7 optimization).
             let identity_mapper = match self.cached_identity_mapper.get() {
                 Some(cached) => cached.clone(),
-                None => {
-                    match IdentityMapper::new(&self.app_config.identity) {
-                        Ok(m) => {
-                            let arc = Arc::new(m);
-                            let _ = self.cached_identity_mapper.set(arc.clone());
-                            arc
-                        }
-                        Err(e) => {
-                            error!(repo_name = %repo.name, error = %e, "failed to create identity mapper");
-                            continue;
-                        }
+                None => match IdentityMapper::new(&self.app_config.identity) {
+                    Ok(m) => {
+                        let arc = Arc::new(m);
+                        let _ = self.cached_identity_mapper.set(arc.clone());
+                        arc
                     }
-                }
+                    Err(e) => {
+                        error!(repo_name = %repo.name, error = %e, "failed to create identity mapper");
+                        continue;
+                    }
+                },
             };
 
             // Open a per-engine DB connection.
@@ -516,10 +519,14 @@ impl Scheduler {
             }
 
             // Parse and set path validation rules
-            let allowed_paths: Vec<String> = repo.allowed_paths.as_ref()
+            let allowed_paths: Vec<String> = repo
+                .allowed_paths
+                .as_ref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
-            let blocked_patterns: Vec<String> = repo.blocked_patterns.as_ref()
+            let blocked_patterns: Vec<String> = repo
+                .blocked_patterns
+                .as_ref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
             if !allowed_paths.is_empty() || !blocked_patterns.is_empty() {
@@ -623,7 +630,8 @@ impl Scheduler {
                                 &error_str[..error_str.len().min(100)]
                             );
                         } else {
-                            let sanitized_error = reposync_core::errors::sanitize_error_message(&error_str);
+                            let sanitized_error =
+                                reposync_core::errors::sanitize_error_message(&error_str);
                             let msg = serde_json::json!({
                                 "type": "repo_sync_failed",
                                 "repo_id": repo_id,

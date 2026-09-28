@@ -251,24 +251,38 @@ pub(crate) fn source_db(path: &Path) -> Result<Connection> {
 // admitted. Callers must keep these private directories quiescent: this is not
 // a fencing mechanism against concurrent replacement by another host process.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct StorageIdentity { device: u64, inode: u64 }
+struct StorageIdentity {
+    device: u64,
+    inode: u64,
+}
 fn private_file(path: &Path) -> Result<StorageIdentity> {
     use std::os::unix::fs::MetadataExt;
-    let m=fs::symlink_metadata(path)?;
-    ensure!(m.is_file() && !m.file_type().is_symlink(), "mutable DB is not a regular private file");
-    ensure!(m.nlink()==1, "mutable DB/sidecar has shared hard-link storage");
-    ensure!(m.ino()!=0, "unknown mutable storage identity");
-    Ok(StorageIdentity {device:m.dev(),inode:m.ino()})
+    let m = fs::symlink_metadata(path)?;
+    ensure!(
+        m.is_file() && !m.file_type().is_symlink(),
+        "mutable DB is not a regular private file"
+    );
+    ensure!(
+        m.nlink() == 1,
+        "mutable DB/sidecar has shared hard-link storage"
+    );
+    ensure!(m.ino() != 0, "unknown mutable storage identity");
+    Ok(StorageIdentity {
+        device: m.dev(),
+        inode: m.ino(),
+    })
 }
-fn independent_storage(source: &Path, copy: &Path) -> Result<(StorageIdentity,StorageIdentity)> {
-    let source_id=private_file(&source.join("reposync.db"))?;
-    let copy_id=private_file(&copy.join("reposync.db"))?;
-    ensure!(source_id!=copy_id, "source and copy share DB storage");
-    for suffix in ["-wal","-shm","-journal"] {
-        let path=copy.join(format!("reposync.db{suffix}"));
-        if path.try_exists()? { private_file(&path)?; }
+fn independent_storage(source: &Path, copy: &Path) -> Result<(StorageIdentity, StorageIdentity)> {
+    let source_id = private_file(&source.join("reposync.db"))?;
+    let copy_id = private_file(&copy.join("reposync.db"))?;
+    ensure!(source_id != copy_id, "source and copy share DB storage");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let path = copy.join(format!("reposync.db{suffix}"));
+        if path.try_exists()? {
+            private_file(&path)?;
+        }
     }
-    Ok((source_id,copy_id))
+    Ok((source_id, copy_id))
 }
 /// Seal an already-quiesced v12 source and its independent copy. No source
 /// writer is opened. Repeated calls may resume a structurally valid v13 copy.
@@ -321,9 +335,19 @@ impl CopySession {
         session.check_files()?;
         Ok(session)
     }
-    pub(crate) fn copy_path(&self)->&Path { &self.copy }
-    pub(crate) fn check_reader_shape(&self,c:&Connection)->Result<()> { ensure!(shape(c)?==self.v14_shape,"typed reader physical schema mismatch"); Ok(()) }
-    pub fn readers(&self)->Result<super::candidate_readers::CopyReaders<'_>> { super::candidate_readers::CopyReaders::open(self) }
+    pub(crate) fn copy_path(&self) -> &Path {
+        &self.copy
+    }
+    pub(crate) fn check_reader_shape(&self, c: &Connection) -> Result<()> {
+        ensure!(
+            shape(c)? == self.v14_shape,
+            "typed reader physical schema mismatch"
+        );
+        Ok(())
+    }
+    pub fn readers(&self) -> Result<super::candidate_readers::CopyReaders<'_>> {
+        super::candidate_readers::CopyReaders::open(self)
+    }
     pub fn source_seal(&self) -> &BTreeMap<String, FileSeal> {
         &self.seal
     }
@@ -335,7 +359,10 @@ impl CopySession {
         Ok(())
     }
     pub(crate) fn check_files(&self) -> Result<()> {
-        ensure!(independent_storage(&self.source,&self.copy)? == self.storage, "sealed DB storage replaced");
+        ensure!(
+            independent_storage(&self.source, &self.copy)? == self.storage,
+            "sealed DB storage replaced"
+        );
         self.source_unchanged()?;
         let mut actual = manifest(&self.copy, true)?;
         let mut source = self.seal.clone();
@@ -559,18 +586,33 @@ impl CopySession {
         git_remote: &Path,
     ) -> Result<Lineage> {
         self.source_unchanged()?;
-        let c=source_db(&self.source.join("reposync.db"))?;
-        let (rev,sha):(i64,String)=c.query_row("SELECT last_svn_rev,last_git_sha FROM repositories WHERE id=?1",[repo],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        let decision=super::candidate_evidence::imported_evidence(&c,repo,rev,&sha)?;
-        if decision.disposition!="qualified" {
-            self.disposition(repo,&decision.disposition,&decision.reasons.join(";"))?;
-            anyhow::bail!("legacy admission refused: {}",decision.reasons.join(";"));
+        let c = source_db(&self.source.join("reposync.db"))?;
+        let (rev, sha): (i64, String) = c.query_row(
+            "SELECT last_svn_rev,last_git_sha FROM repositories WHERE id=?1",
+            [repo],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let decision = super::candidate_evidence::imported_evidence(&c, repo, rev, &sha)?;
+        if decision.disposition != "qualified" {
+            self.disposition(repo, &decision.disposition, &decision.reasons.join(";"))?;
+            anyhow::bail!("legacy admission refused: {}", decision.reasons.join(";"));
         }
-        let result=self.qualify_imported_pair_inner(repo,svn_root,git_remote);
-        if result.is_err() {self.disposition(repo,"needs_reconciliation","endpoint_or_retained_history_unproved")?;}
+        let result = self.qualify_imported_pair_inner(repo, svn_root, git_remote);
+        if result.is_err() {
+            self.disposition(
+                repo,
+                "needs_reconciliation",
+                "endpoint_or_retained_history_unproved",
+            )?;
+        }
         result
     }
-    fn qualify_imported_pair_inner(&mut self,repo:&str,svn_root:&Path,git_remote:&Path)->Result<Lineage> {
+    fn qualify_imported_pair_inner(
+        &mut self,
+        repo: &str,
+        svn_root: &Path,
+        git_remote: &Path,
+    ) -> Result<Lineage> {
         self.source_unchanged()?;
         ensure!(
             !repo.is_empty()

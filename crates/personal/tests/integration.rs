@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use tempfile::TempDir;
 use std::sync::Mutex;
+use tempfile::TempDir;
 
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
@@ -2475,9 +2475,7 @@ fn test_lfs_pointer_detection_precision() {
 #[tokio::test]
 async fn test_replay_path_lfs_pointer_skipped_not_committed() {
     use reposync_core::db::queries::AuditLogEntry;
-    use reposync_core::git::github::{
-        GitHubCommit, GitHubCommitDetail, GitHubGitActor,
-    };
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
     use reposync_personal::git_to_svn::GitToSvnSync;
 
     if !svn_available() {
@@ -2553,8 +2551,11 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
     };
 
     let svn_client = SvnClient::new(&svn_url, "test", "test");
-    let github_client =
-        reposync_core::git::github::GitHubClient::new("https://localhost:0/unused", "unused", reposync_core::config::GitProvider::default());
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        "https://localhost:0/unused",
+        "unused",
+        reposync_core::config::GitProvider::default(),
+    );
 
     let sync = GitToSvnSync::new(
         svn_client,
@@ -2613,7 +2614,10 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
     assert_eq!(entry.action, "lfs_resolution_failed");
     assert_eq!(entry.direction.as_deref(), Some("git_to_svn"));
     assert_eq!(entry.git_sha.as_deref(), Some(commit_sha.as_str()));
-    assert!(!entry.success, "lfs_resolution_failed must be marked as failure");
+    assert!(
+        !entry.success,
+        "lfs_resolution_failed must be marked as failure"
+    );
     assert!(
         entry
             .details
@@ -2629,9 +2633,7 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
 /// Guards against false-positive skipping.
 #[tokio::test]
 async fn test_replay_path_normal_content_written_to_svn() {
-    use reposync_core::git::github::{
-        GitHubCommit, GitHubCommitDetail, GitHubGitActor,
-    };
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
     use reposync_personal::git_to_svn::GitToSvnSync;
 
     if !svn_available() {
@@ -2702,8 +2704,11 @@ async fn test_replay_path_normal_content_written_to_svn() {
     };
 
     let svn_client = SvnClient::new(&svn_url, "test", "test");
-    let github_client =
-        reposync_core::git::github::GitHubClient::new("https://localhost:0/unused", "unused", reposync_core::config::GitProvider::default());
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        "https://localhost:0/unused",
+        "unused",
+        reposync_core::config::GitProvider::default(),
+    );
 
     let sync = GitToSvnSync::new(
         svn_client,
@@ -2747,5 +2752,8 @@ async fn test_replay_path_normal_content_written_to_svn() {
         "normal file must be written to SVN working copy"
     );
     let written = std::fs::read_to_string(&svn_target).unwrap();
-    assert_eq!(written, normal_content, "SVN WC file content must match Git content");
+    assert_eq!(
+        written, normal_content,
+        "SVN WC file content must match Git content"
+    );
 }

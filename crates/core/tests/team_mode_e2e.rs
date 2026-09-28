@@ -10,22 +10,22 @@
 //!
 //! Tests skip gracefully if `svn` / `svnadmin` are not installed.
 
+use sha2::Digest;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::collections::BTreeMap;
-use sha2::Digest;
 
 use tempfile::TempDir;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::Database;
+use reposync_core::errors::SyncError;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::models::Repository;
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
-use reposync_core::errors::SyncError;
 
 // ===========================================================================
 // Helpers
@@ -170,15 +170,26 @@ fn svn_commit_file(wc_path: &Path, filename: &str, content: &str, message: &str)
 }
 
 fn tracked_tree_at(repo: &Path, revision: &str) -> BTreeMap<String, Vec<u8>> {
-    let listing = Command::new("git").arg("-C").arg(repo)
+    let listing = Command::new("git")
+        .arg("-C")
+        .arg(repo)
         .args(["ls-tree", "-r", "--name-only", "-z", revision])
-        .output().unwrap();
+        .output()
+        .unwrap();
     assert!(listing.status.success());
     let mut files = BTreeMap::new();
-    for name in listing.stdout.split(|byte| *byte == 0).filter(|name| !name.is_empty()) {
+    for name in listing
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
         let name = std::str::from_utf8(name).unwrap();
-        let output = Command::new("git").arg("-C").arg(repo)
-            .args(["show", &format!("{revision}:{name}")]).output().unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["show", &format!("{revision}:{name}")])
+            .output()
+            .unwrap();
         assert!(output.status.success(), "cannot read tracked {name}");
         files.insert(name.to_string(), output.stdout);
     }
@@ -199,8 +210,9 @@ fn fixture_tree() -> BTreeMap<String, Vec<u8>> {
 }
 
 fn tree_hashes(tree: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, String> {
-    tree.iter().map(|(name, bytes)|
-        (name.clone(), hex::encode(sha2::Sha256::digest(bytes)))).collect()
+    tree.iter()
+        .map(|(name, bytes)| (name.clone(), hex::encode(sha2::Sha256::digest(bytes))))
+        .collect()
 }
 
 fn exported_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -212,7 +224,12 @@ fn exported_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
                 visit(root, &path, files);
             } else {
                 assert!(entry.file_type().unwrap().is_file());
-                let name = path.strip_prefix(root).unwrap().to_str().unwrap().replace('\\', "/");
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/");
                 files.insert(name, std::fs::read(&path).unwrap());
             }
         }
@@ -232,45 +249,107 @@ fn copy_install_tree(source: &Path, target: &Path) {
         if entry.file_type().unwrap().is_dir() {
             copy_install_tree(&from, &to);
         } else {
-            assert!(entry.file_type().unwrap().is_file(), "old fixture contains a non-file entry");
+            assert!(
+                entry.file_type().unwrap().is_file(),
+                "old fixture contains a non-file entry"
+            );
             std::fs::copy(from, to).unwrap();
         }
     }
 }
 
 async fn svn_tree(fixture: &QualifiedPair, revision: i64) -> BTreeMap<String, Vec<u8>> {
-    let destination = fixture.tmp.path().join(format!("tree-{}-{}", revision, uuid::Uuid::new_v4()));
-    SvnClient::new(&fixture.svn_url, "", "").export("", revision, &destination).await.unwrap();
+    let destination =
+        fixture
+            .tmp
+            .path()
+            .join(format!("tree-{}-{}", revision, uuid::Uuid::new_v4()));
+    SvnClient::new(&fixture.svn_url, "", "")
+        .export("", revision, &destination)
+        .await
+        .unwrap();
     exported_tree(&destination)
 }
 
 fn svn_delete_file(wc: &Path, name: &str, message: &str) -> i64 {
-    let output = Command::new("svn").args(["rm", wc.join(name).to_str().unwrap()]).output().unwrap();
-    assert!(output.status.success(), "svn rm: {}", String::from_utf8_lossy(&output.stderr));
-    let output = Command::new("svn").args([
-        "commit", "-m", message, wc.to_str().unwrap(), "--username", "fixture", "--non-interactive",
-    ]).output().unwrap();
-    assert!(output.status.success(), "svn delete commit: {}", String::from_utf8_lossy(&output.stderr));
+    let output = Command::new("svn")
+        .args(["rm", wc.join(name).to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn rm: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            message,
+            wc.to_str().unwrap(),
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn delete commit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let line = String::from_utf8_lossy(&output.stdout);
-    line.lines().find_map(|line| line.strip_prefix("Committed revision "))
-        .unwrap().trim_end_matches('.').parse().unwrap()
+    line.lines()
+        .find_map(|line| line.strip_prefix("Committed revision "))
+        .unwrap()
+        .trim_end_matches('.')
+        .parse()
+        .unwrap()
 }
 
 fn svn_property_only_revision(wc: &Path) -> i64 {
-    let update = Command::new("svn").args(["update", wc.to_str().unwrap()]).output().unwrap();
-    assert!(update.status.success(), "svn update: {}", String::from_utf8_lossy(&update.stderr));
+    let update = Command::new("svn")
+        .args(["update", wc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "svn update: {}",
+        String::from_utf8_lossy(&update.stderr)
+    );
     let output = Command::new("svn")
         .args(["propset", "svn:ignore", "*.cache", wc.to_str().unwrap()])
-        .output().unwrap();
-    assert!(output.status.success(), "svn propset: {}", String::from_utf8_lossy(&output.stderr));
-    let output = Command::new("svn").args([
-        "commit", "-m", "Property-only revision", wc.to_str().unwrap(),
-        "--username", "fixture", "--non-interactive",
-    ]).output().unwrap();
-    assert!(output.status.success(), "svn property commit: {}", String::from_utf8_lossy(&output.stderr));
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn propset: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            "Property-only revision",
+            wc.to_str().unwrap(),
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn property commit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let line = String::from_utf8_lossy(&output.stdout);
-    line.lines().find_map(|line| line.strip_prefix("Committed revision "))
-        .unwrap().trim_end_matches('.').parse().unwrap()
+    line.lines()
+        .find_map(|line| line.strip_prefix("Committed revision "))
+        .unwrap()
+        .trim_end_matches('.')
+        .parse()
+        .unwrap()
 }
 
 fn setup_git_with_bare_origin(work_dir: &Path, bare_dir: &Path) -> GitClient {
@@ -1073,16 +1152,49 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
     let fixture = QualifiedPair::new().await;
     let git_sha = fixture.developer_commit("config", "from Git\n", "First direction");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, git_sha);
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(git_sha.clone()));
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().1,
+        git_sha
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(git_sha.clone())
+    );
 
-    let svn_rev = svn_commit_file(&fixture.wc, "origin.txt", "Second direction\n", "Second direction");
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let svn_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "Second direction\n",
+        "Second direction",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     let emitted = get_head_sha(&fixture.bridge);
     assert_ne!(emitted, git_sha);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (svn_rev, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(git_sha.clone()));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (svn_rev, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(git_sha.clone())
+    );
     let mapped: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND svn_rev = ?1 AND git_sha = ?2 AND status = 'applied'",
         rusqlite::params![svn_rev, emitted], |row| row.get(0)).unwrap();
@@ -1091,26 +1203,47 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
     let db = Database::new(&fixture.db_path).unwrap();
     db.initialize().unwrap();
     let mut restarted = SyncEngine::new(
-        fixture.engine.config().clone(), db,
+        fixture.engine.config().clone(),
+        db,
         SvnClient::new(&fixture.svn_url, "", ""),
-        GitClient::new(&fixture.bridge).unwrap(), Arc::new(make_identity_mapper()));
+        GitClient::new(&fixture.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     restarted.set_repo_id("pair".into());
     let repeat = restarted.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
     git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
     let further_git = fixture.developer_commit("config", "further Git\n", "Further Git direction");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(restarted.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    assert_eq!(restarted.db().get_repo_watermark("pair").unwrap().1, further_git);
-    assert_eq!(restarted.db().get_state("last_git_sha_pair").unwrap(), Some(further_git.clone()));
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("config")).unwrap(), "further Git\n");
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "Second direction\n");
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_ALTERNATING_DUAL_CURSOR", "git_handled":git_sha,
-        "svn_emitted":emitted, "svn_revision":svn_rev,
-        "legacy_copy":fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        "restarted_noop":true, "further_git":further_git, "mapped":mapped
-    }));
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    assert_eq!(
+        restarted.db().get_repo_watermark("pair").unwrap().1,
+        further_git
+    );
+    assert_eq!(
+        restarted.db().get_state("last_git_sha_pair").unwrap(),
+        Some(further_git.clone())
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("config")).unwrap(),
+        "further Git\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(),
+        "Second direction\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_ALTERNATING_DUAL_CURSOR", "git_handled":git_sha,
+            "svn_emitted":emitted, "svn_revision":svn_rev,
+            "legacy_copy":fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+            "restarted_noop":true, "further_git":further_git, "mapped":mapped
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1118,17 +1251,49 @@ async fn candidate_r01_pending_both_directions_after_legacy_split() {
     let fixture = QualifiedPair::new().await;
     let handled = fixture.developer_commit("config", "first Git\n", "Handled Git direction");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    let emitted_rev = svn_commit_file(&fixture.wc, "origin.txt", "prior SVN\n", "Prior SVN direction");
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let emitted_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "prior SVN\n",
+        "Prior SVN direction",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     let emitted_sha = get_head_sha(&fixture.bridge);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, emitted_sha);
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(handled.clone()));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().1,
+        emitted_sha
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(handled.clone())
+    );
 
     git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
     let pending_git = fixture.developer_commit("config", "pending Git\n", "Pending Git direction");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    let pending_svn = svn_commit_file(&fixture.wc, "origin.txt", "pending SVN\n", "Pending SVN direction");
+    let pending_svn = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "pending SVN\n",
+        "Pending SVN direction",
+    );
     assert_eq!(pending_svn, emitted_rev + 1);
     let before_mapping = fixture.engine.db().count_sync_records().unwrap();
     let stats = fixture.engine.run_sync_cycle().await.unwrap();
@@ -1142,15 +1307,24 @@ async fn candidate_r01_pending_both_directions_after_legacy_split() {
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND svn_rev = ?1 AND status = 'applied'",
         [pending_svn], |row| row.get(0)).unwrap();
     assert_eq!((git_mapped, svn_mapped), (1, 1));
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("config")).unwrap(), "pending Git\n");
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "pending SVN\n");
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_PENDING_BOTH_DIRECTIONS", "handled_git":handled,
-        "prior_emitted":emitted_sha, "pending_git":pending_git,
-        "pending_svn":pending_svn, "git_mapping":git_mapped,
-        "svn_mapping":svn_mapped, "mapping_before":before_mapping,
-        "mapping_after":after_mapping
-    }));
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("config")).unwrap(),
+        "pending Git\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(),
+        "pending SVN\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_PENDING_BOTH_DIRECTIONS", "handled_git":handled,
+            "prior_emitted":emitted_sha, "pending_git":pending_git,
+            "pending_svn":pending_svn, "git_mapping":git_mapped,
+            "svn_mapping":svn_mapped, "mapping_before":before_mapping,
+            "mapping_after":after_mapping
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1161,26 +1335,70 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
     // advances only the repository column to its emitted Git SHA.
     let handled = fixture.developer_commit("config", "legacy Git\n", "Legacy handled Git");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    let revision = svn_commit_file(&fixture.wc, "origin.txt", "legacy SVN\n", "Legacy emitted SVN");
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let revision = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "legacy SVN\n",
+        "Legacy emitted SVN",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     let emitted = get_head_sha(&fixture.bridge);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (revision, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(handled.clone()));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (revision, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(handled.clone())
+    );
     let before = fixture.snapshot().await;
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.git_to_svn_count, repeat.svn_to_git_count), (0, 0));
     assert_eq!(fixture.snapshot().await, before);
-    fixture.engine.db().conn().execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", []).unwrap();
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
+        .unwrap();
     let missing_kv = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!((missing_kv.git_to_svn_count, missing_kv.svn_to_git_count), (0, 0));
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (revision, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), None);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_LEGACY_STALE_COPY", "handled_git":handled,
-        "emitted_git":emitted, "svn_revision":revision,
-        "reconciled_without_new_mapping":true, "missing_kv_reconciled":true
-    }));
+    assert_eq!(
+        (missing_kv.git_to_svn_count, missing_kv.svn_to_git_count),
+        (0, 0)
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (revision, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        None
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_LEGACY_STALE_COPY", "handled_git":handled,
+            "emitted_git":emitted, "svn_revision":revision,
+            "reconciled_without_new_mapping":true, "missing_kv_reconciled":true
+        })
+    );
 }
 
 #[cfg(feature = "reliability-fixture")]
@@ -1189,10 +1407,16 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     let tmp = TempDir::new().unwrap();
     assert_fixture_owned(tmp.path());
     let old_root = tmp.path().join("old-install-generation");
-    let generator = std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
+    let generator =
+        std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
     let old_binary = std::fs::read(&generator).unwrap();
     let generation = Command::new(&generator)
-        .args(["generate_legacy_import", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "generate_legacy_import",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("REPOSYNC_OLD_FIXTURE_DIR", &old_root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1200,9 +1424,16 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "Fixture Developer")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output().unwrap();
-    assert!(generation.status.success(), "pinned old import: {} {}", String::from_utf8_lossy(&generation.stdout), String::from_utf8_lossy(&generation.stderr));
-    let old_generation = String::from_utf8_lossy(&generation.stderr).lines()
+        .output()
+        .unwrap();
+    assert!(
+        generation.status.success(),
+        "pinned old import: {} {}",
+        String::from_utf8_lossy(&generation.stdout),
+        String::from_utf8_lossy(&generation.stderr)
+    );
+    let old_generation = String::from_utf8_lossy(&generation.stderr)
+        .lines()
         .find_map(|line| line.strip_prefix("OLD_FIXTURE_EVIDENCE "))
         .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
         .expect("old generator did not report production import provenance");
@@ -1214,143 +1445,293 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     let original_manifest = tree_hashes(&exported_tree(&original));
     assert_eq!(tree_hashes(&exported_tree(&restored)), original_manifest);
     assert_eq!(tree_hashes(&exported_tree(&candidate)), original_manifest);
-    let original_db_hash = hex::encode(sha2::Sha256::digest(std::fs::read(original.join("reposync.db")).unwrap()));
-    assert_eq!(original_db_hash, hex::encode(sha2::Sha256::digest(std::fs::read(restored.join("reposync.db")).unwrap())));
+    let original_db_hash = hex::encode(sha2::Sha256::digest(
+        std::fs::read(original.join("reposync.db")).unwrap(),
+    ));
+    assert_eq!(
+        original_db_hash,
+        hex::encode(sha2::Sha256::digest(
+            std::fs::read(restored.join("reposync.db")).unwrap()
+        ))
+    );
     let svn_url = format!("file://{}/trunk", old_root.join("svn_repo").display());
     let bare = old_root.join("old-origin.git");
     let bridge = candidate.join("repos/pair/git-repo");
     let old_tip = get_head_sha(&bridge);
     let old_tree = tracked_tree(&bridge);
     let old_export = tmp.path().join("old-import-export");
-    SvnClient::new(&svn_url, "", "").export("", 2, &old_export).await.unwrap();
+    SvnClient::new(&svn_url, "", "")
+        .export("", 2, &old_export)
+        .await
+        .unwrap();
     assert_eq!(exported_tree(&old_export), old_tree);
-    assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), old_tip);
+    assert_eq!(
+        git_output(&bare, &["rev-parse", "refs/heads/main"]),
+        old_tip
+    );
     let mut config = make_app_config(&svn_url, &candidate);
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
     let db_path = candidate.join("reposync.db");
     let db = Database::new(&db_path).unwrap();
-    let old_schema: i64 = db.conn().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let old_schema: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     db.initialize().unwrap();
-    let new_schema: i64 = db.conn().query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    let new_schema: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
     assert_eq!((old_schema, new_schema), (12, 12));
     let old_repo = db.get_repository("pair").unwrap().unwrap();
     assert_eq!(old_repo.last_git_sha, old_tip);
-    assert_eq!(db.get_state("last_git_sha_pair").unwrap(), Some(old_tip.clone()));
-    assert_eq!(db.get_state("secret_svn_password_pair").unwrap().as_deref(), Some("fixture-only-svn-secret"));
-    assert_eq!(db.get_state("secret_git_token_pair").unwrap().as_deref(), Some("fixture-only-git-secret"));
-    assert_eq!(std::fs::read(candidate.join("config.toml")).unwrap(), std::fs::read(original.join("config.toml")).unwrap());
+    assert_eq!(
+        db.get_state("last_git_sha_pair").unwrap(),
+        Some(old_tip.clone())
+    );
+    assert_eq!(
+        db.get_state("secret_svn_password_pair").unwrap().as_deref(),
+        Some("fixture-only-svn-secret")
+    );
+    assert_eq!(
+        db.get_state("secret_git_token_pair").unwrap().as_deref(),
+        Some("fixture-only-git-secret")
+    );
+    assert_eq!(
+        std::fs::read(candidate.join("config.toml")).unwrap(),
+        std::fs::read(original.join("config.toml")).unwrap()
+    );
     let old_svn_rev = old_repo.last_svn_rev;
-    let mut engine = SyncEngine::new(config.clone(), db, SvnClient::new(&svn_url, "", ""),
-        GitClient::new(&bridge).unwrap(), Arc::new(make_identity_mapper()));
+    let mut engine = SyncEngine::new(
+        config.clone(),
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     engine.set_repo_id("pair".into());
     let idle = engine.run_sync_cycle().await.unwrap();
     assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
     assert_eq!(get_head_sha(&bridge), old_tip);
     assert_eq!(tracked_tree(&bridge), old_tree);
-    assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), old_tip);
-    assert_eq!(engine.db().get_repo_watermark("pair").unwrap(), (old_svn_rev, old_tip.clone()));
+    assert_eq!(
+        git_output(&bare, &["rev-parse", "refs/heads/main"]),
+        old_tip
+    );
+    assert_eq!(
+        engine.db().get_repo_watermark("pair").unwrap(),
+        (old_svn_rev, old_tip.clone())
+    );
     let baseline_receipt: serde_json::Value = serde_json::from_str(
-        &engine.db().get_state("handled_git_baseline_pair").unwrap().unwrap()).unwrap();
+        &engine
+            .db()
+            .get_state("handled_git_baseline_pair")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(baseline_receipt["git_sha"], old_tip);
     assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
     let restored_db = Database::new(&restored.join("reposync.db")).unwrap();
-    assert_eq!(restored_db.get_repo_watermark("pair").unwrap(), (old_svn_rev, old_tip.clone()));
-    assert_eq!(restored_db.get_state("secret_svn_password_pair").unwrap().as_deref(), Some("fixture-only-svn-secret"));
+    assert_eq!(
+        restored_db.get_repo_watermark("pair").unwrap(),
+        (old_svn_rev, old_tip.clone())
+    );
+    assert_eq!(
+        restored_db
+            .get_state("secret_svn_password_pair")
+            .unwrap()
+            .as_deref(),
+        Some("fixture-only-svn-secret")
+    );
     let mut restore_config = make_app_config(&svn_url, &restored);
     restore_config.svn.layout = reposync_core::config::SvnLayout::Custom;
-    let mut restore_engine = SyncEngine::new(restore_config, restored_db,
-        SvnClient::new(&svn_url,"",""), GitClient::new(&restored_bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut restore_engine = SyncEngine::new(
+        restore_config,
+        restored_db,
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&restored_bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     restore_engine.set_repo_id("pair".into());
     let restore_idle = restore_engine.run_sync_cycle().await.unwrap();
-    assert_eq!((restore_idle.svn_to_git_count, restore_idle.git_to_svn_count), (0, 0));
-    assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), old_tip);
+    assert_eq!(
+        (restore_idle.svn_to_git_count, restore_idle.git_to_svn_count),
+        (0, 0)
+    );
+    assert_eq!(
+        git_output(&bare, &["rev-parse", "refs/heads/main"]),
+        old_tip
+    );
     drop(restore_engine);
 
     let source_wc = old_root.join("source-wc");
-    let svn_only_rev = svn_commit_file(&source_wc, "origin.txt", "post-upgrade SVN\n", "SVN-only after old import");
+    let svn_only_rev = svn_commit_file(
+        &source_wc,
+        "origin.txt",
+        "post-upgrade SVN\n",
+        "SVN-only after old import",
+    );
     assert_eq!(svn_only_rev, old_svn_rev + 1);
     let incoming = engine.run_sync_cycle().await.unwrap();
-    assert_eq!((incoming.svn_to_git_count, incoming.git_to_svn_count), (1, 0));
+    assert_eq!(
+        (incoming.svn_to_git_count, incoming.git_to_svn_count),
+        (1, 0)
+    );
     let emitted = get_head_sha(&bridge);
     assert_ne!(emitted, old_tip);
-    assert_eq!(engine.db().get_repo_watermark("pair").unwrap(), (svn_only_rev, emitted.clone()));
-    assert_eq!(engine.db().get_state("last_git_sha_pair").unwrap(), Some(old_tip.clone()));
-    assert_eq!(std::fs::read_to_string(bridge.join("origin.txt")).unwrap(), "post-upgrade SVN\n");
+    assert_eq!(
+        engine.db().get_repo_watermark("pair").unwrap(),
+        (svn_only_rev, emitted.clone())
+    );
+    assert_eq!(
+        engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(old_tip.clone())
+    );
+    assert_eq!(
+        std::fs::read_to_string(bridge.join("origin.txt")).unwrap(),
+        "post-upgrade SVN\n"
+    );
     let wrong_db = Database::new(&db_path).unwrap();
-    let mut wrong_projection = SyncEngine::new(config.clone(), wrong_db,
-        SvnClient::new(&svn_url, "", ""), GitClient::new(&bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut wrong_projection = SyncEngine::new(
+        config.clone(),
+        wrong_db,
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     wrong_projection.set_repo_id("pair".into());
     wrong_projection.set_path_rules(vec!["restricted/".into()], vec![]);
     assert!(matches!(wrong_projection.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"));
-    assert_eq!(wrong_projection.db().get_repo_watermark("pair").unwrap(), (svn_only_rev, emitted.clone()));
-    assert_eq!(git_output(&bare, &["rev-parse", "refs/heads/main"]), emitted);
+    assert_eq!(
+        wrong_projection.db().get_repo_watermark("pair").unwrap(),
+        (svn_only_rev, emitted.clone())
+    );
+    assert_eq!(
+        git_output(&bare, &["rev-parse", "refs/heads/main"]),
+        emitted
+    );
     drop(wrong_projection);
     let after_incoming = engine.run_sync_cycle().await.unwrap();
-    assert_eq!((after_incoming.svn_to_git_count, after_incoming.git_to_svn_count), (0, 0));
+    assert_eq!(
+        (
+            after_incoming.svn_to_git_count,
+            after_incoming.git_to_svn_count
+        ),
+        (0, 0)
+    );
     drop(engine);
     let reopened_db = Database::new(&db_path).unwrap();
-    let mut reopened = SyncEngine::new(config, reopened_db, SvnClient::new(&svn_url, "", ""),
-        GitClient::new(&bridge).unwrap(), Arc::new(make_identity_mapper()));
+    let mut reopened = SyncEngine::new(
+        config,
+        reopened_db,
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     reopened.set_repo_id("pair".into());
     let restart_idle = reopened.run_sync_cycle().await.unwrap();
-    assert_eq!((restart_idle.svn_to_git_count, restart_idle.git_to_svn_count), (0, 0));
+    assert_eq!(
+        (restart_idle.svn_to_git_count, restart_idle.git_to_svn_count),
+        (0, 0)
+    );
     let developer = tmp.path().join("old-upgrade-developer");
-    git_cli(tmp.path(), &["clone", "-b", "main", bare.to_str().unwrap(), developer.to_str().unwrap()]);
-    std::fs::write(developer.join("post-upgrade-git.txt"), b"Git after upgrade\n").unwrap();
+    git_cli(
+        tmp.path(),
+        &[
+            "clone",
+            "-b",
+            "main",
+            bare.to_str().unwrap(),
+            developer.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(
+        developer.join("post-upgrade-git.txt"),
+        b"Git after upgrade\n",
+    )
+    .unwrap();
     git_cli(&developer, &["add", "post-upgrade-git.txt"]);
     git_cli(&developer, &["commit", "-m", "Git after upgrade"]);
     let outgoing_sha = get_head_sha(&developer);
     git_cli(&developer, &["push", "origin", "main"]);
     let outgoing = reopened.run_sync_cycle().await.unwrap();
-    assert_eq!((outgoing.svn_to_git_count, outgoing.git_to_svn_count), (0, 1));
+    assert_eq!(
+        (outgoing.svn_to_git_count, outgoing.git_to_svn_count),
+        (0, 1)
+    );
     let after = reopened.run_sync_cycle().await.unwrap();
     assert_eq!((after.svn_to_git_count, after.git_to_svn_count), (0, 0));
     let outgoing_map: i64 = reopened.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'git_to_svn' AND git_sha = ?1 AND status = 'applied'",
         [&outgoing_sha], |row| row.get(0)).unwrap();
     assert_eq!(outgoing_map, 1);
-    assert_eq!(reopened.db().get_state("last_git_sha_pair").unwrap(), Some(outgoing_sha.clone()));
-    assert_eq!(reopened.db().get_repo_watermark("pair").unwrap().1, outgoing_sha);
-    let final_rev = SvnClient::new(&svn_url,"","").info().await.unwrap().latest_rev;
+    assert_eq!(
+        reopened.db().get_state("last_git_sha_pair").unwrap(),
+        Some(outgoing_sha.clone())
+    );
+    assert_eq!(
+        reopened.db().get_repo_watermark("pair").unwrap().1,
+        outgoing_sha
+    );
+    let final_rev = SvnClient::new(&svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
     let final_export = tmp.path().join("final-upgrade-export");
-    SvnClient::new(&svn_url,"","").export("", final_rev, &final_export).await.unwrap();
+    SvnClient::new(&svn_url, "", "")
+        .export("", final_rev, &final_export)
+        .await
+        .unwrap();
     assert_eq!(exported_tree(&final_export), tracked_tree(&bridge));
     let mapped_rows: Vec<(i64, String, String, String)> = {
         let conn = reopened.db().conn();
         let mut statement = conn.prepare(
             "SELECT COALESCE(svn_rev, 0), COALESCE(git_sha, ''), direction, status FROM sync_records WHERE repo_id = 'pair' ORDER BY rowid").unwrap();
-        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
-            .unwrap().map(|row| row.unwrap()).collect()
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
     };
     let final_install_manifest = tree_hashes(&exported_tree(&candidate));
     let svn_uuid_output = Command::new("svnlook")
-        .args(["uuid", old_root.join("svn_repo").to_str().unwrap()]).output().unwrap();
+        .args(["uuid", old_root.join("svn_repo").to_str().unwrap()])
+        .output()
+        .unwrap();
     assert!(svn_uuid_output.status.success());
-    let svn_uuid = String::from_utf8(svn_uuid_output.stdout).unwrap().trim().to_string();
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
-        "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
-        "old_db_sha256":original_db_hash, "old_generation":old_generation,
-        "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
-        "schema_before":old_schema, "schema_after":new_schema,
-        "verified_baseline_receipt":baseline_receipt,
-        "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
-        "old_install_manifest":original_manifest,
-        "prewrite_restore_verified":true, "restore_noop":true,
-        "configuration_and_synthetic_credentials_preserved":true,
-        "changed_projection_rejected_without_remote_write":true,
-        "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
-        "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
-        "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
-        "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
-        "post_upgrade_install_manifest":final_install_manifest,
-        "repository_mapping_rows":mapped_rows,
-    }));
+    let svn_uuid = String::from_utf8(svn_uuid_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_OLD_INSTALL_UPGRADE", "old_code":"87379741779a6259f7eeb52a68cc6f061174e5ef",
+            "old_generator_sha256":hex::encode(sha2::Sha256::digest(old_binary)),
+            "old_db_sha256":original_db_hash, "old_generation":old_generation,
+            "old_svn_rev":old_svn_rev, "old_git":old_tip, "svn_uuid":svn_uuid,
+            "schema_before":old_schema, "schema_after":new_schema,
+            "verified_baseline_receipt":baseline_receipt,
+            "old_tree":tree_hashes(&old_tree), "old_install_file_count":original_manifest.len(),
+            "old_install_manifest":original_manifest,
+            "prewrite_restore_verified":true, "restore_noop":true,
+            "configuration_and_synthetic_credentials_preserved":true,
+            "changed_projection_rejected_without_remote_write":true,
+            "svn_only_rev":svn_only_rev, "svn_emitted":emitted,
+            "restart_noop":true, "git_outgoing":outgoing_sha, "outgoing_mapping":outgoing_map,
+            "final_svn_rev":final_rev, "final_svn_tree":tree_hashes(&exported_tree(&final_export)),
+            "final_git_tree":tree_hashes(&tracked_tree(&bridge)),
+            "post_upgrade_install_manifest":final_install_manifest,
+            "repository_mapping_rows":mapped_rows,
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1358,74 +1739,163 @@ async fn candidate_r01_empty_git_no_target_cursor_survives_svn_publication() {
     let fixture = QualifiedPair::new().await;
     let old_svn_rev = fixture.engine.db().get_repo_watermark("pair").unwrap().0;
     let old_tree = tracked_tree(&fixture.bridge);
-    git_cli(&fixture.developer, &["commit", "--allow-empty", "-m", "Intentional empty Git change"]);
+    git_cli(
+        &fixture.developer,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Intentional empty Git change",
+        ],
+    );
     let empty_sha = get_head_sha(&fixture.developer);
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let no_target = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!((no_target.svn_to_git_count, no_target.git_to_svn_count), (0, 0));
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (old_svn_rev, empty_sha.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(empty_sha.clone()));
+    assert_eq!(
+        (no_target.svn_to_git_count, no_target.git_to_svn_count),
+        (0, 0)
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (old_svn_rev, empty_sha.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(empty_sha.clone())
+    );
     let receipt_key = format!("handled_git_no_target_pair_{empty_sha}");
-    let receipt: serde_json::Value = serde_json::from_str(&fixture.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
+    let receipt: serde_json::Value = serde_json::from_str(
+        &fixture
+            .engine
+            .db()
+            .get_state(&receipt_key)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(receipt["outcome"], "empty_commit");
     assert_eq!(receipt["repo_id"], "pair");
     assert_eq!(receipt["git_sha"], empty_sha);
     assert_eq!(tracked_tree(&fixture.bridge), old_tree);
-    assert_eq!(SvnClient::new(&fixture.svn_url,"","").info().await.unwrap().latest_rev, old_svn_rev);
-    let svn_rev = svn_commit_file(&fixture.wc, "origin.txt", "SVN after empty Git\n", "Incoming after no-target");
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        SvnClient::new(&fixture.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        old_svn_rev
+    );
+    let svn_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "SVN after empty Git\n",
+        "Incoming after no-target",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     let emitted = get_head_sha(&fixture.bridge);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (svn_rev, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(empty_sha.clone()));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (svn_rev, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(empty_sha.clone())
+    );
     let before_remote = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
     let before_tree = tracked_tree(&fixture.bridge);
     let wrong_db = Database::new(&fixture.db_path).unwrap();
-    let mut wrong_policy = SyncEngine::new(fixture.engine.config().clone(), wrong_db,
-        SvnClient::new(&fixture.svn_url,"",""), GitClient::new(&fixture.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut wrong_policy = SyncEngine::new(
+        fixture.engine.config().clone(),
+        wrong_db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     wrong_policy.set_repo_id("pair".into());
     wrong_policy.set_path_rules(vec!["restricted/".into()], vec![]);
     assert!(matches!(wrong_policy.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"));
-    assert_eq!(git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]), before_remote);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        before_remote
+    );
     assert_eq!(tracked_tree(&fixture.bridge), before_tree);
-    assert_eq!(wrong_policy.db().get_repo_watermark("pair").unwrap(), (svn_rev, emitted.clone()));
+    assert_eq!(
+        wrong_policy.db().get_repo_watermark("pair").unwrap(),
+        (svn_rev, emitted.clone())
+    );
     drop(wrong_policy);
     let db = Database::new(&fixture.db_path).unwrap();
-    let mut restarted = SyncEngine::new(fixture.engine.config().clone(), db,
-        SvnClient::new(&fixture.svn_url,"",""), GitClient::new(&fixture.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut restarted = SyncEngine::new(
+        fixture.engine.config().clone(),
+        db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     restarted.set_repo_id("pair".into());
     let idle = restarted.run_sync_cycle().await.unwrap();
     assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
     git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
-    let actual = fixture.developer_commit("after-empty.txt", "real Git content\n", "Real Git after no-target");
+    let actual = fixture.developer_commit(
+        "after-empty.txt",
+        "real Git content\n",
+        "Real Git after no-target",
+    );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(restarted.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    assert_eq!(restarted.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
     let applied: i64 = restarted.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'git_to_svn' AND git_sha = ?1 AND status = 'applied'",
         [&actual], |row| row.get(0)).unwrap();
     assert_eq!(applied, 1);
     assert_eq!(restarted.db().get_repo_watermark("pair").unwrap().1, actual);
-    let final_revision = SvnClient::new(&fixture.svn_url,"","").info().await.unwrap().latest_rev;
-    assert_eq!(svn_tree(&fixture, final_revision).await, tracked_tree(&fixture.bridge));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_NO_TARGET_GIT_CURSOR", "empty_git":empty_sha,
-        "empty_outcome":receipt, "svn_revision":svn_rev, "svn_emitted":emitted,
-        "changed_policy_rejected_without_remote_write":true,
-        "remote_svn_unchanged_after_empty":old_svn_rev, "restart_noop":true,
-        "actual_git":actual, "actual_applied_once":applied,
-        "final_svn_tree":tree_hashes(&svn_tree(&fixture, final_revision).await),
-        "final_git_tree":tree_hashes(&tracked_tree(&fixture.bridge))
-    }));
+    let final_revision = SvnClient::new(&fixture.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    assert_eq!(
+        svn_tree(&fixture, final_revision).await,
+        tracked_tree(&fixture.bridge)
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_NO_TARGET_GIT_CURSOR", "empty_git":empty_sha,
+            "empty_outcome":receipt, "svn_revision":svn_rev, "svn_emitted":emitted,
+            "changed_policy_rejected_without_remote_write":true,
+            "remote_svn_unchanged_after_empty":old_svn_rev, "restart_noop":true,
+            "actual_git":actual, "actual_applied_once":applied,
+            "final_svn_tree":tree_hashes(&svn_tree(&fixture, final_revision).await),
+            "final_git_tree":tree_hashes(&tracked_tree(&fixture.bridge))
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
     let fixture = QualifiedPair::new().await;
     let baseline = fixture.imported_base.clone();
-    let pending = fixture.developer_commit("pending.txt", "pending Git survives\n", "Pending before SVN apply failure");
+    let pending = fixture.developer_commit(
+        "pending.txt",
+        "pending Git survives\n",
+        "Pending before SVN apply failure",
+    );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let verified = svn_commit_file(&fixture.wc, "origin.txt", "retention B\n", "Verified B");
     let failed = svn_commit_file(&fixture.wc, "origin.txt", "retention C\n", "Failed C");
@@ -1433,8 +1903,14 @@ async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
     assert!(fixture.engine.run_sync_cycle().await.is_err());
     drop(fault);
     let emitted = get_head_sha(&fixture.bridge);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (verified, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), None);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (verified, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        None
+    );
     let conn = fixture.engine.db().conn();
     let old_time = "2000-01-01 00:00:00";
     assert_eq!(conn.execute(
@@ -1446,13 +1922,25 @@ async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
     let retained_baseline: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
         [&baseline], |row| row.get(0)).unwrap();
-    let pruned_diagnostic: i64 = fixture.engine.db().conn().query_row(
-        "SELECT COUNT(*) FROM sync_records WHERE id = 'old-diagnostic'", [], |row| row.get(0)).unwrap();
+    let pruned_diagnostic: i64 = fixture
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE id = 'old-diagnostic'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!((retained_baseline, pruned_diagnostic), (1, 0));
     let db = Database::new(&fixture.db_path).unwrap();
-    let mut restarted = SyncEngine::new(fixture.engine.config().clone(), db,
-        SvnClient::new(&fixture.svn_url,"",""), GitClient::new(&fixture.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut restarted = SyncEngine::new(
+        fixture.engine.config().clone(),
+        db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     restarted.set_repo_id("pair".into());
     let retry = restarted.run_sync_cycle().await.unwrap();
     assert_eq!((retry.svn_to_git_count, retry.git_to_svn_count), (1, 1));
@@ -1460,27 +1948,44 @@ async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
         [&pending], |row| row.get(0)).unwrap();
     assert_eq!(pending_map, 1);
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("pending.txt")).unwrap(), "pending Git survives\n");
-    let final_revision = SvnClient::new(&fixture.svn_url,"","").info().await.unwrap().latest_rev;
-    assert_eq!(svn_tree(&fixture, final_revision).await, tracked_tree(&fixture.bridge));
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("pending.txt")).unwrap(),
+        "pending Git survives\n"
+    );
+    let final_revision = SvnClient::new(&fixture.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    assert_eq!(
+        svn_tree(&fixture, final_revision).await,
+        tracked_tree(&fixture.bridge)
+    );
     let repeat = restarted.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_RETENTION_FRONTIER", "baseline":baseline, "pending_git":pending,
-        "verified_svn_revision":verified, "failed_svn_revision":failed,
-        "emitted_before_retention":emitted, "baseline_applied_row_retained":retained_baseline,
-        "old_diagnostic_pruned":pruned_diagnostic == 0, "pending_git_applied_once":pending_map,
-        "restarted_after_maintenance":true, "repeat_noop":true,
-        "final_git_tree":tree_hashes(&tracked_tree(&fixture.bridge)),
-        "final_svn_tree":tree_hashes(&svn_tree(&fixture, final_revision).await)
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_RETENTION_FRONTIER", "baseline":baseline, "pending_git":pending,
+            "verified_svn_revision":verified, "failed_svn_revision":failed,
+            "emitted_before_retention":emitted, "baseline_applied_row_retained":retained_baseline,
+            "old_diagnostic_pruned":pruned_diagnostic == 0, "pending_git_applied_once":pending_map,
+            "restarted_after_maintenance":true, "repeat_noop":true,
+            "final_git_tree":tree_hashes(&tracked_tree(&fixture.bridge)),
+            "final_svn_tree":tree_hashes(&svn_tree(&fixture, final_revision).await)
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_prior_pruned_baseline_blocks_without_guessing() {
     let fixture = QualifiedPair::new().await;
     let baseline = fixture.imported_base.clone();
-    let pending = fixture.developer_commit("pending.txt", "must remain pending\n", "Pending Git before degraded retention");
+    let pending = fixture.developer_commit(
+        "pending.txt",
+        "must remain pending\n",
+        "Pending Git before degraded retention",
+    );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let verified = svn_commit_file(&fixture.wc, "origin.txt", "verified B\n", "Verified B");
     let failed = svn_commit_file(&fixture.wc, "origin.txt", "failed C\n", "Failed C");
@@ -1488,48 +1993,111 @@ async fn candidate_r10_prior_pruned_baseline_blocks_without_guessing() {
     assert!(fixture.engine.run_sync_cycle().await.is_err());
     drop(fault);
     let emitted = get_head_sha(&fixture.bridge);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (verified, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), None);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (verified, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        None
+    );
     // Model an installation already pruned by the original maintenance code.
     // Candidate retention cannot recreate a lost authority from the next row.
     let conn = fixture.engine.db().conn();
-    conn.execute("DELETE FROM kv_state WHERE key = 'handled_git_baseline_pair'", []).unwrap();
+    conn.execute(
+        "DELETE FROM kv_state WHERE key = 'handled_git_baseline_pair'",
+        [],
+    )
+    .unwrap();
     conn.execute("DELETE FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git'", [&baseline]).unwrap();
     drop(conn);
     let before_remote = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
     let before_tree = tracked_tree(&fixture.bridge);
-    let before_svn = SvnClient::new(&fixture.svn_url,"","").info().await.unwrap().latest_rev;
+    let before_svn = SvnClient::new(&fixture.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
     let result = fixture.engine.run_sync_cycle().await;
-    assert!(matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"));
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (verified, emitted.clone()));
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), None);
-    assert_eq!(git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]), before_remote);
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint")
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (verified, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        None
+    );
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        before_remote
+    );
     assert_eq!(tracked_tree(&fixture.bridge), before_tree);
-    assert_eq!(SvnClient::new(&fixture.svn_url,"","").info().await.unwrap().latest_rev, before_svn);
+    assert_eq!(
+        SvnClient::new(&fixture.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        before_svn
+    );
     let applied: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
         [&pending], |row| row.get(0)).unwrap();
     assert_eq!(applied, 0);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_PRIOR_PRUNED_BASELINE", "baseline":baseline,
-        "pending_git":pending, "emitted_git":emitted, "failed_revision":failed,
-        "safe_block":"ambiguous_checkpoint", "outgoing_mapping":applied,
-        "remote_git_unchanged":before_remote, "svn_revision_unchanged":before_svn,
-        "git_tree_preserved":tree_hashes(&before_tree)
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_PRIOR_PRUNED_BASELINE", "baseline":baseline,
+            "pending_git":pending, "emitted_git":emitted, "failed_revision":failed,
+            "safe_block":"ambiguous_checkpoint", "outgoing_mapping":applied,
+            "remote_git_unchanged":before_remote, "svn_revision_unchanged":before_svn,
+            "git_tree_preserved":tree_hashes(&before_tree)
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_retention_preserves_present_kv_applied_mapping() {
     let fixture = QualifiedPair::new().await;
-    let handled = fixture.developer_commit("handled.txt", "handled Git\n", "Handled before retention");
+    let handled =
+        fixture.developer_commit("handled.txt", "handled Git\n", "Handled before retention");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    let revision = svn_commit_file(&fixture.wc, "origin.txt", "SVN after handled\n", "Incoming before retention");
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let revision = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "SVN after handled\n",
+        "Incoming before retention",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     let emitted = get_head_sha(&fixture.bridge);
-    assert_eq!(fixture.engine.db().get_state("last_git_sha_pair").unwrap(), Some(handled.clone()));
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), (revision, emitted.clone()));
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(handled.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (revision, emitted.clone())
+    );
     let conn = fixture.engine.db().conn();
     assert_eq!(conn.execute(
         "UPDATE sync_records SET synced_at = '2000-01-01 00:00:00' WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
@@ -1541,22 +2109,39 @@ async fn candidate_r10_retention_preserves_present_kv_applied_mapping() {
         [&handled], |row| row.get(0)).unwrap();
     assert_eq!(applied, 1);
     let db = Database::new(&fixture.db_path).unwrap();
-    let mut restarted = SyncEngine::new(fixture.engine.config().clone(), db,
-        SvnClient::new(&fixture.svn_url,"",""), GitClient::new(&fixture.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut restarted = SyncEngine::new(
+        fixture.engine.config().clone(),
+        db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     restarted.set_repo_id("pair".into());
     let idle = restarted.run_sync_cycle().await.unwrap();
     assert_eq!((idle.svn_to_git_count, idle.git_to_svn_count), (0, 0));
-    assert_eq!(restarted.db().get_repo_watermark("pair").unwrap(), (revision, emitted.clone()));
-    let final_revision = SvnClient::new(&fixture.svn_url,"","").info().await.unwrap().latest_rev;
-    assert_eq!(svn_tree(&fixture, final_revision).await, tracked_tree(&fixture.bridge));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_RETENTION_PRESENT_KV", "handled_git":handled,
-        "emitted_git":emitted, "svn_revision":revision,
-        "old_applied_mapping_retained":applied, "restart_noop":true,
-        "git_tree":tree_hashes(&tracked_tree(&fixture.bridge)),
-        "svn_tree":tree_hashes(&svn_tree(&fixture, final_revision).await)
-    }));
+    assert_eq!(
+        restarted.db().get_repo_watermark("pair").unwrap(),
+        (revision, emitted.clone())
+    );
+    let final_revision = SvnClient::new(&fixture.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    assert_eq!(
+        svn_tree(&fixture, final_revision).await,
+        tracked_tree(&fixture.bridge)
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_RETENTION_PRESENT_KV", "handled_git":handled,
+            "emitted_git":emitted, "svn_revision":revision,
+            "old_applied_mapping_retained":applied, "restart_noop":true,
+            "git_tree":tree_hashes(&tracked_tree(&fixture.bridge)),
+            "svn_tree":tree_hashes(&svn_tree(&fixture, final_revision).await)
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1564,13 +2149,23 @@ async fn candidate_r10_unmapped_stale_copy_rejected() {
     let fixture = QualifiedPair::new().await;
     let before = fixture.snapshot().await;
     let false_cursor = "a".repeat(40);
-    fixture.engine.db().set_state("last_git_sha_pair", &false_cursor).unwrap();
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_sha_pair", &false_cursor)
+        .unwrap();
     assert_pair_blocked_without_damage(&fixture, "ambiguous_checkpoint").await;
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), before.watermark);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_UNMAPPED_STALE_COPY", "column":before.watermark.1,
-        "unmapped_copy":false_cursor, "blocked":true
-    }));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        before.watermark
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_UNMAPPED_STALE_COPY", "column":before.watermark.1,
+            "unmapped_copy":false_cursor, "blocked":true
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1582,13 +2177,19 @@ async fn candidate_r09_ignored_file_collision_preserved() {
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let before = fixture.snapshot().await;
     assert_pair_blocked_without_damage(&fixture, "ignored_path_collision").await;
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("cache.dat")).unwrap(), "private cache\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("cache.dat")).unwrap(),
+        "private cache\n"
+    );
     assert_eq!(fixture.snapshot().await, before);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R09_IGNORED_FILE_COLLISION", "protected_tree":before.bridge_tree,
-        "protected_index_sha256":hex::encode(sha2::Sha256::digest(&before.bridge_index)),
-        "protected_cache":true, "checkpoint":before.watermark
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_IGNORED_FILE_COLLISION", "protected_tree":before.bridge_tree,
+            "protected_index_sha256":hex::encode(sha2::Sha256::digest(&before.bridge_index)),
+            "protected_cache":true, "checkpoint":before.watermark
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1601,13 +2202,19 @@ async fn candidate_r09_ignored_directory_collision_preserved() {
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let before = fixture.snapshot().await;
     assert_pair_blocked_without_damage(&fixture, "ignored_path_collision").await;
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("cache/private.dat")).unwrap(), "private cache\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("cache/private.dat")).unwrap(),
+        "private cache\n"
+    );
     assert_eq!(fixture.snapshot().await, before);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R09_IGNORED_DIRECTORY_COLLISION", "protected_tree":before.bridge_tree,
-        "protected_index_sha256":hex::encode(sha2::Sha256::digest(&before.bridge_index)),
-        "protected_cache":true, "checkpoint":before.watermark
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_IGNORED_DIRECTORY_COLLISION", "protected_tree":before.bridge_tree,
+            "protected_index_sha256":hex::encode(sha2::Sha256::digest(&before.bridge_index)),
+            "protected_cache":true, "checkpoint":before.watermark
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1615,32 +2222,75 @@ async fn candidate_r09_rejection_preserves_raw_index_before_status() {
     let fixture = QualifiedPair::new().await;
     let initial = fixture.developer_commit("feature.txt", "version one\n", "Handled version");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, initial);
-    git_cli(&fixture.developer, &["commit", "--amend", "-m", "Rewritten metadata"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().1,
+        initial
+    );
+    git_cli(
+        &fixture.developer,
+        &["commit", "--amend", "-m", "Rewritten metadata"],
+    );
     git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
     // Change only a tracked file's metadata, then capture raw bytes before
     // any status/snapshot helper can refresh the index stat cache.
     let tracked = fixture.bridge.join("origin.txt");
-    let touch = Command::new("touch").args(["-m", "-t", "202001010000"]).arg(&tracked).status().unwrap();
+    let touch = Command::new("touch")
+        .args(["-m", "-t", "202001010000"])
+        .arg(&tracked)
+        .status()
+        .unwrap();
     assert!(touch.success());
     let index_before = std::fs::read(fixture.bridge.join(".git/index")).unwrap();
     let bridge_before = get_head_sha(&fixture.bridge);
     let cursor_before = fixture.engine.db().get_repo_watermark("pair").unwrap();
     let mapping_before = fixture.engine.db().count_sync_records().unwrap();
-    let svn_before = SvnClient::new(&fixture.svn_url, "", "").info().await.unwrap().latest_rev;
+    let svn_before = SvnClient::new(&fixture.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
     let result = fixture.engine.run_sync_cycle().await;
-    assert!(matches!(result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "non_fast_forward"));
-    assert_eq!(std::fs::read(fixture.bridge.join(".git/index")).unwrap(), index_before);
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "non_fast_forward")
+    );
+    assert_eq!(
+        std::fs::read(fixture.bridge.join(".git/index")).unwrap(),
+        index_before
+    );
     assert_eq!(get_head_sha(&fixture.bridge), bridge_before);
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap(), cursor_before);
-    assert_eq!(fixture.engine.db().count_sync_records().unwrap(), mapping_before);
-    assert_eq!(SvnClient::new(&fixture.svn_url, "", "").info().await.unwrap().latest_rev, svn_before);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R09_READONLY_INDEX", "index_sha256":hex::encode(sha2::Sha256::digest(&index_before)),
-        "bridge":bridge_before, "checkpoint":cursor_before, "svn_revision":svn_before,
-        "mapping_count":mapping_before
-    }));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        cursor_before
+    );
+    assert_eq!(
+        fixture.engine.db().count_sync_records().unwrap(),
+        mapping_before
+    );
+    assert_eq!(
+        SvnClient::new(&fixture.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        svn_before
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_READONLY_INDEX", "index_sha256":hex::encode(sha2::Sha256::digest(&index_before)),
+            "bridge":bridge_before, "checkpoint":cursor_before, "svn_revision":svn_before,
+            "mapping_count":mapping_before
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1653,16 +2303,25 @@ async fn candidate_r01_ignored_noncollision_allows_qualified_sync() {
     let before = fixture.snapshot().await;
     let stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(stats.git_to_svn_count, 1);
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("cache.dat")).unwrap(), "private cache\n");
-    assert_eq!(fixture.engine.db().get_repo_watermark("pair").unwrap().1, pending);
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("cache.dat")).unwrap(),
+        "private cache\n"
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().1,
+        pending
+    );
     let after = fixture.snapshot().await;
     assert_eq!(after.svn_rev, before.svn_rev + 1);
     assert_eq!(after.svn_feature.as_deref(), Some("ordinary change\n"));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_IGNORED_NONCOLLISION", "p":before.watermark.1,
-        "r":pending, "svn_revision":after.svn_rev,
-        "cache_preserved":true, "bridge_tree":after.bridge_tree
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_IGNORED_NONCOLLISION", "p":before.watermark.1,
+            "r":pending, "svn_revision":after.svn_rev,
+            "cache_preserved":true, "bridge_tree":after.bridge_tree
+        })
+    );
 }
 
 struct TestApplyFault {
@@ -1672,8 +2331,14 @@ struct TestApplyFault {
 impl TestApplyFault {
     async fn new(revision: i64, bridge: &Path) -> Self {
         static FAULT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let guard = FAULT_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
-        std::env::set_var("REPOSYNC_TEST_SVN_APPLY_FAULT", format!("{}|{}", revision, bridge.display()));
+        let guard = FAULT_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        std::env::set_var(
+            "REPOSYNC_TEST_SVN_APPLY_FAULT",
+            format!("{}|{}", revision, bridge.display()),
+        );
         Self { _guard: guard }
     }
 }
@@ -1686,53 +2351,88 @@ impl Drop for TestApplyFault {
 
 async fn run_failed_apply_barrier(retry: bool) {
     let fixture = QualifiedPair::new().await;
-    let pending_git = fixture.developer_commit("config", "pending outgoing\n", "Pending outgoing Git");
+    let pending_git =
+        fixture.developer_commit("config", "pending outgoing\n", "Pending outgoing Git");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let before = fixture.snapshot().await;
-    let verified = svn_commit_file(&fixture.wc, "origin.txt", "verified N-1\n", "Verified prior revision");
+    let verified = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "verified N-1\n",
+        "Verified prior revision",
+    );
     let failed = svn_commit_file(&fixture.wc, "origin.txt", "failed N\n", "Faulted revision");
     let later = svn_commit_file(&fixture.wc, "origin.txt", "queued N+1\n", "Later revision");
-    assert_eq!((verified, failed, later), (before.svn_rev + 1, before.svn_rev + 2, before.svn_rev + 3));
+    assert_eq!(
+        (verified, failed, later),
+        (before.svn_rev + 1, before.svn_rev + 2, before.svn_rev + 3)
+    );
     let fault = TestApplyFault::new(failed, &fixture.bridge).await;
     let result = fixture.engine.run_sync_cycle().await;
-    assert!(matches!(&result, Err(SyncError::GitError(reposync_core::errors::GitError::ApplyFailed(message)))
-        if message.contains(&format!("r{failed}"))), "failed N must stop cycle: {result:?}");
+    assert!(
+        matches!(&result, Err(SyncError::GitError(reposync_core::errors::GitError::ApplyFailed(message)))
+        if message.contains(&format!("r{failed}"))),
+        "failed N must stop cycle: {result:?}"
+    );
     drop(fault);
     let frontier = fixture.snapshot().await;
     assert_eq!(frontier.watermark.0, verified);
     assert_eq!(frontier.svn_rev, later);
     assert_eq!(frontier.svn_origin, "queued N+1\n");
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "verified N-1\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(),
+        "verified N-1\n"
+    );
     assert_eq!(frontier.remote_sha, frontier.bridge_sha);
     assert_eq!(frontier.remote_tree, frontier.bridge_tree);
-    assert!(frontier.bridge_status.is_empty(), "failed git apply left bridge dirty");
+    assert!(
+        frontier.bridge_status.is_empty(),
+        "failed git apply left bridge dirty"
+    );
     assert_eq!(frontier.mapping_count, before.mapping_count + 1);
     assert_eq!(frontier.repo_sync_count, before.repo_sync_count + 1);
     for revision in [failed, later] {
         let count: i64 = fixture.engine.db().conn().query_row(
             "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND svn_rev = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
             [revision], |row| row.get(0)).unwrap();
-        assert_eq!(count, 0, "unapplied r{revision} must have no successful mapping");
+        assert_eq!(
+            count, 0,
+            "unapplied r{revision} must have no successful mapping"
+        );
     }
     let outgoing_at_barrier: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
         [&pending_git], |row| row.get(0)).unwrap();
-    assert_eq!(outgoing_at_barrier, 0, "outgoing Git must wait behind failed incoming SVN");
+    assert_eq!(
+        outgoing_at_barrier, 0,
+        "outgoing Git must wait behind failed incoming SVN"
+    );
     let verified_sha = frontier.bridge_sha.clone();
-    assert_eq!(git_output(&fixture.bridge, &["show", &format!("{verified_sha}:origin.txt")]), "verified N-1");
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_FAILED_APPLY_BARRIER", "svn_source_head":later,
-        "frontier_revision":verified, "failed_revision":failed,
-        "queued_revision":later, "frontier_git":verified_sha,
-        "frontier_tree":frontier.bridge_tree, "remote_tree":frontier.remote_tree,
-        "frontier_index_sha256":hex::encode(sha2::Sha256::digest(&frontier.bridge_index)),
-        "frontier_status":frontier.bridge_status,
-        "mapping_before":before.mapping_count, "mapping_at_frontier":frontier.mapping_count,
-        "success_before":before.repo_sync_count, "success_at_frontier":frontier.repo_sync_count,
-        "pending_git":pending_git, "outgoing_mapping_at_barrier":outgoing_at_barrier,
-        "fault":"debug-only exact-revision invalid patch to real git apply"
-    }));
-    if !retry { return; }
+    assert_eq!(
+        git_output(
+            &fixture.bridge,
+            &["show", &format!("{verified_sha}:origin.txt")]
+        ),
+        "verified N-1"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_FAILED_APPLY_BARRIER", "svn_source_head":later,
+            "frontier_revision":verified, "failed_revision":failed,
+            "queued_revision":later, "frontier_git":verified_sha,
+            "frontier_tree":frontier.bridge_tree, "remote_tree":frontier.remote_tree,
+            "frontier_index_sha256":hex::encode(sha2::Sha256::digest(&frontier.bridge_index)),
+            "frontier_status":frontier.bridge_status,
+            "mapping_before":before.mapping_count, "mapping_at_frontier":frontier.mapping_count,
+            "success_before":before.repo_sync_count, "success_at_frontier":frontier.repo_sync_count,
+            "pending_git":pending_git, "outgoing_mapping_at_barrier":outgoing_at_barrier,
+            "fault":"debug-only exact-revision invalid patch to real git apply"
+        })
+    );
+    if !retry {
+        return;
+    }
 
     let applied = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 1));
@@ -1741,30 +2441,42 @@ async fn run_failed_apply_barrier(retry: bool) {
     assert_eq!(after.mapping_count, frontier.mapping_count + 3);
     assert_eq!(after.repo_sync_count, frontier.repo_sync_count + 3);
     assert_eq!(after.svn_rev, later + 1);
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("config")).unwrap(), "pending outgoing\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("config")).unwrap(),
+        "pending outgoing\n"
+    );
     let outgoing_mapped: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
         [&pending_git], |row| row.get(0)).unwrap();
     assert_eq!(outgoing_mapped, 1);
     assert_eq!(after.remote_sha, after.bridge_sha);
     assert_eq!(after.remote_tree, after.bridge_tree);
-    assert_eq!(std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(), "queued N+1\n");
+    assert_eq!(
+        std::fs::read_to_string(fixture.bridge.join("origin.txt")).unwrap(),
+        "queued N+1\n"
+    );
     for (revision, expected) in [(failed, "failed N"), (later, "queued N+1")] {
         let mapped: String = fixture.engine.db().conn().query_row(
             "SELECT git_sha FROM sync_records WHERE repo_id = 'pair' AND svn_rev = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
             [revision], |row| row.get(0)).unwrap();
-        assert_eq!(git_output(&fixture.bridge, &["show", &format!("{mapped}:origin.txt")]), expected);
+        assert_eq!(
+            git_output(&fixture.bridge, &["show", &format!("{mapped}:origin.txt")]),
+            expected
+        );
     }
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
     assert_eq!(fixture.snapshot().await, after);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_FAILED_APPLY_RETRY", "frontier_git":verified_sha,
-        "final_git":after.bridge_sha, "final_tree":after.bridge_tree,
-        "watermark":after.watermark, "mapping_after":after.mapping_count,
-        "success_after":after.repo_sync_count, "outgoing_mapping":outgoing_mapped,
-        "repeat_noop":true
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_FAILED_APPLY_RETRY", "frontier_git":verified_sha,
+            "final_git":after.bridge_sha, "final_tree":after.bridge_tree,
+            "watermark":after.watermark, "mapping_after":after.mapping_count,
+            "success_after":after.repo_sync_count, "outgoing_mapping":outgoing_mapped,
+            "repeat_noop":true
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1784,8 +2496,13 @@ async fn candidate_r01_property_only_revision_has_explicit_no_target_checkpoint(
     let revision = svn_property_only_revision(&fixture.wc);
     assert_eq!(revision, before.svn_rev + 1);
     let content_only = SvnClient::new(&fixture.svn_url, "", "")
-        .diff_content_only(revision).await.unwrap();
-    assert!(content_only.trim().is_empty(), "fixture must have no target file delta: {content_only}");
+        .diff_content_only(revision)
+        .await
+        .unwrap();
+    assert!(
+        content_only.trim().is_empty(),
+        "fixture must have no target file delta: {content_only}"
+    );
     let stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 0));
     let after = fixture.snapshot().await;
@@ -1802,19 +2519,32 @@ async fn candidate_r01_property_only_revision_has_explicit_no_target_checkpoint(
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
     assert_eq!(fixture.snapshot().await, after);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_METADATA_ONLY", "revision":revision,
-        "bridge_tree_before_after":before.bridge_tree,
-        "remote_tree_before_after":before.remote_tree,
-        "mapping_before_after":before.mapping_count,
-        "recorded_no_target_checkpoint":recorded,
-        "repeat_noop":true
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_METADATA_ONLY", "revision":revision,
+            "bridge_tree_before_after":before.bridge_tree,
+            "remote_tree_before_after":before.remote_tree,
+            "mapping_before_after":before.mapping_count,
+            "recorded_no_target_checkpoint":recorded,
+            "repeat_noop":true
+        })
+    );
 }
 
 async fn prepare_r19_tree(fixture: &QualifiedPair) -> (i64, BTreeMap<String, Vec<u8>>) {
-    let loose = svn_commit_file(&fixture.wc, "loose.txt", "untouched top-level\n", "Add top-level survivor");
-    let notes = svn_commit_file(&fixture.wc, "notes/keep.txt", "untouched directory\n", "Add directory survivor");
+    let loose = svn_commit_file(
+        &fixture.wc,
+        "loose.txt",
+        "untouched top-level\n",
+        "Add top-level survivor",
+    );
+    let notes = svn_commit_file(
+        &fixture.wc,
+        "notes/keep.txt",
+        "untouched directory\n",
+        "Add directory survivor",
+    );
     assert_eq!(notes, loose + 1);
     let stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(stats.svn_to_git_count, 2);
@@ -1830,7 +2560,12 @@ async fn candidate_r19_untouched_top_level_tree_survives_deltas() {
     let (before_rev, mut expected) = prepare_r19_tree(&fixture).await;
     let before_tree = git_output(&fixture.bridge, &["rev-parse", "HEAD^{tree}"]);
     let added = svn_commit_file(&fixture.wc, "added.txt", "new path\n", "Add path");
-    let modified = svn_commit_file(&fixture.wc, "origin.txt", "modified origin\n", "Modify path");
+    let modified = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "modified origin\n",
+        "Modify path",
+    );
     assert_eq!((added, modified), (before_rev + 1, before_rev + 2));
     let stats = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!(stats.svn_to_git_count, 2);
@@ -1850,34 +2585,61 @@ async fn candidate_r19_untouched_top_level_tree_survives_deltas() {
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
     assert_eq!(fixture.snapshot().await, after);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R19_UNTOUCHED_TREE", "before_revision":before_rev,
-        "added_revision":added, "modified_revision":modified,
-        "before_tree":before_tree, "added_commit":added_sha,
-        "before_full_tree_content_sha256":tree_hashes(&fixture_tree()),
-        "after_tree":after_tree, "expected_paths":expected.keys().collect::<Vec<_>>(),
-        "full_tree_content_sha256":tree_hashes(&expected),
-        "expected_sha256":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&expected).unwrap())),
-        "repeat_noop":true
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R19_UNTOUCHED_TREE", "before_revision":before_rev,
+            "added_revision":added, "modified_revision":modified,
+            "before_tree":before_tree, "added_commit":added_sha,
+            "before_full_tree_content_sha256":tree_hashes(&fixture_tree()),
+            "after_tree":after_tree, "expected_paths":expected.keys().collect::<Vec<_>>(),
+            "full_tree_content_sha256":tree_hashes(&expected),
+            "expected_sha256":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&expected).unwrap())),
+            "repeat_noop":true
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r19_explicit_svn_delete_only_removes_target() {
     let fixture = QualifiedPair::new().await;
     let (_, mut expected) = prepare_r19_tree(&fixture).await;
-    let added = svn_commit_file(&fixture.wc, "remove-me.txt", "delete target\n", "Add delete target");
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let added = svn_commit_file(
+        &fixture.wc,
+        "remove-me.txt",
+        "delete target\n",
+        "Add delete target",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     expected.insert("remove-me.txt".into(), b"delete target\n".to_vec());
     assert_eq!(tracked_tree(&fixture.bridge), expected);
     let before_head = get_head_sha(&fixture.bridge);
     let deleted = svn_delete_file(&fixture.wc, "remove-me.txt", "Explicit deletion");
     assert_eq!(deleted, added + 1);
-    assert_eq!(fixture.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
     expected.remove("remove-me.txt");
     assert_eq!(tracked_tree(&fixture.bridge), expected);
     assert_eq!(svn_tree(&fixture, deleted).await, expected);
-    let diff = git_output(&fixture.bridge, &["diff", "--name-status", &before_head, "HEAD"]);
+    let diff = git_output(
+        &fixture.bridge,
+        &["diff", "--name-status", &before_head, "HEAD"],
+    );
     assert_eq!(diff, "D\tremove-me.txt");
     let after = fixture.snapshot().await;
     assert_eq!(after.watermark.0, deleted);
@@ -1889,15 +2651,18 @@ async fn candidate_r19_explicit_svn_delete_only_removes_target() {
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
     assert_eq!(fixture.snapshot().await, after);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R19_EXPLICIT_DELETE", "added_revision":added,
-        "deleted_revision":deleted, "before_git":before_head,
-        "after_git":after.bridge_sha, "after_tree":after.bridge_tree,
-        "git_change":diff, "expected_paths":expected.keys().collect::<Vec<_>>(),
-        "full_tree_content_sha256":tree_hashes(&expected),
-        "expected_sha256":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&expected).unwrap())),
-        "mapping":mapping, "repeat_noop":true
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R19_EXPLICIT_DELETE", "added_revision":added,
+            "deleted_revision":deleted, "before_git":before_head,
+            "after_git":after.bridge_sha, "after_tree":after.bridge_tree,
+            "git_change":diff, "expected_paths":expected.keys().collect::<Vec<_>>(),
+            "full_tree_content_sha256":tree_hashes(&expected),
+            "expected_sha256":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&expected).unwrap())),
+            "mapping":mapping, "repeat_noop":true
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2500,9 +3265,16 @@ async fn diagnostic_r06_late_pair_checkpoint_omits_existing_git_work() {
     git_cli(&git_dir, &["push", "origin", "feature"]);
     let feature_tip = get_head_sha(&git_dir);
     assert_ne!(feature_tip, imported_base);
-    let pending = Command::new("git").arg("-C").arg(&git_dir)
-        .args(["rev-list", "--count", &format!("{imported_base}..{feature_tip}")])
-        .output().unwrap();
+    let pending = Command::new("git")
+        .arg("-C")
+        .arg(&git_dir)
+        .args([
+            "rev-list",
+            "--count",
+            &format!("{imported_base}..{feature_tip}"),
+        ])
+        .output()
+        .unwrap();
     assert!(pending.status.success());
     assert_eq!(String::from_utf8_lossy(&pending.stdout).trim(), "2");
 
@@ -2578,11 +3350,20 @@ async fn diagnostic_r06_late_pair_checkpoint_omits_existing_git_work() {
         .latest_rev;
     assert_eq!(stats.git_to_svn_count, 0);
     assert_eq!(before, after);
-    let child_records: i64 = child_engine.db().conn().query_row(
-        "SELECT COUNT(*) FROM sync_records WHERE git_sha = ?1",
-        [&feature_tip], |row| row.get(0)).unwrap();
+    let child_records: i64 = child_engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE git_sha = ?1",
+            [&feature_tip],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(child_records, 0);
-    assert_eq!(child_engine.db().get_state("last_git_sha_child").unwrap(), Some(feature_tip.clone()));
+    assert_eq!(
+        child_engine.db().get_state("last_git_sha_child").unwrap(),
+        Some(feature_tip.clone())
+    );
     let exported = tmp.path().join("feature_export");
     SvnClient::new(&target_url, "", "")
         .export("", after, &exported)
@@ -3218,23 +3999,48 @@ async fn test_team_mode_forced_failure_persists_audit_entry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
     let mut pair = QualifiedPair::new().await;
-    pair.developer_commit("handled.txt", "ordinary baseline\n", "Establish applied outbound cursor");
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
     pair.engine.set_path_rules(vec!["allow".into()], vec![]);
-    let filtered = pair.developer_commit("blocked.txt", "filtered content\n", "Nonempty filtered Git commit");
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Nonempty filtered Git commit",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, filtered);
-    assert_eq!(pair.engine.db().get_state("last_git_sha_pair").unwrap(), Some(filtered.clone()));
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        filtered
+    );
+    assert_eq!(
+        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(filtered.clone())
+    );
     let receipt_key = format!("handled_git_no_target_pair_{filtered}");
-    let receipt: serde_json::Value = serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
     assert_eq!(receipt["outcome"], "filtered");
     let before = pair.snapshot().await;
     let db = Database::new(&pair.db_path).unwrap();
-    let mut changed = SyncEngine::new(pair.engine.config().clone(), db,
-        SvnClient::new(&pair.svn_url, "", ""), GitClient::new(&pair.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut changed = SyncEngine::new(
+        pair.engine.config().clone(),
+        db,
+        SvnClient::new(&pair.svn_url, "", ""),
+        GitClient::new(&pair.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     changed.set_repo_id("pair".into());
     changed.set_path_rules(vec!["blocked".into()], vec![]);
     assert!(matches!(changed.run_sync_cycle().await,
@@ -3242,120 +4048,229 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
     assert_eq!(pair.snapshot().await, before);
     drop(changed);
     let saved_receipt = pair.engine.db().get_state(&receipt_key).unwrap().unwrap();
-    pair.engine.db().set_state(&receipt_key, "{malformed").unwrap();
+    pair.engine
+        .db()
+        .set_state(&receipt_key, "{malformed")
+        .unwrap();
     assert!(matches!(pair.engine.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
     assert_eq!(pair.snapshot().await, before);
-    pair.engine.db().set_state(&receipt_key, &saved_receipt).unwrap();
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
-    let allowed = pair.developer_commit("allow.txt", "ordinary work\n", "Ordinary work under unchanged policy");
+    pair.engine
+        .db()
+        .set_state(&receipt_key, &saved_receipt)
+        .unwrap();
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    let allowed = pair.developer_commit(
+        "allow.txt",
+        "ordinary work\n",
+        "Ordinary work under unchanged policy",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, allowed);
-    let svn_rev = SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev;
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        allowed
+    );
+    let svn_rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
     let tree = svn_tree(&pair, svn_rev).await;
     assert_eq!(tree.get("allow.txt"), Some(&b"ordinary work\n".to_vec()));
     assert!(!tree.contains_key("blocked.txt"));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_POLICY_EQUAL_CURSOR", "filtered":filtered,
-        "receipt":receipt, "changed_policy_block":"receipt_policy_changed",
-        "prewrite_snapshot_preserved":true, "same_policy_successor":allowed,
-        "same_policy_applied_once":1, "svn_tree":tree_hashes(&tree)
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_POLICY_EQUAL_CURSOR", "filtered":filtered,
+            "receipt":receipt, "changed_policy_block":"receipt_policy_changed",
+            "prewrite_snapshot_preserved":true, "same_policy_successor":allowed,
+            "same_policy_applied_once":1, "svn_tree":tree_hashes(&tree)
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
     let mut pair = QualifiedPair::new().await;
-    pair.developer_commit("handled.txt", "ordinary baseline\n", "Establish applied outbound cursor");
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
     pair.engine.set_path_rules(vec!["allow".into()], vec![]);
-    let filtered = pair.developer_commit("blocked.txt", "filtered content\n", "Filtered before SVN publication");
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Filtered before SVN publication",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
-    let svn_rev = svn_commit_file(&pair.wc, "origin.txt", "SVN after filtered Git\n", "Incoming after filtered Git");
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
-    assert_ne!(pair.engine.db().get_repo_watermark("pair").unwrap().1, filtered);
-    assert_eq!(pair.engine.db().get_state("last_git_sha_pair").unwrap(), Some(filtered.clone()));
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    let svn_rev = svn_commit_file(
+        &pair.wc,
+        "origin.txt",
+        "SVN after filtered Git\n",
+        "Incoming after filtered Git",
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1
+    );
+    assert_ne!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        filtered
+    );
+    assert_eq!(
+        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(filtered.clone())
+    );
     let before = pair.snapshot().await;
     let db = Database::new(&pair.db_path).unwrap();
-    let mut changed = SyncEngine::new(pair.engine.config().clone(), db,
-        SvnClient::new(&pair.svn_url, "", ""), GitClient::new(&pair.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut changed = SyncEngine::new(
+        pair.engine.config().clone(),
+        db,
+        SvnClient::new(&pair.svn_url, "", ""),
+        GitClient::new(&pair.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     changed.set_repo_id("pair".into());
     changed.set_path_rules(vec!["blocked".into()], vec![]);
     assert!(matches!(changed.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
     assert_eq!(pair.snapshot().await, before);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_POLICY_SPLIT_CURSOR", "filtered":filtered,
-        "svn_revision":svn_rev, "emitted":before.watermark.1,
-        "kv":before.kv_cursor, "changed_policy_block":"receipt_policy_changed",
-        "prewrite_snapshot_preserved":true
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_POLICY_SPLIT_CURSOR", "filtered":filtered,
+            "svn_revision":svn_rev, "emitted":before.watermark.1,
+            "kv":before.kv_cursor, "changed_policy_block":"receipt_policy_changed",
+            "prewrite_snapshot_preserved":true
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_policy_kv_only_filtered_commit_rejected() {
     let mut pair = QualifiedPair::new().await;
-    pair.developer_commit("handled.txt", "ordinary baseline\n", "Establish applied outbound cursor");
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 1);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
     pair.engine.set_path_rules(vec!["allow".into()], vec![]);
-    let filtered = pair.developer_commit("blocked.txt", "filtered content\n", "Filtered before KV-only overlay");
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Filtered before KV-only overlay",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
     // Explicit synthetic legacy overlay: the pinned old generator does not
     // create this absent-column shape.
-    pair.engine.db().conn().execute("UPDATE repositories SET last_git_sha = '' WHERE id = 'pair'", []).unwrap();
-    assert_eq!(pair.engine.db().get_state("last_git_sha_pair").unwrap(), Some(filtered.clone()));
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = '' WHERE id = 'pair'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(filtered.clone())
+    );
     let before = pair.snapshot().await;
     let db = Database::new(&pair.db_path).unwrap();
-    let mut changed = SyncEngine::new(pair.engine.config().clone(), db,
-        SvnClient::new(&pair.svn_url, "", ""), GitClient::new(&pair.bridge).unwrap(),
-        Arc::new(make_identity_mapper()));
+    let mut changed = SyncEngine::new(
+        pair.engine.config().clone(),
+        db,
+        SvnClient::new(&pair.svn_url, "", ""),
+        GitClient::new(&pair.bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
     changed.set_repo_id("pair".into());
     changed.set_path_rules(vec!["blocked".into()], vec![]);
     assert!(matches!(changed.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
     assert_eq!(pair.snapshot().await, before);
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_POLICY_KV_ONLY", "filtered":filtered,
-        "synthetic_column_absent":true, "kv":before.kv_cursor,
-        "changed_policy_block":"receipt_policy_changed", "prewrite_snapshot_preserved":true
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_POLICY_KV_ONLY", "filtered":filtered,
+            "synthetic_column_absent":true, "kv":before.kv_cursor,
+            "changed_policy_block":"receipt_policy_changed", "prewrite_snapshot_preserved":true
+        })
+    );
 }
 
 struct TestOutboundFault(&'static str);
 impl TestOutboundFault {
     fn new(kind: &'static str, sha: &str, bridge: &Path) -> Self {
-        let name = match kind { "read" => "REPOSYNC_TEST_GIT_CONTENT_FAULT", "stage" => "REPOSYNC_TEST_SVN_STAGE_FAULT", _ => panic!("unknown fault") };
+        let name = match kind {
+            "read" => "REPOSYNC_TEST_GIT_CONTENT_FAULT",
+            "stage" => "REPOSYNC_TEST_SVN_STAGE_FAULT",
+            _ => panic!("unknown fault"),
+        };
         std::env::set_var(name, format!("{}|{}", sha, bridge.display()));
         Self(name)
     }
 }
 impl Drop for TestOutboundFault {
-    fn drop(&mut self) { std::env::remove_var(self.0); }
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
 }
 
 struct TestOutboundPause(String);
 impl TestOutboundPause {
     fn new(key: &'static str, sha: &str, bridge: &Path, dir: &Path) -> Self {
-        let scoped_key = format!("{key}_{sha}_{}", hex::encode(sha2::Sha256::digest(bridge.to_string_lossy().as_bytes())));
+        let scoped_key = format!(
+            "{key}_{sha}_{}",
+            hex::encode(sha2::Sha256::digest(bridge.to_string_lossy().as_bytes()))
+        );
         std::env::set_var(&scoped_key, dir);
         Self(scoped_key)
     }
 }
 impl Drop for TestOutboundPause {
-    fn drop(&mut self) { std::env::remove_var(&self.0); }
+    fn drop(&mut self) {
+        std::env::remove_var(&self.0);
+    }
 }
 
 async fn wait_outbound_pause(dir: &Path) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     while !dir.join("ready").exists() {
-        assert!(tokio::time::Instant::now() < deadline, "outbound test boundary not reached");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "outbound test boundary not reached"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
@@ -3368,7 +4283,10 @@ async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str)
     let before = pair.snapshot().await;
     let fault = TestOutboundFault::new(kind, &first, &pair.bridge);
     let result = pair.engine.run_sync_cycle().await;
-    assert!(result.is_err(), "{kind} fault was incorrectly treated as no-target proof");
+    assert!(
+        result.is_err(),
+        "{kind} fault was incorrectly treated as no-target proof"
+    );
     drop(fault);
     let after_failure = pair.snapshot().await;
     assert_eq!(after_failure.svn_rev, before.svn_rev);
@@ -3380,9 +4298,18 @@ async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str)
     assert_eq!(after_failure.mapping_count, before.mapping_count);
     assert_eq!(after_failure.bridge_sha, second);
     assert!(after_failure.bridge_status.is_empty());
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, pair.imported_base);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        pair.imported_base
+    );
     for sha in [&first, &second] {
-        assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
+        assert_eq!(
+            pair.engine
+                .db()
+                .get_state(&format!("handled_git_no_target_pair_{sha}"))
+                .unwrap(),
+            None
+        );
         let count: i64 = pair.engine.db().conn().query_row(
             "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
             [sha], |row| row.get(0)).unwrap();
@@ -3390,23 +4317,36 @@ async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str)
     }
     let retry = pair.engine.run_sync_cycle().await.unwrap();
     assert_eq!(retry.git_to_svn_count, 2);
-    assert_eq!(pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, second);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        second
+    );
     for sha in [&first, &second] {
         let count: i64 = pair.engine.db().conn().query_row(
             "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
             [sha], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
     }
-    let rev = SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev;
+    let rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
     let svn = svn_tree(&pair, rev).await;
     assert_eq!(svn, tracked_tree(&pair.bridge));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":case, "fault":kind, "first":first, "queued_successor":second,
-        "failed_without_receipt_or_advance":true, "retry_applied_each_once":true,
-        "final_svn_revision":rev, "final_svn_tree":tree_hashes(&svn),
-        "final_git_tree":tree_hashes(&tracked_tree(&pair.bridge))
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":case, "fault":kind, "first":first, "queued_successor":second,
+            "failed_without_receipt_or_advance":true, "retry_applied_each_once":true,
+            "final_svn_revision":rev, "final_svn_tree":tree_hashes(&svn),
+            "final_git_tree":tree_hashes(&tracked_tree(&pair.bridge))
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3422,67 +4362,138 @@ async fn candidate_r01_no_target_stage_failure_preserves_pending_successor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r01_nonempty_already_represented_delta_is_verified() {
     let pair = QualifiedPair::new().await;
-    let rev = SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev;
-    git_cli(&pair.developer, &["update-index", "--chmod=+x", "origin.txt"]);
-    git_cli(&pair.developer, &["commit", "-m", "Git mode-only delta with represented content"]);
+    let rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    git_cli(
+        &pair.developer,
+        &["update-index", "--chmod=+x", "origin.txt"],
+    );
+    git_cli(
+        &pair.developer,
+        &[
+            "commit",
+            "-m",
+            "Git mode-only delta with represented content",
+        ],
+    );
     let mode_sha = get_head_sha(&pair.developer);
-    let successor = pair.developer_commit("later.txt", "queued after mode change\n", "Queued successor");
+    let successor = pair.developer_commit(
+        "later.txt",
+        "queued after mode change\n",
+        "Queued successor",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
     let before = pair.snapshot().await;
     assert!(matches!(pair.engine.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unsupported_git_semantics"));
     let after = pair.snapshot().await;
-    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, rev);
+    assert_eq!(
+        SvnClient::new(&pair.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        rev
+    );
     assert_eq!(after.svn_origin, before.svn_origin);
     assert_eq!(after.watermark, before.watermark);
     assert_eq!(after.kv_cursor, before.kv_cursor);
     assert_eq!(after.mapping_count, before.mapping_count);
     assert_eq!(after.remote_sha, before.remote_sha);
     for sha in [&mode_sha, &successor] {
-        assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
+        assert_eq!(
+            pair.engine
+                .db()
+                .get_state(&format!("handled_git_no_target_pair_{sha}"))
+                .unwrap(),
+            None
+        );
         let count: i64 = pair.engine.db().conn().query_row(
             "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
             [sha], |row| row.get(0)).unwrap();
         assert_eq!(count, 0);
     }
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_VERIFIED_NO_DELTA", "source_commit":mode_sha,
-        "queued_successor":successor, "old_oracle":"v2_byte_only_receipt_success",
-        "new_oracle":"unsupported_git_semantics_before_write",
-        "pinned_svn_revision":rev, "checkpoint_unchanged":true,
-        "target_byte_tree":tree_hashes(&svn_tree(&pair, rev).await),
-        "source_git_entry":git_output(&pair.developer, &["ls-tree", &mode_sha, "origin.txt"])
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_VERIFIED_NO_DELTA", "source_commit":mode_sha,
+            "queued_successor":successor, "old_oracle":"v2_byte_only_receipt_success",
+            "new_oracle":"unsupported_git_semantics_before_write",
+            "pinned_svn_revision":rev, "checkpoint_unchanged":true,
+            "target_byte_tree":tree_hashes(&svn_tree(&pair, rev).await),
+            "source_git_entry":git_output(&pair.developer, &["ls-tree", &mode_sha, "origin.txt"])
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r01_regular_content_already_represented_is_verified() {
     let pair = QualifiedPair::new().await;
-    let source_sha = pair.developer_commit("origin.txt", "same regular content\n", "Regular content delta");
+    let source_sha = pair.developer_commit(
+        "origin.txt",
+        "same regular content\n",
+        "Regular content delta",
+    );
     git_cli(&pair.developer, &["push", "origin", "main"]);
     let pause_dir = pair.tmp.path().join("before-outbound-checkout");
     std::fs::create_dir(&pause_dir).unwrap();
-    let pause = TestOutboundPause::new("REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT", &source_sha, &pair.bridge, &pause_dir);
+    let pause = TestOutboundPause::new(
+        "REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT",
+        &source_sha,
+        &pair.bridge,
+        &pause_dir,
+    );
     let (cycle, represented_rev) = tokio::join!(pair.engine.run_sync_cycle(), async {
         wait_outbound_pause(&pause_dir).await;
-        let rev = svn_commit_file(&pair.wc, "origin.txt", "same regular content\n", "Independent matching SVN content");
+        let rev = svn_commit_file(
+            &pair.wc,
+            "origin.txt",
+            "same regular content\n",
+            "Independent matching SVN content",
+        );
         std::fs::write(pause_dir.join("release"), b"").unwrap();
         rev
     });
     drop(pause);
     let cycle = cycle.unwrap();
     assert_eq!(cycle.git_to_svn_count, 0);
-    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, represented_rev);
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap().1, source_sha);
+    assert_eq!(
+        SvnClient::new(&pair.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        represented_rev
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        source_sha
+    );
     let key = format!("handled_git_no_target_pair_{source_sha}");
     let receipt: serde_json::Value = serde_json::from_str(
-        &pair.engine.db().get_state(&key).unwrap().expect("semantic no-target receipt")).unwrap();
+        &pair
+            .engine
+            .db()
+            .get_state(&key)
+            .unwrap()
+            .expect("semantic no-target receipt"),
+    )
+    .unwrap();
     assert_eq!(receipt["version"], 3);
     assert_eq!(receipt["outcome"], "no_svn_delta");
     assert_eq!(receipt["target"]["svn_revision"], represented_rev);
-    assert_eq!(receipt["target"]["semantic_projection"], "regular_file_bytes_no_properties_v1");
+    assert_eq!(
+        receipt["target"]["semantic_projection"],
+        "regular_file_bytes_no_properties_v1"
+    );
     assert_eq!(receipt["target"]["paths"]["origin.txt"]["git_mode"], 33188);
-    assert_eq!(receipt["target"]["paths"]["origin.txt"]["svn_executable"], false);
+    assert_eq!(
+        receipt["target"]["paths"]["origin.txt"]["svn_executable"],
+        false
+    );
     let old_v2 = serde_json::json!({
         "version":2,"repo_id":"pair","git_sha":source_sha,
         "outcome":"no_svn_delta","projection":receipt["projection"],
@@ -3490,20 +4501,26 @@ async fn candidate_r01_regular_content_already_represented_is_verified() {
                   "svn_url":receipt["target"]["svn_url"],"paths":{"origin.txt":receipt["target"]["paths"]["origin.txt"]["sha256"]}}
     });
     let v3 = pair.engine.db().get_state(&key).unwrap().unwrap();
-    pair.engine.db().set_state(&key, &old_v2.to_string()).unwrap();
+    pair.engine
+        .db()
+        .set_state(&key, &old_v2.to_string())
+        .unwrap();
     assert!(matches!(pair.engine.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
     pair.engine.db().set_state(&key, &v3).unwrap();
     assert_eq!(pair.engine.db().get_state(&key).unwrap(), Some(v3));
     let svn = svn_tree(&pair, represented_rev).await;
     assert_eq!(svn, tracked_tree(&pair.developer));
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_REPRESENTED_CONTENT", "source_commit":source_sha,
-        "pinned_svn_revision":represented_rev, "semantic_receipt":receipt,
-        "old_v2_unverified":true, "full_svn_bytes":tree_hashes(&svn),
-        "full_git_bytes":tree_hashes(&tracked_tree(&pair.developer)),
-        "git_entry":git_output(&pair.developer, &["ls-tree", &source_sha, "origin.txt"])
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_REPRESENTED_CONTENT", "source_commit":source_sha,
+            "pinned_svn_revision":represented_rev, "semantic_receipt":receipt,
+            "old_v2_unverified":true, "full_svn_bytes":tree_hashes(&svn),
+            "full_git_bytes":tree_hashes(&tracked_tree(&pair.developer)),
+            "git_entry":git_output(&pair.developer, &["ls-tree", &source_sha, "origin.txt"])
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3516,29 +4533,66 @@ async fn candidate_r01_target_changes_during_no_delta_proof_blocks_successor() {
     let verify_pause = pair.tmp.path().join("before-verify");
     std::fs::create_dir(&checkout_pause).unwrap();
     std::fs::create_dir(&verify_pause).unwrap();
-    let checkout_guard = TestOutboundPause::new("REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT", &first, &pair.bridge, &checkout_pause);
-    let verify_guard = TestOutboundPause::new("REPOSYNC_TEST_BEFORE_NO_TARGET_VERIFY", &first, &pair.bridge, &verify_pause);
+    let checkout_guard = TestOutboundPause::new(
+        "REPOSYNC_TEST_BEFORE_GIT_TO_SVN_CHECKOUT",
+        &first,
+        &pair.bridge,
+        &checkout_pause,
+    );
+    let verify_guard = TestOutboundPause::new(
+        "REPOSYNC_TEST_BEFORE_NO_TARGET_VERIFY",
+        &first,
+        &pair.bridge,
+        &verify_pause,
+    );
     let old_checkpoint = pair.engine.db().get_repo_watermark("pair").unwrap();
     let old_mapping_count = pair.snapshot().await.mapping_count;
-    let (result, (represented_rev, mismatched_rev)) = tokio::join!(pair.engine.run_sync_cycle(), async {
-        wait_outbound_pause(&checkout_pause).await;
-        let represented = svn_commit_file(&pair.wc, "origin.txt", "represented first\n", "Independent representation");
-        std::fs::write(checkout_pause.join("release"), b"").unwrap();
-        wait_outbound_pause(&verify_pause).await;
-        let mismatch = svn_commit_file(&pair.wc, "origin.txt", "different newer target\n", "Intervening target change");
-        std::fs::write(verify_pause.join("release"), b"").unwrap();
-        (represented, mismatch)
-    });
+    let (result, (represented_rev, mismatched_rev)) =
+        tokio::join!(pair.engine.run_sync_cycle(), async {
+            wait_outbound_pause(&checkout_pause).await;
+            let represented = svn_commit_file(
+                &pair.wc,
+                "origin.txt",
+                "represented first\n",
+                "Independent representation",
+            );
+            std::fs::write(checkout_pause.join("release"), b"").unwrap();
+            wait_outbound_pause(&verify_pause).await;
+            let mismatch = svn_commit_file(
+                &pair.wc,
+                "origin.txt",
+                "different newer target\n",
+                "Intervening target change",
+            );
+            std::fs::write(verify_pause.join("release"), b"").unwrap();
+            (represented, mismatch)
+        });
     drop(checkout_guard);
     drop(verify_guard);
     assert!(matches!(result,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target"));
-    assert_eq!(pair.engine.db().get_repo_watermark("pair").unwrap(), old_checkpoint);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap(),
+        old_checkpoint
+    );
     assert_eq!(pair.snapshot().await.mapping_count, old_mapping_count);
-    assert_eq!(SvnClient::new(&pair.svn_url, "", "").info().await.unwrap().latest_rev, mismatched_rev);
+    assert_eq!(
+        SvnClient::new(&pair.svn_url, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        mismatched_rev
+    );
     assert_eq!(mismatched_rev, represented_rev + 1);
     for sha in [&first, &successor] {
-        assert_eq!(pair.engine.db().get_state(&format!("handled_git_no_target_pair_{sha}")).unwrap(), None);
+        assert_eq!(
+            pair.engine
+                .db()
+                .get_state(&format!("handled_git_no_target_pair_{sha}"))
+                .unwrap(),
+            None
+        );
         let count: i64 = pair.engine.db().conn().query_row(
             "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
             [sha], |row| row.get(0)).unwrap();
@@ -3546,13 +4600,16 @@ async fn candidate_r01_target_changes_during_no_delta_proof_blocks_successor() {
     }
     let svn = svn_tree(&pair, mismatched_rev).await;
     assert_eq!(svn["origin.txt"], b"different newer target\n");
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R01_TARGET_MISMATCH", "first":first, "queued_successor":successor,
-        "represented_revision":represented_rev, "mismatched_revision":mismatched_rev,
-        "failed_without_receipt_or_checkpoint_advance":true,
-        "target_byte_tree":tree_hashes(&svn),
-        "source_git_entry":git_output(&pair.developer, &["ls-tree", &first, "origin.txt"])
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R01_TARGET_MISMATCH", "first":first, "queued_successor":successor,
+            "represented_revision":represented_rev, "mismatched_revision":mismatched_rev,
+            "failed_without_receipt_or_checkpoint_advance":true,
+            "target_byte_tree":tree_hashes(&svn),
+            "source_git_entry":git_output(&pair.developer, &["ls-tree", &first, "origin.txt"])
+        })
+    );
 }
 
 #[cfg(feature = "reliability-fixture")]
@@ -3561,9 +4618,15 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
     let tmp = TempDir::new().unwrap();
     assert_fixture_owned(tmp.path());
     let old_root = tmp.path().join("pinned-old-topology");
-    let generator = std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
+    let generator =
+        std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
     let generation = Command::new(&generator)
-        .args(["generate_legacy_topology", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "generate_legacy_topology",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("REPOSYNC_OLD_TOPOLOGY_DIR", &old_root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3571,38 +4634,72 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "Fixture Developer")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output().unwrap();
-    assert!(generation.status.success(), "pinned old topology: {} {}",
-        String::from_utf8_lossy(&generation.stdout), String::from_utf8_lossy(&generation.stderr));
-    let old_evidence = String::from_utf8_lossy(&generation.stderr).lines()
+        .output()
+        .unwrap();
+    assert!(
+        generation.status.success(),
+        "pinned old topology: {} {}",
+        String::from_utf8_lossy(&generation.stdout),
+        String::from_utf8_lossy(&generation.stderr)
+    );
+    let old_evidence = String::from_utf8_lossy(&generation.stderr)
+        .lines()
         .find_map(|line| line.strip_prefix("OLD_TOPOLOGY_EVIDENCE "))
         .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
         .expect("old production topology evidence missing");
     assert_eq!(old_evidence["pair"]["svn_rev"], 2);
     assert_eq!(old_evidence["pair_two"]["svn_rev"], 2);
-    assert_ne!(old_evidence["pair"]["git_sha"], old_evidence["pair_two"]["git_sha"]);
+    assert_ne!(
+        old_evidence["pair"]["git_sha"],
+        old_evidence["pair_two"]["git_sha"]
+    );
     assert_eq!(old_evidence["disabled"]["enabled"], false);
     let original = old_root.join("install");
     let copy = tmp.path().join("quiesced-copy");
     copy_install_tree(&original, &copy);
-    assert_eq!(tree_hashes(&exported_tree(&original)), tree_hashes(&exported_tree(&copy)));
-    let inventory_script = std::env::var("REPOSYNC_INVENTORY_SCRIPT")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reliability-inventory.py").to_string());
+    assert_eq!(
+        tree_hashes(&exported_tree(&original)),
+        tree_hashes(&exported_tree(&copy))
+    );
+    let inventory_script = std::env::var("REPOSYNC_INVENTORY_SCRIPT").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/reliability-inventory.py"
+        )
+        .to_string()
+    });
     let python_bin = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("python3")).find(|path| path.is_file())
+        .map(|dir| dir.join("python3"))
+        .find(|path| path.is_file())
         .expect("fixture Python interpreter");
     let python = |args: &[&str]| {
-        Command::new(&python_bin).arg(&inventory_script).args(args)
+        Command::new(&python_bin)
+            .arg(&inventory_script)
+            .args(args)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("PATH", "/nonexistent")
-            .output().unwrap()
+            .output()
+            .unwrap()
     };
     let seal_output = python(&["--seal-copy", copy.to_str().unwrap()]);
-    assert!(seal_output.status.success(), "seal: {}", String::from_utf8_lossy(&seal_output.stderr));
+    assert!(
+        seal_output.status.success(),
+        "seal: {}",
+        String::from_utf8_lossy(&seal_output.stderr)
+    );
     let seal_path = tmp.path().join("seal.json");
     std::fs::write(&seal_path, &seal_output.stdout).unwrap();
-    let report_output = python(&["--copy", copy.to_str().unwrap(), "--manifest", seal_path.to_str().unwrap()]);
-    assert!(report_output.status.success(), "inventory: {}", String::from_utf8_lossy(&report_output.stderr));
+    let report_output = python(&[
+        "--copy",
+        copy.to_str().unwrap(),
+        "--manifest",
+        seal_path.to_str().unwrap(),
+    ]);
+    assert!(
+        report_output.status.success(),
+        "inventory: {}",
+        String::from_utf8_lossy(&report_output.stderr)
+    );
     let report: serde_json::Value = serde_json::from_slice(&report_output.stdout).unwrap();
     let repositories = report["repositories"].as_array().unwrap();
     assert_eq!(repositories.len(), 3);
@@ -3618,23 +4715,56 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
         assert_eq!(row["credentials"]["repo_git_secret_present"], true);
         if id != "pair_disabled" {
             assert_eq!(row["checkpoints"]["repository_svn_revision"], 2);
-            assert_eq!(row["checkpoints"]["scoped_git_kv"], row["checkpoints"]["repository_git_column"]);
-            assert_eq!(row["target"]["local_ref"], row["checkpoints"]["repository_git_column"]);
-            assert!(row["applied_mappings"].as_array().unwrap().iter().any(|entry|
-                entry["svn_rev"] == 2 && entry["git_sha"] == row["checkpoints"]["repository_git_column"]));
+            assert_eq!(
+                row["checkpoints"]["scoped_git_kv"],
+                row["checkpoints"]["repository_git_column"]
+            );
+            assert_eq!(
+                row["target"]["local_ref"],
+                row["checkpoints"]["repository_git_column"]
+            );
+            assert!(row["applied_mappings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["svn_rev"] == 2
+                    && entry["git_sha"] == row["checkpoints"]["repository_git_column"]));
         }
     }
     let report_text = String::from_utf8(report_output.stdout.clone()).unwrap();
-    for secret in ["synthetic-svn-pair", "synthetic-git-pair", "synthetic-svn-pair_two",
-                   "synthetic-git-pair_two", "synthetic-svn-pair_disabled", "synthetic-git-pair_disabled"] {
-        assert!(!report_text.contains(secret), "inventory leaked a synthetic credential");
+    for secret in [
+        "synthetic-svn-pair",
+        "synthetic-git-pair",
+        "synthetic-svn-pair_two",
+        "synthetic-git-pair_two",
+        "synthetic-svn-pair_disabled",
+        "synthetic-git-pair_disabled",
+    ] {
+        assert!(
+            !report_text.contains(secret),
+            "inventory leaked a synthetic credential"
+        );
     }
-    let repeated = python(&["--copy", copy.to_str().unwrap(), "--manifest", seal_path.to_str().unwrap()]);
+    let repeated = python(&[
+        "--copy",
+        copy.to_str().unwrap(),
+        "--manifest",
+        seal_path.to_str().unwrap(),
+    ]);
     assert!(repeated.status.success());
-    assert_eq!(repeated.stdout, report_output.stdout, "inventory is not deterministic");
+    assert_eq!(
+        repeated.stdout, report_output.stdout,
+        "inventory is not deterministic"
+    );
     let after_seal = python(&["--seal-copy", copy.to_str().unwrap()]);
-    assert_eq!(after_seal.stdout, seal_output.stdout, "input hashes or permissions changed");
-    assert_eq!(tree_hashes(&exported_tree(&original)), tree_hashes(&exported_tree(&copy)));
+    assert_eq!(
+        after_seal.stdout, seal_output.stdout,
+        "input hashes or permissions changed"
+    );
+    assert_eq!(
+        tree_hashes(&exported_tree(&original)),
+        tree_hashes(&exported_tree(&copy))
+    );
 
     // These are explicit synthetic fault overlays, not states claimed to have
     // been emitted by unchanged old production code.
@@ -3648,28 +4778,55 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
     assert!(degraded_seal.status.success());
     let degraded_manifest = tmp.path().join("pruned-seal.json");
     std::fs::write(&degraded_manifest, degraded_seal.stdout).unwrap();
-    let degraded_report = python(&["--copy", degraded.to_str().unwrap(), "--manifest", degraded_manifest.to_str().unwrap()]);
+    let degraded_report = python(&[
+        "--copy",
+        degraded.to_str().unwrap(),
+        "--manifest",
+        degraded_manifest.to_str().unwrap(),
+    ]);
     assert!(degraded_report.status.success());
     let degraded_json: serde_json::Value = serde_json::from_slice(&degraded_report.stdout).unwrap();
-    assert_eq!(degraded_json["repositories"][0]["classification"], "needs_reconciliation");
+    assert_eq!(
+        degraded_json["repositories"][0]["classification"],
+        "needs_reconciliation"
+    );
 
     let missing_receipt = tmp.path().join("synthetic-missing-receipt-overlay");
     copy_install_tree(&original, &missing_receipt);
     let synthetic_cursor = "a".repeat(40);
     {
         let db = rusqlite::Connection::open(missing_receipt.join("reposync.db")).unwrap();
-        db.execute("UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'", [&synthetic_cursor]).unwrap();
-        db.execute("UPDATE kv_state SET value = ?1 WHERE key = 'last_git_sha_pair'", [&synthetic_cursor]).unwrap();
+        db.execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&synthetic_cursor],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE kv_state SET value = ?1 WHERE key = 'last_git_sha_pair'",
+            [&synthetic_cursor],
+        )
+        .unwrap();
     }
     let missing_seal = python(&["--seal-copy", missing_receipt.to_str().unwrap()]);
     assert!(missing_seal.status.success());
     let missing_manifest = tmp.path().join("missing-seal.json");
     std::fs::write(&missing_manifest, missing_seal.stdout).unwrap();
-    let missing_report = python(&["--copy", missing_receipt.to_str().unwrap(), "--manifest", missing_manifest.to_str().unwrap()]);
+    let missing_report = python(&[
+        "--copy",
+        missing_receipt.to_str().unwrap(),
+        "--manifest",
+        missing_manifest.to_str().unwrap(),
+    ]);
     assert!(missing_report.status.success());
     let missing_json: serde_json::Value = serde_json::from_slice(&missing_report.stdout).unwrap();
-    assert_eq!(missing_json["repositories"][0]["classification"], "needs_reconciliation");
-    assert!(missing_json["repositories"][0]["missing_proof"].as_array().unwrap().iter()
+    assert_eq!(
+        missing_json["repositories"][0]["classification"],
+        "needs_reconciliation"
+    );
+    assert!(missing_json["repositories"][0]["missing_proof"]
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|entry| entry == "no_target_receipt_or_applied_mapping_missing"));
 
     let unverified_receipt = tmp.path().join("synthetic-v1-receipt-overlay");
@@ -3679,18 +4836,35 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
         let sha = old_evidence["pair"]["git_sha"].as_str().unwrap();
         let value = serde_json::json!({"version":1,"repo_id":"pair","git_sha":sha,
             "outcome":"no_svn_delta","projection":"{\"allowed_paths\":[],\"blocked_patterns\":[]}"});
-        db.execute("INSERT INTO kv_state (key,value,updated_at) VALUES (?1,?2,'')",
-            rusqlite::params![format!("handled_git_no_target_pair_{sha}"), value.to_string()]).unwrap();
+        db.execute(
+            "INSERT INTO kv_state (key,value,updated_at) VALUES (?1,?2,'')",
+            rusqlite::params![
+                format!("handled_git_no_target_pair_{sha}"),
+                value.to_string()
+            ],
+        )
+        .unwrap();
     }
     let receipt_seal = python(&["--seal-copy", unverified_receipt.to_str().unwrap()]);
     assert!(receipt_seal.status.success());
     let receipt_manifest = tmp.path().join("receipt-seal.json");
     std::fs::write(&receipt_manifest, receipt_seal.stdout).unwrap();
-    let receipt_report = python(&["--copy", unverified_receipt.to_str().unwrap(), "--manifest", receipt_manifest.to_str().unwrap()]);
+    let receipt_report = python(&[
+        "--copy",
+        unverified_receipt.to_str().unwrap(),
+        "--manifest",
+        receipt_manifest.to_str().unwrap(),
+    ]);
     assert!(receipt_report.status.success());
     let receipt_json: serde_json::Value = serde_json::from_slice(&receipt_report.stdout).unwrap();
-    assert_eq!(receipt_json["repositories"][0]["classification"], "needs_reconciliation");
-    assert_eq!(receipt_json["repositories"][0]["no_target_receipts"][0]["target_proof_present"], false);
+    assert_eq!(
+        receipt_json["repositories"][0]["classification"],
+        "needs_reconciliation"
+    );
+    assert_eq!(
+        receipt_json["repositories"][0]["no_target_receipts"][0]["target_proof_present"],
+        false
+    );
 
     let unknown = tmp.path().join("synthetic-effect-unknown-overlay");
     copy_install_tree(&original, &unknown);
@@ -3702,15 +4876,29 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
     assert!(unknown_seal.status.success());
     let unknown_manifest = tmp.path().join("unknown-seal.json");
     std::fs::write(&unknown_manifest, unknown_seal.stdout).unwrap();
-    let unknown_report = python(&["--copy", unknown.to_str().unwrap(), "--manifest", unknown_manifest.to_str().unwrap()]);
+    let unknown_report = python(&[
+        "--copy",
+        unknown.to_str().unwrap(),
+        "--manifest",
+        unknown_manifest.to_str().unwrap(),
+    ]);
     assert!(unknown_report.status.success());
     let unknown_json: serde_json::Value = serde_json::from_slice(&unknown_report.stdout).unwrap();
-    assert_eq!(unknown_json["repositories"][0]["classification"], "external_effect_unknown");
+    assert_eq!(
+        unknown_json["repositories"][0]["classification"],
+        "external_effect_unknown"
+    );
 
     let wal_copy = tmp.path().join("synthetic-incomplete-wal-overlay");
     copy_install_tree(&original, &wal_copy);
-    std::fs::write(wal_copy.join("reposync.db-wal"), b"synthetic incomplete WAL").unwrap();
-    assert!(!python(&["--seal-copy", wal_copy.to_str().unwrap()]).status.success());
+    std::fs::write(
+        wal_copy.join("reposync.db-wal"),
+        b"synthetic incomplete WAL",
+    )
+    .unwrap();
+    assert!(!python(&["--seal-copy", wal_copy.to_str().unwrap()])
+        .status
+        .success());
     let wrong_schema = tmp.path().join("synthetic-future-schema-overlay");
     copy_install_tree(&original, &wrong_schema);
     {
@@ -3721,27 +4909,37 @@ async fn candidate_r10_pinned_old_topology_read_safe_inventory() {
     assert!(wrong_seal.status.success());
     let wrong_manifest = tmp.path().join("wrong-seal.json");
     std::fs::write(&wrong_manifest, wrong_seal.stdout).unwrap();
-    assert!(!python(&["--copy", wrong_schema.to_str().unwrap(), "--manifest", wrong_manifest.to_str().unwrap()]).status.success());
+    assert!(!python(&[
+        "--copy",
+        wrong_schema.to_str().unwrap(),
+        "--manifest",
+        wrong_manifest.to_str().unwrap()
+    ])
+    .status
+    .success());
 
-    eprintln!("RELIABILITY_EVIDENCE {}", serde_json::json!({
-        "case":"R10_PINNED_OLD_TOPOLOGY_INVENTORY", "old_generation":old_evidence,
-        "old_generator_sha256":hex::encode(sha2::Sha256::digest(std::fs::read(&generator).unwrap())),
-        "original_copy_file_count":report["file_count"],
-        "input_hashes_and_permissions_unchanged":true,
-        "repeated_report_equal":true, "no_git_or_svn_cli_on_inventory_path":true,
-        "credential_values_redacted":true,
-        "classifications":repositories.iter().map(|row| serde_json::json!({
-            "id":row["id"], "classification":row["classification"],
-            "svn_revision":row["checkpoints"]["repository_svn_revision"],
-            "mapped_rows":row["applied_mappings"].as_array().unwrap().len()
-        })).collect::<Vec<_>>(),
-        "synthetic_pruned_reconciliation":true,
-        "synthetic_missing_receipt_reconciliation":true,
-        "synthetic_v1_unverified_receipt_reconciliation":true,
-        "synthetic_external_effect_unknown":true,
-        "incomplete_wal_refused":true, "future_schema_refused":true,
-        "production_eligibility":"NOT_ESTABLISHED"
-    }));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_PINNED_OLD_TOPOLOGY_INVENTORY", "old_generation":old_evidence,
+            "old_generator_sha256":hex::encode(sha2::Sha256::digest(std::fs::read(&generator).unwrap())),
+            "original_copy_file_count":report["file_count"],
+            "input_hashes_and_permissions_unchanged":true,
+            "repeated_report_equal":true, "no_git_or_svn_cli_on_inventory_path":true,
+            "credential_values_redacted":true,
+            "classifications":repositories.iter().map(|row| serde_json::json!({
+                "id":row["id"], "classification":row["classification"],
+                "svn_revision":row["checkpoints"]["repository_svn_revision"],
+                "mapped_rows":row["applied_mappings"].as_array().unwrap().len()
+            })).collect::<Vec<_>>(),
+            "synthetic_pruned_reconciliation":true,
+            "synthetic_missing_receipt_reconciliation":true,
+            "synthetic_v1_unverified_receipt_reconciliation":true,
+            "synthetic_external_effect_unknown":true,
+            "incomplete_wal_refused":true, "future_schema_refused":true,
+            "production_eligibility":"NOT_ESTABLISHED"
+        })
+    );
 }
 
 #[cfg(feature = "reliability-fixture")]
@@ -3750,9 +4948,15 @@ async fn candidate_r10_inventory_authority_and_confined_reads() {
     let tmp = TempDir::new().unwrap();
     assert_fixture_owned(tmp.path());
     let old_root = tmp.path().join("pinned-old-authority");
-    let generator = std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
+    let generator =
+        std::env::var("REPOSYNC_OLD_GENERATOR").expect("pinned old generator must be packaged");
     let generated = Command::new(&generator)
-        .args(["generate_legacy_topology", "--exact", "--nocapture", "--test-threads=1"])
+        .args([
+            "generate_legacy_topology",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("REPOSYNC_OLD_TOPOLOGY_DIR", &old_root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3760,25 +4964,51 @@ async fn candidate_r10_inventory_authority_and_confined_reads() {
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "Fixture Developer")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output().unwrap();
-    assert!(generated.status.success(), "pinned old topology generation failed: {}",
-        String::from_utf8_lossy(&generated.stderr));
-    let inventory = std::env::var("REPOSYNC_INVENTORY_SCRIPT")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reliability-inventory.py").to_string());
-    let probes = std::env::var("REPOSYNC_INVENTORY_PROBES_SCRIPT")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/reliability-inventory-probes.py").to_string());
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "pinned old topology generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let inventory = std::env::var("REPOSYNC_INVENTORY_SCRIPT").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/reliability-inventory.py"
+        )
+        .to_string()
+    });
+    let probes = std::env::var("REPOSYNC_INVENTORY_PROBES_SCRIPT").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/reliability-inventory-probes.py"
+        )
+        .to_string()
+    });
     let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
-        .map(|dir| dir.join("python3")).find(|path| path.is_file())
+        .map(|dir| dir.join("python3"))
+        .find(|path| path.is_file())
         .expect("fixture Python interpreter");
     let work = tmp.path().join("inventory-overlays");
     let result = Command::new(python)
-        .args([&probes, "--inventory-script", &inventory,
-               "--old-install", old_root.join("install").to_str().unwrap(),
-               "--work", work.to_str().unwrap()])
+        .args([
+            &probes,
+            "--inventory-script",
+            &inventory,
+            "--old-install",
+            old_root.join("install").to_str().unwrap(),
+            "--work",
+            work.to_str().unwrap(),
+        ])
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("PATH", "/nonexistent")
-        .output().unwrap();
-    assert!(result.status.success(), "inventory probes: {}", String::from_utf8_lossy(&result.stderr));
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "inventory probes: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let evidence: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(evidence["case"], "R10_INVENTORY_AUTHORITY_CONFINEMENT");
     assert_eq!(evidence["outside_canary_open_count"], 0);

@@ -92,8 +92,12 @@ impl GitClient {
         // Set HEAD as a symbolic reference (it's fine if the target doesn't
         // exist yet — that's what "unborn" HEAD means, and the first commit
         // will materialize it).
-        self.repo
-            .reference_symbolic("HEAD", &target_ref, true, "reposync: align HEAD with configured branch")?;
+        self.repo.reference_symbolic(
+            "HEAD",
+            &target_ref,
+            true,
+            "reposync: align HEAD with configured branch",
+        )?;
         info!(branch, "aligned HEAD to refs/heads/{}", branch);
         Ok(())
     }
@@ -105,20 +109,15 @@ impl GitClient {
     /// Get the current HEAD commit SHA.
     pub fn head_sha(&self) -> Result<String, GitError> {
         let head = self.repo.head().map_err(GitError::from)?;
-        let oid = head
-            .peel_to_commit()
-            .map_err(GitError::from)?
-            .id();
+        let oid = head.peel_to_commit().map_err(GitError::from)?.id();
         Ok(oid.to_string())
     }
 
     /// Hard-reset HEAD to a specific commit SHA.
     /// Used to roll back failed pushes so bad commits don't accumulate.
     pub fn reset_hard(&self, sha: &str) -> Result<(), GitError> {
-        let oid = git2::Oid::from_str(sha)
-            .map_err(|e| GitError::Git2Error(e))?;
-        let commit = self.repo.find_commit(oid)
-            .map_err(GitError::from)?;
+        let oid = git2::Oid::from_str(sha).map_err(|e| GitError::Git2Error(e))?;
+        let commit = self.repo.find_commit(oid).map_err(GitError::from)?;
         self.repo
             .reset(commit.as_object(), git2::ResetType::Hard, None)
             .map_err(GitError::from)?;
@@ -206,9 +205,10 @@ impl GitClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError::Git2Error(git2::Error::from_str(
-                &format!("git fetch failed: {}", stderr.trim())
-            )));
+            return Err(GitError::Git2Error(git2::Error::from_str(&format!(
+                "git fetch failed: {}",
+                stderr.trim()
+            ))));
         }
         debug!("fetch completed");
         Ok(())
@@ -250,15 +250,15 @@ impl GitClient {
             if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
                 info!(
                     remote = remote_name,
-                    branch,
-                    "remote has no '{}' branch yet; treating as empty remote",
-                    branch
+                    branch, "remote has no '{}' branch yet; treating as empty remote", branch
                 );
                 return Ok(());
             }
-            return Err(GitError::Git2Error(git2::Error::from_str(
-                &format!("git reset --hard {} failed: {}", remote_ref, stderr.trim())
-            )));
+            return Err(GitError::Git2Error(git2::Error::from_str(&format!(
+                "git reset --hard {} failed: {}",
+                remote_ref,
+                stderr.trim()
+            ))));
         }
         info!("pull completed");
         Ok(())
@@ -398,7 +398,9 @@ impl GitClient {
             .output()
             .map_err(GitError::IoError)?;
 
-        let sha_str = String::from_utf8_lossy(&rev_output.stdout).trim().to_string();
+        let sha_str = String::from_utf8_lossy(&rev_output.stdout)
+            .trim()
+            .to_string();
         let oid = Oid::from_str(&sha_str).map_err(|e| {
             error!(sha = %sha_str, error = %e, "failed to parse commit SHA");
             e
@@ -440,14 +442,12 @@ impl GitClient {
             .to_path_buf()
     }
 
-    fn push_impl(
-        &self,
-        remote_name: &str,
-        branch: &str,
-        force: bool,
-    ) -> Result<(), GitError> {
+    fn push_impl(&self, remote_name: &str, branch: &str, force: bool) -> Result<(), GitError> {
         let start = std::time::Instant::now();
-        info!(remote = remote_name, branch, force, "pushing via git CLI (LFS-compatible)");
+        info!(
+            remote = remote_name,
+            branch, force, "pushing via git CLI (LFS-compatible)"
+        );
 
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
 
@@ -686,12 +686,27 @@ impl GitClient {
 
     /// Tree-entry modes on both sides of a changed path. A missing side is
     /// an add or delete, not evidence that its surviving side is a regular file.
-    pub fn changed_entry_modes(&self, sha: &str, path: &str) -> Result<(Option<i32>, Option<i32>), GitError> {
+    pub fn changed_entry_modes(
+        &self,
+        sha: &str,
+        path: &str,
+    ) -> Result<(Option<i32>, Option<i32>), GitError> {
         let commit = self.repo.find_commit(Oid::from_str(sha)?)?;
-        let current = commit.tree()?.get_path(std::path::Path::new(path)).ok().map(|entry| entry.filemode());
+        let current = commit
+            .tree()?
+            .get_path(std::path::Path::new(path))
+            .ok()
+            .map(|entry| entry.filemode());
         let previous = if commit.parent_count() > 0 {
-            commit.parent(0)?.tree()?.get_path(std::path::Path::new(path)).ok().map(|entry| entry.filemode())
-        } else { None };
+            commit
+                .parent(0)?
+                .tree()?
+                .get_path(std::path::Path::new(path))
+                .ok()
+                .map(|entry| entry.filemode())
+        } else {
+            None
+        };
         Ok((previous, current))
     }
 

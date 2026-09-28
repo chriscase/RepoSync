@@ -328,11 +328,28 @@ impl model::CopyReaders<'_> {
     ) -> Result<Response> {
         self.lookup_dto_visibility(repo, g, d, s, false)
     }
-    pub fn lookup_scoped_dto(&self, repo: &str, g: Option<i64>, d: model::Direction, s: &model::Source) -> Result<Response> {
+    pub fn lookup_scoped_dto(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: model::Direction,
+        s: &model::Source,
+    ) -> Result<Response> {
         self.lookup_dto_visibility(repo, g, d, s, true)
     }
-    fn lookup_dto_visibility(&self, repo: &str, g: Option<i64>, d: model::Direction, s: &model::Source, scoped: bool) -> Result<Response> {
-        let m = if scoped { self.lookup_scoped(repo, g, d, s)? } else { self.lookup(repo, g, d, s)? };
+    fn lookup_dto_visibility(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: model::Direction,
+        s: &model::Source,
+        scoped: bool,
+    ) -> Result<Response> {
+        let m = if scoped {
+            self.lookup_scoped(repo, g, d, s)?
+        } else {
+            self.lookup(repo, g, d, s)?
+        };
         // Separate nonhandled visibility is mandatory even for Canonical::Missing.
         let nonhandled = Nonhandled::from_emitted(&self.last_emitted(repo, g, d)?);
         let response = Response::new(
@@ -365,11 +382,30 @@ impl model::CopyReaders<'_> {
     ) -> Result<Response> {
         self.list_dto_visibility(repo, g, d, after, limit, false)
     }
-    pub fn list_scoped_dto(&self, repo: &str, g: Option<i64>, d: model::Direction, after: Option<i64>, limit: usize) -> Result<Response> {
+    pub fn list_scoped_dto(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: model::Direction,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<Response> {
         self.list_dto_visibility(repo, g, d, after, limit, true)
     }
-    fn list_dto_visibility(&self, repo: &str, g: Option<i64>, d: model::Direction, after: Option<i64>, limit: usize, scoped: bool) -> Result<Response> {
-        let p = if scoped { self.list_scoped(repo, g, d, after, limit)? } else { self.list(repo, g, d, after, limit)? };
+    fn list_dto_visibility(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: model::Direction,
+        after: Option<i64>,
+        limit: usize,
+        scoped: bool,
+    ) -> Result<Response> {
+        let p = if scoped {
+            self.list_scoped(repo, g, d, after, limit)?
+        } else {
+            self.list(repo, g, d, after, limit)?
+        };
         let nonhandled = Nonhandled::from_emitted(&self.last_emitted(repo, g, d)?);
         let response = Response::new(
             Request::List {
@@ -443,7 +479,12 @@ impl model::CopyReaders<'_> {
             },
         ))
     }
-    pub fn last_emitted_scoped_dto(&self, repo: &str, g: Option<i64>, d: model::Direction) -> Result<Response> {
+    pub fn last_emitted_scoped_dto(
+        &self,
+        repo: &str,
+        g: Option<i64>,
+        d: model::Direction,
+    ) -> Result<Response> {
         self.last_emitted_dto(repo, g, d).map(Response::scoped)
     }
     pub fn legacy_page_dto(&self, after: Option<i64>, limit: usize) -> Result<Response> {

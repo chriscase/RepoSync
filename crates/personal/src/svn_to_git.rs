@@ -385,8 +385,7 @@ impl SvnToGitSync {
                         // Ensure `.gitattributes` has the appropriate LFS tracking pattern.
                         // Use dst_root (the Git repo root) for .gitattributes placement.
                         let pattern = reposync_core::lfs::pattern_for_path(&rel);
-                        if let Err(e) = reposync_core::lfs::ensure_lfs_tracked(dst_root, &pattern)
-                        {
+                        if let Err(e) = reposync_core::lfs::ensure_lfs_tracked(dst_root, &pattern) {
                             warn!(
                                 path = rel.as_str(),
                                 pattern = pattern.as_str(),

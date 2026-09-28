@@ -241,18 +241,16 @@ impl<'a> InitialImport<'a> {
 
         // Build identity mapper if configured — allows preserving original SVN authors.
         let identity_mapper = match &self.config.identity {
-            Some(identity_config) => {
-                match IdentityMapper::new(identity_config) {
-                    Ok(mapper) => {
-                        info!("identity mapper enabled — original SVN authors will be preserved");
-                        Some(mapper)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to initialize identity mapper, falling back to developer identity");
-                        None
-                    }
+            Some(identity_config) => match IdentityMapper::new(identity_config) {
+                Ok(mapper) => {
+                    info!("identity mapper enabled — original SVN authors will be preserved");
+                    Some(mapper)
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "failed to initialize identity mapper, falling back to developer identity");
+                    None
+                }
+            },
             None => {
                 info!("no identity mapping configured — all commits will use developer identity");
                 None
@@ -351,10 +349,16 @@ impl<'a> InitialImport<'a> {
                     }
                     Err(e) => {
                         debug!(rev, svn_author = %entry.author, error = %e, "identity mapping failed, using developer identity");
-                        (self.config.developer.name.clone(), self.config.developer.email.clone())
+                        (
+                            self.config.developer.name.clone(),
+                            self.config.developer.email.clone(),
+                        )
                     }
                 },
-                None => (self.config.developer.name.clone(), self.config.developer.email.clone()),
+                None => (
+                    self.config.developer.name.clone(),
+                    self.config.developer.email.clone(),
+                ),
             };
 
             let git_client = self.git_client.lock().unwrap();

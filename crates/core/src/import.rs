@@ -305,8 +305,7 @@ fn remove_stale_inner(src: &Path, dst: &Path, is_root: bool) -> Result<()> {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to read directory: {}", dst.display()));
+            return Err(e).with_context(|| format!("failed to read directory: {}", dst.display()));
         }
     };
 
@@ -332,9 +331,8 @@ fn remove_stale_inner(src: &Path, dst: &Path, is_root: bool) -> Result<()> {
                 debug!(path = %dst_path.display(), "removed stale directory");
             }
         } else if !src_path.exists() {
-            std::fs::remove_file(&dst_path).with_context(|| {
-                format!("failed to remove stale file: {}", dst_path.display())
-            })?;
+            std::fs::remove_file(&dst_path)
+                .with_context(|| format!("failed to remove stale file: {}", dst_path.display()))?;
             debug!(path = %dst_path.display(), "removed stale file");
         }
     }
@@ -436,7 +434,10 @@ pub async fn run_full_import(
                         log(
                             &progress,
                             &ws_broadcast,
-                            format!("[warn] git lfs install failed: {} — LFS tracking will not work", e),
+                            format!(
+                                "[warn] git lfs install failed: {} — LFS tracking will not work",
+                                e
+                            ),
                         )
                         .await;
                         false
@@ -447,7 +448,10 @@ pub async fn run_full_import(
                 log(
                     &progress,
                     &ws_broadcast,
-                    format!("[warn] Git LFS not available: {} — large files will be committed directly", e),
+                    format!(
+                        "[warn] Git LFS not available: {} — large files will be committed directly",
+                        e
+                    ),
                 )
                 .await;
                 false
@@ -473,10 +477,7 @@ pub async fn run_full_import(
         }
     }
 
-    let svn_info = svn_client
-        .info()
-        .await
-        .context("failed to get SVN info")?;
+    let svn_info = svn_client.info().await.context("failed to get SVN info")?;
     let head_rev = svn_info.latest_rev;
 
     {
@@ -581,7 +582,8 @@ pub async fn run_full_import(
                     } else {
                         diff_text
                     };
-                    match crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await {
+                    match crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await
+                    {
                         Ok(()) => {
                             used_incremental = true;
                             debug!(rev, "applied incremental SVN diff");
@@ -617,17 +619,16 @@ pub async fn run_full_import(
         let copy_stats = if used_incremental {
             CopyStats::default()
         } else {
-            match copy_tree_with_policy(export_dir.path(), &repo_path, file_policy, db)
-            {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = format!("[error] r{}: copy failed: {}", rev, e);
-                log(&progress, &ws_broadcast, msg.clone()).await;
-                let mut p = progress.write().await;
-                p.errors.push(msg);
-                continue;
+            match copy_tree_with_policy(export_dir.path(), &repo_path, file_policy, db) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("[error] r{}: copy failed: {}", rev, e);
+                    log(&progress, &ws_broadcast, msg.clone()).await;
+                    let mut p = progress.write().await;
+                    p.errors.push(msg);
+                    continue;
+                }
             }
-        }
         };
 
         // Update file stats — use current file count (not cumulative)
@@ -660,10 +661,7 @@ pub async fn run_full_import(
                     "identity mapping failed, using fallback {}@svn",
                     entry.author
                 );
-                (
-                    entry.author.clone(),
-                    format!("{}@svn", entry.author),
-                )
+                (entry.author.clone(), format!("{}@svn", entry.author))
             }
         };
 
@@ -724,7 +722,14 @@ pub async fn run_full_import(
                     rev,
                     short_sha,
                     author_name,
-                    entry.message.lines().next().unwrap_or("").chars().take(60).collect::<String>(),
+                    entry
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect::<String>(),
                     details,
                 );
                 log(&progress, &ws_broadcast, log_line).await;
@@ -777,7 +782,10 @@ pub async fn run_full_import(
                     log(
                         &progress,
                         &ws_broadcast,
-                        format!("[info] {} batch of {} commits to remote...", push_type, commits_since_push),
+                        format!(
+                            "[info] {} batch of {} commits to remote...",
+                            push_type, commits_since_push
+                        ),
                     )
                     .await;
 
@@ -803,8 +811,13 @@ pub async fn run_full_import(
                             push_log_line(
                                 &hb_progress,
                                 &hb_ws,
-                                format!("[push] still uploading... ({}m {}s elapsed)", elapsed / 60, elapsed % 60),
-                            ).await;
+                                format!(
+                                    "[push] still uploading... ({}m {}s elapsed)",
+                                    elapsed / 60,
+                                    elapsed % 60
+                                ),
+                            )
+                            .await;
                         }
                     });
 
@@ -855,7 +868,8 @@ pub async fn run_full_import(
                             for line in stderr.lines() {
                                 let trimmed = line.trim();
                                 if !trimmed.is_empty() {
-                                    log(&progress, &ws_broadcast, format!("[push] {}", trimmed)).await;
+                                    log(&progress, &ws_broadcast, format!("[push] {}", trimmed))
+                                        .await;
                                 }
                             }
                             {
@@ -866,18 +880,26 @@ pub async fn run_full_import(
                             {
                                 let p = progress.read().await;
                                 if let Err(e) = db.persist_import_progress(&p) {
-                                    warn!("failed to persist import progress after batch push: {}", e);
+                                    warn!(
+                                        "failed to persist import progress after batch push: {}",
+                                        e
+                                    );
                                 }
                             }
                             log(
                                 &progress,
                                 &ws_broadcast,
-                                format!("[ok] Batch pushed ({} of {} total commits)", count, log_entries.len()),
+                                format!(
+                                    "[ok] Batch pushed ({} of {} total commits)",
+                                    count,
+                                    log_entries.len()
+                                ),
                             )
                             .await;
                         }
                         Ok(Err(e)) => {
-                            let msg = format!("[warn] Batch push failed (will retry at end): {}", e);
+                            let msg =
+                                format!("[warn] Batch push failed (will retry at end): {}", e);
                             log(&progress, &ws_broadcast, msg).await;
                         }
                         Err(e) => {
@@ -920,7 +942,11 @@ pub async fn run_full_import(
         if (idx + 1) % 10 == 0 {
             let p = progress.read().await;
             if let Err(e) = db.persist_import_progress(&p) {
-                warn!("failed to persist import progress at rev {}: {}", idx + 1, e);
+                warn!(
+                    "failed to persist import progress at rev {}: {}",
+                    idx + 1,
+                    e
+                );
             }
         }
     }
@@ -958,34 +984,62 @@ pub async fn run_full_import(
 
             let push_result = tokio::task::spawn_blocking(move || {
                 let mut args = vec!["push".to_string(), "--progress".to_string()];
-                if force { args.push("--force".to_string()); }
-                args.push(remote); args.push(branch);
+                if force {
+                    args.push("--force".to_string());
+                }
+                args.push(remote);
+                args.push(branch);
                 let output = std::process::Command::new("git")
-                    .args(&args).current_dir(&rp)
-                    .env("GIT_TERMINAL_PROMPT", "0").output();
+                    .args(&args)
+                    .current_dir(&rp)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .output();
                 match output {
-                    Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stderr).to_string()),
-                    Ok(out) => Err(format!("exit {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim())),
+                    Ok(out) if out.status.success() => {
+                        Ok(String::from_utf8_lossy(&out.stderr).to_string())
+                    }
+                    Ok(out) => Err(format!(
+                        "exit {:?}: {}",
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )),
                     Err(e) => Err(format!("spawn failed: {}", e)),
                 }
-            }).await;
+            })
+            .await;
 
             match push_result {
                 Ok(Ok(stderr)) => {
                     for line in stderr.lines() {
                         let t = line.trim();
-                        if !t.is_empty() { log(&progress, &ws_broadcast, format!("[push] {}", t)).await; }
+                        if !t.is_empty() {
+                            log(&progress, &ws_broadcast, format!("[push] {}", t)).await;
+                        }
                     }
-                    { let mut p = progress.write().await; p.batches_pushed += 1; }
-                    log(&progress, &ws_broadcast, format!("[ok] All {} commits pushed successfully", count)).await;
+                    {
+                        let mut p = progress.write().await;
+                        p.batches_pushed += 1;
+                    }
+                    log(
+                        &progress,
+                        &ws_broadcast,
+                        format!("[ok] All {} commits pushed successfully", count),
+                    )
+                    .await;
                     push_success = true;
                     break;
                 }
                 Ok(Err(e)) => {
-                    let _msg = format!("[warn] Push attempt {}/{} failed: {}", attempt, max_retries, e);
+                    let _msg = format!(
+                        "[warn] Push attempt {}/{} failed: {}",
+                        attempt, max_retries, e
+                    );
                 }
                 Err(e) => {
-                    let msg = format!("[warn] Push attempt {}/{} failed (panic): {}", attempt, max_retries, e);
+                    let msg = format!(
+                        "[warn] Push attempt {}/{} failed (panic): {}",
+                        attempt, max_retries, e
+                    );
                     log(&progress, &ws_broadcast, msg.clone()).await;
 
                     if attempt < max_retries {
@@ -1023,8 +1077,7 @@ pub async fn run_full_import(
 
     // Set watermarks
     if let Some(last) = log_entries.last() {
-        db.set_watermark("svn_rev", &last.revision.to_string())
-            .ok();
+        db.set_watermark("svn_rev", &last.revision.to_string()).ok();
     }
 
     {
@@ -1151,12 +1204,18 @@ async fn async_git_push(
                             if trimmed.starts_with("Total ") || trimmed.contains("100%") {
                                 // Extract a clean summary from "Total N (delta M), reused X, SIZE | SPEED"
                                 if trimmed.starts_with("Total ") {
-                                    push_log_line(progress, ws_broadcast, format!("[push] {}", trimmed)).await;
+                                    push_log_line(
+                                        progress,
+                                        ws_broadcast,
+                                        format!("[push] {}", trimmed),
+                                    )
+                                    .await;
                                 }
                                 // Skip the 100% lines — redundant with Total
                             }
                         } else {
-                            push_log_line(progress, ws_broadcast, format!("[push] {}", trimmed)).await;
+                            push_log_line(progress, ws_broadcast, format!("[push] {}", trimmed))
+                                .await;
                         }
                     }
                     last_heartbeat = std::time::Instant::now();
@@ -1184,10 +1243,7 @@ async fn async_git_push(
         }
     }
 
-    let status = child
-        .wait()
-        .await
-        .context("failed to wait for git push")?;
+    let status = child.wait().await.context("failed to wait for git push")?;
 
     let elapsed = start.elapsed();
 

@@ -9,13 +9,13 @@ pub mod schema;
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;
 #[cfg(feature = "reliability-fixture")]
-pub mod candidate_migration;
+pub mod candidate_dto;
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_evidence;
 #[cfg(feature = "reliability-fixture")]
-pub mod candidate_readers;
+pub mod candidate_migration;
 #[cfg(feature = "reliability-fixture")]
-pub mod candidate_dto;
+pub mod candidate_readers;
 
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};

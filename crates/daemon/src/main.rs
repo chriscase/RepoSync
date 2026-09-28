@@ -134,11 +134,10 @@ async fn main() -> Result<()> {
     // Acquire singleton lock — prevents duplicate daemon instances.
     // The lock is held for the lifetime of _lock_guard. On process exit
     // (including SIGKILL/crash), the OS releases the flock automatically.
-    let _lock_guard = lockfile::acquire(&config.daemon.data_dir)
-        .map_err(|e| {
-            error!("{}", e);
-            anyhow::anyhow!("{}", e)
-        })?;
+    let _lock_guard = lockfile::acquire(&config.daemon.data_dir).map_err(|e| {
+        error!("{}", e);
+        anyhow::anyhow!("{}", e)
+    })?;
     info!("Acquired singleton lock (PID {})", std::process::id());
 
     // Initialize database
@@ -210,10 +209,14 @@ async fn main() -> Result<()> {
                     .prepare("SELECT key FROM kv_state WHERE key LIKE 'secret_svn_password_%' AND key != 'secret_svn_password' LIMIT 1")
                     .ok()?;
                 let key: String = stmt.query_row([], |row| row.get(0)).ok()?;
-                key.strip_prefix("secret_svn_password_").map(|s| s.to_string())
+                key.strip_prefix("secret_svn_password_")
+                    .map(|s| s.to_string())
             })();
             if let Some(ref id) = reuse_repo_id {
-                info!("Reusing existing repo UUID {} from orphaned credential keys", id);
+                info!(
+                    "Reusing existing repo UUID {} from orphaned credential keys",
+                    id
+                );
             }
 
             let default_repo = reposync_core::models::Repository {
@@ -255,14 +258,24 @@ async fn main() -> Result<()> {
                     // Migrate global credentials to per-repo keys
                     if let Ok(Some(pw)) = db.get_state("secret_svn_password") {
                         if !pw.is_empty() {
-                            let _ = db.set_state(&format!("secret_svn_password_{}", default_repo.id), &pw);
-                            info!("Migrated global SVN password to per-repo key for {}", default_repo.name);
+                            let _ = db.set_state(
+                                &format!("secret_svn_password_{}", default_repo.id),
+                                &pw,
+                            );
+                            info!(
+                                "Migrated global SVN password to per-repo key for {}",
+                                default_repo.name
+                            );
                         }
                     }
                     if let Ok(Some(tok)) = db.get_state("secret_git_token") {
                         if !tok.is_empty() {
-                            let _ = db.set_state(&format!("secret_git_token_{}", default_repo.id), &tok);
-                            info!("Migrated global Git token to per-repo key for {}", default_repo.name);
+                            let _ = db
+                                .set_state(&format!("secret_git_token_{}", default_repo.id), &tok);
+                            info!(
+                                "Migrated global Git token to per-repo key for {}",
+                                default_repo.name
+                            );
                         }
                     }
                 }
@@ -281,16 +294,27 @@ async fn main() -> Result<()> {
 
         for repo in &repos {
             let svn_key = format!("secret_svn_password_{}", repo.id);
-            if db.get_state(&svn_key).ok().flatten().filter(|v| !v.is_empty()).is_none() {
+            if db
+                .get_state(&svn_key)
+                .ok()
+                .flatten()
+                .filter(|v| !v.is_empty())
+                .is_none()
+            {
                 // Try parent's credentials first (for branch pairs)
                 let source_pw = repo.parent_id.as_ref().and_then(|pid| {
                     db.get_state(&format!("secret_svn_password_{}", pid))
-                        .ok().flatten().filter(|v| !v.is_empty())
+                        .ok()
+                        .flatten()
+                        .filter(|v| !v.is_empty())
                 });
                 // Only fall back to global if this is the sole parent repo
                 let source_pw = source_pw.or_else(|| {
                     if repo.parent_id.is_none() && parent_count == 1 {
-                        db.get_state("secret_svn_password").ok().flatten().filter(|v| !v.is_empty())
+                        db.get_state("secret_svn_password")
+                            .ok()
+                            .flatten()
+                            .filter(|v| !v.is_empty())
                     } else {
                         None
                     }
@@ -302,14 +326,25 @@ async fn main() -> Result<()> {
             }
 
             let git_key = format!("secret_git_token_{}", repo.id);
-            if db.get_state(&git_key).ok().flatten().filter(|v| !v.is_empty()).is_none() {
+            if db
+                .get_state(&git_key)
+                .ok()
+                .flatten()
+                .filter(|v| !v.is_empty())
+                .is_none()
+            {
                 let source_tok = repo.parent_id.as_ref().and_then(|pid| {
                     db.get_state(&format!("secret_git_token_{}", pid))
-                        .ok().flatten().filter(|v| !v.is_empty())
+                        .ok()
+                        .flatten()
+                        .filter(|v| !v.is_empty())
                 });
                 let source_tok = source_tok.or_else(|| {
                     if repo.parent_id.is_none() && parent_count == 1 {
-                        db.get_state("secret_git_token").ok().flatten().filter(|v| !v.is_empty())
+                        db.get_state("secret_git_token")
+                            .ok()
+                            .flatten()
+                            .filter(|v| !v.is_empty())
                     } else {
                         None
                     }
@@ -380,13 +415,7 @@ async fn main() -> Result<()> {
     info!("Identity mapper initialized");
 
     // Initialize sync engine
-    let mut engine = SyncEngine::new(
-        config.clone(),
-        db,
-        svn_client,
-        git_client,
-        identity_mapper,
-    );
+    let mut engine = SyncEngine::new(config.clone(), db, svn_client, git_client, identity_mapper);
     // Set repo_id from the first enabled repository for per-repo keys
     if let Ok(repos) = engine.db().list_repositories() {
         if let Some(repo) = repos.into_iter().find(|r| r.enabled) {
@@ -420,14 +449,20 @@ async fn main() -> Result<()> {
                 if let Ok(Some(rev_str)) = engine.db().get_watermark("svn_rev") {
                     if let Ok(rev) = rev_str.parse::<i64>() {
                         if rev > 0 {
-                            let sha = engine.db().get_watermark("git_sha")
-                                .ok().flatten().unwrap_or_default();
+                            let sha = engine
+                                .db()
+                                .get_watermark("git_sha")
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
                             match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
                                 Ok(()) => {
                                     info!(repo_name = %repo.name, rev, "Recovered watermark from global watermarks table (single-repo migration)");
                                     continue;
                                 }
-                                Err(e) => warn!("Failed to write watermark for {}: {}", repo.name, e),
+                                Err(e) => {
+                                    warn!("Failed to write watermark for {}: {}", repo.name, e)
+                                }
                             }
                         }
                     }
@@ -440,7 +475,12 @@ async fn main() -> Result<()> {
                 if let Ok(rev) = rev_str.parse::<i64>() {
                     if rev > 0 {
                         let sha_key = format!("last_git_sha_{}", repo.id);
-                        let sha = engine.db().get_state(&sha_key).ok().flatten().unwrap_or_default();
+                        let sha = engine
+                            .db()
+                            .get_state(&sha_key)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
                         match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
                             Ok(()) => {
                                 info!(repo_name = %repo.name, rev, "Recovered watermark from per-repo kv_state");
@@ -578,7 +618,9 @@ async fn main() -> Result<()> {
             prev_phase
         ));
         // Persist the reconciled state immediately so the web UI reflects it.
-        let _ = sync_engine.db().persist_import_progress(&recovered_progress);
+        let _ = sync_engine
+            .db()
+            .persist_import_progress(&recovered_progress);
     }
     let import_progress = std::sync::Arc::new(tokio::sync::RwLock::new(recovered_progress));
 
@@ -622,8 +664,8 @@ async fn main() -> Result<()> {
     // Also check for Teams webhook URL from database (kv_state)
     // This allows admin to configure via the Settings UI without restarting
     {
-        let check_db = reposync_core::db::Database::new(&config.daemon.data_dir.join("reposync.db"))
-            .ok();
+        let check_db =
+            reposync_core::db::Database::new(&config.daemon.data_dir.join("reposync.db")).ok();
         let db_teams_url = check_db
             .and_then(|db| db.get_state("teams_webhook_url").ok().flatten())
             .filter(|v| !v.is_empty());
@@ -750,7 +792,10 @@ async fn main() -> Result<()> {
             locked.drain(..).filter(|h| !h.is_finished()).collect()
         };
         if !handles.is_empty() {
-            info!(count = handles.len(), "waiting for in-flight import tasks...");
+            info!(
+                count = handles.len(),
+                "waiting for in-flight import tasks..."
+            );
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
             for handle in handles {
                 match tokio::time::timeout_at(deadline, handle).await {
@@ -779,12 +824,10 @@ async fn main() -> Result<()> {
     info!("checkpointing SQLite WAL...");
     let db_path = config.daemon.data_dir.join("reposync.db");
     match rusqlite::Connection::open(&db_path) {
-        Ok(conn) => {
-            match conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                Ok(_) => info!("WAL checkpoint completed successfully"),
-                Err(e) => warn!("WAL checkpoint failed: {}", e),
-            }
-        }
+        Ok(conn) => match conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            Ok(_) => info!("WAL checkpoint completed successfully"),
+            Err(e) => warn!("WAL checkpoint failed: {}", e),
+        },
         Err(e) => warn!("could not open DB for WAL checkpoint: {}", e),
     }
 
