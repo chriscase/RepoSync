@@ -291,7 +291,7 @@ impl<'a> CopyReaders<'a> {
         }
         Ok(out)
     }
-    fn lookup_inner(&self, repo: &str, g: Option<i64>, d: Direction, s: &Source) -> Result<Lookup> {
+    fn lookup_inner(&self, repo: &str, g: Option<i64>, d: Direction, s: &Source, owned_only: bool) -> Result<Lookup> {
         ensure!(
             matches!(
                 (d, s),
@@ -308,7 +308,10 @@ impl<'a> CopyReaders<'a> {
             Source::Svn(r) => Value::Integer(*r),
             Source::Git(x) => Value::Text(x.clone()),
         };
-        let raw=legacy(&self.c,&format!("SELECT * FROM commit_map WHERE (repo_id=?1 OR repo_id IS NULL) AND direction=?2 AND {column}=?3 ORDER BY id"),params![repo,d.sql(),value])?;
+        // The scoped transport selects owned rows in SQL, before a result or
+        // page cursor is formed. Offline diagnostics retain ownerless rows.
+        let predicate = if owned_only { "repo_id=?1" } else { "(repo_id=?1 OR repo_id IS NULL)" };
+        let raw=legacy(&self.c,&format!("SELECT * FROM commit_map WHERE {predicate} AND direction=?2 AND {column}=?3 ORDER BY id"),params![repo,d.sql(),value])?;
         let scope = self.scope(repo, g)?;
         let canonical = if let Scope::Qualified(g) = scope {
             let owned: Vec<_> = raw.iter().filter(|r| r.repo() == Some(repo)).collect();
@@ -394,7 +397,12 @@ impl<'a> CopyReaders<'a> {
         })
     }
     pub fn lookup(&self, repo: &str, g: Option<i64>, d: Direction, s: &Source) -> Result<Lookup> {
-        self.read(|| self.lookup_inner(repo, g, d, s))
+        self.read(|| self.lookup_inner(repo, g, d, s, false))
+    }
+    /// Repository-owned visibility for the candidate HTTP profile. A missing
+    /// result here is not a complete legacy diagnostic or permission to retry.
+    pub fn lookup_scoped(&self, repo: &str, g: Option<i64>, d: Direction, s: &Source) -> Result<Lookup> {
+        self.read(|| self.lookup_inner(repo, g, d, s, true))
     }
     /// Every retained row is available for display in deterministic ID order.
     /// None starts at the first stored ID, including explicit zero/negative IDs.
@@ -417,11 +425,18 @@ impl<'a> CopyReaders<'a> {
         after: Option<i64>,
         limit: usize,
     ) -> Result<Page> {
+        self.list_visibility(repo, g, d, after, limit, false)
+    }
+    pub fn list_scoped(&self, repo: &str, g: Option<i64>, d: Direction, after: Option<i64>, limit: usize) -> Result<Page> {
+        self.list_visibility(repo, g, d, after, limit, true)
+    }
+    fn list_visibility(&self, repo: &str, g: Option<i64>, d: Direction, after: Option<i64>, limit: usize, owned_only: bool) -> Result<Page> {
         self.read(||{
         ensure!((1..=200).contains(&limit),"page size out of bounds");
-        let raw=legacy(&self.c,"SELECT * FROM commit_map WHERE (repo_id=?1 OR repo_id IS NULL) AND direction=?2 AND (?3 IS NULL OR id>?3) ORDER BY id LIMIT ?4",params![repo,d.sql(),after,limit as i64])?;
+        let predicate = if owned_only { "repo_id=?1" } else { "(repo_id=?1 OR repo_id IS NULL)" };
+        let raw=legacy(&self.c,&format!("SELECT * FROM commit_map WHERE {predicate} AND direction=?2 AND (?3 IS NULL OR id>?3) ORDER BY id LIMIT ?4"),params![repo,d.sql(),after,limit as i64])?;
         let next=raw.last().map(|r|r.id);let mut items=Vec::new();
-        for row in raw{let canonical=if row.repo()!=Some(repo){Canonical::Unresolved("legacy_ownerless".into())}else if let Some(source)=row.source(d){self.lookup_inner(repo,g,d,&source)?.canonical}else{Canonical::Unresolved("malformed_legacy_source".into())};items.push(ListItem{legacy:row,canonical});}
+        for row in raw{let canonical=if row.repo()!=Some(repo){Canonical::Unresolved("legacy_ownerless".into())}else if let Some(source)=row.source(d){self.lookup_inner(repo,g,d,&source,owned_only)?.canonical}else{Canonical::Unresolved("malformed_legacy_source".into())};items.push(ListItem{legacy:row,canonical});}
         Ok(Page{scope:self.scope(repo,g)?,rows:items,next_after_id:next})
     })
     }

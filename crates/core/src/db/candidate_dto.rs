@@ -5,6 +5,9 @@ use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA: &str = "reposync.copy_read.v1";
+/// Distinct transport profile: repository-owned legacy rows only. Missing in
+/// this profile is not a claim about hidden diagnostics or retry safety.
+pub const SCOPED_SCHEMA: &str = "reposync.copy_read.scoped.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -286,11 +289,21 @@ impl Response {
             data,
         }
     }
+    fn scoped(mut self) -> Self {
+        self.schema = SCOPED_SCHEMA.into();
+        self
+    }
     /// An explicit consumer boundary: never silently accept another version or
     /// deserialize a response for a different operation as this contract.
     pub fn decode(json: &[u8]) -> Result<Self> {
+        Self::decode_version(json, SCHEMA)
+    }
+    pub fn decode_scoped(json: &[u8]) -> Result<Self> {
+        Self::decode_version(json, SCOPED_SCHEMA)
+    }
+    fn decode_version(json: &[u8], schema: &str) -> Result<Self> {
         let r: Self = serde_json::from_slice(json)?;
-        ensure!(r.schema == SCHEMA, "unsupported copy DTO schema");
+        ensure!(r.schema == schema, "unsupported copy DTO schema");
         ensure!(
             matches!(
                 (&r.request, &r.data),
@@ -313,10 +326,16 @@ impl model::CopyReaders<'_> {
         d: model::Direction,
         s: &model::Source,
     ) -> Result<Response> {
-        let m = self.lookup(repo, g, d, s)?;
+        self.lookup_dto_visibility(repo, g, d, s, false)
+    }
+    pub fn lookup_scoped_dto(&self, repo: &str, g: Option<i64>, d: model::Direction, s: &model::Source) -> Result<Response> {
+        self.lookup_dto_visibility(repo, g, d, s, true)
+    }
+    fn lookup_dto_visibility(&self, repo: &str, g: Option<i64>, d: model::Direction, s: &model::Source, scoped: bool) -> Result<Response> {
+        let m = if scoped { self.lookup_scoped(repo, g, d, s)? } else { self.lookup(repo, g, d, s)? };
         // Separate nonhandled visibility is mandatory even for Canonical::Missing.
         let nonhandled = Nonhandled::from_emitted(&self.last_emitted(repo, g, d)?);
-        Ok(Response::new(
+        let response = Response::new(
             Request::Lookup {
                 repository: repo.into(),
                 generation: g,
@@ -333,7 +352,8 @@ impl model::CopyReaders<'_> {
                     .collect::<Result<_>>()?,
                 nonhandled,
             },
-        ))
+        );
+        Ok(if scoped { response.scoped() } else { response })
     }
     pub fn list_dto(
         &self,
@@ -343,9 +363,15 @@ impl model::CopyReaders<'_> {
         after: Option<i64>,
         limit: usize,
     ) -> Result<Response> {
-        let p = self.list(repo, g, d, after, limit)?;
+        self.list_dto_visibility(repo, g, d, after, limit, false)
+    }
+    pub fn list_scoped_dto(&self, repo: &str, g: Option<i64>, d: model::Direction, after: Option<i64>, limit: usize) -> Result<Response> {
+        self.list_dto_visibility(repo, g, d, after, limit, true)
+    }
+    fn list_dto_visibility(&self, repo: &str, g: Option<i64>, d: model::Direction, after: Option<i64>, limit: usize, scoped: bool) -> Result<Response> {
+        let p = if scoped { self.list_scoped(repo, g, d, after, limit)? } else { self.list(repo, g, d, after, limit)? };
         let nonhandled = Nonhandled::from_emitted(&self.last_emitted(repo, g, d)?);
-        Ok(Response::new(
+        let response = Response::new(
             Request::List {
                 repository: repo.into(),
                 generation: g,
@@ -368,7 +394,8 @@ impl model::CopyReaders<'_> {
                 next_after_id: p.next_after_id,
                 nonhandled,
             },
-        ))
+        );
+        Ok(if scoped { response.scoped() } else { response })
     }
     pub fn status_dto(&self, repo: &str, g: Option<i64>) -> Result<Response> {
         let s = self.status(repo, g)?;
@@ -396,6 +423,9 @@ impl model::CopyReaders<'_> {
             },
         ))
     }
+    pub fn status_scoped_dto(&self, repo: &str, g: Option<i64>) -> Result<Response> {
+        self.status_dto(repo, g).map(Response::scoped)
+    }
     pub fn last_emitted_dto(
         &self,
         repo: &str,
@@ -412,6 +442,9 @@ impl model::CopyReaders<'_> {
                 result: self.last_emitted(repo, g, d)?.into(),
             },
         ))
+    }
+    pub fn last_emitted_scoped_dto(&self, repo: &str, g: Option<i64>, d: model::Direction) -> Result<Response> {
+        self.last_emitted_dto(repo, g, d).map(Response::scoped)
     }
     pub fn legacy_page_dto(&self, after: Option<i64>, limit: usize) -> Result<Response> {
         let rows = self.legacy_page(after, limit)?;

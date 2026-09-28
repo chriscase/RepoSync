@@ -7,6 +7,7 @@ use reposync_core::{
     config::{AppConfig, IdentityConfig},
     db::{candidate_authority::{advance_frontier, ResolvedTransition}, candidate_migration::CopySession, Database},
     git::GitClient, identity::IdentityMapper, import::ImportProgress,
+    models::{Session, User},
     svn::SvnClient, sync_engine::SyncEngine,
 };
 use reposync_web::{api, AppState};
@@ -15,6 +16,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tower::Service;
+use api::copy_inspection::InspectionContext;
 
 fn copy(source: &Path, target: &Path) {
     fs::create_dir_all(target).unwrap();
@@ -97,6 +99,12 @@ fn auth_state(t: &TempDir) -> Arc<AppState> {
     Arc::new(AppState{db:web_db,sync_engine:Arc::new(engine),config,sync_trigger:tx,ws_broadcast:broadcast,sessions:tokio::sync::RwLock::new(HashMap::new()),import_progress:Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),config_path:t.path().join("auth-config.toml"),prev_net_snapshot:Mutex::new(None),repo_import_progress:tokio::sync::RwLock::new(HashMap::new()),login_attempts:Mutex::new(HashMap::new()),import_handles:tokio::sync::Mutex::new(Vec::new())})
 }
 
+fn named_session(auth: &AppState, id: &str, token: &str, role: &str) {
+    let now=chrono::Utc::now().to_rfc3339();
+    auth.db.insert_user(&User{id:id.into(),username:id.into(),display_name:id.into(),email:format!("{id}@example.invalid"),password_hash:"fixture-only".into(),role:role.into(),enabled:true,created_at:now.clone(),updated_at:now.clone()}).unwrap();
+    auth.db.insert_session(&Session{token:token.into(),user_id:id.into(),expires_at:(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339(),created_at:now}).unwrap();
+}
+
 #[derive(Serialize)]
 struct Wire { label:String,status:u16,content_type:String,body:String }
 
@@ -125,8 +133,11 @@ async fn copy_only_http_to_javascript_journey() {
     stage_structural_history(&copy_path,provenance["pair"]["git_sha"].as_str().unwrap());
     let copy_before=tree(&copy_path);
     let auth=auth_state(&t);
-    auth.sessions.write().await.insert("fixture-session".into(),chrono::Utc::now()+chrono::Duration::hours(1));
-    let app=api::copy_inspection::routes(auth.clone(),Arc::new(session));
+    named_session(&auth,"fixture-operator","fixture-session","admin");
+    let context=Arc::new(InspectionContext::new(Arc::new(session)));
+    for repo in ["pair","pair_two","pair_disabled","missing"] { context.grant_read("fixture-operator",repo).await; }
+    context.set_diagnostics("fixture-operator",true).await;
+    let app=api::copy_inspection::routes(auth.clone(),context);
     let base="/__reliability/copy-read";
     let mut wire=Vec::new();
     for (label,path) in [
@@ -162,7 +173,10 @@ async fn copy_only_http_to_javascript_journey() {
     unqualified.disposition("pair","needs_reconciliation","fixture_only").unwrap();
     unqualified.migrate(14,&mut |_,_,_|Ok(())).unwrap();
     let unqualified_before=tree(&unqualified_path);
-    let unqualified_app=api::copy_inspection::routes(auth.clone(),Arc::new(unqualified));
+    let unqualified_context=Arc::new(InspectionContext::new(Arc::new(unqualified)));
+    unqualified_context.grant_read("fixture-operator","pair").await;
+    unqualified_context.set_diagnostics("fixture-operator",true).await;
+    let unqualified_app=api::copy_inspection::routes(auth.clone(),unqualified_context);
     wire.push(request(&unqualified_app,"not_qualified",Method::GET,&format!("{base}/lookup?repository=pair&generation=1&direction=svn_to_git&source_svn_rev=3"),Some("fixture-session")).await);
     let operational=Router::new().merge(api::sync_history::routes()).with_state(auth);
     wire.push(request(&operational,"default_candidate_absent",Method::GET,&format!("{base}/status?repository=pair&generation=1"),Some("fixture-session")).await);
