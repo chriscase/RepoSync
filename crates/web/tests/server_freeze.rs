@@ -1872,6 +1872,31 @@ async fn terminal_import_status(client: &reqwest::Client, base: &str) -> serde_j
     .unwrap()
 }
 
+#[cfg(all(feature = "reliability-fixture", unix))]
+fn fixture_process_stopped(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with("Z ") || rest.starts_with("X "));
+    }
+    false
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+async fn wait_for_stopped(pid: i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture_process_stopped(pid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[cfg(feature = "reliability-fixture")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64a_mid_import_cancel_holds_local_work_without_publication_after_restart() {
@@ -2505,6 +2530,361 @@ async fn candidate_64a_existing_git_target_is_preserved_before_replay() {
     assert_eq!(tree.stdout, b"existing independent history\n");
     assert!(state.db.active_import_operation(&id).unwrap().is_some());
     server.abort();
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_incremental_apply_completes_through_supervised_command() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let wrapper = tmp.path().join("git-apply-positive-wrapper");
+    let outcomes = tmp.path().join("git-apply-exits.txt");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = apply ]; then\n git \"$@\"\n result=$?\n echo $result >> \"$GIT_APPLY_EXITS\"\n exit $result\nfi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    std::env::set_var("GIT_APPLY_EXITS", &outcomes);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "completed", "{terminal}");
+    let exits = std::fs::read_to_string(&outcomes).unwrap();
+    assert!(
+        exits.lines().any(|line| line == "0"),
+        "actual git apply never succeeded: {exits}"
+    );
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 3);
+    let tree = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:history.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(tree.stdout, b"second\n");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_APPLY_POSITIVE","operation_id":operation_id,
+            "successful_git_apply_calls":exits.lines().filter(|line| *line == "0").count(),
+            "remote_tree_content":"second\\n","checkpoint":3
+        })
+    );
+    server.abort();
+    for name in [
+        "REPOSYNC_IMPORT_GIT_BINARY",
+        "REPOSYNC_FIXTURE_ROOT",
+        "GIT_APPLY_EXITS",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_git_apply_child_and_descendant_stop_on_exact_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let wrapper = tmp.path().join("git-apply-stall-wrapper");
+    let parent_file = tmp.path().join("git-apply-parent.pid");
+    let descendant_file = tmp.path().join("git-apply-descendant.pid");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = apply ]; then\n echo $$ > \"$GIT_STALL_PARENT\"\n sleep 60 & echo $! > \"$GIT_STALL_DESCENDANT\"\n wait\nfi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    std::env::set_var("GIT_STALL_PARENT", &parent_file);
+    std::env::set_var("GIT_STALL_DESCENDANT", &descendant_file);
+
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&descendant_file).await;
+    let parent: i32 = std::fs::read_to_string(&parent_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let descendant: i32 = std::fs::read_to_string(&descendant_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(parent, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+    let before = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(format!("{base}/status")).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(before.status().is_success());
+    let before: serde_json::Value = before.json().await.unwrap();
+    assert_eq!(before["operation_id"], operation_id);
+    assert_eq!(before["last_local_svn_rev"], 1);
+
+    let cancel = client
+        .post(format!("{base}/{operation_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "cancelled", "{terminal}");
+    assert_eq!(terminal["last_local_svn_rev"], 1);
+    assert!(terminal["last_confirmed_svn_rev"].is_null());
+    wait_for_stopped(parent).await;
+    wait_for_stopped(descendant).await;
+    let op = state
+        .db
+        .get_import_operation(&id, operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.processed_revisions, 1);
+    assert_eq!(op.local_commits, 1);
+    assert_eq!(op.last_local_svn_rev, Some(1));
+    assert!(op.last_confirmed_svn_rev.is_none());
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap();
+    assert!(!remote.success());
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let local_count = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&local)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&local_count.stdout).trim(), "1");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_GIT_APPLY_STOP","operation_id":operation_id,
+            "parent_stopped":true,"descendant_stopped":true,
+            "local_rev":1,"local_commits":1,"remote_ref_present":false,
+            "checkpoint":0,"held":true
+        })
+    );
+    server.abort();
+    for name in [
+        "REPOSYNC_IMPORT_GIT_BINARY",
+        "REPOSYNC_FIXTURE_ROOT",
+        "GIT_STALL_PARENT",
+        "GIT_STALL_DESCENDANT",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_lfs_enabled_import_completes_with_pointer_publication() {
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET lfs_threshold_mb=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let checkout = tmp.path().join("svn-wc");
+    let large = vec![0u8; 1_100_000];
+    std::fs::write(checkout.join("large.bin"), &large).unwrap();
+    assert!(Command::new("svn")
+        .args(["add", "large.bin"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    let commit = Command::new("svn")
+        .args(["commit", "-m", "large binary", "--username", "fixture"])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "completed", "{terminal}");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 4);
+    assert!(terminal["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| {
+            line.as_str()
+                .unwrap_or("")
+                .contains("Git LFS installed in repo")
+        }));
+    let pointer = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:large.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(pointer.status.success());
+    assert!(pointer
+        .stdout
+        .starts_with(b"version https://git-lfs.github.com/spec/v1\n"));
+    assert!(String::from_utf8_lossy(&pointer.stdout).contains("size 1100000"));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_LFS_POSITIVE","operation_id":operation_id,
+            "checkpoint":4,"pointer_published":true,"source_bytes":large.len(),
+            "remote_pointer_bytes":pointer.stdout.len()
+        })
+    );
+    server.abort();
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_lfs_preflight_child_and_descendant_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET lfs_threshold_mb=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let wrapper = tmp.path().join("git-lfs-stall-wrapper");
+    let parent_file = tmp.path().join("git-lfs-parent.pid");
+    let descendant_file = tmp.path().join("git-lfs-descendant.pid");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = lfs ] && [ \"$2\" = version ]; then\n echo $$ > \"$GIT_STALL_PARENT\"\n sleep 60 & echo $! > \"$GIT_STALL_DESCENDANT\"\n wait\nfi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    std::env::set_var("GIT_STALL_PARENT", &parent_file);
+    std::env::set_var("GIT_STALL_DESCENDANT", &descendant_file);
+
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&descendant_file).await;
+    let parent: i32 = std::fs::read_to_string(&parent_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let descendant: i32 = std::fs::read_to_string(&descendant_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(parent, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+    let responsive = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(format!("{base}/status")).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(responsive.status().is_success());
+    let cancel = client
+        .post(format!("{base}/{operation_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "cancelled", "{terminal}");
+    wait_for_stopped(parent).await;
+    wait_for_stopped(descendant).await;
+    let op = state
+        .db
+        .get_import_operation(&id, operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.processed_revisions, 0);
+    assert!(op.last_local_svn_rev.is_none());
+    assert!(op.last_confirmed_svn_rev.is_none());
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap();
+    assert!(!remote.success());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_LFS_STOP","operation_id":operation_id,
+            "parent_stopped":true,"descendant_stopped":true,
+            "processed_revisions":0,"remote_ref_present":false,"checkpoint":0,"held":true
+        })
+    );
+    server.abort();
+    for name in [
+        "REPOSYNC_IMPORT_GIT_BINARY",
+        "REPOSYNC_FIXTURE_ROOT",
+        "GIT_STALL_PARENT",
+        "GIT_STALL_DESCENDANT",
+    ] {
+        std::env::remove_var(name);
+    }
 }
 
 #[cfg(all(feature = "reliability-fixture", unix))]

@@ -530,6 +530,11 @@
     {"id":"64A_SVN_CHILD", "binary":"server_freeze", "test":"candidate_64a_stalled_svn_info_child_and_descendant_are_stopped", "tier":"candidate_regression"},
     {"id":"64A_SCHEDULER", "binary":"reposync-daemon", "test":"scheduler::cancellation_tests::held_partial_import_is_skipped_on_actual_scheduler_tick", "tier":"candidate_regression"},
     {"id":"64A_EXISTING_TARGET", "binary":"server_freeze", "test":"candidate_64a_existing_git_target_is_preserved_before_replay", "tier":"candidate_regression"},
-    {"id":"74_RESET_REFUSAL", "binary":"server_freeze", "test":"candidate_74_reset_refusal_preserves_published_installation", "tier":"candidate_regression"}
+    {"id":"74_RESET_REFUSAL", "binary":"server_freeze", "test":"candidate_74_reset_refusal_preserves_published_installation", "tier":"candidate_regression"},
+    {"id":"74_STDIN_FILE", "binary":"reposync_core", "test":"process::tests::staged_patch_input_cannot_block_cancellation_of_nonreader", "tier":"candidate_regression"},
+    {"id":"74_GIT_APPLY_STOP", "binary":"server_freeze", "test":"candidate_74_git_apply_child_and_descendant_stop_on_exact_cancel", "tier":"candidate_regression"},
+    {"id":"74_APPLY_POSITIVE", "binary":"server_freeze", "test":"candidate_74_incremental_apply_completes_through_supervised_command", "tier":"candidate_regression"},
+    {"id":"74_LFS_STOP", "binary":"server_freeze", "test":"candidate_74_lfs_preflight_child_and_descendant_stop", "tier":"candidate_regression"},
+    {"id":"74_LFS_POSITIVE", "binary":"server_freeze", "test":"candidate_74_lfs_enabled_import_completes_with_pointer_publication", "tier":"candidate_regression"}
   ]
 }

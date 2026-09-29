@@ -565,6 +565,16 @@ async fn import_cli_commit(
     )?)
 }
 
+async fn import_lfs_command(
+    args: &[&str],
+    workdir: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<std::process::Output> {
+    let mut command = crate::process::import_git_command()?;
+    command.args(args).current_dir(workdir);
+    crate::process::run(command, Duration::from_secs(60), cancel).await
+}
+
 pub async fn run_full_import(
     svn_client: &SvnClient,
     git_client: &Arc<std::sync::Mutex<GitClient>>,
@@ -614,7 +624,33 @@ pub async fn run_full_import(
 
     // LFS preflight: check availability and install hooks in the repo
     let lfs_available = if file_policy.lfs_enabled() {
-        match crate::lfs::preflight_check() {
+        let rp = {
+            let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git_guard.repo_workdir()
+        };
+        let preflight = if operation_id.is_some() {
+            match import_lfs_command(&["lfs", "version"], &rp, cancel_signal.as_ref()).await {
+                Ok(output) if output.status.success() => {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                }
+                Ok(output) => Err(format!(
+                    "git lfs version failed (exit {:?}): {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::Interrupted
+                        && stop_requested(&progress, cancel_signal.as_ref()).await
+                    {
+                        return Ok(ImportOutcome::Cancelled { commits: 0 });
+                    }
+                    return Err(e).context("LFS preflight did not quiesce safely");
+                }
+            }
+        } else {
+            crate::lfs::preflight_check()
+        };
+        match preflight {
             Ok(version) => {
                 log(
                     &progress,
@@ -625,11 +661,29 @@ pub async fn run_full_import(
 
                 // Install LFS hooks/filters in the repo so `git add` invokes
                 // the clean filter and creates pointer files for tracked patterns.
-                let rp = {
-                    let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-                    git_guard.repo_workdir()
+                let install = if operation_id.is_some() {
+                    match import_lfs_command(
+                        &["lfs", "install", "--local"],
+                        &rp,
+                        cancel_signal.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(output) if output.status.success() => Ok(()),
+                        Ok(output) => Err(format!(
+                            "git lfs install failed (exit {:?}): {}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        )),
+                        Err(e) => {
+                            return Err(e)
+                                .context("LFS hook installation outcome requires inspection")
+                        }
+                    }
+                } else {
+                    crate::lfs::install_lfs_hooks(&rp)
                 };
-                match crate::lfs::install_lfs_hooks(&rp) {
+                match install {
                     Ok(()) => {
                         log(
                             &progress,
@@ -813,13 +867,31 @@ pub async fn run_full_import(
                     } else {
                         diff_text
                     };
-                    match crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await
-                    {
+                    let apply = if let Some(signal) = cancel_signal.as_ref() {
+                        crate::sync_engine::apply_diff_to_path_for_import(
+                            &repo_path,
+                            &processed_diff,
+                            signal,
+                        )
+                        .await
+                    } else {
+                        crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await
+                    };
+                    match apply {
                         Ok(()) => {
                             used_incremental = true;
                             debug!(rev, "applied incremental SVN diff");
                         }
                         Err(e) => {
+                            if stop_requested(&progress, cancel_signal.as_ref()).await {
+                                if matches!(&e, crate::errors::GitError::IoError(io)
+                                    if io.kind() == std::io::ErrorKind::Interrupted)
+                                {
+                                    return Ok(ImportOutcome::Cancelled { commits: count });
+                                }
+                                return Err(e)
+                                    .context("Git apply stopped without confirmed quiescence");
+                            }
                             debug!(rev, error = %e, "incremental diff failed, falling back to full export");
                         }
                     }
@@ -831,6 +903,9 @@ pub async fn run_full_import(
         }
 
         if !used_incremental {
+            if stop_requested(&progress, cancel_signal.as_ref()).await {
+                return Ok(ImportOutcome::Cancelled { commits: count });
+            }
             if let Err(e) = svn_client.export("", rev, export_dir.path()).await {
                 if stop_requested(&progress, cancel_signal.as_ref()).await {
                     return Ok(ImportOutcome::Cancelled { commits: count });

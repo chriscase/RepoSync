@@ -1532,7 +1532,8 @@ impl SyncEngine {
             let mut apply_error = None;
             let diff_applied = if !git_diff.trim().is_empty() {
                 let result =
-                    apply_diff_to_path_revision(&repo_path, &git_diff, Some(change.revision)).await;
+                    apply_diff_to_path_revision(&repo_path, &git_diff, Some(change.revision), None)
+                        .await;
                 if result.is_ok() {
                     // Verify: check that files were created at the correct paths
                     for cf in &change.changed_files {
@@ -2943,20 +2944,33 @@ pub async fn apply_diff_to_path(
     repo_path: &std::path::Path,
     diff_content: &str,
 ) -> Result<(), crate::errors::GitError> {
-    apply_diff_to_path_revision(repo_path, diff_content, None).await
+    apply_diff_to_path_revision(repo_path, diff_content, None, None).await
+}
+
+/// The existing Git apply path with import-scoped subprocess supervision.
+pub async fn apply_diff_to_path_for_import(
+    repo_path: &std::path::Path,
+    diff_content: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(), crate::errors::GitError> {
+    apply_diff_to_path_revision(repo_path, diff_content, None, Some(cancel)).await
 }
 
 async fn apply_diff_to_path_revision(
     repo_path: &std::path::Path,
     diff_content: &str,
     revision: Option<i64>,
+    cancel: Option<&Arc<AtomicBool>>,
 ) -> Result<(), crate::errors::GitError> {
     use std::process::Stdio;
     use tokio::process::Command;
-    let mut cmd = Command::new("git");
+    let mut cmd = if cancel.is_some() {
+        crate::process::import_git_command().map_err(crate::errors::GitError::IoError)?
+    } else {
+        Command::new("git")
+    };
     cmd.current_dir(repo_path)
         .args(["apply", "--3way", "-p0", "-"])
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Only debug fixture runs may replace one exact SVN revision's patch
@@ -2977,30 +2991,44 @@ async fn apply_diff_to_path_revision(
     let _ = revision;
     #[cfg(not(debug_assertions))]
     let injected = false;
-    let mut child = cmd.spawn().map_err(crate::errors::GitError::IoError)?;
-    // Write diff to stdin and explicitly close it so git apply sees EOF
-    // and begins processing. Without closing, git apply may hang forever.
-    {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            crate::errors::GitError::IoError(std::io::Error::other(
-                "failed to open git apply stdin",
-            ))
-        })?;
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(if injected {
-                b"invalid fixture patch\n"
-            } else {
-                diff_content.as_bytes()
-            })
-            .await
-            .map_err(crate::errors::GitError::IoError)?;
-        // stdin is dropped here, closing the pipe
-    }
-    let output = child
-        .wait_with_output()
+    let input = if injected {
+        b"invalid fixture patch\n".as_slice()
+    } else {
+        diff_content.as_bytes()
+    };
+    let output = if let Some(cancel) = cancel {
+        // A regular temporary file replaces the pipe. Git can stall before
+        // reading input without blocking this worker's stdin delivery.
+        crate::process::run_with_input(
+            cmd,
+            input,
+            std::time::Duration::from_secs(120),
+            Some(cancel),
+        )
         .await
-        .map_err(crate::errors::GitError::IoError)?;
+        .map_err(crate::errors::GitError::IoError)?
+    } else {
+        cmd.stdin(Stdio::piped());
+        let mut child = cmd.spawn().map_err(crate::errors::GitError::IoError)?;
+        // Write diff to stdin and explicitly close it so git apply sees EOF
+        // and begins processing. Without closing, git apply may hang forever.
+        {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                crate::errors::GitError::IoError(std::io::Error::other(
+                    "failed to open git apply stdin",
+                ))
+            })?;
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(input)
+                .await
+                .map_err(crate::errors::GitError::IoError)?;
+        }
+        child
+            .wait_with_output()
+            .await
+            .map_err(crate::errors::GitError::IoError)?
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         tracing::warn!(%stderr, "git apply failed");

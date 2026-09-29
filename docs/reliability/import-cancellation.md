@@ -28,6 +28,21 @@ The importer checks the stop request before connection, each revision, local com
 
 The process-wide repository busy guard excludes same-ID sync/import workers while the daemon lives. The durable active pointer excludes scheduler and manual writer paths after restart. An import refuses another registration targeting the exact same Git repository and branch. The legacy singleton engine is conservatively paused while any import hold exists because it has no per-repository operation identity. Unrelated per-repository targets can continue. The original setup-wizard cancellation route remains separate and uses the shared outcome type without acquiring a per-repository operation ID.
 
+### Per-repository import command boundary
+
+| Phase and command | Bound and stop behavior | Result rule |
+| --- | --- | --- |
+| Prepare: Git clone; inspect target `ls-remote` | 300s / 60s, cancellable process group | Preparation errors retain the operation hold. `reset=true` is refused before enrollment. |
+| SVN info, log, diff, checkout/export and working-copy commands | 300s per command, cancellable process group | No next revision starts after a durable stop. |
+| Incremental `git apply --3way -p0 -` | Patch bytes staged in an anonymous regular file; 120s cancellable process group | A child that does not read stdin cannot block cancellation. Unconfirmed cleanup is an error and leaves a hold; a verified stopped child retains local work without publishing it. |
+| LFS `version` and `install --local` | 60s each, cancellable process group | Missing LFS remains the prior nonzero-exit fallback. Timeout or uncertain hook installation holds the import. |
+| LFS-aware `git add`, cached diff, and commit | 120s / 60s / 120s, cancellable process group | Interrupted local writes remain held; no push follows a stop. |
+| Local `rev-parse` after an issued commit | 30s, deliberately noncancellable | A bounded read completes the local-effect record even if stop arrives during the commit. Failure holds the import. |
+| Git push, then target `ls-remote` confirmation | 300s cancellable push; 60s deliberately noncancellable read | Intent is durable before push. Stopping a child does not disprove a remote write; uncertain results retain intent and require reconciliation. The confirmation read is bounded so an issued effect can be recorded truthfully. |
+
+The normal non-import sync and setup-wizard command paths keep their existing behavior. The isolated Git wrapper used in exact tests is sealed to the disposable fixture root and absent from normal builds.
+The isolated runtime image now includes the Git LFS CLI so its large-file import control exercises actual pointer creation and publication. This changes the disposable image package set, not the pinned Cargo package versions or lock bytes.
+
 ## Compatibility and operator recovery
 
 `POST /api/repos/{id}/import?reset=true` now refuses the request after authentication and repository lookup, before enrolling an operation or changing local, remote, credential, mapping, or checkpoint state. The former reset preparation created a bootstrap Git branch that the importer's absent-ref publication lease would correctly reject. The repository page presents Reset & Reimport as unavailable and directs the operator to a separately reviewed recovery plan. Ordinary `reset=false` imports and healthy existing synchronization remain supported; this refusal does not silently convert a reset request into a new import.

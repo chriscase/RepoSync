@@ -54,6 +54,8 @@ MANDATORY["candidate"].update({"M01_HISTORY", "S54_JSON_LOOKUP", "S54_JSON_HISTO
 MANDATORY["candidate"].update({"N01_FRONTIER", "S54_HTTP_COPY", "S54_SCOPED_HTTP"})
 MANDATORY["candidate"].update({"64A_JOURNAL", "64A_PROCESS_TREE", "64A_ORDINARY", "64A_CONNECTING",
                                "64A_MID_IMPORT", "64A_LOST_PUSH", "64A_FINALIZER", "64A_CANCEL_WRITE", "64A_AUTH", "64A_SVN_CHILD", "64A_SCHEDULER", "64A_EXISTING_TARGET"})
+MANDATORY["candidate"].update({"74_RESET_REFUSAL", "74_STDIN_FILE", "74_GIT_APPLY_STOP",
+                               "74_APPLY_POSITIVE", "74_LFS_STOP", "74_LFS_POSITIVE"})
 SCANNER_CASES = {
     "EVIDENCE_SCAN_CLEAN": "evidence_scan_clean",
     "EVIDENCE_SCAN_CANARY": "evidence_scan_canary",
