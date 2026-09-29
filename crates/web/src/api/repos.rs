@@ -521,6 +521,7 @@ struct ImportPreparationGuard<'a> {
     repo_id: String,
     operation_id: String,
     armed: bool,
+    cleanup_unconfirmed: bool,
 }
 
 impl Drop for ImportPreparationGuard<'_> {
@@ -531,21 +532,28 @@ impl Drop for ImportPreparationGuard<'_> {
         let outcome = self
             .db
             .get_import_operation(&self.repo_id, &self.operation_id);
-        let (state, detail) = match outcome {
-            Ok(Some(op))
-                if op.cancel_requested
-                    && op.last_local_svn_rev.is_none()
-                    && op.intended_git_sha.is_none() =>
-            {
-                (
-                    ImportOperationState::Cancelled,
-                    "cancelled during quiesced preparation",
-                )
-            }
-            _ => (
+        let (state, detail) = if self.cleanup_unconfirmed {
+            (
                 ImportOperationState::ReconciliationRequired,
-                "preparation stopped before worker start; inspect local work and target",
-            ),
+                "preparation command cleanup unconfirmed; inspect local work and target",
+            )
+        } else {
+            match outcome {
+                Ok(Some(op))
+                    if op.cancel_requested
+                        && op.last_local_svn_rev.is_none()
+                        && op.intended_git_sha.is_none() =>
+                {
+                    (
+                        ImportOperationState::Cancelled,
+                        "cancelled during quiesced preparation",
+                    )
+                }
+                _ => (
+                    ImportOperationState::ReconciliationRequired,
+                    "preparation stopped before worker start; inspect local work and target",
+                ),
+            }
         };
         if let Err(e) =
             self.db
@@ -719,6 +727,7 @@ async fn start_repo_import(
         repo_id: id.clone(),
         operation_id: operation_id.clone(),
         armed: true,
+        cleanup_unconfirmed: false,
     };
 
     // 3. Reset progress
@@ -815,7 +824,11 @@ async fn start_repo_import(
         let output =
             reposync_core::process::run(clone, std::time::Duration::from_secs(300), Some(&signal))
                 .await
-                .map_err(|e| AppError::Internal(format!("Git clone stopped or timed out: {e}")))?;
+                .map_err(|e| {
+                    preparation_guard.cleanup_unconfirmed =
+                        reposync_core::process::cleanup_unconfirmed(&e);
+                    AppError::Internal(format!("Git clone stopped or timed out: {e}"))
+                })?;
         if !output.status.success() {
             return Err(AppError::BadRequest(format!(
                 "Git target could not be cloned (exit {:?}); import held for inspection",
@@ -853,6 +866,8 @@ async fn start_repo_import(
             reposync_core::process::run(inspect, std::time::Duration::from_secs(60), Some(&signal))
                 .await
                 .map_err(|e| {
+                    preparation_guard.cleanup_unconfirmed =
+                        reposync_core::process::cleanup_unconfirmed(&e);
                     AppError::Internal(format!("Git target inspection stopped or timed out: {e}"))
                 })?;
         match remote.status.code() {
@@ -1010,7 +1025,7 @@ async fn start_repo_import(
                 ImportPhase::Failed
             }
             Err(e) => {
-                let detail = format!("import stopped with error; inspect local work: {e}");
+                let detail = format!("import stopped with error; inspect local work: {e:#}");
                 if let Err(write_error) = import_db.finish_import_operation(
                     &repo_id_clone,
                     &worker_operation_id,

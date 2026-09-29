@@ -646,7 +646,7 @@ pub async fn run_full_import(
                     String::from_utf8_lossy(&output.stderr).trim()
                 )),
                 Err(e) => {
-                    if e.kind() == std::io::ErrorKind::Interrupted
+                    if crate::process::confirmed_cancelled(&e)
                         && stop_requested(&progress, cancel_signal.as_ref()).await
                     {
                         return Ok(ImportOutcome::Cancelled { commits: 0 });
@@ -753,7 +753,10 @@ pub async fn run_full_import(
 
     let svn_info = match svn_client.info().await {
         Ok(info) => info,
-        Err(_) if stop_requested(&progress, cancel_signal.as_ref()).await => {
+        Err(crate::errors::SvnError::IoError(ref e))
+            if crate::process::confirmed_cancelled(e)
+                && stop_requested(&progress, cancel_signal.as_ref()).await =>
+        {
             return Ok(ImportOutcome::Cancelled { commits: 0 });
         }
         Err(e) => return Err(e).context("failed to get SVN info"),
@@ -788,7 +791,10 @@ pub async fn run_full_import(
     }
     let log_entries = match svn_client.log(1, head_rev).await {
         Ok(entries) => entries,
-        Err(_) if stop_requested(&progress, cancel_signal.as_ref()).await => {
+        Err(crate::errors::SvnError::IoError(ref e))
+            if crate::process::confirmed_cancelled(e)
+                && stop_requested(&progress, cancel_signal.as_ref()).await =>
+        {
             return Ok(ImportOutcome::Cancelled { commits: 0 });
         }
         Err(e) => return Err(e).context("failed to get SVN log"),
@@ -892,19 +898,41 @@ pub async fn run_full_import(
                         Err(e) => {
                             if stop_requested(&progress, cancel_signal.as_ref()).await {
                                 if matches!(&e, crate::errors::GitError::IoError(io)
-                                    if io.kind() == std::io::ErrorKind::Interrupted)
+                                    if crate::process::confirmed_cancelled(io))
                                 {
                                     return Ok(ImportOutcome::Cancelled { commits: count });
                                 }
                                 return Err(e)
                                     .context("Git apply stopped without confirmed quiescence");
                             }
-                            debug!(rev, error = %e, "incremental diff failed, falling back to full export");
+                            if matches!(e, crate::errors::GitError::ApplyFailed(_)) {
+                                debug!(rev, error = %e, "finished incremental apply failed, using full export");
+                            } else {
+                                return Err(e).context(
+                                    "Git apply did not finish with a known failed-patch result",
+                                );
+                            }
                         }
                     }
                 }
-                _ => {
+                Ok(_) => {
                     debug!(rev, "no diff available, using full export");
+                }
+                Err(e)
+                    if matches!(e, crate::errors::SvnError::CommandFailed { .. })
+                        && !stop_requested(&progress, cancel_signal.as_ref()).await =>
+                {
+                    debug!(rev, error = %e, "finished SVN diff failed, using full export");
+                }
+                Err(e) => {
+                    if matches!(&e, crate::errors::SvnError::IoError(io)
+                        if crate::process::confirmed_cancelled(io))
+                        && stop_requested(&progress, cancel_signal.as_ref()).await
+                    {
+                        return Ok(ImportOutcome::Cancelled { commits: count });
+                    }
+                    return Err(e)
+                        .context("SVN diff stopped without confirmed fallback eligibility");
                 }
             }
         }
@@ -914,7 +942,10 @@ pub async fn run_full_import(
                 return Ok(ImportOutcome::Cancelled { commits: count });
             }
             if let Err(e) = svn_client.export("", rev, export_dir.path()).await {
-                if stop_requested(&progress, cancel_signal.as_ref()).await {
+                if matches!(&e, crate::errors::SvnError::IoError(io)
+                    if crate::process::confirmed_cancelled(io))
+                    && stop_requested(&progress, cancel_signal.as_ref()).await
+                {
                     return Ok(ImportOutcome::Cancelled { commits: count });
                 }
                 let msg = format!("[error] r{}: SVN export failed: {}", rev, e);

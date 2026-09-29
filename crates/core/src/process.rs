@@ -10,6 +10,141 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
+/// The child or its output-producing descendants could not be proven stopped.
+/// Callers must hold the operation, irrespective of a cancellation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnconfirmedCleanup {
+    GroupTermination,
+    OutputCompletion,
+}
+
+impl std::fmt::Display for UnconfirmedCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "import command cleanup unconfirmed ({self:?})")
+    }
+}
+
+impl std::error::Error for UnconfirmedCleanup {}
+
+#[derive(Debug)]
+struct ConfirmedStop;
+
+impl std::fmt::Display for ConfirmedStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("import command stopped with confirmed cleanup")
+    }
+}
+
+impl std::error::Error for ConfirmedStop {}
+
+pub fn cleanup_unconfirmed(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<UnconfirmedCleanup>())
+}
+
+pub fn confirmed_cancelled(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
+        && error
+            .get_ref()
+            .is_some_and(|source| source.is::<ConfirmedStop>())
+}
+
+fn stop_result(
+    killed: io::Result<()>,
+    reaped: Result<io::Result<Output>, tokio::time::error::Elapsed>,
+    kind: io::ErrorKind,
+) -> io::Result<Output> {
+    if killed.is_err() {
+        return Err(io::Error::other(UnconfirmedCleanup::GroupTermination));
+    }
+    if !matches!(reaped, Ok(Ok(_))) {
+        return Err(io::Error::other(UnconfirmedCleanup::OutputCompletion));
+    }
+    Err(io::Error::new(kind, ConfirmedStop))
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn fixture_cleanup_fault(command: &Command) -> io::Result<()> {
+    use std::io::Write as _;
+    let Some(root) = std::env::var_os("REPOSYNC_FIXTURE_ROOT") else {
+        return Ok(());
+    };
+    let Some(dir) = std::env::var_os("REPOSYNC_IMPORT_FAULT_DIR") else {
+        return Ok(());
+    };
+    let root_path = std::path::Path::new(&root);
+    let root = root_path.canonicalize()?;
+    let dir = std::path::Path::new(&dir).canonicalize()?;
+    if !dir.starts_with(&root) {
+        return Err(io::Error::other("fixture fault escaped sealed root"));
+    }
+    let args: Vec<_> = command
+        .as_std()
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let program = command.as_std().get_program().to_string_lossy();
+    let kind = if program.contains("svn") || args.first().is_some_and(|a| a.contains("svn")) {
+        "svn"
+    } else if program.contains("git") || args.first().is_some_and(|a| a.contains("git")) {
+        "git"
+    } else {
+        return Ok(());
+    };
+    let stage = [
+        "clone",
+        "ls-remote",
+        "info",
+        "log",
+        "diff",
+        "export",
+        "apply",
+        "push",
+        "commit",
+    ]
+    .into_iter()
+    .find(|token| args.iter().any(|arg| arg == token))
+    .map(|token| format!("{kind}-{token}"));
+    let Some(stage) = stage else {
+        return Ok(());
+    };
+    let scoped = command
+        .as_std()
+        .get_current_dir()
+        .is_some_and(|p| p.starts_with(&root) || p.starts_with(root_path))
+        || args.iter().any(|arg| {
+            arg.contains(root.to_string_lossy().as_ref())
+                || arg.contains(root_path.to_string_lossy().as_ref())
+        });
+    if !scoped {
+        return Err(io::Error::other(
+            "fixture fault command escaped sealed root",
+        ));
+    }
+    writeln!(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("commands.log"))?,
+        "{stage}"
+    )?;
+    if std::env::var("REPOSYNC_IMPORT_FAULT_STAGE").ok().as_deref() == Some(stage.as_str()) {
+        std::fs::write(dir.join("fault.ready"), stage.as_bytes())?;
+        let released = tokio::time::timeout(Duration::from_secs(15), async {
+            while !dir.join("fault.release").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if released.is_err() {
+            return Err(io::Error::other("fixture fault barrier timed out"));
+        }
+        return Err(io::Error::other(UnconfirmedCleanup::OutputCompletion));
+    }
+    Ok(())
+}
+
 /// Fixture-scoped replacement for import Git commands. It cannot select a
 /// path outside the disposable fixture and is absent from normal builds.
 pub fn import_git_command() -> io::Result<Command> {
@@ -41,10 +176,7 @@ pub async fn run_with_input(
     cancel: Option<&Arc<AtomicBool>>,
 ) -> io::Result<Output> {
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "import cancellation requested",
-        ));
+        return Err(io::Error::new(io::ErrorKind::Interrupted, ConfirmedStop));
     }
     let mut file = tempfile::tempfile()?;
     file.write_all(input)?;
@@ -59,11 +191,10 @@ pub async fn run(
     cancel: Option<&Arc<AtomicBool>>,
 ) -> io::Result<Output> {
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "import cancellation requested",
-        ));
+        return Err(io::Error::new(io::ErrorKind::Interrupted, ConfirmedStop));
     }
+    #[cfg(feature = "reliability-fixture")]
+    fixture_cleanup_fault(&command).await?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.kill_on_drop(true);
     #[cfg(unix)]
@@ -78,23 +209,17 @@ pub async fn run(
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            output = &mut wait => return output,
+            output = &mut wait => return output.map_err(|_| io::Error::other(UnconfirmedCleanup::OutputCompletion)),
             _ = &mut deadline => {
                 let killed = kill_group(pid);
                 let reaped = tokio::time::timeout(Duration::from_secs(5), &mut wait).await;
-                if killed.is_err() || !matches!(reaped, Ok(Ok(_))) {
-                    return Err(io::Error::other("import command quiescence unconfirmed after timeout"));
-                }
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "import command timed out"));
+                return stop_result(killed, reaped, io::ErrorKind::TimedOut);
             }
             _ = tokio::time::sleep(Duration::from_millis(100)), if cancel.is_some() => {
                 if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
                     let killed = kill_group(pid);
                     let reaped = tokio::time::timeout(Duration::from_secs(5), &mut wait).await;
-                    if killed.is_err() || !matches!(reaped, Ok(Ok(_))) {
-                        return Err(io::Error::other("import command quiescence unconfirmed after cancellation"));
-                    }
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "import command cancelled"));
+                    return stop_result(killed, reaped, io::ErrorKind::Interrupted);
                 }
             }
         }
@@ -120,6 +245,9 @@ fn kill_group(pid: Option<u32>) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    use crate::errors::{GitError, SvnError};
 
     fn stopped(pid: i32) -> bool {
         if unsafe { libc::kill(pid, 0) } != 0 {
@@ -136,6 +264,59 @@ mod tests {
             }
         }
         false
+    }
+
+    #[tokio::test]
+    async fn cleanup_certainty_survives_git_svn_wrappers_with_and_without_cancel() {
+        for requested_cancel in [false, true] {
+            let confirmed_kind = if requested_cancel {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::TimedOut
+            };
+            for cause in [
+                UnconfirmedCleanup::GroupTermination,
+                UnconfirmedCleanup::OutputCompletion,
+            ] {
+                let reaped = if cause == UnconfirmedCleanup::OutputCompletion {
+                    tokio::time::timeout(
+                        Duration::ZERO,
+                        std::future::pending::<io::Result<Output>>(),
+                    )
+                    .await
+                } else {
+                    Ok(Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }))
+                };
+                let killed = if cause == UnconfirmedCleanup::GroupTermination {
+                    Err(io::Error::other("kill failed"))
+                } else {
+                    Ok(())
+                };
+                let error = stop_result(killed, reaped, confirmed_kind).unwrap_err();
+                assert!(cleanup_unconfirmed(&error));
+                let git = GitError::IoError(io::Error::other(cause));
+                let svn = SvnError::IoError(io::Error::other(cause));
+                assert!(matches!(git, GitError::IoError(ref e) if cleanup_unconfirmed(e)));
+                assert!(matches!(svn, SvnError::IoError(ref e) if cleanup_unconfirmed(e)));
+            }
+            let confirmed = stop_result(
+                Ok(()),
+                Ok(Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })),
+                confirmed_kind,
+            )
+            .unwrap_err();
+            assert_eq!(confirmed.kind(), confirmed_kind);
+            assert!(!cleanup_unconfirmed(&confirmed));
+            assert_eq!(confirmed_cancelled(&confirmed), requested_cancel);
+        }
     }
 
     #[tokio::test]
