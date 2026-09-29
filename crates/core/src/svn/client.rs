@@ -39,7 +39,7 @@ impl fmt::Debug for SvnClient {
 }
 
 impl SvnClient {
-    fn svn_binary(&self) -> String {
+    fn svn_command(&self) -> Command {
         #[cfg(feature = "reliability-fixture")]
         if self.cancel.is_some() {
             if let (Ok(root), Ok(binary)) = (
@@ -51,19 +51,17 @@ impl SvnClient {
                     Path::new(&binary).canonicalize(),
                 ) {
                     if binary.starts_with(root) {
-                        eprintln!(
-                            "RELIABILITY_FIXTURE_SVN_BINARY selected {}",
-                            binary.display()
-                        );
-                        return binary.to_string_lossy().into_owned();
+                        // The isolated runtime's fixture tmpfs can deny direct
+                        // execution. The shell reads only this sealed script;
+                        // production still invokes the SVN binary directly.
+                        let mut command = Command::new("sh");
+                        command.arg(binary);
+                        return command;
                     }
                 }
             }
-            if std::env::var_os("REPOSYNC_IMPORT_SVN_BINARY").is_some() {
-                eprintln!("RELIABILITY_FIXTURE_SVN_BINARY rejected by sealed-root check");
-            }
         }
-        "svn".into()
+        Command::new("svn")
     }
     /// Create a new SVN client targeting `url` with the given credentials.
     pub fn new(
@@ -519,7 +517,7 @@ impl SvnClient {
     // -- Internal helpers ----------------------------------------------------
 
     async fn run_svn(&self, args: &[&str]) -> Result<String, SvnError> {
-        let mut cmd = Command::new(self.svn_binary());
+        let mut cmd = self.svn_command();
         cmd.args(args)
             .arg("--non-interactive")
             .arg("--no-auth-cache")
@@ -567,7 +565,7 @@ impl SvnClient {
     }
 
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
-        let mut cmd = Command::new(self.svn_binary());
+        let mut cmd = self.svn_command();
         cmd.current_dir(dir)
             .args(args)
             .arg("--non-interactive")
