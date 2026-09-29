@@ -529,6 +529,7 @@
     {"id":"64A_AUTH", "binary":"server_freeze", "test":"candidate_64a_named_disabled_expired_and_legacy_fallback_cannot_cancel", "tier":"candidate_regression"},
     {"id":"64A_SVN_CHILD", "binary":"server_freeze", "test":"candidate_64a_stalled_svn_info_child_and_descendant_are_stopped", "tier":"candidate_regression"},
     {"id":"64A_SCHEDULER", "binary":"reposync-daemon", "test":"scheduler::cancellation_tests::held_partial_import_is_skipped_on_actual_scheduler_tick", "tier":"candidate_regression"},
-    {"id":"64A_EXISTING_TARGET", "binary":"server_freeze", "test":"candidate_64a_existing_git_target_is_preserved_before_replay", "tier":"candidate_regression"}
+    {"id":"64A_EXISTING_TARGET", "binary":"server_freeze", "test":"candidate_64a_existing_git_target_is_preserved_before_replay", "tier":"candidate_regression"},
+    {"id":"74_RESET_REFUSAL", "binary":"server_freeze", "test":"candidate_74_reset_refusal_preserves_published_installation", "tier":"candidate_regression"}
   ]
 }

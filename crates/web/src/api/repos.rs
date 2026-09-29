@@ -520,7 +520,6 @@ struct ImportPreparationGuard<'a> {
     db: &'a Database,
     repo_id: String,
     operation_id: String,
-    reset: bool,
     armed: bool,
 }
 
@@ -536,8 +535,7 @@ impl Drop for ImportPreparationGuard<'_> {
             Ok(Some(op))
                 if op.cancel_requested
                     && op.last_local_svn_rev.is_none()
-                    && op.intended_git_sha.is_none()
-                    && !self.reset =>
+                    && op.intended_git_sha.is_none() =>
             {
                 (
                     ImportOperationState::Cancelled,
@@ -594,6 +592,15 @@ async fn start_repo_import(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
+    // This cancellation increment cannot account for the legacy reset's
+    // destructive local cleanup and force-push. Refuse before enrollment or
+    // any workdir, credential, checkpoint, mapping, or target mutation.
+    if import_query.reset {
+        return Err(AppError::BadRequest(
+            "Reset & Reimport is unavailable while safe import cancellation is in effect; request a separately reviewed recovery plan".into(),
+        ));
+    }
+
     if let Some(previous) = db
         .latest_import_operation(&id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -614,7 +621,7 @@ async fn start_repo_import(
             "repository import is active or held for reconciliation".into(),
         ));
     }
-    if repo.last_svn_rev > 0 && !import_query.reset {
+    if repo.last_svn_rev > 0 {
         return Err(AppError::BadRequest(
             "repository already has a completed baseline; refusing implicit full replay".into(),
         ));
@@ -711,7 +718,6 @@ async fn start_repo_import(
         db,
         repo_id: id.clone(),
         operation_id: operation_id.clone(),
-        reset: import_query.reset,
         armed: true,
     };
 
@@ -764,7 +770,7 @@ async fn start_repo_import(
         }
     };
 
-    info!(repo_id = %id, svn_import_url = %svn_import_url, reset = import_query.reset, "starting per-repo import");
+    info!(repo_id = %id, svn_import_url = %svn_import_url, "starting per-repo import");
 
     let svn_client = SvnClient::new(&svn_import_url, &repo.svn_username, &svn_password)
         .with_cancel_signal(progress.read().await.cancel_signal.clone());
@@ -772,93 +778,6 @@ async fn start_repo_import(
     // 6. Build the git repo path: {data_dir}/repos/{repo_id}/git-repo
     let data_dir = state.config.daemon.data_dir.clone();
     let git_repo_path = data_dir.join("repos").join(&id).join("git-repo");
-
-    // If reset=true, wipe the local git repo and force-push empty to remote
-    if import_query.reset {
-        info!(repo_id = %id, "resetting: wiping local git repo and remote");
-        {
-            let mut p = progress.write().await;
-            p.push_log("[info] Reset: deleting local git repository...".into());
-        }
-        if git_repo_path.exists() {
-            std::fs::remove_dir_all(&git_repo_path)
-                .map_err(|e| AppError::Internal(format!("failed to delete git repo: {}", e)))?;
-        }
-
-        // Create fresh repo, force-push empty commit to wipe remote
-        std::fs::create_dir_all(&git_repo_path)
-            .map_err(|e| AppError::Internal(format!("mkdir failed: {}", e)))?;
-
-        let base_clone_url = reposync_core::git::remote_url::derive_git_remote_url(
-            &repo.git_api_url,
-            None,
-            &repo.git_repo,
-        );
-        // Embed token in URL for the force-push
-        let clone_url = if let Some(ref tok) = git_token {
-            if let Some(rest) = base_clone_url.strip_prefix("https://") {
-                format!("https://x-access-token:{}@{}", tok, rest)
-            } else {
-                base_clone_url.clone()
-            }
-        } else {
-            base_clone_url.clone()
-        };
-        let branch = if repo.git_branch.is_empty() {
-            "main"
-        } else {
-            &repo.git_branch
-        };
-
-        let init_cmds: Vec<Vec<&str>> = vec![
-            vec!["init", "--initial-branch", branch],
-            vec![
-                "commit",
-                "--allow-empty",
-                "-m",
-                "Reset for full SVN reimport",
-            ],
-            vec!["remote", "add", "origin", &clone_url],
-            vec!["push", "--force", "origin", branch],
-        ];
-        for args in &init_cmds {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&git_repo_path)
-                .output()
-                .map_err(|e| AppError::Internal(format!("git {:?} failed: {}", args[0], e)))?;
-            if !output.status.success() && args[0] != "push" {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(cmd = ?args[0], %stderr, "git command failed during reset");
-            }
-        }
-
-        // Reset watermark to 0
-        let _ = db.update_repo_watermark(&id, 0, "");
-
-        // Clear stale sync_records, commit_map, and error count
-        if let Ok(n) = db.delete_sync_records_for_repo(&id) {
-            debug!(repo_id = %id, count = n, "cleared sync_records for reimport");
-        }
-        if let Ok(n) = db.delete_commit_map_for_repo(&id) {
-            debug!(repo_id = %id, count = n, "cleared commit_map for reimport");
-        }
-        // Reset error count (clears audit_log errors + resets total_errors column)
-        let _ = db.clear_errors_for_repo(&id);
-        // Reset sync_status to idle and total_syncs to 0
-        let _ = db.conn().execute(
-            "UPDATE repositories SET sync_status = 'idle', total_syncs = 0 WHERE id = ?1",
-            rusqlite::params![&id],
-        );
-
-        {
-            let mut p = progress.write().await;
-            p.push_log(
-                "[info] Reset: remote wiped, records cleared, starting fresh import...".into(),
-            );
-        }
-        info!(repo_id = %id, "reset complete, git repo and remote wiped, stale records cleared");
-    }
 
     std::fs::create_dir_all(&git_repo_path)
         .map_err(|e| AppError::Internal(format!("failed to create repo dir: {}", e)))?;
@@ -918,7 +837,7 @@ async fn start_repo_import(
         .ensure_remote_credentials("origin", git_token.as_deref())
         .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
 
-    if !import_query.reset {
+    {
         let mut inspect = tokio::process::Command::new("git");
         inspect
             .args([

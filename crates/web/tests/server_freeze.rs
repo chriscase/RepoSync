@@ -2509,6 +2509,167 @@ async fn candidate_64a_existing_git_target_is_preserved_before_replay() {
 
 #[cfg(all(feature = "reliability-fixture", unix))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_reset_refusal_preserves_published_installation() {
+    use sha2::{Digest, Sha256};
+    use std::process::Command;
+
+    fn domain_hash(db: &Database) -> String {
+        let conn = db.conn();
+        let mut hash = Sha256::new();
+        for table in ["repositories", "kv_state", "commit_map", "sync_records"] {
+            hash.update(table.as_bytes());
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..columns {
+                    let value = format!("{:?}", row.get_ref(column).unwrap());
+                    hash.update((value.len() as u64).to_le_bytes());
+                    hash.update(value.as_bytes());
+                }
+            }
+        }
+        format!("{:x}", hash.finalize())
+    }
+    fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    assert_eq!(
+        terminal_import_status(&client, &base).await["lifecycle"],
+        "completed"
+    );
+    state
+        .db
+        .set_state(
+            &format!("secret_svn_password_{id}"),
+            "synthetic-reset-preservation",
+        )
+        .unwrap();
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let sentinel = local.join("untracked-preservation.fixture");
+    std::fs::write(&sentinel, b"keep this local work\n").unwrap();
+    let before_db = domain_hash(&state.db);
+    let before_remote_refs = git_output(&bare, &["show-ref"]);
+    let before_remote_tree = git_output(&bare, &["rev-parse", "main^{tree}"]);
+    let before_local_refs = git_output(&local, &["show-ref"]);
+    let before_local_tree = git_output(&local, &["rev-parse", "HEAD^{tree}"]);
+    let before_local_status = git_output(&local, &["status", "--porcelain", "-uall"]);
+    let before_watermark = state.db.get_repo_watermark(&id).unwrap();
+    assert_eq!(before_watermark.0, 3);
+    assert!(state.db.active_import_operation(&id).unwrap().is_none());
+
+    let refusal = client
+        .post(format!("{base}?reset=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(refusal
+        .text()
+        .await
+        .unwrap()
+        .contains("Reset & Reimport is unavailable"));
+    assert_eq!(domain_hash(&state.db), before_db);
+    assert_eq!(git_output(&bare, &["show-ref"]), before_remote_refs);
+    assert_eq!(
+        git_output(&bare, &["rev-parse", "main^{tree}"]),
+        before_remote_tree
+    );
+    assert_eq!(git_output(&local, &["show-ref"]), before_local_refs);
+    assert_eq!(
+        git_output(&local, &["rev-parse", "HEAD^{tree}"]),
+        before_local_tree
+    );
+    assert_eq!(
+        git_output(&local, &["status", "--porcelain", "-uall"]),
+        before_local_status
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep this local work\n");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap(), before_watermark);
+    assert!(state.db.active_import_operation(&id).unwrap().is_none());
+    assert_eq!(
+        state.db.latest_import_operation(&id).unwrap().unwrap().id,
+        operation_id
+    );
+
+    // The deliberately untracked preservation sentinel would independently
+    // block sync as a dirty worktree, so remove it before the healthy control.
+    std::fs::remove_file(&sentinel).unwrap();
+    // A new SVN revision remains synchronizable after the refused reset.
+    let checkout = tmp.path().join("svn-wc");
+    std::fs::write(checkout.join("history.txt"), "after refused reset\n").unwrap();
+    let svn_commit = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            "after refused reset",
+            "--username",
+            "fixture",
+        ])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(svn_commit.status.success());
+    let mut config = state.config.clone();
+    config.svn.trunk_path = String::new();
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    config.github.default_branch = "main".into();
+    config.identity.email_domain = Some("example.invalid".into());
+    let repo = state.db.get_repository(&id).unwrap().unwrap();
+    let mut engine = SyncEngine::new(
+        config,
+        Database::new(tmp.path().join("reposync.db")).unwrap(),
+        SvnClient::new(format!("{}/trunk", repo.svn_url), "fixture", ""),
+        GitClient::new(&local).unwrap(),
+        Arc::new(
+            IdentityMapper::new(&IdentityConfig {
+                email_domain: Some("example.invalid".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+    );
+    engine.set_repo_id(id.clone());
+    engine.run_sync_cycle().await.unwrap();
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 4);
+    assert_eq!(
+        git_output(&bare, &["show", "main:history.txt"]),
+        b"after refused reset\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_RESET_REFUSAL", "operation_id":operation_id,
+            "before_db_sha256":before_db, "remote_refs_unchanged":true,
+            "remote_tree_unchanged":true,"local_refs_tree_index_workdir_unchanged":true,
+            "checkpoint_before":3,"healthy_sync_after":4,"active_hold":false
+        })
+    );
+    server.abort();
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
