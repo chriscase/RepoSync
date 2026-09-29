@@ -3,6 +3,8 @@
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -22,6 +24,7 @@ pub struct SvnClient {
     url: String,
     username: String,
     password: String,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 // Custom Debug implementation that redacts the password field.
@@ -36,6 +39,30 @@ impl fmt::Debug for SvnClient {
 }
 
 impl SvnClient {
+    fn svn_command(&self) -> Command {
+        #[cfg(feature = "reliability-fixture")]
+        if self.cancel.is_some() {
+            if let (Ok(root), Ok(binary)) = (
+                std::env::var("REPOSYNC_FIXTURE_ROOT"),
+                std::env::var("REPOSYNC_IMPORT_SVN_BINARY"),
+            ) {
+                if let (Ok(root), Ok(binary)) = (
+                    Path::new(&root).canonicalize(),
+                    Path::new(&binary).canonicalize(),
+                ) {
+                    if binary.starts_with(root) {
+                        // The isolated runtime's fixture tmpfs can deny direct
+                        // execution. The shell reads only this sealed script;
+                        // production still invokes the SVN binary directly.
+                        let mut command = Command::new("sh");
+                        command.arg(binary);
+                        return command;
+                    }
+                }
+            }
+        }
+        Command::new("svn")
+    }
     /// Create a new SVN client targeting `url` with the given credentials.
     pub fn new(
         url: impl Into<String>,
@@ -46,6 +73,7 @@ impl SvnClient {
             url: url.into(),
             username: username.into(),
             password: password.into(),
+            cancel: None,
         };
         info!(url = %client.url, username = %client.username, "created SvnClient");
         client
@@ -53,6 +81,12 @@ impl SvnClient {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Import-scoped cancellation; ordinary sync clients remain unchanged.
+    pub fn with_cancel_signal(mut self, signal: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(signal);
+        self
     }
 
     /// Update the password at runtime (credential hot-reload from DB).
@@ -483,7 +517,7 @@ impl SvnClient {
     // -- Internal helpers ----------------------------------------------------
 
     async fn run_svn(&self, args: &[&str]) -> Result<String, SvnError> {
-        let mut cmd = Command::new("svn");
+        let mut cmd = self.svn_command();
         cmd.args(args)
             .arg("--non-interactive")
             .arg("--no-auth-cache")
@@ -495,15 +529,8 @@ impl SvnClient {
             .stderr(Stdio::piped());
 
         debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
-        let output = tokio::time::timeout(SVN_COMMAND_TIMEOUT, cmd.output())
+        let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
             .await
-            .map_err(|_| {
-                SvnError::NetworkError(format!(
-                    "svn command timed out after {}s: svn {}",
-                    SVN_COMMAND_TIMEOUT.as_secs(),
-                    args.join(" ")
-                ))
-            })?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     SvnError::BinaryNotFound("svn".into())
@@ -538,7 +565,7 @@ impl SvnClient {
     }
 
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
-        let mut cmd = Command::new("svn");
+        let mut cmd = self.svn_command();
         cmd.current_dir(dir)
             .args(args)
             .arg("--non-interactive")
@@ -551,16 +578,8 @@ impl SvnClient {
             .stderr(Stdio::piped());
 
         debug!(cmd = ?format!("svn {} (in {})", args.join(" "), dir.display()), "running svn command in dir");
-        let output = tokio::time::timeout(SVN_COMMAND_TIMEOUT, cmd.output())
+        let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
             .await
-            .map_err(|_| {
-                SvnError::NetworkError(format!(
-                    "svn command timed out after {}s: svn {} (in {})",
-                    SVN_COMMAND_TIMEOUT.as_secs(),
-                    args.join(" "),
-                    dir.display()
-                ))
-            })?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     SvnError::BinaryNotFound("svn".into())

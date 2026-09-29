@@ -1248,7 +1248,8 @@ async fn test_commit_map_no_repo_id_does_not_deadlock() {
 
 /// R02/R03 baseline API diagnostic with real disposable SVN and Git remotes.
 /// The import progress represents the actual per-repository route's in-memory
-/// state; import subprocess cancellation stages remain outside this test.
+/// state; the historical test name is retained for matched-base comparison.
+/// Its old 404 observation is archived in the initial Phase 0 report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing() {
     use reposync_core::import::ImportPhase;
@@ -1455,7 +1456,11 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
         .send()
         .await
         .unwrap();
-    assert_eq!(cancel.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        cancel.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "cancellation requires an exact durable operation ID"
+    );
     let status: serde_json::Value = client
         .get(format!("{base}/api/repos/{id}/import/status"))
         .send()
@@ -1465,7 +1470,14 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
         .await
         .unwrap();
     assert_eq!(status["phase"], "importing");
+    assert!(status.get("operation_id").is_none());
     assert!(!progress.read().await.cancel_requested);
+    assert!(!progress
+        .read()
+        .await
+        .cancel_signal
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert!(state.db.active_import_operation(id).unwrap().is_none());
 
     let delete = client
         .delete(format!("{base}/api/repos/{id}"))
@@ -1492,7 +1504,2240 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
         .unwrap();
     assert_eq!(svn_before.stdout, svn_after.stdout);
     assert_eq!(git_before.stdout, git_after.stdout);
-    eprintln!("BASELINE OBSERVATION R02/R03: root DELETE retained disabled registration; per-repo cancel returned 404 while progress remained importing. Remote SVN r{} and Git ref {} unchanged.", String::from_utf8_lossy(&svn_after.stdout).trim(), String::from_utf8_lossy(&git_after.stdout).trim());
+    eprintln!("CANDIDATE R02/R03: root DELETE retained disabled registration; missing operation ID rejected without changing import state. Remote SVN r{} and Git ref {} unchanged.", String::from_utf8_lossy(&svn_after.stdout).trim(), String::from_utf8_lossy(&git_after.stdout).trim());
     server.abort();
     provider_handle.abort();
+}
+
+/// Disposable real SVN history, local bare Git target, v12 file database and
+/// the actual repository routes. No provider or production credentials.
+async fn import_fixture() -> (
+    SocketAddr,
+    Arc<AppState>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    String,
+    std::path::PathBuf,
+) {
+    use std::process::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let svn_repo = tmp.path().join("svn-repo");
+    let bare = tmp.path().join("local").join("history.git");
+    std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+    assert!(Command::new("svnadmin")
+        .args(["create", svn_repo.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let svn_url = format!("file://{}", svn_repo.display());
+    assert!(Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/trunk"),
+            "-m",
+            "trunk",
+            "--username",
+            "fixture",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let checkout = tmp.path().join("svn-wc");
+    assert!(Command::new("svn")
+        .args([
+            "checkout",
+            &format!("{svn_url}/trunk"),
+            checkout.to_str().unwrap()
+        ])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(checkout.join("history.txt"), "first\n").unwrap();
+    assert!(Command::new("svn")
+        .args(["add", "history.txt"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("svn")
+        .args(["commit", "-m", "first", "--username", "fixture"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(checkout.join("history.txt"), "second\n").unwrap();
+    assert!(Command::new("svn")
+        .args(["commit", "-m", "second", "--username", "fixture"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["init", "--bare", bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+
+    let config = minimal_config(tmp.path());
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    let engine_db = Database::in_memory().unwrap();
+    engine_db.initialize().unwrap();
+    let dummy_git = tmp.path().join("dummy-git");
+    git2::Repository::init(&dummy_git).unwrap();
+    let engine = Arc::new(SyncEngine::new(
+        config.clone(),
+        engine_db,
+        SvnClient::new("file:///nonexistent", "fixture", ""),
+        GitClient::new(&dummy_git).unwrap(),
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
+    ));
+    let (sync_tx, _) = tokio::sync::mpsc::channel(1);
+    let (ws_tx, _) = tokio::sync::broadcast::channel(32);
+    let state = Arc::new(AppState {
+        db,
+        sync_engine: engine,
+        config,
+        sync_trigger: sync_tx,
+        ws_broadcast: ws_tx,
+        sessions: tokio::sync::RwLock::new(HashMap::new()),
+        import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+        config_path: tmp.path().join("config.toml"),
+        prev_net_snapshot: std::sync::Mutex::new(None),
+        repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
+        login_attempts: std::sync::Mutex::new(HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
+    });
+    state.sessions.write().await.insert(
+        TEST_TOKEN.into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let app = Router::new()
+        .merge(api::repos::routes())
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos"))
+        .json(&serde_json::json!({
+            "name":"history", "svn_url":svn_url, "svn_branch":"trunk",
+            "svn_username":"fixture", "git_provider":"gitea",
+            "git_api_url":format!("file://{}", tmp.path().display()),
+            "git_repo":"local/history", "git_branch":"main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let created: serde_json::Value = response.json().await.unwrap();
+    (
+        addr,
+        state,
+        server,
+        tmp,
+        created["id"].as_str().unwrap().to_string(),
+        bare,
+    )
+}
+
+#[cfg(feature = "reliability-browser")]
+async fn run_import_card_browser(
+    addr: SocketAddr,
+    id: &str,
+    barrier: &Path,
+    mode: &str,
+) -> (tokio::process::Child, std::process::Child) {
+    use std::process::{Command, Stdio};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ui = root.join("web-ui");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let vite = Command::new("node")
+        .arg(ui.join("node_modules/vite/bin/vite.js"))
+        .args(["--host", "127.0.0.1", "--strictPort", "--port"])
+        .arg(port.to_string())
+        .env("REPOSYNC_TEST_API_URL", format!("http://{addr}"))
+        .current_dir(&ui)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/reliability-import.html?repo={id}");
+    let client = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let artifacts = root.join("target/reliability-ui-artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let browser = tokio::process::Command::new("node")
+        .arg(root.join("scripts/reliability-import-browser.mjs"))
+        .env("REPOSYNC_UI_URL", url)
+        .env("REPOSYNC_UI_MODE", mode)
+        .env("REPOSYNC_UI_BARRIER", barrier)
+        .env("REPOSYNC_UI_ARTIFACTS", &artifacts)
+        .env("REPOSYNC_UI_TOKEN", TEST_TOKEN)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (browser, vite)
+}
+
+#[cfg(feature = "reliability-browser")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_mounted_import_card_real_api_browser_journey() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::fs::write(barrier.join("connecting.release"), b"go").unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_BARRIER_DIR", &barrier);
+    std::env::set_var("REPOSYNC_IMPORT_CANCEL_OBSERVE", "1");
+    let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "cancel").await;
+    let mut browser = Some(browser);
+    wait_for_file(&barrier.join("after_first_local.ready")).await;
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_cancel_receipt
+         BEFORE UPDATE OF value ON kv_state
+         WHEN NEW.key LIKE 'import_operation_v1:document:%' AND json_extract(NEW.value, '$.cancel_requested') = 1
+         BEGIN SELECT RAISE(FAIL, 'fixture receipt failure'); END;",
+        )
+        .unwrap();
+    std::fs::write(barrier.join("failure_ready"), b"ready").unwrap();
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            if barrier.join("failure_seen").exists() {
+                break;
+            }
+            if browser.as_mut().unwrap().try_wait().unwrap().is_some() {
+                let output = browser.take().unwrap().wait_with_output().await.unwrap();
+                panic!(
+                    "browser exited before failed cancellation inspection: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let active = state.db.active_import_operation(&id).unwrap().unwrap();
+    assert!(
+        !active.cancel_requested,
+        "failed durable write acknowledged cancellation"
+    );
+    state
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_cancel_receipt")
+        .unwrap();
+    std::fs::write(barrier.join("failure_release"), b"go").unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(45),
+        browser.take().unwrap().wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    let status = terminal_import_status(
+        &authed_client(),
+        &format!("http://{addr}/api/repos/{id}/import"),
+    )
+    .await;
+    assert_eq!(status["lifecycle"], "cancelled");
+    assert_eq!(status["last_local_svn_rev"], 1);
+    assert!(status["last_confirmed_svn_rev"].is_null());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_BARRIER_DIR");
+    std::env::remove_var("REPOSYNC_IMPORT_CANCEL_OBSERVE");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY", &id);
+    let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "uncertain").await;
+    let output = tokio::time::timeout(Duration::from_secs(50), browser.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    let status = terminal_import_status(
+        &authed_client(),
+        &format!("http://{addr}/api/repos/{id}/import"),
+    )
+    .await;
+    assert_eq!(status["lifecycle"], "reconciliation_required");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert!(Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_real_import_completes_with_confirmed_ref_and_cursors() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .header("x-request-id", "ordinary-request")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    let mut final_status = serde_json::Value::Null;
+    for _ in 0..100 {
+        final_status = client
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if final_status["lifecycle"] == "completed" {
+            break;
+        }
+        if final_status["lifecycle"] == "failed"
+            || final_status["lifecycle"] == "reconciliation_required"
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(final_status["lifecycle"], "completed", "{final_status}");
+    assert_eq!(final_status["operation_id"], op_id);
+    let op = state.db.get_import_operation(&id, op_id).unwrap().unwrap();
+    let (rev, sha) = state.db.get_repo_watermark(&id).unwrap();
+    assert_eq!(rev, 3);
+    assert_eq!(op.last_confirmed_svn_rev, Some(rev));
+    assert_eq!(op.last_confirmed_git_sha.as_deref(), Some(sha.as_str()));
+    assert!(state.db.active_import_operation(&id).unwrap().is_none());
+    let out = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), sha);
+    let tree = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:history.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(tree.stdout, b"second\n");
+    let history = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-list",
+            "--reverse",
+            "main",
+        ])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let commits: Vec<_> = String::from_utf8_lossy(&history.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(commits.len(), 3);
+    for (position, expected) in [(1usize, b"first\n".as_slice()), (2, b"second\n".as_slice())] {
+        let path = format!("{}:history.txt", commits[position]);
+        let git_tree = Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "show", &path])
+            .output()
+            .unwrap();
+        assert_eq!(git_tree.stdout, expected);
+        let svn_rev = (position + 1).to_string();
+        let svn_tree = Command::new("svn")
+            .args([
+                "cat",
+                "-r",
+                &svn_rev,
+                &format!(
+                    "file://{}/trunk/history.txt",
+                    tmp.path().join("svn-repo").display()
+                ),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(svn_tree.stdout, expected);
+    }
+    let late_cancel: serde_json::Value = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(late_cancel["lifecycle"], "completed");
+    assert_eq!(
+        state.db.get_repo_watermark(&id).unwrap(),
+        (rev, sha.clone())
+    );
+    let repeated: serde_json::Value = client
+        .post(&base)
+        .header("x-request-id", "ordinary-request")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeated["operation_id"], op_id);
+    assert_eq!(repeated["lifecycle"], "completed");
+    assert_eq!(
+        client.post(&base).send().await.unwrap().status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    let checkout = tmp.path().join("svn-wc");
+    std::fs::write(checkout.join("history.txt"), "third\n").unwrap();
+    let commit = Command::new("svn")
+        .args(["commit", "-m", "after import", "--username", "fixture"])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let mut sync_config = state.config.clone();
+    sync_config.svn.trunk_path = String::new();
+    sync_config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    sync_config.github.default_branch = "main".into();
+    sync_config.identity.email_domain = Some("example.invalid".into());
+    let repo = state.db.get_repository(&id).unwrap().unwrap();
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let mut engine = SyncEngine::new(
+        sync_config,
+        Database::new(tmp.path().join("reposync.db")).unwrap(),
+        SvnClient::new(format!("{}/trunk", repo.svn_url), "fixture", ""),
+        GitClient::new(&local).unwrap(),
+        Arc::new(
+            IdentityMapper::new(&IdentityConfig {
+                email_domain: Some("example.invalid".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+    );
+    engine.set_repo_id(id.clone());
+    engine.run_sync_cycle().await.unwrap();
+    let after_sync = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:history.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(after_sync.stdout, b"third\n");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 4);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"64A_ORDINARY","operation_id":op_id,
+        "svn_rev":rev,"remote_sha":sha,"remote_tree_content":"second\\n","later_sync_rev":4,
+        "later_remote_tree_content":"third\\n","active_pointer":false})
+    );
+    server.abort();
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn wait_for_file(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn terminal_import_status(client: &reqwest::Client, base: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: serde_json::Value = client
+                .get(format!("{base}/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if matches!(
+                status["lifecycle"].as_str(),
+                Some("completed" | "cancelled" | "failed" | "reconciliation_required")
+            ) {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(feature = "reliability-fixture")]
+fn set_import_cleanup_fault(root: &Path, stage: &str) -> std::path::PathBuf {
+    let dir = root.join("cleanup-fault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", root);
+    std::env::set_var("REPOSYNC_IMPORT_FAULT_DIR", &dir);
+    std::env::set_var("REPOSYNC_IMPORT_FAULT_STAGE", stage);
+    dir
+}
+
+#[cfg(feature = "reliability-fixture")]
+fn clear_import_cleanup_fault() {
+    for key in [
+        "REPOSYNC_IMPORT_FAULT_STAGE",
+        "REPOSYNC_IMPORT_FAULT_DIR",
+        "REPOSYNC_FIXTURE_ROOT",
+    ] {
+        std::env::remove_var(key);
+    }
+}
+
+#[cfg(feature = "reliability-fixture")]
+fn import_fault_commands(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("commands.log"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn actual_import_unknown_cleanup(stage: &str, request_cancel: bool, expected_local_rev: i64) {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let fault = set_import_cleanup_fault(tmp.path(), stage);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let started = client.post(&base).send().await.unwrap();
+    assert!(started.status().is_success());
+    let started: serde_json::Value = started.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&fault.join("fault.ready")).await;
+    assert_eq!(
+        std::fs::read_to_string(fault.join("fault.ready")).unwrap(),
+        stage
+    );
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let local_snapshot = |args: &[&str]| {
+        let result = Command::new("git")
+            .args(args)
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    let tree_before = local_snapshot(&["rev-parse", "HEAD^{tree}"]);
+    let head_before = local_snapshot(&["rev-parse", "HEAD"]);
+    let index_before = local_snapshot(&["ls-files", "--stage"]);
+    let index_workdir_before = local_snapshot(&["status", "--porcelain", "-uall"]);
+    let remote_refs = || {
+        Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "show-ref"])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let remote_refs_before = remote_refs();
+    let map_before: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(map_before, 0);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    if request_cancel {
+        let cancel = client
+            .post(format!("{base}/{operation_id}/cancel"))
+            .send()
+            .await
+            .unwrap();
+        assert!(cancel.status().is_success());
+        assert_eq!(
+            cancel.json::<serde_json::Value>().await.unwrap()["lifecycle"],
+            "cancel_requested"
+        );
+    }
+    std::fs::write(fault.join("fault.release"), b"release").unwrap();
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["operation_id"], operation_id);
+    assert!(
+        terminal["lifecycle"] == "failed" || terminal["lifecycle"] == "reconciliation_required",
+        "{terminal}"
+    );
+    assert!(
+        terminal.to_string().contains("cleanup unconfirmed"),
+        "{terminal}"
+    );
+    assert_eq!(terminal["last_local_svn_rev"], expected_local_rev);
+    assert!(terminal["last_confirmed_svn_rev"].is_null());
+    let trace = import_fault_commands(&fault);
+    assert_eq!(trace.last().map(String::as_str), Some(stage), "{trace:?}");
+    assert_eq!(
+        trace.iter().filter(|s| s.as_str() == "svn-export").count(),
+        1
+    );
+    assert!(!trace
+        .iter()
+        .any(|s| matches!(s.as_str(), "git-push" | "git-commit")));
+    assert_eq!(local_snapshot(&["rev-parse", "HEAD^{tree}"]), tree_before);
+    assert_eq!(local_snapshot(&["rev-parse", "HEAD"]), head_before);
+    assert_eq!(local_snapshot(&["ls-files", "--stage"]), index_before);
+    assert_eq!(
+        local_snapshot(&["status", "--porcelain", "-uall"]),
+        index_workdir_before
+    );
+    assert_eq!(remote_refs(), remote_refs_before);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let map_after: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(map_after, map_before);
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+    let held = reopened.active_import_operation(&id).unwrap().unwrap();
+    assert_eq!(held.id, operation_id);
+    assert_ne!(
+        held.state,
+        reposync_core::db::import_operations::ImportOperationState::Cancelled
+    );
+    let retry = client.post(&base).send().await.unwrap();
+    assert_eq!(retry.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        terminal_import_status(&client, &base).await["operation_id"],
+        operation_id
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":if request_cancel {"74_UNCERTAIN_SVN_CANCEL"} else {"74_UNCERTAIN_APPLY_TIMEOUT"},
+            "operation_id":operation_id,"fault_stage":stage,"commands":trace,
+            "checkpoint":0,"local_rev":expected_local_rev,"map_rows":map_after,
+            "tree_index_workdir_preserved":true,"all_remote_refs_preserved":true,"remote_ref_present":false,"restart_held":true
+        })
+    );
+    server.abort();
+    clear_import_cleanup_fault();
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_apply_timeout_cleanup_unknown_holds_without_export_or_next_write() {
+    actual_import_unknown_cleanup("git-apply", false, 1).await;
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_svn_cancel_cleanup_unknown_holds_without_next_revision() {
+    actual_import_unknown_cleanup("svn-diff", true, 1).await;
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_svn_early_cleanup_unknown_never_starts_revision_work() {
+    use std::process::Command;
+    for stage in ["svn-info", "svn-log", "svn-export"] {
+        let (addr, state, server, tmp, id, bare) = import_fixture().await;
+        let fault = set_import_cleanup_fault(tmp.path(), stage);
+        let client = authed_client();
+        let base = format!("http://{addr}/api/repos/{id}/import");
+        let started = client.post(&base).send().await.unwrap();
+        assert!(started.status().is_success());
+        let started: serde_json::Value = started.json().await.unwrap();
+        let operation_id = started["operation_id"].as_str().unwrap();
+        wait_for_file(&fault.join("fault.ready")).await;
+        assert!(client
+            .post(format!("{base}/{operation_id}/cancel"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        std::fs::write(fault.join("fault.release"), b"release").unwrap();
+        let terminal = terminal_import_status(&client, &base).await;
+        assert!(
+            terminal["lifecycle"] == "failed" || terminal["lifecycle"] == "reconciliation_required",
+            "{stage}: {terminal}"
+        );
+        assert!(
+            terminal.to_string().contains("cleanup unconfirmed"),
+            "{stage}: {terminal}"
+        );
+        let trace = import_fault_commands(&fault);
+        assert_eq!(trace.last().map(String::as_str), Some(stage));
+        assert!(!trace
+            .iter()
+            .any(|s| matches!(s.as_str(), "git-apply" | "git-commit" | "git-push")));
+        assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+        assert_eq!(
+            state
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "refs/heads/main"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            Database::new(tmp.path().join("reposync.db"))
+                .unwrap()
+                .active_import_operation(&id)
+                .unwrap()
+                .unwrap()
+                .id,
+            operation_id
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"74_UNCERTAIN_SVN_EARLY","stage":stage,"operation_id":operation_id,"commands":trace,"checkpoint":0,"mapping_rows":0,"remote_ref_present":false,"restart_held":true})
+        );
+        server.abort();
+        clear_import_cleanup_fault();
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_finished_failed_patch_still_uses_export_and_completes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let fault = set_import_cleanup_fault(tmp.path(), "none");
+    let wrapper = tmp.path().join("git-finished-apply-failure");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = apply ]; then exit 1; fi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    assert!(client
+        .post(&base)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "completed", "{terminal}");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 3);
+    let trace = import_fault_commands(&fault);
+    assert!(trace.iter().any(|s| s == "git-apply"));
+    assert!(
+        trace.iter().filter(|s| s.as_str() == "svn-export").count() >= 2,
+        "{trace:?}"
+    );
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:history.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(remote.status.success());
+    assert_eq!(remote.stdout, b"second\n");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"74_FINISHED_PATCH_FALLBACK","commands":trace,"checkpoint":3,"remote_history":"second","completed":true})
+    );
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_GIT_BINARY");
+    clear_import_cleanup_fault();
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_preparation_cancel_cleanup_unknown_never_starts_worker() {
+    use std::process::Command;
+    for stage in ["git-clone", "git-ls-remote"] {
+        let (addr, state, server, tmp, id, bare) = import_fixture().await;
+        let fault = set_import_cleanup_fault(tmp.path(), stage);
+        let client = authed_client();
+        let base = format!("http://{addr}/api/repos/{id}/import");
+        let pending = tokio::spawn({
+            let client = client.clone();
+            let base = base.clone();
+            async move { client.post(base).send().await.unwrap() }
+        });
+        wait_for_file(&fault.join("fault.ready")).await;
+        let op = state.db.active_import_operation(&id).unwrap().unwrap();
+        let cancel = client
+            .post(format!("{base}/{}/cancel", op.id))
+            .send()
+            .await
+            .unwrap();
+        assert!(cancel.status().is_success());
+        std::fs::write(fault.join("fault.release"), b"release").unwrap();
+        assert!(!pending.await.unwrap().status().is_success());
+        let terminal = terminal_import_status(&client, &base).await;
+        assert_eq!(terminal["operation_id"], op.id);
+        assert_eq!(
+            terminal["lifecycle"], "reconciliation_required",
+            "{terminal}"
+        );
+        assert!(
+            terminal.to_string().contains("cleanup unconfirmed"),
+            "{terminal}"
+        );
+        let trace = import_fault_commands(&fault);
+        assert_eq!(trace.last().map(String::as_str), Some(stage));
+        assert!(!trace.iter().any(|s| s.starts_with("svn-")
+            || matches!(s.as_str(), "git-apply" | "git-commit" | "git-push")));
+        assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+        assert!(!Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "refs/heads/main"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+        assert_eq!(
+            reopened.active_import_operation(&id).unwrap().unwrap().id,
+            op.id
+        );
+        assert_eq!(
+            client.post(&base).send().await.unwrap().status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"74_UNCERTAIN_PREPARATION_CANCEL","operation_id":op.id,
+                "stage":stage,"commands":trace,"worker_started":false,"checkpoint":0,
+                "remote_ref_present":false,"restart_held":true
+            })
+        );
+        server.abort();
+        clear_import_cleanup_fault();
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+fn fixture_process_stopped(pid: i32) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with("Z ") || rest.starts_with("X "));
+    }
+    false
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+async fn wait_for_stopped(pid: i32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture_process_stopped(pid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_mid_import_cancel_holds_local_work_without_publication_after_restart() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::fs::write(barrier.join("connecting.release"), b"go").unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_BARRIER_DIR", &barrier);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&barrier.join("after_first_local.ready")).await;
+    assert_eq!(
+        state
+            .db
+            .get_import_operation(&id, op_id)
+            .unwrap()
+            .unwrap()
+            .last_local_svn_rev,
+        Some(1)
+    );
+    let cancel = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
+    let accepted: serde_json::Value = cancel.json().await.unwrap();
+    assert_eq!(accepted["lifecycle"], "cancel_requested");
+    let duplicate: serde_json::Value = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(duplicate["lifecycle"] == "cancel_requested" || duplicate["lifecycle"] == "cancelled");
+    let stale = client
+        .post(format!(
+            "{base}/00000000-0000-0000-0000-000000000000/cancel"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::NOT_FOUND);
+    let status = terminal_import_status(&client, &base).await;
+    assert_eq!(status["lifecycle"], "cancelled", "{status}");
+    assert_eq!(status["last_local_svn_rev"], 1);
+    assert!(status["last_confirmed_svn_rev"].is_null());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !remote.status.success(),
+        "cancelled import published unexpectedly"
+    );
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let local_head = Command::new("git")
+        .args(["-C", local.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        local_head.status.success(),
+        "local partial work must remain identifiable"
+    );
+    let repeated_start = client.post(&base).send().await.unwrap();
+    assert_eq!(repeated_start.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+    reopened.initialize().unwrap();
+    let restarted = reposync_web::WebServer::new(
+        state.config.clone(),
+        reopened,
+        state.sync_engine.clone(),
+        state.sync_trigger.clone(),
+        tmp.path().join("config.toml"),
+        Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+    )
+    .app_state();
+    restarted.sessions.write().await.insert(
+        TEST_TOKEN.into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let app = Router::new()
+        .merge(api::repos::routes())
+        .with_state(restarted.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let restart_addr = listener.local_addr().unwrap();
+    let restart_server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let restart_base = format!("http://{restart_addr}/api/repos/{id}/import");
+    let restart_status: serde_json::Value = client
+        .get(format!("{restart_base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(restart_status["lifecycle"], "cancelled");
+    assert_eq!(restart_status["operation_id"], op_id);
+    assert_eq!(
+        client.post(&restart_base).send().await.unwrap().status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert!(restarted.db.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(restarted.db.get_repo_watermark(&id).unwrap().0, 0);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"64A_MID_IMPORT","operation_id":op_id,
+        "local_rev":1,"local_sha":String::from_utf8_lossy(&local_head.stdout).trim(),
+        "remote_ref_present":false,"checkpoint":0,"restart_lifecycle":"cancelled","held":true})
+    );
+    restart_server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_BARRIER_DIR");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_lost_push_reply_retains_intent_and_blocks_replay() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY", &id);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    let status = terminal_import_status(&client, &base).await;
+    assert_eq!(status["lifecycle"], "reconciliation_required", "{status}");
+    let op = state.db.get_import_operation(&id, op_id).unwrap().unwrap();
+    let intended = op.intended_git_sha.unwrap();
+    assert_eq!(op.intended_ref.as_deref(), Some("refs/heads/main"));
+    assert!(op.last_confirmed_git_sha.is_none());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(remote.status.success());
+    assert_eq!(String::from_utf8_lossy(&remote.stdout).trim(), intended);
+    assert_eq!(
+        client.post(&base).send().await.unwrap().status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    server.abort();
+    let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+    reopened.initialize().unwrap();
+    reopened.hold_interrupted_imports().unwrap();
+    assert!(reopened.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(reopened.get_repo_watermark(&id).unwrap().0, 0);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"64A_LOST_PUSH","operation_id":op_id,
+        "intended_sha":intended,"observed_remote_sha":String::from_utf8_lossy(&remote.stdout).trim(),
+        "checkpoint":0,"held":true})
+    );
+    std::env::remove_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_connecting_cancel_rejects_duplicate_and_keeps_other_repo_independent() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_BARRIER_DIR", &barrier);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .header("x-request-id", "connecting-request")
+        .send()
+        .await
+        .unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&barrier.join("connecting.ready")).await;
+    let repeated: serde_json::Value = client
+        .post(&base)
+        .header("x-request-id", "connecting-request")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeated["operation_id"], op_id);
+    assert_eq!(
+        client.post(&base).send().await.unwrap().status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        reqwest::Client::new()
+            .post(format!("{base}/{op_id}/cancel"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        !state
+            .db
+            .get_import_operation(&id, op_id)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+    let cancel: serde_json::Value = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancel["lifecycle"], "cancel_requested");
+    let status = terminal_import_status(&client, &base).await;
+    assert_eq!(status["lifecycle"], "cancelled");
+    assert!(status["last_local_svn_rev"].is_null());
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let second_bare = tmp.path().join("local").join("second.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", second_bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let source = state.db.get_repository(&id).unwrap().unwrap();
+    let second = client
+        .post(format!("http://{addr}/api/repos"))
+        .json(
+            &serde_json::json!({"name":"second", "svn_url":source.svn_url, "svn_branch":"trunk",
+            "svn_username":"fixture", "git_provider":"gitea",
+            "git_api_url":format!("file://{}", tmp.path().display()),
+            "git_repo":"local/second", "git_branch":"main"}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(second.status().is_success());
+    let second: serde_json::Value = second.json().await.unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    let second_base = format!("http://{addr}/api/repos/{second_id}/import");
+    assert!(client
+        .post(&second_base)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    let second_status = terminal_import_status(&client, &second_base).await;
+    assert_eq!(second_status["lifecycle"], "completed", "{second_status}");
+    assert_eq!(state.db.get_repo_watermark(second_id).unwrap().0, 3);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(Command::new("git")
+        .args([
+            "--git-dir",
+            second_bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"64A_CONNECTING","stopped_repo":id,
+        "stopped_checkpoint":0,"independent_repo":second_id,"independent_checkpoint":3,"equal_svn_numbers_isolated":true})
+    );
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_BARRIER_DIR");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_failed_finalizer_keeps_confirmed_ref_held_without_checkpoint() {
+    use std::process::Command;
+    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_import_finalization
+        BEFORE UPDATE OF last_svn_rev ON repositories
+        BEGIN SELECT RAISE(FAIL, 'fixture finalizer failure'); END;",
+        )
+        .unwrap();
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let value: serde_json::Value = client
+                .get(format!("{base}/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if value["lifecycle"] == "reconciliation_required" {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status["last_confirmed_svn_rev"], 3);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(remote.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&remote.stdout).trim(),
+        status["last_confirmed_git_sha"].as_str().unwrap()
+    );
+    assert_eq!(
+        state
+            .db
+            .get_import_operation(&id, op_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"64A_FINALIZER","operation_id":op_id,
+        "remote_sha":String::from_utf8_lossy(&remote.stdout).trim(),"checkpoint":0,"held":true})
+    );
+    server.abort();
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_failed_cancel_receipt_is_not_acknowledged_or_signalled() {
+    let (addr, state, server, tmp, id, _bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_BARRIER_DIR", &barrier);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&barrier.join("connecting.ready")).await;
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_cancel_receipt
+        BEFORE UPDATE OF value ON kv_state
+        WHEN NEW.key LIKE 'import_operation_v1:document:%' AND NEW.value LIKE '%cancel_requested%'
+        BEGIN SELECT RAISE(FAIL, 'fixture receipt failure'); END;",
+        )
+        .unwrap();
+    let failed = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !state
+            .db
+            .get_import_operation(&id, op_id)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+    let progress = state.get_repo_import_progress(&id).await;
+    assert!(!progress.read().await.cancel_signal.load(Ordering::Acquire));
+    state
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_cancel_receipt")
+        .unwrap();
+    let accepted = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(accepted.status().is_success());
+    assert_eq!(
+        terminal_import_status(&client, &base).await["lifecycle"],
+        "cancelled"
+    );
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_BARRIER_DIR");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_named_disabled_expired_and_legacy_fallback_cannot_cancel() {
+    use reposync_core::models::{Session, User};
+    let (addr, state, server, _tmp, id, _bare) = import_fixture().await;
+    let now = chrono::Utc::now();
+    for (user_id, role, enabled) in [
+        ("active-admin", "admin", true),
+        ("disabled-admin", "admin", false),
+        ("viewer", "viewer", true),
+    ] {
+        state
+            .db
+            .insert_user(&User {
+                id: user_id.into(),
+                username: user_id.into(),
+                display_name: user_id.into(),
+                email: format!("{user_id}@example.invalid"),
+                password_hash: "fixture".into(),
+                role: role.into(),
+                enabled,
+                created_at: now.to_rfc3339(),
+                updated_at: now.to_rfc3339(),
+            })
+            .unwrap();
+    }
+    for (token, user, expiry) in [
+        (
+            "active-token",
+            "active-admin",
+            now + chrono::Duration::hours(1),
+        ),
+        (
+            "disabled-token",
+            "disabled-admin",
+            now + chrono::Duration::hours(1),
+        ),
+        (
+            "expired-token",
+            "active-admin",
+            now - chrono::Duration::hours(1),
+        ),
+        ("viewer-token", "viewer", now + chrono::Duration::hours(1)),
+    ] {
+        state
+            .db
+            .insert_session(&Session {
+                token: token.into(),
+                user_id: user.into(),
+                expires_at: expiry.to_rfc3339(),
+                created_at: now.to_rfc3339(),
+            })
+            .unwrap();
+    }
+    let op = state
+        .db
+        .create_import_operation(&id, "active-admin", "auth-fixture", "target")
+        .unwrap();
+    let url = format!("http://{addr}/api/repos/{id}/import/{}/cancel", op.id);
+    for token in [
+        "disabled-token",
+        "expired-token",
+        TEST_TOKEN,
+        "viewer-token",
+    ] {
+        let status = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "token {token} gained cancellation access"
+        );
+        assert!(
+            !state
+                .db
+                .get_import_operation(&id, &op.id)
+                .unwrap()
+                .unwrap()
+                .cancel_requested
+        );
+    }
+    let accepted = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth("active-token")
+        .send()
+        .await
+        .unwrap();
+    assert!(accepted.status().is_success());
+    assert!(
+        state
+            .db
+            .get_import_operation(&id, &op.id)
+            .unwrap()
+            .unwrap()
+            .cancel_requested
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_existing_git_target_is_preserved_before_replay() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let work = tmp.path().join("existing-target");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main", work.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(work.join("keep.txt"), "existing independent history\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&work)
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["add", "keep.txt"]);
+    git(&["commit", "-m", "preexisting"]);
+    git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&["push", "origin", "main"]);
+    let before = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let rejected = client.post(&base).send().await.unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    let status: serde_json::Value = client
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["lifecycle"], "reconciliation_required");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let after = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(before.stdout, after.stdout);
+    let tree = Command::new("git")
+        .args(["--git-dir", bare.to_str().unwrap(), "show", "main:keep.txt"])
+        .output()
+        .unwrap();
+    assert_eq!(tree.stdout, b"existing independent history\n");
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    server.abort();
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_incremental_apply_completes_through_supervised_command() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let wrapper = tmp.path().join("git-apply-positive-wrapper");
+    let outcomes = tmp.path().join("git-apply-exits.txt");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = apply ]; then\n git \"$@\"\n result=$?\n echo $result >> \"$GIT_APPLY_EXITS\"\n exit $result\nfi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    std::env::set_var("GIT_APPLY_EXITS", &outcomes);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "completed", "{terminal}");
+    let exits = std::fs::read_to_string(&outcomes).unwrap();
+    assert!(
+        exits.lines().any(|line| line == "0"),
+        "actual git apply never succeeded: {exits}"
+    );
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 3);
+    let tree = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:history.txt",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(tree.stdout, b"second\n");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_APPLY_POSITIVE","operation_id":operation_id,
+            "successful_git_apply_calls":exits.lines().filter(|line| *line == "0").count(),
+            "remote_tree_content":"second\\n","checkpoint":3
+        })
+    );
+    server.abort();
+    for name in [
+        "REPOSYNC_IMPORT_GIT_BINARY",
+        "REPOSYNC_FIXTURE_ROOT",
+        "GIT_APPLY_EXITS",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_git_apply_child_and_descendant_stop_on_exact_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let wrapper = tmp.path().join("git-apply-stall-wrapper");
+    let parent_file = tmp.path().join("git-apply-parent.pid");
+    let descendant_file = tmp.path().join("git-apply-descendant.pid");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = apply ]; then\n echo $$ > \"$GIT_STALL_PARENT\"\n sleep 60 & echo $! > \"$GIT_STALL_DESCENDANT\"\n wait\nfi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    std::env::set_var("GIT_STALL_PARENT", &parent_file);
+    std::env::set_var("GIT_STALL_DESCENDANT", &descendant_file);
+
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&descendant_file).await;
+    let parent: i32 = std::fs::read_to_string(&parent_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let descendant: i32 = std::fs::read_to_string(&descendant_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(parent, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+    let before = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(format!("{base}/status")).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(before.status().is_success());
+    let before: serde_json::Value = before.json().await.unwrap();
+    assert_eq!(before["operation_id"], operation_id);
+    assert_eq!(before["last_local_svn_rev"], 1);
+
+    let cancel = client
+        .post(format!("{base}/{operation_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "cancelled", "{terminal}");
+    assert_eq!(terminal["last_local_svn_rev"], 1);
+    assert!(terminal["last_confirmed_svn_rev"].is_null());
+    wait_for_stopped(parent).await;
+    wait_for_stopped(descendant).await;
+    let op = state
+        .db
+        .get_import_operation(&id, operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.processed_revisions, 1);
+    assert_eq!(op.local_commits, 1);
+    assert_eq!(op.last_local_svn_rev, Some(1));
+    assert!(op.last_confirmed_svn_rev.is_none());
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap();
+    assert!(!remote.success());
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let local_count = Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&local)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&local_count.stdout).trim(), "1");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_GIT_APPLY_STOP","operation_id":operation_id,
+            "parent_stopped":true,"descendant_stopped":true,
+            "local_rev":1,"local_commits":1,"remote_ref_present":false,
+            "checkpoint":0,"held":true
+        })
+    );
+    server.abort();
+    for name in [
+        "REPOSYNC_IMPORT_GIT_BINARY",
+        "REPOSYNC_FIXTURE_ROOT",
+        "GIT_STALL_PARENT",
+        "GIT_STALL_DESCENDANT",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_lfs_enabled_import_completes_with_pointer_publication() {
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET lfs_threshold_mb=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let checkout = tmp.path().join("svn-wc");
+    let large = vec![0u8; 1_100_000];
+    std::fs::write(checkout.join("large.bin"), &large).unwrap();
+    assert!(Command::new("svn")
+        .args(["add", "large.bin"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    let commit = Command::new("svn")
+        .args(["commit", "-m", "large binary", "--username", "fixture"])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "completed", "{terminal}");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 4);
+    assert!(terminal["log_lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| {
+            line.as_str()
+                .unwrap_or("")
+                .contains("Git LFS installed in repo")
+        }));
+    let pointer = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:large.bin",
+        ])
+        .output()
+        .unwrap();
+    assert!(pointer.status.success());
+    assert!(pointer
+        .stdout
+        .starts_with(b"version https://git-lfs.github.com/spec/v1\n"));
+    assert!(String::from_utf8_lossy(&pointer.stdout).contains("size 1100000"));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_LFS_POSITIVE","operation_id":operation_id,
+            "checkpoint":4,"pointer_published":true,"source_bytes":large.len(),
+            "remote_pointer_bytes":pointer.stdout.len()
+        })
+    );
+    server.abort();
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_lfs_preflight_child_and_descendant_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET lfs_threshold_mb=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let wrapper = tmp.path().join("git-lfs-stall-wrapper");
+    let parent_file = tmp.path().join("git-lfs-parent.pid");
+    let descendant_file = tmp.path().join("git-lfs-descendant.pid");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = lfs ] && [ \"$2\" = version ]; then\n echo $$ > \"$GIT_STALL_PARENT\"\n sleep 60 & echo $! > \"$GIT_STALL_DESCENDANT\"\n wait\nfi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    std::env::set_var("GIT_STALL_PARENT", &parent_file);
+    std::env::set_var("GIT_STALL_DESCENDANT", &descendant_file);
+
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&descendant_file).await;
+    let parent: i32 = std::fs::read_to_string(&parent_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let descendant: i32 = std::fs::read_to_string(&descendant_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(parent, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+    let responsive = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.get(format!("{base}/status")).send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(responsive.status().is_success());
+    let cancel = client
+        .post(format!("{base}/{operation_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "cancelled", "{terminal}");
+    wait_for_stopped(parent).await;
+    wait_for_stopped(descendant).await;
+    let op = state
+        .db
+        .get_import_operation(&id, operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.processed_revisions, 0);
+    assert!(op.last_local_svn_rev.is_none());
+    assert!(op.last_confirmed_svn_rev.is_none());
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap();
+    assert!(!remote.success());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_LFS_STOP","operation_id":operation_id,
+            "parent_stopped":true,"descendant_stopped":true,
+            "processed_revisions":0,"remote_ref_present":false,"checkpoint":0,"held":true
+        })
+    );
+    server.abort();
+    for name in [
+        "REPOSYNC_IMPORT_GIT_BINARY",
+        "REPOSYNC_FIXTURE_ROOT",
+        "GIT_STALL_PARENT",
+        "GIT_STALL_DESCENDANT",
+    ] {
+        std::env::remove_var(name);
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_reset_refusal_preserves_published_installation() {
+    use sha2::{Digest, Sha256};
+    use std::process::Command;
+
+    fn domain_hash(db: &Database) -> String {
+        let conn = db.conn();
+        let mut hash = Sha256::new();
+        for table in ["repositories", "kv_state", "commit_map", "sync_records"] {
+            hash.update(table.as_bytes());
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for column in 0..columns {
+                    let value = format!("{:?}", row.get_ref(column).unwrap());
+                    hash.update((value.len() as u64).to_le_bytes());
+                    hash.update(value.as_bytes());
+                }
+            }
+        }
+        format!("{:x}", hash.finalize())
+    }
+    fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    assert_eq!(
+        terminal_import_status(&client, &base).await["lifecycle"],
+        "completed"
+    );
+    state
+        .db
+        .set_state(
+            &format!("secret_svn_password_{id}"),
+            "synthetic-reset-preservation",
+        )
+        .unwrap();
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let sentinel = local.join("untracked-preservation.fixture");
+    std::fs::write(&sentinel, b"keep this local work\n").unwrap();
+    let before_db = domain_hash(&state.db);
+    let before_remote_refs = git_output(&bare, &["show-ref"]);
+    let before_remote_tree = git_output(&bare, &["rev-parse", "main^{tree}"]);
+    let before_local_refs = git_output(&local, &["show-ref"]);
+    let before_local_tree = git_output(&local, &["rev-parse", "HEAD^{tree}"]);
+    let before_local_status = git_output(&local, &["status", "--porcelain", "-uall"]);
+    let before_watermark = state.db.get_repo_watermark(&id).unwrap();
+    assert_eq!(before_watermark.0, 3);
+    assert!(state.db.active_import_operation(&id).unwrap().is_none());
+
+    let refusal = client
+        .post(format!("{base}?reset=true"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(refusal
+        .text()
+        .await
+        .unwrap()
+        .contains("Reset & Reimport is unavailable"));
+    assert_eq!(domain_hash(&state.db), before_db);
+    assert_eq!(git_output(&bare, &["show-ref"]), before_remote_refs);
+    assert_eq!(
+        git_output(&bare, &["rev-parse", "main^{tree}"]),
+        before_remote_tree
+    );
+    assert_eq!(git_output(&local, &["show-ref"]), before_local_refs);
+    assert_eq!(
+        git_output(&local, &["rev-parse", "HEAD^{tree}"]),
+        before_local_tree
+    );
+    assert_eq!(
+        git_output(&local, &["status", "--porcelain", "-uall"]),
+        before_local_status
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep this local work\n");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap(), before_watermark);
+    assert!(state.db.active_import_operation(&id).unwrap().is_none());
+    assert_eq!(
+        state.db.latest_import_operation(&id).unwrap().unwrap().id,
+        operation_id
+    );
+
+    // The deliberately untracked preservation sentinel would independently
+    // block sync as a dirty worktree, so remove it before the healthy control.
+    std::fs::remove_file(&sentinel).unwrap();
+    // A new SVN revision remains synchronizable after the refused reset.
+    let checkout = tmp.path().join("svn-wc");
+    std::fs::write(checkout.join("history.txt"), "after refused reset\n").unwrap();
+    let svn_commit = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            "after refused reset",
+            "--username",
+            "fixture",
+        ])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(svn_commit.status.success());
+    let mut config = state.config.clone();
+    config.svn.trunk_path = String::new();
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    config.github.default_branch = "main".into();
+    config.identity.email_domain = Some("example.invalid".into());
+    let repo = state.db.get_repository(&id).unwrap().unwrap();
+    let mut engine = SyncEngine::new(
+        config,
+        Database::new(tmp.path().join("reposync.db")).unwrap(),
+        SvnClient::new(format!("{}/trunk", repo.svn_url), "fixture", ""),
+        GitClient::new(&local).unwrap(),
+        Arc::new(
+            IdentityMapper::new(&IdentityConfig {
+                email_domain: Some("example.invalid".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        ),
+    );
+    engine.set_repo_id(id.clone());
+    engine.run_sync_cycle().await.unwrap();
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 4);
+    assert_eq!(
+        git_output(&bare, &["show", "main:history.txt"]),
+        b"after refused reset\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"74_RESET_REFUSAL", "operation_id":operation_id,
+            "before_db_sha256":before_db, "remote_refs_unchanged":true,
+            "remote_tree_unchanged":true,"local_refs_tree_index_workdir_unchanged":true,
+            "checkpoint_before":3,"healthy_sync_after":4,"active_hold":false
+        })
+    );
+    server.abort();
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let descendant_stopped = |pid: i32| {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // The isolated container's PID 1 may defer reaping an orphaned
+            // grandchild. A zombie has stopped and cannot perform SVN work.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                return stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with("Z ") || rest.starts_with("X "));
+            }
+        }
+        false
+    };
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let wrapper = tmp.path().join("svn-stall-wrapper");
+    let pid_file = tmp.path().join("svn-descendant.pid");
+    std::fs::write(&wrapper, b"#!/bin/sh\nif [ \"$1\" = info ]; then\n sleep 60 & echo $! > \"$CHILD_PID_FILE\"\n wait\nfi\nexec svn \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_SVN_BINARY", &wrapper);
+    std::env::set_var("CHILD_PID_FILE", &pid_file);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(start.status().is_success());
+    let started: serde_json::Value = start.json().await.unwrap();
+    let op_id = started["operation_id"].as_str().unwrap();
+    if tokio::time::timeout(Duration::from_secs(10), async {
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let status: serde_json::Value = client
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        panic!("stalled SVN child marker missing; durable status: {status}");
+    }
+    let descendant: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
+    let status: serde_json::Value = tokio::time::timeout(Duration::from_secs(2), async {
+        client
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(status["operation_id"], op_id);
+    let cancel = client
+        .post(format!("{base}/{op_id}/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success());
+    assert_eq!(
+        terminal_import_status(&client, &base).await["lifecycle"],
+        "cancelled"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !descendant_stopped(descendant) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"64A_SVN_CHILD","operation_id":op_id,
+        "descendant_pid":descendant,"descendant_stopped":true,"checkpoint":0,"remote_ref_present":false})
+    );
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_SVN_BINARY");
+    std::env::remove_var("CHILD_PID_FILE");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
 }

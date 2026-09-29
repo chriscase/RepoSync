@@ -869,19 +869,33 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
                 progress: progress.clone(),
                 ws_broadcast: ws_broadcast.clone(),
                 repo_id: None, // setup wizard doesn't have a repo_id yet
+                operation_id: None,
+                cancel_signal: None,
             },
         )
         .await;
 
         let mut p = progress.write().await;
         match result {
-            Ok(count) => {
+            Ok(import::ImportOutcome::Completed { commits: count, .. }) => {
                 if p.phase != ImportPhase::Cancelled {
                     p.phase = ImportPhase::Completed;
                 }
                 p.completed_at = Some(chrono::Utc::now().to_rfc3339());
                 p.push_log(format!("[info] Import complete: {} commits created", count));
                 info!(count, "import completed successfully");
+            }
+            Ok(import::ImportOutcome::Cancelled { commits }) => {
+                p.phase = ImportPhase::Cancelled;
+                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                p.push_log(format!(
+                    "[info] Import stopped after {} local commits",
+                    commits
+                ));
+            }
+            Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
+                p.phase = ImportPhase::Failed;
+                p.errors.push(reason);
             }
             Err(e) => {
                 p.phase = ImportPhase::Failed;

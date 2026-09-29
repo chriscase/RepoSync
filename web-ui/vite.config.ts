@@ -11,7 +11,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://localhost:8080',
+      '/api': process.env.REPOSYNC_TEST_API_URL ?? 'http://localhost:8080',
       '/ws': {
         target: 'ws://localhost:8080',
         ws: true,

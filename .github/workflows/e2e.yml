@@ -35,7 +35,9 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          cargo test --workspace --test '*' -- --nocapture 2>&1 | tee test-output.txt
+          # The resource-leak test measures process-wide FDs while making 1,000
+          # requests. Keep other integration cases from changing that baseline.
+          cargo test --workspace --test '*' -- --nocapture --test-threads=1 2>&1 | tee test-output.txt
           # Guard: fail if zero tests were executed across all test binaries.
           total=$(grep -Eo '[0-9]+ passed' test-output.txt | awk '{s+=$1} END {print s+0}')
           echo "Total tests passed: $total"
@@ -67,3 +69,32 @@ jobs:
           GIT_AUTHOR_EMAIL: "test@example.com"
           GIT_COMMITTER_NAME: "Test User"
           GIT_COMMITTER_EMAIL: "test@example.com"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
+      - name: Mount import card in Chrome against disposable SVN/Git API
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          google-chrome --version
+          npm ci --prefix web-ui
+          cargo test -p reposync-web --features reliability-browser --test server_freeze candidate_74_mounted_import_card_real_api_browser_journey -- --exact --nocapture 2>&1 | tee import-browser.log
+        env:
+          GIT_AUTHOR_NAME: "Test User"
+          GIT_AUTHOR_EMAIL: "test@example.com"
+          GIT_COMMITTER_NAME: "Test User"
+          GIT_COMMITTER_EMAIL: "test@example.com"
+
+      - name: Preserve import card browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-card-browser-${{ github.sha }}
+          path: |
+            import-browser.log
+            target/reliability-ui-artifacts/
+          if-no-files-found: warn

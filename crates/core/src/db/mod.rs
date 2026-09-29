@@ -3,6 +3,7 @@
 //! Provides a [`Database`] handle with WAL-mode journaling, automatic schema
 //! migrations, and query helpers for every table used by the sync engine.
 
+pub mod import_operations;
 pub mod queries;
 pub mod schema;
 

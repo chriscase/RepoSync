@@ -31,7 +31,7 @@ RUN mkdir -p /opt/reliability-old-tests && \
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git subversion libssl3 ca-certificates nodejs && rm -rf /var/lib/apt/lists/*
+    git git-lfs subversion libssl3 ca-certificates nodejs && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
 COPY --from=build /opt/reliability-old-tests /opt/reliability-old-tests
 COPY scripts/reliability-runtime.py /usr/local/bin/reliability-runtime

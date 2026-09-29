@@ -7,6 +7,7 @@ description = "RepoSync web server and API"
 
 [features]
 reliability-fixture = ["reposync-core/reliability-fixture"]
+reliability-browser = ["reliability-fixture"]
 
 [dependencies]
 reposync-core = { path = "../core" }
@@ -35,6 +36,7 @@ tempfile = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 git2 = { workspace = true }
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

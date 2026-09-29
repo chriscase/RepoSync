@@ -25,6 +25,7 @@ diffy = { workspace = true }
 lettre = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
+libc = "0.2"
 hex = { workspace = true }
 regex-lite = { workspace = true }
 glob-match = { workspace = true }

@@ -1,5 +1,13 @@
 # RepoSync: feedback response, improvement plan, and FAQ
 
+## September 2026 implementation update: full-import Stop
+
+The new per-repository full-import flow assigns a persistent operation ID. Its Stop button requests cancellation of that exact job. “Cancellation requested” means the worker is still stopping; “Cancelled” means it has stopped. Already published Git commits stay published. The page shows the last locally created and remote-confirmed positions separately.
+
+If a Git push may have succeeded but its result cannot be verified, RepoSync records **reconciliation required** and holds that repository. A cancelled partial import is also held. Restart does not restart the import or let the ordinary scheduler treat it as complete. Another, independent repository can keep working. An operator must compare the local and remote histories with the recorded operation before choosing a later recovery action; resetting checkpoints or reimporting is not the cancellation procedure.
+
+This is the first bounded #64 implementation, not automatic recovery for every interrupted external write. The old setup-wizard cancellation flow remains available, and the existing #73 conflict test remains ignored until its fixture and behavior are corrected.
+
 **Prepared for:** Chris and the RepoSync team  
 **Date:** September 23, 2026  
 **Tracking:** [Reliability epic #61](https://github.com/chriscase/RepoSync/issues/61)  

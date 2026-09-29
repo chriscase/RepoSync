@@ -169,6 +169,19 @@ impl Scheduler {
     /// If the engine is already running or an import is in progress, skip.
     #[allow(dead_code)]
     async fn maybe_run_cycle(&self, trigger: &str) {
+        // The legacy global engine has no repository identity to compare to a
+        // held per-repository import, so fail closed while any hold exists.
+        match self.db.has_any_active_import_operation() {
+            Ok(true) => {
+                info!(trigger, "skipping global sync while import work is held");
+                return;
+            }
+            Err(e) => {
+                error!(trigger, error = %e, "cannot establish import holds; refusing global sync");
+                return;
+            }
+            Ok(false) => {}
+        }
         // Skip sync cycles while an import is active to avoid concurrent
         // git repo access ("file changed before we could read it" errors).
         {
@@ -292,6 +305,19 @@ impl Scheduler {
         for repo in repos {
             if !repo.enabled {
                 continue;
+            }
+            match self.db.active_import_operation(&repo.id) {
+                Ok(Some(op)) => {
+                    debug!(repo_name = %repo.name, operation_id = %op.id,
+                        "skipping repository held by import operation");
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo_name = %repo.name, error = %e,
+                        "cannot establish import hold; refusing repository sync");
+                    continue;
+                }
+                Ok(None) => {}
             }
             // Circuit breaker: skip repos that have been paused due to permanent errors
             if repo.sync_status == "error_paused" {
@@ -655,5 +681,101 @@ impl Scheduler {
                 handles.push(handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use reposync_core::config::IdentityConfig;
+    use reposync_core::models::Repository;
+
+    #[tokio::test]
+    async fn held_partial_import_is_skipped_on_actual_scheduler_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        std::fs::write(&config_file, format!("[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"file:///nonexistent\"\nusername = \"fixture\"\n[github]\nrepo = \"local/fixture\"\n", tmp.path().display())).unwrap();
+        let config = AppConfig::load_from_file(&config_file).unwrap();
+        let db_path = tmp.path().join("reposync.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        let now = Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: "held-repo".into(),
+            name: "held".into(),
+            svn_url: "file:///nonexistent".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "gitea".into(),
+            git_api_url: "file:///nonexistent".into(),
+            git_repo: "local/fixture".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 1,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 2,
+            last_git_sha: "verified-old".into(),
+            last_sync_at: Some("2000-01-01T00:00:00Z".into()),
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        let operation = db
+            .create_import_operation("held-repo", "legacy", "request", "target")
+            .unwrap();
+        db.finish_import_operation(
+            "held-repo",
+            &operation.id,
+            reposync_core::db::import_operations::ImportOperationState::Cancelled,
+            "verified partial prefix remains",
+        )
+        .unwrap();
+        let dummy_git = tmp.path().join("dummy-git");
+        assert!(std::process::Command::new("git")
+            .args(["init", dummy_git.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let engine = SyncEngine::new(
+            config.clone(),
+            Database::in_memory().unwrap(),
+            SvnClient::new("file:///nonexistent", "fixture", ""),
+            GitClient::new(&dummy_git).unwrap(),
+            Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
+        );
+        let (_, rx) = mpsc::channel(1);
+        let (ws, _) = broadcast::channel(1);
+        let scheduler = Scheduler::new(
+            Arc::new(engine),
+            Duration::from_secs(1),
+            rx,
+            ws,
+            Arc::new(RwLock::new(ImportProgress::default())),
+            db,
+            config,
+        );
+        scheduler.maybe_run_repo_cycles().await;
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+        assert!(!tmp.path().join("repos/held-repo/git-repo").exists());
+        assert_eq!(
+            scheduler.db.get_repo_watermark("held-repo").unwrap(),
+            (2, "verified-old".into())
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64A_SCHEDULER",
+            "operation_id":operation.id,"checkpoint":2,"worker_spawned":false,"workdir_created":false})
+        );
     }
 }

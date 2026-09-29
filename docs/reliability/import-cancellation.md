@@ -1,0 +1,56 @@
+# RS64-A: bounded full-import cancellation contract
+
+This increment starts from merged `main` at `6b4b3587f6f442ec40e9308b13f2b927bf84f19a`. Its assigned brief is preserved byte-for-byte in [RS64-A-goal.md](RS64-A-goal.md). The original [GOAL.md](GOAL.md) remains unchanged (SHA-256 `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`). #64 remains open after this slice.
+
+## Storage and authority
+
+Normal startup remains at SQLite `user_version=12`. `Database::import_operations` stores versioned JSON documents under `import_operation_v1:document:<UUID>` and repository-owned `active:<repo-id>` and `latest:<repo-id>` keys in the existing `kv_state` table. These are operation records, not SVN lineage or checkpoint authority. No generation, migration, or canonical origin is inferred by writing one. The active pointer and document are created or changed in one SQLite transaction; exact repository and operation IDs are checked before every mutation. A completed operation atomically changes its document, removes the active pointer, and updates the repository and per-repository `last_svn_rev_*`/`last_git_sha_*` cursor copies. No global watermark or UI total is used as completion proof.
+
+The fixture lock adds `libc` as a direct `reposync-core` dependency for Unix process-group termination. It was already present transitively: the locked package versions and checksums are unchanged. The lock-file hash changes by this one dependency edge. The isolated comparison overlays that same one manifest edge onto archived baselines and the pinned old generator before building with the identical lock. It records each manifest's before/after hash; no baseline Rust implementation changes.
+
+The document records the initiator and request identity, target/workdir/policy SHA-256 fingerprint, timestamps, processed count, local commit count and tip/revision, confirmed remote batch count and tip/revision, and outstanding intended ref/SHA. It contains no credential or token. `latest` retains terminal status across restart; `active` remains for cancelled, failed, or uncertain partial work. A missing operation document on an older healthy repository creates no hold and triggers no import.
+
+| From | Allowed next state | Meaning |
+| --- | --- | --- |
+| queued | running, cancel_requested, cancelled, reconciliation_required | No worker has entered replay; interrupted preparation is held if effects are unclear. |
+| running | cancel_requested, completed, failed, reconciliation_required | Completed requires every local revision and final Git ref confirmed, with checkpoint/document committed together. |
+| cancel_requested | cancelled, completed, failed, reconciliation_required | Completion can win only if all work was already published and verified. An issued push with unknown result requires reconciliation. |
+| completed | completed | Terminal; late cancel returns the completed record without changing history. |
+| cancelled / failed / reconciliation_required | same state only | Held terminal result; no automatic retry or scheduler pickup. |
+
+Duplicate cancellation returns the same durable state. A repeated start with the same `X-Request-ID` and initiator returns the same operation ID; a different request is refused while the repository is active or held. A delayed request for A cannot signal B. A failed SQLite write is returned as an error before the in-memory stop signal is set. On daemon startup, any `queued`, `running`, or `cancel_requested` pointer left by an absent worker becomes `reconciliation_required`; startup fails closed if that transition cannot persist. No routine version-12 DDL is added. The offline v13/v14 prototypes and inspection routes remain unactivated.
+
+## API, authorization and worker boundaries
+
+`POST /api/repos/{id}/import` retains `ok` and `message` and adds `operation_id` and `lifecycle`. `GET /api/repos/{id}/import/status` retains the legacy progress fields and adds the durable lifecycle, local/remote confirmed positions, outstanding publication intent, and outcome detail. `POST /api/repos/{id}/import/{operation_id}/cancel` requires the exact ID. The former no-ID path now returns a documented bad request after authentication. Start requires an admin; status/cancel require the initiator or a current admin. Legacy single-admin sessions work only when no named users exist. Expired, disabled and revoked named sessions cannot fall back to that mode.
+
+The importer checks the stop request before connection, each revision, local commit, each publication, and finalization. It never takes a progress read guard then awaits a write guard. Per-repository SVN commands and Git clone/push run under bounded child supervision (300 seconds); remote ref inspection and local CLI phases have shorter bounds. Unix children run in their own process groups, which are terminated on stop/timeout; the direct child is reaped. Local Git work is retained. A new import refuses an existing target branch rather than treating it as an empty destination. Its first push uses an empty-ref lease, so a branch created after preflight cannot be overwritten. Before each push the intended branch/SHA is persisted; a successful push is followed by a read-only `ls-remote` equality check. A lost reply, mismatched ref, or failed receipt keeps the operation held with its intent. No extra push is started to flush work after cancellation.
+
+The process-wide repository busy guard excludes same-ID sync/import workers while the daemon lives. The durable active pointer excludes scheduler and manual writer paths after restart. An import refuses another registration targeting the exact same Git repository and branch. The legacy singleton engine is conservatively paused while any import hold exists because it has no per-repository operation identity. Unrelated per-repository targets can continue. The original setup-wizard cancellation route remains separate and uses the shared outcome type without acquiring a per-repository operation ID.
+
+### Per-repository import command boundary
+
+| Phase and command | Bound and stop behavior | Result rule |
+| --- | --- | --- |
+| Prepare: Git clone; inspect target `ls-remote` | 300s / 60s, cancellable process group | Preparation errors retain the operation hold. `reset=true` is refused before enrollment. |
+| SVN info, log, diff, checkout/export and working-copy commands | 300s per command, cancellable process group | No next revision starts after a durable stop. |
+| Incremental `git apply --3way -p0 -` | Patch bytes staged in an anonymous regular file; 120s cancellable process group | A child that does not read stdin cannot block cancellation. Unconfirmed cleanup is an error and leaves a hold; a verified stopped child retains local work without publishing it. |
+| LFS `version` and `install --local` | 60s each, cancellable process group | Missing LFS remains the prior nonzero-exit fallback. Timeout or uncertain hook installation holds the import. |
+| LFS-aware `git add`, cached diff, and commit | 120s / 60s / 120s, cancellable process group | Interrupted local writes remain held; no push follows a stop. |
+| Local `rev-parse` after an issued commit | 30s, deliberately noncancellable | A bounded read completes the local-effect record even if stop arrives during the commit. Failure holds the import. |
+| Git push, then target `ls-remote` confirmation | 300s cancellable push; 60s deliberately noncancellable read | Intent is durable before push. Stopping a child does not disprove a remote write; uncertain results retain intent and require reconciliation. The confirmation read is bounded so an issued effect can be recorded truthfully. |
+
+The normal non-import sync and setup-wizard command paths keep their existing behavior. The isolated Git wrapper used in exact tests is sealed to the disposable fixture root and absent from normal builds.
+The isolated runtime image now includes the Git LFS CLI so its large-file import control exercises actual pointer creation and publication. This changes the disposable image package set, not the pinned Cargo package versions or lock bytes.
+
+### Mounted browser qualification
+
+The E2E workflow runs `cargo test -p reposync-web --features reliability-browser --test server_freeze candidate_74_mounted_import_card_real_api_browser_journey -- --exact --nocapture` after installing the existing locked UI packages. This feature mounts the real `ImportProgressCard` in Chrome with a disposable v12 API, SVN repository, and bare Git target. A fixture-only worker barrier allows the browser to see the durable `cancel_requested` state before finalization. A SQLite trigger rejects the first cancellation receipt; the browser checks the error, then retries the same exact operation ID after that trigger is removed. It checks local r1 versus no confirmed remote revision, a terminal hold, and the same result after reload. A second fixture injects an uncertain push reply and checks reconciliation-required before and after reload, with no retry action. The browser uses Node's built-in Chrome protocol client; no UI package or lock change was needed. Screenshots, request/response summaries, and the test log are uploaded by the E2E job. Existing API tests continue to check denied or expired principals and ordinary completed imports.
+
+## Compatibility and operator recovery
+
+`POST /api/repos/{id}/import?reset=true` now refuses the request after authentication and repository lookup, before enrolling an operation or changing local, remote, credential, mapping, or checkpoint state. The former reset preparation created a bootstrap Git branch that the importer's absent-ref publication lease would correctly reject. The repository page presents Reset & Reimport as unavailable and directs the operator to a separately reviewed recovery plan. Ordinary `reset=false` imports and healthy existing synchronization remain supported; this refusal does not silently convert a reset request into a new import.
+
+A cancelled import means **stop further work**, not undo commits already published. `last_local_*` can be ahead of `last_confirmed_*`; an unpublished local tip stays in the managed workdir. The active pointer blocks ordinary sync, duplicate import, update, disable/delete, branch pairing, skip and retry on that repository. Inspect the operation ID, local Git log/tree, remote Git ref/log/tree, SVN revisions and all per-repository cursor copies before any manual decision. Do not reset checkpoints or reimport to dismiss a hold. A `reconciliation_required` result is an unresolved external-effect record, not a failed test disguised as success.
+
+Quiesced old v12 installations can open without an operation record; their IDs, config, credential rows, refs, enabled states and existing checkpoints are not migrated by this slice. An older executable cannot interpret the active pointer and is not a safe concurrent writer or downgrade while an operation is active or unresolved. One daemon owns the data directory; cross-host fencing and automatic reconciliation are future #64 work. The known ignored conflict case remains #73, not passing coverage.

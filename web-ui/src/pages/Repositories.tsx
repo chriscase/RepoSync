@@ -176,8 +176,8 @@ export default function Repositories() {
         password: form.svn_password || undefined,
       });
       setSvnTestResult(result);
-    } catch (e: any) {
-      setSvnTestResult({ ok: false, message: e.message });
+    } catch (e: unknown) {
+      setSvnTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
     } finally {
       setSvnTesting(false);
     }
@@ -194,8 +194,8 @@ export default function Repositories() {
         token: form.git_token || undefined,
       });
       setGitTestResult(result);
-    } catch (e: any) {
-      setGitTestResult({ ok: false, message: e.message });
+    } catch (e: unknown) {
+      setGitTestResult({ ok: false, message: e instanceof Error ? e.message : String(e) });
     } finally {
       setGitTesting(false);
     }

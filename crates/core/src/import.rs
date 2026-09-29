@@ -9,7 +9,9 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -85,6 +87,8 @@ pub struct ImportProgress {
     /// Set to true to request cancellation.
     #[serde(skip)]
     pub cancel_requested: bool,
+    #[serde(skip)]
+    pub cancel_signal: Arc<AtomicBool>,
     /// Tracks unique LFS files (path:size) — not serialized.
     #[serde(skip)]
     pub lfs_seen: HashSet<String>,
@@ -108,6 +112,7 @@ impl Default for ImportProgress {
             completed_at: None,
             verification: None,
             cancel_requested: false,
+            cancel_signal: Arc::new(AtomicBool::new(false)),
             lfs_seen: HashSet::new(),
         }
     }
@@ -372,6 +377,209 @@ pub struct ImportRunState {
     pub progress: Arc<RwLock<ImportProgress>>,
     pub ws_broadcast: Option<broadcast::Sender<String>>,
     pub repo_id: Option<String>,
+    /// Present for durable per-repository imports; absent for the setup wizard.
+    pub operation_id: Option<String>,
+    pub cancel_signal: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Debug)]
+pub enum ImportOutcome {
+    Completed {
+        commits: u64,
+        svn_rev: i64,
+        git_sha: String,
+    },
+    Cancelled {
+        commits: u64,
+    },
+    ReconciliationRequired {
+        commits: u64,
+        reason: String,
+    },
+}
+
+async fn stop_requested(
+    progress: &Arc<RwLock<ImportProgress>>,
+    signal: Option<&Arc<AtomicBool>>,
+) -> bool {
+    signal.is_some_and(|s| s.load(Ordering::Acquire)) || progress.read().await.cancel_requested
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn fixture_barrier(
+    stage: &str,
+    repo: Option<&str>,
+    signal: Option<&Arc<AtomicBool>>,
+) -> bool {
+    let Ok(root) = std::env::var("REPOSYNC_FIXTURE_ROOT") else {
+        return false;
+    };
+    let Ok(dir) = std::env::var("REPOSYNC_IMPORT_BARRIER_DIR") else {
+        return false;
+    };
+    let Ok(root) = Path::new(&root).canonicalize() else {
+        return false;
+    };
+    let Ok(dir) = Path::new(&dir).canonicalize() else {
+        return false;
+    };
+    if !dir.starts_with(root) || repo.is_none_or(|id| !dir.ends_with(id)) {
+        return false;
+    }
+    std::fs::write(dir.join(format!("{stage}.ready")), b"ready").expect("fixture barrier ready");
+    loop {
+        if signal.is_some_and(|s| s.load(Ordering::Acquire)) {
+            if std::env::var_os("REPOSYNC_IMPORT_CANCEL_OBSERVE").is_some() {
+                std::fs::write(dir.join(format!("{stage}.cancel_observed")), b"observed")
+                    .expect("fixture cancel observation");
+                while !dir.join(format!("{stage}.cancel_release")).exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            return true;
+        }
+        if dir.join(format!("{stage}.release")).exists() {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+struct PublicationTarget<'a> {
+    workdir: &'a Path,
+    remote: &'a str,
+    branch: &'a str,
+    sha: &'a str,
+    force: bool,
+}
+
+async fn publish_checked(
+    db: &Database,
+    repo: &str,
+    op: &str,
+    target: PublicationTarget<'_>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<(), String> {
+    let PublicationTarget {
+        workdir,
+        remote,
+        branch,
+        sha,
+        force,
+    } = target;
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return Err("cancelled before publication".into());
+    }
+    db.begin_import_publication(repo, op, &format!("refs/heads/{branch}"), sha)
+        .map_err(|e| format!("cannot persist publication intent: {e}"))?;
+    let mut push = tokio::process::Command::new("git");
+    push.arg("push");
+    if force {
+        push.arg(format!("--force-with-lease=refs/heads/{branch}:"));
+    }
+    push.arg(remote)
+        .arg(branch)
+        .current_dir(workdir)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::process::run(push, Duration::from_secs(300), cancel)
+        .await
+        .map_err(|e| format!("Git push outcome uncertain: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Git push outcome uncertain (exit {:?})",
+            output.status.code()
+        ));
+    }
+    #[cfg(feature = "reliability-fixture")]
+    if std::env::var("REPOSYNC_IMPORT_LOST_PUSH_REPLY")
+        .ok()
+        .as_deref()
+        == Some(repo)
+        && std::env::var("REPOSYNC_FIXTURE_ROOT")
+            .ok()
+            .and_then(|root| Path::new(&root).canonicalize().ok())
+            .is_some_and(|root| {
+                workdir
+                    .canonicalize()
+                    .is_ok_and(|workdir| workdir.starts_with(root))
+            })
+    {
+        return Err("fixture: successful Git push reply lost before verification".into());
+    }
+    // A successful local exit is not the checkpoint proof: read the actual ref.
+    let mut inspect = tokio::process::Command::new("git");
+    inspect
+        .args([
+            "ls-remote",
+            "--exit-code",
+            remote,
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(workdir)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let observed = crate::process::run(inspect, Duration::from_secs(60), None)
+        .await
+        .map_err(|e| format!("published ref could not be verified: {e}"))?;
+    let observed_sha = String::from_utf8_lossy(&observed.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if !observed.status.success() || observed_sha != sha {
+        return Err("published ref differs from intended local SHA".into());
+    }
+    db.confirm_import_publication(repo, op, sha)
+        .map_err(|e| format!("published ref verified but receipt failed: {e}"))?;
+    Ok(())
+}
+
+async fn import_cli_commit(
+    workdir: &Path,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+    committer_email: &str,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<git2::Oid> {
+    let mut add = tokio::process::Command::new("git");
+    add.args(["add", "--all"]).current_dir(workdir);
+    let output = crate::process::run(add, Duration::from_secs(120), cancel).await?;
+    anyhow::ensure!(output.status.success(), "LFS-aware git add failed");
+    let mut diff = tokio::process::Command::new("git");
+    diff.args(["diff", "--cached", "--quiet"])
+        .current_dir(workdir);
+    let output = crate::process::run(diff, Duration::from_secs(60), cancel).await?;
+    anyhow::ensure!(
+        output.status.code() == Some(1),
+        "no staged import changes or git diff failed"
+    );
+    let author = format!("{author_name} <{author_email}>");
+    let mut commit = tokio::process::Command::new("git");
+    commit
+        .args(["commit", "-m", message, "--author", &author])
+        .current_dir(workdir)
+        .env("GIT_COMMITTER_NAME", committer_name)
+        .env("GIT_COMMITTER_EMAIL", committer_email);
+    let output = crate::process::run(commit, Duration::from_secs(120), cancel).await?;
+    anyhow::ensure!(output.status.success(), "LFS-aware git commit failed");
+    let mut rev = tokio::process::Command::new("git");
+    rev.args(["rev-parse", "HEAD"]).current_dir(workdir);
+    let output = crate::process::run(rev, Duration::from_secs(30), None).await?;
+    anyhow::ensure!(output.status.success(), "could not read new local commit");
+    Ok(git2::Oid::from_str(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    )?)
+}
+
+async fn import_lfs_command(
+    args: &[&str],
+    workdir: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> std::io::Result<std::process::Output> {
+    let mut command = crate::process::import_git_command()?;
+    command.args(args).current_dir(workdir);
+    crate::process::run(command, Duration::from_secs(60), cancel).await
 }
 
 pub async fn run_full_import(
@@ -382,12 +590,21 @@ pub async fn run_full_import(
     file_policy: &FilePolicy,
     import_config: &ImportConfig,
     run_state: ImportRunState,
-) -> Result<u64> {
+) -> Result<ImportOutcome> {
     let ImportRunState {
         progress,
         ws_broadcast,
         repo_id,
+        operation_id,
+        cancel_signal,
     } = run_state;
+
+    if stop_requested(&progress, cancel_signal.as_ref()).await {
+        let mut p = progress.write().await;
+        p.phase = ImportPhase::Cancelled;
+        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
     // Helper to push a log line and broadcast it.
     let log = |progress: &Arc<RwLock<ImportProgress>>,
                ws: &Option<broadcast::Sender<String>>,
@@ -414,7 +631,33 @@ pub async fn run_full_import(
 
     // LFS preflight: check availability and install hooks in the repo
     let lfs_available = if file_policy.lfs_enabled() {
-        match crate::lfs::preflight_check() {
+        let rp = {
+            let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git_guard.repo_workdir()
+        };
+        let preflight = if operation_id.is_some() {
+            match import_lfs_command(&["lfs", "version"], &rp, cancel_signal.as_ref()).await {
+                Ok(output) if output.status.success() => {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                }
+                Ok(output) => Err(format!(
+                    "git lfs version failed (exit {:?}): {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(e) => {
+                    if crate::process::confirmed_cancelled(&e)
+                        && stop_requested(&progress, cancel_signal.as_ref()).await
+                    {
+                        return Ok(ImportOutcome::Cancelled { commits: 0 });
+                    }
+                    return Err(e).context("LFS preflight did not quiesce safely");
+                }
+            }
+        } else {
+            crate::lfs::preflight_check()
+        };
+        match preflight {
             Ok(version) => {
                 log(
                     &progress,
@@ -425,11 +668,29 @@ pub async fn run_full_import(
 
                 // Install LFS hooks/filters in the repo so `git add` invokes
                 // the clean filter and creates pointer files for tracked patterns.
-                let rp = {
-                    let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-                    git_guard.repo_workdir()
+                let install = if operation_id.is_some() {
+                    match import_lfs_command(
+                        &["lfs", "install", "--local"],
+                        &rp,
+                        cancel_signal.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(output) if output.status.success() => Ok(()),
+                        Ok(output) => Err(format!(
+                            "git lfs install failed (exit {:?}): {}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        )),
+                        Err(e) => {
+                            return Err(e)
+                                .context("LFS hook installation outcome requires inspection")
+                        }
+                    }
+                } else {
+                    crate::lfs::install_lfs_hooks(&rp)
                 };
-                match crate::lfs::install_lfs_hooks(&rp) {
+                match install {
                     Ok(()) => {
                         log(
                             &progress,
@@ -471,6 +732,10 @@ pub async fn run_full_import(
     };
 
     // Get SVN info
+    #[cfg(feature = "reliability-fixture")]
+    if fixture_barrier("connecting", repo_id.as_deref(), cancel_signal.as_ref()).await {
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
     log(
         &progress,
         &ws_broadcast,
@@ -486,7 +751,16 @@ pub async fn run_full_import(
         }
     }
 
-    let svn_info = svn_client.info().await.context("failed to get SVN info")?;
+    let svn_info = match svn_client.info().await {
+        Ok(info) => info,
+        Err(crate::errors::SvnError::IoError(ref e))
+            if crate::process::confirmed_cancelled(e)
+                && stop_requested(&progress, cancel_signal.as_ref()).await =>
+        {
+            return Ok(ImportOutcome::Cancelled { commits: 0 });
+        }
+        Err(e) => return Err(e).context("failed to get SVN info"),
+    };
     let head_rev = svn_info.latest_rev;
 
     {
@@ -512,10 +786,23 @@ pub async fn run_full_import(
     )
     .await;
 
-    let log_entries = svn_client
-        .log(1, head_rev)
-        .await
-        .context("failed to get SVN log")?;
+    if stop_requested(&progress, cancel_signal.as_ref()).await {
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
+    let log_entries = match svn_client.log(1, head_rev).await {
+        Ok(entries) => entries,
+        Err(crate::errors::SvnError::IoError(ref e))
+            if crate::process::confirmed_cancelled(e)
+                && stop_requested(&progress, cancel_signal.as_ref()).await =>
+        {
+            return Ok(ImportOutcome::Cancelled { commits: 0 });
+        }
+        Err(e) => return Err(e).context("failed to get SVN log"),
+    };
+
+    if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+        db.note_import_total(repo, op, log_entries.len() as u64)?;
+    }
 
     {
         let mut p = progress.write().await;
@@ -540,20 +827,19 @@ pub async fn run_full_import(
 
     for (idx, entry) in log_entries.iter().enumerate() {
         // Check for cancellation
-        {
-            let p = progress.read().await;
-            if p.cancel_requested {
+        if stop_requested(&progress, cancel_signal.as_ref()).await {
+            {
                 let mut p = progress.write().await;
                 p.phase = ImportPhase::Cancelled;
                 p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                log(
-                    &progress,
-                    &ws_broadcast,
-                    "[warn] Import cancelled by user".into(),
-                )
-                .await;
-                return Ok(count);
             }
+            log(
+                &progress,
+                &ws_broadcast,
+                "[warn] Import stopped; already published commits are not undone".into(),
+            )
+            .await;
+            return Ok(ImportOutcome::Cancelled { commits: count });
         }
 
         let rev = entry.revision;
@@ -570,6 +856,9 @@ pub async fn run_full_import(
                 log(&progress, &ws_broadcast, msg.clone()).await;
                 let mut p = progress.write().await;
                 p.errors.push(msg);
+                if operation_id.is_some() {
+                    return Err(e).context("import export directory unavailable");
+                }
                 continue;
             }
         };
@@ -591,29 +880,81 @@ pub async fn run_full_import(
                     } else {
                         diff_text
                     };
-                    match crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await
-                    {
+                    let apply = if let Some(signal) = cancel_signal.as_ref() {
+                        crate::sync_engine::apply_diff_to_path_for_import(
+                            &repo_path,
+                            &processed_diff,
+                            signal,
+                        )
+                        .await
+                    } else {
+                        crate::sync_engine::apply_diff_to_path(&repo_path, &processed_diff).await
+                    };
+                    match apply {
                         Ok(()) => {
                             used_incremental = true;
                             debug!(rev, "applied incremental SVN diff");
                         }
                         Err(e) => {
-                            debug!(rev, error = %e, "incremental diff failed, falling back to full export");
+                            if stop_requested(&progress, cancel_signal.as_ref()).await {
+                                if matches!(&e, crate::errors::GitError::IoError(io)
+                                    if crate::process::confirmed_cancelled(io))
+                                {
+                                    return Ok(ImportOutcome::Cancelled { commits: count });
+                                }
+                                return Err(e)
+                                    .context("Git apply stopped without confirmed quiescence");
+                            }
+                            if matches!(e, crate::errors::GitError::ApplyFailed(_)) {
+                                debug!(rev, error = %e, "finished incremental apply failed, using full export");
+                            } else {
+                                return Err(e).context(
+                                    "Git apply did not finish with a known failed-patch result",
+                                );
+                            }
                         }
                     }
                 }
-                _ => {
+                Ok(_) => {
                     debug!(rev, "no diff available, using full export");
+                }
+                Err(e)
+                    if matches!(e, crate::errors::SvnError::CommandFailed { .. })
+                        && !stop_requested(&progress, cancel_signal.as_ref()).await =>
+                {
+                    debug!(rev, error = %e, "finished SVN diff failed, using full export");
+                }
+                Err(e) => {
+                    if matches!(&e, crate::errors::SvnError::IoError(io)
+                        if crate::process::confirmed_cancelled(io))
+                        && stop_requested(&progress, cancel_signal.as_ref()).await
+                    {
+                        return Ok(ImportOutcome::Cancelled { commits: count });
+                    }
+                    return Err(e)
+                        .context("SVN diff stopped without confirmed fallback eligibility");
                 }
             }
         }
 
         if !used_incremental {
+            if stop_requested(&progress, cancel_signal.as_ref()).await {
+                return Ok(ImportOutcome::Cancelled { commits: count });
+            }
             if let Err(e) = svn_client.export("", rev, export_dir.path()).await {
+                if matches!(&e, crate::errors::SvnError::IoError(io)
+                    if crate::process::confirmed_cancelled(io))
+                    && stop_requested(&progress, cancel_signal.as_ref()).await
+                {
+                    return Ok(ImportOutcome::Cancelled { commits: count });
+                }
                 let msg = format!("[error] r{}: SVN export failed: {}", rev, e);
                 log(&progress, &ws_broadcast, msg.clone()).await;
                 let mut p = progress.write().await;
                 p.errors.push(msg);
+                if operation_id.is_some() {
+                    return Err(e).context("SVN export failed");
+                }
                 continue;
             }
 
@@ -622,6 +963,10 @@ pub async fn run_full_import(
                 let msg = format!("[warn] r{}: failed to remove stale files: {}", rev, e);
                 log(&progress, &ws_broadcast, msg).await;
             }
+        }
+
+        if stop_requested(&progress, cancel_signal.as_ref()).await {
+            return Ok(ImportOutcome::Cancelled { commits: count });
         }
 
         // Copy with policy enforcement (only needed for full export path)
@@ -635,6 +980,9 @@ pub async fn run_full_import(
                     log(&progress, &ws_broadcast, msg.clone()).await;
                     let mut p = progress.write().await;
                     p.errors.push(msg);
+                    if operation_id.is_some() {
+                        return Err(e).context("import copy failed");
+                    }
                     continue;
                 }
             }
@@ -684,36 +1032,55 @@ pub async fn run_full_import(
         // invokes the LFS clean filter and stores large files as pointers.
         // libgit2's Index::add_all() bypasses LFS filters entirely.
         let use_cli = lfs_available && copy_stats.lfs_tracked > 0;
-        let (commit_result, push_repo_path) = {
+        if stop_requested(&progress, cancel_signal.as_ref()).await {
+            return Ok(ImportOutcome::Cancelled { commits: count });
+        }
+        let push_repo_path = {
             let git_client_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-            let rp = git_client_guard.repo_workdir();
-            let result = if use_cli {
-                debug!(
-                    rev,
-                    lfs_count = copy_stats.lfs_tracked,
-                    "using git CLI for commit (LFS files present)"
-                );
-                git_client_guard.commit_via_cli(
-                    &message,
-                    &author_name,
-                    &author_email,
-                    &import_config.committer_name,
-                    &import_config.committer_email,
-                )
+            git_client_guard.repo_workdir()
+        };
+        let commit_result: Result<git2::Oid> = if use_cli && operation_id.is_some() {
+            import_cli_commit(
+                &push_repo_path,
+                &message,
+                &author_name,
+                &author_email,
+                &import_config.committer_name,
+                &import_config.committer_email,
+                cancel_signal.as_ref(),
+            )
+            .await
+        } else {
+            let git_client_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+            if use_cli {
+                git_client_guard
+                    .commit_via_cli(
+                        &message,
+                        &author_name,
+                        &author_email,
+                        &import_config.committer_name,
+                        &import_config.committer_email,
+                    )
+                    .map_err(Into::into)
             } else {
-                git_client_guard.commit(
-                    &message,
-                    &author_name,
-                    &author_email,
-                    &import_config.committer_name,
-                    &import_config.committer_email,
-                )
-            };
-            (result, rp)
-        }; // git_client_guard dropped here, before any .await
+                git_client_guard
+                    .commit(
+                        &message,
+                        &author_name,
+                        &author_email,
+                        &import_config.committer_name,
+                        &import_config.committer_email,
+                    )
+                    .map_err(Into::into)
+            }
+        };
         match commit_result {
             Ok(oid) => {
                 let sha = oid.to_string();
+                if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+                    db.note_import_local(repo, op, rev, &sha, idx as u64 + 1, count + 1)
+                        .context("failed to persist local import progress")?;
+                }
                 let short_sha = &sha[..8.min(sha.len())];
 
                 // Log with details
@@ -744,14 +1111,16 @@ pub async fn run_full_import(
                 log(&progress, &ws_broadcast, log_line).await;
 
                 // Record in DB (commit_map for bidirectional mapping)
-                db.insert_commit_map(
+                let map_result = db.insert_commit_map(
                     rev,
                     &sha,
                     "svn_to_git",
                     &entry.author,
                     &format!("{} <{}>", author_name, author_email),
-                )
-                .ok();
+                );
+                if operation_id.is_some() {
+                    map_result.context("failed to persist import mapping")?;
+                }
 
                 // Record sync_record for audit trail and UI display
                 let sync_record = crate::models::SyncRecord {
@@ -767,6 +1136,9 @@ pub async fn run_full_import(
                     status: crate::models::SyncRecordStatus::Applied,
                 };
                 if let Err(e) = db.insert_sync_record(&sync_record) {
+                    if operation_id.is_some() {
+                        return Err(e).context("failed to persist import sync record");
+                    }
                     debug!(rev, error = %e, "failed to insert sync_record during import");
                 } else {
                     debug!(rev, sha = %short_sha, "import: sync_record created");
@@ -774,6 +1146,17 @@ pub async fn run_full_import(
 
                 count += 1;
                 commits_since_push += 1;
+                #[cfg(feature = "reliability-fixture")]
+                if count == 1
+                    && fixture_barrier(
+                        "after_first_local",
+                        repo_id.as_deref(),
+                        cancel_signal.as_ref(),
+                    )
+                    .await
+                {
+                    return Ok(ImportOutcome::Cancelled { commits: count });
+                }
                 {
                     let mut p = progress.write().await;
                     p.commits_created = count;
@@ -783,54 +1166,81 @@ pub async fn run_full_import(
 
                 // Incremental push every PUSH_BATCH_SIZE commits
                 if commits_since_push >= PUSH_BATCH_SIZE {
-                    let is_first_push = {
-                        let p = progress.read().await;
-                        p.batches_pushed == 0
-                    };
-                    let push_type = if is_first_push { "force-push" } else { "push" };
-                    log(
-                        &progress,
-                        &ws_broadcast,
-                        format!(
-                            "[info] {} batch of {} commits to remote...",
-                            push_type, commits_since_push
-                        ),
-                    )
-                    .await;
-
-                    // Use spawn_blocking to avoid blocking the tokio runtime
-                    let remote = import_config.remote_name.clone();
-                    let branch = import_config.branch.clone();
-                    let force = is_first_push;
-                    let rp = repo_path.clone();
-
-                    // Heartbeat task: log "still pushing..." every 30s
-                    let hb_progress = progress.clone();
-                    let hb_ws = ws_broadcast.clone();
-                    let hb_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let hb_cancel2 = hb_cancel.clone();
-                    let hb_handle = tokio::spawn(async move {
-                        let start = std::time::Instant::now();
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                            if hb_cancel2.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
-                            let elapsed = start.elapsed().as_secs();
-                            push_log_line(
-                                &hb_progress,
-                                &hb_ws,
-                                format!(
-                                    "[push] still uploading... ({}m {}s elapsed)",
-                                    elapsed / 60,
-                                    elapsed % 60
-                                ),
-                            )
-                            .await;
+                    if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+                        if stop_requested(&progress, cancel_signal.as_ref()).await {
+                            return Ok(ImportOutcome::Cancelled { commits: count });
                         }
-                    });
+                        let force = progress.read().await.batches_pushed == 0;
+                        if let Err(reason) = publish_checked(
+                            db,
+                            repo,
+                            op,
+                            PublicationTarget {
+                                workdir: &repo_path,
+                                remote: &import_config.remote_name,
+                                branch: &import_config.branch,
+                                sha: &sha,
+                                force,
+                            },
+                            cancel_signal.as_ref(),
+                        )
+                        .await
+                        {
+                            return Ok(ImportOutcome::ReconciliationRequired {
+                                commits: count,
+                                reason,
+                            });
+                        }
+                        progress.write().await.batches_pushed += 1;
+                    } else {
+                        let is_first_push = {
+                            let p = progress.read().await;
+                            p.batches_pushed == 0
+                        };
+                        let push_type = if is_first_push { "force-push" } else { "push" };
+                        log(
+                            &progress,
+                            &ws_broadcast,
+                            format!(
+                                "[info] {} batch of {} commits to remote...",
+                                push_type, commits_since_push
+                            ),
+                        )
+                        .await;
 
-                    let push_result = tokio::task::spawn_blocking(move || {
+                        // Use spawn_blocking to avoid blocking the tokio runtime
+                        let remote = import_config.remote_name.clone();
+                        let branch = import_config.branch.clone();
+                        let force = is_first_push;
+                        let rp = repo_path.clone();
+
+                        // Heartbeat task: log "still pushing..." every 30s
+                        let hb_progress = progress.clone();
+                        let hb_ws = ws_broadcast.clone();
+                        let hb_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let hb_cancel2 = hb_cancel.clone();
+                        let hb_handle = tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                                if hb_cancel2.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
+                                let elapsed = start.elapsed().as_secs();
+                                push_log_line(
+                                    &hb_progress,
+                                    &hb_ws,
+                                    format!(
+                                        "[push] still uploading... ({}m {}s elapsed)",
+                                        elapsed / 60,
+                                        elapsed % 60
+                                    ),
+                                )
+                                .await;
+                            }
+                        });
+
+                        let push_result = tokio::task::spawn_blocking(move || {
                         let start = std::time::Instant::now();
                         info!(remote = %remote, branch = %branch, force, "spawn_blocking push starting");
 
@@ -867,59 +1277,76 @@ pub async fn run_full_import(
                         }
                     }).await;
 
-                    // Stop heartbeat
-                    hb_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-                    hb_handle.abort();
+                        // Stop heartbeat
+                        hb_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        hb_handle.abort();
 
-                    match push_result {
-                        Ok(Ok(stderr)) => {
-                            // Log any git push output (remote warnings, etc.)
-                            for line in stderr.lines() {
-                                let trimmed = line.trim();
-                                if !trimmed.is_empty() {
-                                    log(&progress, &ws_broadcast, format!("[push] {}", trimmed))
+                        match push_result {
+                            Ok(Ok(stderr)) => {
+                                // Log any git push output (remote warnings, etc.)
+                                for line in stderr.lines() {
+                                    let trimmed = line.trim();
+                                    if !trimmed.is_empty() {
+                                        log(
+                                            &progress,
+                                            &ws_broadcast,
+                                            format!("[push] {}", trimmed),
+                                        )
                                         .await;
+                                    }
                                 }
-                            }
-                            {
-                                let mut p = progress.write().await;
-                                p.batches_pushed += 1;
-                            }
-                            // Persist progress after batch push
-                            {
-                                let p = progress.read().await;
-                                if let Err(e) = db.persist_import_progress(&p) {
-                                    warn!(
+                                {
+                                    let mut p = progress.write().await;
+                                    p.batches_pushed += 1;
+                                }
+                                // Persist progress after batch push
+                                {
+                                    let p = progress.read().await;
+                                    if let Err(e) = db.persist_import_progress(&p) {
+                                        warn!(
                                         "failed to persist import progress after batch push: {}",
                                         e
                                     );
+                                    }
                                 }
+                                log(
+                                    &progress,
+                                    &ws_broadcast,
+                                    format!(
+                                        "[ok] Batch pushed ({} of {} total commits)",
+                                        count,
+                                        log_entries.len()
+                                    ),
+                                )
+                                .await;
                             }
-                            log(
-                                &progress,
-                                &ws_broadcast,
-                                format!(
-                                    "[ok] Batch pushed ({} of {} total commits)",
-                                    count,
-                                    log_entries.len()
-                                ),
-                            )
-                            .await;
-                        }
-                        Ok(Err(e)) => {
-                            let msg =
-                                format!("[warn] Batch push failed (will retry at end): {}", e);
-                            log(&progress, &ws_broadcast, msg).await;
-                        }
-                        Err(e) => {
-                            let msg = format!("[warn] Batch push task panicked: {}", e);
-                            log(&progress, &ws_broadcast, msg).await;
+                            Ok(Err(e)) => {
+                                let msg =
+                                    format!("[warn] Batch push failed (will retry at end): {}", e);
+                                log(&progress, &ws_broadcast, msg).await;
+                            }
+                            Err(e) => {
+                                let msg = format!("[warn] Batch push task panicked: {}", e);
+                                log(&progress, &ws_broadcast, msg).await;
+                            }
                         }
                     }
                     commits_since_push = 0;
                 }
             }
             Err(e) => {
+                if use_cli && operation_id.is_some() {
+                    return Ok(ImportOutcome::ReconciliationRequired {
+                        commits: count,
+                        reason: format!(
+                            "LFS-aware local commit stopped with uncertain local state: {e}"
+                        ),
+                    });
+                }
+                if operation_id.is_some() {
+                    return Err(e)
+                        .context("Git import commit failed; local work requires inspection");
+                }
                 // Empty commits (property-only revisions) are expected
                 let msg = format!(
                     "[skip] r{}: no changes to commit ({})",
@@ -962,117 +1389,157 @@ pub async fn run_full_import(
 
     // Push remaining commits (those since last batch push)
     if commits_since_push > 0 {
-        let max_retries = 3;
-        let mut push_success = false;
-
-        for attempt in 1..=max_retries {
-            log(
-                &progress,
-                &ws_broadcast,
-                format!(
-                    "[info] Pushing remaining {} commits to remote (attempt {}/{})...",
-                    commits_since_push, attempt, max_retries
-                ),
+        if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+            #[cfg(feature = "reliability-fixture")]
+            if fixture_barrier("before_final_push", Some(repo), cancel_signal.as_ref()).await {
+                return Ok(ImportOutcome::Cancelled { commits: count });
+            }
+            if stop_requested(&progress, cancel_signal.as_ref()).await {
+                return Ok(ImportOutcome::Cancelled { commits: count });
+            }
+            progress.write().await.phase = ImportPhase::FinalPush;
+            let (repo_path, sha) = {
+                let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    git.repo_workdir(),
+                    git.get_head_sha().context("missing local import tip")?,
+                )
+            };
+            let force = progress.read().await.batches_pushed == 0;
+            if let Err(reason) = publish_checked(
+                db,
+                repo,
+                op,
+                PublicationTarget {
+                    workdir: &repo_path,
+                    remote: &import_config.remote_name,
+                    branch: &import_config.branch,
+                    sha: &sha,
+                    force,
+                },
+                cancel_signal.as_ref(),
             )
-            .await;
+            .await
+            {
+                return Ok(ImportOutcome::ReconciliationRequired {
+                    commits: count,
+                    reason,
+                });
+            }
+            progress.write().await.batches_pushed += 1;
+        } else {
+            let max_retries = 3;
+            let mut push_success = false;
 
-            let repo_path = {
-                let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-                git_guard.repo_workdir()
-            };
+            for attempt in 1..=max_retries {
+                log(
+                    &progress,
+                    &ws_broadcast,
+                    format!(
+                        "[info] Pushing remaining {} commits to remote (attempt {}/{})...",
+                        commits_since_push, attempt, max_retries
+                    ),
+                )
+                .await;
 
-            let is_first_push = {
-                let p = progress.read().await;
-                p.batches_pushed == 0
-            };
+                let repo_path = {
+                    let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    git_guard.repo_workdir()
+                };
 
-            let remote = import_config.remote_name.clone();
-            let branch = import_config.branch.clone();
-            let force = is_first_push;
-            let rp = repo_path.clone();
+                let is_first_push = {
+                    let p = progress.read().await;
+                    p.batches_pushed == 0
+                };
 
-            let push_result = tokio::task::spawn_blocking(move || {
-                let mut args = vec!["push".to_string(), "--progress".to_string()];
-                if force {
-                    args.push("--force".to_string());
-                }
-                args.push(remote);
-                args.push(branch);
-                let output = std::process::Command::new("git")
-                    .args(&args)
-                    .current_dir(&rp)
-                    .env("GIT_TERMINAL_PROMPT", "0")
-                    .output();
-                match output {
-                    Ok(out) if out.status.success() => {
-                        Ok(String::from_utf8_lossy(&out.stderr).to_string())
+                let remote = import_config.remote_name.clone();
+                let branch = import_config.branch.clone();
+                let force = is_first_push;
+                let rp = repo_path.clone();
+
+                let push_result = tokio::task::spawn_blocking(move || {
+                    let mut args = vec!["push".to_string(), "--progress".to_string()];
+                    if force {
+                        args.push("--force".to_string());
                     }
-                    Ok(out) => Err(format!(
-                        "exit {:?}: {}",
-                        out.status.code(),
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    )),
-                    Err(e) => Err(format!("spawn failed: {}", e)),
-                }
-            })
-            .await;
-
-            match push_result {
-                Ok(Ok(stderr)) => {
-                    for line in stderr.lines() {
-                        let t = line.trim();
-                        if !t.is_empty() {
-                            log(&progress, &ws_broadcast, format!("[push] {}", t)).await;
+                    args.push(remote);
+                    args.push(branch);
+                    let output = std::process::Command::new("git")
+                        .args(&args)
+                        .current_dir(&rp)
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .output();
+                    match output {
+                        Ok(out) if out.status.success() => {
+                            Ok(String::from_utf8_lossy(&out.stderr).to_string())
                         }
+                        Ok(out) => Err(format!(
+                            "exit {:?}: {}",
+                            out.status.code(),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        )),
+                        Err(e) => Err(format!("spawn failed: {}", e)),
                     }
-                    {
-                        let mut p = progress.write().await;
-                        p.batches_pushed += 1;
-                    }
-                    log(
-                        &progress,
-                        &ws_broadcast,
-                        format!("[ok] All {} commits pushed successfully", count),
-                    )
-                    .await;
-                    push_success = true;
-                    break;
-                }
-                Ok(Err(e)) => {
-                    let _msg = format!(
-                        "[warn] Push attempt {}/{} failed: {}",
-                        attempt, max_retries, e
-                    );
-                }
-                Err(e) => {
-                    let msg = format!(
-                        "[warn] Push attempt {}/{} failed (panic): {}",
-                        attempt, max_retries, e
-                    );
-                    log(&progress, &ws_broadcast, msg.clone()).await;
+                })
+                .await;
 
-                    if attempt < max_retries {
-                        let delay_secs = attempt as u64 * 5; // 5s, 10s, 15s backoff
+                match push_result {
+                    Ok(Ok(stderr)) => {
+                        for line in stderr.lines() {
+                            let t = line.trim();
+                            if !t.is_empty() {
+                                log(&progress, &ws_broadcast, format!("[push] {}", t)).await;
+                            }
+                        }
+                        {
+                            let mut p = progress.write().await;
+                            p.batches_pushed += 1;
+                        }
                         log(
                             &progress,
                             &ws_broadcast,
-                            format!("[info] Retrying in {} seconds...", delay_secs),
+                            format!("[ok] All {} commits pushed successfully", count),
                         )
                         .await;
-                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        push_success = true;
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        let _msg = format!(
+                            "[warn] Push attempt {}/{} failed: {}",
+                            attempt, max_retries, e
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "[warn] Push attempt {}/{} failed (panic): {}",
+                            attempt, max_retries, e
+                        );
+                        log(&progress, &ws_broadcast, msg.clone()).await;
+
+                        if attempt < max_retries {
+                            let delay_secs = attempt as u64 * 5; // 5s, 10s, 15s backoff
+                            log(
+                                &progress,
+                                &ws_broadcast,
+                                format!("[info] Retrying in {} seconds...", delay_secs),
+                            )
+                            .await;
+                            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        }
                     }
                 }
             }
-        }
 
-        if !push_success {
-            let msg = format!(
+            if !push_success {
+                let msg = format!(
                 "[error] Push failed after {} attempts. {} commits are saved locally and can be pushed manually with: cd /opt/reposync/git-repo && git push origin main",
                 max_retries, commits_since_push
             );
-            log(&progress, &ws_broadcast, msg.clone()).await;
-            let mut p = progress.write().await;
-            p.errors.push(msg);
+                log(&progress, &ws_broadcast, msg.clone()).await;
+                let mut p = progress.write().await;
+                p.errors.push(msg);
+            }
         }
     }
 
@@ -1084,16 +1551,27 @@ pub async fn run_full_import(
         }
     }
 
-    // Set watermarks
-    if let Some(last) = log_entries.last() {
-        db.set_watermark("svn_rev", &last.revision.to_string()).ok();
-    }
-
-    {
-        let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-        if let Ok(sha) = git_guard.get_head_sha() {
-            db.set_watermark("git_sha", &sha).ok();
+    let last_rev = log_entries.last().map(|e| e.revision).unwrap_or(0);
+    let sha = {
+        let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
+        git.get_head_sha().context("missing final Git import tip")?
+    };
+    if stop_requested(&progress, cancel_signal.as_ref()).await {
+        let all_confirmed = match (&repo_id, &operation_id) {
+            (Some(repo), Some(op_id)) => db.get_import_operation(repo, op_id)?.is_some_and(|op| {
+                op.last_confirmed_svn_rev == Some(last_rev)
+                    && op.last_confirmed_git_sha.as_deref() == Some(sha.as_str())
+                    && op.intended_git_sha.is_none()
+            }),
+            _ => false,
+        };
+        if !all_confirmed {
+            return Ok(ImportOutcome::Cancelled { commits: count });
         }
+    }
+    if operation_id.is_none() {
+        db.set_watermark("svn_rev", &last_rev.to_string())?;
+        db.set_watermark("git_sha", &sha)?;
     }
 
     // Final audit log
@@ -1117,7 +1595,11 @@ pub async fn run_full_import(
         revisions = log_entries.len(),
         "full import completed"
     );
-    Ok(count)
+    Ok(ImportOutcome::Completed {
+        commits: count,
+        svn_rev: last_rev,
+        git_sha: sha,
+    })
 }
 
 /// Helper to push a log line and broadcast it via WebSocket.
