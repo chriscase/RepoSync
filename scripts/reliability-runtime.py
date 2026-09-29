@@ -56,6 +56,9 @@ MANDATORY["candidate"].update({"64A_JOURNAL", "64A_PROCESS_TREE", "64A_ORDINARY"
                                "64A_MID_IMPORT", "64A_LOST_PUSH", "64A_FINALIZER", "64A_CANCEL_WRITE", "64A_AUTH", "64A_SVN_CHILD", "64A_SCHEDULER", "64A_EXISTING_TARGET"})
 MANDATORY["candidate"].update({"74_RESET_REFUSAL", "74_STDIN_FILE", "74_GIT_APPLY_STOP",
                                "74_APPLY_POSITIVE", "74_LFS_STOP", "74_LFS_POSITIVE"})
+MANDATORY["candidate"].update({"74_CLEANUP_CLASSIFIER", "74_UNCERTAIN_APPLY_TIMEOUT",
+                               "74_UNCERTAIN_SVN_CANCEL", "74_UNCERTAIN_SVN_EARLY",
+                               "74_UNCERTAIN_PREPARATION", "74_FINISHED_PATCH_FALLBACK"})
 SCANNER_CASES = {
     "EVIDENCE_SCAN_CLEAN": "evidence_scan_clean",
     "EVIDENCE_SCAN_CANARY": "evidence_scan_canary",

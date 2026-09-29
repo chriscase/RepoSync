@@ -2065,6 +2065,394 @@ async fn terminal_import_status(client: &reqwest::Client, base: &str) -> serde_j
     .unwrap()
 }
 
+#[cfg(feature = "reliability-fixture")]
+fn set_import_cleanup_fault(root: &Path, stage: &str) -> std::path::PathBuf {
+    let dir = root.join("cleanup-fault");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", root);
+    std::env::set_var("REPOSYNC_IMPORT_FAULT_DIR", &dir);
+    std::env::set_var("REPOSYNC_IMPORT_FAULT_STAGE", stage);
+    dir
+}
+
+#[cfg(feature = "reliability-fixture")]
+fn clear_import_cleanup_fault() {
+    for key in [
+        "REPOSYNC_IMPORT_FAULT_STAGE",
+        "REPOSYNC_IMPORT_FAULT_DIR",
+        "REPOSYNC_FIXTURE_ROOT",
+    ] {
+        std::env::remove_var(key);
+    }
+}
+
+#[cfg(feature = "reliability-fixture")]
+fn import_fault_commands(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("commands.log"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn actual_import_unknown_cleanup(stage: &str, request_cancel: bool, expected_local_rev: i64) {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let fault = set_import_cleanup_fault(tmp.path(), stage);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let started = client.post(&base).send().await.unwrap();
+    assert!(started.status().is_success());
+    let started: serde_json::Value = started.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    wait_for_file(&fault.join("fault.ready")).await;
+    assert_eq!(
+        std::fs::read_to_string(fault.join("fault.ready")).unwrap(),
+        stage
+    );
+    let local = tmp.path().join("repos").join(&id).join("git-repo");
+    let local_snapshot = |args: &[&str]| {
+        let result = Command::new("git")
+            .args(args)
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        result.stdout
+    };
+    let tree_before = local_snapshot(&["rev-parse", "HEAD^{tree}"]);
+    let head_before = local_snapshot(&["rev-parse", "HEAD"]);
+    let index_before = local_snapshot(&["ls-files", "--stage"]);
+    let index_workdir_before = local_snapshot(&["status", "--porcelain", "-uall"]);
+    let remote_refs = || {
+        Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "show-ref"])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let remote_refs_before = remote_refs();
+    let map_before: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(map_before, 0);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    if request_cancel {
+        let cancel = client
+            .post(format!("{base}/{operation_id}/cancel"))
+            .send()
+            .await
+            .unwrap();
+        assert!(cancel.status().is_success());
+        assert_eq!(
+            cancel.json::<serde_json::Value>().await.unwrap()["lifecycle"],
+            "cancel_requested"
+        );
+    }
+    std::fs::write(fault.join("fault.release"), b"release").unwrap();
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["operation_id"], operation_id);
+    assert!(
+        terminal["lifecycle"] == "failed" || terminal["lifecycle"] == "reconciliation_required",
+        "{terminal}"
+    );
+    assert!(
+        terminal.to_string().contains("cleanup unconfirmed"),
+        "{terminal}"
+    );
+    assert_eq!(terminal["last_local_svn_rev"], expected_local_rev);
+    assert!(terminal["last_confirmed_svn_rev"].is_null());
+    let trace = import_fault_commands(&fault);
+    assert_eq!(trace.last().map(String::as_str), Some(stage), "{trace:?}");
+    assert_eq!(
+        trace.iter().filter(|s| s.as_str() == "svn-export").count(),
+        1
+    );
+    assert!(!trace
+        .iter()
+        .any(|s| matches!(s.as_str(), "git-push" | "git-commit")));
+    assert_eq!(local_snapshot(&["rev-parse", "HEAD^{tree}"]), tree_before);
+    assert_eq!(local_snapshot(&["rev-parse", "HEAD"]), head_before);
+    assert_eq!(local_snapshot(&["ls-files", "--stage"]), index_before);
+    assert_eq!(
+        local_snapshot(&["status", "--porcelain", "-uall"]),
+        index_workdir_before
+    );
+    assert_eq!(remote_refs(), remote_refs_before);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let map_after: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(map_after, map_before);
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+    let held = reopened.active_import_operation(&id).unwrap().unwrap();
+    assert_eq!(held.id, operation_id);
+    assert_ne!(
+        held.state,
+        reposync_core::db::import_operations::ImportOperationState::Cancelled
+    );
+    let retry = client.post(&base).send().await.unwrap();
+    assert_eq!(retry.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        terminal_import_status(&client, &base).await["operation_id"],
+        operation_id
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":if request_cancel {"74_UNCERTAIN_SVN_CANCEL"} else {"74_UNCERTAIN_APPLY_TIMEOUT"},
+            "operation_id":operation_id,"fault_stage":stage,"commands":trace,
+            "checkpoint":0,"local_rev":expected_local_rev,"map_rows":map_after,
+            "tree_index_workdir_preserved":true,"all_remote_refs_preserved":true,"remote_ref_present":false,"restart_held":true
+        })
+    );
+    server.abort();
+    clear_import_cleanup_fault();
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_apply_timeout_cleanup_unknown_holds_without_export_or_next_write() {
+    actual_import_unknown_cleanup("git-apply", false, 1).await;
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_svn_cancel_cleanup_unknown_holds_without_next_revision() {
+    actual_import_unknown_cleanup("svn-diff", true, 1).await;
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_svn_early_cleanup_unknown_never_starts_revision_work() {
+    use std::process::Command;
+    for stage in ["svn-info", "svn-log", "svn-export"] {
+        let (addr, state, server, tmp, id, bare) = import_fixture().await;
+        let fault = set_import_cleanup_fault(tmp.path(), stage);
+        let client = authed_client();
+        let base = format!("http://{addr}/api/repos/{id}/import");
+        let started = client.post(&base).send().await.unwrap();
+        assert!(started.status().is_success());
+        let started: serde_json::Value = started.json().await.unwrap();
+        let operation_id = started["operation_id"].as_str().unwrap();
+        wait_for_file(&fault.join("fault.ready")).await;
+        assert!(client
+            .post(format!("{base}/{operation_id}/cancel"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        std::fs::write(fault.join("fault.release"), b"release").unwrap();
+        let terminal = terminal_import_status(&client, &base).await;
+        assert!(
+            terminal["lifecycle"] == "failed" || terminal["lifecycle"] == "reconciliation_required",
+            "{stage}: {terminal}"
+        );
+        assert!(
+            terminal.to_string().contains("cleanup unconfirmed"),
+            "{stage}: {terminal}"
+        );
+        let trace = import_fault_commands(&fault);
+        assert_eq!(trace.last().map(String::as_str), Some(stage));
+        assert!(!trace
+            .iter()
+            .any(|s| matches!(s.as_str(), "git-apply" | "git-commit" | "git-push")));
+        assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+        assert_eq!(
+            state
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "refs/heads/main"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            Database::new(tmp.path().join("reposync.db"))
+                .unwrap()
+                .active_import_operation(&id)
+                .unwrap()
+                .unwrap()
+                .id,
+            operation_id
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"74_UNCERTAIN_SVN_EARLY","stage":stage,"operation_id":operation_id,"commands":trace,"checkpoint":0,"mapping_rows":0,"remote_ref_present":false,"restart_held":true})
+        );
+        server.abort();
+        clear_import_cleanup_fault();
+    }
+}
+
+#[cfg(all(feature = "reliability-fixture", unix))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_finished_failed_patch_still_uses_export_and_completes() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let fault = set_import_cleanup_fault(tmp.path(), "none");
+    let wrapper = tmp.path().join("git-finished-apply-failure");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nif [ \"$1\" = apply ]; then exit 1; fi\nexec git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", &wrapper);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    assert!(client
+        .post(&base)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    let terminal = terminal_import_status(&client, &base).await;
+    assert_eq!(terminal["lifecycle"], "completed", "{terminal}");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 3);
+    let trace = import_fault_commands(&fault);
+    assert!(trace.iter().any(|s| s == "git-apply"));
+    assert!(
+        trace.iter().filter(|s| s.as_str() == "svn-export").count() >= 2,
+        "{trace:?}"
+    );
+    let remote = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show",
+            "main:history.txt",
+        ])
+        .output()
+        .unwrap();
+    assert!(remote.status.success());
+    assert_eq!(remote.stdout, b"second\n");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"74_FINISHED_PATCH_FALLBACK","commands":trace,"checkpoint":3,"remote_history":"second","completed":true})
+    );
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_GIT_BINARY");
+    clear_import_cleanup_fault();
+}
+
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_preparation_cancel_cleanup_unknown_never_starts_worker() {
+    use std::process::Command;
+    for stage in ["git-clone", "git-ls-remote"] {
+        let (addr, state, server, tmp, id, bare) = import_fixture().await;
+        let fault = set_import_cleanup_fault(tmp.path(), stage);
+        let client = authed_client();
+        let base = format!("http://{addr}/api/repos/{id}/import");
+        let pending = tokio::spawn({
+            let client = client.clone();
+            let base = base.clone();
+            async move { client.post(base).send().await.unwrap() }
+        });
+        wait_for_file(&fault.join("fault.ready")).await;
+        let op = state.db.active_import_operation(&id).unwrap().unwrap();
+        let cancel = client
+            .post(format!("{base}/{}/cancel", op.id))
+            .send()
+            .await
+            .unwrap();
+        assert!(cancel.status().is_success());
+        std::fs::write(fault.join("fault.release"), b"release").unwrap();
+        assert!(!pending.await.unwrap().status().is_success());
+        let terminal = terminal_import_status(&client, &base).await;
+        assert_eq!(terminal["operation_id"], op.id);
+        assert_eq!(
+            terminal["lifecycle"], "reconciliation_required",
+            "{terminal}"
+        );
+        assert!(
+            terminal.to_string().contains("cleanup unconfirmed"),
+            "{terminal}"
+        );
+        let trace = import_fault_commands(&fault);
+        assert_eq!(trace.last().map(String::as_str), Some(stage));
+        assert!(!trace.iter().any(|s| s.starts_with("svn-")
+            || matches!(s.as_str(), "git-apply" | "git-commit" | "git-push")));
+        assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+        assert!(!Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "refs/heads/main"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let reopened = Database::new(tmp.path().join("reposync.db")).unwrap();
+        assert_eq!(
+            reopened.active_import_operation(&id).unwrap().unwrap().id,
+            op.id
+        );
+        assert_eq!(
+            client.post(&base).send().await.unwrap().status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"74_UNCERTAIN_PREPARATION_CANCEL","operation_id":op.id,
+                "stage":stage,"commands":trace,"worker_started":false,"checkpoint":0,
+                "remote_ref_present":false,"restart_held":true
+            })
+        );
+        server.abort();
+        clear_import_cleanup_fault();
+    }
+}
+
 #[cfg(all(feature = "reliability-fixture", unix))]
 fn fixture_process_stopped(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {

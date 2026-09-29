@@ -535,6 +535,12 @@
     {"id":"74_GIT_APPLY_STOP", "binary":"server_freeze", "test":"candidate_74_git_apply_child_and_descendant_stop_on_exact_cancel", "tier":"candidate_regression"},
     {"id":"74_APPLY_POSITIVE", "binary":"server_freeze", "test":"candidate_74_incremental_apply_completes_through_supervised_command", "tier":"candidate_regression"},
     {"id":"74_LFS_STOP", "binary":"server_freeze", "test":"candidate_74_lfs_preflight_child_and_descendant_stop", "tier":"candidate_regression"},
-    {"id":"74_LFS_POSITIVE", "binary":"server_freeze", "test":"candidate_74_lfs_enabled_import_completes_with_pointer_publication", "tier":"candidate_regression"}
+    {"id":"74_LFS_POSITIVE", "binary":"server_freeze", "test":"candidate_74_lfs_enabled_import_completes_with_pointer_publication", "tier":"candidate_regression"},
+    {"id":"74_CLEANUP_CLASSIFIER", "binary":"reposync_core", "test":"process::tests::cleanup_certainty_survives_git_svn_wrappers_with_and_without_cancel", "tier":"candidate_regression"},
+    {"id":"74_UNCERTAIN_APPLY_TIMEOUT", "binary":"server_freeze", "test":"candidate_74_apply_timeout_cleanup_unknown_holds_without_export_or_next_write", "tier":"candidate_regression"},
+    {"id":"74_UNCERTAIN_SVN_CANCEL", "binary":"server_freeze", "test":"candidate_74_svn_cancel_cleanup_unknown_holds_without_next_revision", "tier":"candidate_regression"},
+    {"id":"74_UNCERTAIN_SVN_EARLY", "binary":"server_freeze", "test":"candidate_74_svn_early_cleanup_unknown_never_starts_revision_work", "tier":"candidate_regression"},
+    {"id":"74_UNCERTAIN_PREPARATION", "binary":"server_freeze", "test":"candidate_74_preparation_cancel_cleanup_unknown_never_starts_worker", "tier":"candidate_regression"},
+    {"id":"74_FINISHED_PATCH_FALLBACK", "binary":"server_freeze", "test":"candidate_74_finished_failed_patch_still_uses_export_and_completes", "tier":"candidate_regression"}
   ]
 }

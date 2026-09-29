@@ -316,6 +316,10 @@ mod tests {
             assert_eq!(confirmed.kind(), confirmed_kind);
             assert!(!cleanup_unconfirmed(&confirmed));
             assert_eq!(confirmed_cancelled(&confirmed), requested_cancel);
+            assert!(!confirmed_cancelled(&io::Error::new(
+                io::ErrorKind::Interrupted,
+                "untyped I/O interruption"
+            )));
         }
     }
 
