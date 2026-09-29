@@ -68,6 +68,12 @@ jobs:
           GIT_COMMITTER_NAME: "Test User"
           GIT_COMMITTER_EMAIL: "test@example.com"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+
       - name: Mount import card in Chrome against disposable SVN/Git API
         timeout-minutes: 10
         run: |
