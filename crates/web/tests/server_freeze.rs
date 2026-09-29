@@ -2512,13 +2512,8 @@ async fn candidate_64a_existing_git_target_is_preserved_before_replay() {
 async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    let descendant_stopped = |pid: &str| {
-        if !Command::new("kill")
-            .args(["-0", pid])
-            .status()
-            .unwrap()
-            .success()
-        {
+    let descendant_stopped = |pid: i32| {
+        if unsafe { libc::kill(pid, 0) } != 0 {
             return true;
         }
         #[cfg(target_os = "linux")]
@@ -2565,15 +2560,12 @@ async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
             .unwrap();
         panic!("stalled SVN child marker missing; durable status: {status}");
     }
-    let descendant = std::fs::read_to_string(&pid_file)
+    let descendant: i32 = std::fs::read_to_string(&pid_file)
         .unwrap()
         .trim()
-        .to_string();
-    assert!(Command::new("kill")
-        .args(["-0", &descendant])
-        .status()
-        .unwrap()
-        .success());
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(descendant, 0) }, 0);
     let status: serde_json::Value = tokio::time::timeout(Duration::from_secs(2), async {
         client
             .get(format!("{base}/status"))
@@ -2598,7 +2590,7 @@ async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
         "cancelled"
     );
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !descendant_stopped(&descendant) {
+        while !descendant_stopped(descendant) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
