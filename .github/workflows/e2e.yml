@@ -35,7 +35,9 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          cargo test --workspace --test '*' -- --nocapture 2>&1 | tee test-output.txt
+          # The resource-leak test measures process-wide FDs while making 1,000
+          # requests. Keep other integration cases from changing that baseline.
+          cargo test --workspace --test '*' -- --nocapture --test-threads=1 2>&1 | tee test-output.txt
           # Guard: fail if zero tests were executed across all test binaries.
           total=$(grep -Eo '[0-9]+ passed' test-output.txt | awk '{s+=$1} END {print s+0}')
           echo "Total tests passed: $total"
