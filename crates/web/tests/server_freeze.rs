@@ -1648,6 +1648,199 @@ async fn import_fixture() -> (
     )
 }
 
+#[cfg(feature = "reliability-browser")]
+async fn run_import_card_browser(
+    addr: SocketAddr,
+    id: &str,
+    barrier: &Path,
+    mode: &str,
+) -> (tokio::process::Child, std::process::Child) {
+    use std::process::{Command, Stdio};
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ui = root.join("web-ui");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let vite = Command::new("node")
+        .arg(ui.join("node_modules/vite/bin/vite.js"))
+        .args(["--host", "127.0.0.1", "--strictPort", "--port"])
+        .arg(port.to_string())
+        .env("REPOSYNC_TEST_API_URL", format!("http://{addr}"))
+        .current_dir(&ui)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/reliability-import.html?repo={id}");
+    let client = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if client
+                .get(&url)
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let artifacts = root.join("target/reliability-ui-artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let browser = tokio::process::Command::new("node")
+        .arg(root.join("scripts/reliability-import-browser.mjs"))
+        .env("REPOSYNC_UI_URL", url)
+        .env("REPOSYNC_UI_MODE", mode)
+        .env("REPOSYNC_UI_BARRIER", barrier)
+        .env("REPOSYNC_UI_ARTIFACTS", &artifacts)
+        .env("REPOSYNC_UI_TOKEN", TEST_TOKEN)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (browser, vite)
+}
+
+#[cfg(feature = "reliability-browser")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_74_mounted_import_card_real_api_browser_journey() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::fs::write(barrier.join("connecting.release"), b"go").unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_BARRIER_DIR", &barrier);
+    std::env::set_var("REPOSYNC_IMPORT_CANCEL_OBSERVE", "1");
+    let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "cancel").await;
+    let mut browser = Some(browser);
+    wait_for_file(&barrier.join("after_first_local.ready")).await;
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_cancel_receipt
+         BEFORE UPDATE OF value ON kv_state
+         WHEN NEW.key LIKE 'import_operation_v1:document:%' AND json_extract(NEW.value, '$.cancel_requested') = 1
+         BEGIN SELECT RAISE(FAIL, 'fixture receipt failure'); END;",
+        )
+        .unwrap();
+    std::fs::write(barrier.join("failure_ready"), b"ready").unwrap();
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            if barrier.join("failure_seen").exists() {
+                break;
+            }
+            if browser.as_mut().unwrap().try_wait().unwrap().is_some() {
+                let output = browser.take().unwrap().wait_with_output().await.unwrap();
+                panic!(
+                    "browser exited before failed cancellation inspection: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let active = state.db.active_import_operation(&id).unwrap().unwrap();
+    assert!(
+        !active.cancel_requested,
+        "failed durable write acknowledged cancellation"
+    );
+    state
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_cancel_receipt")
+        .unwrap();
+    std::fs::write(barrier.join("failure_release"), b"go").unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(45),
+        browser.take().unwrap().wait_with_output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    let status = terminal_import_status(
+        &authed_client(),
+        &format!("http://{addr}/api/repos/{id}/import"),
+    )
+    .await;
+    assert_eq!(status["lifecycle"], "cancelled");
+    assert_eq!(status["last_local_svn_rev"], 1);
+    assert!(status["last_confirmed_svn_rev"].is_null());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_BARRIER_DIR");
+    std::env::remove_var("REPOSYNC_IMPORT_CANCEL_OBSERVE");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY", &id);
+    let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "uncertain").await;
+    let output = tokio::time::timeout(Duration::from_secs(50), browser.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    let status = terminal_import_status(
+        &authed_client(),
+        &format!("http://{addr}/api/repos/{id}/import"),
+    )
+    .await;
+    assert_eq!(status["lifecycle"], "reconciliation_required");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(state.db.active_import_operation(&id).unwrap().is_some());
+    assert!(Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    server.abort();
+    std::env::remove_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY");
+    std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64a_real_import_completes_with_confirmed_ref_and_cursors() {
     use std::process::Command;

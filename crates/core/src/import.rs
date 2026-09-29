@@ -429,6 +429,13 @@ async fn fixture_barrier(
     std::fs::write(dir.join(format!("{stage}.ready")), b"ready").expect("fixture barrier ready");
     loop {
         if signal.is_some_and(|s| s.load(Ordering::Acquire)) {
+            if std::env::var_os("REPOSYNC_IMPORT_CANCEL_OBSERVE").is_some() {
+                std::fs::write(dir.join(format!("{stage}.cancel_observed")), b"observed")
+                    .expect("fixture cancel observation");
+                while !dir.join(format!("{stage}.cancel_release")).exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
             return true;
         }
         if dir.join(format!("{stage}.release")).exists() {

@@ -7,6 +7,7 @@ description = "RepoSync web server and API"
 
 [features]
 reliability-fixture = ["reposync-core/reliability-fixture"]
+reliability-browser = ["reliability-fixture"]
 
 [dependencies]
 reposync-core = { path = "../core" }
