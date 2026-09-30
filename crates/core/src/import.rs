@@ -453,6 +453,70 @@ struct PublicationTarget<'a> {
     force: bool,
 }
 
+fn without_http_credentials(url: &str) -> String {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https://", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http://", rest)
+    } else {
+        return url.into();
+    };
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    let host_path = rest[..host_end]
+        .rfind('@')
+        .map_or(rest, |at| &rest[at + 1..]);
+    format!("{scheme}{host_path}")
+}
+
+/// Read-only local proof for a held import. Reject missing/replaced managed
+/// checkouts, changed origin targets, incomplete SHAs and absent commit trees.
+pub fn verify_import_local_tip(
+    workdir: &Path,
+    reference: &str,
+    sha: &str,
+    expected_remote_url: &str,
+) -> Result<String> {
+    anyhow::ensure!(
+        sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "recorded Git SHA is not full"
+    );
+    anyhow::ensure!(
+        std::fs::symlink_metadata(workdir.join(".git"))
+            .is_ok_and(|metadata| metadata.file_type().is_dir()),
+        "managed Git checkout is missing"
+    );
+    let repo = git2::Repository::open(workdir).context("managed Git checkout cannot be opened")?;
+    anyhow::ensure!(
+        repo.workdir().and_then(|p| p.canonicalize().ok()) == workdir.canonicalize().ok(),
+        "managed Git checkout path changed"
+    );
+    let origin = repo
+        .find_remote("origin")
+        .context("managed Git origin is missing")?;
+    anyhow::ensure!(
+        origin
+            .url()
+            .is_some_and(|url| without_http_credentials(url) == expected_remote_url),
+        "managed Git origin differs from configured target"
+    );
+    let oid = git2::Oid::from_str(sha).context("recorded Git SHA is malformed")?;
+    anyhow::ensure!(oid.to_string() == sha, "recorded Git SHA is not canonical");
+    let branch = repo
+        .find_reference(reference)
+        .context("local import branch is missing")?;
+    anyhow::ensure!(
+        branch.target() == Some(oid),
+        "local import branch differs from recorded tip"
+    );
+    let commit = repo
+        .find_commit(oid)
+        .context("recorded local Git commit is missing")?;
+    let tree = commit
+        .tree()
+        .context("recorded local Git tree is missing")?;
+    Ok(tree.id().to_string())
+}
+
 async fn publish_checked(
     db: &Database,
     repo: &str,
