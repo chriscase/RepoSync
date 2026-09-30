@@ -87,6 +87,48 @@ try {
     };
   ` });
   await send('Page.navigate', { url });
+  if (mode.startsWith('reconcile-')) {
+    await until(() => button('Verify remote'), 'held import verification action');
+    const before = await body();
+    if (!before.includes('Reconciliation required') || !before.includes('Operation ')) {
+      throw new Error(`Missing held operation evidence: ${before}`);
+    }
+    await screenshot(`${mode}-before.png`);
+    await click('Verify remote');
+    const receipt = await until(async () => (await calls()).find(c => c.method === 'POST' &&
+      c.path.endsWith('/reconcile')), 'exact-operation reconciliation response');
+    if (receipt.status !== 200) throw new Error(`Reconciliation API failed: ${JSON.stringify(receipt)}`);
+    const operation = receipt.payload?.operation_id;
+    if (!operation || !receipt.path.endsWith(`/${operation}/reconcile`)) {
+      throw new Error(`Reconciliation did not use the exact operation ID: ${JSON.stringify(receipt)}`);
+    }
+    if (mode === 'reconcile-complete') {
+      if (receipt.payload?.lifecycle !== 'completed' || receipt.payload?.publication_proved !== true ||
+          receipt.payload?.checkpoint_completed !== true) throw new Error(`Completion proof missing: ${JSON.stringify(receipt)}`);
+      await until(async () => (await body()).includes('Import completed after remote verification'), 'verified completion');
+    } else if (mode === 'reconcile-mismatch') {
+      if (receipt.payload?.lifecycle !== 'reconciliation_required' || receipt.payload?.publication_proved !== false ||
+          !receipt.payload?.remaining_reason?.includes('differs')) throw new Error(`Mismatch was not held: ${JSON.stringify(receipt)}`);
+      await until(async () => (await body()).includes('Remote ref differs'), 'mismatch reason');
+    } else if (mode === 'reconcile-partial') {
+      if (receipt.payload?.lifecycle !== 'reconciliation_required' || receipt.payload?.publication_proved !== true ||
+          receipt.payload?.checkpoint_completed !== false) throw new Error(`Partial proof was not held: ${JSON.stringify(receipt)}`);
+      await until(async () => (await body()).includes('safe resume is not yet implemented'), 'partial hold reason');
+    } else throw new Error(`Unknown reconciliation mode ${mode}`);
+    await screenshot(`${mode}-after.png`);
+    await send('Page.reload', { ignoreCache: true });
+    const durable = mode === 'reconcile-complete' ? 'Import completed after remote verification' :
+      mode === 'reconcile-mismatch' ? 'Remote ref differs' : 'safe resume is not yet implemented';
+    await until(async () => (await body()).includes(durable), 'durable reconciliation status after reload');
+    if (await button('Start full import') || await button('Stop import')) {
+      throw new Error('Unsafe import action available after verification');
+    }
+    await screenshot(`${mode}-reload.png`);
+    const result = { mode, operation_id: operation, receipt: receipt.payload,
+      reconcile_path: receipt.path, reload: durable };
+    await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
+    process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
+  } else {
   await until(() => button('Start full import'), 'mounted idle card');
   await click('Start full import');
   const start = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith('/import') && c.status === 200), 'start operation');
@@ -135,6 +177,7 @@ try {
   await screenshot(`${mode}-reload.png`);
   await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
   process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
+  }
 } finally {
   ws?.close();
   child.kill();

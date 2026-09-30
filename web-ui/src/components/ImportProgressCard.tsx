@@ -134,6 +134,16 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['import-status', repoId] }),
   });
+  const reconcile = useMutation({
+    mutationFn: async (operationId: string) => {
+      const res = await fetch(`/api/repos/${repoId}/import/${operationId}/reconcile`, {
+        method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` },
+      });
+      if (!res.ok) throw new Error((await res.json()).error || `Remote verification failed (${res.status})`);
+      return res.json() as Promise<{ lifecycle: string; remaining_reason: string | null }>;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['import-status', repoId] }),
+  });
 
   // No data yet from API
   if (!status) {
@@ -208,6 +218,7 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
           <StatCell label="Batches" value={`${status.batches_pushed}`} />
           <StatCell label="LFS Files" value={`${status.lfs_unique_count}`} />
         </div>
+        {status.outcome_detail && <p className="mb-3 text-xs text-emerald-300">{status.outcome_detail}</p>}
         {repoId && (
           <a
             href={`/repos/${repoId}`}
@@ -285,6 +296,15 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
         <p className="mb-2 text-xs text-gray-400">Local through SVN r{status.last_local_svn_rev};
           remote confirmed through {status.last_confirmed_svn_rev == null ? 'none' : `r${status.last_confirmed_svn_rev}`}.</p>
       )}
+      {status.lifecycle === 'reconciliation_required' && (
+        <div className="mb-2 space-y-1 text-xs text-gray-400 font-mono break-all">
+          {status.last_local_git_sha && <p>Local Git: {status.last_local_git_sha}</p>}
+          {status.last_confirmed_git_sha && <p>Confirmed Git: {status.last_confirmed_git_sha}</p>}
+          {status.intended_ref && status.intended_git_sha && (
+            <p>Publication intent: {status.intended_ref} → {status.intended_git_sha}</p>
+          )}
+        </div>
+      )}
       {status.outcome_detail && <p className="mb-2 text-xs text-yellow-300">{status.outcome_detail}</p>}
       {(status.lifecycle === 'cancelled' || status.lifecycle === 'reconciliation_required') && (
         <p className="mb-3 text-xs text-yellow-300">Stopping does not undo commits already published.
@@ -297,6 +317,14 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
         </button>
       )}
       {cancel.isError && <p className="mb-3 text-xs text-red-400">{cancel.error.message}</p>}
+      {repoId && admin && status.operation_id && status.lifecycle === 'reconciliation_required' && (
+        <button type="button" onClick={() => reconcile.mutate(status.operation_id!)} disabled={reconcile.isPending}
+          className="mb-3 rounded border border-blue-500 px-3 py-1 text-xs text-blue-200 disabled:opacity-50">
+          {reconcile.isPending ? 'Verifying remote…' : 'Verify remote'}
+        </button>
+      )}
+      {reconcile.isError && <p className="mb-3 text-xs text-red-400">{reconcile.error.message}</p>}
+      {reconcile.data?.remaining_reason && <p className="mb-3 text-xs text-yellow-300">{reconcile.data.remaining_reason}</p>}
 
       {/* Mini terminal */}
       {lastLogLines.length > 0 && (

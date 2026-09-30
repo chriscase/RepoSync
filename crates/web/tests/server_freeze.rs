@@ -3741,3 +3741,1137 @@ async fn candidate_64a_stalled_svn_info_child_and_descendant_are_stopped() {
     std::env::remove_var("CHILD_PID_FILE");
     std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
 }
+
+#[cfg(feature = "reliability-fixture")]
+mod import_reconciliation_tests {
+    use super::*;
+    use std::process::Command;
+
+    struct HeldFixture {
+        addr: SocketAddr,
+        state: Arc<AppState>,
+        server: tokio::task::JoinHandle<()>,
+        tmp: tempfile::TempDir,
+        id: String,
+        bare: std::path::PathBuf,
+        operation_id: String,
+    }
+
+    impl HeldFixture {
+        async fn lost_reply() -> Self {
+            Self::lost_reply_with_extra_revisions(0).await
+        }
+
+        async fn lost_reply_with_extra_revisions(extra: usize) -> Self {
+            let (addr, state, server, tmp, id, bare) = import_fixture().await;
+            for n in 0..extra {
+                std::fs::write(
+                    tmp.path().join("svn-wc/history.txt"),
+                    format!("extra {n}\n"),
+                )
+                .unwrap();
+                let output = Command::new("svn")
+                    .args(["commit", "-m", "extra"])
+                    .current_dir(tmp.path().join("svn-wc"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+            std::env::set_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY", &id);
+            let client = authed_client();
+            let base = format!("http://{addr}/api/repos/{id}/import");
+            let start: serde_json::Value = client
+                .post(&base)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let operation_id = start["operation_id"].as_str().unwrap().to_owned();
+            let status = terminal_import_status(&client, &base).await;
+            assert_eq!(status["lifecycle"], "reconciliation_required", "{status}");
+            std::env::remove_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY");
+            Self {
+                addr,
+                state,
+                server,
+                tmp,
+                id,
+                bare,
+                operation_id,
+            }
+        }
+
+        async fn failed_finalizer() -> Self {
+            let (addr, state, server, tmp, id, bare) = import_fixture().await;
+            state.db.conn().execute_batch(
+                "CREATE TRIGGER reject_import_finalization BEFORE UPDATE OF last_svn_rev ON repositories
+                 BEGIN SELECT RAISE(FAIL, 'fixture finalizer failure'); END;"
+            ).unwrap();
+            let client = authed_client();
+            let base = format!("http://{addr}/api/repos/{id}/import");
+            let start: serde_json::Value = client
+                .post(&base)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let operation_id = start["operation_id"].as_str().unwrap().to_owned();
+            let status = terminal_import_status(&client, &base).await;
+            assert_eq!(status["lifecycle"], "reconciliation_required", "{status}");
+            assert!(status["intended_git_sha"].is_null());
+            state
+                .db
+                .conn()
+                .execute_batch("DROP TRIGGER reject_import_finalization")
+                .unwrap();
+            Self {
+                addr,
+                state,
+                server,
+                tmp,
+                id,
+                bare,
+                operation_id,
+            }
+        }
+
+        async fn restart(self) -> Self {
+            let Self {
+                state,
+                server,
+                tmp,
+                id,
+                bare,
+                operation_id,
+                ..
+            } = self;
+            let config = state.config.clone();
+            let engine = state.sync_engine.clone();
+            let sync_trigger = state.sync_trigger.clone();
+            server.abort();
+            let _ = server.await;
+            drop(state);
+            let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+            db.initialize().unwrap();
+            let state = reposync_web::WebServer::new(
+                config,
+                db,
+                engine,
+                sync_trigger,
+                tmp.path().join("config.toml"),
+                Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+            )
+            .app_state();
+            state.sessions.write().await.insert(
+                TEST_TOKEN.into(),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            );
+            let app = Router::new()
+                .merge(api::repos::routes())
+                .with_state(state.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self {
+                addr,
+                state,
+                server,
+                tmp,
+                id,
+                bare,
+                operation_id,
+            }
+        }
+
+        async fn reconcile(&self) -> (reqwest::StatusCode, serde_json::Value) {
+            let response = authed_client()
+                .post(format!(
+                    "http://{}/api/repos/{}/import/{}/reconcile",
+                    self.addr, self.id, self.operation_id,
+                ))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response.json().await.unwrap())
+        }
+
+        fn operation(&self) -> reposync_core::db::import_operations::ImportOperation {
+            self.state
+                .db
+                .get_import_operation(&self.id, &self.operation_id)
+                .unwrap()
+                .unwrap()
+        }
+
+        fn remote(&self) -> (String, String, String) {
+            let read = |args: &[&str]| -> String {
+                let output = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&self.bare)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            };
+            (
+                read(&["rev-parse", "refs/heads/main"]),
+                read(&["rev-parse", "refs/heads/main^{tree}"]),
+                read(&["rev-list", "--count", "refs/heads/main"]),
+            )
+        }
+
+        fn svn_head(&self) -> String {
+            let output = Command::new("svnlook")
+                .arg("youngest")
+                .arg(self.tmp.path().join("svn-repo"))
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn trace_remote_inspection(&self) {
+            let script = self.tmp.path().join("inspection-only.sh");
+            std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$REPOSYNC_RECONCILE_TRACE\"\n[ \"$1\" = ls-remote ] || exit 97\n[ \"${REPOSYNC_RECONCILE_FAIL:-0}\" = 1 ] && exit 128\nexec git \"$@\"\n").unwrap();
+            std::env::set_var("REPOSYNC_FIXTURE_ROOT", self.tmp.path());
+            std::env::set_var("REPOSYNC_IMPORT_GIT_BINARY", script);
+            std::env::set_var(
+                "REPOSYNC_RECONCILE_TRACE",
+                self.tmp.path().join("reconcile-commands.log"),
+            );
+        }
+
+        fn trace(&self) -> String {
+            std::fs::read_to_string(self.tmp.path().join("reconcile-commands.log"))
+                .unwrap_or_default()
+        }
+
+        fn clear_trace() {
+            std::env::remove_var("REPOSYNC_IMPORT_GIT_BINARY");
+            std::env::remove_var("REPOSYNC_RECONCILE_TRACE");
+            std::env::remove_var("REPOSYNC_RECONCILE_FAIL");
+            std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_lost_reply_complete_after_restart_without_second_push() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let svn_before = fixture.svn_head();
+        let op = fixture.operation();
+        assert_eq!(op.intended_git_sha.as_deref(), Some(before.0.as_str()));
+        assert!(op.last_confirmed_git_sha.is_none());
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        let mappings = fixture.state.db.list_commit_map(100).unwrap().len();
+        let fixture = fixture.restart().await;
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK, "{result}");
+        assert_eq!(result["lifecycle"], "completed", "{result}");
+        assert_eq!(result["publication_proved"], true);
+        assert_eq!(result["publication_receipt_recorded"], true);
+        assert_eq!(result["checkpoint_completed"], true);
+        assert_eq!(result["observed_remote_git_sha"], before.0);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.svn_head(), svn_before);
+        assert_eq!(
+            fixture.state.db.list_commit_map(100).unwrap().len(),
+            mappings
+        );
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),
+            (3, before.0.clone())
+        );
+        assert_eq!(
+            fixture
+                .state
+                .db
+                .get_state(&format!("last_svn_rev_{}", fixture.id))
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            fixture
+                .state
+                .db
+                .get_state(&format!("last_git_sha_{}", fixture.id))
+                .unwrap()
+                .as_deref(),
+            Some(before.0.as_str())
+        );
+        assert!(fixture
+            .state
+            .db
+            .active_import_operation(&fixture.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(fixture.operation().confirmed_batches, 1);
+        let (repeat_code, repeat) = fixture.reconcile().await;
+        assert_eq!(repeat_code, reqwest::StatusCode::OK);
+        assert_eq!(repeat["lifecycle"], "completed");
+        assert_eq!(fixture.operation().confirmed_batches, 1);
+        assert_eq!(
+            fixture.trace().lines().collect::<Vec<_>>(),
+            ["ls-remote --exit-code origin refs/heads/main"]
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_LOST_REPLY_COMPLETE",
+            "operation_id":fixture.operation_id,"remote_before_after":before,"checkpoint":3,
+            "mappings_before_after":mappings,"confirmed_batches":1,"command_trace":fixture.trace(),
+            "restart":true,"idempotent":true})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_finalizer_recovery_after_restart_without_remote_write() {
+        let fixture = HeldFixture::failed_finalizer().await;
+        let before = fixture.remote();
+        let svn_before = fixture.svn_head();
+        let op = fixture.operation();
+        assert!(op.intended_git_sha.is_none());
+        assert_eq!(
+            op.last_confirmed_git_sha.as_deref(),
+            Some(before.0.as_str())
+        );
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        let mappings = fixture.state.db.list_commit_map(100).unwrap().len();
+        let fixture = fixture.restart().await;
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK, "{result}");
+        assert_eq!(result["lifecycle"], "completed", "{result}");
+        assert_eq!(result["publication_proved"], true);
+        assert_eq!(result["publication_receipt_recorded"], false);
+        assert_eq!(result["checkpoint_completed"], true);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.svn_head(), svn_before);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),
+            (3, before.0.clone())
+        );
+        assert_eq!(
+            fixture.state.db.list_commit_map(100).unwrap().len(),
+            mappings
+        );
+        assert_eq!(fixture.operation().confirmed_batches, op.confirmed_batches);
+        assert!(fixture
+            .state
+            .db
+            .active_import_operation(&fixture.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fixture.trace().lines().collect::<Vec<_>>(),
+            ["ls-remote --exit-code origin refs/heads/main"]
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_FINALIZER_RECOVERY",
+            "remote_before_after":before,"checkpoint":3,"mappings_before_after":mappings,
+            "command_trace":fixture.trace(),"restart":true})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    async fn remote_negative(kind: &str) {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let intended = fixture.operation().intended_git_sha.unwrap();
+        let observed = match kind {
+            "missing" => {
+                let output = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args(["update-ref", "-d", "refs/heads/main"])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                None
+            }
+            "mismatch" => {
+                let parent = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args(["rev-parse", "refs/heads/main^"])
+                    .output()
+                    .unwrap();
+                assert!(parent.status.success());
+                let parent = String::from_utf8_lossy(&parent.stdout).trim().to_owned();
+                let update = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args(["update-ref", "refs/heads/main", &parent])
+                    .output()
+                    .unwrap();
+                assert!(update.status.success());
+                Some(parent)
+            }
+            "advanced" => {
+                let child = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args([
+                        "commit-tree",
+                        &before.1,
+                        "-p",
+                        &before.0,
+                        "-m",
+                        "external successor",
+                    ])
+                    .env("GIT_AUTHOR_NAME", "external")
+                    .env("GIT_AUTHOR_EMAIL", "external@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "external")
+                    .env("GIT_COMMITTER_EMAIL", "external@example.invalid")
+                    .output()
+                    .unwrap();
+                assert!(
+                    child.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&child.stderr)
+                );
+                let child = String::from_utf8_lossy(&child.stdout).trim().to_owned();
+                let update = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args(["update-ref", "refs/heads/main", &child])
+                    .output()
+                    .unwrap();
+                assert!(update.status.success());
+                let ancestor = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args(["merge-base", "--is-ancestor", &before.0, &child])
+                    .status()
+                    .unwrap();
+                assert!(ancestor.success());
+                Some(child)
+            }
+            _ => panic!("unknown negative case"),
+        };
+        let checkpoint = fixture.state.db.get_repo_watermark(&fixture.id).unwrap();
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK, "{result}");
+        assert_eq!(result["lifecycle"], "reconciliation_required", "{result}");
+        assert_eq!(result["publication_proved"], false);
+        assert_eq!(result["checkpoint_completed"], false);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            fixture.operation().intended_git_sha.as_deref(),
+            Some(intended.as_str())
+        );
+        assert_eq!(fixture.operation().confirmed_batches, 0);
+        assert!(fixture
+            .state
+            .db
+            .active_import_operation(&fixture.id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            fixture.trace().lines().collect::<Vec<_>>(),
+            ["ls-remote --exit-code origin refs/heads/main"]
+        );
+        match observed.as_deref() {
+            Some(sha) => {
+                assert_eq!(fixture.remote().0, sha);
+                assert_eq!(result["observed_remote_git_sha"], sha);
+            }
+            None => {
+                let absent = Command::new("git")
+                    .arg("--git-dir")
+                    .arg(&fixture.bare)
+                    .args(["show-ref", "--verify", "refs/heads/main"])
+                    .status()
+                    .unwrap();
+                assert!(!absent.success());
+                assert!(result["observed_remote_git_sha"].is_null());
+            }
+        }
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":format!("64B_REMOTE_{}", kind.to_uppercase()),
+            "intended":intended,"observed":observed,"checkpoint":checkpoint,"held":true,
+            "command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_remote_missing_keeps_intent_and_checkpoint() {
+        remote_negative("missing").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_remote_mismatch_keeps_intent_and_checkpoint() {
+        remote_negative("mismatch").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_remote_advanced_is_not_exact_publication_proof() {
+        remote_negative("advanced").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_inspection_failure_is_not_remote_absence() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let intended = fixture.operation().intended_git_sha.clone();
+        fixture.trace_remote_inspection();
+        std::env::set_var("REPOSYNC_RECONCILE_FAIL", "1");
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK);
+        assert_eq!(result["lifecycle"], "reconciliation_required");
+        assert!(result["remaining_reason"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable"));
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.operation().intended_git_sha, intended);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert_eq!(
+            fixture.trace().lines().collect::<Vec<_>>(),
+            ["ls-remote --exit-code origin refs/heads/main"]
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_INSPECTION_FAILURE",
+            "remote_before_after":before,"checkpoint":0,"held":true,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_config_changed_blocks_verified_remote() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let intended = fixture.operation().intended_git_sha.clone();
+        fixture.state.db.conn().execute(
+            "UPDATE repositories SET git_repo='local/changed',updated_at=datetime('now') WHERE id=?1",
+            [&fixture.id],
+        ).unwrap();
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK);
+        assert_eq!(result["lifecycle"], "reconciliation_required");
+        assert!(result["remaining_reason"]
+            .as_str()
+            .unwrap()
+            .contains("configuration changed"));
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.operation().intended_git_sha, intended);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert!(
+            fixture.trace().is_empty(),
+            "configuration must be checked before remote access"
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_CONFIG_CHANGED",
+            "remote_before_after":before,"checkpoint":0,"held":true,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_missing_local_object_blocks_remote_confirmation() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let intended = fixture.operation().intended_git_sha.unwrap();
+        let object = fixture
+            .tmp
+            .path()
+            .join("repos")
+            .join(&fixture.id)
+            .join("git-repo")
+            .join(".git/objects")
+            .join(&intended[..2])
+            .join(&intended[2..]);
+        assert!(
+            object.exists(),
+            "fixture commit should be a loose local object"
+        );
+        std::fs::remove_file(object).unwrap();
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK, "{result}");
+        assert_eq!(result["lifecycle"], "reconciliation_required");
+        assert!(result["remaining_reason"]
+            .as_str()
+            .unwrap()
+            .contains("local Git object"));
+        assert_eq!(
+            fixture.operation().intended_git_sha.as_deref(),
+            Some(intended.as_str())
+        );
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert!(fixture.trace().is_empty());
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_LOCAL_MISSING",
+            "remote_before_after":before,"checkpoint":0,"intent_retained":true,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_unsupported_v1_document_is_preserved() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let key = format!("import_operation_v1:document:{}", fixture.operation_id);
+        let mut record: serde_json::Value =
+            serde_json::from_str(&fixture.state.db.get_state(&key).unwrap().unwrap()).unwrap();
+        record["version"] = serde_json::json!(2);
+        let raw = record.to_string();
+        fixture
+            .state
+            .db
+            .conn()
+            .execute(
+                "UPDATE kv_state SET value=?1 WHERE key=?2",
+                rusqlite::params![raw, key],
+            )
+            .unwrap();
+        fixture.trace_remote_inspection();
+        let (code, _) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(fixture.state.db.get_state(&key).unwrap().unwrap(), raw);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert!(fixture.trace().is_empty());
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_MALFORMED",
+            "unsupported_record_preserved":true,"checkpoint":0,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_finalization_failure_rolls_back_publication_receipt() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        fixture.state.db.conn().execute_batch(
+            "CREATE TRIGGER reject_reconciliation_completion BEFORE UPDATE OF last_svn_rev ON repositories
+             BEGIN SELECT RAISE(FAIL, 'fixture completion failure'); END;"
+        ).unwrap();
+        fixture.trace_remote_inspection();
+        let (code, _) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        let held = fixture.operation();
+        assert_eq!(
+            held.state,
+            reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+        );
+        assert!(held.intended_git_sha.is_some());
+        assert!(held.last_confirmed_git_sha.is_none());
+        assert_eq!(held.confirmed_batches, 0);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert_eq!(fixture.remote(), before);
+        fixture
+            .state
+            .db
+            .conn()
+            .execute_batch("DROP TRIGGER reject_reconciliation_completion")
+            .unwrap();
+        let (retry_code, retry) = fixture.reconcile().await;
+        assert_eq!(retry_code, reqwest::StatusCode::OK, "{retry}");
+        assert_eq!(retry["lifecycle"], "completed");
+        assert_eq!(fixture.operation().confirmed_batches, 1);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.trace().lines().count(), 2);
+        assert!(fixture
+            .trace()
+            .lines()
+            .all(|line| line == "ls-remote --exit-code origin refs/heads/main"));
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_ATOMIC_FAILURE",
+            "first":"rolled_back_held","second":"completed_once","remote_before_after":before,
+            "command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_conflicting_legacy_cursor_is_not_overwritten() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let cursor = format!("last_svn_rev_{}", fixture.id);
+        fixture.state.db.set_state(&cursor, "99").unwrap();
+        let intended = fixture.operation().intended_git_sha.clone();
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK, "{result}");
+        assert_eq!(result["lifecycle"], "reconciliation_required");
+        assert!(result["remaining_reason"]
+            .as_str()
+            .unwrap()
+            .contains("checkpoint changed"));
+        assert_eq!(
+            fixture.state.db.get_state(&cursor).unwrap().as_deref(),
+            Some("99")
+        );
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert_eq!(fixture.operation().intended_git_sha, intended);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.trace().lines().count(), 1);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_CURSOR_CONFLICT",
+            "legacy_cursor":99,"repository_checkpoint":0,"intent_retained":true,
+            "remote_before_after":before,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_stale_id_cannot_reconcile_new_active_operation() {
+        let fixture = HeldFixture::lost_reply().await;
+        let old = fixture.operation();
+        let active_key = format!("import_operation_v1:active:{}", fixture.id);
+        fixture
+            .state
+            .db
+            .conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&active_key])
+            .unwrap();
+        let newer = fixture
+            .state
+            .db
+            .create_import_operation(
+                &fixture.id,
+                "legacy",
+                "newer-fixture-request",
+                &old.target_fingerprint,
+            )
+            .unwrap();
+        fixture.trace_remote_inspection();
+        let (code, _result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fixture
+                .state
+                .db
+                .active_import_operation(&fixture.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            newer.id
+        );
+        assert_eq!(fixture.operation().intended_git_sha, old.intended_git_sha);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert!(fixture.trace().is_empty());
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_STALE_ID",
+            "old_id":fixture.operation_id,"new_id":newer.id,"checkpoint":0,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_partial_publication_confirmed_but_stays_held() {
+        let fixture = HeldFixture::lost_reply_with_extra_revisions(49).await;
+        let before = fixture.remote();
+        let original = fixture.operation();
+        assert_eq!(original.processed_revisions, 50);
+        assert_eq!(original.total_revisions, Some(52));
+        fixture.trace_remote_inspection();
+        let (code, result) = fixture.reconcile().await;
+        assert_eq!(code, reqwest::StatusCode::OK, "{result}");
+        assert_eq!(result["lifecycle"], "reconciliation_required");
+        assert_eq!(result["publication_proved"], true);
+        assert_eq!(result["publication_receipt_recorded"], true);
+        assert_eq!(result["checkpoint_completed"], false);
+        assert!(result["remaining_reason"]
+            .as_str()
+            .unwrap()
+            .contains("partial"));
+        assert_eq!(fixture.operation().confirmed_batches, 1);
+        assert!(fixture.operation().intended_git_sha.is_none());
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        assert!(fixture
+            .state
+            .db
+            .active_import_operation(&fixture.id)
+            .unwrap()
+            .is_some());
+        let (repeat_code, repeat) = fixture.reconcile().await;
+        assert_eq!(repeat_code, reqwest::StatusCode::OK);
+        assert_eq!(repeat["lifecycle"], "reconciliation_required");
+        assert_eq!(repeat["publication_receipt_recorded"], false);
+        assert_eq!(fixture.operation().confirmed_batches, 1);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.trace().lines().count(), 2);
+        assert!(fixture
+            .trace()
+            .lines()
+            .all(|line| line == "ls-remote --exit-code origin refs/heads/main"));
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_PARTIAL_CONFIRMED",
+            "processed":50,"total":52,"checkpoint":0,"confirmed_batches":1,
+            "remote_before_after":before,"command_trace":fixture.trace(),"held":true})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_named_admin_only_without_legacy_fallback() {
+        use reposync_core::models::{Session, User};
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let now = chrono::Utc::now();
+        for (id, role, enabled) in [
+            ("admin-64b", "admin", true),
+            ("viewer-64b", "viewer", true),
+            ("disabled-64b", "admin", false),
+        ] {
+            fixture
+                .state
+                .db
+                .insert_user(&User {
+                    id: id.into(),
+                    username: id.into(),
+                    display_name: id.into(),
+                    email: format!("{id}@example.invalid"),
+                    password_hash: "fixture".into(),
+                    role: role.into(),
+                    enabled,
+                    created_at: now.to_rfc3339(),
+                    updated_at: now.to_rfc3339(),
+                })
+                .unwrap();
+        }
+        for (token, user, expiry) in [
+            (
+                "admin-64b-token",
+                "admin-64b",
+                now + chrono::Duration::hours(1),
+            ),
+            (
+                "viewer-64b-token",
+                "viewer-64b",
+                now + chrono::Duration::hours(1),
+            ),
+            (
+                "disabled-64b-token",
+                "disabled-64b",
+                now + chrono::Duration::hours(1),
+            ),
+            (
+                "expired-64b-token",
+                "admin-64b",
+                now - chrono::Duration::hours(1),
+            ),
+        ] {
+            fixture
+                .state
+                .db
+                .insert_session(&Session {
+                    token: token.into(),
+                    user_id: user.into(),
+                    expires_at: expiry.to_rfc3339(),
+                    created_at: now.to_rfc3339(),
+                })
+                .unwrap();
+        }
+        fixture.trace_remote_inspection();
+        let url = format!(
+            "http://{}/api/repos/{}/import/{}/reconcile",
+            fixture.addr, fixture.id, fixture.operation_id
+        );
+        for token in [
+            TEST_TOKEN,
+            "viewer-64b-token",
+            "disabled-64b-token",
+            "expired-64b-token",
+        ] {
+            let denied = reqwest::Client::new()
+                .post(&url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                denied.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "{token}"
+            );
+            assert_eq!(
+                fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+                0
+            );
+            assert!(fixture.trace().is_empty());
+        }
+        let accepted = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth("admin-64b-token")
+            .send()
+            .await
+            .unwrap();
+        assert!(accepted.status().is_success());
+        let body: serde_json::Value = accepted.json().await.unwrap();
+        assert_eq!(body["lifecycle"], "completed");
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.trace().lines().count(), 1);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_AUTH",
+            "denied":4,"admin_completed":true,"checkpoint":3,"command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_reconcile_serializes_against_manual_writer() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        fixture.trace_remote_inspection();
+        let guard = reposync_core::busy::try_acquire(&fixture.id).unwrap();
+        let url = format!(
+            "http://{}/api/repos/{}/import/{}/reconcile",
+            fixture.addr, fixture.id, fixture.operation_id
+        );
+        let first_url = url.clone();
+        let first =
+            tokio::spawn(async move { authed_client().post(first_url).send().await.unwrap() });
+        let second = tokio::spawn(async move { authed_client().post(url).send().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!first.is_finished() && !second.is_finished());
+        let client = authed_client();
+        let denied = client
+            .post(format!(
+                "http://{}/api/repos/{}/sync",
+                fixture.addr, fixture.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
+            0
+        );
+        let repo = fixture
+            .state
+            .db
+            .get_repository(&fixture.id)
+            .unwrap()
+            .unwrap();
+        let other = client
+            .post(format!("http://{}/api/repos", fixture.addr))
+            .json(&serde_json::json!({"name":"other", "svn_url":repo.svn_url,
+                "svn_branch":"trunk", "git_provider":"gitea", "git_api_url":repo.git_api_url,
+                "git_repo":"local/other", "git_branch":"main"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(other.status().is_success());
+        let other: serde_json::Value = other.json().await.unwrap();
+        let unrelated = client
+            .post(format!(
+                "http://{}/api/repos/{}/sync",
+                fixture.addr,
+                other["id"].as_str().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(unrelated.status().is_success());
+        drop(guard);
+        let a = first.await.unwrap();
+        let b = second.await.unwrap();
+        assert!(a.status().is_success() && b.status().is_success());
+        let a: serde_json::Value = a.json().await.unwrap();
+        let b: serde_json::Value = b.json().await.unwrap();
+        assert_eq!(a["lifecycle"], "completed");
+        assert_eq!(b["lifecycle"], "completed");
+        assert_eq!(fixture.operation().confirmed_batches, 1);
+        assert_eq!(fixture.remote(), before);
+        assert_eq!(fixture.trace().lines().count(), 1);
+        let ordinary = client
+            .post(format!(
+                "http://{}/api/repos/{}/sync",
+                fixture.addr, fixture.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(ordinary.status().is_success());
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_RACE",
+            "two_requests":"serialized_completed","manual_during":"held",
+            "unrelated_repo":"usable","manual_after":"allowed","checkpoint":3,
+            "command_trace":fixture.trace()})
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[cfg(feature = "reliability-browser")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64b_mounted_import_card_verifies_complete_mismatch_and_partial() {
+        async fn browse(fixture: &HeldFixture, mode: &str) {
+            let (browser, mut vite) =
+                run_import_card_browser(fixture.addr, &fixture.id, fixture.tmp.path(), mode).await;
+            let output = tokio::time::timeout(Duration::from_secs(60), browser.wait_with_output())
+                .await
+                .unwrap()
+                .unwrap();
+            eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.status.success(),
+                "browser {mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            vite.kill().unwrap();
+            vite.wait().unwrap();
+        }
+
+        let complete = HeldFixture::lost_reply().await;
+        complete.trace_remote_inspection();
+        browse(&complete, "reconcile-complete").await;
+        assert_eq!(
+            complete.operation().state,
+            reposync_core::db::import_operations::ImportOperationState::Completed
+        );
+        assert_eq!(
+            complete
+                .state
+                .db
+                .get_repo_watermark(&complete.id)
+                .unwrap()
+                .0,
+            3
+        );
+        assert_eq!(complete.trace().lines().count(), 1);
+        complete.server.abort();
+        HeldFixture::clear_trace();
+
+        let mismatch = HeldFixture::lost_reply().await;
+        let parent = Command::new("git")
+            .arg("--git-dir")
+            .arg(&mismatch.bare)
+            .args(["rev-parse", "refs/heads/main^"])
+            .output()
+            .unwrap();
+        assert!(parent.status.success());
+        let parent = String::from_utf8_lossy(&parent.stdout).trim().to_owned();
+        assert!(Command::new("git")
+            .arg("--git-dir")
+            .arg(&mismatch.bare)
+            .args(["update-ref", "refs/heads/main", &parent])
+            .status()
+            .unwrap()
+            .success());
+        mismatch.trace_remote_inspection();
+        browse(&mismatch, "reconcile-mismatch").await;
+        assert_eq!(
+            mismatch.operation().state,
+            reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+        );
+        assert_eq!(
+            mismatch
+                .state
+                .db
+                .get_repo_watermark(&mismatch.id)
+                .unwrap()
+                .0,
+            0
+        );
+        assert_eq!(mismatch.trace().lines().count(), 1);
+        mismatch.server.abort();
+        HeldFixture::clear_trace();
+
+        let partial = HeldFixture::lost_reply_with_extra_revisions(49).await;
+        partial.trace_remote_inspection();
+        browse(&partial, "reconcile-partial").await;
+        assert_eq!(
+            partial.operation().state,
+            reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+        );
+        assert_eq!(
+            partial.state.db.get_repo_watermark(&partial.id).unwrap().0,
+            0
+        );
+        assert_eq!(partial.operation().confirmed_batches, 1);
+        assert_eq!(partial.trace().lines().count(), 1);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64B_UI",
+            "journeys":["complete","mismatch","partial"],
+            "command_trace_each":"ls-remote only","reload":true})
+        );
+        partial.server.abort();
+        HeldFixture::clear_trace();
+    }
+}

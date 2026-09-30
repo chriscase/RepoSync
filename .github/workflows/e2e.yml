@@ -83,6 +83,7 @@ jobs:
           google-chrome --version
           npm ci --prefix web-ui
           cargo test -p reposync-web --features reliability-browser --test server_freeze candidate_74_mounted_import_card_real_api_browser_journey -- --exact --nocapture 2>&1 | tee import-browser.log
+          cargo test -p reposync-web --features reliability-browser --test server_freeze import_reconciliation_tests::candidate_64b_mounted_import_card_verifies_complete_mismatch_and_partial -- --exact --nocapture 2>&1 | tee reconcile-browser.log
         env:
           GIT_AUTHOR_NAME: "Test User"
           GIT_AUTHOR_EMAIL: "test@example.com"
@@ -96,5 +97,6 @@ jobs:
           name: import-card-browser-${{ github.sha }}
           path: |
             import-browser.log
+            reconcile-browser.log
             target/reliability-ui-artifacts/
           if-no-files-found: warn

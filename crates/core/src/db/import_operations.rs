@@ -4,10 +4,13 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::Path;
 use uuid::Uuid;
 
 use super::Database;
 use crate::errors::DatabaseError;
+use crate::models::Repository;
 
 const PREFIX: &str = "import_operation_v1:";
 
@@ -63,6 +66,85 @@ pub struct ImportOperation {
     pub outcome_detail: Option<String>,
 }
 
+// This is the original v1 fingerprint vocabulary. Keep its JSON representation
+// stable so operations written before #64-B remain verifiable after restart.
+struct ImportTargetSettings {
+    svn_url: String,
+    svn_branch: String,
+    git_api_url: String,
+    git_repo: String,
+    git_branch: String,
+    allowed_paths: Option<String>,
+    blocked_patterns: Option<String>,
+    lfs_threshold_mb: i64,
+    sync_mode: String,
+    auto_merge: bool,
+}
+
+impl ImportTargetSettings {
+    fn from_repo(repo: &Repository) -> Self {
+        Self {
+            svn_url: repo.svn_url.clone(),
+            svn_branch: repo.svn_branch.clone(),
+            git_api_url: repo.git_api_url.clone(),
+            git_repo: repo.git_repo.clone(),
+            git_branch: repo.git_branch.clone(),
+            allowed_paths: repo.allowed_paths.clone(),
+            blocked_patterns: repo.blocked_patterns.clone(),
+            lfs_threshold_mb: repo.lfs_threshold_mb,
+            sync_mode: repo.sync_mode.clone(),
+            auto_merge: repo.auto_merge,
+        }
+    }
+
+    fn fingerprint(&self, workdir: &Path) -> String {
+        let source = serde_json::json!({
+            "svn_url":self.svn_url, "svn_branch":self.svn_branch,
+            "git_api_url":self.git_api_url, "git_repo":self.git_repo,
+            "git_branch":self.git_branch,
+            "workdir":workdir.display().to_string(),
+            "allowed_paths":self.allowed_paths,
+            "blocked_patterns":self.blocked_patterns,
+            "lfs_threshold_mb":self.lfs_threshold_mb,
+            "sync_mode":self.sync_mode, "auto_merge":self.auto_merge,
+        })
+        .to_string();
+        hex::encode(Sha256::digest(source.as_bytes()))
+    }
+}
+
+pub fn import_target_fingerprint(repo: &Repository, workdir: &Path) -> String {
+    ImportTargetSettings::from_repo(repo).fingerprint(workdir)
+}
+
+fn transaction_target_fingerprint(
+    tx: &Connection,
+    repo_id: &str,
+    workdir: &Path,
+) -> Result<Option<(String, String)>, DatabaseError> {
+    let settings = tx.query_row(
+        "SELECT svn_url,svn_branch,git_api_url,git_repo,git_branch,allowed_paths,blocked_patterns,lfs_threshold_mb,sync_mode,auto_merge FROM repositories WHERE id=?1",
+        [repo_id],
+        |row| Ok(ImportTargetSettings {
+            svn_url: row.get(0)?, svn_branch: row.get(1)?,
+            git_api_url: row.get(2)?, git_repo: row.get(3)?, git_branch: row.get(4)?,
+            allowed_paths: row.get(5)?, blocked_patterns: row.get(6)?,
+            lfs_threshold_mb: row.get(7)?, sync_mode: row.get(8)?,
+            auto_merge: row.get::<_, i64>(9)? != 0,
+        }),
+    ).optional()?;
+    Ok(settings.map(|settings| {
+        let reference = format!("refs/heads/{}", settings.git_branch);
+        (settings.fingerprint(workdir), reference)
+    }))
+}
+
+pub struct ReconciledImport {
+    pub operation: ImportOperation,
+    pub publication_recorded: bool,
+    pub completed: bool,
+}
+
 fn key(kind: &str, id: &str) -> String {
     format!("{PREFIX}{kind}:{id}")
 }
@@ -92,6 +174,49 @@ fn parse(raw: &str) -> Result<ImportOperation, DatabaseError> {
             "unsupported import operation version".into(),
         ));
     }
+    Ok(op)
+}
+
+fn complete_import_tx(
+    tx: &Connection,
+    repo_id: &str,
+    op_id: &str,
+    mut op: ImportOperation,
+    svn_rev: i64,
+    sha: &str,
+) -> Result<ImportOperation, DatabaseError> {
+    if op.intended_git_sha.is_some()
+        || op.intended_ref.is_some()
+        || op.last_local_svn_rev != Some(svn_rev)
+        || op.last_confirmed_svn_rev != Some(svn_rev)
+        || op.last_local_git_sha.as_deref() != Some(sha)
+        || op.last_confirmed_git_sha.as_deref() != Some(sha)
+    {
+        return Err(DatabaseError::Other(
+            "import lacks a fully confirmed final tip".into(),
+        ));
+    }
+    if tx.execute(
+        "UPDATE repositories SET last_svn_rev=?1,last_git_sha=?2,last_sync_at=datetime('now') WHERE id=?3",
+        params![svn_rev, sha, repo_id],
+    )? != 1 {
+        return Err(DatabaseError::Other(
+            "repository disappeared during finalization".into(),
+        ));
+    }
+    write_value(tx, &format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())?;
+    write_value(tx, &format!("last_git_sha_{repo_id}"), sha)?;
+    op.state = ImportOperationState::Completed;
+    op.updated_at = Utc::now().to_rfc3339();
+    write_value(
+        tx,
+        &key("document", op_id),
+        &serde_json::to_string(&op).unwrap(),
+    )?;
+    tx.execute(
+        "DELETE FROM kv_state WHERE key=?1 AND value=?2",
+        params![key("active", repo_id), op_id],
+    )?;
     Ok(op)
 }
 
@@ -412,25 +537,128 @@ impl Database {
         self.transaction(|tx| {
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
+                return Err(DatabaseError::Other(
+                    "stale or inactive import operation".into(),
+                ));
+            }
+            let document = key("document", op_id);
+            let op = parse(
+                &read_value(tx, &document)?
+                    .ok_or_else(|| DatabaseError::Other("missing operation document".into()))?,
+            )?;
+            if op.repo_id != repo_id
+                || !matches!(
+                    op.state,
+                    ImportOperationState::Running | ImportOperationState::CancelRequested
+                )
+            {
+                return Err(DatabaseError::Other(
+                    "import lacks a fully confirmed final tip".into(),
+                ));
+            }
+            complete_import_tx(tx, repo_id, op_id, op, svn_rev, sha)
+        })
+    }
+
+    /// Record only evidence from a fresh exact-ref read. The caller must hold
+    /// the process-wide repo busy slot throughout local/remote inspection and
+    /// this transaction. No external command is issued here.
+    pub fn reconcile_verified_import(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        workdir: &Path,
+        reference: &str,
+        observed_sha: &str,
+    ) -> Result<ReconciledImport, DatabaseError> {
+        self.transaction(|tx| {
+            if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other("stale or inactive import operation".into()));
             }
             let document = key("document", op_id);
-            let mut op = parse(&read_value(tx, &document)?.ok_or_else(|| DatabaseError::Other("missing operation document".into()))?)?;
-            if op.repo_id != repo_id || !matches!(op.state, ImportOperationState::Running | ImportOperationState::CancelRequested) || op.intended_git_sha.is_some()
-                || op.last_local_svn_rev != Some(svn_rev) || op.last_confirmed_svn_rev != Some(svn_rev)
-                || op.last_local_git_sha.as_deref() != Some(sha) || op.last_confirmed_git_sha.as_deref() != Some(sha) {
-                return Err(DatabaseError::Other("import lacks a fully confirmed final tip".into()));
+            let mut op = parse(&read_value(tx, &document)?.ok_or_else(|| {
+                DatabaseError::Other("missing import operation document".into())
+            })?)?;
+            if op.repo_id != repo_id
+                || op.operation_type != "full_import"
+                || op.state != ImportOperationState::ReconciliationRequired
+            {
+                return Err(DatabaseError::Other("operation is not an active reconciliation hold".into()));
             }
-            if tx.execute("UPDATE repositories SET last_svn_rev=?1,last_git_sha=?2,last_sync_at=datetime('now') WHERE id=?3", params![svn_rev, sha, repo_id])? != 1 {
-                return Err(DatabaseError::Other("repository disappeared during finalization".into()));
+            let (fingerprint, configured_ref) = transaction_target_fingerprint(tx, repo_id, workdir)?
+                .ok_or_else(|| DatabaseError::Other("repository disappeared".into()))?;
+            if op.target_fingerprint.is_empty()
+                || op.target_fingerprint != fingerprint
+                || configured_ref != reference
+            {
+                return Err(DatabaseError::Other("import target fingerprint changed".into()));
             }
-            write_value(tx, &format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())?;
-            write_value(tx, &format!("last_git_sha_{repo_id}"), sha)?;
-            op.state = ImportOperationState::Completed;
+            if observed_sha.len() != 40 || !observed_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(DatabaseError::Other("remote did not return a full Git SHA".into()));
+            }
+            let (checkpoint, checkpoint_sha, last_sync_at): (i64, String, Option<String>) = tx.query_row(
+                "SELECT last_svn_rev,last_git_sha,last_sync_at FROM repositories WHERE id=?1",
+                [repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if checkpoint != 0 || !checkpoint_sha.is_empty() || last_sync_at.is_some()
+                || read_value(tx, &format!("last_svn_rev_{repo_id}"))?.is_some_and(|v| v != "0")
+                || read_value(tx, &format!("last_git_sha_{repo_id}"))?.is_some_and(|v| !v.is_empty()) {
+                return Err(DatabaseError::Other("repository checkpoint changed during held import".into()));
+            }
+            let svn_rev = op.last_local_svn_rev.ok_or_else(|| DatabaseError::Other("missing local import revision".into()))?;
+            let total = op.total_revisions.ok_or_else(|| DatabaseError::Other("missing import revision total".into()))?;
+            if svn_rev <= 0 || total == 0 || op.processed_revisions == 0
+                || op.processed_revisions > total || op.local_commits != op.processed_revisions
+                || op.last_local_git_sha.as_deref() != Some(observed_sha) {
+                return Err(DatabaseError::Other("remote SHA is not the recorded local import tip".into()));
+            }
+            if op.last_confirmed_svn_rev.is_some() != op.last_confirmed_git_sha.is_some() {
+                return Err(DatabaseError::Other("incomplete prior publication receipt".into()));
+            }
+            let publication_recorded = match (&op.intended_ref, &op.intended_git_sha) {
+                (Some(intent_ref), Some(intent_sha)) if intent_ref == reference && intent_sha == observed_sha
+                    && op.last_confirmed_svn_rev.is_none_or(|rev| rev < svn_rev)
+                    && op.last_confirmed_git_sha.as_deref() != Some(observed_sha) => {
+                    op.last_confirmed_svn_rev = Some(svn_rev);
+                    op.last_confirmed_git_sha = Some(observed_sha.into());
+                    op.confirmed_batches = op.confirmed_batches.checked_add(1)
+                        .ok_or_else(|| DatabaseError::Other("invalid publication counter".into()))?;
+                    op.intended_ref = None;
+                    op.intended_git_sha = None;
+                    true
+                }
+                (None, None) if op.confirmed_batches > 0 && op.last_confirmed_svn_rev == Some(svn_rev)
+                    && op.last_confirmed_git_sha.as_deref() == Some(observed_sha) => false,
+                _ => return Err(DatabaseError::Other("remote SHA differs from publication evidence".into())),
+            };
+            let complete = op.processed_revisions == total;
+            if complete {
+                op.outcome_detail = Some("Import completed after remote verification".into());
+                let operation = complete_import_tx(tx, repo_id, op_id, op, svn_rev, observed_sha)?;
+                return Ok(ReconciledImport { operation, publication_recorded, completed: true });
+            }
+            op.outcome_detail = Some("Publication verified. Import is still partial and remains held; safe resume is not yet implemented.".into());
             op.updated_at = Utc::now().to_rfc3339();
             write_value(tx, &document, &serde_json::to_string(&op).unwrap())?;
-            tx.execute("DELETE FROM kv_state WHERE key=?1 AND value=?2", params![active, op_id])?;
-            Ok(op)
+            Ok(ReconciledImport { operation: op, publication_recorded, completed: false })
+        })
+    }
+
+    pub fn note_import_reconciliation_reason(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        reason: &str,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.update_import_operation(repo_id, op_id, |op| {
+            if op.state != ImportOperationState::ReconciliationRequired {
+                return Err(DatabaseError::Other(
+                    "operation is not an active reconciliation hold".into(),
+                ));
+            }
+            op.outcome_detail = Some(reason.into());
+            Ok(())
         })
     }
 
