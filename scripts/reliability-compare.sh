@@ -9,7 +9,8 @@ base_tree="$(git rev-parse "$base_sha^{tree}")"
 previous_tree="$(git rev-parse "$previous_sha^{tree}")"
 immediate_sha=ab097580d9415ae2f8df44bed4041f740a1b38f2
 immediate_tree="$(git rev-parse "$immediate_sha^{tree}")"
-merged_sha=6b4b3587f6f442ec40e9308b13f2b927bf84f19a
+# Current merged starting point for #64-B; older review baselines remain above.
+merged_sha=54e183484961bd9ad12bd03505b3b00610de7cd9
 merged_tree="$(git rev-parse "$merged_sha^{tree}")"
 candidate_sha="$(git rev-parse HEAD)"
 candidate_tree="$(git rev-parse HEAD^{tree})"
