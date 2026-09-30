@@ -541,6 +541,21 @@
     {"id":"74_UNCERTAIN_SVN_CANCEL", "binary":"server_freeze", "test":"candidate_74_svn_cancel_cleanup_unknown_holds_without_next_revision", "tier":"candidate_regression"},
     {"id":"74_UNCERTAIN_SVN_EARLY", "binary":"server_freeze", "test":"candidate_74_svn_early_cleanup_unknown_never_starts_revision_work", "tier":"candidate_regression"},
     {"id":"74_UNCERTAIN_PREPARATION", "binary":"server_freeze", "test":"candidate_74_preparation_cancel_cleanup_unknown_never_starts_worker", "tier":"candidate_regression"},
-    {"id":"74_FINISHED_PATCH_FALLBACK", "binary":"server_freeze", "test":"candidate_74_finished_failed_patch_still_uses_export_and_completes", "tier":"candidate_regression"}
+    {"id":"74_FINISHED_PATCH_FALLBACK", "binary":"server_freeze", "test":"candidate_74_finished_failed_patch_still_uses_export_and_completes", "tier":"candidate_regression"},
+    {"id":"64B_LOST_REPLY_COMPLETE", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_lost_reply_complete_after_restart_without_second_push", "tier":"candidate_regression"},
+    {"id":"64B_FINALIZER_RECOVERY", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_finalizer_recovery_after_restart_without_remote_write", "tier":"candidate_regression"},
+    {"id":"64B_REMOTE_MISSING", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_remote_missing_keeps_intent_and_checkpoint", "tier":"candidate_regression"},
+    {"id":"64B_REMOTE_MISMATCH", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_remote_mismatch_keeps_intent_and_checkpoint", "tier":"candidate_regression"},
+    {"id":"64B_REMOTE_ADVANCED", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_remote_advanced_is_not_exact_publication_proof", "tier":"candidate_regression"},
+    {"id":"64B_INSPECTION_FAILURE", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_inspection_failure_is_not_remote_absence", "tier":"candidate_regression"},
+    {"id":"64B_CONFIG_CHANGED", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_config_changed_blocks_verified_remote", "tier":"candidate_regression"},
+    {"id":"64B_PARTIAL_CONFIRMED", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_partial_publication_confirmed_but_stays_held", "tier":"candidate_regression"},
+    {"id":"64B_STALE_ID", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_stale_id_cannot_reconcile_new_active_operation", "tier":"candidate_regression"},
+    {"id":"64B_AUTH", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_named_admin_only_without_legacy_fallback", "tier":"candidate_regression"},
+    {"id":"64B_RACE", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_reconcile_serializes_against_manual_writer", "tier":"candidate_regression"},
+    {"id":"64B_LOCAL_MISSING", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_missing_local_object_blocks_remote_confirmation", "tier":"candidate_regression"},
+    {"id":"64B_MALFORMED", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_unsupported_v1_document_is_preserved", "tier":"candidate_regression"},
+    {"id":"64B_ATOMIC_FAILURE", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_finalization_failure_rolls_back_publication_receipt", "tier":"candidate_regression"},
+    {"id":"64B_CURSOR_CONFLICT", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_conflicting_legacy_cursor_is_not_overwritten", "tier":"candidate_regression"}
   ]
 }

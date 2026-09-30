@@ -59,6 +59,12 @@ MANDATORY["candidate"].update({"74_RESET_REFUSAL", "74_STDIN_FILE", "74_GIT_APPL
 MANDATORY["candidate"].update({"74_CLEANUP_CLASSIFIER", "74_UNCERTAIN_APPLY_TIMEOUT",
                                "74_UNCERTAIN_SVN_CANCEL", "74_UNCERTAIN_SVN_EARLY",
                                "74_UNCERTAIN_PREPARATION", "74_FINISHED_PATCH_FALLBACK"})
+MANDATORY["candidate"].update({"64B_LOST_REPLY_COMPLETE", "64B_FINALIZER_RECOVERY",
+                               "64B_REMOTE_MISSING", "64B_REMOTE_MISMATCH", "64B_REMOTE_ADVANCED",
+                               "64B_INSPECTION_FAILURE", "64B_CONFIG_CHANGED",
+                               "64B_PARTIAL_CONFIRMED", "64B_STALE_ID", "64B_AUTH", "64B_RACE"})
+MANDATORY["candidate"].update({"64B_LOCAL_MISSING", "64B_MALFORMED", "64B_ATOMIC_FAILURE",
+                               "64B_CURSOR_CONFLICT"})
 SCANNER_CASES = {
     "EVIDENCE_SCAN_CLEAN": "evidence_scan_clean",
     "EVIDENCE_SCAN_CANARY": "evidence_scan_canary",
