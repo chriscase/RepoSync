@@ -102,6 +102,25 @@ fn svn_commit_file(wc: &Path, name: &str, content: &str, message: &str) {
         .success());
 }
 
+struct SvnCommitFaultGuard {
+    scoped_key: String,
+}
+
+impl SvnCommitFaultGuard {
+    fn lost_reply(repo_id: &str) -> Self {
+        let key = "REPOSYNC_SVN_COMMIT_LOST_REPLY";
+        let scoped_key = format!("{}__{}", key, repo_id);
+        std::env::set_var(&scoped_key, "1");
+        Self { scoped_key }
+    }
+}
+
+impl Drop for SvnCommitFaultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(&self.scoped_key);
+    }
+}
+
 struct HeldPair {
     addr: std::net::SocketAddr,
     state: Arc<AppState>,
@@ -113,7 +132,7 @@ struct HeldPair {
 }
 
 impl HeldPair {
-    async fn lost_reply() -> Self {
+    async fn lost_reply(repo_id: &str) -> Self {
         assert!(svn_available());
         let tmp = tempfile::tempdir().unwrap();
         let svn_url = create_svn_repo(tmp.path());
@@ -170,7 +189,7 @@ impl HeldPair {
         db.initialize().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         db.insert_repository(&Repository {
-            id: "pair".into(),
+            id: repo_id.into(),
             name: "64c pair".into(),
             svn_url: svn_url.clone(),
             svn_branch: "".into(),
@@ -236,7 +255,7 @@ token_env = ""
                 .unwrap(),
             ),
         );
-        engine.set_repo_id("pair".into());
+        engine.set_repo_id(repo_id.into());
         engine.db().initialize().unwrap();
         assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
 
@@ -257,12 +276,12 @@ token_env = ""
         git_cli(&developer, &["commit", "-m", "Git change"]);
         git_cli(&developer, &["push", "origin", "main"]);
 
-        std::env::set_var("REPOSYNC_SVN_COMMIT_LOST_REPLY", "pair");
+        let _fault = SvnCommitFaultGuard::lost_reply(repo_id);
         let _ = engine.run_sync_cycle().await;
-        std::env::remove_var("REPOSYNC_SVN_COMMIT_LOST_REPLY");
+        drop(_fault);
         let op = engine
             .db()
-            .active_svn_commit_operation("pair")
+            .active_svn_commit_operation(repo_id)
             .unwrap()
             .unwrap();
         assert_eq!(op.state, SvnCommitOperationState::ReconciliationRequired);
@@ -322,7 +341,7 @@ token_env = ""
             state,
             server,
             _tmp: tmp,
-            id: "pair".into(),
+            id: repo_id.into(),
             operation_id: op.id,
             svn_url,
         }
@@ -346,7 +365,7 @@ token_env = ""
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64c_admin_reconcile_finalizes_lost_reply() {
-    let fixture = HeldPair::lost_reply().await;
+    let fixture = HeldPair::lost_reply("64c-http-reconcile").await;
     let svn_before = {
         let repo = fixture.svn_url.strip_prefix("file://").unwrap();
         String::from_utf8_lossy(
@@ -400,7 +419,7 @@ async fn candidate_64c_admin_reconcile_finalizes_lost_reply() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_64c_named_admin_only_without_legacy_fallback() {
-    let fixture = HeldPair::lost_reply().await;
+    let fixture = HeldPair::lost_reply("64c-http-auth").await;
     let now = chrono::Utc::now();
     for (id, role, enabled) in [
         ("admin-64c", "admin", true),
