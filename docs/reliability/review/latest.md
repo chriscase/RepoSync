@@ -1,17 +1,120 @@
-# PR72 review11 compact delta handoff
+# Post-#75 #62 first-review-gate handoff
 
-The current [merge closeout](merge-closeout.md) records the post-review
-formatting, lint, fixture, coverage, and nonactivation checks. The review11
-handoff below is preserved as the independently reviewed starting state.
+```text
+STATUS: READY_FOR_REVIEW
+EPIC / ISSUES: #61; this gate #62 plus design for #63/#64/#66
+BRANCH / PR URL: feature/reposync-reliability (draft PR to main)
+REVIEW BASE SHA: 93e3f5cf24e347d7be477c2c9e0e90531268b7fc (current main = merge of #75)
+PREVIOUS REVIEWED HEAD: f9009e7e862e3910480256d3609d99ac000f9665 (merged PR #72);
+  54e183484961bd9ad12bd03505b3b00610de7cd9 (merged PR #74); 93e3f5c (merged PR #75)
+CURRENT HEAD SHA: see git rev-parse on this branch after this file; do not embed a
+  self-referential hash inside an earlier blob
+REMOTE HEAD MATCH / WORKTREE STATUS: ordinary commits on feature/reposync-reliability
+  fast-forwarding the previously merged feature branch
+GOAL FILE / SHA-256: docs/reliability/GOAL.md
+  16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8
+```
 
-Starting reviewed head `ed2f1a4d73b63716c71b360115de321d7fa7f16c`; original base `87379741779a6259f7eeb52a68cc6f061174e5ef`; retained anchor `f74fce855a1f1d80dd631397f436ba33906272e6`. The [prior handoff](review-10-handoff.md) preserves accepted N01 and the 30-response diagnostic journey. This pass implements candidate-only exact-copy/repository grants and a distinct scoped visibility profile, then qualifies it through the real in-process transport and Node consumer. Functional/final/remote/test-merge/tree and downloaded artifact identities belong in the final PR handoff after CI publication, avoiding recursive SHA-only commits.
+## DELIVERED
 
-The original GOAL SHA-256 remains `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`; locked graph `9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05`; the 26 literal DTO payloads `0ac640a1899881fc195ec6d21bbc6df765b92ca96f08d5b2ac29c67bbca7edc9`. The original GOAL, prior briefs, issue criteria and all 85 prior required ID/test/tier objects are unchanged. `S54_SCOPED_HTTP` makes 86 required exact cases.
+Host-side #62 acceptance matrix and checker against current main, plus
+reviewable contracts for #63/#64/#66. No schema activation, no general
+operation service, no rewrite-replay product change, no merge to main, no
+live acceptance.
 
-[Scoped policy and transport contract](../scoped-read-authorization.md) records named active-principal resolution, copy enrollment, exact grants, separate diagnostics, generic refusals, pre-reader checks, owned-only SQL selection, schema-version distinction, revocation and limits. Existing offline diagnostic DTOs and canonical authority are retained. No production permission schema or operational activation was added.
+Commits on this increment, in order:
 
-The local exact new case passes 1/0/0 on a disposable pinned-old-import fixture: 53 HTTP responses checked by Node; 26 denials with zero reader-open delta; 21 authorized reader-open attempts; five consumer-driven pages yielding `[-8,0,200,201,203,204,206,208]`; populated v12 handler compatibility. A and B read four own routes and are denied four neighbor routes each. Grant, role, session, user, copy enrollment and policy failure transitions are included. The original/copy/config/ref/endpoint byte/mode trees compare equal. [Compressed local raw log](review-11-scoped-local.log.gz) SHA-256 `ed2836a137fabfa0cabbf65124c4e0bd00b3f52d34721dfa3fded6b24cced1b9`, uncompressed SHA-256 `3e722c09f9f97c1f36aa5b293710e010d415df92188a5f41a49c0b6c174a1e7b`. Local emitted wire SHA-256 `c6a60fe940aa0d866cff9ce92dc19c6e4a677eee7e166cdf56d5230aeef96e55`; CI writes its own wire bytes as `S54_SCOPED_HTTP-wire.json`.
+1. `test(reliability): add current-main #62 acceptance matrix`
+2. `docs(reliability): #63 lineage and checkpoint contract`
+3. `docs(reliability): #64 durable job and recovery contract`
+4. `docs(reliability): #66 rewrite containment contract`
+5. this handoff
 
-Focused commands: `REPOSYNC_OLD_GENERATOR=<pinned-original> cargo test -p reposync-web --features reliability-fixture --locked --test copy_inspection scoped_read_authorization_journey -- --exact --nocapture --test-threads=1`; the retained `copy_only_http_to_javascript_journey` command is identical except the test name. `REPOSYNC_OLD_GENERATOR=<pinned-original> cargo test -p reposync-core --features reliability-fixture --locked --test copy_migration nullable_dto_ -- --nocapture --test-threads=1` passed 4/0/0. Default `copy_inspection` listed zero tests; `startup_schema` passed 1/0/0 at v12 with zero candidate tables. The independent Node replay on saved local wire passed 53/53 decisions. Final gate commands are `scripts/reliability-container.sh --all` and `scripts/reliability-compare.sh` in the sealed CI runtime, plus broader E2E and complete artifact scan.
+`docs/reliability/scenarios.json` is regenerated from
+`docs/reliability/acceptance-matrix.json`. Every ID in
+`docs/reliability/required-cases.json` is classified. Isolated execution is
+still `scripts/reliability-container.sh --all`.
 
-Known metadata integration failure, ignored team-conflict case and ordinary formatting failure stay visible. Candidate routes are absent in the default build; the subset-router absence control is not a full daemon-startup execution. No production, checkpoint reset/reimport recovery, general #64 service, recovery search, force push, merge, release or deployment. Stop at independent review after final artifact verification.
+Open PRs inspected, not merged, not duplicated:
+
+- #51 (`fix/s7-exact-provenance-lfs-ci`) — provenance/LFS CI only; this branch
+  does not edit `scripts/test-s7-provenance.sh`, `scripts/ghe-live-validation.sh`,
+  or `scripts/large-file-validation.sh`
+- #44 — GitHub 404; no separate open PR with that number
+
+Monorepo epic #52 is not absorbed.
+
+## EVIDENCE
+
+Host catalog (this agent environment):
+
+```text
+python3 scripts/reliability-acceptance-matrix.py --self-test
+python3 scripts/reliability-acceptance-matrix.py --check --report
+```
+
+Self-test includes an R09_REPLACEMENT omission rejection and a refused empty
+PASS. Candidate rollup at authoring: **PASS 0 / FAIL 0 / PARTIAL 16 / NOT RUN 8**.
+
+Isolated Docker suite and matched-lock compare: **NOT RUN** here (Docker
+unavailable). Ordinary `cargo test --workspace`: run on this head if the
+environment has svn; otherwise report NOT RUN. No production endpoints or
+credentials.
+
+CI on the draft PR must execute the new matrix check plus existing
+format/clippy/workspace tests and the isolated reliability workflow.
+
+## #62 acceptance (candidate)
+
+| ID | Status |
+| --- | --- |
+| R01 | PARTIAL |
+| R02 | PARTIAL |
+| R03 | PARTIAL |
+| R04 | PARTIAL |
+| R05 | PARTIAL |
+| R06 | NOT RUN (baseline FAIL reproduction retained) |
+| R07 | NOT RUN |
+| R08 | NOT RUN (baseline PARTIAL Git-first admission retained) |
+| R09 | PARTIAL (baseline FAIL reproduction retained) |
+| R10 | PARTIAL |
+| R11 | NOT RUN |
+| R12 | PARTIAL |
+| R13 | NOT RUN |
+| R14 | NOT RUN |
+| R15 | PARTIAL |
+| R16 | PARTIAL |
+| R17 | PARTIAL |
+| R18 | PARTIAL |
+| R19 | PARTIAL |
+| R20 | NOT RUN |
+| R21 | PARTIAL |
+| R22 | PARTIAL |
+| R23 | PARTIAL |
+| R24 | NOT RUN |
+
+The deployed version remains **NOT ESTABLISHED**. F06 (watermark advance after
+failed nonempty SVN apply) stays a P0 release blocker under #62/#63; the
+bounded apply-stop tests exist and do not close that original defect class
+for all paths.
+
+## OPEN
+
+- #63 implementation: atomic `user_version` wrapper and exclusive owner;
+  no v13/v14 activation
+- #64-C: explicit Git→SVN lost-reply recovery; no general job platform
+- #66 follow-up: durable pair quarantine + personal-mode coverage;
+  no automatic rebase
+- #65/#67/#68/#69/#70/#71 and #41 live qualification
+- #73 ignored conflict fixture
+- Isolated CI evidence for this exact head, once Docker/CI run
+
+No goal deviations. Original issue acceptance criteria are unchanged.
+
+## REQUESTED NEXT ACTION
+
+Independent review of this draft PR. If the contracts are accepted, implement
+#63 atomic-migration-wrapper first, then #64-C, then the #66 durable-block /
+personal-mode slice. Do not merge to main from this agent run unless CI is
+green, an independent different-family review is posted, and hygiene matches
+repo norms. Prefer PM merge.
