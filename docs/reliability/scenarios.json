@@ -40,7 +40,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. One team-engine Git→SVN commit now persists intent before svn commit, holds on a lost reply, and finalizes only a unique remote match. Absent+unchanged may resume that one write. This is #64-B plus #64-C.",
+      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. One team-engine Git\u2192SVN commit now persists intent, holds on a lost commit reply or failed checkpoint, and finalizes only a unique SVN UUID/path/ancestry/paths/tree plus durable identity match. Absent+unchanged authorizes resume of that one write. This is #64-B plus #64-C.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -184,7 +184,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "#64-B verifies an already-published Git SHA and finalizes without a second push. Finalization failure rolls back the publication receipt. Conflicting legacy cursors are not overwritten. Blind old-DB restore remains forbidden by contract, not by a dedicated fixture.",
+      "evidence": "#64-B verifies an already-published Git SHA and finalizes without a second push. #64-C verifies one accepted Git\u2192SVN commit by UUID/path/revision ancestry/changed paths/tree and the durable operation identity, or authorizes resume when the effect is absent and the pre-write target is unchanged. Blind old-DB restore remains forbidden by contract, not by a dedicated fixture.",
       "diagnostic_expected_baseline_failure": false
     },
     {
