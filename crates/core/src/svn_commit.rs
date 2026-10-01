@@ -55,7 +55,7 @@ pub fn hash_regular_file_tree(root: &Path) -> Result<String, std::io::Error> {
         hasher.update(path.as_bytes());
         hasher.update([0]);
         hasher.update(digest.as_bytes());
-        hasher.update([b'\n']);
+        hasher.update(*b"\n");
     }
     Ok(hex::encode(hasher.finalize()))
 }

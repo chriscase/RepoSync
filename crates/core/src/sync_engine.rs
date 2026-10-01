@@ -2495,7 +2495,7 @@ impl SyncEngine {
             }
 
             let intent = self
-                .persist_git_to_svn_intent(&change, &file_contents, svn_wc_dir.path(), &svn)
+                .persist_git_to_svn_intent(change, &file_contents, svn_wc_dir.path(), &svn)
                 .await?;
             #[cfg(debug_assertions)]
             if let (Some(rid), Some(op)) = (self.effective_repo_id(), intent.as_ref()) {
