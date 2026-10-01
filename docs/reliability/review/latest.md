@@ -7,8 +7,8 @@ BRANCH / PR URL: feature/reposync-reliability (draft PR to main)
 REVIEW BASE SHA: 93e3f5cf24e347d7be477c2c9e0e90531268b7fc (current main = merge of #75)
 PREVIOUS REVIEWED HEAD: f9009e7e862e3910480256d3609d99ac000f9665 (merged PR #72);
   54e183484961bd9ad12bd03505b3b00610de7cd9 (merged PR #74); 93e3f5c (merged PR #75)
-CURRENT HEAD SHA: see git rev-parse on this branch after this file; do not embed a
-  self-referential hash inside an earlier blob
+CURRENT HEAD SHA: e456f96371cf9af46c3cc41bc174390004706079 (functional/docs head
+  before this evidence note; a later docs-only commit may follow)
 REMOTE HEAD MATCH / WORKTREE STATUS: ordinary commits on feature/reposync-reliability
   fast-forwarding the previously merged feature branch
 GOAL FILE / SHA-256: docs/reliability/GOAL.md
@@ -29,6 +29,7 @@ Commits on this increment, in order:
 3. `docs(reliability): #64 durable job and recovery contract`
 4. `docs(reliability): #66 rewrite containment contract`
 5. this handoff
+6. host-test evidence note (this file)
 
 `docs/reliability/scenarios.json` is regenerated from
 `docs/reliability/acceptance-matrix.json`. Every ID in
@@ -46,22 +47,34 @@ Monorepo epic #52 is not absorbed.
 
 ## EVIDENCE
 
-Host catalog (this agent environment):
+Host catalog (this agent environment, rustc 1.99.0, svn 1.14.3):
 
 ```text
 python3 scripts/reliability-acceptance-matrix.py --self-test
+# SELF-TEST: PASS (R09 omission + empty-PASS fixtures)
+
 python3 scripts/reliability-acceptance-matrix.py --check --report
+# CHECK: PASS; candidate rollup PASS 0 / FAIL 0 / PARTIAL 16 / NOT RUN 8
+
+cp docs/reliability/fixtures/Cargo.lock Cargo.lock
+cargo test --workspace --locked --lib -- --test-threads=1
+# reposync-core lib: 224 passed; 0 failed; 0 ignored
+# reposync-personal lib: 21 passed; 0 failed; 0 ignored
+# reposync-web lib: 0 passed (no unit tests in lib.rs)
+
+cargo test -p reposync-core --locked --test startup_schema -- --exact --nocapture
+# 1 passed; 0 failed; 0 ignored  (STARTUP_V12, user_version=12)
+
+cargo test -p reposync-core --locked --lib db::import_operations:: -- --test-threads=1
+# 1 passed; 0 failed; 223 filtered out
 ```
 
-Self-test includes an R09_REPLACEMENT omission rejection and a refused empty
-PASS. Candidate rollup at authoring: **PASS 0 / FAIL 0 / PARTIAL 16 / NOT RUN 8**.
-
-Isolated Docker suite and matched-lock compare: **NOT RUN** here (Docker
-unavailable). Ordinary `cargo test --workspace`: run on this head if the
-environment has svn; otherwise report NOT RUN. No production endpoints or
+Isolated Docker suite and matched-lock compare: **NOT RUN** (Docker daemon
+unavailable). Full `cargo test --workspace` integration/E2E binaries: **NOT RUN**
+here (old-generator/Chrome/LFS image not packaged). No production endpoints or
 credentials.
 
-CI on the draft PR must execute the new matrix check plus existing
+CI on draft PR #76 must execute the new matrix check plus existing
 format/clippy/workspace tests and the isolated reliability workflow.
 
 ## #62 acceptance (candidate)
