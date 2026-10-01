@@ -4,6 +4,10 @@
 //! with an exclusive `flock`. A second daemon — including an older or newer
 //! executable — cannot take that owner while the lock is held. This is a
 //! local file lock, not a distributed lock.
+//!
+//! Ordinary daemon startup acquires this owner. CLI/personal
+//! `Database::new`/`initialize` paths do not; wiring those writers is a later
+//! slice.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -136,7 +140,6 @@ fn read_pid(file: &File) -> Option<u32> {
 fn is_process_alive(#[allow(unused)] pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // SAFETY: kill(pid, 0) only probes existence; it does not signal.
         // SAFETY: kill(pid, 0) only probes existence; it does not deliver a signal.
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }

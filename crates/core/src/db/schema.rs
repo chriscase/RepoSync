@@ -3,7 +3,7 @@
 //! Migrations are simple SQL strings applied in order. The `schema_version`
 //! user-version pragma tracks which migrations have already been applied.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info};
 
 use crate::errors::DatabaseError;
@@ -314,6 +314,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
     refuse_future_schema(current_version)?;
 
     for &(version, description, sql) in MIGRATIONS {
+        if version > CURRENT_SCHEMA_VERSION {
+            continue;
+        }
         if version > current_version {
             apply_one_migration(conn, version, description, sql)?;
         }
@@ -341,12 +344,12 @@ fn apply_one_migration(
     sql: &str,
 ) -> Result<(), DatabaseError> {
     info!(version, description, "applying migration");
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| DatabaseError::MigrationFailed {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|e| {
+        DatabaseError::MigrationFailed {
             version,
             detail: e.to_string(),
-        })?;
+        }
+    })?;
     tx.execute_batch(sql)
         .map_err(|e| DatabaseError::MigrationFailed {
             version,
@@ -387,6 +390,9 @@ mod tests {
         run_migrations(&conn).unwrap();
         assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(MIGRATIONS.last().map(|m| m.0), Some(CURRENT_SCHEMA_VERSION));
+        assert!(MIGRATIONS
+            .iter()
+            .all(|(v, _, _)| *v <= CURRENT_SCHEMA_VERSION));
     }
 
     #[test]

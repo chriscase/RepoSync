@@ -22,7 +22,10 @@ uuid = { workspace = true }
 serde_json = { workspace = true }
 regex-lite = { workspace = true }
 rusqlite = { workspace = true }
-# Retained so the recorded reliability lockfile stays `--locked`-compatible.
+# Unused here after the lock moved to core. Kept so
+# `docs/reliability/fixtures/Cargo.lock` still matches this crate graph for
+# `--locked` overlays on older SHAs. Dropping it would require a lockfile
+# rewrite that breaks those compares.
 fs2 = "0.4"
 libc = "0.2"
 

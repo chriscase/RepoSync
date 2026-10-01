@@ -1,5 +1,6 @@
-//! Runs with default features as well as the fixture build. This is the startup
-//! implementation used by daemon/installer callers, with no candidate registry.
+//! Ordinary startup used by daemon callers: schema v12, no candidate registry.
+//! `Database::new`/`initialize` stays valid without the data-dir lock; exclusive
+//! owner is `Database::open_with_exclusive_owner` (daemon ordinary startup).
 use reposync_core::db::Database;
 use reposync_core::errors::DatabaseError;
 #[test]

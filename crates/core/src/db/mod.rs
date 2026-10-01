@@ -99,11 +99,15 @@ impl Database {
         Ok(())
     }
 
-    /// Ordinary writer startup: exclusive `reposync.lock` owner, then v12 init.
+    /// Ordinary daemon writer startup: exclusive `reposync.lock` owner, then
+    /// v12 init.
     ///
     /// The returned [`crate::data_dir::LockGuard`] must be held for the process
     /// lifetime. Additional SQLite connections to the same file are allowed
     /// in-process; a second process cannot take the owner.
+    ///
+    /// CLI and personal `Database::new`/`initialize` paths do not take this
+    /// lock. Non-daemon writers stay out of scope until a later slice.
     pub fn open_with_exclusive_owner(
         data_dir: impl AsRef<Path>,
     ) -> Result<(Self, crate::data_dir::LockGuard), DatabaseError> {
