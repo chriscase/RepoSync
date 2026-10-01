@@ -1,0 +1,375 @@
+//! Read-then-maybe-finalize inspection for one team-engine Git→SVN commit.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use sha2::{Digest, Sha256};
+
+use crate::db::svn_commit_operations::{
+    svn_commit_target_fingerprint, IntendedPath, ReconciledSvnCommit, SvnCommitOperation,
+    SvnCommitOperationState,
+};
+use crate::db::Database;
+use crate::errors::{DatabaseError, SvnError};
+use crate::svn::SvnClient;
+
+const OPERATION_TRAILER: &str = "RepoSync-Operation:";
+const GIT_SHA_TRAILER: &str = "RepoSync-Git-SHA:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SvnCommitInspect {
+    UniqueMatch {
+        svn_rev: i64,
+        svn_tree: String,
+        changed_paths: Vec<IntendedPath>,
+    },
+    AbsentUnchanged,
+    Conflict {
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SvnCommitReconcileResult {
+    pub operation: SvnCommitOperation,
+    pub inspect: SvnCommitInspect,
+    pub finalized: bool,
+    pub resume_authorized: bool,
+}
+
+pub fn operation_commit_message(original: &str, git_sha: &str, operation_id: &str) -> String {
+    let short = &git_sha[..8.min(git_sha.len())];
+    format!(
+        "{original}\n\n[reposync] synced from Git {short}\n{OPERATION_TRAILER} {operation_id}\n{GIT_SHA_TRAILER} {git_sha}"
+    )
+}
+
+pub fn hash_regular_file_tree(root: &Path) -> Result<String, std::io::Error> {
+    let mut files = BTreeMap::new();
+    collect_regular_files(root, root, &mut files)?;
+    let mut hasher = Sha256::new();
+    for (path, digest) in files {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update([b'\n']);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn collect_regular_files(
+    root: &Path,
+    current: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), std::io::Error> {
+    if !current.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".svn" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_regular_files(root, &path, files)?;
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(&path)?;
+        files.insert(relative, hex::encode(Sha256::digest(&bytes)));
+    }
+    Ok(())
+}
+
+pub fn intended_paths_from_contents(
+    files: &[(String, String, Option<Vec<u8>>)],
+) -> Vec<IntendedPath> {
+    let mut paths: Vec<IntendedPath> = files
+        .iter()
+        .map(|(action, path, content)| IntendedPath {
+            action: action.clone(),
+            path: normalize_svn_path(path),
+            content_sha256: content
+                .as_ref()
+                .map(|bytes| hex::encode(Sha256::digest(bytes))),
+        })
+        .collect();
+    paths.sort_by(|a, b| a.path.cmp(&b.path));
+    paths
+}
+
+pub fn normalize_svn_path(path: &str) -> String {
+    path.trim_start_matches('/').replace('\\', "/")
+}
+
+async fn hash_exported_revision(svn: &SvnClient, revision: i64) -> Result<String, SvnError> {
+    let snapshot = tempfile::tempdir().map_err(SvnError::IoError)?;
+    let dest = snapshot.path().join("export");
+    svn.export("", revision, &dest).await?;
+    hash_regular_file_tree(&dest).map_err(SvnError::IoError)
+}
+
+fn paths_match(intended: &[IntendedPath], observed: &[IntendedPath]) -> bool {
+    let intended_keys: Vec<(String, String)> = intended
+        .iter()
+        .map(|p| (p.action.clone(), normalize_svn_path(&p.path)))
+        .collect();
+    for (action, path) in &intended_keys {
+        if !observed
+            .iter()
+            .any(|item| item.action == *action && normalize_svn_path(&item.path) == *path)
+        {
+            return false;
+        }
+    }
+    observed.iter().all(|item| {
+        let path = normalize_svn_path(&item.path);
+        if intended_keys
+            .iter()
+            .any(|(action, intended)| action == &item.action && intended == &path)
+        {
+            return true;
+        }
+        item.action == "A"
+            && intended_keys.iter().any(|(action, intended)| {
+                action == "A" && (intended.starts_with(&format!("{path}/")) || intended == &path)
+            })
+    })
+}
+
+fn message_carries_identity(message: &str, op: &SvnCommitOperation) -> bool {
+    let mut saw_operation = false;
+    let mut saw_sha = false;
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix(OPERATION_TRAILER) {
+            saw_operation |= value.trim() == op.id;
+        }
+        if let Some(value) = trimmed.strip_prefix(GIT_SHA_TRAILER) {
+            saw_sha |= value.trim() == op.source_git_sha;
+        }
+    }
+    saw_operation && saw_sha
+}
+
+pub async fn inspect_git_to_svn_commit(
+    svn: &SvnClient,
+    op: &SvnCommitOperation,
+) -> SvnCommitInspect {
+    let info = match svn.info().await {
+        Ok(info) => info,
+        Err(error) => {
+            return SvnCommitInspect::Unavailable {
+                reason: format!("SVN inspection unavailable: {error}"),
+            }
+        }
+    };
+    if info.uuid != op.target_svn_uuid || info.url != op.target_svn_path {
+        return SvnCommitInspect::Conflict {
+            reason: "SVN UUID or path differs from the recorded target".into(),
+        };
+    }
+    if info.latest_rev < op.pre_write_svn_rev {
+        return SvnCommitInspect::Conflict {
+            reason: "SVN revision is behind the recorded pre-write revision".into(),
+        };
+    }
+    if info.latest_rev == op.pre_write_svn_rev {
+        return match hash_exported_revision(svn, info.latest_rev).await {
+            Ok(tree) if tree == op.pre_write_svn_tree => SvnCommitInspect::AbsentUnchanged,
+            Ok(_) => SvnCommitInspect::Conflict {
+                reason: "pre-write revision is unchanged but its tree is not".into(),
+            },
+            Err(error) => SvnCommitInspect::Unavailable {
+                reason: format!("could not hash the pre-write SVN tree: {error}"),
+            },
+        };
+    }
+    if info.latest_rev != op.pre_write_svn_rev + 1 {
+        return SvnCommitInspect::Conflict {
+            reason: "SVN advanced by more than the one planned revision".into(),
+        };
+    }
+    let log = match svn.log(info.latest_rev, info.latest_rev).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            return SvnCommitInspect::Unavailable {
+                reason: format!("SVN log inspection failed: {error}"),
+            }
+        }
+    };
+    if log.len() != 1 {
+        return SvnCommitInspect::Unavailable {
+            reason: "SVN log did not return exactly one candidate revision".into(),
+        };
+    }
+    let entry = &log[0];
+    if entry.revision != info.latest_rev {
+        return SvnCommitInspect::Conflict {
+            reason: "SVN log revision is not the immediate successor".into(),
+        };
+    }
+    if !message_carries_identity(&entry.message, op) {
+        return SvnCommitInspect::Conflict {
+            reason: "successor revision does not carry the durable operation identity".into(),
+        };
+    }
+    let mut observed: Vec<IntendedPath> = entry
+        .changed_paths
+        .iter()
+        .map(|path| IntendedPath {
+            action: path.action.clone(),
+            path: normalize_svn_path(&path.path),
+            content_sha256: None,
+        })
+        .collect();
+    observed.sort_by(|a, b| a.path.cmp(&b.path));
+    if !paths_match(&op.intended_changed_paths, &observed) {
+        return SvnCommitInspect::Conflict {
+            reason: "successor changed paths are not a unique match for the intended write".into(),
+        };
+    }
+    let tree = match hash_exported_revision(svn, info.latest_rev).await {
+        Ok(tree) => tree,
+        Err(error) => {
+            return SvnCommitInspect::Unavailable {
+                reason: format!("could not hash the successor SVN tree: {error}"),
+            }
+        }
+    };
+    if tree != op.intended_svn_tree {
+        return SvnCommitInspect::Conflict {
+            reason: "successor tree is not the intended Git-to-SVN tree".into(),
+        };
+    }
+    SvnCommitInspect::UniqueMatch {
+        svn_rev: info.latest_rev,
+        svn_tree: tree,
+        changed_paths: observed,
+    }
+}
+
+pub async fn apply_svn_commit_reconciliation(
+    db: &Database,
+    repo_id: &str,
+    op_id: &str,
+    svn: &SvnClient,
+    projection: &str,
+) -> Result<SvnCommitReconcileResult, DatabaseError> {
+    let requested = db
+        .get_svn_commit_operation(repo_id, op_id)?
+        .ok_or_else(|| DatabaseError::Other("git-to-svn commit operation not found".into()))?;
+    let active = db.active_svn_commit_operation(repo_id)?;
+    if active.is_none() && requested.state == SvnCommitOperationState::Completed {
+        return Ok(SvnCommitReconcileResult {
+            inspect: SvnCommitInspect::UniqueMatch {
+                svn_rev: requested.last_confirmed_svn_rev.unwrap_or(0),
+                svn_tree: requested
+                    .last_confirmed_svn_tree
+                    .clone()
+                    .unwrap_or_default(),
+                changed_paths: requested.intended_changed_paths.clone(),
+            },
+            operation: requested,
+            finalized: true,
+            resume_authorized: false,
+        });
+    }
+    if active.as_ref().is_none_or(|op| op.id != op_id)
+        || requested.state != SvnCommitOperationState::ReconciliationRequired
+    {
+        return Err(DatabaseError::Other(
+            "operation is not this repository's active git-to-svn reconciliation hold".into(),
+        ));
+    }
+    let info = svn
+        .info()
+        .await
+        .map_err(|e| DatabaseError::Other(format!("SVN inspection unavailable: {e}")))?;
+    let fingerprint =
+        svn_commit_target_fingerprint(repo_id, &info.uuid, svn.url(), &info.url, projection);
+    if requested.target_fingerprint != fingerprint {
+        let operation = db.note_svn_commit_reconciliation_reason(
+            repo_id,
+            op_id,
+            "Git-to-SVN target fingerprint changed; review required",
+        )?;
+        return Ok(SvnCommitReconcileResult {
+            operation,
+            inspect: SvnCommitInspect::Conflict {
+                reason: "Git-to-SVN target fingerprint changed; review required".into(),
+            },
+            finalized: false,
+            resume_authorized: false,
+        });
+    }
+    let inspect = inspect_git_to_svn_commit(svn, &requested).await;
+    match &inspect {
+        SvnCommitInspect::UniqueMatch {
+            svn_rev, svn_tree, ..
+        } => {
+            match db.finalize_verified_svn_commit(repo_id, op_id, *svn_rev, svn_tree, &fingerprint)
+            {
+                Ok(ReconciledSvnCommit {
+                    operation,
+                    finalized,
+                    resume_authorized,
+                }) => Ok(SvnCommitReconcileResult {
+                    operation,
+                    inspect,
+                    finalized,
+                    resume_authorized,
+                }),
+                Err(DatabaseError::Other(reason))
+                    if reason.contains("fingerprint")
+                        || reason.contains("differs")
+                        || reason.contains("not after") =>
+                {
+                    let operation =
+                        db.note_svn_commit_reconciliation_reason(repo_id, op_id, &reason)?;
+                    Ok(SvnCommitReconcileResult {
+                        operation,
+                        inspect: SvnCommitInspect::Conflict { reason },
+                        finalized: false,
+                        resume_authorized: false,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        SvnCommitInspect::AbsentUnchanged => {
+            let operation = db.authorize_git_to_svn_resume(
+                repo_id,
+                op_id,
+                "Effect is absent and the pre-write SVN target is unchanged; the worker may resume that one planned write",
+            )?;
+            Ok(SvnCommitReconcileResult {
+                operation,
+                inspect,
+                finalized: false,
+                resume_authorized: true,
+            })
+        }
+        SvnCommitInspect::Conflict { reason } | SvnCommitInspect::Unavailable { reason } => {
+            let operation = db.note_svn_commit_reconciliation_reason(repo_id, op_id, reason)?;
+            Ok(SvnCommitReconcileResult {
+                operation,
+                inspect,
+                finalized: false,
+                resume_authorized: false,
+            })
+        }
+    }
+}

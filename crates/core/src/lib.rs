@@ -22,6 +22,7 @@ pub mod notify;
 pub mod personal_config;
 pub mod process;
 pub mod svn;
+pub mod svn_commit;
 pub mod sync_engine;
 
 // Re-exports for convenience.

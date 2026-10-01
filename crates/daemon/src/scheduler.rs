@@ -182,6 +182,24 @@ impl Scheduler {
             }
             Ok(false) => {}
         }
+        match self.db.has_any_blocking_svn_commit_hold() {
+            Ok(true) => {
+                info!(
+                    trigger,
+                    "skipping global sync while a git-to-svn commit is held"
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    trigger,
+                    error = %e,
+                    "cannot establish git-to-svn holds; refusing global sync"
+                );
+                return;
+            }
+            Ok(false) => {}
+        }
         // Skip sync cycles while an import is active to avoid concurrent
         // git repo access ("file changed before we could read it" errors).
         {
@@ -318,6 +336,28 @@ impl Scheduler {
                     continue;
                 }
                 Ok(None) => {}
+            }
+            match self.db.active_svn_commit_operation(&repo.id) {
+                Ok(Some(op))
+                    if op.state
+                        == reposync_core::db::svn_commit_operations::SvnCommitOperationState::ReconciliationRequired
+                        && !op.resume_authorized =>
+                {
+                    debug!(repo_name = %repo.name, operation_id = %op.id,
+                        "skipping repository held by git-to-svn commit reconciliation");
+                    continue;
+                }
+                Ok(Some(op)) if !op.state.is_terminal() => {
+                    debug!(repo_name = %repo.name, operation_id = %op.id,
+                        "skipping repository with an unfinished git-to-svn commit");
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo_name = %repo.name, error = %e,
+                        "cannot establish git-to-svn hold; refusing repository sync");
+                    continue;
+                }
+                Ok(_) => {}
             }
             // Circuit breaker: skip repos that have been paused due to permanent errors
             if repo.sync_status == "error_paused" {

@@ -26,12 +26,18 @@ use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
 use crate::db::queries::AuditLogInput;
+use crate::db::svn_commit_operations::{
+    svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
+};
 use crate::db::Database;
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
 use crate::svn::client::SvnClient;
+use crate::svn_commit::{
+    hash_regular_file_tree, intended_paths_from_contents, operation_commit_message,
+};
 
 // ---------------------------------------------------------------------------
 // Sync state machine
@@ -266,7 +272,8 @@ impl SyncEngine {
                     stats.svn_to_git_count, stats.git_to_svn_count, stats.conflicts_detected
                 ),
             ),
-            Err(e @ SyncError::HistoryBlocked { .. }) => {
+            Err(e @ SyncError::HistoryBlocked { .. })
+            | Err(e @ SyncError::SvnCommitHeld { .. }) => {
                 ("reconciliation_required", format!("sync blocked: {}", e))
             }
             Err(e) => ("error", format!("sync failed: {}", e)),
@@ -1335,6 +1342,17 @@ impl SyncEngine {
     }
 
     async fn do_sync_cycle(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
+        if let Some(rid) = self.effective_repo_id() {
+            if let Some(op) = self
+                .db
+                .active_svn_commit_operation(rid)
+                .map_err(SyncError::DatabaseError)?
+            {
+                if let Some(error) = self.blocking_svn_commit_hold(&op) {
+                    return Err(error);
+                }
+            }
+        }
         // SVN inspection may adopt a legacy checkpoint. Admit Git history
         // before that call, not merely before the later destructive reset.
         let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
@@ -1851,8 +1869,108 @@ impl SyncEngine {
     /// 3. Stage additions/deletions with `svn add`/`svn rm`.
     /// 4. Commit to SVN with a `[reposync]` marker.
     /// 5. Only then record the sync in the database.
+    fn blocking_svn_commit_hold(&self, op: &SvnCommitOperation) -> Option<SyncError> {
+        if op.state == SvnCommitOperationState::ReconciliationRequired && !op.resume_authorized {
+            return Some(SyncError::SvnCommitHeld {
+                reason: "reconciliation_required".into(),
+                detail: op
+                    .outcome_detail
+                    .clone()
+                    .unwrap_or_else(|| "held Git-to-SVN commit requires explicit reconcile".into()),
+            });
+        }
+        if !op.state.is_terminal() && op.state != SvnCommitOperationState::Running {
+            return Some(SyncError::SvnCommitHeld {
+                reason: "unfinished_write".into(),
+                detail: "an unfinished Git-to-SVN commit is still active".into(),
+            });
+        }
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    fn svn_commit_fixture_flag(&self, var: &str, repo_id: &str) -> bool {
+        std::env::var(var).ok().as_deref() == Some(repo_id)
+    }
+
+    async fn persist_git_to_svn_intent(
+        &self,
+        change: &GitChangeSet,
+        file_contents: &[(String, String, Option<Vec<u8>>)],
+        svn_wc: &std::path::Path,
+        svn: &SvnClient,
+    ) -> Result<Option<SvnCommitOperation>, SyncError> {
+        let Some(rid) = self.effective_repo_id() else {
+            return Ok(None);
+        };
+        let (parent, tree) = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git.commit_parent_and_tree(&change.sha)
+                .map_err(SyncError::GitError)?
+        };
+        let info = svn.info().await.map_err(SyncError::SvnError)?;
+        let snapshot = tempfile::tempdir()
+            .map_err(|e| SyncError::SvnError(crate::errors::SvnError::IoError(e)))?;
+        let exported = snapshot.path().join("pre-write");
+        svn.export("", info.latest_rev, &exported)
+            .await
+            .map_err(SyncError::SvnError)?;
+        let pre_write_tree = hash_regular_file_tree(&exported)
+            .map_err(|e| SyncError::SvnError(crate::errors::SvnError::IoError(e)))?;
+        let intended_tree = hash_regular_file_tree(svn_wc)
+            .map_err(|e| SyncError::SvnError(crate::errors::SvnError::IoError(e)))?;
+        let projection = self.no_target_projection();
+        let fingerprint =
+            svn_commit_target_fingerprint(rid, &info.uuid, svn.url(), &info.url, &projection);
+        let op = self
+            .db
+            .begin_git_to_svn_commit(SvnCommitIntent {
+                repo_id: rid,
+                initiator_id: "team_worker",
+                request_id: &change.sha,
+                target_fingerprint: &fingerprint,
+                source_git_sha: &change.sha,
+                source_git_parent: parent.as_deref(),
+                source_git_tree: &tree,
+                target_svn_uuid: &info.uuid,
+                target_svn_path: &info.url,
+                pre_write_svn_rev: info.latest_rev,
+                pre_write_svn_tree: &pre_write_tree,
+                projection: &projection,
+                intended_changed_paths: intended_paths_from_contents(file_contents),
+                intended_svn_tree: &intended_tree,
+                author: &change.author_name,
+                source_message: &change.message,
+            })
+            .map_err(SyncError::DatabaseError)?;
+        Ok(Some(op))
+    }
+
     async fn sync_git_to_svn(&self, git_changes: &[GitChangeSet]) -> Result<usize, SyncError> {
         let mut count = 0;
+        let resume_sha = if let Some(rid) = self.effective_repo_id() {
+            match self
+                .db
+                .active_svn_commit_operation(rid)
+                .map_err(SyncError::DatabaseError)?
+            {
+                Some(op) => {
+                    if let Some(error) = self.blocking_svn_commit_hold(&op) {
+                        return Err(error);
+                    }
+                    if op.state == SvnCommitOperationState::ReconciliationRequired
+                        && op.resume_authorized
+                    {
+                        Some(op.source_git_sha.clone())
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
 
         // Reuse a single SVN working copy across all commits (P4 optimization).
         // Create the tempdir once and use `svn update` between commits instead
@@ -1862,6 +1980,16 @@ impl SyncEngine {
         let mut svn_wc_initialized = false;
 
         for change in git_changes {
+            if let Some(allowed) = resume_sha.as_deref() {
+                if change.sha != allowed {
+                    debug!(
+                        sha = %change.sha,
+                        allowed,
+                        "skipping Git commit while one held write is authorized to resume"
+                    );
+                    continue;
+                }
+            }
             if self.is_echo_commit(&change.message) {
                 debug!(sha = %change.sha, "skipping echo Git commit");
                 continue;
@@ -2366,35 +2494,58 @@ impl SyncEngine {
                     .map_err(SyncError::SvnError)?;
             }
 
-            let commit_message = format!(
-                "{}\n\n{} synced from Git {}",
-                change.message,
-                SYNC_MARKER,
-                &change.sha[..8.min(change.sha.len())]
-            );
+            let intent = self
+                .persist_git_to_svn_intent(&change, &file_contents, svn_wc_dir.path(), &svn)
+                .await?;
+            #[cfg(debug_assertions)]
+            if let (Some(rid), Some(op)) = (self.effective_repo_id(), intent.as_ref()) {
+                if self.svn_commit_fixture_flag("REPOSYNC_SVN_COMMIT_CRASH_BEFORE", rid) {
+                    let _ = self.db.hold_git_to_svn_reconciliation(
+                        rid,
+                        &op.id,
+                        "intent recorded; planned SVN write was not issued",
+                    );
+                    return Err(SyncError::SvnCommitHeld {
+                        reason: "intent_recorded_write_not_issued".into(),
+                        detail: "fixture: crash after durable intent and before svn commit".into(),
+                    });
+                }
+            }
+            let commit_message = match &intent {
+                Some(op) => operation_commit_message(&change.message, &change.sha, &op.id),
+                None => format!(
+                    "{}\n\n{} synced from Git {}",
+                    change.message,
+                    SYNC_MARKER,
+                    &change.sha[..8.min(change.sha.len())]
+                ),
+            };
             let mut svn_commit_result = svn
                 .commit(svn_wc_dir.path(), &commit_message, &svn_username)
                 .await;
 
-            // Retry once on E155011 (out of date) — run svn update and try again
-            if let Err(ref e) = svn_commit_result {
-                let err_str = e.to_string();
-                if err_str.contains("E155011") || err_str.contains("out of date") {
-                    warn!(
-                        sha = %change.sha,
-                        "svn commit got 'out of date' — updating WC and retrying"
-                    );
-                    let svn = self
-                        .svn_client
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
-                    svn.update(svn_wc_dir.path())
-                        .await
-                        .map_err(SyncError::SvnError)?;
-                    svn_commit_result = svn
-                        .commit(svn_wc_dir.path(), &commit_message, &svn_username)
-                        .await;
+            // Retry once on E155011 only when no durable intent exists.
+            // A journaled write cannot blindly retry after the pre-write snapshot.
+            if intent.is_none() {
+                if let Err(ref e) = svn_commit_result {
+                    let err_str = e.to_string();
+                    if err_str.contains("E155011") || err_str.contains("out of date") {
+                        warn!(
+                            sha = %change.sha,
+                            "svn commit got 'out of date' — updating WC and retrying"
+                        );
+                        let svn = self
+                            .svn_client
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        svn.update(svn_wc_dir.path())
+                            .await
+                            .map_err(SyncError::SvnError)?;
+                        svn_commit_result = svn
+                            .commit(svn_wc_dir.path(), &commit_message, &svn_username)
+                            .await;
+                    }
                 }
             }
 
@@ -2403,7 +2554,7 @@ impl SyncEngine {
             // cycle, or this is an echo commit the detection didn't catch).
             let svn_rev = match svn_commit_result {
                 Ok(rev) => rev,
-                Err(crate::errors::SvnError::NothingToCommit) => {
+                Err(crate::errors::SvnError::NothingToCommit) if intent.is_none() => {
                     info!(
                         sha = %change.sha,
                         "svn commit: nothing to commit — files already in sync, advancing watermark"
@@ -2427,43 +2578,95 @@ impl SyncEngine {
                     }
                     continue;
                 }
-                Err(e) => return Err(SyncError::SvnError(e)),
+                Err(e) => {
+                    if let Some(op) = &intent {
+                        if let Some(rid) = self.effective_repo_id() {
+                            let _ = self.db.hold_git_to_svn_reconciliation(
+                                rid,
+                                &op.id,
+                                &format!("svn commit failed after intent was recorded: {e}"),
+                            );
+                        }
+                    }
+                    return Err(SyncError::SvnError(e));
+                }
             };
 
-            // 6. Record the sync only after successful write.
-            let record = crate::models::SyncRecord {
-                id: uuid::Uuid::new_v4().to_string(),
-                repo_id: self.effective_repo_id().map(|s| s.to_string()),
-                svn_revision: Some(svn_rev),
-                git_hash: Some(change.sha.clone()),
-                direction: crate::models::SyncDirection::GitToSvn,
-                author: change.author_name.clone(),
-                message: change.message.clone(),
-                timestamp: Utc::now(),
-                synced_at: Utc::now(),
-                status: crate::models::SyncRecordStatus::Applied,
-            };
-            self.db
-                .insert_sync_record(&record)
-                .map_err(SyncError::DatabaseError)?;
-
-            // Update the Git watermark (dual-write: kv_state + repo table).
-            // IMPORTANT: Only advance the git SHA here, NOT the SVN rev.
-            // The SVN rev created by git_to_svn is higher than any pending
-            // SVN→Git revisions. If we set last_svn_rev here, we'd skip
-            // SVN commits that were made between our fetch and our commit
-            // (bidirectional race condition / data loss).
-            if let Some(rid) = self.effective_repo_id() {
-                self.db
-                    .advance_all_watermarks(rid, &change.sha)
-                    .map_err(SyncError::DatabaseError)?;
-                self.db
-                    .increment_repo_sync_count(rid)
-                    .map_err(SyncError::DatabaseError)?;
+            if let (Some(rid), Some(op)) = (self.effective_repo_id(), &intent) {
+                #[cfg(debug_assertions)]
+                if self.svn_commit_fixture_flag("REPOSYNC_SVN_COMMIT_LOST_REPLY", rid) {
+                    let _ = self.db.hold_git_to_svn_reconciliation(
+                        rid,
+                        &op.id,
+                        "SVN accepted the commit but the reply was lost before local checkpoint",
+                    );
+                    return Err(SyncError::SvnCommitHeld {
+                        reason: "lost_commit_reply".into(),
+                        detail: "fixture: accepted SVN commit reply lost before verification"
+                            .into(),
+                    });
+                }
+                #[cfg(debug_assertions)]
+                if self.svn_commit_fixture_flag("REPOSYNC_SVN_COMMIT_CHECKPOINT_FAIL", rid) {
+                    let _ = self.db.hold_git_to_svn_reconciliation(
+                        rid,
+                        &op.id,
+                        "SVN accepted the commit but the local checkpoint write failed",
+                    );
+                    return Err(SyncError::SvnCommitHeld {
+                        reason: "checkpoint_write_failed".into(),
+                        detail: "fixture: accepted SVN commit could not be checkpointed".into(),
+                    });
+                }
+                match self
+                    .db
+                    .confirm_git_to_svn_commit(rid, &op.id, svn_rev, &op.intended_svn_tree)
+                {
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = self.db.hold_git_to_svn_reconciliation(
+                            rid,
+                            &op.id,
+                            &format!("SVN accepted the commit but the local checkpoint write failed: {error}"),
+                        );
+                        return Err(SyncError::SvnCommitHeld {
+                            reason: "checkpoint_write_failed".into(),
+                            detail: error.to_string(),
+                        });
+                    }
+                }
             } else {
+                // Legacy path without a pair identity: retain the previous writers.
+                let record = crate::models::SyncRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    repo_id: self.effective_repo_id().map(|s| s.to_string()),
+                    svn_revision: Some(svn_rev),
+                    git_hash: Some(change.sha.clone()),
+                    direction: crate::models::SyncDirection::GitToSvn,
+                    author: change.author_name.clone(),
+                    message: change.message.clone(),
+                    timestamp: Utc::now(),
+                    synced_at: Utc::now(),
+                    status: crate::models::SyncRecordStatus::Applied,
+                };
                 self.db
-                    .set_state("last_git_hash", &change.sha)
+                    .insert_sync_record(&record)
                     .map_err(SyncError::DatabaseError)?;
+
+                // Update the Git watermark (dual-write: kv_state + repo table).
+                // IMPORTANT: Only advance the git SHA here, NOT the SVN rev.
+                if let Some(rid) = self.effective_repo_id() {
+                    self.db
+                        .advance_all_watermarks(rid, &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
+                    self.db
+                        .increment_repo_sync_count(rid)
+                        .map_err(SyncError::DatabaseError)?;
+                } else {
+                    self.db
+                        .set_state("last_git_hash", &change.sha)
+                        .map_err(SyncError::DatabaseError)?;
+                }
             }
 
             count += 1;

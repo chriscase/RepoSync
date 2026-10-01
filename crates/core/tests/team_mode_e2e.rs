@@ -5015,3 +5015,387 @@ async fn candidate_r10_inventory_authority_and_confined_reads() {
     assert!(evidence["reports"].as_object().unwrap().len() >= 14);
     eprintln!("RELIABILITY_EVIDENCE {}", evidence);
 }
+
+fn svn_youngest(url: &str) -> i64 {
+    let repo = url.strip_prefix("file://").unwrap();
+    let output = Command::new("svnlook")
+        .args(["youngest", repo])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn reopen_pair(fixture: &QualifiedPair) -> SyncEngine {
+    let db = Database::new(&fixture.db_path).unwrap();
+    db.initialize().unwrap();
+    db.hold_interrupted_svn_commits().unwrap();
+    let git = GitClient::new(&fixture.bridge).unwrap();
+    let mut engine = SyncEngine::new(
+        fixture.engine.config().clone(),
+        db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        git,
+        Arc::new(make_identity_mapper()),
+    );
+    engine.set_repo_id("pair".into());
+    engine
+}
+
+fn git_to_svn_mappings(db: &Database) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id='pair' AND direction='git_to_svn'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+struct SvnCommitFaultGuard {
+    key: &'static str,
+}
+
+impl SvnCommitFaultGuard {
+    fn set(key: &'static str, repo: &str) -> Self {
+        std::env::set_var(key, repo);
+        Self { key }
+    }
+}
+
+impl Drop for SvnCommitFaultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.key);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c_lost_reply_holds_without_pretending_success() {
+    let fixture = QualifiedPair::new().await;
+    let sha = fixture.developer_commit("feature.txt", "one\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let mappings_before = git_to_svn_mappings(fixture.engine.db());
+    let watermark_before = fixture.engine.db().get_repo_watermark("pair").unwrap();
+    let _fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", "pair");
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::SvnCommitHeld { reason, .. }) if reason == "lost_commit_reply"
+        ),
+        "{result:?}"
+    );
+    drop(_fault);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    assert_eq!(git_to_svn_mappings(fixture.engine.db()), mappings_before);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        watermark_before
+    );
+    let op = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        op.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::ReconciliationRequired
+    );
+    assert_eq!(op.source_git_sha, sha);
+    assert!(!op.resume_authorized);
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_state("sync_state")
+            .unwrap()
+            .as_deref(),
+        Some("reconciliation_required")
+    );
+    let status = fixture
+        .engine
+        .db()
+        .get_svn_commit_operation("pair", &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.lifecycle_is_held(), true);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64C_LOST_REPLY",
+            "operation_id":op.id,
+            "svn_before":svn_before,
+            "svn_after":svn_before + 1,
+            "watermark_before":watermark_before,
+            "mappings_before_after":mappings_before,
+            "lifecycle":"reconciliation_required"
+        })
+    );
+}
+
+trait HeldHint {
+    fn lifecycle_is_held(&self) -> bool;
+}
+
+impl HeldHint for reposync_core::db::svn_commit_operations::SvnCommitOperation {
+    fn lifecycle_is_held(&self) -> bool {
+        self.state
+            == reposync_core::db::svn_commit_operations::SvnCommitOperationState::ReconciliationRequired
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c_unique_match_finalizes_without_second_commit() {
+    let fixture = QualifiedPair::new().await;
+    let sha = fixture.developer_commit("feature.txt", "one\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let _fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", "pair");
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let mappings_before = git_to_svn_mappings(fixture.engine.db());
+    let engine = reopen_pair(&fixture);
+    let svn = SvnClient::new(&fixture.svn_url, "", "");
+    let result = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        engine.db(),
+        "pair",
+        &op.id,
+        &svn,
+        &serde_json::json!({"allowed_paths":Vec::<String>::new(),"blocked_patterns":Vec::<String>::new()})
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(result.finalized, "{result:?}");
+    assert_eq!(
+        result.operation.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::Completed
+    );
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before);
+    assert_eq!(git_to_svn_mappings(engine.db()), mappings_before + 1);
+    assert_eq!(engine.db().get_repo_watermark("pair").unwrap().1, sha);
+    let mapped: i64 = engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id='pair' AND direction='git_to_svn' AND svn_rev=?1 AND git_sha=?2",
+            rusqlite::params![svn_before, sha],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mapped, 1);
+    let again = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(again.git_to_svn_count, 0);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before);
+    assert_eq!(git_to_svn_mappings(engine.db()), mappings_before + 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64C_UNIQUE_MATCH",
+            "operation_id":op.id,
+            "svn_before_after":svn_before,
+            "finalized":true,
+            "second_cycle_writes":0
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c_conflict_and_mismatch_stay_held() {
+    let fixture = QualifiedPair::new().await;
+    fixture.developer_commit("feature.txt", "one\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let _fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", "pair");
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    let watermark = fixture.engine.db().get_repo_watermark("pair").unwrap();
+    let update = Command::new("svn")
+        .args(["update", fixture.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success());
+    svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "interfering write\n",
+        "Unrelated SVN advance",
+    );
+    let svn = SvnClient::new(&fixture.svn_url, "", "");
+    let result = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        fixture.engine.db(),
+        "pair",
+        &op.id,
+        &svn,
+        &serde_json::json!({"allowed_paths":Vec::<String>::new(),"blocked_patterns":Vec::<String>::new()})
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(!result.finalized);
+    assert!(!result.resume_authorized);
+    assert!(matches!(
+        result.inspect,
+        reposync_core::svn_commit::SvnCommitInspect::Conflict { .. }
+    ));
+    let held = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::ReconciliationRequired
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        watermark
+    );
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::SvnCommitHeld { .. })),
+        "{blocked:?}"
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        watermark
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64C_CONFLICT_HELD",
+            "operation_id":op.id,
+            "finalized":false,
+            "resume_authorized":false,
+            "watermark_unchanged":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c_absent_unchanged_may_resume_one_write() {
+    let fixture = QualifiedPair::new().await;
+    let sha = fixture.developer_commit("feature.txt", "resume me\n", "Resume Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let mappings_before = git_to_svn_mappings(fixture.engine.db());
+    let _fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_CRASH_BEFORE", "pair");
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::SvnCommitHeld { reason, .. })
+                if reason == "intent_recorded_write_not_issued"
+        ),
+        "{result:?}"
+    );
+    drop(_fault);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before);
+    let op = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    let svn = SvnClient::new(&fixture.svn_url, "", "");
+    let reconciled = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        fixture.engine.db(),
+        "pair",
+        &op.id,
+        &svn,
+        &serde_json::json!({"allowed_paths":Vec::<String>::new(),"blocked_patterns":Vec::<String>::new()})
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(!reconciled.finalized);
+    assert!(reconciled.resume_authorized);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before);
+    let resumed = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(resumed.git_to_svn_count, 1);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    assert_eq!(
+        git_to_svn_mappings(fixture.engine.db()),
+        mappings_before + 1
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().1,
+        sha
+    );
+    assert!(fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .is_none());
+    let quiet = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(quiet.git_to_svn_count, 0);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64C_RESUME_ONE_WRITE",
+            "operation_id":op.id,
+            "svn_before":svn_before,
+            "svn_after":svn_before + 1,
+            "quiet_second_cycle":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c_ordinary_success_is_truthful_and_terminal() {
+    let fixture = QualifiedPair::new().await;
+    let sha = fixture.developer_commit("feature.txt", "ok\n", "Ordinary Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    let latest = fixture
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::Completed
+    );
+    assert_eq!(latest.source_git_sha, sha);
+    assert!(fixture
+        .engine
+        .db()
+        .active_svn_commit_operation("pair")
+        .unwrap()
+        .is_none());
+    let quiet = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(quiet.git_to_svn_count, 0);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64C_ORDINARY",
+            "operation_id":latest.id,
+            "lifecycle":"completed",
+            "quiet_after_terminal":true
+        })
+    );
+}

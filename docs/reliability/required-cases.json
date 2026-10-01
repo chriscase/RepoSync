@@ -556,6 +556,15 @@
     {"id":"64B_LOCAL_MISSING", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_missing_local_object_blocks_remote_confirmation", "tier":"candidate_regression"},
     {"id":"64B_MALFORMED", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_unsupported_v1_document_is_preserved", "tier":"candidate_regression"},
     {"id":"64B_ATOMIC_FAILURE", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_finalization_failure_rolls_back_publication_receipt", "tier":"candidate_regression"},
-    {"id":"64B_CURSOR_CONFLICT", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_conflicting_legacy_cursor_is_not_overwritten", "tier":"candidate_regression"}
+    {"id":"64B_CURSOR_CONFLICT", "binary":"server_freeze", "test":"import_reconciliation_tests::candidate_64b_conflicting_legacy_cursor_is_not_overwritten", "tier":"candidate_regression"},
+    {"id":"64C_JOURNAL", "binary":"reposync_core", "test":"db::svn_commit_operations::tests::persist_hold_and_unique_finalize", "tier":"candidate_regression"},
+    {"id":"64C_RESUME_INTENT", "binary":"reposync_core", "test":"db::svn_commit_operations::tests::absent_effect_may_resume_same_intent_only", "tier":"candidate_regression"},
+    {"id":"64C_LOST_REPLY", "binary":"team_mode_e2e", "test":"candidate_64c_lost_reply_holds_without_pretending_success", "tier":"candidate_regression"},
+    {"id":"64C_UNIQUE_MATCH", "binary":"team_mode_e2e", "test":"candidate_64c_unique_match_finalizes_without_second_commit", "tier":"candidate_regression"},
+    {"id":"64C_CONFLICT_HELD", "binary":"team_mode_e2e", "test":"candidate_64c_conflict_and_mismatch_stay_held", "tier":"candidate_regression"},
+    {"id":"64C_RESUME_ONE_WRITE", "binary":"team_mode_e2e", "test":"candidate_64c_absent_unchanged_may_resume_one_write", "tier":"candidate_regression"},
+    {"id":"64C_ORDINARY", "binary":"team_mode_e2e", "test":"candidate_64c_ordinary_success_is_truthful_and_terminal", "tier":"candidate_regression"},
+    {"id":"64C_HTTP_UNIQUE_MATCH", "binary":"svn_commit_reconciliation", "test":"candidate_64c_admin_reconcile_finalizes_lost_reply", "tier":"candidate_regression"},
+    {"id":"64C_AUTH", "binary":"svn_commit_reconciliation", "test":"candidate_64c_named_admin_only_without_legacy_fallback", "tier":"candidate_regression"}
   ]
 }

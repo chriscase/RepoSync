@@ -40,7 +40,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. Absence, mismatch, descendant SHA, inspection failure, config change, and cursor conflict remain held. This is #64-B only.",
+      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. One team-engine Git→SVN commit now persists intent before svn commit, holds on a lost reply, and finalizes only a unique remote match. Absent+unchanged may resume that one write. This is #64-B plus #64-C.",
       "diagnostic_expected_baseline_failure": false
     },
     {
