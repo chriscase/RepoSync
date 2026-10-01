@@ -28,6 +28,9 @@ jobs:
       - name: Verify tools
         run: svn --version --quiet && svnadmin --version --quiet && git --version && git lfs version
 
+      - name: Reliability #62 acceptance matrix
+        run: python3 scripts/reliability-acceptance-matrix.py --self-test && python3 scripts/reliability-acceptance-matrix.py --check --report
+
       - name: Build project
         run: cargo build --workspace
 

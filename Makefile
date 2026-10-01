@@ -1,5 +1,6 @@
 .PHONY: build release test lint clean web-ui test-env-up test-env-down test-all install \
-       validate validate-quick validate-soak validate-ghe-live validate-ghe-live-dry-run
+       validate validate-quick validate-soak validate-ghe-live validate-ghe-live-dry-run \
+       reliability-matrix
 
 # Development
 build:
@@ -77,6 +78,11 @@ validate-ghe-live:
 
 validate-ghe-live-dry-run:
 	scripts/ghe-live-validation.sh --dry-run
+
+# #62 host catalog. Isolated proof remains scripts/reliability-container.sh.
+reliability-matrix:
+	python3 scripts/reliability-acceptance-matrix.py --self-test
+	python3 scripts/reliability-acceptance-matrix.py --check --report --host-tools
 
 # Docker
 docker-build:
