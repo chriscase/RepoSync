@@ -7,8 +7,8 @@ BRANCH / PR URL: feature/reposync-reliability (draft PR to main)
 REVIEW BASE SHA: 93e3f5cf24e347d7be477c2c9e0e90531268b7fc (current main = merge of #75)
 PREVIOUS REVIEWED HEAD: f9009e7e862e3910480256d3609d99ac000f9665 (merged PR #72);
   54e183484961bd9ad12bd03505b3b00610de7cd9 (merged PR #74); 93e3f5c (merged PR #75)
-CURRENT HEAD SHA: e456f96371cf9af46c3cc41bc174390004706079 (functional/docs head
-  before this evidence note; a later docs-only commit may follow)
+CURRENT HEAD SHA: 8e495dbeafdf5888154909527865b31e04028c25 (tip including
+  AtomicU64 try_update freeze-test fix; DF SHIP-WITH-NITS on this SHA)
 REMOTE HEAD MATCH / WORKTREE STATUS: ordinary commits on feature/reposync-reliability
   fast-forwarding the previously merged feature branch
 GOAL FILE / SHA-256: docs/reliability/GOAL.md
@@ -30,6 +30,7 @@ Commits on this increment, in order:
 4. `docs(reliability): #66 rewrite containment contract`
 5. this handoff
 6. host-test evidence note (this file)
+7. `fix(reliability): AtomicU64 try_update freeze-test fix` (tip)
 
 `docs/reliability/scenarios.json` is regenerated from
 `docs/reliability/acceptance-matrix.json`. Every ID in
