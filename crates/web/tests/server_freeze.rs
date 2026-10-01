@@ -661,7 +661,7 @@ async fn test_sustained_load_under_sync_cycles() {
                 }
 
                 // Update max latency.
-                let _ = max_lat.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                let _ = max_lat.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                     if elapsed_ms > cur {
                         Some(elapsed_ms)
                     } else {

@@ -1,53 +1,54 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "scope": "Phase 0 observations plus bounded history, SVN apply and tree-preservation subcases; no complete scenario acceptance or migration implemented",
+  "authored_against_main": "93e3f5cf24e347d7be477c2c9e0e90531268b7fc",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
   "scenarios": [
     {
       "id": "R01",
       "baseline": "PARTIAL",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Required real-engine R01_LINEAR, R01_ALTERNATING_DUAL_CURSOR, R01_PENDING_BOTH_DIRECTIONS, R01_FAILED_APPLY_BARRIER, R01_FAILED_APPLY_RETRY and R01_METADATA_ONLY prove bounded directional replay, mapped/stale cursor handling, stop-and-retry at failed SVN apply, explicit no-target checkpoint and no-op repeats. The four formerly failing team tests now pass after the narrow content-preservation correction. Full round-trip, post-write recovery and deployed-version acceptance remain open.",
+      "evidence": "Team-engine fixtures prove linear Git replay, directional cursor splits, lagging-P admission, failed nonempty SVN apply stop-and-retry, explicit no-target metadata revisions, and ignored-path noncollision. Intermediate tree and mapping assertions exist for those subcases. A second unchanged Git run is a no-op in R01_LINEAR. Full product-level bidirectional acceptance and live upgrade remain open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R02",
       "baseline": "PARTIAL",
-      "candidate": "NOT RUN",
+      "candidate": "PARTIAL",
       "tier": "local_api_real_remotes",
-      "evidence": "Local API confirms legacy root DELETE only disables; real disposable SVN and Git remotes unchanged. Explicit managed removal not present.",
+      "evidence": "R02_R03_ROUTE creates disposable file:// SVN and bare Git remotes, then DELETE /api/repos/{id}. The registration remains and enabled=false; message is repository disabled; both remotes are byte-identical after the call. This is the preserved legacy DELETE semantics, not a trash-bin or remote-delete operation.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R03",
       "baseline": "FAIL",
-      "candidate": "NOT RUN",
-      "tier": "local_api",
-      "evidence": "Per-repository import status can show importing while cancellation route returns HTTP 404. In-flight subprocess stages remain untested.",
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "evidence": "Merged #64-A/#74 give a durable v12 import operation ID and exact-ID cancel. R02_R03_ROUTE now asserts POST /import/cancel without an ID is HTTP 400, not 404, and does not flip synthetic in-memory progress. Real-engine cases cover connecting, mid-import, SVN child, git apply, LFS preflight, and uncertain cleanup holds. Cancellation is stop-safely, not undo.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R04",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "A held partial import is skipped by the real scheduler tick. An existing Git target is refused before replay. reset=true is refused before enrollment. A stale operation ID cannot act on a newer active operation. Reconcile serializes against the per-repo busy slot. Two independent repos remain independent in 64A_CONNECTING.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R05",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. Absence, mismatch, descendant SHA, inspection failure, config change, and cursor conflict remain held. This is #64-B only.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R06",
-      "baseline": "PARTIAL",
+      "baseline": "FAIL",
       "candidate": "NOT RUN",
-      "tier": "actual_engine_checkpoint_consequence",
-      "evidence": "The core fixture manually sets a child checkpoint after an actual SVN import and shows two descendant Git commits skipped. It does not call the API or populate a child repository row. Integrated SVN-origin API-to-child-engine coverage is NOT RUN.",
+      "tier": "actual_engine",
+      "evidence": "R06_CHECKPOINT is a baseline_observation: after a real SVN import the fixture manually assigns a child checkpoint and shows two descendant Git commits omitted. R02_R03_ROUTE also records skip_import of a Git-first feature tip with no feature.txt in SVN and an empty commit_map. Those are reproductions, not candidate acceptance.",
       "diagnostic_expected_baseline_failure": true
     },
     {
@@ -55,23 +56,23 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "evidence": "Not executed on current main. The ignored team conflict control remains uncovered (#73).",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R08",
       "baseline": "PARTIAL",
       "candidate": "NOT RUN",
-      "tier": "local_api_unrelated_git_first",
-      "evidence": "The separate API fixture accepts a Git-first feature branch and records its real provider tip. It does not prove a valid SVN-derived R06 late pair or complete R08 admission criteria.",
-      "diagnostic_expected_baseline_failure": false
+      "tier": "local_api",
+      "evidence": "The API fixture in R02_R03_ROUTE accepts an unrelated Git-first feature branch via skip_import and stores the provider tip. That is a baseline admission diagnostic, not a candidate rejection. R09 rejects rewrites of already-handled SVN-origin history; it is not a Git-first pairing test.",
+      "diagnostic_expected_baseline_failure": true
     },
     {
       "id": "R09",
       "baseline": "FAIL",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Baseline replacement writes an extra SVN revision. Candidate original, independent changed-content replacement and metadata-only amend are rejected before reset with explicit non_fast_forward; repeat/reopen and bridge/remote/SVN/checkpoint/mapping preservation subcases pass. Full recovery and lineage acceptance remain open.",
+      "evidence": "Baseline replacement of an already-handled SHA writes another SVN revision. Candidate independent developer/bridge/bare-remote replacement and metadata-only amend reject with non_fast_forward before reset, with repeat/reopen and remote/SVN/checkpoint/mapping preservation. Local dirty index, unpublished commits, and ignored-path collisions are retained.",
       "diagnostic_expected_baseline_failure": true
     },
     {
@@ -79,7 +80,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Required subcases cover L=R with lagging P, missing/ambiguous cursor, missing object, shallow history, ancestry command failure, merge DAG and >1000 pending commits. Complete selection/recovery semantics remain open.",
+      "evidence": "L=R with lagging P replays. Missing/ambiguous cursors do not borrow another repo. Missing objects, shallow history, and ancestry-command errors are distinct from rewrite. Merge DAGs and >1000 pending commits reject before writes. Policy/receipt supporting cases belong to the #63 compatibility reader.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -87,15 +88,15 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "evidence": "Personal snapshot import exists in production code and is not exercised here as an R11 required case. Default full import must stay unchanged (#68 / R12).",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R12",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "A real disposable full import completes with confirmed Git ref, cursors, and LFS pointer publication through supervised commands. reset=true remains refused. This does not qualify an unknown deployed binary.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -103,7 +104,7 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "evidence": "Phase 0 and later reliability slices did not execute this scenario.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -111,15 +112,15 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "evidence": "Not executed. Import-journal interruption (R03/R05) is a different operation type.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R15",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "A property-only SVN revision records an explicit no-target checkpoint and does not invent a Git commit. Revision-number jumps are not treated as Git rewrites by the team gate. Full R15 identity events remain open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -127,7 +128,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Required subcases distinguish missing configured branch with stale tracking ref, transport failure, synthetic auth denial and fetch failure before mutation. Broader credential/remote lifecycle acceptance remains open.",
+      "evidence": "Team inspection distinguishes missing configured branch (ignoring a stale tracking ref), transport failure, synthetic auth denial, and fetch failure. Import reconcile distinguishes remote absence from inspection failure. No automatic recreation or checkpoint advance in those cases.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -135,15 +136,15 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Required two-pair fixture keeps repository cursors scoped and allows an unrelated healthy pair while one is blocked. Full multi-repository lineage/migration acceptance remains open.",
+      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R18",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "copy_only",
+      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. This is not a complete lifecycle lock proof.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -151,7 +152,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "R19_UNTOUCHED_TREE and R19_EXPLICIT_DELETE compare full SVN exports with Git trees across addition, modification and explicit deletion while retaining unrelated top-level bytes. Broader path policy, binary/LFS and deployed-version qualification remain open.",
+      "evidence": "Full SVN export versus Git tree is compared across addition, modification, and explicit deletion while unrelated top-level bytes survive. Isolated LFS import publishes a pointer. Open PRs #51 and #44 (404) were inspected; this row does not modify provenance/LFS CI scripts.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -159,31 +160,31 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "browser",
-      "evidence": "No browser test runner configured; source lead only.",
+      "evidence": "No required exact case for deleting the currently viewed pair. Existing mounted Chrome fixtures exercise ImportProgressCard cancel/reconcile only and run in ordinary E2E, not the sealed runtime.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R21",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "A pinned original importer at 8737974 writes an installation; the candidate opens a copy and continues an SVN-only poll without resetting cursors. Ordinary startup stays schema v12 with zero candidate tables. This qualifies the pinned fixture, not production.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R22",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "copy_only",
+      "evidence": "Copy-only sealed fixtures exercise v13/v14 crash/restart, forged/future schema refusal, null mapping display, typed readers, and scoped HTTP. STARTUP_V12 proves nonactivation. These are not production migrations.",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R23",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "evidence": "#64-B verifies an already-published Git SHA and finalizes without a second push. Finalization failure rolls back the publication receipt. Conflicting legacy cursors are not overwritten. Blind old-DB restore remains forbidden by contract, not by a dedicated fixture.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -191,7 +192,7 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "not_run",
-      "evidence": "Phase 0 did not execute this scenario.",
+      "evidence": "Import start/status/cancel/reconcile are authorized admin routes with named-user denial cases. That is not a general Git-centric request surface. Supporting auth IDs remain classified under R03/R05; they are listed here only as related evidence and are owned by those rows.",
       "diagnostic_expected_baseline_failure": false
     }
   ]
