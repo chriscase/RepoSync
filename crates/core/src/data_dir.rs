@@ -1,16 +1,18 @@
-//! Singleton lockfile to prevent multiple daemon instances.
+//! Exclusive data-directory owner via the daemon lockfile.
 //!
-//! Uses an exclusive file lock (`flock`) on `{data_dir}/reposync.lock`.
-//! The lock is held for the lifetime of the returned [`LockGuard`], which
-//! keeps the file descriptor open. When the process exits — normally, via
-//! signal, or even SIGKILL — the OS releases the lock automatically.
+//! Mixed-version writer policy: one process owns `{data_dir}/reposync.lock`
+//! with an exclusive `flock`. A second daemon — including an older or newer
+//! executable — cannot take that owner while the lock is held. This is a
+//! local file lock, not a distributed lock.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use tracing::{info, warn};
+
+use crate::errors::DatabaseError;
 
 /// Guard that holds the exclusive lock. Drop releases the lock.
 #[derive(Debug)]
@@ -28,9 +30,9 @@ impl Drop for LockGuard {
 /// Acquire an exclusive lock on `{data_dir}/reposync.lock`.
 ///
 /// Returns a [`LockGuard`] that must be held for the daemon's lifetime.
-/// If another instance already holds the lock, returns an error with the
-/// other process's PID.
-pub fn acquire(data_dir: &Path) -> Result<LockGuard, String> {
+/// If another instance already holds the lock, returns [`DatabaseError::DataDirInUse`]
+/// with the other process's PID when it can be read.
+pub fn acquire(data_dir: &Path) -> Result<LockGuard, DatabaseError> {
     let lock_path = data_dir.join("reposync.lock");
 
     let file = OpenOptions::new()
@@ -39,12 +41,16 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, String> {
         .write(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|e| format!("failed to open lock file {}: {}", lock_path.display(), e))?;
+        .map_err(|e| {
+            DatabaseError::Other(format!(
+                "failed to open lock file {}: {}",
+                lock_path.display(),
+                e
+            ))
+        })?;
 
-    // Try to acquire exclusive lock (non-blocking)
-    match file.try_lock_exclusive() {
+    match try_lock_exclusive(&file) {
         Ok(()) => {
-            // Lock acquired — write our PID
             write_pid(&file, &lock_path)?;
             Ok(LockGuard {
                 _file: file,
@@ -52,27 +58,18 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, String> {
             })
         }
         Err(_) => {
-            // Lock held by another process — read its PID
             let other_pid = read_pid(&file);
 
-            // Check if that process is still alive
             if let Some(pid) = other_pid {
                 if is_process_alive(pid) {
-                    return Err(format!(
-                        "Another RepoSync daemon is already running (PID {}). \
-                         Lock file: {}",
-                        pid,
-                        lock_path.display()
-                    ));
+                    return Err(in_use(pid, &lock_path));
                 }
 
-                // Process is dead — stale lock. The OS should have released
-                // the flock when the process died, so try again.
                 warn!(
                     stale_pid = pid,
                     "detected stale lock file (PID {} is not running), retrying", pid
                 );
-                match file.try_lock_exclusive() {
+                match try_lock_exclusive(&file) {
                     Ok(()) => {
                         write_pid(&file, &lock_path)?;
                         Ok(LockGuard {
@@ -80,38 +77,56 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, String> {
                             path: lock_path,
                         })
                     }
-                    Err(e) => Err(format!(
-                        "failed to acquire lock after stale detection: {}",
-                        e
+                    Err(_) => Err(DatabaseError::Other(
+                        "failed to acquire lock after stale detection".into(),
                     )),
                 }
             } else {
-                Err(format!(
+                Err(DatabaseError::DataDirInUse(format!(
                     "Another RepoSync daemon appears to be running \
                      (could not read PID from lock file). Lock file: {}",
                     lock_path.display()
-                ))
+                )))
             }
         }
     }
 }
 
-fn write_pid(file: &File, path: &Path) -> Result<(), String> {
-    // Truncate and write current PID
+fn in_use(pid: u32, lock_path: &Path) -> DatabaseError {
+    DatabaseError::DataDirInUse(format!(
+        "Another RepoSync daemon is already running (PID {}). \
+         Lock file: {}",
+        pid,
+        lock_path.display()
+    ))
+}
+
+fn try_lock_exclusive(file: &File) -> Result<(), ()> {
+    // SAFETY: `file` is an open descriptor we own for the lockfile lifetime;
+    // flock(LOCK_EX|LOCK_NB) does not take ownership of the fd.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn write_pid(file: &File, path: &Path) -> Result<(), DatabaseError> {
     file.set_len(0)
-        .map_err(|e| format!("failed to truncate lock file: {}", e))?;
+        .map_err(|e| DatabaseError::Other(format!("failed to truncate lock file: {}", e)))?;
     let mut f = file;
-    write!(f, "{}", std::process::id())
-        .map_err(|e| format!("failed to write PID to {}: {}", path.display(), e))?;
+    write!(f, "{}", std::process::id()).map_err(|e| {
+        DatabaseError::Other(format!("failed to write PID to {}: {}", path.display(), e))
+    })?;
     f.flush()
-        .map_err(|e| format!("failed to flush lock file: {}", e))?;
+        .map_err(|e| DatabaseError::Other(format!("failed to flush lock file: {}", e)))?;
     Ok(())
 }
 
 fn read_pid(file: &File) -> Option<u32> {
     let mut contents = String::new();
     let mut f = file;
-    // Seek to beginning before reading
     use std::io::Seek;
     f.seek(std::io::SeekFrom::Start(0)).ok()?;
     f.read_to_string(&mut contents).ok()?;
@@ -119,14 +134,14 @@ fn read_pid(file: &File) -> Option<u32> {
 }
 
 fn is_process_alive(#[allow(unused)] pid: u32) -> bool {
-    // On Unix, kill(pid, 0) checks if the process exists without sending a signal
     #[cfg(unix)]
     {
+        // SAFETY: kill(pid, 0) only probes existence; it does not signal.
+        // SAFETY: kill(pid, 0) only probes existence; it does not deliver a signal.
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
-        // On non-Unix, assume alive (conservative)
         true
     }
 }
@@ -147,7 +162,7 @@ mod tests {
         let pid: u32 = contents.trim().parse().unwrap();
         assert_eq!(pid, std::process::id());
 
-        drop(guard); // release lock
+        drop(guard);
     }
 
     #[test]
@@ -155,11 +170,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = acquire(dir.path()).unwrap();
 
-        // Second acquire should fail
         let result = acquire(dir.path());
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("already running"), "Error was: {}", err);
+        let msg = err.to_string();
+        assert!(msg.contains("already running"), "Error was: {}", msg);
+        assert!(matches!(err, DatabaseError::DataDirInUse(_)));
     }
 
     #[test]
@@ -168,10 +184,8 @@ mod tests {
 
         {
             let _guard = acquire(dir.path()).unwrap();
-            // guard drops here
         }
 
-        // Should succeed since lock was released
         let _guard2 = acquire(dir.path()).unwrap();
     }
 }

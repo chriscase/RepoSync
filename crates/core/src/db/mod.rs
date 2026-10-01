@@ -46,6 +46,11 @@ impl Database {
 
         let conn = Connection::open(path)?;
 
+        // Refuse a future schema before WAL checkpoint or other writes.
+        let existing_version: u32 =
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        schema::refuse_future_schema(existing_version)?;
+
         // Enable WAL mode for better concurrent read performance.
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -92,6 +97,22 @@ impl Database {
         schema::run_migrations(&conn)?;
         debug!("database schema is up to date");
         Ok(())
+    }
+
+    /// Ordinary writer startup: exclusive `reposync.lock` owner, then v12 init.
+    ///
+    /// The returned [`crate::data_dir::LockGuard`] must be held for the process
+    /// lifetime. Additional SQLite connections to the same file are allowed
+    /// in-process; a second process cannot take the owner.
+    pub fn open_with_exclusive_owner(
+        data_dir: impl AsRef<Path>,
+    ) -> Result<(Self, crate::data_dir::LockGuard), DatabaseError> {
+        let data_dir = data_dir.as_ref();
+        std::fs::create_dir_all(data_dir)?;
+        let owner = crate::data_dir::acquire(data_dir)?;
+        let db = Self::new(data_dir.join("reposync.db"))?;
+        db.initialize()?;
+        Ok((db, owner))
     }
 
     /// Obtain a lock on the underlying connection.

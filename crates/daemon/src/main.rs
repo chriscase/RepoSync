@@ -3,7 +3,6 @@
 //! Loads configuration, initializes all subsystems, starts the web server
 //! and sync scheduler, and handles graceful shutdown.
 
-mod lockfile;
 pub(crate) mod memory;
 mod scheduler;
 mod signals;
@@ -128,24 +127,18 @@ async fn main() -> Result<()> {
     info!("Log level     : {}", log_level);
     info!("========================================");
 
-    // Ensure data directory exists
-    std::fs::create_dir_all(&config.daemon.data_dir).context("failed to create data directory")?;
-
-    // Acquire singleton lock — prevents duplicate daemon instances.
+    // Exclusive data-directory owner (reposync.lock) plus schema init.
     // The lock is held for the lifetime of _lock_guard. On process exit
     // (including SIGKILL/crash), the OS releases the flock automatically.
-    let _lock_guard = lockfile::acquire(&config.daemon.data_dir).map_err(|e| {
-        error!("{}", e);
-        anyhow::anyhow!("{}", e)
-    })?;
+    let (db, _lock_guard) =
+        Database::open_with_exclusive_owner(&config.daemon.data_dir).map_err(|e| {
+            error!("{}", e);
+            anyhow::anyhow!("{}", e)
+        })?;
     info!("Acquired singleton lock (PID {})", std::process::id());
 
-    // Initialize database
-    let db_path = config.daemon.data_dir.join("reposync.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
-    db.initialize()
-        .context("failed to initialize database schema")?;
     // Open a second connection for the web server (SQLite supports multiple readers with WAL)
+    let db_path = config.daemon.data_dir.join("reposync.db");
     let web_db = Database::new(&db_path).context("failed to open web database connection")?;
     info!("Database initialized at {}", db_path.display());
 

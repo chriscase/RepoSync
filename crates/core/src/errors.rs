@@ -360,6 +360,14 @@ pub enum DatabaseError {
     #[error("database migration failed (version {version}): {detail}")]
     MigrationFailed { version: u32, detail: String },
 
+    /// The on-disk schema is newer than this executable.
+    #[error("unsupported database schema version {found}; this executable supports {supported}")]
+    UnsupportedSchema { found: u32, supported: u32 },
+
+    /// Another process already owns this data directory via `reposync.lock`.
+    #[error("{0}")]
+    DataDirInUse(String),
+
     /// A record was not found.
     #[error("{entity} not found: {id}")]
     NotFound { entity: String, id: String },
