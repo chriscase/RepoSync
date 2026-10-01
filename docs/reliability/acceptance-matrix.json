@@ -134,7 +134,11 @@
         "64B_REMOTE_MISSING",
         "64B_REMOTE_MISMATCH",
         "64B_REMOTE_ADVANCED",
-        "64B_INSPECTION_FAILURE"
+        "64B_INSPECTION_FAILURE",
+        "64C_LOST_REPLY",
+        "64C_UNIQUE_MATCH",
+        "64C_CONFLICT_HELD",
+        "64C_RESUME_ONE_WRITE"
       ],
       "supporting_case_ids": [
         "64B_PARTIAL_CONFIRMED",
@@ -143,14 +147,19 @@
         "64B_ATOMIC_FAILURE",
         "64B_CURSOR_CONFLICT",
         "64B_CONFIG_CHANGED",
-        "64B_AUTH"
+        "64B_AUTH",
+        "64C_JOURNAL",
+        "64C_RESUME_INTENT",
+        "64C_ORDINARY",
+        "64C_HTTP_UNIQUE_MATCH",
+        "64C_AUTH"
       ],
       "open": [
-        "SVN commit lost-reply recovery is not implemented",
         "Automatic/background reconciliation is not implemented",
-        "General team-sync journal is not implemented"
+        "General team-sync journal is not implemented",
+        "Git-push lost-reply recovery beyond full import remains #64-B only"
       ],
-      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. Absence, mismatch, descendant SHA, inspection failure, config change, and cursor conflict remain held. This is #64-B only.",
+      "evidence": "Full-import Git publication can persist intent, hold on a lost push reply or failed finalizer, and later verify the exact remote SHA with read-only ls-remote. One team-engine Git→SVN commit now persists intent, holds on a lost commit reply or failed checkpoint, and finalizes only a unique SVN UUID/path/ancestry/paths/tree plus durable identity match. Absent+unchanged authorizes resume of that one write. This is #64-B plus #64-C.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -514,16 +523,19 @@
       "required_case_ids": [
         "64B_LOST_REPLY_COMPLETE",
         "64B_FINALIZER_RECOVERY",
-        "64B_ATOMIC_FAILURE"
+        "64B_ATOMIC_FAILURE",
+        "64C_UNIQUE_MATCH",
+        "64C_RESUME_ONE_WRITE"
       ],
       "supporting_case_ids": [
-        "64B_CURSOR_CONFLICT"
+        "64B_CURSOR_CONFLICT",
+        "64C_CONFLICT_HELD"
       ],
       "open": [
         "Restoring an old DB after remote writes and blindly replaying is not a dedicated negative case",
-        "SVN-side post-write recovery is not implemented"
+        "Automatic/background SVN recovery is not implemented"
       ],
-      "evidence": "#64-B verifies an already-published Git SHA and finalizes without a second push. Finalization failure rolls back the publication receipt. Conflicting legacy cursors are not overwritten. Blind old-DB restore remains forbidden by contract, not by a dedicated fixture.",
+      "evidence": "#64-B verifies an already-published Git SHA and finalizes without a second push. #64-C verifies one accepted Git→SVN commit by UUID/path/revision ancestry/changed paths/tree and the durable operation identity, or authorizes resume when the effect is absent and the pre-write target is unchanged. Blind old-DB restore remains forbidden by contract, not by a dedicated fixture.",
       "diagnostic_expected_baseline_failure": false
     },
     {

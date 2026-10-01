@@ -635,6 +635,19 @@ impl GitClient {
         Ok(commit.parent_count())
     }
 
+    /// First parent SHA (if any) and the commit tree object ID.
+    pub fn commit_parent_and_tree(&self, sha: &str) -> Result<(Option<String>, String), GitError> {
+        let oid = Oid::from_str(sha)?;
+        let commit = self.repo.find_commit(oid)?;
+        let tree = commit.tree()?.id().to_string();
+        let parent = if commit.parent_count() > 0 {
+            Some(commit.parent_id(0)?.to_string())
+        } else {
+            None
+        };
+        Ok((parent, tree))
+    }
+
     /// Get the list of changed files for a specific commit.
     ///
     /// Returns a vec of `(action, path)` tuples where action is "A" (added),

@@ -6,6 +6,7 @@
 pub mod import_operations;
 pub mod queries;
 pub mod schema;
+pub mod svn_commit_operations;
 
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;

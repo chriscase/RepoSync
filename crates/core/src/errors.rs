@@ -243,6 +243,10 @@ pub enum SyncError {
     #[error("team history reconciliation required ({reason}): {detail}")]
     HistoryBlocked { reason: String, detail: String },
 
+    /// One Git→SVN commit is held until explicit remote inspection.
+    #[error("git-to-svn commit reconciliation required ({reason}): {detail}")]
+    SvnCommitHeld { reason: String, detail: String },
+
     /// The sync detected an unresolvable conflict.
     #[error("unresolvable conflict on '{file_path}': {detail}")]
     UnresolvableConflict { file_path: String, detail: String },
@@ -282,6 +286,7 @@ impl SyncError {
         match self {
             SyncError::SvnError(e) => e.is_permanent(),
             SyncError::GitError(e) => e.is_permanent(),
+            SyncError::SvnCommitHeld { .. } | SyncError::HistoryBlocked { .. } => true,
             _ => false,
         }
     }

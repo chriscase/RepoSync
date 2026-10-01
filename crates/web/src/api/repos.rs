@@ -14,6 +14,7 @@ use reposync_core::db::import_operations::{
     import_target_fingerprint, ImportOperation, ImportOperationState,
 };
 use reposync_core::db::queries::AuditLogInput;
+use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::errors::DatabaseError;
 use reposync_core::file_policy::FilePolicy;
@@ -202,6 +203,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/repos/:id/import/:operation_id/reconcile",
             post(reconcile_repo_import),
+        )
+        .route(
+            "/api/repos/:id/svn-commit/:operation_id",
+            get(svn_commit_status),
+        )
+        .route(
+            "/api/repos/:id/svn-commit/:operation_id/reconcile",
+            post(reconcile_svn_commit),
         )
         .route(
             "/api/repos/:id/import/cancel",
@@ -1497,6 +1506,162 @@ async fn reconcile_repo_import(
         reconciled.publication_recorded,
         reconciled.completed,
     ))
+}
+
+fn svn_commit_status_json(
+    op: &reposync_core::db::svn_commit_operations::SvnCommitOperation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": op.id,
+        "lifecycle": op.state,
+        "operation_type": op.operation_type,
+        "source_git_sha": op.source_git_sha,
+        "source_git_parent": op.source_git_parent,
+        "source_git_tree": op.source_git_tree,
+        "target_svn_uuid": op.target_svn_uuid,
+        "target_svn_path": op.target_svn_path,
+        "pre_write_svn_rev": op.pre_write_svn_rev,
+        "pre_write_svn_tree": op.pre_write_svn_tree,
+        "intended_svn_tree": op.intended_svn_tree,
+        "last_confirmed_svn_rev": op.last_confirmed_svn_rev,
+        "last_confirmed_svn_tree": op.last_confirmed_svn_tree,
+        "resume_authorized": op.resume_authorized,
+        "outcome_detail": op.outcome_detail,
+    })
+}
+
+async fn svn_commit_status(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, operation_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+    state
+        .db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    let op = state
+        .db
+        .get_svn_commit_operation(&id, &operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("git-to-svn commit operation not found".into()))?;
+    Ok(Json(svn_commit_status_json(&op)))
+}
+
+async fn reconcile_svn_commit(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, operation_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+    let mut busy_guard = None;
+    for _ in 0..100 {
+        busy_guard = reposync_core::busy::try_acquire(&id);
+        if busy_guard.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _busy_guard = busy_guard.ok_or_else(|| {
+        AppError::BadRequest("repository is busy; retry remote verification later".into())
+    })?;
+
+    let db = &state.db;
+    let repo = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    let requested = db
+        .get_svn_commit_operation(&id, &operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("git-to-svn commit operation not found".into()))?;
+    if requested.state == SvnCommitOperationState::Completed
+        && db
+            .active_svn_commit_operation(&id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .is_none()
+    {
+        return Ok(Json(serde_json::json!({
+            "operation_id": requested.id,
+            "previous_lifecycle": requested.state,
+            "lifecycle": requested.state,
+            "publication_proved": true,
+            "checkpoint_completed": true,
+            "may_resume": false,
+            "remaining_reason": requested.outcome_detail,
+        })));
+    }
+
+    let svn_password = db
+        .resolve_credential_chain(&id, "secret_svn_password")
+        .unwrap_or_default();
+    let svn = SvnClient::new(&repo.svn_url, &repo.svn_username, &svn_password);
+    let allowed_paths: Vec<String> = repo
+        .allowed_paths
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let blocked_patterns: Vec<String> = repo
+        .blocked_patterns
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let projection = serde_json::json!({
+        "allowed_paths": allowed_paths,
+        "blocked_patterns": blocked_patterns,
+    })
+    .to_string();
+    let reconciled = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        db,
+        &id,
+        &operation_id,
+        &svn,
+        &projection,
+    )
+    .await
+    .map_err(import_write_error)?;
+    Ok(Json(serde_json::json!({
+        "operation_id": requested.id,
+        "previous_lifecycle": requested.state,
+        "lifecycle": reconciled.operation.state,
+        "recorded_source_git_sha": requested.source_git_sha,
+        "recorded_pre_write_svn_rev": requested.pre_write_svn_rev,
+        "recorded_target_svn_uuid": requested.target_svn_uuid,
+        "observed": match &reconciled.inspect {
+            reposync_core::svn_commit::SvnCommitInspect::UniqueMatch { svn_rev, svn_tree, .. } => {
+                serde_json::json!({"kind":"unique_match","svn_rev":svn_rev,"svn_tree":svn_tree})
+            }
+            reposync_core::svn_commit::SvnCommitInspect::AbsentUnchanged => {
+                serde_json::json!({"kind":"absent_unchanged"})
+            }
+            reposync_core::svn_commit::SvnCommitInspect::Conflict { reason } => {
+                serde_json::json!({"kind":"conflict","reason":reason})
+            }
+            reposync_core::svn_commit::SvnCommitInspect::Unavailable { reason } => {
+                serde_json::json!({"kind":"unavailable","reason":reason})
+            }
+        },
+        "publication_proved": reconciled.finalized,
+        "checkpoint_completed": reconciled.finalized,
+        "may_resume": reconciled.resume_authorized,
+        "remaining_reason": reconciled.operation.outcome_detail,
+        "resume_authorized": reconciled.operation.resume_authorized,
+    })))
 }
 
 async fn cancel_repo_import_without_id(
