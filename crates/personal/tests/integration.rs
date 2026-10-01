@@ -2759,3 +2759,192 @@ async fn test_replay_path_normal_content_written_to_svn() {
         "SVN WC file content must match Git content"
     );
 }
+
+fn git_sha(repo: &Path) -> String {
+    let output = Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_cmd(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Personal-mode Git→SVN uses the same P/O/R/L inspection before replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_personal_rewrite_contained() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::history_block_key;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = {
+        let repo = svn_url.strip_prefix("file://").unwrap();
+        String::from_utf8_lossy(
+            &Command::new("svnlook")
+                .args(["youngest", repo])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .parse::<i64>()
+        .unwrap()
+    };
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    std::fs::write(git_work.join("feature.txt"), "first version\n").unwrap();
+    git_client
+        .commit(
+            "First Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let handled = git_sha(&git_work);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+    drop(db);
+
+    git_cmd(&git_work, &["reset", "--hard", &imported_base]);
+    std::fs::write(git_work.join("feature.txt"), "rewritten version\n").unwrap();
+    git_client
+        .commit(
+            "Rewritten Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push_force("origin", "main").unwrap();
+    let rewritten = git_sha(&git_work);
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    drop(git_client);
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let engine = PersonalSyncEngine::new(
+        config.clone(),
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let err = engine
+        .run_cycle()
+        .await
+        .expect_err("personal rewrite must be refused before replay");
+    let err_text = format!("{err:#}");
+    assert!(
+        err_text.contains("non_fast_forward"),
+        "personal inspection must use the team classification: {err_text}"
+    );
+    drop(engine);
+    let block_raw = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .unwrap();
+    let block: serde_json::Value = serde_json::from_str(&block_raw).unwrap();
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(block["reason"], "non_fast_forward");
+    assert_eq!(block["durable"], true);
+    assert_eq!(block["p_handled"], handled);
+    assert_eq!(block["r_fresh_remote"], rewritten);
+    let restore_ref = format!("{handled}:refs/heads/main");
+    git_cmd(&git_work, &["push", "--force", "origin", &restore_ref]);
+    assert_eq!(
+        git_sha_at(&bare, "refs/heads/main"),
+        handled,
+        "live remote restored; admission would pass without the durable block"
+    );
+
+    let restarted = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let again = restarted
+        .run_cycle()
+        .await
+        .expect_err("durable personal block must survive restored remote");
+    assert!(
+        format!("{again:#}").contains("non_fast_forward"),
+        "{again:#}"
+    );
+    let svn_after = {
+        let repo = svn_url.strip_prefix("file://").unwrap();
+        String::from_utf8_lossy(
+            &Command::new("svnlook")
+                .args(["youngest", repo])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .parse::<i64>()
+        .unwrap()
+    };
+    assert_eq!(svn_after, svn_before, "personal rewrite must not write SVN");
+    assert_eq!(
+        git_sha(&git_work),
+        handled,
+        "personal checkout must not reset"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_PERSONAL", "p":handled, "blocked_r":rewritten,
+            "restored_remote":handled, "reason":"non_fast_forward",
+            "durable":true, "svn_revision_before_after":svn_before,
+            "mode":"personal"
+        })
+    );
+}
+
+fn git_sha_at(repo: &Path, rev: &str) -> String {
+    let output = Command::new("git")
+        .args(["-C", repo.to_str().unwrap(), "rev-parse", rev])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}

@@ -195,6 +195,30 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "R09_POLLING_ONLY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_polling_only_force_push",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_DURABLE_BLOCK",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_durable_block_survives_restored_remote",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_PERSONAL",
+      "binary": "integration",
+      "test": "candidate_r09_personal_rewrite_contained",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_WEBHOOK_FORCED_HINT",
+      "binary": "github_webhook_forced",
+      "test": "candidate_r09_webhook_forced_is_hint_not_reset",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R01_IGNORED_NONCOLLISION",
       "binary": "team_mode_e2e",
       "test": "candidate_r01_ignored_noncollision_allows_qualified_sync",

@@ -23,6 +23,10 @@ use reposync_core::config::GitProvider;
 struct GitHubPushPayload {
     #[serde(rename = "ref")]
     git_ref: String,
+    /// GitHub/Gitea hint that the push was not a fast-forward. Never authority
+    /// to reset; polling inspection remains the safety gate.
+    #[serde(default)]
+    forced: bool,
     commits: Option<Vec<GitHubCommitPayload>>,
     repository: Option<GitHubRepoPayload>,
 }
@@ -63,6 +67,11 @@ struct SvnPostCommitPayload {
 struct WebhookResponse {
     ok: bool,
     message: String,
+    /// Present on GitHub push events. `true` only means "inspect"; never reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forced_hint: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inspection: Option<&'static str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +144,8 @@ async fn github_webhook(
         return Ok(Json(WebhookResponse {
             ok: true,
             message: format!("event type '{}' ignored", event_type),
+            forced_hint: None,
+            inspection: None,
         }));
     }
 
@@ -154,10 +165,11 @@ async fn github_webhook(
         repo = repo_name,
         git_ref = %payload.git_ref,
         commits = commit_count,
-        "received GitHub push webhook"
+        forced_hint = payload.forced,
+        "received GitHub push webhook; forced is a hint, polling inspection is the safety gate"
     );
 
-    // Trigger an immediate sync
+    // Same ordinary sync trigger as an unforced push. Do not reset from this flag.
     if let Err(e) = state.sync_trigger.send(()).await {
         warn!("failed to trigger sync from webhook: {}", e);
     }
@@ -168,15 +180,27 @@ async fn github_webhook(
         "source": "github",
         "ref": payload.git_ref,
         "commits": commit_count,
+        "forced_hint": payload.forced,
+        "inspection": "polling_safety_gate",
     });
     let _ = state.ws_broadcast.send(update.to_string());
 
-    Ok(Json(WebhookResponse {
-        ok: true,
-        message: format!(
+    let message = if payload.forced {
+        format!(
+            "push event received (forced=true is a hint only; polling inspects), {} commits, sync triggered",
+            commit_count
+        )
+    } else {
+        format!(
             "push event received, {} commits, sync triggered",
             commit_count
-        ),
+        )
+    };
+    Ok(Json(WebhookResponse {
+        ok: true,
+        message,
+        forced_hint: Some(payload.forced),
+        inspection: Some("polling_safety_gate"),
     }))
 }
 
@@ -233,5 +257,7 @@ async fn svn_webhook(
     Ok(Json(WebhookResponse {
         ok: true,
         message: format!("SVN revision {} received, sync triggered", payload.revision),
+        forced_hint: None,
+        inspection: None,
     }))
 }

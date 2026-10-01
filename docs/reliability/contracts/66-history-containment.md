@@ -1,7 +1,10 @@
 # #66 contract: rewritten or unproven history before reset/replay
 
-**Status:** design/contract for remaining work after the merged team
-pre-reset gate. This PR does not change `inspect_team_history`.
+**Status:** smallest remaining product slice after the merged team
+pre-reset gate. Team `inspect_team_history` classifications are unchanged;
+this slice persists a durable `reconciliation_required` rewrite block, applies
+the same P/O/R/L inspect to personal-mode Git→SVN, and treats webhook `forced`
+as a hint. Automatic rewrite reconciliation and merge-DAG replay remain later.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
