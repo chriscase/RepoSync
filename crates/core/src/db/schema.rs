@@ -3,7 +3,7 @@
 //! Migrations are simple SQL strings applied in order. The `schema_version`
 //! user-version pragma tracks which migrations have already been applied.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info};
 
 use crate::errors::DatabaseError;
@@ -295,28 +295,75 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
     ),
 ];
 
+/// Operational schema version for ordinary startup. Candidate v13/v14 SQL is
+/// not registered here and must not be applied by [`run_migrations`].
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+
 /// Run all pending migrations against `conn`.
+///
+/// Each migration's SQL batch and its `PRAGMA user_version` bump run in one
+/// SQLite transaction. A newer `user_version` than [`CURRENT_SCHEMA_VERSION`]
+/// is refused before any migration write.
 pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
     let current_version = get_schema_version(conn)?;
     info!(
         current_version,
-        target_version = MIGRATIONS.last().map(|m| m.0).unwrap_or(0),
+        target_version = CURRENT_SCHEMA_VERSION,
         "checking database migrations"
     );
+    refuse_future_schema(current_version)?;
 
     for &(version, description, sql) in MIGRATIONS {
+        if version > CURRENT_SCHEMA_VERSION {
+            continue;
+        }
         if version > current_version {
-            info!(version, description, "applying migration");
-            conn.execute_batch(sql)
-                .map_err(|e| DatabaseError::MigrationFailed {
-                    version,
-                    detail: e.to_string(),
-                })?;
-            set_schema_version(conn, version)?;
-            debug!(version, "migration applied successfully");
+            apply_one_migration(conn, version, description, sql)?;
         }
     }
 
+    Ok(())
+}
+
+/// Refuse a schema written by a newer executable.
+pub fn refuse_future_schema(found: u32) -> Result<(), DatabaseError> {
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(DatabaseError::UnsupportedSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Apply one migration SQL batch and its version bump in a single transaction.
+fn apply_one_migration(
+    conn: &Connection,
+    version: u32,
+    description: &str,
+    sql: &str,
+) -> Result<(), DatabaseError> {
+    info!(version, description, "applying migration");
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(|e| {
+        DatabaseError::MigrationFailed {
+            version,
+            detail: e.to_string(),
+        }
+    })?;
+    tx.execute_batch(sql)
+        .map_err(|e| DatabaseError::MigrationFailed {
+            version,
+            detail: e.to_string(),
+        })?;
+    set_schema_version(&tx, version).map_err(|e| DatabaseError::MigrationFailed {
+        version,
+        detail: e.to_string(),
+    })?;
+    tx.commit().map_err(|e| DatabaseError::MigrationFailed {
+        version,
+        detail: e.to_string(),
+    })?;
+    debug!(version, "migration applied successfully");
     Ok(())
 }
 
@@ -341,7 +388,72 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap();
-        assert_eq!(get_schema_version(&conn).unwrap(), 12);
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(MIGRATIONS.last().map(|m| m.0), Some(CURRENT_SCHEMA_VERSION));
+        assert!(MIGRATIONS
+            .iter()
+            .all(|(v, _, _)| *v <= CURRENT_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn test_midway_failure_rolls_back_sql_and_user_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+
+        let err = apply_one_migration(
+            &conn,
+            CURRENT_SCHEMA_VERSION + 1,
+            "intentional midway failure",
+            "CREATE TABLE probe_should_rollback (id INTEGER PRIMARY KEY);\n\
+             SELECT * FROM __reposync_missing_table__;",
+        )
+        .unwrap_err();
+        match err {
+            DatabaseError::MigrationFailed { version, detail } => {
+                assert_eq!(version, CURRENT_SCHEMA_VERSION + 1);
+                assert!(
+                    detail.contains("__reposync_missing_table__")
+                        || detail.contains("no such table"),
+                    "unexpected migration error detail: {detail}"
+                );
+            }
+            other => panic!("expected MigrationFailed, got {other:?}"),
+        }
+
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'probe_should_rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "partial SQL must roll back with user_version");
+    }
+
+    #[test]
+    fn test_future_user_version_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        let err = run_migrations(&conn).unwrap_err();
+        match err {
+            DatabaseError::UnsupportedSchema { found, supported } => {
+                assert_eq!(found, 99);
+                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+        assert_eq!(get_schema_version(&conn).unwrap(), 99);
+        let candidate_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'pair_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(candidate_tables, 0);
     }
 
     #[test]

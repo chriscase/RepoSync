@@ -8,6 +8,7 @@ pub mod busy;
 pub mod config;
 pub mod conflict;
 pub mod crypto;
+pub mod data_dir;
 pub mod db;
 pub mod errors;
 pub mod file_policy;

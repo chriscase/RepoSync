@@ -111,7 +111,10 @@ is unacceptable.
 
 ## Smallest next implementation slice (after this review)
 
-Do **not** activate v13/v14.
+Do **not** activate v13/v14. Ordinary startup remains `user_version=12`.
+
+The three items below are the reviewed implementation slice. Candidate tables,
+operational typed readers, and installer wiring stay later.
 
 1. Make `run_migrations` apply one migration SQL batch and its
    `user_version` bump in a single transaction, with a failing-midway test
