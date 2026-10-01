@@ -1890,6 +1890,11 @@ impl SyncEngine {
 
     #[cfg(debug_assertions)]
     fn svn_commit_fixture_flag(&self, var: &str, repo_id: &str) -> bool {
+        let scoped = format!("{}__{}", var, repo_id);
+        if std::env::var(&scoped).is_ok() {
+            return true;
+        }
+        // Legacy single-threaded harness: one global var names the target repo.
         std::env::var(var).ok().as_deref() == Some(repo_id)
     }
 
