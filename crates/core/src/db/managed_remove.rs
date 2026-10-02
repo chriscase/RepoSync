@@ -1033,7 +1033,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(done.state, GitPushOperationState::Completed);
-        assert!(db.active_git_push_operation("quiet-repo").unwrap().is_none());
+        assert!(db
+            .active_git_push_operation("quiet-repo")
+            .unwrap()
+            .is_none());
 
         match db
             .prepare_managed_remove("quiet-repo", "admin", "req")
@@ -1048,7 +1051,9 @@ mod tests {
 
     #[test]
     fn removal_still_blocked_by_git_to_svn_commit() {
-        use crate::db::svn_commit_operations::{IntendedPath, SvnCommitIntent, SvnCommitOperationState};
+        use crate::db::svn_commit_operations::{
+            IntendedPath, SvnCommitIntent, SvnCommitOperationState,
+        };
 
         let db = setup();
         let r = repo("svn-repo", "Svn", None);
@@ -1096,7 +1101,9 @@ mod tests {
 
     #[test]
     fn removal_still_blocked_by_git_to_svn_reconcile_hold() {
-        use crate::db::svn_commit_operations::{IntendedPath, SvnCommitIntent, SvnCommitOperationState};
+        use crate::db::svn_commit_operations::{
+            IntendedPath, SvnCommitIntent, SvnCommitOperationState,
+        };
 
         let db = setup();
         let r = repo("svn-held", "SvnHeld", None);
