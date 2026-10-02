@@ -1,61 +1,40 @@
-# READY_FOR_REVIEW — #67 late-pair admission/preview slice
+# READY_FOR_REVIEW — #69 pair-refresh preview slice
 
 ```text
 STATUS: READY_FOR_REVIEW
-EPIC / ISSUES: Refs #67 (this slice); Refs #61 (epic). Do not close either.
-BRANCH / PR URL: cursor/67-late-pair-admission-61e1 — https://github.com/chriscase/RepoSync/pull/82 (draft)
-REVIEW BASE SHA: 779d8e2b76f92cc98adf9153d0a97f725918c5fe
-PREVIOUS REVIEWED HEAD: none for this branch
-CURRENT HEAD SHA: 5cddec9e6ce9dcdd1f806f73f62f3260b4c90601
-REMOTE HEAD MATCH / WORKTREE STATUS: ordinary commits on cursor/67-late-pair-admission-61e1
+EPIC / ISSUES: Refs #69 (this slice); Refs #61 (epic). Do not close either.
+BRANCH: cursor/69-pair-refresh-preview-c31e
+REVIEW BASE SHA: b501d3e2bee97d041a56834adf3bfd23c5b363f0
 GOAL FILE / SHA-256: docs/reliability/GOAL.md
   16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8
-AGENT: bc-107871d8-17b1-5ed0-a9cf-4107850961e1
 ```
+
+The exact CURRENT HEAD SHA is the draft PR tip. This note is part of that tip, so it does not embed a self-hash.
 
 ## DELIVERED
 
-Smallest independently mergeable #67 product slice: SVN-origin admission and dry-run/preview for late pairing. Full replay/publish is not in this PR.
+Smallest independently mergeable #69 slice: ADR, operation table, and a read-only **update pair from parent** preview. Execution and re-anchor are not in this PR.
 
-- `POST /api/repos/{id}/branches` defaults to `dry_run`/`preview`. It proves the Git tip descends from a verified SVN-import mapping (scoped applied records + completed import SHA plus `merge-base --is-ancestor`). Unrelated Git-first / orphan history is refused before SVN copy, checkpoint write, remote mutation, or child insert.
-- A Git-created development ref that truly descends from verified SVN-derived parent history is admitted. Snapshot-bounded ancestry is enough.
-- The preview pins Git tip, SVN source/target revisions (or unknowns), parent/pair identity, and `late_pair_admission_v1`. It reports inherited work, pending Git count/summary, pending SVN if knowable, proposed copy source for a new target, existing-target non-equivalence, and `pair_state=preparing`.
-- Unsafe `skip_import` / start-from-now is refused (`unsafe_skip_import`). `compatibility_skip_import` can acknowledge the request in the plan but still does not apply watermarks. An existing SVN path is never treated as equivalent.
-- `dry_run=false` returns `publish_not_implemented`. No scheduler-active child is created.
+- `docs/reliability/contracts/69-pair-refresh.md` defines the default history-preserving refresh, merge/echo treatment, and the separate re-anchor mode.
+- `POST /api/repos/{pair_id}/refresh` pins Git tips, SVN UUID/paths/revisions, `pair_refresh_preview_v1`, and compatibility generation `1`. The plan digest binds those inputs. Unsynced work on both sides is reported. `discards_unsynced_work` is false.
+- `execute=true` / `dry_run=false` returns `refresh_execute_not_implemented`. No durable #64 job is started. No external Git or SVN write and no checkpoint mutation.
+- `reanchor` / `recreate` returns `reanchor_not_implemented`. The UI shows that refusal. Re-anchor is not an alias for reset or force-push.
+- Rewritten lineage (#66) is not counted as new work. Verified mappings reuse #67/#68. Snapshot ancestry is enough for an inherited baseline.
 
-R06, R07, and R08 are PARTIAL. Replay, conflict UI, #69, closing #67/#61 remain later.
+R13 is **PARTIAL**. R14 stays **NOT RUN**. This does not close #69 or #61.
 
 ## OPEN / PARTIAL
 
-R06/R07/R08 PARTIAL. Full Git→SVN replay, overlapping conflict resolution, and publish of a reconciled pair are later. R02/R09/R11/R12 remain PARTIAL as previously.
+- Update-pair execution, digest revalidation, and the #64 durable job
+- Conflict resolution beyond reporting `both_advanced`
+- Re-anchor generation and retirement
+- Crash recovery across Git, SVN, and SQLite (R14)
+- Closing #69 / #61
 
 ## EVIDENCE
 
-Commands at this head (`cp -f docs/reliability/fixtures/Cargo.lock Cargo.lock` first; rustc 1.99.0 / cargo 1.99.0):
+`docs/reliability/GOAL.md` remains `16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8`.
 
-```text
-sha256sum docs/reliability/GOAL.md
-# 16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8
+Named cases: `R13_PREVIEW_PINS_INPUTS`, `R13_PENDING_BOTH_SIDES`, `R13_EXECUTE_REFUSED`, `R13_REANCHOR_NOT_IMPLEMENTED`, `R13_REWRITTEN_LINEAGE`, `R13_DIGEST_BINDS_INPUTS`.
 
-cargo test -p reposync-core --locked --lib late_pair
-# ok. 7 passed; 0 failed; 0 ignored; 0 measured; 240 filtered out
-
-cargo test -p reposync-web --locked --test server_freeze -- candidate_r0 --test-threads=2
-# ok. 9 passed (6 late-pair + overlapping R02 names); 0 failed
-
-cargo test -p reposync-web --locked --test server_freeze diagnostic_r02_r03_root_delete -- --test-threads=2
-# ok. 1 passed (R02_R03_ROUTE refuses skip_import of unproven Git-first)
-
-cargo clippy -p reposync-core -p reposync-web --locked -- -D warnings
-# Finished `dev` profile (libs/bins only; --all-targets hits pre-existing team_mode_e2e lints)
-
-python3 scripts/reliability-acceptance-matrix.py --self-test
-# SELF-TEST: PASS
-
-python3 scripts/reliability-acceptance-matrix.py --check --report
-# CHECK: PASS; R06/R07/R08 PARTIAL; PASS rollup 0 / PARTIAL 20 / NOT RUN 4
-```
-
-API fixture note: `push_feature_commits` must checkout `origin/main` (snapshot SHA). Bare `git init` leaves unborn `master` as HEAD; `checkout -b feature` from that clone created an unrelated root and falsely failed admission.
-
-Leave this PR **draft**. Do not merge. Do not undraft. Keep #67 and #61 open.
+Leave this PR **draft**. Do not merge. Do not undraft. Keep #69 and #61 open. Leave #51 and #52 alone.

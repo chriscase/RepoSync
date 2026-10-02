@@ -132,6 +132,54 @@ export interface LatePairPlan {
   skip_import_note: string;
 }
 
+export interface PairRefreshPlan {
+  mode: string;
+  operation: string;
+  executed: boolean;
+  published: boolean;
+  durable_job_started: boolean;
+  policy_version: string;
+  pair_id: string;
+  parent_id: string;
+  pair_generation: number;
+  generation_source: string;
+  pins_complete: boolean;
+  plan_id: string;
+  plan_digest: string;
+  approval: { eligible: boolean; reason: string; binds_to: string };
+  git: {
+    pair_branch: string;
+    parent_branch: string;
+    pair_tip: string | null;
+    parent_tip: string | null;
+    pair_local_tip: string | null;
+    parent_local_tip: string | null;
+  };
+  svn: {
+    uuid: string | null;
+    pair_path: string;
+    parent_path: string;
+    pair_revision: number | null;
+    parent_revision: number | null;
+  };
+  pending: {
+    pair_git: { knowable: boolean; rewritten: boolean; count: number; shas: string[]; note: string };
+    parent_git: { knowable: boolean; rewritten: boolean; count: number; shas: string[]; note: string };
+    pair_svn: { knowable: boolean; count: number; mapped_revision: number | null; head_revision: number | null };
+    parent_svn: { knowable: boolean; count: number; mapped_revision: number | null; head_revision: number | null };
+  };
+  conflicts: string[];
+  intended_result: {
+    summary: string;
+    discards_unsynced_work: boolean;
+    preserves_published_git_commits: boolean;
+    preserves_published_svn_revisions: boolean;
+    merge_echo_treatment: string;
+  };
+  reanchor_status: string;
+  execute_status: string;
+}
+
 export interface ConfigResponse {
   daemon: { poll_interval_secs: number; log_level: string; data_dir: string };
   svn: { url: string; username: string; password: string; trunk_path: string };
@@ -376,6 +424,16 @@ export const api = {
 
   listBranchPairs: (repoId: string) =>
     fetchJson<Repository[]>(`/repos/${repoId}/branches`),
+
+  previewPairRefresh: (repoId: string, data: {
+    operation?: 'update_pair_from_parent' | 'reanchor' | 'recreate';
+    execute?: boolean;
+    dry_run?: boolean;
+  }) =>
+    fetchJson<PairRefreshPlan>(`/repos/${repoId}/refresh`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   deleteBranchPair: (repoId: string, opts?: { delete_git?: boolean; delete_svn?: boolean }) => {
     const params = new URLSearchParams();

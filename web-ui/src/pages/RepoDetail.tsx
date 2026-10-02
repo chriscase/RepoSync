@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan } from '../api';
+import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan } from '../api';
 import ImportProgressCard from '../components/ImportProgressCard';
 import ServerMonitor from '../components/ServerMonitor';
 import {
@@ -89,6 +89,8 @@ export default function RepoDetail() {
   });
   const [branchSuccess, setBranchSuccess] = useState(false);
   const [branchPlan, setBranchPlan] = useState<LatePairPlan | null>(null);
+  const [refreshPlan, setRefreshPlan] = useState<PairRefreshPlan | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   const { data: repo, isLoading, isError, error } = useQuery({
     queryKey: ['repo', id],
@@ -149,6 +151,19 @@ export default function RepoDetail() {
     onSuccess: (plan) => {
       setBranchPlan(plan);
       setBranchSuccess(true);
+    },
+  });
+
+  const refreshMutation = useMutation({
+    mutationFn: (args: { repoId: string; operation: 'update_pair_from_parent' | 'reanchor' }) =>
+      api.previewPairRefresh(args.repoId, { operation: args.operation, execute: false }),
+    onSuccess: (plan) => {
+      setRefreshPlan(plan);
+      setRefreshError(null);
+    },
+    onError: (err: Error) => {
+      setRefreshPlan(null);
+      setRefreshError(err.message);
     },
   });
 
@@ -903,6 +918,77 @@ export default function RepoDetail() {
         )}
       </div>
 
+      {repo?.parent_id && (
+        <div className="bg-gray-800 shadow rounded-lg border border-gray-700 p-6">
+          <h2 className="text-lg font-semibold text-gray-100">Update pair from parent</h2>
+          <p className="text-sm text-gray-400 mt-1">
+            Read-only preview. Published Git commits and SVN revisions stay. Unsynced work on either side is reported and is not discarded. Running the refresh is not available in this slice.
+          </p>
+          <p className="text-sm text-amber-200/90 mt-2">
+            Re-anchor / recreate is a separate mode and is NOT IMPLEMENTED. It does not reset, force-push, or delete the old SVN path.
+          </p>
+          <div className="flex flex-wrap gap-2 mt-4">
+            <button
+              data-testid="preview-update-from-parent"
+              onClick={() => refreshMutation.mutate({ repoId: id!, operation: 'update_pair_from_parent' })}
+              disabled={refreshMutation.isPending}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              {refreshMutation.isPending ? 'Previewing...' : 'Preview update from parent'}
+            </button>
+            <button
+              data-testid="reanchor-not-implemented"
+              onClick={() => refreshMutation.mutate({ repoId: id!, operation: 'reanchor' })}
+              disabled={refreshMutation.isPending}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border border-amber-700 text-amber-200 hover:bg-amber-900/30 disabled:opacity-50"
+            >
+              Re-anchor pair (not implemented)
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(refreshPlan || refreshError) && (
+        <div className="bg-gray-800 shadow rounded-lg border border-gray-700 p-6" data-testid="pair-refresh-result">
+          {refreshError && (
+            <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-3 text-amber-100 text-sm">
+              {refreshError}
+            </div>
+          )}
+          {refreshPlan && (
+            <div className="text-sm text-gray-300 space-y-2">
+              <p className="text-gray-100 font-medium">Update-pair preview · not executed</p>
+              <p className="font-mono text-xs text-gray-400 break-all">plan {refreshPlan.plan_digest}</p>
+              <p>
+                Git {refreshPlan.git.pair_branch} {refreshPlan.git.pair_tip?.slice(0, 12) || 'unpinned'}
+                {' · parent '}
+                {refreshPlan.git.parent_branch} {refreshPlan.git.parent_tip?.slice(0, 12) || 'unpinned'}
+              </p>
+              <p>
+                SVN {refreshPlan.svn.uuid || 'uuid unpinned'} · {refreshPlan.svn.pair_path} r{refreshPlan.svn.pair_revision ?? '?'}
+                {' · parent '}
+                {refreshPlan.svn.parent_path} r{refreshPlan.svn.parent_revision ?? '?'}
+              </p>
+              <p>
+                Generation {refreshPlan.pair_generation} · {refreshPlan.policy_version} · pending Git pair {refreshPlan.pending.pair_git.count} / parent {refreshPlan.pending.parent_git.count}
+                {' · pending SVN pair '}{refreshPlan.pending.pair_svn.count} / parent {refreshPlan.pending.parent_svn.count}
+              </p>
+              {refreshPlan.pending.pair_git.rewritten && (
+                <p className="text-amber-200">Pair lineage is rewritten. Those commits are not counted as new work and are not discarded.</p>
+              )}
+              {refreshPlan.conflicts.length > 0 && (
+                <p className="text-amber-200">Conflicts: {refreshPlan.conflicts.join(', ')}. Resolution is not in this slice.</p>
+              )}
+              <p>{refreshPlan.intended_result.summary}</p>
+              <p className="text-xs text-gray-500">
+                Discards unsynced work: {String(refreshPlan.intended_result.discards_unsynced_work)}. Execute: {refreshPlan.execute_status}. Re-anchor: {refreshPlan.reanchor_status}.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Branch Pairs */}
       <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
         <div className="p-6 pb-3 flex items-center justify-between">
@@ -964,17 +1050,41 @@ export default function RepoDetail() {
                     <td className="px-6 py-3 text-sm text-gray-400">{formatTimeAgo(bp.updated_at)}</td>
                     {isAdmin && (
                       <td className="px-6 py-3 text-right">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setDeleteBranchTarget(bp);
-                            setDeleteBranchConfirmText('');
-                          }}
-                          className="text-gray-500 hover:text-red-400 transition-colors p-1"
-                          title="Delete branch pair"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            data-testid={`preview-refresh-${bp.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              refreshMutation.mutate({ repoId: bp.id, operation: 'update_pair_from_parent' });
+                            }}
+                            className="text-xs text-blue-300 hover:text-blue-200"
+                            title="Read-only update-from-parent preview"
+                          >
+                            Preview update
+                          </button>
+                          <button
+                            data-testid={`reanchor-${bp.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              refreshMutation.mutate({ repoId: bp.id, operation: 'reanchor' });
+                            }}
+                            className="text-xs text-amber-300 hover:text-amber-200"
+                            title="Re-anchor is NOT IMPLEMENTED"
+                          >
+                            Re-anchor
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setDeleteBranchTarget(bp);
+                              setDeleteBranchConfirmText('');
+                            }}
+                            className="text-gray-500 hover:text-red-400 transition-colors p-1"
+                            title="Delete branch pair"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </td>
                     )}
                   </tr>

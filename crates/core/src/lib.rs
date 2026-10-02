@@ -22,6 +22,7 @@ pub mod lfs;
 pub mod managed_remove;
 pub mod models;
 pub mod notify;
+pub mod pair_refresh;
 pub mod personal_config;
 pub mod process;
 pub mod snapshot;
