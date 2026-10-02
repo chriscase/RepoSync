@@ -5609,7 +5609,17 @@ async fn candidate_64c_ordinary_success_is_truthful_and_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue() {
-    let pair = QualifiedPair::new().await;
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
     pair.engine
         .set_path_rules(Vec::new(), vec!["secret/".into()]);
     let svn_before = svn_youngest(&pair.svn_url);
@@ -5683,7 +5693,7 @@ async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_mixed_commit_preserves_excluded_and_rejects_sibling_prefix() {
-    let pair = QualifiedPair::new().await;
+    let mut pair = QualifiedPair::new().await;
     pair.developer_commit(
         "secret/keep.txt",
         "keep original\n",
@@ -5744,7 +5754,17 @@ async fn candidate_rsc02_mixed_commit_preserves_excluded_and_rejects_sibling_pre
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_out_of_scope_delete_leaves_svn_file() {
-    let pair = QualifiedPair::new().await;
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
     pair.engine.set_path_rules(vec!["keep/".into()], Vec::new());
     let sha = pair.developer_commit_tree(
         &[

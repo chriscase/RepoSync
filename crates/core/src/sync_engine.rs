@@ -1813,6 +1813,23 @@ impl SyncEngine {
                 }
             }
             let file_contents = projected.into_file_contents();
+            if let Err(violations) = validate_file_paths_impl(
+                &self.allowed_paths,
+                &self.blocked_patterns,
+                &file_contents,
+            ) {
+                return Err(self.record_history_block(
+                    "projected_changeset_inconsistent",
+                    &format!(
+                        "projected Git→SVN set still contains out-of-scope paths: {}",
+                        violations.join("; ")
+                    ),
+                    Some(&change.sha),
+                    None,
+                    None,
+                    None,
+                ));
+            }
 
             // The current bridge maps regular-file bytes only. Mode, type,
             // symlink and executable changes cannot be acknowledged by an
