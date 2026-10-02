@@ -5729,6 +5729,53 @@ async fn candidate_64c_ordinary_success_is_truthful_and_terminal() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc03_success_stores_observed_not_intended_svn_tree() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc03-observed-tree").await;
+    let repo_id = fixture.repo_id.as_str();
+    fixture.developer_commit("feature.txt", "observed tree\n", "RS-C03 observed tree");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    let svn_after = svn_youngest(&fixture.svn_url);
+    assert_eq!(svn_after, svn_before + 1);
+    let latest = fixture
+        .engine
+        .db()
+        .latest_svn_commit_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::Completed
+    );
+    let confirmed = latest
+        .last_confirmed_svn_tree
+        .clone()
+        .expect("completed write must record observed SVN tree");
+    assert!(!confirmed.is_empty());
+    let svn = SvnClient::new(&fixture.svn_url, "", "");
+    let independently_observed =
+        reposync_core::svn_commit::observed_svn_tree_at_revision(&svn, svn_after)
+            .await
+            .unwrap();
+    assert_eq!(
+        confirmed, independently_observed,
+        "checkpoint must store re-read SVN evidence, not substitute intended tree"
+    );
+    assert_eq!(confirmed, latest.intended_svn_tree);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC03_OBSERVED_TREE",
+            "operation_id":latest.id,
+            "svn_rev":svn_after,
+            "confirmed_tree_matches_independent_export":true
+        })
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RS-C02 / #89: projected changeset before SVN WC mutation
 // ---------------------------------------------------------------------------

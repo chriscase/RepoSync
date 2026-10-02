@@ -41,7 +41,8 @@ use crate::models::AuditEntry;
 use crate::path_projection::project_git_to_svn_changeset;
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
-    hash_regular_file_tree, intended_paths_from_contents, operation_commit_message,
+    hash_regular_file_tree, intended_paths_from_contents, observed_svn_tree_at_revision,
+    operation_commit_message,
 };
 
 // ---------------------------------------------------------------------------
@@ -2263,9 +2264,32 @@ impl SyncEngine {
                         detail: "fixture: accepted SVN commit could not be checkpointed".into(),
                     });
                 }
+                let observed_svn_tree = match observed_svn_tree_at_revision(&svn, svn_rev).await {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        let detail = format!(
+                            "SVN accepted the commit but the observed tree could not be re-read: {error}"
+                        );
+                        let _ = self.db.hold_git_to_svn_reconciliation(rid, &op.id, &detail);
+                        return Err(SyncError::SvnCommitHeld {
+                            reason: "observed_tree_unavailable".into(),
+                            detail,
+                        });
+                    }
+                };
+                if observed_svn_tree != op.intended_svn_tree {
+                    let detail = format!(
+                        "SVN revision {svn_rev} tree does not match the intended Git-to-SVN tree"
+                    );
+                    let _ = self.db.hold_git_to_svn_reconciliation(rid, &op.id, &detail);
+                    return Err(SyncError::SvnCommitHeld {
+                        reason: "observed_tree_mismatch".into(),
+                        detail,
+                    });
+                }
                 match self
                     .db
-                    .confirm_git_to_svn_commit(rid, &op.id, svn_rev, &op.intended_svn_tree)
+                    .confirm_git_to_svn_commit(rid, &op.id, svn_rev, &observed_svn_tree)
                 {
                     Ok(_) => {}
                     Err(error) => {
