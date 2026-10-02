@@ -7165,3 +7165,108 @@ async fn candidate_r13_digest_binds_inputs() {
     );
     server.abort();
 }
+
+/// #70: deleting the branch pair on screen replaces that history entry with the
+/// parent (or the repository list) and does not keep polling the removed detail.
+/// Failure variants are deterministic responses in the browser harness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "browser fixture; run in e2e after npm ci and Chrome"]
+async fn candidate_70_delete_viewed_pair_redirects_without_detail_polling() {
+    use std::process::Command;
+
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let parent_id = "parent-repo";
+    let viewed_id = "viewed-pair";
+    let listed_id = "listed-pair";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Parent trunk",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            viewed_id,
+            "Viewed pair",
+            Some(parent_id),
+            "viewed-branch",
+            "branches/viewed",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            listed_id,
+            "Listed pair",
+            Some(parent_id),
+            "listed-branch",
+            "branches/listed",
+        ))
+        .unwrap();
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new("node")
+        .arg(root.join("scripts/branch-pair-delete-browser.mjs"))
+        .env("REPOSYNC_REAL_API", format!("http://{addr}"))
+        .env("REPOSYNC_UI_TOKEN", TEST_TOKEN)
+        .env("REPOSYNC_PARENT_ID", parent_id)
+        .env("REPOSYNC_VIEWED_PAIR_ID", viewed_id)
+        .env("REPOSYNC_LISTED_PAIR_ID", listed_id)
+        .env("REPOSYNC_VIEWED_GIT_BRANCH", "viewed-branch")
+        .env("REPOSYNC_LISTED_GIT_BRANCH", "listed-branch")
+        .output()
+        .expect("spawn branch-pair delete browser");
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "branch-pair delete browser failed");
+    assert!(state.db.get_repository(viewed_id).unwrap().is_none());
+    assert!(state.db.get_repository(listed_id).unwrap().is_none());
+    assert!(state.db.get_repository(parent_id).unwrap().is_some());
+    server.abort();
+    drop(tmp);
+}
+
+fn fixture_branch_repo(
+    id: &str,
+    name: &str,
+    parent: Option<&str>,
+    git_branch: &str,
+    svn_branch: &str,
+) -> reposync_core::models::Repository {
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::models::Repository {
+        id: id.into(),
+        name: name.into(),
+        svn_url: "https://svn.test.invalid/repo".into(),
+        svn_branch: svn_branch.into(),
+        svn_username: "testuser".into(),
+        git_provider: "github".into(),
+        git_api_url: "https://git.test.invalid".into(),
+        git_repo: "test/repo".into(),
+        git_branch: git_branch.into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 60,
+        lfs_threshold_mb: 1,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: parent.map(str::to_string),
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    }
+}
