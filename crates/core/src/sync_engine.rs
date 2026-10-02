@@ -1626,6 +1626,7 @@ impl SyncEngine {
         let projection = self.no_target_projection();
         let fingerprint =
             svn_commit_target_fingerprint(rid, &info.uuid, svn.url(), &info.url, &projection);
+        let identity = crate::path_projection::svn_path_identity(&info.root_url, &info.url);
         let op = self
             .db
             .begin_git_to_svn_commit(SvnCommitIntent {
@@ -1638,6 +1639,8 @@ impl SyncEngine {
                 source_git_tree: &tree,
                 target_svn_uuid: &info.uuid,
                 target_svn_path: &info.url,
+                target_svn_root_url: &identity.root_url,
+                target_svn_branch_path: &identity.branch_path,
                 pre_write_svn_rev: info.latest_rev,
                 pre_write_svn_tree: &pre_write_tree,
                 projection: &projection,

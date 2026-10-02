@@ -11,6 +11,9 @@ use crate::db::svn_commit_operations::{
 };
 use crate::db::Database;
 use crate::errors::{DatabaseError, SvnError};
+use crate::path_projection::{
+    git_intent_path, svn_log_path_to_branch_relative, svn_path_identity, SvnPathIdentity,
+};
 use crate::svn::SvnClient;
 
 const OPERATION_TRAILER: &str = "RepoSync-Operation:";
@@ -100,7 +103,7 @@ pub fn intended_paths_from_contents(
         .iter()
         .map(|(action, path, content)| IntendedPath {
             action: action.clone(),
-            path: normalize_svn_path(path),
+            path: git_intent_path(path),
             content_sha256: content
                 .as_ref()
                 .map(|bytes| hex::encode(Sha256::digest(bytes))),
@@ -111,7 +114,7 @@ pub fn intended_paths_from_contents(
 }
 
 pub fn normalize_svn_path(path: &str) -> String {
-    path.trim_start_matches('/').replace('\\', "/")
+    git_intent_path(path)
 }
 
 async fn hash_exported_revision(svn: &SvnClient, revision: i64) -> Result<String, SvnError> {
@@ -121,21 +124,39 @@ async fn hash_exported_revision(svn: &SvnClient, revision: i64) -> Result<String
     hash_regular_file_tree(&dest).map_err(SvnError::IoError)
 }
 
-fn paths_match(intended: &[IntendedPath], observed: &[IntendedPath]) -> bool {
+fn operation_path_identity(op: &SvnCommitOperation, live_root_url: &str) -> SvnPathIdentity {
+    if !op.target_svn_root_url.is_empty() {
+        return SvnPathIdentity {
+            root_url: op.target_svn_root_url.clone(),
+            branch_path: op.target_svn_branch_path.clone(),
+        };
+    }
+    svn_path_identity(live_root_url, &op.target_svn_path)
+}
+
+fn paths_match(
+    intended: &[IntendedPath],
+    observed: &[IntendedPath],
+    identity: &SvnPathIdentity,
+) -> bool {
     let intended_keys: Vec<(String, String)> = intended
         .iter()
-        .map(|p| (p.action.clone(), normalize_svn_path(&p.path)))
+        .map(|p| (p.action.clone(), git_intent_path(&p.path)))
         .collect();
     for (action, path) in &intended_keys {
-        if !observed
-            .iter()
-            .any(|item| item.action == *action && normalize_svn_path(&item.path) == *path)
-        {
+        if !observed.iter().any(|item| {
+            let Some(obs_path) = svn_log_path_to_branch_relative(&item.path, identity) else {
+                return false;
+            };
+            item.action == *action && obs_path == *path
+        }) {
             return false;
         }
     }
     observed.iter().all(|item| {
-        let path = normalize_svn_path(&item.path);
+        let Some(path) = svn_log_path_to_branch_relative(&item.path, identity) else {
+            return false;
+        };
         if intended_keys
             .iter()
             .any(|(action, intended)| action == &item.action && intended == &path)
@@ -226,21 +247,42 @@ pub async fn inspect_git_to_svn_commit(
             reason: "successor revision does not carry the durable operation identity".into(),
         };
     }
-    let mut observed: Vec<IntendedPath> = entry
+    let identity = operation_path_identity(op, &info.root_url);
+    let raw_observed: Vec<IntendedPath> = entry
         .changed_paths
         .iter()
         .map(|path| IntendedPath {
             action: path.action.clone(),
-            path: normalize_svn_path(&path.path),
+            path: path.path.clone(),
             content_sha256: None,
         })
         .collect();
-    observed.sort_by(|a, b| a.path.cmp(&b.path));
-    if !paths_match(&op.intended_changed_paths, &observed) {
+    if raw_observed
+        .iter()
+        .any(|item| svn_log_path_to_branch_relative(&item.path, &identity).is_none())
+    {
+        return SvnCommitInspect::Conflict {
+            reason: "successor changed paths include entries outside the pinned branch namespace"
+                .into(),
+        };
+    }
+    if !paths_match(&op.intended_changed_paths, &raw_observed, &identity) {
         return SvnCommitInspect::Conflict {
             reason: "successor changed paths are not a unique match for the intended write".into(),
         };
     }
+    let mut observed: Vec<IntendedPath> = raw_observed
+        .into_iter()
+        .filter_map(|item| {
+            let branch_relative = svn_log_path_to_branch_relative(&item.path, &identity)?;
+            Some(IntendedPath {
+                action: item.action,
+                path: branch_relative,
+                content_sha256: None,
+            })
+        })
+        .collect();
+    observed.sort_by(|a, b| a.path.cmp(&b.path));
     let tree = match hash_exported_revision(svn, info.latest_rev).await {
         Ok(tree) => tree,
         Err(error) => {

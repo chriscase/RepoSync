@@ -56,6 +56,10 @@ pub struct SvnCommitOperation {
     pub source_git_tree: String,
     pub target_svn_uuid: String,
     pub target_svn_path: String,
+    #[serde(default)]
+    pub target_svn_root_url: String,
+    #[serde(default)]
+    pub target_svn_branch_path: String,
     pub pre_write_svn_rev: i64,
     pub pre_write_svn_tree: String,
     pub projection: String,
@@ -350,6 +354,8 @@ impl Database {
                     && existing.source_git_tree == intent.source_git_tree
                     && existing.target_svn_uuid == intent.target_svn_uuid
                     && existing.target_svn_path == intent.target_svn_path
+                    && existing.target_svn_root_url == intent.target_svn_root_url
+                    && existing.target_svn_branch_path == intent.target_svn_branch_path
                     && existing.pre_write_svn_rev == intent.pre_write_svn_rev
                     && existing.pre_write_svn_tree == intent.pre_write_svn_tree
                     && existing.intended_svn_tree == intent.intended_svn_tree
@@ -387,6 +393,8 @@ impl Database {
                 source_git_tree: intent.source_git_tree.into(),
                 target_svn_uuid: intent.target_svn_uuid.into(),
                 target_svn_path: intent.target_svn_path.into(),
+                target_svn_root_url: intent.target_svn_root_url.into(),
+                target_svn_branch_path: intent.target_svn_branch_path.into(),
                 pre_write_svn_rev: intent.pre_write_svn_rev,
                 pre_write_svn_tree: intent.pre_write_svn_tree.into(),
                 projection: intent.projection.into(),
@@ -635,6 +643,8 @@ pub struct SvnCommitIntent<'a> {
     pub source_git_tree: &'a str,
     pub target_svn_uuid: &'a str,
     pub target_svn_path: &'a str,
+    pub target_svn_root_url: &'a str,
+    pub target_svn_branch_path: &'a str,
     pub pre_write_svn_rev: i64,
     pub pre_write_svn_tree: &'a str,
     pub projection: &'a str,
@@ -663,6 +673,8 @@ mod tests {
                 source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
                 target_svn_uuid: "uuid",
                 target_svn_path: "file:///svn",
+                target_svn_root_url: "file:///svn",
+                target_svn_branch_path: "",
                 pre_write_svn_rev: 2,
                 pre_write_svn_tree: "pre-tree",
                 projection: "{}",
