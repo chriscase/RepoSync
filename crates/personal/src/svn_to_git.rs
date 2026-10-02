@@ -9,11 +9,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use reposync_core::db::Database;
-use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
+use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
+use reposync_core::import::{
+    copy_tree_with_policy as copy_tree_with_policy_shared,
+    remove_stale_files as remove_stale_files_shared,
+};
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
 
@@ -256,19 +260,19 @@ impl SvnToGitSync {
             .with_context(|| format!("failed to advance SVN watermark to r{}", rev))
     }
 
-    /// Recursively copy all files from `src` into `dst`, overwriting existing
-    /// files. Directories that exist in `dst` are preserved; new directories
-    /// are created. Hidden files and directories (starting with `.`) in the
-    /// destination root are skipped to avoid clobbering `.git/`.
-    ///
-    /// This is the policy-unaware version, retained for tests.
+    /// Policy-unaware wrapper over the shared core copier (tests).
     #[cfg(test)]
     fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let noop_policy = FilePolicy::new(0, vec![]);
-        Self::copy_tree_policy_inner(src, dst, dst, src, true, &noop_policy, &mut 0)
+        let db = Database::in_memory()?;
+        db.initialize()?;
+        copy_tree_with_policy_shared(src, dst, &noop_policy, &db)?;
+        Ok(())
     }
 
     /// Recursively copy files from `src` into `dst`, enforcing `FilePolicy`.
+    ///
+    /// Delegates to the shared core writer used by full import and team snapshot.
     /// Returns the number of files skipped by policy.
     pub fn copy_tree_with_policy(
         src: &Path,
@@ -276,206 +280,14 @@ impl SvnToGitSync {
         policy: &FilePolicy,
         db: &Database,
     ) -> Result<usize> {
-        let mut skipped = 0;
-        Self::copy_tree_policy_inner(src, dst, dst, src, true, policy, &mut skipped)?;
-
-        // Audit skipped count if any.
-        if skipped > 0 {
-            let _ = db.insert_audit_log(
-                "file_policy_skip",
-                Some("svn_to_git"),
-                None,
-                None,
-                None,
-                Some(&format!(
-                    "Skipped {} files by policy during SVN→Git copy",
-                    skipped
-                )),
-                true,
-            );
-        }
-
-        Ok(skipped)
+        let stats = copy_tree_with_policy_shared(src, dst, policy, db)?;
+        Ok(stats.skipped)
     }
 
-    fn copy_tree_policy_inner(
-        src: &Path,
-        dst: &Path,
-        dst_root: &Path,
-        export_root: &Path,
-        is_root: bool,
-        policy: &FilePolicy,
-        skipped: &mut usize,
-    ) -> Result<()> {
-        let entries = std::fs::read_dir(src)
-            .with_context(|| format!("failed to read directory: {}", src.display()))?;
-
-        for entry in entries {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-
-            // At the root level of the destination, skip dotfiles/dotdirs to
-            // avoid overwriting `.git/` and similar metadata.
-            if is_root && name_str.starts_with('.') {
-                debug!(name = %name_str, "skipping dotfile/dotdir in export root");
-                continue;
-            }
-
-            let src_path = entry.path();
-            let dst_path = dst.join(&file_name);
-
-            if src_path.is_dir() {
-                // Check if the entire directory matches an ignore pattern.
-                let rel = src_path
-                    .strip_prefix(export_root)
-                    .unwrap_or(&src_path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let dir_pattern_path = format!("{}/", rel);
-                // Quick check: does the dir itself match? Some patterns like
-                // "build/**" should still recurse into `build/` to find matches.
-                // We check individual files below.
-                if !dst_path.exists() {
-                    std::fs::create_dir_all(&dst_path).with_context(|| {
-                        format!("failed to create directory: {}", dst_path.display())
-                    })?;
-                }
-                let _ = dir_pattern_path; // Used for potential future directory-level skipping.
-                Self::copy_tree_policy_inner(
-                    &src_path,
-                    &dst_path,
-                    dst_root,
-                    export_root,
-                    false,
-                    policy,
-                    skipped,
-                )?;
-            } else {
-                // Compute relative path for policy evaluation.
-                let rel = src_path
-                    .strip_prefix(export_root)
-                    .unwrap_or(&src_path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-
-                let decision = policy.evaluate_path(export_root, &rel);
-                match &decision {
-                    FilePolicyDecision::Allow => {
-                        std::fs::copy(&src_path, &dst_path).with_context(|| {
-                            format!(
-                                "failed to copy {} -> {}",
-                                src_path.display(),
-                                dst_path.display()
-                            )
-                        })?;
-                    }
-                    FilePolicyDecision::LfsTrack { size, threshold } => {
-                        // Copy the actual file content to the Git working tree.
-                        // With `.gitattributes` set up, `git add` will run the
-                        // LFS clean filter and store the blob in LFS storage,
-                        // replacing the file content with a pointer in the index.
-                        std::fs::copy(&src_path, &dst_path).with_context(|| {
-                            format!(
-                                "failed to copy {} -> {}",
-                                src_path.display(),
-                                dst_path.display()
-                            )
-                        })?;
-
-                        // Ensure `.gitattributes` has the appropriate LFS tracking pattern.
-                        // Use dst_root (the Git repo root) for .gitattributes placement.
-                        let pattern = reposync_core::lfs::pattern_for_path(&rel);
-                        if let Err(e) = reposync_core::lfs::ensure_lfs_tracked(dst_root, &pattern) {
-                            warn!(
-                                path = rel.as_str(),
-                                pattern = pattern.as_str(),
-                                error = %e,
-                                "failed to update .gitattributes for LFS tracking"
-                            );
-                        } else {
-                            info!(
-                                path = rel.as_str(),
-                                size,
-                                threshold,
-                                pattern = pattern.as_str(),
-                                "LFS: file copied and .gitattributes updated"
-                            );
-                        }
-                    }
-                    FilePolicyDecision::Ignored { pattern } => {
-                        warn!(
-                            path = rel.as_str(),
-                            pattern = pattern.as_str(),
-                            "file ignored by policy — not copied to Git"
-                        );
-                        *skipped += 1;
-                    }
-                    FilePolicyDecision::Oversize { size, limit } => {
-                        warn!(
-                            path = rel.as_str(),
-                            size, limit, "file exceeds max_file_size — not copied to Git"
-                        );
-                        *skipped += 1;
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Remove files and directories from `dst` (Git working tree) that do not
-    /// exist in `src` (SVN export). Hidden entries (starting with `.`) at the
-    /// root level are always skipped so `.git/` is never touched.
+    /// Remove files and directories from `dst` that do not exist in `src`.
+    /// Delegates to the shared core helper (reserved VCS metadata is preserved).
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
-        Self::remove_stale_inner(src, dst, true)
-    }
-
-    fn remove_stale_inner(src: &Path, dst: &Path, is_root: bool) -> Result<()> {
-        let entries = match std::fs::read_dir(dst) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to read directory: {}", dst.display()));
-            }
-        };
-
-        for entry in entries {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let name_str = file_name.to_string_lossy();
-
-            // Skip dotfiles/dotdirs at root to protect .git/.
-            if is_root && name_str.starts_with('.') {
-                continue;
-            }
-
-            let src_path = src.join(&file_name);
-            let dst_path = entry.path();
-
-            if dst_path.is_dir() {
-                if src_path.is_dir() {
-                    // Both exist — recurse.
-                    Self::remove_stale_inner(&src_path, &dst_path, false)?;
-                } else {
-                    // Directory exists in Git but not in SVN export — remove it.
-                    std::fs::remove_dir_all(&dst_path).with_context(|| {
-                        format!("failed to remove stale directory: {}", dst_path.display())
-                    })?;
-                    debug!(path = %dst_path.display(), "removed stale directory");
-                }
-            } else if !src_path.exists() {
-                // File exists in Git but not in SVN export — remove it.
-                std::fs::remove_file(&dst_path).with_context(|| {
-                    format!("failed to remove stale file: {}", dst_path.display())
-                })?;
-                debug!(path = %dst_path.display(), "removed stale file");
-            }
-        }
-
-        Ok(())
+        remove_stale_files_shared(src, dst)
     }
 }
 
@@ -484,39 +296,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_copy_tree_skips_dotfiles_at_root() {
+    fn test_copy_tree_skips_reserved_vcs_and_preserves_ordinary_dotfiles() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
 
-        // Create a dotdir and a normal file in src.
         std::fs::create_dir(src.path().join(".svn")).unwrap();
         std::fs::write(src.path().join(".svn/entries"), "data").unwrap();
+        std::fs::write(src.path().join(".gitignore"), "*.tmp\n").unwrap();
+        std::fs::write(src.path().join(".editorconfig"), "root = true\n").unwrap();
+        std::fs::create_dir_all(src.path().join(".github/workflows")).unwrap();
+        std::fs::write(src.path().join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
         std::fs::write(src.path().join("hello.txt"), "world").unwrap();
         std::fs::create_dir(src.path().join("subdir")).unwrap();
         std::fs::write(src.path().join("subdir/.hidden"), "secret").unwrap();
         std::fs::write(src.path().join("subdir/visible.txt"), "content").unwrap();
 
-        // Create a .git dir in dst that should not be touched.
         std::fs::create_dir(dst.path().join(".git")).unwrap();
         std::fs::write(dst.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
 
         SvnToGitSync::copy_tree(src.path(), dst.path()).unwrap();
 
-        // .git should be untouched.
         assert_eq!(
             std::fs::read_to_string(dst.path().join(".git/HEAD")).unwrap(),
             "ref: refs/heads/main"
         );
-        // .svn should NOT have been copied.
         assert!(!dst.path().join(".svn").exists());
-
-        // Normal file should be present.
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".gitignore")).unwrap(),
+            "*.tmp\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".editorconfig")).unwrap(),
+            "root = true\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".github/workflows/ci.yml")).unwrap(),
+            "name: ci\n"
+        );
         assert_eq!(
             std::fs::read_to_string(dst.path().join("hello.txt")).unwrap(),
             "world"
         );
-
-        // Nested dotfiles SHOULD be copied (only root-level dots are skipped).
         assert_eq!(
             std::fs::read_to_string(dst.path().join("subdir/.hidden")).unwrap(),
             "secret"
