@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
-import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan } from '../api';
+import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
   isNotFoundError,
@@ -104,6 +104,9 @@ export default function RepoDetail() {
   const [branchPlan, setBranchPlan] = useState<LatePairPlan | null>(null);
   const [refreshPlan, setRefreshPlan] = useState<PairRefreshPlan | null>(null);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [showSkipModal, setShowSkipModal] = useState(false);
+  const [skipSelectedCount, setSkipSelectedCount] = useState(0);
+  const [skipError, setSkipError] = useState<string | null>(null);
 
   const repoQuery = useQuery({
     queryKey: ['repo', id],
@@ -173,6 +176,43 @@ export default function RepoDetail() {
     enabled: detailLive,
     refetchInterval: detailLive ? 5000 : false,
     retry: detailRetry,
+  });
+
+  const skipContextEnabled = detailLive && isAdmin && status?.state === 'error_paused';
+  const { data: skipContextResponse } = useQuery({
+    queryKey: ['skip-commit-context', id],
+    queryFn: () => api.getSkipCommitContext(id!),
+    enabled: skipContextEnabled,
+    refetchInterval: skipContextEnabled ? 5000 : false,
+    retry: detailRetry,
+  });
+  const skipContext: SkipCommitContext | null = skipContextResponse?.context ?? null;
+
+  const skipMutation = useMutation({
+    mutationFn: (selected: string[]) => {
+      if (!skipContext?.observed_remote_tip) {
+        throw new Error('Observed remote tip is unavailable for exact skip');
+      }
+      return api.skipCommit(id!, {
+        pinned_cursor: skipContext.pinned_cursor,
+        selected_commits: selected,
+        expected_remote_tip: skipContext.observed_remote_tip,
+        expected_bridge_tip: skipContext.observed_bridge_tip ?? undefined,
+        reason: 'operator_exact_skip',
+      });
+    },
+    onSuccess: () => {
+      setShowSkipModal(false);
+      setSkipSelectedCount(0);
+      setSkipError(null);
+      queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
+      queryClient.invalidateQueries({ queryKey: ['repo', id] });
+      queryClient.invalidateQueries({ queryKey: ['status', id] });
+      queryClient.invalidateQueries({ queryKey: ['skip-commit-context', id] });
+    },
+    onError: (error: Error) => {
+      setSkipError(error.message);
+    },
   });
 
   const branchMutation = useMutation({
@@ -799,17 +839,27 @@ export default function RepoDetail() {
             <p className="text-red-300 font-medium">Sync Paused — Permanent Error</p>
             <p className="text-sm text-red-400 mt-1">
               The sync engine encountered repeated permanent errors and has been automatically paused.
-              Skipping to live branch HEAD is disabled until exact per-commit skip disposition exists;
-              pending work is preserved. Retry if the issue has been resolved.
+              Skip selected pending commits using observed tips; this does not adopt live HEAD or skip unselected work.
+              {skipContext?.observed_remote_tip && (
+                <span className="block mt-1 text-red-300/80 font-mono text-xs">
+                  cursor {skipContext.pinned_cursor.slice(0, 8)} · remote {skipContext.observed_remote_tip.slice(0, 8)}
+                  {skipContext.observed_bridge_tip ? ` · bridge ${skipContext.observed_bridge_tip.slice(0, 8)}` : ''}
+                </span>
+              )}
             </p>
           </div>
           <div className="flex gap-2 ml-4 flex-shrink-0">
             <button
               type="button"
-              disabled
-              title="Skip-to-HEAD is disabled until exact per-commit skip disposition exists. Pending work is preserved."
+              disabled={!skipContext?.observed_remote_tip || (skipContext.pending_commits.filter((c) => !c.excluded).length === 0)}
+              title="Exclude selected pending commits at observed tips. Does not adopt live HEAD."
               data-testid="skip-commit-button"
-              className="px-3 py-1.5 rounded-lg bg-yellow-600 text-white text-sm font-medium opacity-50 cursor-not-allowed"
+              onClick={() => {
+                setSkipError(null);
+                setSkipSelectedCount(0);
+                setShowSkipModal(true);
+              }}
+              className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
             >
               Skip Commit
             </button>
@@ -823,6 +873,57 @@ export default function RepoDetail() {
             >
               Retry
             </button>
+          </div>
+        </div>
+      )}
+
+      {showSkipModal && skipContext && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" data-testid="skip-commit-modal">
+          <div className="bg-gray-800 border border-gray-600 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
+            <h3 className="text-lg font-semibold text-gray-100 mb-2">Skip selected pending commits</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              Select the oldest contiguous pending prefix to exclude. Unselected commits remain pending.
+              Observed remote tip: <span className="font-mono text-gray-300">{skipContext.observed_remote_tip?.slice(0, 12) ?? 'unavailable'}</span>
+            </p>
+            <div className="space-y-2 mb-4 max-h-48 overflow-y-auto">
+              {skipContext.pending_commits.filter((c) => !c.excluded).map((commit, index) => (
+                <label key={commit.sha} className="flex items-start gap-2 text-sm text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={index < skipSelectedCount}
+                    onChange={() => setSkipSelectedCount(index + 1)}
+                    data-testid={`skip-commit-select-${index}`}
+                  />
+                  <span>
+                    <span className="font-mono text-xs text-gray-400">{commit.sha.slice(0, 8)}</span>
+                    {' '}{commit.subject}
+                  </span>
+                </label>
+              ))}
+            </div>
+            {skipError && <p className="text-sm text-red-400 mb-3">{skipError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => { setShowSkipModal(false); setSkipError(null); }}
+                className="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-sm text-gray-200"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={skipSelectedCount === 0 || skipMutation.isPending}
+                data-testid="skip-commit-confirm"
+                onClick={() => {
+                  const pending = skipContext.pending_commits.filter((c) => !c.excluded);
+                  const selected = pending.slice(0, skipSelectedCount).map((c) => c.sha);
+                  skipMutation.mutate(selected);
+                }}
+                className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 text-sm text-white font-medium"
+              >
+                {skipMutation.isPending ? 'Skipping…' : 'Skip selected'}
+              </button>
+            </div>
           </div>
         </div>
       )}

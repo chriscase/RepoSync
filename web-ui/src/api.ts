@@ -182,6 +182,27 @@ export interface PairRefreshPlan {
   execute_status: string;
 }
 
+export interface SkipCommitPending {
+  sha: string;
+  subject: string;
+  excluded: boolean;
+}
+
+export interface SkipCommitContext {
+  pinned_cursor: string;
+  observed_remote_tip: string | null;
+  observed_bridge_tip: string | null;
+  pending_commits: SkipCommitPending[];
+}
+
+export interface SkipCommitRequest {
+  pinned_cursor: string;
+  selected_commits: string[];
+  expected_remote_tip: string;
+  expected_bridge_tip?: string;
+  reason?: string;
+}
+
 export interface ConfigResponse {
   daemon: { poll_interval_secs: number; log_level: string; data_dir: string };
   svn: { url: string; username: string; password: string; trunk_path: string };
@@ -481,11 +502,23 @@ export const api = {
   triggerRepoSync: (id: string) =>
     fetchJson<{ ok: boolean }>(`/repos/${id}/sync`, { method: 'POST' }),
 
-  /** POST skip-commit is refused (409 skip_commit_disabled) until exact skip disposition exists. */
-  skipCommit: (repoId: string) =>
-    fetchJson<{ ok: boolean; message: string; old_sha: string; new_sha: string }>(
-      `/repos/${repoId}/skip-commit`, { method: 'POST' }
+  getSkipCommitContext: (repoId: string) =>
+    fetchJson<{ ok: boolean; context: SkipCommitContext }>(
+      `/repos/${repoId}/skip-commit/context`
     ),
+
+  skipCommit: (repoId: string, body: SkipCommitRequest) =>
+    fetchJson<{
+      ok: boolean;
+      message: string;
+      old_sha: string;
+      new_sha: string;
+      excluded_commits: string[];
+      remaining_pending: string[];
+    }>(`/repos/${repoId}/skip-commit`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   retryRepo: (repoId: string) =>
     fetchJson<{ ok: boolean; message: string }>(

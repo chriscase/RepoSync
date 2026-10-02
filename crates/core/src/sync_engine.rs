@@ -2510,6 +2510,14 @@ impl SyncEngine {
             if self.is_echo_commit(&c.message) {
                 continue;
             }
+            if let Some(rid) = self.effective_repo_id() {
+                if crate::skip_commit::is_commit_excluded(&self.db, rid, &c.sha)
+                    .map_err(SyncError::DatabaseError)?
+                {
+                    debug!(repo_id = rid, git_sha = %c.sha, "skipping excluded Git commit");
+                    continue;
+                }
+            }
             // Populate changed_files from the commit's diff.
             let files = git.get_changed_files(&c.sha).map_err(SyncError::GitError)?;
             let changed_files: Vec<ChangedFile> = files

@@ -26,6 +26,7 @@ pub mod pair_refresh;
 pub mod path_projection;
 pub mod personal_config;
 pub mod process;
+pub mod skip_commit;
 pub mod snapshot;
 pub mod svn;
 pub mod svn_commit;
