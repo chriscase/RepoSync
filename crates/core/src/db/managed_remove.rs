@@ -3,8 +3,8 @@
 //! Documents live in `kv_state` under `managed_remove_v1:`. Ordinary schema
 //! stays v12. Legacy root DELETE does not write this journal.
 //!
-//! Removal disables the registration, waits until #64 import / Git→SVN
-//! ownership is quiet, then deletes only exact per-repo secret keys and the
+//! Removal disables the registration, waits until #64 import / Git→SVN /
+//! SVN→Git ownership is quiet, then deletes only exact per-repo secret keys and the
 //! repository row. Commit mappings, audit rows, and remote history are kept.
 //! Restore is not supported. A tombstone blocks a stale job from inserting
 //! the same id again.
@@ -89,6 +89,8 @@ pub enum RemovalBlocker {
     ImportReconciliationRequired,
     SvnCommitRunning,
     SvnCommitReconciliationRequired,
+    GitPushRunning,
+    GitPushReconciliationRequired,
     ChildRegistrations { count: i64 },
 }
 
@@ -110,6 +112,14 @@ impl RemovalBlocker {
                 "Git-to-SVN commit has an unresolved external effect; registration and local data were kept"
                     .into()
             }
+            Self::GitPushRunning => {
+                "in-flight SVN-to-Git push still owns the repository; local data was not deleted"
+                    .into()
+            }
+            Self::GitPushReconciliationRequired => {
+                "SVN-to-Git push has an unresolved external effect; registration and local data were kept"
+                    .into()
+            }
             Self::ChildRegistrations { count } => format!(
                 "parent removal is blocked while {count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
             ),
@@ -118,11 +128,13 @@ impl RemovalBlocker {
 
     pub fn waiting_state(&self) -> ManagedRemoveState {
         match self {
-            Self::ImportReconciliationRequired | Self::SvnCommitReconciliationRequired => {
-                ManagedRemoveState::ReconciliationRequired
-            }
+            Self::ImportReconciliationRequired
+            | Self::SvnCommitReconciliationRequired
+            | Self::GitPushReconciliationRequired => ManagedRemoveState::ReconciliationRequired,
             Self::ChildRegistrations { .. } => ManagedRemoveState::Failed,
-            Self::ImportRunning | Self::SvnCommitRunning => ManagedRemoveState::Cancelling,
+            Self::ImportRunning | Self::SvnCommitRunning | Self::GitPushRunning => {
+                ManagedRemoveState::Cancelling
+            }
         }
     }
 }
@@ -358,6 +370,25 @@ fn svn_commit_blocker(
     })
 }
 
+fn git_push_blocker(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<RemovalBlocker>, DatabaseError> {
+    let Some(op_id) = read_value(conn, &format!("svn_to_git_push_v1:active:{repo_id}"))? else {
+        return Ok(None);
+    };
+    let Some(raw) = read_value(conn, &format!("svn_to_git_push_v1:document:{op_id}"))? else {
+        return Ok(Some(RemovalBlocker::GitPushRunning));
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let state = value.get("state").and_then(|s| s.as_str());
+    Ok(match state {
+        Some("completed" | "failed") => None,
+        Some("reconciliation_required") => Some(RemovalBlocker::GitPushReconciliationRequired),
+        _ => Some(RemovalBlocker::GitPushRunning),
+    })
+}
+
 fn writer_blocker(
     conn: &Connection,
     repo_id: &str,
@@ -365,7 +396,10 @@ fn writer_blocker(
     if let Some(blocker) = import_blocker(conn, repo_id)? {
         return Ok(Some(blocker));
     }
-    svn_commit_blocker(conn, repo_id)
+    if let Some(blocker) = svn_commit_blocker(conn, repo_id)? {
+        return Ok(Some(blocker));
+    }
+    git_push_blocker(conn, repo_id)
 }
 
 fn fresh_op(repo: &Repository, initiator_id: &str, request_id: &str) -> ManagedRemoveOperation {
@@ -876,5 +910,250 @@ mod tests {
         let error = db.insert_repository(&parent).unwrap_err();
         assert!(error.to_string().contains("cannot recreate"), "{error}");
         assert!(db.list_repositories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removal_blocked_while_svn_to_git_push_running() {
+        use crate::db::git_push_operations::{GitPushIntent, GitPushOperationState};
+
+        let db = setup();
+        let r = repo("push-repo", "Push", None);
+        db.insert_repository(&r).unwrap();
+
+        let intent = GitPushIntent {
+            repo_id: "push-repo",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let push = db.begin_svn_to_git_push(intent).unwrap();
+        assert_eq!(push.state, GitPushOperationState::Running);
+
+        match db
+            .prepare_managed_remove("push-repo", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::GitPushRunning);
+                assert_eq!(operation.state, ManagedRemoveState::Cancelling);
+            }
+            other => panic!("expected git-push wait, got {other:?}"),
+        }
+        assert!(db.get_repository("push-repo").unwrap().unwrap().enabled == false);
+    }
+
+    #[test]
+    fn removal_blocked_while_svn_to_git_push_held_for_reconcile() {
+        use crate::db::git_push_operations::{GitPushIntent, GitPushOperationState};
+
+        let db = setup();
+        let r = repo("held-repo", "Held", None);
+        db.insert_repository(&r).unwrap();
+
+        let intent = GitPushIntent {
+            repo_id: "held-repo",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let push = db.begin_svn_to_git_push(intent).unwrap();
+        db.hold_svn_to_git_reconciliation("held-repo", &push.id, "lost reply")
+            .unwrap();
+        assert_eq!(
+            db.active_git_push_operation("held-repo")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitPushOperationState::ReconciliationRequired
+        );
+
+        match db
+            .prepare_managed_remove("held-repo", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::GitPushReconciliationRequired);
+                assert_eq!(operation.state, ManagedRemoveState::ReconciliationRequired);
+            }
+            other => panic!("expected git-push reconcile wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removal_allowed_when_no_active_git_push() {
+        use crate::db::git_push_operations::{GitPushIntent, GitPushOperationState};
+
+        let db = setup();
+        let r = repo("quiet-repo", "Quiet", None);
+        db.insert_repository(&r).unwrap();
+
+        let intent = GitPushIntent {
+            repo_id: "quiet-repo",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let push = db.begin_svn_to_git_push(intent).unwrap();
+        let done = db
+            .confirm_svn_to_git_push(
+                "quiet-repo",
+                &push.id,
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            )
+            .unwrap();
+        assert_eq!(done.state, GitPushOperationState::Completed);
+        assert!(db
+            .active_git_push_operation("quiet-repo")
+            .unwrap()
+            .is_none());
+
+        match db
+            .prepare_managed_remove("quiet-repo", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::Cleanup { operation } => {
+                assert_eq!(operation.state, ManagedRemoveState::Running);
+            }
+            other => panic!("expected cleanup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removal_still_blocked_by_git_to_svn_commit() {
+        use crate::db::svn_commit_operations::{
+            IntendedPath, SvnCommitIntent, SvnCommitOperationState,
+        };
+
+        let db = setup();
+        let r = repo("svn-repo", "Svn", None);
+        db.insert_repository(&r).unwrap();
+
+        let paths = vec![IntendedPath {
+            action: "A".into(),
+            path: "feature.txt".into(),
+            content_sha256: Some("d".repeat(64)),
+        }];
+        let intent = SvnCommitIntent {
+            repo_id: "svn-repo",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_git_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            source_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "file:///svn",
+            target_svn_root_url: "file:///svn",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 2,
+            pre_write_svn_tree: "pre-tree",
+            projection: "{}",
+            intended_changed_paths: paths,
+            intended_svn_tree: "post-tree",
+            author: "dev",
+            source_message: "add feature",
+        };
+        let commit = db.begin_git_to_svn_commit(intent).unwrap();
+        assert_eq!(commit.state, SvnCommitOperationState::Running);
+
+        match db
+            .prepare_managed_remove("svn-repo", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::SvnCommitRunning);
+                assert_eq!(operation.state, ManagedRemoveState::Cancelling);
+            }
+            other => panic!("expected svn-commit wait, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removal_still_blocked_by_git_to_svn_reconcile_hold() {
+        use crate::db::svn_commit_operations::{
+            IntendedPath, SvnCommitIntent, SvnCommitOperationState,
+        };
+
+        let db = setup();
+        let r = repo("svn-held", "SvnHeld", None);
+        db.insert_repository(&r).unwrap();
+
+        let paths = vec![IntendedPath {
+            action: "A".into(),
+            path: "feature.txt".into(),
+            content_sha256: Some("d".repeat(64)),
+        }];
+        let intent = SvnCommitIntent {
+            repo_id: "svn-held",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_git_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            source_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "file:///svn",
+            target_svn_root_url: "file:///svn",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 2,
+            pre_write_svn_tree: "pre-tree",
+            projection: "{}",
+            intended_changed_paths: paths,
+            intended_svn_tree: "post-tree",
+            author: "dev",
+            source_message: "add feature",
+        };
+        let commit = db.begin_git_to_svn_commit(intent).unwrap();
+        db.hold_git_to_svn_reconciliation("svn-held", &commit.id, "lost reply")
+            .unwrap();
+        assert_eq!(
+            db.active_svn_commit_operation("svn-held")
+                .unwrap()
+                .unwrap()
+                .state,
+            SvnCommitOperationState::ReconciliationRequired
+        );
+
+        match db
+            .prepare_managed_remove("svn-held", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::SvnCommitReconciliationRequired);
+                assert_eq!(operation.state, ManagedRemoveState::ReconciliationRequired);
+            }
+            other => panic!("expected svn-commit reconcile wait, got {other:?}"),
+        }
     }
 }
