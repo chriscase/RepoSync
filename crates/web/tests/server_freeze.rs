@@ -4032,6 +4032,155 @@ mod import_reconciliation_tests {
             std::env::remove_var("REPOSYNC_RECONCILE_FAIL");
             std::env::remove_var("REPOSYNC_FIXTURE_ROOT");
         }
+
+        fn git_workdir(&self) -> std::path::PathBuf {
+            self.state
+                .config
+                .daemon
+                .data_dir
+                .join("repos")
+                .join(&self.id)
+                .join("git-repo")
+        }
+
+        async fn auto_reconcile(&self) -> reposync_core::auto_reconcile::AutoReconcileResult {
+            let repo = self.state.db.get_repository(&self.id).unwrap().unwrap();
+            let svn = reposync_core::svn::SvnClient::new("file:///nonexistent", "fixture", "");
+            reposync_core::auto_reconcile::reconcile_held_external_writes(
+                &self.state.db,
+                &repo,
+                &svn,
+                Some(self.git_workdir().as_path()),
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64e_import_lost_reply_auto_finalizes_without_second_publication() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let checkpoint_before = fixture.state.db.get_repo_watermark(&fixture.id).unwrap();
+        let op = fixture.operation();
+        fixture.trace_remote_inspection();
+        let result = fixture.auto_reconcile().await;
+        let attempt = result
+            .attempts
+            .iter()
+            .find(|a| {
+                a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::ImportOperation
+            })
+            .expect("import auto-reconcile attempt");
+        assert!(attempt.finalized, "{attempt:?}");
+        assert!(!attempt.resume_authorized);
+        assert_eq!(fixture.remote(), before);
+        assert_ne!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),
+            checkpoint_before
+        );
+        assert!(fixture
+            .state
+            .db
+            .active_import_operation(&fixture.id)
+            .unwrap()
+            .is_none());
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"64E_IMPORT_AUTO_COMPLETE",
+                "operation_id":op.id,
+                "remote_before_after":before,
+                "finalized":true
+            })
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64e_import_mismatch_auto_reconcile_stays_held_without_mutation() {
+        let fixture = HeldFixture::lost_reply().await;
+        let checkpoint = fixture.state.db.get_repo_watermark(&fixture.id).unwrap();
+        let parent = Command::new("git")
+            .arg("--git-dir")
+            .arg(&fixture.bare)
+            .args(["rev-parse", "refs/heads/main^"])
+            .output()
+            .unwrap();
+        assert!(parent.status.success());
+        let parent = String::from_utf8_lossy(&parent.stdout).trim().to_owned();
+        assert!(Command::new("git")
+            .arg("--git-dir")
+            .arg(&fixture.bare)
+            .args(["update-ref", "refs/heads/main", &parent])
+            .status()
+            .unwrap()
+            .success());
+        fixture.trace_remote_inspection();
+        let result = fixture.auto_reconcile().await;
+        let attempt = result
+            .attempts
+            .iter()
+            .find(|a| {
+                a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::ImportOperation
+            })
+            .expect("import auto-reconcile attempt");
+        assert!(!attempt.finalized);
+        assert!(!attempt.resume_authorized);
+        assert_eq!(
+            fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            fixture.operation().state,
+            reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"64E_IMPORT_MISMATCH_HELD",
+                "finalized":false,
+                "watermark_unchanged":true
+            })
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64e_import_restart_still_auto_reconciles() {
+        let fixture = HeldFixture::lost_reply().await;
+        let before = fixture.remote();
+        let op = fixture.operation();
+        let fixture = fixture.restart().await;
+        fixture.state.db.hold_interrupted_imports().unwrap();
+        assert_eq!(
+            fixture.operation().state,
+            reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+        );
+        fixture.trace_remote_inspection();
+        let result = fixture.auto_reconcile().await;
+        let attempt = result
+            .attempts
+            .iter()
+            .find(|a| {
+                a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::ImportOperation
+            })
+            .expect("import auto-reconcile attempt");
+        assert!(attempt.finalized, "{attempt:?}");
+        assert_eq!(fixture.remote(), before);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"64E_IMPORT_RESTART_AUTO",
+                "operation_id":op.id,
+                "held_until_auto_reconcile":true,
+                "finalized":true
+            })
+        );
+        HeldFixture::clear_trace();
+        fixture.server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

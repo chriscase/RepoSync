@@ -141,8 +141,8 @@ impl Scheduler {
                         }
                     }
 
-                    // Observe-first auto-reconcile for held external-write journals,
-                    // then per-repo sync cycles.
+                    // Observe-first auto-reconcile for held import and external-write
+                    // journals, then per-repo sync cycles.
                     self.maybe_auto_reconcile_held_operations().await;
                     self.maybe_run_repo_cycles().await;
                     // Periodic maintenance (every ~10 minutes)
@@ -298,7 +298,8 @@ impl Scheduler {
     }
 
     /// On each scheduler tick, attempt observe-first reconciliation for held
-    /// `svn_commit` and `svn_to_git_push` journals before ordinary sync cycles.
+    /// `import_operation_v1`, `svn_commit`, and `svn_to_git_push` journals
+    /// before ordinary sync cycles.
     ///
     /// Frequency is bounded by the scheduler poll interval and the per-repository
     /// busy slot: at most one reconcile attempt per tick per repository, and no
@@ -411,6 +412,8 @@ impl Scheduler {
                         };
                         let details = serde_json::json!({
                             "kind": match attempt.kind {
+                                reposync_core::auto_reconcile::HeldExternalWriteKind::ImportOperation =>
+                                    "import_operation",
                                 reposync_core::auto_reconcile::HeldExternalWriteKind::GitToSvnCommit =>
                                     "git_to_svn_commit",
                                 reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush =>
@@ -1204,6 +1207,89 @@ mod cancellation_tests {
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64C07_PRISTINE_WC",
             "head_unchanged":true,"sentinel_unchanged":true,"worker_spawned":false})
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_64e_import_auto_reconcile_skips_when_writer_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, "held-import-auto", "2000-01-01T00:00:00Z");
+        let operation = scheduler
+            .db
+            .create_import_operation("held-import-auto", "legacy", "request", "fp")
+            .unwrap();
+        scheduler
+            .db
+            .finish_import_operation(
+                "held-import-auto",
+                &operation.id,
+                reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired,
+                "lost reply",
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .db
+                .active_import_operation("held-import-auto")
+                .unwrap()
+                .unwrap()
+                .state,
+            reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired
+        );
+        let guard = reposync_core::busy::try_acquire("held-import-auto").unwrap();
+
+        scheduler.maybe_auto_reconcile_held_operations().await;
+
+        let audit = scheduler.db.list_audit_log(20, 0).unwrap();
+        assert!(
+            !audit
+                .iter()
+                .any(|entry| entry.action.starts_with("auto_reconcile")),
+            "busy writer must defer import auto-reconcile until the slot is free"
+        );
+        drop(guard);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64E_IMPORT_BUSY_DEFER","auto_reconcile_attempted":false})
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_64e_held_import_blocks_scheduler_sync_without_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, "held-import-block", "2000-01-01T00:00:00Z");
+        let operation = scheduler
+            .db
+            .create_import_operation("held-import-block", "legacy", "request", "fp")
+            .unwrap();
+        scheduler
+            .db
+            .finish_import_operation(
+                "held-import-block",
+                &operation.id,
+                reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired,
+                "lost reply",
+            )
+            .unwrap();
+
+        scheduler.maybe_run_repo_cycles().await;
+
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+        assert_eq!(
+            scheduler
+                .db
+                .get_repo_watermark("held-import-block")
+                .unwrap(),
+            (2, "verified-old".into())
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"64E_IMPORT_CYCLE_BLOCKED",
+                "operation_id":operation.id,
+                "resume_authorized":false,
+                "worker_spawned":false
+            })
         );
     }
 
