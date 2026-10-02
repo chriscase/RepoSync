@@ -1,6 +1,6 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "authored_against_main": "93e3f5cf24e347d7be477c2c9e0e90531268b7fc",
+  "authored_against_main": "c2ab1d29535571a3ff12a9904ad6d2b1def9c137",
   "scope": "Current-main #62 rollup after merged PR #72/#74/#75. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
   "scenarios": [
     {
@@ -16,7 +16,7 @@
       "baseline": "PARTIAL",
       "candidate": "PARTIAL",
       "tier": "local_api_real_remotes",
-      "evidence": "R02_R03_ROUTE creates disposable file:// SVN and bare Git remotes, then DELETE /api/repos/{id}. The registration remains and enabled=false; message is repository disabled; both remotes are byte-identical after the call. This is the preserved legacy DELETE semantics, not a trash-bin or remote-delete operation.",
+      "evidence": "R02_R03_ROUTE and R02_LEGACY_DELETE keep legacy DELETE as disable-only: the registration, commit_map row, and per-repo secret remain, no managed-removal journal is written, and disposable SVN/Git remotes are byte-identical. R02_MANAGED_REMOVE and R02_REMOVE_RETRY add POST /api/repos/{id}/remove. It waits while a worker holds the repo, refuses symlink roots without following them, retries a visible failure, then removes only the owned local tree and exact per-repo secrets. Mappings, audit, sibling data, global secrets, and both remotes stay. Restore is not supported. Parent removal is refused while children exist.",
       "diagnostic_expected_baseline_failure": false
     },
     {

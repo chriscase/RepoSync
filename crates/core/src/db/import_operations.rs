@@ -237,6 +237,11 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ImportOperation, DatabaseError> {
         self.transaction(|tx| {
+            if super::managed_remove::new_work_blocked(tx, repo_id)? {
+                return Err(DatabaseError::Other(
+                    "repository removal blocks a new import".into(),
+                ));
+            }
             let active = key("active", repo_id);
             if read_value(tx, &active)?.is_some() {
                 return Err(DatabaseError::Other(

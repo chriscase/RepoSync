@@ -9,6 +9,7 @@ acceptance.
 | #63 | [63-lineage-checkpoints.md](63-lineage-checkpoints.md) | No |
 | #64 | [64-durable-jobs.md](64-durable-jobs.md) | No |
 | #66 | [66-history-containment.md](66-history-containment.md) | No |
+| #65 | [65-managed-remove.md](65-managed-remove.md) | Additive removal API only; does not close #65 |
 
 Authoritative sources that these contracts must not silently rewrite:
 

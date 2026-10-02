@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
@@ -193,6 +195,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id", get(get_repo))
         .route("/api/repos/:id", put(update_repo))
         .route("/api/repos/:id", delete(delete_repo))
+        .route("/api/repos/:id/remove", post(remove_repo))
+        .route("/api/repos/:id/removal", get(get_removal))
         .route("/api/repos/:id/sync", post(trigger_sync))
         .route("/api/repos/:id/import", post(start_repo_import))
         .route("/api/repos/:id/import/status", get(repo_import_status))
@@ -371,6 +375,15 @@ async fn update_repo(
 
     let db = &state.db;
     reject_held_import(db, &id)?;
+    if db
+        .managed_remove_blocks_new_work(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Err(AppError::BadRequest(
+            "repository removal is in progress or completed; the registration cannot be reactivated"
+                .into(),
+        ));
+    }
 
     let existing = db
         .get_repository(&id)
@@ -435,25 +448,257 @@ async fn delete_repo(
     let db = &state.db;
     reject_held_import(db, &id)?;
 
-    // Soft delete: disable the repository rather than removing it.
-    let existing = db
-        .get_repository(&id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
-
-    let disabled = reposync_core::models::Repository {
-        enabled: false,
-        updated_at: Utc::now().to_rfc3339(),
-        ..existing
-    };
-
-    db.update_repository(&disabled)
+    // Legacy DELETE stays non-destructive: disable only. Managed removal is
+    // POST /api/repos/:id/remove and never runs from this route.
+    let disabled = db
+        .legacy_disable_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+    if !disabled {
+        return Err(AppError::NotFound("repository not found".into()));
+    }
 
     Ok(Json(serde_json::json!({
         "ok": true,
+        "action": "disable",
         "message": "repository disabled",
+        "enabled": false,
     })))
+}
+
+fn removal_response(
+    operation: &reposync_core::db::managed_remove::ManagedRemoveOperation,
+    registration_listed: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use reposync_core::db::managed_remove::ManagedRemoveState;
+    let status = match operation.state {
+        ManagedRemoveState::Completed => StatusCode::OK,
+        ManagedRemoveState::Failed | ManagedRemoveState::ReconciliationRequired => {
+            StatusCode::CONFLICT
+        }
+        ManagedRemoveState::Queued
+        | ManagedRemoveState::Cancelling
+        | ManagedRemoveState::Running => StatusCode::ACCEPTED,
+    };
+    let retryable = !operation.state.is_terminal_success();
+    let message = operation.outcome_detail.clone().unwrap_or_else(|| {
+        match operation.state {
+            ManagedRemoveState::Completed => {
+                "removed from RepoSync; remote Git and SVN history were not modified; restore is not supported"
+            }
+            ManagedRemoveState::Cancelling | ManagedRemoveState::Queued | ManagedRemoveState::Running => {
+                "removal is waiting for in-flight work to stop; local data was not deleted"
+            }
+            ManagedRemoveState::Failed => "local cleanup failed; removal was not completed",
+            ManagedRemoveState::ReconciliationRequired => {
+                "removal is blocked by an unresolved external effect; registration and local data were kept"
+            }
+        }
+        .to_string()
+    });
+    (
+        status,
+        Json(serde_json::json!({
+            "ok": operation.state.is_terminal_success(),
+            "action": "managed_remove",
+            "state": operation.state,
+            "operation_id": operation.id,
+            "message": message,
+            "remote_git": "untouched",
+            "remote_svn": "untouched",
+            "restore_supported": false,
+            "retryable": retryable,
+            "registration_listed": registration_listed,
+        })),
+    )
+}
+
+fn registration_listed(db: &Database, repo_id: &str) -> Result<bool, AppError> {
+    Ok(db
+        .get_repository(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_some())
+}
+
+async fn signal_import_stop(state: &AppState, repo_id: &str) {
+    if let Ok(Some(active)) = state.db.active_import_operation(repo_id) {
+        if !active.state.is_terminal() {
+            let _ = state.db.request_import_cancel(repo_id, &active.id);
+        }
+    }
+    let progress = state.get_repo_import_progress(repo_id).await;
+    let mut progress = progress.write().await;
+    progress.cancel_requested = true;
+    progress
+        .cancel_signal
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+async fn remove_repo(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    let (user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+    if reposync_core::managed_remove::validate_repo_id(&id).is_err() {
+        return Err(AppError::BadRequest(
+            "repository id is not a single safe path component".into(),
+        ));
+    }
+    let request_id = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("managed-remove")
+        .to_string();
+
+    let advance = state
+        .db
+        .prepare_managed_remove(&id, &user_id, &request_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    use reposync_core::db::managed_remove::{RemovalAdvance, RemovalBlocker};
+    let operation = match advance {
+        RemovalAdvance::NotFound => {
+            return Err(AppError::NotFound("repository not found".into()));
+        }
+        RemovalAdvance::ParentBlocked { child_count } => {
+            return Err(AppError::BadRequest(format!(
+                "parent removal is blocked while {child_count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
+            )));
+        }
+        RemovalAdvance::Completed { operation } => {
+            let listed = registration_listed(&state.db, &id)?;
+            let (status, body) = removal_response(&operation, listed);
+            return Ok((status, body).into_response());
+        }
+        RemovalAdvance::Waiting { operation, blocker } => {
+            if matches!(blocker, RemovalBlocker::ImportRunning) {
+                signal_import_stop(&state, &id).await;
+            }
+            let listed = registration_listed(&state.db, &id)?;
+            let (status, body) = removal_response(&operation, listed);
+            return Ok((status, body).into_response());
+        }
+        RemovalAdvance::Cleanup { operation } => operation,
+    };
+
+    let progress = state.get_repo_import_progress(&id).await;
+    let phase = progress.read().await.phase.clone();
+    let memory_active = !matches!(
+        phase,
+        ImportPhase::Idle | ImportPhase::Completed | ImportPhase::Failed | ImportPhase::Cancelled
+    );
+    if memory_active || reposync_core::busy::is_busy(&id) {
+        signal_import_stop(&state, &id).await;
+        let operation = state
+            .db
+            .note_removal_waiting(
+                &id,
+                &operation.id,
+                "in-process worker still holds the repository; local data was not deleted",
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let listed = registration_listed(&state.db, &id)?;
+        let (status, body) = removal_response(&operation, listed);
+        return Ok((status, body).into_response());
+    }
+    let Some(_busy) = reposync_core::busy::try_acquire(&id) else {
+        let operation = state
+            .db
+            .note_removal_waiting(
+                &id,
+                &operation.id,
+                "in-process worker still holds the repository; local data was not deleted",
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let listed = registration_listed(&state.db, &id)?;
+        let (status, body) = removal_response(&operation, listed);
+        return Ok((status, body).into_response());
+    };
+    let advance = state
+        .db
+        .prepare_managed_remove(&id, &user_id, &request_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let operation = match advance {
+        RemovalAdvance::Cleanup { operation } => operation,
+        RemovalAdvance::Completed { operation } => {
+            let listed = registration_listed(&state.db, &id)?;
+            let (status, body) = removal_response(&operation, listed);
+            return Ok((status, body).into_response());
+        }
+        RemovalAdvance::Waiting { operation, blocker } => {
+            if matches!(blocker, RemovalBlocker::ImportRunning) {
+                signal_import_stop(&state, &id).await;
+            }
+            let listed = registration_listed(&state.db, &id)?;
+            let (status, body) = removal_response(&operation, listed);
+            return Ok((status, body).into_response());
+        }
+        RemovalAdvance::ParentBlocked { child_count } => {
+            return Err(AppError::BadRequest(format!(
+                "parent removal is blocked while {child_count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
+            )));
+        }
+        RemovalAdvance::NotFound => {
+            return Err(AppError::NotFound("repository not found".into()));
+        }
+    };
+
+    let data_dir = state.config.daemon.data_dir.clone();
+    let cleanup = reposync_core::managed_remove::remove_owned_repo_tree(&data_dir, &id);
+    if let Err(error) = cleanup {
+        let operation = state
+            .db
+            .fail_managed_remove(&id, &operation.id, &error.to_string())
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let listed = registration_listed(&state.db, &id)?;
+        let (status, body) = removal_response(&operation, listed);
+        return Ok((status, body).into_response());
+    }
+    match state.db.complete_managed_remove(&id, &operation.id) {
+        Ok(operation) => {
+            let listed = registration_listed(&state.db, &id)?;
+            let (status, body) = removal_response(&operation, listed);
+            Ok((status, body).into_response())
+        }
+        Err(error) => {
+            let operation = state
+                .db
+                .fail_managed_remove(&id, &operation.id, &error.to_string())
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            let listed = registration_listed(&state.db, &id)?;
+            let (status, body) = removal_response(&operation, listed);
+            Ok((status, body).into_response())
+        }
+    }
+}
+
+async fn get_removal(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    validate_session(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    let Some(operation) = state
+        .db
+        .managed_removal(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    else {
+        return Err(AppError::NotFound("managed removal not found".into()));
+    };
+    let listed = registration_listed(&state.db, &id)?;
+    let (status, body) = removal_response(&operation, listed);
+    Ok((status, body).into_response())
 }
 
 async fn trigger_sync(
@@ -474,6 +719,14 @@ async fn trigger_sync(
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
     reject_held_import(db, &id)?;
+    if db
+        .managed_remove_blocks_new_work(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Err(AppError::BadRequest(
+            "repository removal is in progress or completed; sync was not started".into(),
+        ));
+    }
 
     // Check import progress for this repo to give useful status.
     let progress = state.get_repo_import_progress(&id).await;
@@ -613,6 +866,14 @@ async fn start_repo_import(
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    if db
+        .managed_remove_blocks_new_work(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Err(AppError::BadRequest(
+            "repository removal is in progress or completed; import was not started".into(),
+        ));
+    }
 
     // This cancellation increment cannot account for the legacy reset's
     // destructive local cleanup and force-push. Refuse before enrollment or
@@ -1886,6 +2147,14 @@ async fn create_branch_pair(
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound(format!("repository {} not found", id)))?;
+    if db
+        .managed_remove_blocks_new_work(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Err(AppError::BadRequest(
+            "parent removal blocks a new child registration".into(),
+        ));
+    }
 
     // Check nesting depth (max 4 levels: root + 3 children)
     let ancestors = db

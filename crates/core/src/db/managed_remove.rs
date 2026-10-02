@@ -1,0 +1,880 @@
+//! Durable v12 journal for explicit managed removal (#65).
+//!
+//! Documents live in `kv_state` under `managed_remove_v1:`. Ordinary schema
+//! stays v12. Legacy root DELETE does not write this journal.
+//!
+//! Removal disables the registration, waits until #64 import / Git→SVN
+//! ownership is quiet, then deletes only exact per-repo secret keys and the
+//! repository row. Commit mappings, audit rows, and remote history are kept.
+//! Restore is not supported. A tombstone blocks a stale job from inserting
+//! the same id again.
+
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use super::Database;
+use crate::errors::DatabaseError;
+use crate::models::Repository;
+
+const PREFIX: &str = "managed_remove_v1:";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRemoveState {
+    Queued,
+    Cancelling,
+    Running,
+    Completed,
+    Failed,
+    ReconciliationRequired,
+}
+
+impl ManagedRemoveState {
+    pub fn is_terminal_success(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    pub fn blocks_success_response(&self) -> bool {
+        !self.is_terminal_success()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRemoveOperation {
+    pub version: u8,
+    pub id: String,
+    pub repo_id: String,
+    pub operation_type: String,
+    pub initiator_id: String,
+    pub request_id: String,
+    pub target_fingerprint: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub state: ManagedRemoveState,
+    pub outcome_detail: Option<String>,
+    pub last_svn_rev: i64,
+    pub last_git_sha: String,
+    pub remote_git: String,
+    pub remote_svn: String,
+    pub restore_supported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalTombstone {
+    pub version: u8,
+    pub repo_id: String,
+    pub operation_id: String,
+    pub name: String,
+    pub svn_url: String,
+    pub svn_branch: String,
+    pub git_api_url: String,
+    pub git_repo: String,
+    pub git_branch: String,
+    pub parent_id: Option<String>,
+    pub last_svn_rev: i64,
+    pub last_git_sha: String,
+    pub commit_map_count: i64,
+    pub remote_git: String,
+    pub remote_svn: String,
+    pub restore_supported: bool,
+    pub retention: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalBlocker {
+    ImportRunning,
+    ImportReconciliationRequired,
+    SvnCommitRunning,
+    SvnCommitReconciliationRequired,
+    ChildRegistrations { count: i64 },
+}
+
+impl RemovalBlocker {
+    pub fn detail(&self) -> String {
+        match self {
+            Self::ImportRunning => {
+                "in-flight import still owns the repository; local data was not deleted".into()
+            }
+            Self::ImportReconciliationRequired => {
+                "import has an unresolved external effect; registration and local data were kept"
+                    .into()
+            }
+            Self::SvnCommitRunning => {
+                "in-flight Git-to-SVN commit still owns the repository; local data was not deleted"
+                    .into()
+            }
+            Self::SvnCommitReconciliationRequired => {
+                "Git-to-SVN commit has an unresolved external effect; registration and local data were kept"
+                    .into()
+            }
+            Self::ChildRegistrations { count } => format!(
+                "parent removal is blocked while {count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
+            ),
+        }
+    }
+
+    pub fn waiting_state(&self) -> ManagedRemoveState {
+        match self {
+            Self::ImportReconciliationRequired | Self::SvnCommitReconciliationRequired => {
+                ManagedRemoveState::ReconciliationRequired
+            }
+            Self::ChildRegistrations { .. } => ManagedRemoveState::Failed,
+            Self::ImportRunning | Self::SvnCommitRunning => ManagedRemoveState::Cancelling,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovalAdvance {
+    NotFound,
+    ParentBlocked {
+        child_count: i64,
+    },
+    Waiting {
+        operation: ManagedRemoveOperation,
+        blocker: RemovalBlocker,
+    },
+    Cleanup {
+        operation: ManagedRemoveOperation,
+    },
+    Completed {
+        operation: ManagedRemoveOperation,
+    },
+}
+
+fn key(kind: &str, id: &str) -> String {
+    format!("{PREFIX}{kind}:{id}")
+}
+
+fn read_value(conn: &Connection, name: &str) -> Result<Option<String>, DatabaseError> {
+    Ok(conn
+        .query_row("SELECT value FROM kv_state WHERE key=?1", [name], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn write_value(conn: &Connection, name: &str, value: &str) -> Result<(), DatabaseError> {
+    conn.execute(
+        "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        params![name, value, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn parse_op(raw: &str) -> Result<ManagedRemoveOperation, DatabaseError> {
+    let op: ManagedRemoveOperation = serde_json::from_str(raw)
+        .map_err(|error| DatabaseError::Other(format!("invalid managed removal: {error}")))?;
+    if op.version != 1 || op.operation_type != "managed_remove" {
+        return Err(DatabaseError::Other(
+            "unsupported managed removal document".into(),
+        ));
+    }
+    Ok(op)
+}
+
+pub fn new_work_blocked(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+    Ok(read_value(conn, &key("active", repo_id))?.is_some() || tombstone_present(conn, repo_id)?)
+}
+
+pub fn tombstone_present(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+    Ok(read_value(conn, &key("tombstone", repo_id))?.is_some())
+}
+
+fn owned_secret_keys(repo_id: &str) -> [String; 2] {
+    [
+        format!("secret_svn_password_{repo_id}"),
+        format!("secret_git_token_{repo_id}"),
+    ]
+}
+
+fn load_repo(conn: &Connection, repo_id: &str) -> Result<Option<Repository>, DatabaseError> {
+    conn.query_row(
+        "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url
+         FROM repositories WHERE id=?1",
+        [repo_id],
+        |row| {
+            Ok(Repository {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                svn_url: row.get(2)?,
+                svn_branch: row.get(3)?,
+                svn_username: row.get(4)?,
+                git_provider: row.get(5)?,
+                git_api_url: row.get(6)?,
+                git_repo: row.get(7)?,
+                git_branch: row.get(8)?,
+                sync_mode: row.get(9)?,
+                poll_interval_secs: row.get(10)?,
+                lfs_threshold_mb: row.get(11)?,
+                auto_merge: row.get::<_, i32>(12)? != 0,
+                enabled: row.get::<_, i32>(13)? != 0,
+                created_by: row.get(14)?,
+                parent_id: row.get(23)?,
+                allowed_paths: row.get(24)?,
+                blocked_patterns: row.get(25)?,
+                consecutive_errors: row.get(26)?,
+                teams_webhook_url: row.get(27)?,
+                created_at: row.get(15)?,
+                updated_at: row.get(16)?,
+                last_svn_rev: row.get(17)?,
+                last_git_sha: row.get(18)?,
+                last_sync_at: row.get(19)?,
+                sync_status: row.get(20)?,
+                total_syncs: row.get(21)?,
+                total_errors: row.get(22)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(DatabaseError::from)
+}
+
+fn child_count(conn: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM repositories WHERE parent_id=?1",
+        [repo_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+fn fingerprint(repo: &Repository) -> String {
+    let source = serde_json::json!({
+        "repo_id": repo.id,
+        "svn_url": repo.svn_url,
+        "svn_branch": repo.svn_branch,
+        "git_api_url": repo.git_api_url,
+        "git_repo": repo.git_repo,
+        "git_branch": repo.git_branch,
+        "managed_rel": format!("repos/{}", repo.id),
+    })
+    .to_string();
+    hex::encode(Sha256::digest(source.as_bytes()))
+}
+
+fn read_op(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
+    let Some(op_id) =
+        read_value(conn, &key("active", repo_id))?.or(read_value(conn, &key("latest", repo_id))?)
+    else {
+        return Ok(None);
+    };
+    let Some(raw) = read_value(conn, &key("document", &op_id))? else {
+        return Ok(None);
+    };
+    let op = parse_op(&raw)?;
+    if op.repo_id != repo_id {
+        return Err(DatabaseError::Other(
+            "managed removal repository mismatch".into(),
+        ));
+    }
+    Ok(Some(op))
+}
+
+fn store_op(conn: &Connection, op: &ManagedRemoveOperation) -> Result<(), DatabaseError> {
+    write_value(
+        conn,
+        &key("document", &op.id),
+        &serde_json::to_string(op).map_err(|error| {
+            DatabaseError::Other(format!("managed removal serialization failed: {error}"))
+        })?,
+    )?;
+    write_value(conn, &key("latest", &op.repo_id), &op.id)?;
+    if op.state.is_terminal_success() {
+        conn.execute(
+            "DELETE FROM kv_state WHERE key=?1 AND value=?2",
+            params![key("active", &op.repo_id), op.id],
+        )?;
+    } else {
+        write_value(conn, &key("active", &op.repo_id), &op.id)?;
+    }
+    Ok(())
+}
+
+fn audit(
+    conn: &Connection,
+    repo_id: &str,
+    action: &str,
+    details: &str,
+    success: bool,
+) -> Result<(), DatabaseError> {
+    conn.execute(
+        "INSERT INTO audit_log (action, direction, svn_rev, git_sha, author, details, created_at, success, repo_id)
+         VALUES (?1, NULL, NULL, NULL, 'managed_remove', ?2, ?3, ?4, ?5)",
+        params![
+            action,
+            details,
+            Utc::now().to_rfc3339(),
+            success as i32,
+            repo_id
+        ],
+    )?;
+    Ok(())
+}
+
+fn import_blocker(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<RemovalBlocker>, DatabaseError> {
+    let Some(op_id) = read_value(conn, &format!("import_operation_v1:active:{repo_id}"))? else {
+        return Ok(None);
+    };
+    let Some(raw) = read_value(conn, &format!("import_operation_v1:document:{op_id}"))? else {
+        return Ok(Some(RemovalBlocker::ImportRunning));
+    };
+    let state = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| value.get("state")?.as_str().map(str::to_owned));
+    Ok(match state.as_deref() {
+        Some("completed" | "cancelled" | "failed") => None,
+        Some("reconciliation_required") => Some(RemovalBlocker::ImportReconciliationRequired),
+        _ => Some(RemovalBlocker::ImportRunning),
+    })
+}
+
+fn svn_commit_blocker(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<RemovalBlocker>, DatabaseError> {
+    let Some(op_id) = read_value(conn, &format!("git_to_svn_commit_v1:active:{repo_id}"))? else {
+        return Ok(None);
+    };
+    let Some(raw) = read_value(conn, &format!("git_to_svn_commit_v1:document:{op_id}"))? else {
+        return Ok(Some(RemovalBlocker::SvnCommitRunning));
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let state = value.get("state").and_then(|s| s.as_str());
+    Ok(match state {
+        Some("completed" | "failed") => None,
+        Some("reconciliation_required") => Some(RemovalBlocker::SvnCommitReconciliationRequired),
+        _ => Some(RemovalBlocker::SvnCommitRunning),
+    })
+}
+
+fn writer_blocker(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<RemovalBlocker>, DatabaseError> {
+    if let Some(blocker) = import_blocker(conn, repo_id)? {
+        return Ok(Some(blocker));
+    }
+    svn_commit_blocker(conn, repo_id)
+}
+
+fn fresh_op(repo: &Repository, initiator_id: &str, request_id: &str) -> ManagedRemoveOperation {
+    let now = Utc::now().to_rfc3339();
+    ManagedRemoveOperation {
+        version: 1,
+        id: Uuid::new_v4().to_string(),
+        repo_id: repo.id.clone(),
+        operation_type: "managed_remove".into(),
+        initiator_id: initiator_id.into(),
+        request_id: request_id.into(),
+        target_fingerprint: fingerprint(repo),
+        created_at: now.clone(),
+        updated_at: now,
+        state: ManagedRemoveState::Queued,
+        outcome_detail: None,
+        last_svn_rev: repo.last_svn_rev,
+        last_git_sha: repo.last_git_sha.clone(),
+        remote_git: "untouched".into(),
+        remote_svn: "untouched".into(),
+        restore_supported: false,
+    }
+}
+
+impl Database {
+    pub fn managed_remove_blocks_new_work(&self, repo_id: &str) -> Result<bool, DatabaseError> {
+        let conn = self.conn();
+        new_work_blocked(&conn, repo_id)
+    }
+
+    pub fn managed_removal(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
+        let conn = self.conn();
+        read_op(&conn, repo_id)
+    }
+
+    pub fn removal_tombstone(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<RemovalTombstone>, DatabaseError> {
+        let conn = self.conn();
+        let Some(raw) = read_value(&conn, &key("tombstone", repo_id))? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw)
+            .map(Some)
+            .map_err(|error| DatabaseError::Other(format!("invalid removal tombstone: {error}")))
+    }
+
+    /// Narrow legacy DELETE: clear `enabled` only. Does not create a removal
+    /// journal and does not delete mappings, secrets, files, or remotes.
+    pub fn legacy_disable_repository(&self, repo_id: &str) -> Result<bool, DatabaseError> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), repo_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn prepare_managed_remove(
+        &self,
+        repo_id: &str,
+        initiator_id: &str,
+        request_id: &str,
+    ) -> Result<RemovalAdvance, DatabaseError> {
+        self.transaction(|tx| {
+            if let Some(op) = read_op(tx, repo_id)? {
+                if op.state.is_terminal_success() {
+                    return Ok(RemovalAdvance::Completed { operation: op });
+                }
+            }
+            let children = child_count(tx, repo_id)?;
+            if children > 0 {
+                return Ok(RemovalAdvance::ParentBlocked {
+                    child_count: children,
+                });
+            }
+            let Some(repo) = load_repo(tx, repo_id)? else {
+                return Ok(match read_op(tx, repo_id)? {
+                    Some(op) if op.state.is_terminal_success() => {
+                        RemovalAdvance::Completed { operation: op }
+                    }
+                    Some(_) => RemovalAdvance::NotFound,
+                    None => RemovalAdvance::NotFound,
+                });
+            };
+            let mut op = match read_op(tx, repo_id)? {
+                Some(op) => op,
+                None => {
+                    let op = fresh_op(&repo, initiator_id, request_id);
+                    audit(
+                        tx,
+                        repo_id,
+                        "managed_remove_accepted",
+                        "explicit managed removal accepted; remote Git and SVN history will not be modified; restore is not supported",
+                        true,
+                    )?;
+                    op
+                }
+            };
+            tx.execute(
+                "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), repo_id],
+            )?;
+            if let Some(blocker) = writer_blocker(tx, repo_id)? {
+                op.state = blocker.waiting_state();
+                op.outcome_detail = Some(blocker.detail());
+                op.updated_at = Utc::now().to_rfc3339();
+                store_op(tx, &op)?;
+                return Ok(RemovalAdvance::Waiting { operation: op, blocker });
+            }
+            op.state = ManagedRemoveState::Running;
+            op.outcome_detail = Some(
+                "writers are quiet; owned local cleanup has not finished".into(),
+            );
+            op.updated_at = Utc::now().to_rfc3339();
+            op.last_svn_rev = repo.last_svn_rev;
+            op.last_git_sha = repo.last_git_sha;
+            store_op(tx, &op)?;
+            Ok(RemovalAdvance::Cleanup { operation: op })
+        })
+    }
+
+    pub fn note_removal_waiting(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        detail: &str,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        self.transaction(|tx| {
+            let mut op = require_active(tx, repo_id, op_id)?;
+            if op.state.is_terminal_success() {
+                return Ok(op);
+            }
+            op.state = ManagedRemoveState::Cancelling;
+            op.outcome_detail = Some(detail.into());
+            op.updated_at = Utc::now().to_rfc3339();
+            store_op(tx, &op)?;
+            Ok(op)
+        })
+    }
+
+    pub fn fail_managed_remove(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        detail: &str,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        self.transaction(|tx| {
+            let mut op = require_active(tx, repo_id, op_id)?;
+            if op.state.is_terminal_success() {
+                return Err(DatabaseError::Other(
+                    "completed removal cannot be marked failed".into(),
+                ));
+            }
+            op.state = ManagedRemoveState::Failed;
+            op.outcome_detail = Some(detail.into());
+            op.updated_at = Utc::now().to_rfc3339();
+            store_op(tx, &op)?;
+            audit(tx, repo_id, "managed_remove_failed", detail, false)?;
+            Ok(op)
+        })
+    }
+
+    /// Finish removal only after owned-path cleanup has returned success.
+    /// Partial failure must use [`Database::fail_managed_remove`] instead.
+    pub fn complete_managed_remove(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        self.transaction(|tx| {
+            let mut op = require_active(tx, repo_id, op_id)?;
+            if op.state.is_terminal_success() {
+                return Ok(op);
+            }
+            if child_count(tx, repo_id)? > 0 {
+                return Err(DatabaseError::Other(
+                    "child registrations appeared before removal finished".into(),
+                ));
+            }
+            if let Some(blocker) = writer_blocker(tx, repo_id)? {
+                return Err(DatabaseError::Other(blocker.detail()));
+            }
+            let Some(repo) = load_repo(tx, repo_id)? else {
+                return Err(DatabaseError::Other(
+                    "registration disappeared before removal could record its tombstone".into(),
+                ));
+            };
+            let commit_map_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                [repo_id],
+                |row| row.get(0),
+            )?;
+            let tombstone = RemovalTombstone {
+                version: 1,
+                repo_id: repo.id.clone(),
+                operation_id: op.id.clone(),
+                name: repo.name.clone(),
+                svn_url: repo.svn_url.clone(),
+                svn_branch: repo.svn_branch.clone(),
+                git_api_url: repo.git_api_url.clone(),
+                git_repo: repo.git_repo.clone(),
+                git_branch: repo.git_branch.clone(),
+                parent_id: repo.parent_id.clone(),
+                last_svn_rev: repo.last_svn_rev,
+                last_git_sha: repo.last_git_sha.clone(),
+                commit_map_count,
+                remote_git: "untouched".into(),
+                remote_svn: "untouched".into(),
+                restore_supported: false,
+                retention: "tombstone_audit_and_mappings_retained_no_restore".into(),
+            };
+            write_value(
+                tx,
+                &key("tombstone", repo_id),
+                &serde_json::to_string(&tombstone).map_err(|error| {
+                    DatabaseError::Other(format!("tombstone serialization failed: {error}"))
+                })?,
+            )?;
+            for secret_key in owned_secret_keys(repo_id) {
+                tx.execute("DELETE FROM kv_state WHERE key=?1", [&secret_key])?;
+                tx.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&secret_key])?;
+            }
+            if tx.execute("DELETE FROM repositories WHERE id=?1", [repo_id])? != 1 {
+                return Err(DatabaseError::Other(
+                    "registration row was not removed".into(),
+                ));
+            }
+            op.state = ManagedRemoveState::Completed;
+            op.outcome_detail = Some(
+                "removed from active listings; owned local data cleaned; remote Git and SVN history were not modified; restore is not supported"
+                    .into(),
+            );
+            op.updated_at = Utc::now().to_rfc3339();
+            op.last_svn_rev = repo.last_svn_rev;
+            op.last_git_sha = repo.last_git_sha;
+            store_op(tx, &op)?;
+            audit(
+                tx,
+                repo_id,
+                "managed_remove_completed",
+                op.outcome_detail.as_deref().unwrap_or("completed"),
+                true,
+            )?;
+            Ok(op)
+        })
+    }
+}
+
+fn require_active(
+    conn: &Connection,
+    repo_id: &str,
+    op_id: &str,
+) -> Result<ManagedRemoveOperation, DatabaseError> {
+    let active = read_value(conn, &key("active", repo_id))?;
+    if active.as_deref() != Some(op_id) {
+        if let Some(op) = read_op(conn, repo_id)? {
+            if op.id == op_id && op.state.is_terminal_success() {
+                return Ok(op);
+            }
+        }
+        return Err(DatabaseError::Other(
+            "stale or inactive managed removal".into(),
+        ));
+    }
+    let raw = read_value(conn, &key("document", op_id))?
+        .ok_or_else(|| DatabaseError::Other("missing managed removal document".into()))?;
+    let op = parse_op(&raw)?;
+    if op.repo_id != repo_id {
+        return Err(DatabaseError::Other(
+            "managed removal repository mismatch".into(),
+        ));
+    }
+    Ok(op)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::import_operations::ImportOperationState;
+
+    fn setup() -> Database {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    fn repo(id: &str, name: &str, parent: Option<&str>) -> Repository {
+        Repository {
+            id: id.into(),
+            name: name.into(),
+            svn_url: "file:///tmp/svn".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "user".into(),
+            git_provider: "gitea".into(),
+            git_api_url: "http://127.0.0.1/api/v1".into(),
+            git_repo: "local/fixture".into(),
+            git_branch: "main".into(),
+            sync_mode: "direct".into(),
+            poll_interval_secs: 60,
+            lfs_threshold_mb: 0,
+            auto_merge: true,
+            enabled: true,
+            created_by: None,
+            parent_id: parent.map(str::to_owned),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_svn_rev: 3,
+            last_git_sha: "abc".into(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 1,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        }
+    }
+
+    #[test]
+    fn candidate_r02_journal_failure_is_retryable_and_stale_job_cannot_resurrect() {
+        let db = setup();
+        let parent = repo("parent-1", "Parent", None);
+        db.insert_repository(&parent).unwrap();
+        db.insert_repository(&repo("child-1", "Child", Some("parent-1")))
+            .unwrap();
+        match db
+            .prepare_managed_remove("parent-1", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::ParentBlocked { child_count } => assert_eq!(child_count, 1),
+            other => panic!("expected parent block, got {other:?}"),
+        }
+        assert!(db.get_repository("parent-1").unwrap().unwrap().enabled);
+        assert!(db.managed_removal("parent-1").unwrap().is_none());
+
+        db.set_state("secret_svn_password_child-1", "child-secret")
+            .unwrap();
+        db.set_state("secret_svn_password_parent-1", "owned-secret")
+            .unwrap();
+        match db
+            .prepare_managed_remove("child-1", "admin", "child")
+            .unwrap()
+        {
+            RemovalAdvance::Cleanup { operation } => {
+                db.complete_managed_remove("child-1", &operation.id)
+                    .unwrap();
+            }
+            other => panic!("expected child cleanup, got {other:?}"),
+        }
+        assert!(db.get_repository("child-1").unwrap().is_none());
+        assert!(db.get_repository("parent-1").unwrap().unwrap().enabled);
+        assert_eq!(
+            db.get_state("secret_svn_password_parent-1")
+                .unwrap()
+                .as_deref(),
+            Some("owned-secret")
+        );
+        assert!(db
+            .get_state("secret_svn_password_child-1")
+            .unwrap()
+            .is_none());
+        db.set_state("secret_svn_password_parent-1", "owned-secret")
+            .unwrap();
+        db.set_state("secret_git_token_parent-1", "owned-token")
+            .unwrap();
+        db.set_state("secret_svn_password", "global-secret")
+            .unwrap();
+        db.set_state("secret_svn_password_sibling", "sibling-secret")
+            .unwrap();
+        db.set_state("last_svn_rev_parent-1", "3").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (3, 'abc', 'svn_to_git', 't', 'a', 'b', 'parent-1')",
+                [],
+            )
+            .unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let owned = data.path().join("repos").join("parent-1");
+        std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+        std::fs::write(owned.join("git-repo").join("owned.txt"), "owned\n").unwrap();
+        std::fs::create_dir_all(data.path().join("repos").join("sibling")).unwrap();
+        std::fs::write(
+            data.path().join("repos").join("sibling").join("keep.txt"),
+            "keep\n",
+        )
+        .unwrap();
+
+        db.create_import_operation("parent-1", "admin", "imp", "fingerprint")
+            .unwrap();
+        match db
+            .prepare_managed_remove("parent-1", "admin", "req-1")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::ImportRunning);
+                assert_eq!(operation.state, ManagedRemoveState::Cancelling);
+                assert!(!operation.state.is_terminal_success());
+            }
+            other => panic!("expected import wait, got {other:?}"),
+        }
+        assert!(owned.join("git-repo").join("owned.txt").exists());
+        assert_eq!(
+            db.get_state("secret_svn_password_parent-1")
+                .unwrap()
+                .as_deref(),
+            Some("owned-secret")
+        );
+        let op = db.managed_removal("parent-1").unwrap().unwrap();
+        db.finish_import_operation(
+            "parent-1",
+            &db.active_import_operation("parent-1").unwrap().unwrap().id,
+            ImportOperationState::Cancelled,
+            "cancelled for removal test",
+        )
+        .unwrap();
+
+        let failed = db
+            .fail_managed_remove(&op.repo_id, &op.id, "injected cleanup failure")
+            .unwrap();
+        assert_eq!(failed.state, ManagedRemoveState::Failed);
+        assert!(db.get_repository("parent-1").unwrap().is_some());
+        assert_eq!(
+            db.get_state("secret_svn_password_parent-1")
+                .unwrap()
+                .as_deref(),
+            Some("owned-secret")
+        );
+
+        match db
+            .prepare_managed_remove("parent-1", "admin", "req-2")
+            .unwrap()
+        {
+            RemovalAdvance::Cleanup { operation } => {
+                assert_eq!(operation.id, op.id);
+                crate::managed_remove::remove_owned_repo_tree(data.path(), "parent-1").unwrap();
+                let done = db
+                    .complete_managed_remove("parent-1", &operation.id)
+                    .unwrap();
+                assert_eq!(done.state, ManagedRemoveState::Completed);
+                assert!(!done.restore_supported);
+                assert_eq!(done.remote_git, "untouched");
+                assert_eq!(done.remote_svn, "untouched");
+            }
+            other => panic!("expected cleanup, got {other:?}"),
+        }
+
+        assert!(!owned.exists());
+        assert_eq!(
+            std::fs::read_to_string(data.path().join("repos").join("sibling").join("keep.txt"))
+                .unwrap(),
+            "keep\n"
+        );
+        assert!(db.get_repository("parent-1").unwrap().is_none());
+        assert!(db
+            .get_state("secret_svn_password_parent-1")
+            .unwrap()
+            .is_none());
+        assert!(db.get_state("secret_git_token_parent-1").unwrap().is_none());
+        assert_eq!(
+            db.get_state("secret_svn_password").unwrap().as_deref(),
+            Some("global-secret")
+        );
+        assert_eq!(
+            db.get_state("secret_svn_password_sibling")
+                .unwrap()
+                .as_deref(),
+            Some("sibling-secret")
+        );
+        assert_eq!(
+            db.get_state("last_svn_rev_parent-1").unwrap().as_deref(),
+            Some("3")
+        );
+        let maps: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE repo_id='parent-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(maps, 1);
+        let audits: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE repo_id='parent-1' AND action='managed_remove_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(audits >= 1);
+        let tombstone = db.removal_tombstone("parent-1").unwrap().unwrap();
+        assert!(!tombstone.restore_supported);
+        assert_eq!(tombstone.commit_map_count, 1);
+        assert_eq!(tombstone.remote_svn, "untouched");
+
+        let again = db
+            .prepare_managed_remove("parent-1", "admin", "req-3")
+            .unwrap();
+        assert!(matches!(again, RemovalAdvance::Completed { .. }));
+        let error = db.insert_repository(&parent).unwrap_err();
+        assert!(error.to_string().contains("cannot recreate"), "{error}");
+        assert!(db.list_repositories().unwrap().is_empty());
+    }
+}

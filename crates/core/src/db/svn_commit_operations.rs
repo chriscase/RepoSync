@@ -209,27 +209,41 @@ fn finalize_tx(
             ],
         )?;
     }
-    tx.execute(
-        "UPDATE repositories SET last_git_sha=?1 WHERE id=?2",
-        params![op.source_git_sha, op.repo_id],
-    )?;
+    let removed = super::managed_remove::tombstone_present(tx, &op.repo_id)?;
     let now = Utc::now().to_rfc3339();
-    write_value(
-        tx,
-        &format!("last_git_sha_{}", op.repo_id),
-        &op.source_git_sha,
-    )?;
-    write_value(tx, "last_git_hash", &op.source_git_sha)?;
-    tx.execute(
-        "UPDATE repositories SET total_syncs = total_syncs + 1 WHERE id=?1",
-        params![op.repo_id],
-    )?;
+    if !removed {
+        let updated_sha = tx.execute(
+            "UPDATE repositories SET last_git_sha=?1 WHERE id=?2",
+            params![op.source_git_sha, op.repo_id],
+        )?;
+        let updated_syncs = tx.execute(
+            "UPDATE repositories SET total_syncs = total_syncs + 1 WHERE id=?1",
+            params![op.repo_id],
+        )?;
+        if updated_sha != 1 || updated_syncs != 1 {
+            return Err(DatabaseError::Other(
+                "git-to-svn commit lost its repository registration".into(),
+            ));
+        }
+        write_value(
+            tx,
+            &format!("last_git_sha_{}", op.repo_id),
+            &op.source_git_sha,
+        )?;
+        write_value(tx, "last_git_hash", &op.source_git_sha)?;
+    }
+    if removed {
+        op.outcome_detail =
+            Some("recorded after repository removal; registration was not restored".into());
+    }
     op.state = SvnCommitOperationState::Completed;
     op.last_confirmed_svn_rev = Some(svn_rev);
     op.last_confirmed_svn_tree = Some(svn_tree.into());
     op.resume_authorized = false;
     op.updated_at = now;
-    op.outcome_detail = Some("Git-to-SVN commit verified and recorded".into());
+    if !removed {
+        op.outcome_detail = Some("Git-to-SVN commit verified and recorded".into());
+    }
     write_op(tx, &op)?;
     clear_active(tx, &op.repo_id, &op.id)?;
     Ok(op)
@@ -312,7 +326,15 @@ impl Database {
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
             let active = key("active", intent.repo_id);
-            if let Some(existing_id) = read_value(tx, &active)? {
+            let active_existing = read_value(tx, &active)?;
+            if active_existing.is_none()
+                && super::managed_remove::new_work_blocked(tx, intent.repo_id)?
+            {
+                return Err(DatabaseError::Other(
+                    "repository removal blocks a new Git-to-SVN commit".into(),
+                ));
+            }
+            if let Some(existing_id) = active_existing {
                 let mut existing = parse(
                     &read_value(tx, &key("document", &existing_id))?.ok_or_else(|| {
                         DatabaseError::Other("missing git-to-svn commit document".into())

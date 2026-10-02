@@ -1478,17 +1478,57 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
         .cancel_signal
         .load(std::sync::atomic::Ordering::Acquire));
     assert!(state.db.active_import_operation(id).unwrap().is_none());
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (1, 'abc123', 'svn_to_git', 't', 'svn', 'git', ?1)",
+            [id],
+        )
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{id}"), "keep-secret")
+        .unwrap();
 
     let delete = client
         .delete(format!("{base}/api/repos/{id}"))
         .send()
         .await
         .unwrap();
+
     assert!(delete.status().is_success());
     let delete_body: serde_json::Value = delete.json().await.unwrap();
     assert_eq!(delete_body["message"], "repository disabled");
+    assert_eq!(delete_body["action"], "disable");
     assert!(!state.db.get_repository(id).unwrap().unwrap().enabled);
     assert!(state.db.get_repository(id).unwrap().is_some());
+    let maps: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps, 1);
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("secret_svn_password_{id}"))
+            .unwrap()
+            .as_deref(),
+        Some("keep-secret")
+    );
+    assert!(state.db.managed_removal(id).unwrap().is_none());
+    assert!(state
+        .db
+        .list_repositories()
+        .unwrap()
+        .iter()
+        .any(|repo| repo.id == id));
     let svn_after = Command::new("svnlook")
         .args(["youngest", svn_repo.to_str().unwrap()])
         .output()
@@ -4874,4 +4914,476 @@ mod import_reconciliation_tests {
         partial.server.abort();
         HeldFixture::clear_trace();
     }
+}
+
+fn disposable_remote_tips(
+    root: &std::path::Path,
+) -> (std::path::PathBuf, String, std::path::PathBuf) {
+    use std::process::Command;
+    let svn_repo = root.join("svn-remote");
+    let created = Command::new("svnadmin")
+        .args(["create", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let svn_url = format!("file://{}", svn_repo.display());
+    let created = Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/trunk"),
+            "-m",
+            "fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let git_bare = root.join("git-origin.git");
+    assert!(Command::new("git")
+        .args(["init", "--bare", git_bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let git_work = root.join("git-work");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main", git_work.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(git_work.join("fixture.txt"), "preserve remote history\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&git_work)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["add", "fixture.txt"]);
+    git(&["commit", "-m", "Fixture"]);
+    git(&["remote", "add", "origin", git_bare.to_str().unwrap()]);
+    git(&["push", "origin", "main"]);
+    (svn_repo, svn_url, git_bare)
+}
+
+fn remote_snapshot(svn_repo: &std::path::Path, git_bare: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+    use std::process::Command;
+    let svn = Command::new("svnlook")
+        .args(["youngest", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(svn.status.success());
+    let git = Command::new("git")
+        .args([
+            "--git-dir",
+            git_bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(git.status.success());
+    (svn.stdout, git.stdout)
+}
+
+async fn create_fixture_repo(base: &str, client: &reqwest::Client, svn_url: &str) -> String {
+    let response = client
+        .post(format!("{base}/api/repos"))
+        .json(&serde_json::json!({
+            "name": format!("fixture-{}", uuid::Uuid::new_v4()),
+            "svn_url": svn_url,
+            "svn_branch": "trunk",
+            "git_provider": "gitea",
+            "git_api_url": "http://127.0.0.1:9/api/v1",
+            "git_repo": "local/fixture",
+            "git_branch": "main"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["id"].as_str().unwrap().to_string()
+}
+
+/// R02: legacy root DELETE disables only. Registration, mappings, secrets, and remotes stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r02_legacy_delete_keeps_registration_mappings_and_remotes() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let (svn_repo, svn_url, git_bare) = disposable_remote_tips(tmp.path());
+    let before = remote_snapshot(&svn_repo, &git_bare);
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let id = create_fixture_repo(&base, &client, &svn_url).await;
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (2, 'def456', 'svn_to_git', 't', 'svn', 'git', ?1)",
+            [&id],
+        )
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{id}"), "owned")
+        .unwrap();
+    let delete = client
+        .delete(format!("{base}/api/repos/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(delete.status().is_success());
+    let body: serde_json::Value = delete.json().await.unwrap();
+    assert_eq!(body["message"], "repository disabled");
+    assert_eq!(body["action"], "disable");
+    assert_ne!(body["action"], "managed_remove");
+    let again = client
+        .delete(format!("{base}/api/repos/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(again.status().is_success());
+    let repo = state.db.get_repository(&id).unwrap().unwrap();
+    assert!(!repo.enabled);
+    let maps: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps, 1);
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("secret_svn_password_{id}"))
+            .unwrap()
+            .as_deref(),
+        Some("owned")
+    );
+    assert!(state.db.managed_removal(&id).unwrap().is_none());
+    assert!(state.db.removal_tombstone(&id).unwrap().is_none());
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/repos"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed
+        .iter()
+        .any(|repo| repo["id"] == id && repo["enabled"] == false));
+    assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R02_LEGACY_DELETE","action":"disable","registration":true,"mappings":1,"remote":"unchanged"})
+    );
+    server.abort();
+}
+
+/// R02: additive managed removal cleans owned local data only and leaves remotes unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let (svn_repo, svn_url, git_bare) = disposable_remote_tips(tmp.path());
+    let before = remote_snapshot(&svn_repo, &git_bare);
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let id = create_fixture_repo(&base, &client, &svn_url).await;
+    let saved = state.db.get_repository(&id).unwrap().unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{id}"), "owned-secret")
+        .unwrap();
+    state
+        .db
+        .set_state("secret_svn_password", "global-secret")
+        .unwrap();
+    state
+        .db
+        .set_state("secret_svn_password_sibling", "sibling-secret")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("last_svn_rev_{id}"), "4")
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (4, 'abc', 'svn_to_git', 't', 'svn', 'git', ?1)",
+            [&id],
+        )
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    let owned = data.join("repos").join(&id);
+    std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+    std::fs::write(owned.join("git-repo").join("owned.txt"), "owned\n").unwrap();
+    let outside = tmp.path().join("outside-target");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "do-not-delete\n").unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.txt"), owned.join("escape")).unwrap();
+    let sibling = data.join("repos").join("sibling-dir");
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::write(sibling.join("keep.txt"), "sibling\n").unwrap();
+
+    let mut child = saved.clone();
+    child.id = format!("{id}-child");
+    child.name = format!("{}-child", saved.name);
+    child.parent_id = Some(id.clone());
+    child.git_branch = "feature".into();
+    state.db.insert_repository(&child).unwrap();
+    let blocked = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "{}",
+        blocked.text().await.unwrap()
+    );
+    assert!(owned.join("git-repo").join("owned.txt").exists());
+    assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
+    state
+        .db
+        .conn()
+        .execute("DELETE FROM repositories WHERE id=?1", [&child.id])
+        .unwrap();
+
+    let removed = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        removed.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        removed.text().await.unwrap()
+    );
+    let body: serde_json::Value = removed.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["action"], "managed_remove");
+    assert_eq!(body["state"], "completed");
+    assert_eq!(body["remote_git"], "untouched");
+    assert_eq!(body["remote_svn"], "untouched");
+    assert_eq!(body["restore_supported"], false);
+    assert_eq!(body["registration_listed"], false);
+    assert!(!owned.exists());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "do-not-delete\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(sibling.join("keep.txt")).unwrap(),
+        "sibling\n"
+    );
+    assert!(state.db.get_repository(&id).unwrap().is_none());
+    assert!(state
+        .db
+        .get_state(&format!("secret_svn_password_{id}"))
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        state
+            .db
+            .get_state("secret_svn_password")
+            .unwrap()
+            .as_deref(),
+        Some("global-secret")
+    );
+    assert_eq!(
+        state
+            .db
+            .get_state("secret_svn_password_sibling")
+            .unwrap()
+            .as_deref(),
+        Some("sibling-secret")
+    );
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("last_svn_rev_{id}"))
+            .unwrap()
+            .as_deref(),
+        Some("4")
+    );
+    let maps: i64 = state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps, 1);
+    let tombstone = state.db.removal_tombstone(&id).unwrap().unwrap();
+    assert!(!tombstone.restore_supported);
+    assert_eq!(tombstone.remote_git, "untouched");
+    let listed: Vec<serde_json::Value> = client
+        .get(format!("{base}/api/repos"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(listed.iter().all(|repo| repo["id"] != id));
+    let missing = client
+        .get(format!("{base}/api/repos/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    let status = client
+        .get(format!("{base}/api/repos/{id}/removal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), reqwest::StatusCode::OK);
+    let repeated = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), reqwest::StatusCode::OK);
+    let repeated: serde_json::Value = repeated.json().await.unwrap();
+    assert_eq!(repeated["state"], "completed");
+    assert_eq!(repeated["ok"], true);
+    assert!(state
+        .db
+        .insert_repository(&saved)
+        .unwrap_err()
+        .to_string()
+        .contains("cannot recreate"));
+    assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R02_MANAGED_REMOVE","state":"completed","remote":"unchanged","owned_local":"removed","sibling":"kept","restore_supported":false})
+    );
+    server.abort();
+}
+
+/// R02: busy or failed path cleanup does not report success and does not touch remotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r02_managed_remove_waits_and_retries_without_touching_remotes() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let (svn_repo, svn_url, git_bare) = disposable_remote_tips(tmp.path());
+    let before = remote_snapshot(&svn_repo, &git_bare);
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let id = create_fixture_repo(&base, &client, &svn_url).await;
+    let data = state.config.daemon.data_dir.clone();
+    let outside = tmp.path().join("linked-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "do-not-delete\n").unwrap();
+    let link = data.join("repos").join(&id);
+    if link.exists() {
+        std::fs::remove_dir_all(&link).unwrap();
+    }
+    std::fs::create_dir_all(data.join("repos")).unwrap();
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let failed = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    let failed_status = failed.status();
+    let failed_body: serde_json::Value = failed.json().await.unwrap();
+    assert_eq!(
+        failed_status,
+        reqwest::StatusCode::CONFLICT,
+        "{failed_body}"
+    );
+    assert_eq!(failed_body["ok"], false);
+    assert_eq!(failed_body["state"], "failed");
+    assert_eq!(failed_body["retryable"], true);
+    assert_eq!(failed_body["action"], "managed_remove");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "do-not-delete\n"
+    );
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(state.db.get_repository(&id).unwrap().is_some());
+    assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
+
+    std::fs::remove_file(&link).unwrap();
+    std::fs::create_dir_all(link.join("git-repo")).unwrap();
+    std::fs::write(link.join("owned.txt"), "owned\n").unwrap();
+    let guard = reposync_core::busy::try_acquire(&id).unwrap();
+    let waiting = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    let waiting_status = waiting.status();
+    let waiting_body: serde_json::Value = waiting.json().await.unwrap();
+    assert_eq!(
+        waiting_status,
+        reqwest::StatusCode::ACCEPTED,
+        "{waiting_body}"
+    );
+    assert_eq!(waiting_body["ok"], false);
+    assert_eq!(waiting_body["state"], "cancelling");
+    assert!(link.join("owned.txt").exists());
+    assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
+    drop(guard);
+
+    let done = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        done.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        done.text().await.unwrap()
+    );
+    let done: serde_json::Value = done.json().await.unwrap();
+    assert_eq!(done["state"], "completed");
+    assert_eq!(done["ok"], true);
+    assert!(!link.exists());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "do-not-delete\n"
+    );
+    assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R02_REMOVE_RETRY","failed_then_completed":true,"busy_wait":"cancelling","remote":"unchanged"})
+    );
+    server.abort();
 }

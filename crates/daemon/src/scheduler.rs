@@ -325,6 +325,18 @@ impl Scheduler {
             if !repo.enabled {
                 continue;
             }
+            match self.db.managed_remove_blocks_new_work(&repo.id) {
+                Ok(true) => {
+                    debug!(repo_name = %repo.name, "skipping repository held by managed removal");
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo_name = %repo.name, error = %e,
+                        "cannot establish removal hold; refusing repository sync");
+                    continue;
+                }
+                Ok(false) => {}
+            }
             match self.db.active_import_operation(&repo.id) {
                 Ok(Some(op)) => {
                     debug!(repo_name = %repo.name, operation_id = %op.id,
