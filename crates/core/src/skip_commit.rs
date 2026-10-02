@@ -197,10 +197,8 @@ pub fn load_exclusion_receipt(
 ) -> Result<Option<serde_json::Value>, DatabaseError> {
     let key = exclusion_receipt_key(repo_id, sha);
     let raw = db.get_state(&key)?;
-    raw.map(|value| {
-        serde_json::from_str(&value).map_err(|e| DatabaseError::Other(e.to_string()))
-    })
-    .transpose()
+    raw.map(|value| serde_json::from_str(&value).map_err(|e| DatabaseError::Other(e.to_string())))
+        .transpose()
 }
 
 pub fn is_commit_excluded(db: &Database, repo_id: &str, sha: &str) -> Result<bool, DatabaseError> {
@@ -307,8 +305,7 @@ pub fn execute_exact_skip(
 
     if let Some(expected_bridge) = expected_bridge_tip {
         let actual_bridge = normalize_sha(
-            &git_success(workdir, &["rev-parse", "HEAD"])
-                .map(|output| stdout_trim(&output))?,
+            &git_success(workdir, &["rev-parse", "HEAD"]).map(|output| stdout_trim(&output))?,
         )?;
         if actual_bridge != expected_bridge {
             return Err(SkipCommitRefusal {
@@ -370,7 +367,10 @@ pub fn execute_exact_skip(
         if !is_ancestor(workdir, &pinned_cursor, sha)? {
             return Err(SkipCommitRefusal {
                 code: reason::UNPROVEN_ANCESTRY.into(),
-                detail: format!("selected commit {} is not descended from pinned cursor", sha),
+                detail: format!(
+                    "selected commit {} is not descended from pinned cursor",
+                    sha
+                ),
             });
         }
         if !is_ancestor(workdir, sha, &expected_remote_tip)? {

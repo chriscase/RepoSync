@@ -285,7 +285,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id/test-svn", post(test_repo_svn))
         .route("/api/repos/:id/test-git", post(test_repo_git))
         .route("/api/repos/:id/skip-commit", post(skip_commit))
-        .route("/api/repos/:id/skip-commit/context", get(skip_commit_context))
+        .route(
+            "/api/repos/:id/skip-commit/context",
+            get(skip_commit_context),
+        )
         .route("/api/repos/:id/retry", post(retry_repo))
         .route("/api/repos/:id/hooks/pre-commit", get(get_pre_commit_hook))
 }
@@ -3208,11 +3211,8 @@ async fn observed_remote_tip(
         "gitea" => reposync_core::config::GitProvider::Gitea,
         _ => reposync_core::config::GitProvider::GitHub,
     };
-    let github_client = reposync_core::git::github::GitHubClient::new(
-        &repo.git_api_url,
-        &git_token,
-        provider,
-    );
+    let github_client =
+        reposync_core::git::github::GitHubClient::new(&repo.git_api_url, &git_token, provider);
     match github_client
         .get_branch_sha(&repo.git_repo, &repo.git_branch)
         .await
@@ -3226,15 +3226,18 @@ async fn observed_remote_tip(
             );
             if let Some(workdir) = workdir {
                 if workdir_ready(workdir) {
-                    return reposync_core::skip_commit::git_success(workdir, &["rev-parse", "HEAD"])
-                        .map(|output| {
-                            Some(
-                                String::from_utf8_lossy(&output.stdout)
-                                    .trim()
-                                    .to_ascii_lowercase(),
-                            )
-                        })
-                        .map_err(|refuse| AppError::Conflict(refuse.message()));
+                    return reposync_core::skip_commit::git_success(
+                        workdir,
+                        &["rev-parse", "HEAD"],
+                    )
+                    .map(|output| {
+                        Some(
+                            String::from_utf8_lossy(&output.stdout)
+                                .trim()
+                                .to_ascii_lowercase(),
+                        )
+                    })
+                    .map_err(|refuse| AppError::Conflict(refuse.message()));
                 }
             }
             Ok(None)
@@ -3264,18 +3267,15 @@ async fn skip_commit_context(
 
     let workdir = repo_git_workdir(&state, &id);
     if !workdir_ready(&workdir) {
-        return Err(AppError::Conflict(
-            format!(
-                "{}: local Git workdir is unavailable for exact skip planning",
-                skip_reason::WORKDIR_UNAVAILABLE
-            ),
-        ));
+        return Err(AppError::Conflict(format!(
+            "{}: local Git workdir is unavailable for exact skip planning",
+            skip_reason::WORKDIR_UNAVAILABLE
+        )));
     }
 
     let remote_tip = observed_remote_tip(&repo, db, Some(&workdir)).await?;
-    let context = build_skip_context(db, &id, &workdir, remote_tip.as_deref()).map_err(|refuse| {
-        AppError::Conflict(refuse.message())
-    })?;
+    let context = build_skip_context(db, &id, &workdir, remote_tip.as_deref())
+        .map_err(|refuse| AppError::Conflict(refuse.message()))?;
     Ok(Json(serde_json::json!({ "ok": true, "context": context })))
 }
 
@@ -3303,12 +3303,10 @@ async fn skip_commit(
 
     let workdir = repo_git_workdir(&state, &id);
     if !workdir_ready(&workdir) {
-        return Err(AppError::Conflict(
-            format!(
-                "{}: local Git workdir is unavailable; exact skip requires proven ancestry",
-                skip_reason::WORKDIR_UNAVAILABLE
-            ),
-        ));
+        return Err(AppError::Conflict(format!(
+            "{}: local Git workdir is unavailable; exact skip requires proven ancestry",
+            skip_reason::WORKDIR_UNAVAILABLE
+        )));
     }
 
     let remote_tip = observed_remote_tip(&repo, db, Some(&workdir))
@@ -3328,15 +3326,8 @@ async fn skip_commit(
         })
         .ok();
 
-    let outcome = execute_exact_skip(
-        db,
-        &id,
-        &workdir,
-        &remote_tip,
-        bridge_tip.as_deref(),
-        &body,
-    )
-    .map_err(|refuse| AppError::Conflict(refuse.message()))?;
+    let outcome = execute_exact_skip(db, &id, &workdir, &remote_tip, bridge_tip.as_deref(), &body)
+        .map_err(|refuse| AppError::Conflict(refuse.message()))?;
 
     let _ = db.reset_consecutive_errors(&id);
     let _ = db.conn().execute(

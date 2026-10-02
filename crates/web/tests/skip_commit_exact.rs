@@ -328,7 +328,12 @@ async fn skip_commit_refuses_tip_token_mismatch_without_mutation() {
         &client,
         fixture.addr,
         &fixture.repo_id,
-        &skip_body(&fixture.sha_a, &[&fixture.sha_b], "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", Some(&fixture.sha_c)),
+        &skip_body(
+            &fixture.sha_a,
+            &[&fixture.sha_b],
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            Some(&fixture.sha_c),
+        ),
     )
     .await;
 
@@ -378,7 +383,10 @@ async fn skip_commit_accepts_selected_commit_with_exclusion_receipt() {
 
     let after = snapshot_watermarks(&fixture.state.db, &fixture.repo_id);
     assert_eq!(after.last_git_sha, fixture.sha_b);
-    assert_eq!(after.kv_last_git_sha.as_deref(), Some(fixture.sha_b.as_str()));
+    assert_eq!(
+        after.kv_last_git_sha.as_deref(),
+        Some(fixture.sha_b.as_str())
+    );
     assert!(is_commit_excluded(&fixture.state.db, &fixture.repo_id, &fixture.sha_b).unwrap());
     let receipt = fixture
         .state
@@ -506,12 +514,10 @@ async fn skip_commit_refuses_cursor_mismatch_without_checkpoint_change() {
     .await;
 
     assert_eq!(status, reqwest::StatusCode::CONFLICT);
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains(skip_reason::CURSOR_MISMATCH)
-    );
+    assert!(body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains(skip_reason::CURSOR_MISMATCH));
     let after = snapshot_watermarks(&fixture.state.db, &fixture.repo_id);
     assert_watermarks_unchanged(&before, &after);
     fixture.server.abort();
