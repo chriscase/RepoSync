@@ -167,6 +167,7 @@ fn transaction_target_fingerprint(
     }))
 }
 
+#[derive(Debug)]
 pub struct ReconciledImport {
     pub operation: ImportOperation,
     pub publication_recorded: bool,
@@ -192,6 +193,29 @@ fn write_value(tx: &Connection, name: &str, value: &str) -> Result<(), DatabaseE
         params![name, value, Utc::now().to_rfc3339()],
     )?;
     Ok(())
+}
+
+/// Snapshot holds may finish only as one pinned baseline. Anything else stays
+/// an error so reconcile cannot treat a partial or unpinned snapshot as done.
+fn snapshot_hold_is_honest(op: &ImportOperation) -> Result<(), String> {
+    match op.operation_type.as_str() {
+        "full_import" => Ok(()),
+        "snapshot_import" => {
+            let Some(pin) = &op.snapshot_pin else {
+                return Err("snapshot import is missing its pin".into());
+            };
+            if op.total_revisions != Some(1) || op.processed_revisions != 1 || op.local_commits != 1
+            {
+                return Err("snapshot import is not a single verified baseline".into());
+            }
+            if pin.operative_rev != pin.peg_rev || op.last_local_svn_rev != Some(pin.operative_rev)
+            {
+                return Err("snapshot pin does not match the recorded local revision".into());
+            }
+            Ok(())
+        }
+        _ => Err("operation is not an active reconciliation hold".into()),
+    }
 }
 
 fn parse(raw: &str) -> Result<ImportOperation, DatabaseError> {
@@ -665,11 +689,11 @@ impl Database {
             let mut op = parse(&read_value(tx, &document)?.ok_or_else(|| {
                 DatabaseError::Other("missing import operation document".into())
             })?)?;
-            if op.repo_id != repo_id
-                || op.operation_type != "full_import"
-                || op.state != ImportOperationState::ReconciliationRequired
-            {
+            if op.repo_id != repo_id || op.state != ImportOperationState::ReconciliationRequired {
                 return Err(DatabaseError::Other("operation is not an active reconciliation hold".into()));
+            }
+            if let Err(reason) = snapshot_hold_is_honest(&op) {
+                return Err(DatabaseError::Other(reason));
             }
             let (fingerprint, configured_ref) = transaction_target_fingerprint(tx, repo_id, workdir)?
                 .ok_or_else(|| DatabaseError::Other("repository disappeared".into()))?;
@@ -782,6 +806,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     #[test]
     fn exact_identity_cancel_and_reopen_hold() {
@@ -856,5 +881,308 @@ mod tests {
             loaded.snapshot_pin.unwrap().history_boundary(),
             pin.history_boundary()
         );
+    }
+
+    const BASELINE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn open_repo(id: &str) -> (tempfile::TempDir, Database, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("state.db")).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES (?1,'p','file:///svn','trunk','','local','file:///git','repo','main','team',5,0,0,1,'t','t',0,'','idle',0,0)",
+                [id],
+            )
+            .unwrap();
+        let workdir = dir.path().join("git-repo");
+        (dir, db, workdir)
+    }
+
+    fn fingerprint(db: &Database, id: &str, workdir: &Path) -> String {
+        import_target_fingerprint(&db.get_repository(id).unwrap().unwrap(), workdir)
+    }
+
+    fn pin_at(rev: i64) -> SnapshotPin {
+        SnapshotPin {
+            svn_uuid: "uuid-1".into(),
+            canonical_url: "file:///svn/trunk".into(),
+            operative_rev: rev,
+            peg_rev: rev,
+            copy_from_path: None,
+            copy_from_rev: None,
+            requested: rev.to_string(),
+        }
+    }
+
+    #[test]
+    fn snapshot_reconcile_completes_exact_baseline_and_refuses_dishonest_evidence() {
+        let (_dir, db, workdir) = open_repo("snap");
+        let fp = fingerprint(&db, "snap", &workdir);
+        let op = db
+            .create_import_operation("snap", "admin", "req-snap", &fp)
+            .unwrap();
+        db.pin_snapshot_import("snap", &op.id, pin_at(4)).unwrap();
+        db.start_import_operation("snap", &op.id).unwrap();
+        db.note_import_local("snap", &op.id, 4, BASELINE_SHA, 1, 1)
+            .unwrap();
+        db.begin_import_publication("snap", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        db.finish_import_operation(
+            "snap",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let wrong = db
+            .reconcile_verified_import(
+                "snap",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            wrong.contains("remote SHA is not the recorded local import tip"),
+            "{wrong}"
+        );
+        assert_eq!(db.get_repo_watermark("snap").unwrap().0, 0);
+        assert_eq!(
+            db.get_import_operation("snap", &op.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ImportOperationState::ReconciliationRequired
+        );
+
+        let done = db
+            .reconcile_verified_import("snap", &op.id, &workdir, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        assert!(done.completed);
+        assert!(done.publication_recorded);
+        assert_eq!(done.operation.state, ImportOperationState::Completed);
+        assert_eq!(
+            db.get_repo_watermark("snap").unwrap(),
+            (4, BASELINE_SHA.to_string())
+        );
+        assert!(db.active_import_operation("snap").unwrap().is_none());
+        assert!(db
+            .reconcile_verified_import("snap", &op.id, &workdir, "refs/heads/main", BASELINE_SHA)
+            .is_err());
+
+        let (_dir, confirmed, workdir) = open_repo("confirmed");
+        let fp = fingerprint(&confirmed, "confirmed", &workdir);
+        let op = confirmed
+            .create_import_operation("confirmed", "admin", "req-c", &fp)
+            .unwrap();
+        confirmed
+            .pin_snapshot_import("confirmed", &op.id, pin_at(2))
+            .unwrap();
+        confirmed
+            .start_import_operation("confirmed", &op.id)
+            .unwrap();
+        confirmed
+            .note_import_local("confirmed", &op.id, 2, BASELINE_SHA, 1, 1)
+            .unwrap();
+        confirmed
+            .begin_import_publication("confirmed", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        confirmed
+            .confirm_import_publication("confirmed", &op.id, BASELINE_SHA)
+            .unwrap();
+        confirmed
+            .finish_import_operation(
+                "confirmed",
+                &op.id,
+                ImportOperationState::ReconciliationRequired,
+                "finalizer",
+            )
+            .unwrap();
+        let done = confirmed
+            .reconcile_verified_import(
+                "confirmed",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert!(!done.publication_recorded);
+        assert_eq!(confirmed.get_repo_watermark("confirmed").unwrap().0, 2);
+
+        let (_dir, missing, workdir) = open_repo("missing-pin");
+        let fp = fingerprint(&missing, "missing-pin", &workdir);
+        let op = missing
+            .create_import_operation("missing-pin", "admin", "req-m", &fp)
+            .unwrap();
+        missing
+            .mark_snapshot_import_request("missing-pin", &op.id)
+            .unwrap();
+        missing
+            .start_import_operation("missing-pin", &op.id)
+            .unwrap();
+        missing
+            .note_import_local("missing-pin", &op.id, 4, BASELINE_SHA, 1, 1)
+            .unwrap();
+        missing
+            .begin_import_publication("missing-pin", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        missing
+            .finish_import_operation(
+                "missing-pin",
+                &op.id,
+                ImportOperationState::ReconciliationRequired,
+                "held",
+            )
+            .unwrap();
+        let err = missing
+            .reconcile_verified_import(
+                "missing-pin",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("snapshot import is missing its pin"), "{err}");
+        assert_eq!(missing.get_repo_watermark("missing-pin").unwrap().0, 0);
+
+        let (_dir, drifted, workdir) = open_repo("drift");
+        let fp = fingerprint(&drifted, "drift", &workdir);
+        let op = drifted
+            .create_import_operation("drift", "admin", "req-d", &fp)
+            .unwrap();
+        drifted
+            .pin_snapshot_import("drift", &op.id, pin_at(4))
+            .unwrap();
+        drifted.start_import_operation("drift", &op.id).unwrap();
+        drifted
+            .note_import_local("drift", &op.id, 5, BASELINE_SHA, 1, 1)
+            .unwrap();
+        drifted.note_import_total("drift", &op.id, 1).unwrap();
+        drifted
+            .begin_import_publication("drift", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        drifted
+            .finish_import_operation(
+                "drift",
+                &op.id,
+                ImportOperationState::ReconciliationRequired,
+                "held",
+            )
+            .unwrap();
+        let err = drifted
+            .reconcile_verified_import("drift", &op.id, &workdir, "refs/heads/main", BASELINE_SHA)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("snapshot pin does not match the recorded local revision"),
+            "{err}"
+        );
+        assert_eq!(drifted.get_repo_watermark("drift").unwrap().0, 0);
+
+        let (_dir, wide, workdir) = open_repo("wide");
+        let fp = fingerprint(&wide, "wide", &workdir);
+        let op = wide
+            .create_import_operation("wide", "admin", "req-w", &fp)
+            .unwrap();
+        wide.pin_snapshot_import("wide", &op.id, pin_at(4)).unwrap();
+        wide.start_import_operation("wide", &op.id).unwrap();
+        wide.note_import_local("wide", &op.id, 4, BASELINE_SHA, 1, 1)
+            .unwrap();
+        wide.note_import_total("wide", &op.id, 3).unwrap();
+        wide.begin_import_publication("wide", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        wide.finish_import_operation(
+            "wide",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "held",
+        )
+        .unwrap();
+        let err = wide
+            .reconcile_verified_import("wide", &op.id, &workdir, "refs/heads/main", BASELINE_SHA)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("snapshot import is not a single verified baseline"),
+            "{err}"
+        );
+
+        let (_dir, full, workdir) = open_repo("full");
+        let fp = fingerprint(&full, "full", &workdir);
+        let op = full
+            .create_import_operation("full", "admin", "req-f", &fp)
+            .unwrap();
+        full.start_import_operation("full", &op.id).unwrap();
+        full.note_import_total("full", &op.id, 3).unwrap();
+        full.note_import_local("full", &op.id, 3, BASELINE_SHA, 3, 3)
+            .unwrap();
+        full.begin_import_publication("full", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        full.finish_import_operation(
+            "full",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let done = full
+            .reconcile_verified_import("full", &op.id, &workdir, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        assert!(done.completed);
+        assert_eq!(full.get_repo_watermark("full").unwrap().0, 3);
+
+        let (_dir, other, workdir) = open_repo("other");
+        let fp = fingerprint(&other, "other", &workdir);
+        let op = other
+            .create_import_operation("other", "admin", "req-o", &fp)
+            .unwrap();
+        other.start_import_operation("other", &op.id).unwrap();
+        other.note_import_total("other", &op.id, 1).unwrap();
+        other
+            .note_import_local("other", &op.id, 1, BASELINE_SHA, 1, 1)
+            .unwrap();
+        other
+            .begin_import_publication("other", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        other
+            .finish_import_operation(
+                "other",
+                &op.id,
+                ImportOperationState::ReconciliationRequired,
+                "held",
+            )
+            .unwrap();
+        let mut stored = other
+            .get_import_operation("other", &op.id)
+            .unwrap()
+            .unwrap();
+        stored.operation_type = "side_import".into();
+        other
+            .conn()
+            .execute(
+                "UPDATE kv_state SET value=?1 WHERE key=?2",
+                params![
+                    serde_json::to_string(&stored).unwrap(),
+                    format!("import_operation_v1:document:{}", op.id)
+                ],
+            )
+            .unwrap();
+        let err = other
+            .reconcile_verified_import("other", &op.id, &workdir, "refs/heads/main", BASELINE_SHA)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("operation is not an active reconciliation hold"),
+            "{err}"
+        );
+        assert_eq!(other.get_repo_watermark("other").unwrap().0, 0);
     }
 }

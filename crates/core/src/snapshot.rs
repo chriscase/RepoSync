@@ -13,7 +13,7 @@ use tracing::info;
 
 use crate::db::import_operations::SnapshotPin;
 use crate::db::Database;
-use crate::file_policy::FilePolicy;
+use crate::file_policy::{FilePolicy, FilePolicyDecision};
 use crate::import::{copy_tree_with_policy, CopyStats, VerificationResult};
 use crate::svn::SvnClient;
 
@@ -265,20 +265,93 @@ pub fn git_commit_content_index(git_workdir: &Path, sha: &str) -> Result<BTreeMa
     Ok(files)
 }
 
+enum CommittedBlob {
+    /// Small enough to be an LFS pointer (or a normal small file).
+    Inline(Vec<u8>),
+    /// Larger than a pointer; only the raw digest is kept.
+    Digest(String),
+}
+
+fn git_commit_blobs(git_workdir: &Path, sha: &str) -> Result<BTreeMap<String, CommittedBlob>> {
+    let repo = git2::Repository::open(git_workdir).context("failed to open Git workdir")?;
+    let oid = git2::Oid::from_str(sha).context("snapshot Git SHA is malformed")?;
+    let commit = repo
+        .find_commit(oid)
+        .context("snapshot Git commit is missing")?;
+    let tree = commit.tree().context("snapshot Git tree is missing")?;
+    let mut files = BTreeMap::new();
+    tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            if let Some(name) = entry.name() {
+                if let Ok(blob) = repo.find_blob(entry.id()) {
+                    let path = format!("{dir}{name}");
+                    let content = blob.content();
+                    let record = if content.len() <= 512 {
+                        CommittedBlob::Inline(content.to_vec())
+                    } else {
+                        CommittedBlob::Digest(hex::encode(Sha256::digest(content)))
+                    };
+                    files.insert(path, record);
+                }
+            }
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .context("failed to walk snapshot Git tree")?;
+    Ok(files)
+}
+
+fn committed_blob_matches(
+    policy: &FilePolicy,
+    path: &str,
+    expected_hash: &str,
+    expected_size: u64,
+    blob: &CommittedBlob,
+) -> bool {
+    match policy.evaluate(path, expected_size) {
+        FilePolicyDecision::LfsTrack { .. } => {
+            let CommittedBlob::Inline(bytes) = blob else {
+                return false;
+            };
+            let Some(pointer) = crate::lfs::parse_lfs_pointer(bytes) else {
+                return false;
+            };
+            pointer.oid == expected_hash && pointer.size == expected_size
+        }
+        _ => {
+            let actual = match blob {
+                CommittedBlob::Inline(bytes) => hex::encode(Sha256::digest(bytes)),
+                CommittedBlob::Digest(hash) => hash.clone(),
+            };
+            actual == expected_hash
+        }
+    }
+}
+
 pub fn verify_commit_matches_projection(
     projected_root: &Path,
     git_workdir: &Path,
     sha: &str,
+    policy: &FilePolicy,
 ) -> Result<VerificationResult> {
     let expected = content_index(projected_root)?;
-    let actual = git_commit_content_index(git_workdir, sha)?;
+    let actual = git_commit_blobs(git_workdir, sha)?;
     let mut result = VerificationResult {
         files_checked: expected.len() as u64,
         ..VerificationResult::default()
     };
     for (path, hash) in &expected {
+        let size = match std::fs::metadata(projected_root.join(path)) {
+            Ok(meta) => meta.len(),
+            Err(_) => {
+                result.mismatches.push(path.clone());
+                continue;
+            }
+        };
         match actual.get(path) {
-            Some(other) if other == hash => result.files_matched += 1,
+            Some(blob) if committed_blob_matches(policy, path, hash, size, blob) => {
+                result.files_matched += 1;
+            }
             Some(_) => result.mismatches.push(path.clone()),
             None => result.svn_only.push(path.clone()),
         }
@@ -378,5 +451,63 @@ mod tests {
         assert!(text.contains("r7"));
         assert!(text.contains("was not imported"));
         assert!(!text.to_lowercase().contains("full history"));
+    }
+
+    fn commit_files(dir: &Path, files: &[(&str, &[u8])]) -> String {
+        let repo = git2::Repository::init(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+            index.add_path(Path::new(name)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Snapshot", "snapshot@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "baseline", &tree, &[])
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn lfs_pointer_matches_projected_bytes_and_fat_or_wrong_pointer_does_not() {
+        let raw = b"0123456789abcdefRAW";
+        assert_eq!(raw.len(), 19);
+        let policy = FilePolicy::with_lfs(0, vec![], 8, &[]);
+        let plain = FilePolicy::new(0, vec![]);
+        let pointer = crate::lfs::create_lfs_pointer(raw);
+        let projected = tempfile::tempdir().unwrap();
+        std::fs::write(projected.path().join("large.bin"), raw).unwrap();
+        std::fs::write(projected.path().join("note.txt"), b"ok\n").unwrap();
+
+        let good = tempfile::tempdir().unwrap();
+        let sha = commit_files(
+            good.path(),
+            &[("large.bin", pointer.as_bytes()), ("note.txt", b"ok\n")],
+        );
+        assert!(
+            verify_commit_matches_projection(projected.path(), good.path(), &sha, &policy).is_ok()
+        );
+
+        let fat = tempfile::tempdir().unwrap();
+        let fat_sha = commit_files(fat.path(), &[("large.bin", raw), ("note.txt", b"ok\n")]);
+        assert!(
+            verify_commit_matches_projection(projected.path(), fat.path(), &fat_sha, &policy)
+                .is_err()
+        );
+        assert!(
+            verify_commit_matches_projection(projected.path(), fat.path(), &fat_sha, &plain)
+                .is_ok()
+        );
+
+        let wrong = pointer.replace("size 19", "size 18");
+        let bad = tempfile::tempdir().unwrap();
+        let bad_sha = commit_files(
+            bad.path(),
+            &[("large.bin", wrong.as_bytes()), ("note.txt", b"ok\n")],
+        );
+        assert!(
+            verify_commit_matches_projection(projected.path(), bad.path(), &bad_sha, &policy)
+                .is_err()
+        );
     }
 }

@@ -189,6 +189,12 @@ impl<'a> InitialImport<'a> {
         .await
         .context("snapshot working tree does not match pinned projection")?;
 
+        if policy.lfs_enabled() {
+            reposync_core::lfs::install_lfs_hooks(&repo_path).map_err(|e| {
+                anyhow::anyhow!("Git LFS is configured but git lfs install --local failed: {e}")
+            })?;
+        }
+
         // Commit
         let message = self.formatter.format_svn_to_git(
             &format!(
@@ -203,15 +209,24 @@ impl<'a> InitialImport<'a> {
 
         let sha = {
             let git_client = self.git_client.lock().unwrap();
-            let oid = git_client
-                .commit(
+            let oid = if policy.lfs_enabled() {
+                git_client.commit_via_cli(
                     &message,
                     &self.config.developer.name,
                     &self.config.developer.email,
                     &self.config.developer.name,
                     &self.config.developer.email,
                 )
-                .context("failed to create initial commit")?;
+            } else {
+                git_client.commit(
+                    &message,
+                    &self.config.developer.name,
+                    &self.config.developer.email,
+                    &self.config.developer.name,
+                    &self.config.developer.email,
+                )
+            }
+            .context("failed to create initial commit")?;
             oid.to_string()
         };
         info!(sha = %sha, rev = head_rev, "created snapshot commit");
@@ -224,6 +239,7 @@ impl<'a> InitialImport<'a> {
             projected.path(),
             &repo_path,
             &sha,
+            &policy,
         )
         .context("snapshot Git commit does not match pinned SVN projection")?;
 

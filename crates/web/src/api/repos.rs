@@ -1812,7 +1812,10 @@ async fn reconcile_repo_import(
     }
     if active.as_ref().is_none_or(|op| op.id != operation_id)
         || requested.state != ImportOperationState::ReconciliationRequired
-        || requested.operation_type != "full_import"
+        || !matches!(
+            requested.operation_type.as_str(),
+            "full_import" | "snapshot_import"
+        )
     {
         return Err(AppError::BadRequest(
             "operation is not this repository's active reconciliation hold".into(),
@@ -1930,6 +1933,9 @@ async fn reconcile_repo_import(
                         | "incomplete prior publication receipt"
                         | "remote SHA differs from publication evidence"
                         | "invalid publication counter"
+                        | "snapshot import is missing its pin"
+                        | "snapshot import is not a single verified baseline"
+                        | "snapshot pin does not match the recorded local revision"
                 ) =>
             {
                 return reconciliation_held(

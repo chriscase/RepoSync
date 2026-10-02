@@ -647,6 +647,92 @@ async fn import_lfs_command(
     crate::process::run(command, Duration::from_secs(60), cancel).await
 }
 
+enum ImportLfsPrep {
+    NotRequired,
+    Ready,
+    PreflightFailed(String),
+    InstallFailed(String),
+    Cancelled,
+}
+
+/// Shared LFS preflight and `git lfs install --local`.
+///
+/// Success and failure are reported to the caller. Full import warns and may
+/// continue without pointers. Snapshot import must fail closed on
+/// [`ImportLfsPrep::PreflightFailed`] / [`ImportLfsPrep::InstallFailed`]
+/// before it creates a commit.
+async fn prepare_import_lfs(
+    file_policy: &FilePolicy,
+    repo_path: &Path,
+    durable: bool,
+    progress: &Arc<RwLock<ImportProgress>>,
+    ws_broadcast: &Option<broadcast::Sender<String>>,
+    cancel_signal: Option<&Arc<AtomicBool>>,
+) -> Result<ImportLfsPrep> {
+    if !file_policy.lfs_enabled() {
+        return Ok(ImportLfsPrep::NotRequired);
+    }
+    let preflight = if durable {
+        match import_lfs_command(&["lfs", "version"], repo_path, cancel_signal).await {
+            Ok(output) if output.status.success() => {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }
+            Ok(output) => Err(format!(
+                "git lfs version failed (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => {
+                if crate::process::confirmed_cancelled(&e)
+                    && stop_requested(progress, cancel_signal).await
+                {
+                    return Ok(ImportLfsPrep::Cancelled);
+                }
+                return Err(e).context("LFS preflight did not quiesce safely");
+            }
+        }
+    } else {
+        crate::lfs::preflight_check()
+    };
+    let version = match preflight {
+        Ok(version) => version,
+        Err(reason) => return Ok(ImportLfsPrep::PreflightFailed(reason)),
+    };
+    push_log_line(
+        progress,
+        ws_broadcast,
+        format!("[info] Git LFS available: {version}"),
+    )
+    .await;
+    let install = if durable {
+        match import_lfs_command(&["lfs", "install", "--local"], repo_path, cancel_signal).await {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(format!(
+                "git lfs install failed (exit {:?}): {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(e) => {
+                return Err(e).context("LFS hook installation outcome requires inspection");
+            }
+        }
+    } else {
+        crate::lfs::install_lfs_hooks(repo_path)
+    };
+    match install {
+        Ok(()) => {
+            push_log_line(
+                progress,
+                ws_broadcast,
+                "[info] Git LFS installed in repo (filters active)".into(),
+            )
+            .await;
+            Ok(ImportLfsPrep::Ready)
+        }
+        Err(reason) => Ok(ImportLfsPrep::InstallFailed(reason)),
+    }
+}
+
 /// Materialize one pinned SVN snapshot, verify projected bytes, publish, and
 /// record the verified baseline. The pin must already be stored; this never
 /// re-resolves live HEAD.
@@ -697,6 +783,31 @@ pub async fn run_snapshot_import(
         anyhow::bail!(
             "existing non-empty Git workdir refuses snapshot overwrite; choose a new target"
         );
+    }
+
+    match prepare_import_lfs(
+        file_policy,
+        &repo_path,
+        operation_id.is_some(),
+        &progress,
+        &ws_broadcast,
+        cancel_signal.as_ref(),
+    )
+    .await?
+    {
+        ImportLfsPrep::Cancelled => return Ok(ImportOutcome::Cancelled { commits: 0 }),
+        ImportLfsPrep::NotRequired | ImportLfsPrep::Ready => {}
+        ImportLfsPrep::PreflightFailed(reason) | ImportLfsPrep::InstallFailed(reason) => {
+            push_log_line(
+                &progress,
+                &ws_broadcast,
+                format!("[error] Git LFS required for snapshot import but unavailable: {reason}"),
+            )
+            .await;
+            anyhow::bail!(
+                "Git LFS is required for this snapshot import but is unavailable: {reason}"
+            );
+        }
     }
 
     #[cfg(feature = "reliability-fixture")]
@@ -751,8 +862,12 @@ pub async fn run_snapshot_import(
 
     let projected =
         crate::snapshot::project_snapshot_tree(svn_client, file_policy, db, pin).await?;
-    let commit_verify =
-        crate::snapshot::verify_commit_matches_projection(projected.path(), &repo_path, &sha)?;
+    let commit_verify = crate::snapshot::verify_commit_matches_projection(
+        projected.path(),
+        &repo_path,
+        &sha,
+        file_policy,
+    )?;
     {
         let mut p = progress.write().await;
         p.verification = Some(commit_verify);
@@ -793,6 +908,10 @@ pub async fn run_snapshot_import(
                 remote: &import_config.remote_name,
                 branch: &import_config.branch,
                 sha: &sha,
+                // First-ref creation only. The empty lease
+                // (`refs/heads/{branch}:`) creates the branch when that
+                // remote ref is absent. The empty-target gate already
+                // refused an existing branch before the worker started.
                 force: true,
             },
             cancel_signal.as_ref(),
@@ -819,20 +938,9 @@ pub async fn run_snapshot_import(
     )
     .ok();
 
-    if let Some(sender) = &ws_broadcast {
-        let p = progress.read().await;
-        let json = serde_json::json!({
-            "type": "import_progress",
-            "phase": "completed",
-            "current_rev": p.current_rev,
-            "total_revs": 1,
-            "commits_created": 1,
-            "import_mode": "snapshot",
-            "starting_revision": pin.operative_rev,
-            "history_boundary": pin.history_boundary(),
-        });
-        let _ = sender.send(json.to_string());
-    }
+    // The worker broadcasts phase completion only after
+    // `complete_import_operation` succeeds. Emitting completed here would
+    // claim success if finalization then fails.
 
     Ok(ImportOutcome::Completed {
         commits: 1,
@@ -888,106 +996,46 @@ pub async fn run_full_import(
         }
     };
 
-    // LFS preflight: check availability and install hooks in the repo
-    let lfs_available = if file_policy.lfs_enabled() {
-        let rp = {
-            let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-            git_guard.repo_workdir()
-        };
-        let preflight = if operation_id.is_some() {
-            match import_lfs_command(&["lfs", "version"], &rp, cancel_signal.as_ref()).await {
-                Ok(output) if output.status.success() => {
-                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                }
-                Ok(output) => Err(format!(
-                    "git lfs version failed (exit {:?}): {}",
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Err(e) => {
-                    if crate::process::confirmed_cancelled(&e)
-                        && stop_requested(&progress, cancel_signal.as_ref()).await
-                    {
-                        return Ok(ImportOutcome::Cancelled { commits: 0 });
-                    }
-                    return Err(e).context("LFS preflight did not quiesce safely");
-                }
-            }
-        } else {
-            crate::lfs::preflight_check()
-        };
-        match preflight {
-            Ok(version) => {
-                log(
-                    &progress,
-                    &ws_broadcast,
-                    format!("[info] Git LFS available: {}", version),
-                )
-                .await;
-
-                // Install LFS hooks/filters in the repo so `git add` invokes
-                // the clean filter and creates pointer files for tracked patterns.
-                let install = if operation_id.is_some() {
-                    match import_lfs_command(
-                        &["lfs", "install", "--local"],
-                        &rp,
-                        cancel_signal.as_ref(),
-                    )
-                    .await
-                    {
-                        Ok(output) if output.status.success() => Ok(()),
-                        Ok(output) => Err(format!(
-                            "git lfs install failed (exit {:?}): {}",
-                            output.status.code(),
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        )),
-                        Err(e) => {
-                            return Err(e)
-                                .context("LFS hook installation outcome requires inspection")
-                        }
-                    }
-                } else {
-                    crate::lfs::install_lfs_hooks(&rp)
-                };
-                match install {
-                    Ok(()) => {
-                        log(
-                            &progress,
-                            &ws_broadcast,
-                            "[info] Git LFS installed in repo (filters active)".into(),
-                        )
-                        .await;
-                        true
-                    }
-                    Err(e) => {
-                        log(
-                            &progress,
-                            &ws_broadcast,
-                            format!(
-                                "[warn] git lfs install failed: {} — LFS tracking will not work",
-                                e
-                            ),
-                        )
-                        .await;
-                        false
-                    }
-                }
-            }
-            Err(e) => {
-                log(
-                    &progress,
-                    &ws_broadcast,
-                    format!(
-                        "[warn] Git LFS not available: {} — large files will be committed directly",
-                        e
-                    ),
-                )
-                .await;
-                false
-            }
+    // LFS preflight: check availability and install hooks in the repo.
+    // Full import still warns and may commit without pointers. Snapshot
+    // import uses the same helper and fails closed instead.
+    let lfs_repo = {
+        let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+        git_guard.repo_workdir()
+    };
+    let lfs_available = match prepare_import_lfs(
+        file_policy,
+        &lfs_repo,
+        operation_id.is_some(),
+        &progress,
+        &ws_broadcast,
+        cancel_signal.as_ref(),
+    )
+    .await?
+    {
+        ImportLfsPrep::Cancelled => return Ok(ImportOutcome::Cancelled { commits: 0 }),
+        ImportLfsPrep::NotRequired => false,
+        ImportLfsPrep::Ready => true,
+        ImportLfsPrep::PreflightFailed(e) => {
+            log(
+                &progress,
+                &ws_broadcast,
+                format!(
+                    "[warn] Git LFS not available: {e} — large files will be committed directly"
+                ),
+            )
+            .await;
+            false
         }
-    } else {
-        false
+        ImportLfsPrep::InstallFailed(e) => {
+            log(
+                &progress,
+                &ws_broadcast,
+                format!("[warn] git lfs install failed: {e} — LFS tracking will not work"),
+            )
+            .await;
+            false
+        }
     };
 
     // Get SVN info

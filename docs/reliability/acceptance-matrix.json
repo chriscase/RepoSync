@@ -290,7 +290,10 @@
         "R11_MISMATCHED_TARGET",
         "R11_INVALID_REV"
       ],
-      "supporting_case_ids": [],
+      "supporting_case_ids": [
+        "R11_SNAPSHOT_LFS",
+        "R11_SNAPSHOT_RECONCILE"
+      ],
       "open": [
         "Rich onboarding UI / wizard polish is later",
         "Late-pair of a snapshot-derived branch is #67, not this slice",
@@ -298,7 +301,7 @@
         "Bidirectional incremental sync after snapshot is covered only by existing R01 cases on full-import baselines",
         "Issue #68 remains open"
       ],
-      "evidence": "Team snapshot init pins UUID/path/operative+peg revision once, materializes the selected SVN tree under file policy, verifies projected bytes, publishes through the #64 import journal, and records the verified baseline. R11_SNAPSHOT_FIXED_R imports r2 only (one Git commit, history.txt=first). R11_PIN_HOLDS_AFTER_ADVANCE keeps r3 after SVN advances. Mismatched non-empty Git targets and invalid revisions are refused without watermark advance. Status reports starting_revision/history_boundary and earlier_history_imported=false.",
+      "evidence": "Team snapshot init pins UUID/path/operative+peg revision once, materializes the selected SVN tree under file policy, verifies projected bytes, publishes through the #64 import journal, and records the verified baseline. R11_SNAPSHOT_FIXED_R imports r2 only (one Git commit, history.txt=first). R11_PIN_HOLDS_AFTER_ADVANCE keeps r3 after SVN advances. Mismatched non-empty Git targets and invalid revisions are refused without watermark advance. R11_SNAPSHOT_LFS publishes one snapshot commit whose threshold file is an LFS pointer (size 1100000). A unit check rejects a fat blob or a pointer whose oid or size does not match the projected bytes. R11_SNAPSHOT_RECONCILE finishes a held snapshot only when the remote SHA is that baseline. Status reports starting_revision/history_boundary and earlier_history_imported=false.",
       "diagnostic_expected_baseline_failure": false
     },
     {

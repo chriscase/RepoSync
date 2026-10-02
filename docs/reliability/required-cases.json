@@ -599,6 +599,8 @@
     {"id":"R11_PIN_HOLDS_AFTER_ADVANCE", "binary":"server_freeze", "test":"candidate_r11_pin_holds_when_svn_advances", "tier":"candidate_regression"},
     {"id":"R11_MISMATCHED_TARGET", "binary":"server_freeze", "test":"candidate_r11_mismatched_target_is_refused", "tier":"candidate_regression"},
     {"id":"R11_INVALID_REV", "binary":"server_freeze", "test":"candidate_r11_invalid_revision_is_refused", "tier":"candidate_regression"},
-    {"id":"R12_FULL_DEFAULT", "binary":"server_freeze", "test":"candidate_r12_omitted_mode_is_full_history", "tier":"candidate_regression"}
+    {"id":"R12_FULL_DEFAULT", "binary":"server_freeze", "test":"candidate_r12_omitted_mode_is_full_history", "tier":"candidate_regression"},
+    {"id":"R11_SNAPSHOT_LFS", "binary":"server_freeze", "test":"candidate_r11_snapshot_lfs_pointer_publication", "tier":"candidate_regression"},
+    {"id":"R11_SNAPSHOT_RECONCILE", "binary":"server_freeze", "test":"candidate_r11_snapshot_reconcile_finishes_exact_baseline", "tier":"candidate_regression"}
   ]
 }
