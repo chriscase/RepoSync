@@ -120,20 +120,137 @@ pub fn preflight_check() -> Result<String, String> {
 // .gitattributes management
 // ---------------------------------------------------------------------------
 
+/// Marker under the destination `.git/` directory listing LFS patterns this
+/// engine has applied. Copy and stale-remove both skip reserved `.git/`, so
+/// an SVN export cannot plant the marker. Absent from the export, root
+/// `.gitattributes` is rewritten to exactly these patterns.
+pub(crate) const ENGINE_LFS_PATTERN_MARKER: &str = "reposync-lfs-patterns";
+
+/// Canonical attribute text for one engine LFS pattern.
+pub(crate) fn lfs_tracking_line(pattern: &str) -> String {
+    format!("{pattern} filter=lfs diff=lfs merge=lfs -text")
+}
+
+fn is_single_line_pattern(pattern: &str) -> bool {
+    !pattern.is_empty() && !pattern.contains(['\n', '\r', '\0'])
+}
+
+fn unlink_gitattributes_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(path),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn git_metadata_dir(repo_root: &Path) -> Option<std::path::PathBuf> {
+    let git_dir = repo_root.join(".git");
+    let meta = std::fs::symlink_metadata(&git_dir).ok()?;
+    if meta.is_dir() {
+        Some(git_dir)
+    } else {
+        None
+    }
+}
+
+fn read_engine_lfs_patterns(path: &Path) -> std::io::Result<Vec<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    }
+    let text = std::fs::read_to_string(path)?;
+    let mut patterns = Vec::new();
+    for line in text.lines() {
+        if !is_single_line_pattern(line) {
+            continue;
+        }
+        if !patterns.iter().any(|existing| existing == line) {
+            patterns.push(line.to_string());
+        }
+    }
+    Ok(patterns)
+}
+
+fn record_engine_lfs_pattern(repo_root: &Path, pattern: &str) -> std::io::Result<()> {
+    let Some(git_dir) = git_metadata_dir(repo_root) else {
+        return Ok(());
+    };
+    let path = git_dir.join(ENGINE_LFS_PATTERN_MARKER);
+    let mut patterns = read_engine_lfs_patterns(&path)?;
+    if patterns.iter().any(|existing| existing == pattern) {
+        return Ok(());
+    }
+    patterns.push(pattern.to_string());
+    let mut body = String::new();
+    for recorded in &patterns {
+        body.push_str(recorded);
+        body.push('\n');
+    }
+    if std::fs::symlink_metadata(&path)
+        .map(|meta| !meta.file_type().is_file())
+        .unwrap_or(false)
+    {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::write(path, body)
+}
+
+/// `.gitattributes` body for LFS patterns recorded by [`ensure_lfs_tracked`].
+///
+/// `None` when this destination has no engine marker (no `.git/` directory,
+/// or no patterns recorded). Callers must not treat an untracked
+/// `.gitattributes` as engine-owned.
+pub(crate) fn engine_gitattributes_body(repo_root: &Path) -> std::io::Result<Option<String>> {
+    let Some(git_dir) = git_metadata_dir(repo_root) else {
+        return Ok(None);
+    };
+    let patterns = read_engine_lfs_patterns(&git_dir.join(ENGINE_LFS_PATTERN_MARKER))?;
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    for pattern in patterns {
+        body.push_str(&lfs_tracking_line(&pattern));
+        body.push('\n');
+    }
+    Ok(Some(body))
+}
+
 /// Ensure that the given file extension or glob pattern is tracked by LFS
 /// in the `.gitattributes` file at `repo_root`.
 ///
 /// If the pattern is already present, this is a no-op. Otherwise, appends
 /// the appropriate line. Returns `true` if a new line was added.
+///
+/// When `repo_root/.git` is a directory, the pattern is also recorded in
+/// `.git/reposync-lfs-patterns`. Stale-remove uses that marker to keep only
+/// engine-written LFS lines and to drop planted filter rules when the export
+/// omits `.gitattributes`.
 pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bool> {
-    let gitattr_path = repo_root.join(".gitattributes");
-    let expected_line = format!("{} filter=lfs diff=lfs merge=lfs -text", pattern);
+    if !is_single_line_pattern(pattern) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to record a .gitattributes LFS pattern that is empty or contains a newline",
+        ));
+    }
+    record_engine_lfs_pattern(repo_root, pattern)?;
 
-    // Read existing content.
-    let existing = if gitattr_path.exists() {
-        std::fs::read_to_string(&gitattr_path)?
-    } else {
-        String::new()
+    let gitattr_path = repo_root.join(".gitattributes");
+    let expected_line = lfs_tracking_line(pattern);
+
+    // A planted symlink must not be followed: appending would write the LFS
+    // line through to the target and leave the symlink in the work tree.
+    unlink_gitattributes_symlink(&gitattr_path)?;
+
+    // Read existing content. Only a regular file counts; do not follow links.
+    let existing = match std::fs::symlink_metadata(&gitattr_path) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::read_to_string(&gitattr_path)?,
+        Ok(_) => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
     };
 
     // Check if already tracked.
@@ -392,6 +509,68 @@ mod tests {
         let content = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
         assert!(content.contains("*.bin filter=lfs"));
         assert!(content.contains("*.psd filter=lfs"));
+    }
+
+    #[test]
+    fn test_ensure_lfs_tracked_records_pattern_in_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert!(ensure_lfs_tracked(dir.path(), "*.bin").unwrap());
+        assert!(!ensure_lfs_tracked(dir.path(), "*.bin").unwrap());
+        let marker =
+            std::fs::read_to_string(dir.path().join(".git").join(ENGINE_LFS_PATTERN_MARKER))
+                .unwrap();
+        assert_eq!(marker, "*.bin\n");
+        let body = engine_gitattributes_body(dir.path()).unwrap().unwrap();
+        assert_eq!(body, "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn test_ensure_lfs_tracked_skips_marker_without_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_lfs_tracked(dir.path(), "*.bin").unwrap();
+        assert!(engine_gitattributes_body(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join(".git").exists());
+    }
+
+    #[test]
+    fn test_ensure_lfs_tracked_replaces_symlink_without_following() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let outside = dir.path().join("outside-attrs");
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(".gitattributes")).unwrap();
+
+        assert!(ensure_lfs_tracked(dir.path(), "*.bin").unwrap());
+
+        let meta = std::fs::symlink_metadata(dir.path().join(".gitattributes")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "engine .gitattributes must be a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap(),
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "must not append through the planted symlink"
+        );
+    }
+
+    #[test]
+    fn test_ensure_lfs_tracked_rejects_multiline_pattern() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let err = ensure_lfs_tracked(dir.path(), "*.bin\n* filter=evil").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(engine_gitattributes_body(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join(".gitattributes").exists());
     }
 
     #[test]
