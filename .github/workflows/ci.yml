@@ -33,6 +33,9 @@ jobs:
       - name: Reliability #62 acceptance matrix
         run: python3 scripts/reliability-acceptance-matrix.py --self-test && python3 scripts/reliability-acceptance-matrix.py --check --report
 
+      - name: Git operation request client
+        run: python3 scripts/test_git_operation_request.py
+
       - name: Check formatting
         run: cargo fmt --check
 

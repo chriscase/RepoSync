@@ -1,0 +1,98 @@
+# Opt-in manual RepoSync operation request.
+#
+# This workflow is not a push or pull-request trigger. Auto-triggered refresh
+# stays disabled until pair-refresh execution exists and is qualified.
+# Dispatch it only from the default branch. A workflow file on another ref can
+# delete the guard below, so the reposync-operations environment must also
+# restrict deployment branches to the default branch and require a reviewer.
+# This file does not create that environment, its secrets, or any branch rule.
+
+name: Git operation request
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "preview, execute, status, or cancel"
+        required: true
+        type: choice
+        options:
+          - preview
+          - execute
+          - status
+          - cancel
+      repo_id:
+        description: "Pinned parent repository id"
+        required: true
+        type: string
+      pair_id:
+        description: "Pinned child pair id"
+        required: true
+        type: string
+      idempotency_key:
+        description: "Idempotency key bound to this pin set"
+        required: true
+        type: string
+      expected_plan_digest:
+        description: "Pinned plan digest; required for execute"
+        required: false
+        type: string
+      expected_pair_tip:
+        description: "Expected pair Git tip (full SHA)"
+        required: false
+        type: string
+      expected_parent_tip:
+        description: "Expected parent Git tip (full SHA)"
+        required: false
+        type: string
+      operation_id:
+        description: "Durable operation id for import or svn-commit status/cancel"
+        required: false
+        type: string
+      operation_kind:
+        description: "refresh, import, or svn-commit"
+        required: true
+        type: choice
+        default: refresh
+        options:
+          - refresh
+          - import
+          - svn-commit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: git-operation-request-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  request:
+    name: Request RepoSync operation
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: reposync-operations
+    timeout-minutes: 10
+    steps:
+      - name: Check out trusted workflow
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Call RepoSync API
+        env:
+          REPOSYNC_BASE_URL: ${{ secrets.REPOSYNC_BASE_URL }}
+          REPOSYNC_API_TOKEN: ${{ secrets.REPOSYNC_API_TOKEN }}
+          REPOSYNC_ACTION: ${{ inputs.action }}
+          REPOSYNC_REPO_ID: ${{ inputs.repo_id }}
+          REPOSYNC_PAIR_ID: ${{ inputs.pair_id }}
+          REPOSYNC_IDEMPOTENCY_KEY: ${{ inputs.idempotency_key }}
+          REPOSYNC_EXPECTED_PLAN_DIGEST: ${{ inputs.expected_plan_digest }}
+          REPOSYNC_EXPECTED_PAIR_TIP: ${{ inputs.expected_pair_tip }}
+          REPOSYNC_EXPECTED_PARENT_TIP: ${{ inputs.expected_parent_tip }}
+          REPOSYNC_OPERATION_ID: ${{ inputs.operation_id }}
+          REPOSYNC_OPERATION_KIND: ${{ inputs.operation_kind }}
+          REPOSYNC_REQUEST_JOURNAL: ${{ runner.temp }}/operation-journal.json
+          REPOSYNC_POLL_INTERVAL: "2"
+          REPOSYNC_POLL_ATTEMPTS: "15"
+        run: python3 scripts/git_operation_request.py
