@@ -141,7 +141,9 @@ impl Scheduler {
                         }
                     }
 
-                    // Per-repo scheduler handles all repos from the DB.
+                    // Observe-first auto-reconcile for held external-write journals,
+                    // then per-repo sync cycles.
+                    self.maybe_auto_reconcile_held_operations().await;
                     self.maybe_run_repo_cycles().await;
                     // Periodic maintenance (every ~10 minutes)
                     if tick_count.checked_rem(maintenance_ticks).unwrap() == 0 {
@@ -157,6 +159,7 @@ impl Scheduler {
                 // hint on the webhook; this runs the same inspection as polling.
                 Some(()) = self.sync_rx.recv() => {
                     info!("immediate sync requested via webhook (same polling inspection)");
+                    self.maybe_auto_reconcile_held_operations().await;
                     self.maybe_run_repo_cycles().await;
                     // Reset the interval so we don't sync again too soon
                     interval.reset();
@@ -294,6 +297,175 @@ impl Scheduler {
         });
     }
 
+    /// On each scheduler tick, attempt observe-first reconciliation for held
+    /// `svn_commit` and `svn_to_git_push` journals before ordinary sync cycles.
+    ///
+    /// Frequency is bounded by the scheduler poll interval and the per-repository
+    /// busy slot: at most one reconcile attempt per tick per repository, and no
+    /// attempt while another writer holds the slot.
+    async fn maybe_auto_reconcile_held_operations(&self) {
+        {
+            let phase = self.import_progress.read().await.phase.clone();
+            if !matches!(
+                phase,
+                ImportPhase::Idle
+                    | ImportPhase::Completed
+                    | ImportPhase::Failed
+                    | ImportPhase::Cancelled
+            ) {
+                debug!("skipping auto-reconcile: import in progress");
+                return;
+            }
+        }
+
+        let repos = match self.db.list_repositories() {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "failed to list repositories for auto-reconcile");
+                return;
+            }
+        };
+
+        for repo in repos {
+            if !repo.enabled {
+                continue;
+            }
+            match reposync_core::auto_reconcile::repo_has_reconciliation_hold(&self.db, &repo.id) {
+                Ok(true) => {}
+                Err(e) => {
+                    error!(repo_name = %repo.name, error = %e,
+                        "cannot establish reconciliation hold; skipping auto-reconcile");
+                    continue;
+                }
+                Ok(false) => continue,
+            }
+            match self.db.managed_remove_blocks_new_work(&repo.id) {
+                Ok(true) => {
+                    debug!(repo_name = %repo.name, "skipping auto-reconcile: managed removal");
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo_name = %repo.name, error = %e,
+                        "cannot establish removal hold; skipping auto-reconcile");
+                    continue;
+                }
+                Ok(false) => {}
+            }
+
+            let busy_guard = match reposync_core::busy::try_acquire(&repo.id) {
+                Some(g) => g,
+                None => {
+                    debug!(
+                        repo_name = %repo.name,
+                        "skipping auto-reconcile: writer busy"
+                    );
+                    continue;
+                }
+            };
+
+            let svn_password = self
+                .db
+                .resolve_credential_chain(&repo.id, "secret_svn_password");
+            let svn_url = if repo.svn_branch.is_empty() {
+                repo.svn_url.clone()
+            } else {
+                format!(
+                    "{}/{}",
+                    repo.svn_url.trim_end_matches('/'),
+                    repo.svn_branch.trim_start_matches('/')
+                )
+            };
+            let svn_client = SvnClient::new(
+                &svn_url,
+                &repo.svn_username,
+                svn_password.as_deref().unwrap_or(""),
+            );
+
+            let git_repo_path = self
+                .app_config
+                .daemon
+                .data_dir
+                .join("repos")
+                .join(&repo.id)
+                .join("git-repo");
+
+            let reconciled = reposync_core::auto_reconcile::reconcile_held_external_writes(
+                &self.db,
+                &repo,
+                &svn_client,
+                Some(git_repo_path.as_path()),
+            )
+            .await;
+
+            match reconciled {
+                Ok(result) => {
+                    for attempt in &result.attempts {
+                        let action = if attempt.skipped {
+                            "auto_reconcile_skipped"
+                        } else if attempt.finalized {
+                            "auto_reconcile_finalized"
+                        } else if attempt.resume_authorized {
+                            "auto_reconcile_resume_authorized"
+                        } else {
+                            "auto_reconcile_still_held"
+                        };
+                        let details = serde_json::json!({
+                            "kind": match attempt.kind {
+                                reposync_core::auto_reconcile::HeldExternalWriteKind::GitToSvnCommit =>
+                                    "git_to_svn_commit",
+                                reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush =>
+                                    "svn_to_git_push",
+                            },
+                            "operation_id": attempt.operation_id,
+                            "finalized": attempt.finalized,
+                            "resume_authorized": attempt.resume_authorized,
+                            "skipped": attempt.skipped,
+                            "skip_reason": attempt.skip_reason,
+                        })
+                        .to_string();
+                        let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                            action,
+                            direction: None,
+                            svn_rev: None,
+                            git_sha: None,
+                            author: Some("scheduler"),
+                            details: Some(&details),
+                            success: attempt.finalized || attempt.resume_authorized,
+                            repo_id: Some(&repo.id),
+                        });
+                        info!(
+                            repo_name = %repo.name,
+                            operation_id = %attempt.operation_id,
+                            finalized = attempt.finalized,
+                            resume_authorized = attempt.resume_authorized,
+                            skipped = attempt.skipped,
+                            "auto-reconcile attempt completed"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        repo_name = %repo.name,
+                        error = %e,
+                        "auto-reconcile failed"
+                    );
+                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                        action: "auto_reconcile_failed",
+                        direction: None,
+                        svn_rev: None,
+                        git_sha: None,
+                        author: Some("scheduler"),
+                        details: Some(&e.to_string()),
+                        success: false,
+                        repo_id: Some(&repo.id),
+                    });
+                }
+            }
+
+            drop(busy_guard);
+        }
+    }
+
     /// Check all enabled repositories and spawn sync cycles for those that
     /// are due (based on `poll_interval_secs` and `last_sync_at`).
     async fn maybe_run_repo_cycles(&self) {
@@ -369,6 +541,28 @@ impl Scheduler {
                 Err(e) => {
                     error!(repo_name = %repo.name, error = %e,
                         "cannot establish git-to-svn hold; refusing repository sync");
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match self.db.active_git_push_operation(&repo.id) {
+                Ok(Some(op))
+                    if op.state
+                        == reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+                        && !op.resume_authorized =>
+                {
+                    debug!(repo_name = %repo.name, operation_id = %op.id,
+                        "skipping repository held by svn-to-git push reconciliation");
+                    continue;
+                }
+                Ok(Some(op)) if !op.state.is_terminal() => {
+                    debug!(repo_name = %repo.name, operation_id = %op.id,
+                        "skipping repository with an unfinished svn-to-git push");
+                    continue;
+                }
+                Err(e) => {
+                    error!(repo_name = %repo.name, error = %e,
+                        "cannot establish svn-to-git hold; refusing repository sync");
                     continue;
                 }
                 Ok(_) => {}
@@ -1010,6 +1204,124 @@ mod cancellation_tests {
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64C07_PRISTINE_WC",
             "head_unchanged":true,"sentinel_unchanged":true,"worker_spawned":false})
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_64d_auto_reconcile_skips_when_writer_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, "held-auto", "2000-01-01T00:00:00Z");
+        use reposync_core::db::git_push_operations::{GitPushIntent, GitPushOperationState};
+        let intent = GitPushIntent {
+            repo_id: "held-auto",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let push = scheduler.db.begin_svn_to_git_push(intent).unwrap();
+        scheduler
+            .db
+            .hold_svn_to_git_reconciliation("held-auto", &push.id, "lost reply")
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .db
+                .active_git_push_operation("held-auto")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitPushOperationState::ReconciliationRequired
+        );
+        let guard = reposync_core::busy::try_acquire("held-auto").unwrap();
+
+        scheduler.maybe_auto_reconcile_held_operations().await;
+
+        let audit = scheduler.db.list_audit_log(20, 0).unwrap();
+        assert!(
+            !audit
+                .iter()
+                .any(|entry| entry.action.starts_with("auto_reconcile")),
+            "busy writer must defer auto-reconcile until the slot is free"
+        );
+        drop(guard);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64D_BUSY_DEFER","auto_reconcile_attempted":false})
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_64d_auto_reconcile_records_attempt_without_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, "held-no-wc", "2000-01-01T00:00:00Z");
+        use reposync_core::db::git_push_operations::{GitPushIntent, GitPushOperationState};
+        let intent = GitPushIntent {
+            repo_id: "held-no-wc",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let push = scheduler.db.begin_svn_to_git_push(intent).unwrap();
+        scheduler
+            .db
+            .hold_svn_to_git_reconciliation("held-no-wc", &push.id, "lost reply")
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .db
+                .active_git_push_operation("held-no-wc")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitPushOperationState::ReconciliationRequired
+        );
+
+        scheduler.maybe_auto_reconcile_held_operations().await;
+
+        let audit = scheduler
+            .db
+            .list_audit_log(20, 0)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.action == "auto_reconcile_skipped")
+            .expect("auto-reconcile must record a skipped attempt when git workdir is absent");
+        assert!(audit
+            .details
+            .as_deref()
+            .unwrap_or("")
+            .contains("git workdir unavailable"));
+        assert_eq!(
+            scheduler
+                .db
+                .active_git_push_operation("held-no-wc")
+                .unwrap()
+                .unwrap()
+                .state,
+            GitPushOperationState::ReconciliationRequired
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64D_NO_WORKDIR","audit_action":"auto_reconcile_skipped"})
         );
     }
 
