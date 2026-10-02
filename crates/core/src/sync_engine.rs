@@ -38,6 +38,7 @@ use crate::history_inspect::{
 };
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
+use crate::path_projection::project_git_to_svn_changeset;
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
     hash_regular_file_tree, intended_paths_from_contents, operation_commit_message,
@@ -178,14 +179,6 @@ impl SyncEngine {
     pub fn set_path_rules(&mut self, allowed: Vec<String>, blocked: Vec<String>) {
         self.allowed_paths = allowed;
         self.blocked_patterns = blocked;
-    }
-
-    /// Validate file paths against allowed/blocked rules.
-    fn validate_file_paths(
-        &self,
-        files: &[(String, String, Option<Vec<u8>>)],
-    ) -> Result<(), Vec<String>> {
-        validate_file_paths_impl(&self.allowed_paths, &self.blocked_patterns, files)
     }
 
     /// Return the kv_state key for the last SVN revision watermark.
@@ -1628,6 +1621,8 @@ impl SyncEngine {
             .map_err(|e| SyncError::SvnError(crate::errors::SvnError::IoError(e)))?;
         let intended_tree = hash_regular_file_tree(svn_wc)
             .map_err(|e| SyncError::SvnError(crate::errors::SvnError::IoError(e)))?;
+        // `file_contents` is the pre-mutation projected set — the same paths
+        // that were staged into this working copy.
         let projection = self.no_target_projection();
         let fingerprint =
             svn_commit_target_fingerprint(rid, &info.uuid, svn.url(), &info.url, &projection);
@@ -1750,36 +1745,74 @@ impl SyncEngine {
                 contents?
             };
 
-            // 1b. EARLY filter: remove files that don't match allowed_paths
-            // BEFORE copying to SVN WC. This prevents svn add from failing
-            // on paths like SLS/ that don't exist in the SVN branch structure.
-            let file_contents: Vec<(String, String, Option<Vec<u8>>)> =
-                if !self.allowed_paths.is_empty() {
-                    file_contents
-                        .into_iter()
-                        .filter(|(action, path, _)| {
-                            if action == "D" {
-                                // Allow deletes even for blocked paths
-                                true
-                            } else if self
-                                .allowed_paths
-                                .iter()
-                                .any(|prefix| path.starts_with(prefix))
-                            {
-                                true
-                            } else {
-                                debug!(
-                                    sha = %change.sha,
-                                    path = %path,
-                                    "early filter: skipping file not under allowed_paths"
-                                );
-                                false
-                            }
-                        })
-                        .collect()
+            // 1b. Project the typed changeset BEFORE any SVN working-copy
+            // mutation. Allow prefixes, blocked patterns, and deletes share
+            // one component-aware matcher. Staging, verification, journal,
+            // and receipts below consume this same included set.
+            let projected = project_git_to_svn_changeset(
+                file_contents,
+                &self.allowed_paths,
+                &self.blocked_patterns,
+            );
+            if !projected.excluded.is_empty() {
+                let violations =
+                    projected.exclusion_messages(&self.allowed_paths, &self.blocked_patterns);
+                for (action, path) in &projected.excluded {
+                    debug!(
+                        sha = %change.sha,
+                        action = %action,
+                        path = %path,
+                        "projection: excluding path from Git→SVN write"
+                    );
+                }
+                if projected.is_empty() {
+                    warn!(
+                        sha = %change.sha,
+                        violations = ?violations,
+                        "skipping entire commit: all files are outside the active projection"
+                    );
+                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                        action: "path_violation_skipped",
+                        direction: Some("git_to_svn"),
+                        svn_rev: None,
+                        git_sha: Some(&change.sha),
+                        author: Some(&change.author_name),
+                        details: Some(&format!(
+                            "Skipped entire commit {}: {}",
+                            &change.sha[..8.min(change.sha.len())],
+                            violations.join("; ")
+                        )),
+                        success: false,
+                        repo_id: self.effective_repo_id(),
+                    });
                 } else {
-                    file_contents
-                };
+                    warn!(
+                        sha = %change.sha,
+                        violations = ?violations,
+                        valid_files = projected.included.len(),
+                        "projection: {} file(s) outside scope, {} in-scope file(s) remain",
+                        projected.excluded.len(),
+                        projected.included.len(),
+                    );
+                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                        action: "path_violation_filtered",
+                        direction: Some("git_to_svn"),
+                        svn_rev: None,
+                        git_sha: Some(&change.sha),
+                        author: Some(&change.author_name),
+                        details: Some(&format!(
+                            "Commit {} filtered: removed {} violating file(s), synced {} valid file(s). Violations: {}",
+                            &change.sha[..8.min(change.sha.len())],
+                            projected.excluded.len(),
+                            projected.included.len(),
+                            violations.join("; ")
+                        )),
+                        success: true,
+                        repo_id: self.effective_repo_id(),
+                    });
+                }
+            }
+            let file_contents = projected.into_file_contents();
 
             // The current bridge maps regular-file bytes only. Mode, type,
             // symlink and executable changes cannot be acknowledged by an
@@ -2070,125 +2103,8 @@ impl SyncEngine {
                 "SVN working copy has pending changes, committing"
             );
 
-            // 4b. Validate file paths against allowed/blocked rules.
-            // If some files violate, revert them from SVN working copy and
-            // continue with only the valid files. Only skip the entire commit
-            // if ALL files are violations.
-            if let Err(violations) = self.validate_file_paths(&file_contents) {
-                // Collect just the bare file paths that violated
-                let violating_paths: Vec<String> = file_contents
-                    .iter()
-                    .filter(|(action, path, _)| {
-                        if action == "D" {
-                            return false;
-                        }
-                        if !self.allowed_paths.is_empty()
-                            && !self
-                                .allowed_paths
-                                .iter()
-                                .any(|prefix| path.starts_with(prefix))
-                        {
-                            return true;
-                        }
-                        for pattern in &self.blocked_patterns {
-                            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
-                                path.ends_with(suffix)
-                            } else if pattern.ends_with('/') {
-                                path.starts_with(pattern)
-                            } else {
-                                path == pattern || path.starts_with(&format!("{}/", pattern))
-                            };
-                            if matches {
-                                return true;
-                            }
-                        }
-                        false
-                    })
-                    .map(|(_, path, _)| path.clone())
-                    .collect();
-
-                let valid_count = file_contents.len() - violating_paths.len();
-
-                warn!(
-                    sha = %change.sha,
-                    violations = ?violations,
-                    valid_files = valid_count,
-                    "path validation: {} file(s) violate rules, {} valid file(s) remain",
-                    violating_paths.len(),
-                    valid_count,
-                );
-
-                if valid_count == 0 {
-                    // ALL files violate — skip entire commit
-                    warn!(sha = %change.sha, "skipping entire commit: all files violate path rules");
-                    if let Some(rid) = self.effective_repo_id() {
-                        self.db
-                            .advance_no_target_watermarks(
-                                rid,
-                                &change.sha,
-                                "filtered",
-                                &self.no_target_projection(),
-                            )
-                            .map_err(SyncError::DatabaseError)?;
-                    }
-                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
-                        action: "path_violation_skipped",
-                        direction: Some("git_to_svn"),
-                        svn_rev: None,
-                        git_sha: Some(&change.sha),
-                        author: Some(&change.author_name),
-                        details: Some(&format!(
-                            "Skipped entire commit {}: {}",
-                            &change.sha[..8.min(change.sha.len())],
-                            violations.join("; ")
-                        )),
-                        success: false,
-                        repo_id: self.effective_repo_id(),
-                    });
-                    continue;
-                }
-
-                // Revert violating files from SVN working copy
-                let revert_paths: Vec<&str> = violating_paths.iter().map(|s| s.as_str()).collect();
-                let svn = self
-                    .svn_client
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
-                if let Err(e) = svn.revert_files(svn_wc_dir.path(), &revert_paths).await {
-                    return Err(SyncError::SvnError(e));
-                }
-                // Also remove the files from disk if they were newly added
-                for path in &violating_paths {
-                    let full = svn_wc_dir.path().join(path);
-                    let _ = std::fs::remove_file(&full);
-                }
-                info!(
-                    sha = %change.sha,
-                    reverted = violating_paths.len(),
-                    remaining = valid_count,
-                    "reverted violating files, proceeding with valid files only"
-                );
-
-                let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
-    action: "path_violation_filtered",
-    direction: Some("git_to_svn"),
-    svn_rev: None,
-    git_sha: Some(&change.sha),
-    author: Some(&change.author_name),
-    details: Some(&format!(
-                        "Commit {} filtered: removed {} violating file(s), synced {} valid file(s). Violations: {}",
-                        &change.sha[..8.min(change.sha.len())],
-                        violating_paths.len(),
-                        valid_count,
-                        violations.join("; ")
-                    )),
-    success: true,
-    repo_id: self.effective_repo_id(),
-});
-            }
-
-            // 5. Commit to SVN.
+            // 5. Commit to SVN. The working copy contains only the projected
+            // changeset; excluded/blocked paths were never written.
             // Run svn update immediately before commit to minimize the window
             // for E155011 "out of date" errors. The WC may be stale if a
             // previous commit in this batch advanced the server HEAD.
@@ -2999,7 +2915,9 @@ pub struct ChangedFile {
 }
 
 /// Validate file paths against allowed/blocked rules.
-/// Extracted as a standalone function for testability.
+///
+/// Uses the same component-aware matcher as the pre-mutation projector,
+/// including deletes. Extracted for testability.
 pub(crate) fn validate_file_paths_impl(
     allowed_paths: &[String],
     blocked_patterns: &[String],
@@ -3009,30 +2927,13 @@ pub(crate) fn validate_file_paths_impl(
         return Ok(());
     }
     let mut violations = Vec::new();
-    for (action, path, _) in files {
-        if action == "D" {
-            continue;
-        }
-        if !allowed_paths.is_empty() {
-            let allowed = allowed_paths.iter().any(|prefix| path.starts_with(prefix));
-            if !allowed {
-                violations.push(format!(
-                    "'{}' not under allowed paths {:?}",
-                    path, allowed_paths
-                ));
-            }
-        }
-        for pattern in blocked_patterns {
-            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
-                path.ends_with(suffix)
-            } else if pattern.ends_with('/') {
-                path.starts_with(pattern)
-            } else {
-                path == pattern || path.starts_with(&format!("{}/", pattern))
-            };
-            if matches {
-                violations.push(format!("'{}' matches blocked pattern '{}'", path, pattern));
-            }
+    for (_action, path, _) in files {
+        if !crate::path_projection::path_is_projected(path, allowed_paths, blocked_patterns) {
+            violations.push(crate::path_projection::exclusion_message(
+                path,
+                allowed_paths,
+                blocked_patterns,
+            ));
         }
     }
     if violations.is_empty() {
@@ -3128,10 +3029,35 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_always_passes() {
+    fn test_delete_out_of_scope_is_excluded() {
         let allowed = vec!["source/".to_string()];
         let files = vec![make_file("D", "root-level-file.txt")];
+        let result = validate_file_paths_impl(&allowed, &[], &files);
+        assert!(result.is_err());
+        let violations = result.unwrap_err();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("root-level-file.txt"));
+    }
+
+    #[test]
+    fn test_delete_in_scope_passes() {
+        let allowed = vec!["source/".to_string()];
+        let files = vec![make_file("D", "source/gone.txt")];
         assert!(validate_file_paths_impl(&allowed, &[], &files).is_ok());
+    }
+
+    #[test]
+    fn test_allowed_prefix_does_not_match_sibling() {
+        let allowed = vec!["team".to_string()];
+        let files = vec![
+            make_file("A", "team/ok.txt"),
+            make_file("A", "team-other/leak.txt"),
+        ];
+        let result = validate_file_paths_impl(&allowed, &[], &files);
+        assert!(result.is_err());
+        let violations = result.unwrap_err();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("team-other/leak.txt"));
     }
 
     #[test]

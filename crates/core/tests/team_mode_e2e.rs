@@ -640,8 +640,26 @@ impl QualifiedPair {
     }
 
     fn developer_commit(&self, name: &str, content: &str, message: &str) -> String {
-        std::fs::write(self.developer.join(name), content).unwrap();
-        git_cli(&self.developer, &["add", name]);
+        self.developer_commit_tree(&[(name, Some(content))], message)
+    }
+
+    /// Commit several paths at once. `None` content means `git rm`.
+    fn developer_commit_tree(&self, files: &[(&str, Option<&str>)], message: &str) -> String {
+        for (name, content) in files {
+            let path = self.developer.join(name);
+            match content {
+                Some(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    std::fs::write(&path, bytes).unwrap();
+                    git_cli(&self.developer, &["add", name]);
+                }
+                None => {
+                    git_cli(&self.developer, &["rm", "-f", name]);
+                }
+            }
+        }
         git_cli(&self.developer, &["commit", "-m", message]);
         get_head_sha(&self.developer)
     }
@@ -4176,7 +4194,7 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
-    pair.engine.set_path_rules(vec!["allow".into()], vec![]);
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
     let filtered = pair.developer_commit(
         "blocked.txt",
         "filtered content\n",
@@ -4209,7 +4227,7 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
         Arc::new(make_identity_mapper()),
     );
     changed.set_repo_id("pair".into());
-    changed.set_path_rules(vec!["blocked".into()], vec![]);
+    changed.set_path_rules(vec!["blocked/".into()], vec![]);
     assert!(matches!(changed.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
     assert_eq!(pair.snapshot().await, before);
@@ -4231,7 +4249,7 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
         0
     );
     let allowed = pair.developer_commit(
-        "allow.txt",
+        "allow/work.txt",
         "ordinary work\n",
         "Ordinary work under unchanged policy",
     );
@@ -4254,7 +4272,10 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
         .unwrap()
         .latest_rev;
     let tree = svn_tree(&pair, svn_rev).await;
-    assert_eq!(tree.get("allow.txt"), Some(&b"ordinary work\n".to_vec()));
+    assert_eq!(
+        tree.get("allow/work.txt"),
+        Some(&b"ordinary work\n".to_vec())
+    );
     assert!(!tree.contains_key("blocked.txt"));
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -4280,7 +4301,7 @@ async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
-    pair.engine.set_path_rules(vec!["allow".into()], vec![]);
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
     let filtered = pair.developer_commit(
         "blocked.txt",
         "filtered content\n",
@@ -4319,7 +4340,7 @@ async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
         Arc::new(make_identity_mapper()),
     );
     changed.set_repo_id("pair".into());
-    changed.set_path_rules(vec!["blocked".into()], vec![]);
+    changed.set_path_rules(vec!["blocked/".into()], vec![]);
     assert!(matches!(changed.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
     assert_eq!(pair.snapshot().await, before);
@@ -4347,7 +4368,7 @@ async fn candidate_r10_policy_kv_only_filtered_commit_rejected() {
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1
     );
-    pair.engine.set_path_rules(vec!["allow".into()], vec![]);
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
     let filtered = pair.developer_commit(
         "blocked.txt",
         "filtered content\n",
@@ -4382,7 +4403,7 @@ async fn candidate_r10_policy_kv_only_filtered_commit_rejected() {
         Arc::new(make_identity_mapper()),
     );
     changed.set_repo_id("pair".into());
-    changed.set_path_rules(vec!["blocked".into()], vec![]);
+    changed.set_path_rules(vec!["blocked/".into()], vec![]);
     assert!(matches!(changed.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "receipt_policy_changed"));
     assert_eq!(pair.snapshot().await, before);
@@ -5578,6 +5599,188 @@ async fn candidate_64c_ordinary_success_is_truthful_and_terminal() {
             "operation_id":latest.id,
             "lifecycle":"completed",
             "quiet_after_terminal":true
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RS-C02 / #89: projected changeset before SVN WC mutation
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue() {
+    let pair = QualifiedPair::new().await;
+    pair.engine
+        .set_path_rules(Vec::new(), vec!["secret/".into()]);
+    let svn_before = svn_youngest(&pair.svn_url);
+    let before_tree = svn_tree(&pair, svn_before).await;
+    // One cycle: allowed (initializes reused WC) → all-filtered → allowed.
+    // The middle commit must not leave blocked residue for the successor.
+    let primed = pair.developer_commit("public0.txt", "prime wc\n", "Prime reused SVN WC");
+    let filtered = pair.developer_commit(
+        "secret/leak.txt",
+        "blocked residue must not publish\n",
+        "All-filtered blocked path",
+    );
+    let allowed = pair.developer_commit(
+        "public.txt",
+        "allowed successor\n",
+        "Allowed commit after filtered",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        2
+    );
+    assert_eq!(svn_youngest(&pair.svn_url), svn_before + 2);
+    let receipt_key = format!("handled_git_no_target_pair_{filtered}");
+    let receipt: serde_json::Value =
+        serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
+    assert_eq!(receipt["outcome"], "filtered");
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert_eq!(tree.get("public0.txt"), Some(&b"prime wc\n".to_vec()));
+    assert_eq!(
+        tree.get("public.txt"),
+        Some(&b"allowed successor\n".to_vec())
+    );
+    assert!(!tree.contains_key("secret/leak.txt"));
+    assert_eq!(tree.get("origin.txt"), before_tree.get("origin.txt"));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, allowed);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    assert_eq!(journal_paths, vec!["public.txt"]);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap().1,
+        allowed
+    );
+    let mut restarted = reopen_pair(&pair);
+    restarted.set_path_rules(Vec::new(), vec!["secret/".into()]);
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    let after_restart = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert_eq!(after_restart, tree);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_FILTERED_THEN_ALLOWED",
+            "primed":primed, "filtered":filtered, "allowed":allowed,
+            "svn_rev_delta":2, "blocked_residue":false,
+            "journal_paths":journal_paths, "restart_quiet":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_mixed_commit_preserves_excluded_and_rejects_sibling_prefix() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "secret/keep.txt",
+        "keep original\n",
+        "Seed excluded file into SVN",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine
+        .set_path_rules(vec!["team".into()], vec!["*.exe".into()]);
+    let mixed = pair.developer_commit_tree(
+        &[
+            ("secret/keep.txt", Some("mutated must not publish\n")),
+            ("team/ok.txt", Some("in scope\n")),
+            ("team-other/leak.txt", Some("sibling trap\n")),
+            ("team/skip.exe", Some("blocked suffix inside allow\n")),
+        ],
+        "Mixed allowed, sibling, and blocked",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert_eq!(
+        tree.get("secret/keep.txt"),
+        Some(&b"keep original\n".to_vec())
+    );
+    assert_eq!(tree.get("team/ok.txt"), Some(&b"in scope\n".to_vec()));
+    assert!(!tree.contains_key("team-other/leak.txt"));
+    assert!(!tree.contains_key("team/skip.exe"));
+    assert_eq!(tree.get("origin.txt"), Some(&b"SVN origin\n".to_vec()));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, mixed);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    assert_eq!(journal_paths, vec!["team/ok.txt"]);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_MIXED_AND_SIBLING",
+            "mixed":mixed, "journal_paths":journal_paths,
+            "excluded_preserved":true, "sibling_rejected":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_out_of_scope_delete_leaves_svn_file() {
+    let pair = QualifiedPair::new().await;
+    pair.engine.set_path_rules(vec!["keep/".into()], Vec::new());
+    let sha = pair.developer_commit_tree(
+        &[
+            ("origin.txt", None),
+            ("keep/new.txt", Some("in scope add\n")),
+        ],
+        "Out-of-scope delete plus allowed add",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert_eq!(tree.get("origin.txt"), Some(&b"SVN origin\n".to_vec()));
+    assert_eq!(tree.get("keep/new.txt"), Some(&b"in scope add\n".to_vec()));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, sha);
+    assert!(journal
+        .intended_changed_paths
+        .iter()
+        .all(|p| p.path != "origin.txt"));
+    assert!(journal
+        .intended_changed_paths
+        .iter()
+        .any(|p| p.path == "keep/new.txt" && p.action != "D"));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_OUT_OF_SCOPE_DELETE",
+            "sha":sha, "origin_preserved":true
         })
     );
 }
