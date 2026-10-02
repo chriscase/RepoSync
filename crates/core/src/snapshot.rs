@@ -549,4 +549,43 @@ mod tests {
         ));
         assert!(!src_manifest.contains_file_digest_of(canary));
     }
+
+    #[test]
+    fn snapshot_materialize_writer_rejects_outside_hardlink_canary() {
+        use crate::db::Database;
+        use crate::import::{independent_tree_manifest, ManifestEntry};
+
+        let export = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let canary = b"SNAPSHOT-HARDLINK-CANARY-88";
+        std::fs::write(outside.path().join("secret"), canary).unwrap();
+        std::fs::write(export.path().join("app.rs"), "fn main() {}\n").unwrap();
+        std::fs::hard_link(outside.path().join("secret"), export.path().join("escape")).unwrap();
+
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let policy = FilePolicy::new(0, vec![]);
+        let poisoned = tempfile::tempdir().unwrap();
+        let err = copy_tree_with_policy(export.path(), poisoned.path(), &policy, &db).unwrap_err();
+        assert!(err.to_string().contains("unsupported hardlink"), "{err}");
+        assert!(!poisoned.path().join("escape").exists());
+        let published_canary = std::fs::read_dir(poisoned.path()).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            std::fs::read(entry.path())
+                .map(|bytes| bytes.windows(canary.len()).any(|w| w == canary))
+                .unwrap_or(false)
+        });
+        assert!(
+            !published_canary,
+            "snapshot writer published outside-root hardlink bytes"
+        );
+
+        let src_manifest = independent_tree_manifest(export.path()).unwrap();
+        assert!(matches!(
+            src_manifest.entries.get("escape"),
+            Some(ManifestEntry::Unsupported { kind, detail })
+                if kind == "hardlink" && detail.contains("not opened")
+        ));
+        assert!(!src_manifest.contains_file_digest_of(canary));
+    }
 }
