@@ -163,10 +163,12 @@ pub fn is_reserved_vcs_metadata(name: &OsStr) -> bool {
 }
 
 /// Destination names `remove_stale_files` must keep even when they are absent
-/// from the SVN export. Reserved VCS dirs stay protected; `.gitattributes` is
-/// engine-written LFS tracking (not reserved during copy).
+/// from the SVN export. Only reserved VCS metadata (`.git`, `.svn`, `.hg`,
+/// `.bzr`). `.gitattributes` is not name-protected: engine LFS output is
+/// reconciled from patterns [`crate::lfs::ensure_lfs_tracked`] recorded under
+/// `.git/`, and any other `.gitattributes` is removed when the export omits it.
 pub fn is_stale_remove_protected(name: &OsStr) -> bool {
-    is_reserved_vcs_metadata(name) || name == ".gitattributes"
+    is_reserved_vcs_metadata(name)
 }
 
 /// Recursively copy files from SVN export `src` into Git working tree `dst`,
@@ -845,14 +847,19 @@ fn file_exec_bit(mode: u32) -> bool {
 }
 
 /// Remove files from `dst` (Git working tree) that no longer exist in `src`
-/// (SVN export). Preserves reserved VCS metadata (e.g. destination `.git/`)
-/// and engine-written `.gitattributes`. Ordinary root dotfiles such as
-/// `.gitignore` can be stale-removed.
+/// (SVN export). Preserves reserved VCS metadata (e.g. destination `.git/`).
+///
+/// A root `.gitattributes` that the export omits is not kept by name. It is
+/// replaced with the engine LFS patterns recorded by
+/// [`crate::lfs::ensure_lfs_tracked`] under `.git/`, or deleted when that
+/// marker is absent, so SVN-planted filter rules do not survive. Nested
+/// `.gitattributes` files are ordinary and can be stale-removed. Ordinary
+/// root dotfiles such as `.gitignore` can be stale-removed.
 pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
-    remove_stale_inner(src, dst)
+    remove_stale_inner(src, dst, true)
 }
 
-fn remove_stale_inner(src: &Path, dst: &Path) -> Result<()> {
+fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
     let entries = match std::fs::read_dir(dst) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -871,9 +878,16 @@ fn remove_stale_inner(src: &Path, dst: &Path) -> Result<()> {
         let src_path = src.join(&file_name);
         let dst_path = entry.path();
 
+        if at_root
+            && file_name == ".gitattributes"
+            && reconcile_root_gitattributes(dst, &src_path, &dst_path)?
+        {
+            continue;
+        }
+
         if dst_path.is_dir() {
             if src_path.is_dir() {
-                remove_stale_inner(&src_path, &dst_path)?;
+                remove_stale_inner(&src_path, &dst_path, false)?;
             } else {
                 std::fs::remove_dir_all(&dst_path).with_context(|| {
                     format!("failed to remove stale directory: {}", dst_path.display())
@@ -887,6 +901,63 @@ fn remove_stale_inner(src: &Path, dst: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Handle a root `.gitattributes` entry.
+///
+/// Returns `true` when the entry was reconciled (export copy left in place,
+/// replaced with engine LFS lines, or removed as non-engine). Returns `false`
+/// when the path is a directory and ordinary stale-remove should run.
+fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Path) -> Result<bool> {
+    let dst_meta = std::fs::symlink_metadata(dst_path).with_context(|| {
+        format!(
+            "failed to stat .gitattributes without following: {}",
+            dst_path.display()
+        )
+    })?;
+    if dst_meta.is_dir() {
+        return Ok(false);
+    }
+
+    // The current export ships this path. Leave it for the copier; do not
+    // blanket-rewrite exported attribute rules.
+    if std::fs::symlink_metadata(src_path).is_ok() {
+        return Ok(true);
+    }
+
+    if let Some(body) = crate::lfs::engine_gitattributes_body(dst_root)
+        .with_context(|| format!("failed to read engine LFS marker in {}", dst_root.display()))?
+    {
+        replace_with_regular_file(dst_path, &dst_meta, &body)?;
+        debug!(
+            path = %dst_path.display(),
+            "rewrote .gitattributes to engine-recorded LFS patterns"
+        );
+        return Ok(true);
+    }
+
+    std::fs::remove_file(dst_path).with_context(|| {
+        format!(
+            "failed to remove non-engine .gitattributes: {}",
+            dst_path.display()
+        )
+    })?;
+    debug!(path = %dst_path.display(), "removed non-engine .gitattributes");
+    Ok(true)
+}
+
+fn replace_with_regular_file(path: &Path, meta: &std::fs::Metadata, body: &str) -> Result<()> {
+    if !meta.file_type().is_file() {
+        std::fs::remove_file(path).with_context(|| {
+            format!(
+                "failed to remove non-regular .gitattributes: {}",
+                path.display()
+            )
+        })?;
+    }
+    std::fs::write(path, body)
+        .with_context(|| format!("failed to write engine .gitattributes: {}", path.display()))?;
     Ok(())
 }
 
@@ -3196,9 +3267,114 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&gitattr).unwrap(), before);
         assert!(dst.path().join(".git").exists());
+        assert!(!is_stale_remove_protected(std::ffi::OsStr::new(
+            ".gitattributes"
+        )));
         assert!(!is_reserved_vcs_metadata(std::ffi::OsStr::new(
             ".gitattributes"
         )));
+    }
+
+    #[test]
+    fn import_stale_remove_drops_planted_gitattributes_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-attrs");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        symlink(&outside, dst.join(".gitattributes")).unwrap();
+        std::fs::create_dir(dst.join(".git")).unwrap();
+
+        remove_stale_files(&src, &dst).unwrap();
+
+        assert!(!dst.join(".gitattributes").exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "removing a planted .gitattributes symlink must not follow it"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_drops_planted_gitattributes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/a.txt"), "a").unwrap();
+
+        std::fs::write(dst.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(dst.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(dst.path().join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::create_dir(dst.path().join("sub")).unwrap();
+        std::fs::write(dst.path().join("sub/a.txt"), "a").unwrap();
+        std::fs::write(dst.path().join("sub/.gitattributes"), "* filter=evil\n").unwrap();
+
+        remove_stale_files(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join("keep.txt").exists());
+        assert!(dst.path().join("sub/a.txt").exists());
+        assert!(dst.path().join(".git/HEAD").exists());
+        assert!(
+            !dst.path().join(".gitattributes").exists(),
+            "planted root .gitattributes must not survive when the export omits it"
+        );
+        assert!(
+            !dst.path().join("sub/.gitattributes").exists(),
+            "nested .gitattributes must not be name-protected"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_strips_planted_rules_keeps_engine_lfs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("model.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(
+            dst.path().join(".gitattributes"),
+            "* filter=evil\n*.c filter=evil\n",
+        )
+        .unwrap();
+
+        let policy = FilePolicy::with_lfs(0, vec![], 100, &[]);
+        copy_tree_with_policy(src.path(), dst.path(), &policy, &test_db()).unwrap();
+        let merged = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert!(
+            merged.contains("filter=evil"),
+            "ensure_lfs_tracked appends onto existing content before reconcile: {merged}"
+        );
+        assert!(merged.contains("filter=lfs"), "{merged}");
+
+        remove_stale_files(src.path(), dst.path()).unwrap();
+        let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(after, "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        assert!(
+            !after.contains("evil"),
+            "planted filter rules must not remain: {after}"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_keeps_exported_gitattributes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        // Engine marker from an earlier LFS sync must not overwrite attributes
+        // the current export still ships.
+        crate::lfs::ensure_lfs_tracked(dst.path(), "*.bin").unwrap();
+
+        copy_tree_with_policy(src.path(), dst.path(), &noop_policy(), &test_db()).unwrap();
+        remove_stale_files(src.path(), dst.path()).unwrap();
+
+        let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(after, "* text=auto\n");
     }
 
     #[test]

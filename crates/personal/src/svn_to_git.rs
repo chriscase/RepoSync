@@ -285,7 +285,9 @@ impl SvnToGitSync {
     }
 
     /// Remove files and directories from `dst` that do not exist in `src`.
-    /// Delegates to the shared core helper (reserved VCS metadata is preserved).
+    /// Delegates to the shared core helper. Reserved VCS metadata is preserved.
+    /// Root `.gitattributes` is reconciled to engine-recorded LFS patterns when
+    /// the export omits it.
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
         remove_stale_files_shared(src, dst)
     }
@@ -391,11 +393,7 @@ mod tests {
         std::fs::write(dst.path().join("stale.txt"), "remove me").unwrap();
         std::fs::create_dir(dst.path().join(".git")).unwrap();
         std::fs::write(dst.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
-        std::fs::write(
-            dst.path().join(".gitattributes"),
-            "*.bin filter=lfs diff=lfs merge=lfs -text\n",
-        )
-        .unwrap();
+        assert!(reposync_core::lfs::ensure_lfs_tracked(dst.path(), "*.bin").unwrap());
 
         SvnToGitSync::remove_stale_files(src.path(), dst.path()).unwrap();
 
@@ -403,9 +401,42 @@ mod tests {
         assert!(!dst.path().join("stale.txt").exists());
         // .git must be preserved (root dotdir).
         assert!(dst.path().join(".git/HEAD").exists());
+        let gitattr = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(
+            gitattr, "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+            "engine-recorded LFS .gitattributes must survive stale-remove"
+        );
+    }
+
+    #[test]
+    fn test_remove_stale_files_drops_planted_gitattributes() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        std::fs::write(src.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/a.txt"), "a").unwrap();
+
+        std::fs::write(dst.path().join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(dst.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(dst.path().join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::create_dir(dst.path().join("sub")).unwrap();
+        std::fs::write(dst.path().join("sub/a.txt"), "a").unwrap();
+        std::fs::write(dst.path().join("sub/.gitattributes"), "* filter=evil\n").unwrap();
+
+        SvnToGitSync::remove_stale_files(src.path(), dst.path()).unwrap();
+
+        assert!(dst.path().join("keep.txt").exists());
+        assert!(dst.path().join("sub/a.txt").exists());
+        assert!(dst.path().join(".git/HEAD").exists());
         assert!(
-            dst.path().join(".gitattributes").exists(),
-            "engine-written .gitattributes must survive stale-remove"
+            !dst.path().join(".gitattributes").exists(),
+            "planted root .gitattributes must not survive when the export omits it"
+        );
+        assert!(
+            !dst.path().join("sub/.gitattributes").exists(),
+            "nested planted .gitattributes must not be name-protected"
         );
     }
 
