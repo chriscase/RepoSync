@@ -5347,6 +5347,7 @@ fn reopen_pair(fixture: &QualifiedPair) -> SyncEngine {
     let db = Database::new(&fixture.db_path).unwrap();
     db.initialize().unwrap();
     db.hold_interrupted_svn_commits().unwrap();
+    db.hold_interrupted_git_pushes().unwrap();
     let git = GitClient::new(&fixture.bridge).unwrap();
     let mut engine = SyncEngine::new(
         fixture.engine.config().clone(),
@@ -6088,4 +6089,239 @@ async fn candidate_rsc14_nested_project_lost_reply_finalizes_without_second_comm
         "64C_RSC14_NESTED",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// RS-C04 / #64: SVN→Git durable push intent before publication
+// ---------------------------------------------------------------------------
+
+fn svn_to_git_mappings(db: &Database, repo_id: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git'",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+struct GitPushFaultGuard {
+    scoped_key: String,
+}
+
+impl GitPushFaultGuard {
+    fn set(key: &'static str, repo: &str) -> Self {
+        let scoped_key = format!("{}__{}", key, repo);
+        std::env::set_var(&scoped_key, "1");
+        Self { scoped_key }
+    }
+}
+
+impl Drop for GitPushFaultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(&self.scoped_key);
+    }
+}
+
+impl HeldHint for reposync_core::db::git_push_operations::GitPushOperation {
+    fn lifecycle_is_held(&self) -> bool {
+        self.state
+            == reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_success_stores_observed_not_intended_git_tree() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-observed-tree").await;
+    let repo_id = fixture.repo_id.as_str();
+    let svn_before = svn_youngest(&fixture.svn_url);
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "observed git tree\n",
+        "RS-C04 observed git tree",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    let remote_after = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(remote_before, remote_after);
+    let latest = fixture
+        .engine
+        .db()
+        .latest_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        latest.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::Completed
+    );
+    let confirmed_tree = latest
+        .last_confirmed_git_tree
+        .clone()
+        .expect("completed push must record observed Git tree");
+    let confirmed_sha = latest
+        .last_confirmed_git_sha
+        .clone()
+        .expect("completed push must record observed Git SHA");
+    assert_eq!(confirmed_sha, remote_after);
+    let git = GitClient::new(&fixture.bridge).unwrap();
+    let independently_observed =
+        reposync_core::git_push::observed_git_tree(&git, &confirmed_sha).unwrap();
+    assert_eq!(
+        confirmed_tree, independently_observed,
+        "checkpoint must store re-read Git tree evidence, not substitute intended tree"
+    );
+    assert_eq!(confirmed_tree, latest.intended_local_git_tree);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_OBSERVED_TREE",
+            "operation_id":latest.id,
+            "git_sha":confirmed_sha,
+            "confirmed_tree_matches_independent_read":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_lost_reply_holds_without_pretending_success() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-lost-reply").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "lost reply\n",
+        "RS-C04 lost reply",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let watermark_before = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::GitPushHeld { reason, .. }) if reason == "lost_push_reply"
+        ),
+        "{result:?}"
+    );
+    drop(_fault);
+    let remote_after = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(remote_before, remote_after, "remote push must have landed");
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark_before
+    );
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        op.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    assert!(!op.resume_authorized);
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_state("sync_state")
+            .unwrap()
+            .as_deref(),
+        Some("reconciliation_required")
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_LOST_REPLY",
+            "operation_id":op.id,
+            "remote_before":remote_before,
+            "remote_after":remote_after,
+            "watermark_before":watermark_before,
+            "mappings_before_after":mappings_before,
+            "lifecycle":"reconciliation_required"
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_observed_tree_mismatch_stays_held() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-tree-mismatch").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "tree mismatch\n",
+        "RS-C04 tree mismatch",
+    );
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_OBSERVED_TREE_MISMATCH", repo_id);
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::GitPushHeld { reason, .. }) if reason == "observed_tree_mismatch"
+        ),
+        "{result:?}"
+    );
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert!(op.lifecycle_is_held());
+    assert_eq!(svn_to_git_mappings(fixture.engine.db(), repo_id), 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_TREE_MISMATCH",
+            "operation_id":op.id,
+            "lifecycle":"reconciliation_required"
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_held_cycle_does_not_blind_repush() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-no-blind-repush").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "no blind repush\n",
+        "RS-C04 no blind repush",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let remote_after_first = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(remote_before, remote_after_first);
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "held push must block another cycle instead of blind re-push: {blocked:?}"
+    );
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_after_first
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_NO_BLIND_REPUSH",
+            "remote_before":remote_before,
+            "remote_after_first":remote_after_first,
+            "second_cycle_blocked":true
+        })
+    );
 }

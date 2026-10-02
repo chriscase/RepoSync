@@ -98,6 +98,8 @@ impl WebServer {
             .expect("cannot safely start while import operation recovery state is unwritable");
         db.hold_interrupted_svn_commits()
             .expect("cannot safely start while git-to-svn commit recovery state is unwritable");
+        db.hold_interrupted_git_pushes()
+            .expect("cannot safely start while svn-to-git push recovery state is unwritable");
         let (ws_tx, _) = broadcast::channel(256);
         let state = Arc::new(AppState {
             db,

@@ -247,6 +247,10 @@ pub enum SyncError {
     #[error("git-to-svn commit reconciliation required ({reason}): {detail}")]
     SvnCommitHeld { reason: String, detail: String },
 
+    /// One SVN→Git push is held until explicit remote inspection.
+    #[error("svn-to-git push reconciliation required ({reason}): {detail}")]
+    GitPushHeld { reason: String, detail: String },
+
     /// The sync detected an unresolvable conflict.
     #[error("unresolvable conflict on '{file_path}': {detail}")]
     UnresolvableConflict { file_path: String, detail: String },
