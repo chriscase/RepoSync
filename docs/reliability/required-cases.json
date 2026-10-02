@@ -589,6 +589,11 @@
     {"id":"64C_RESUME_ONE_WRITE", "binary":"team_mode_e2e", "test":"candidate_64c_absent_unchanged_may_resume_one_write", "tier":"candidate_regression"},
     {"id":"64C_ORDINARY", "binary":"team_mode_e2e", "test":"candidate_64c_ordinary_success_is_truthful_and_terminal", "tier":"candidate_regression"},
     {"id":"64C_HTTP_UNIQUE_MATCH", "binary":"svn_commit_reconciliation", "test":"candidate_64c_admin_reconcile_finalizes_lost_reply", "tier":"candidate_regression"},
-    {"id":"64C_AUTH", "binary":"svn_commit_reconciliation", "test":"candidate_64c_named_admin_only_without_legacy_fallback", "tier":"candidate_regression"}
+    {"id":"64C_AUTH", "binary":"svn_commit_reconciliation", "test":"candidate_64c_named_admin_only_without_legacy_fallback", "tier":"candidate_regression"},
+    {"id":"R02_LEGACY_DELETE", "binary":"server_freeze", "test":"candidate_r02_legacy_delete_keeps_registration_mappings_and_remotes", "tier":"candidate_regression"},
+    {"id":"R02_MANAGED_REMOVE", "binary":"server_freeze", "test":"candidate_r02_managed_remove_preserves_remotes_and_owned_local_only", "tier":"candidate_regression"},
+    {"id":"R02_REMOVE_RETRY", "binary":"server_freeze", "test":"candidate_r02_managed_remove_waits_and_retries_without_touching_remotes", "tier":"candidate_regression"},
+    {"id":"R02_PATH_CONFINEMENT", "binary":"reposync_core", "test":"managed_remove::tests::candidate_r02_path_confinement_blocks_symlink_and_sibling_escape", "tier":"candidate_regression"},
+    {"id":"R02_JOURNAL_RETRY", "binary":"reposync_core", "test":"db::managed_remove::tests::candidate_r02_journal_failure_is_retryable_and_stale_job_cannot_resurrect", "tier":"candidate_regression"}
   ]
 }

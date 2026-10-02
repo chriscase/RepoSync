@@ -4,6 +4,7 @@
 //! migrations, and query helpers for every table used by the sync engine.
 
 pub mod import_operations;
+pub mod managed_remove;
 pub mod queries;
 pub mod schema;
 pub mod svn_commit_operations;
