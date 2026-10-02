@@ -8,6 +8,23 @@ If a Git push may have succeeded but its result cannot be verified, RepoSync rec
 
 This is the first bounded #64 implementation, not automatic recovery for every interrupted external write. The old setup-wizard cancellation flow remains available, and the existing #73 conflict test remains ignored until its fixture and behavior are corrected.
 
+## October 2026 status: current, implemented, and planned
+
+This section describes the tree that adds the first #71 slice. It does not close #71 or #61. The version installed in the active environment is still not established, and this slice is not #41 release evidence. Links below are source and local tests, not a live sandbox run of the new workflow.
+
+| Behavior | Current product behavior | In this slice | Planned, not done here |
+| --- | --- | --- | --- |
+| Ordinary sync | `POST /api/repos/{id}/sync` records a scheduler request. The response is not a finished cycle. | Documented. The manual client does not replace the scheduler. | No change to sync semantics. |
+| Late pairing | `POST /api/repos/{parent}/branches` can preview an SVN-derived branch. `dry_run: false` returns `publish_not_implemented`. | Documented, with one valid and one invalid SVN-origin example. | Publishing the pair, creating the remote branch, and checkpoints stay later work. |
+| Pair refresh | `POST /api/repos/{pair}/refresh` previews and pins `plan_digest`. `execute: true` returns `refresh_execute_not_implemented`. Re-anchor returns `reanchor_not_implemented`. | The manual client calls that preview and reports the refusal. It does not invent execute. | #69 execution and re-anchor. |
+| GitHub request path | The UI already uses bearer sessions. | `scripts/git_operation_request.py` and a `workflow_dispatch` workflow call that same API for preview, import/SVN-commit status, and import cancel. | Push-triggered refresh, webhooks, and live secrets. |
+| Branch protection | Repository rules were not changed by the reliability work. | A recommendation that would block non-fast-forward updates and deletion of paired refs, without blocking fast-forward sync. | Applying a ruleset requires a separate admin decision. |
+| Local hooks | Not installed by RepoSync in this tree. | Limitations are documented. No clone is modified. | A guarded installer that preserves an existing hook chain. |
+| Reconciliation | Imports and SVN commits can remain in `reconciliation_required`. | Status prints that lifecycle and says not to force-push, delete the ref, edit SQLite, or run an independent `svn merge`. | Automatic recovery is not claimed. |
+| SVN merge versus lineage | A normal SVN merge adds a revision. Deleting and recreating a branch, or replacing repository history, is a different identity event. | Restated below as current guidance, not as a new merge implementation. | Content and mergeinfo coverage still needs explicit tests. |
+
+Local evidence for the client is `python3 scripts/test_git_operation_request.py` (loopback HTTP only). The workflow file is not authorized to receive a production token. Exact host support for GitHub-hosted versus self-hosted enterprise runners is the reachability note in [Git-centric workflows](git-workflows.md): the runner must reach the RepoSync API over HTTPS, and this slice did not run that workflow with live secrets.
+
 **Prepared for:** Chris and the RepoSync team  
 **Date:** September 23, 2026  
 **Tracking:** [Reliability epic #61](https://github.com/chriscase/RepoSync/issues/61)  
@@ -87,11 +104,11 @@ A true replacement/re-anchor is a distinct operation. Its design must retain the
 
 ### Could GitHub Actions keep us in Git rather than visiting RepoSync?
 
-Yes—as an interface to RepoSync's safe operations. A proposed first version is a manually requested workflow that asks RepoSync to preview and execute a pair refresh, then reports its operation status. This is a plan, not an endpoint or workflow that is already available.
+Yes—as a client of RepoSync's API, not as a second sync engine. The manual client and `workflow_dispatch` workflow now request a pair-refresh preview, and they read status or cancel durable import and SVN-commit operations that already exist. Refresh execution is still `refresh_execute_not_implemented`. The workflow does not run on push. See the October 2026 status section and [Git-centric workflows](git-workflows.md).
 
 GitHub supports event-driven and manually dispatched workflows. A workflow responding to a push is not a pre-receive barrier: it cannot prevent the push that triggered it. [GitHub workflow events][actions]
 
-The workflow should not independently run SVN merges, edit RepoSync's database, or force-push a branch. That would create a second coordinator with different locks and recovery behavior. Requests must use the same authenticated operation service as the UI, with scoped credentials and pinned inputs. Automatic refresh can be considered after manual execution is qualified. See [#71](https://github.com/chriscase/RepoSync/issues/71).
+The workflow must not independently run SVN merges, edit RepoSync's database, or force-push a branch. That would create a second coordinator with different locks and recovery behavior. Requests use the same authenticated API as the UI, with the token kept in an environment secret and with pinned inputs. Automatic refresh stays disabled until manual execution exists and is qualified. See [#71](https://github.com/chriscase/RepoSync/issues/71).
 
 ### What happens when somebody “rebases” from the SVN side?
 
@@ -99,13 +116,15 @@ An ordinary SVN update-from-parent workflow is a **merge followed by a new commi
 
 The content and merge-property cases need explicit RepoSync tests; we are not claiming that today's implementation handles every variation correctly. Git/SVN graphs do not have to look identical, but their mapped content and provenance must agree.
 
-Deleting and recreating the SVN branch path, copying a different source into its place, or administratively replacing repository history are different situations. The plan treats those as identity/lineage changes requiring validation or reconciliation—not as an ordinary batch of new revisions.
+A normal SVN merge **appends** revisions. The earlier revisions stay in the repository, and the merge commit (or the merge revision) is a new point in history. Revision numbers increasing is expected.
+
+Deleting and recreating the SVN branch path, copying a different source into its place, or administratively replacing repository history are a separate lineage event. They are not an ordinary batch of new revisions, and they are not what "update pair from parent" means. Re-anchor remains `reanchor_not_implemented`. The current guidance is to stop and reconcile, not to treat the replacement as the next fast-forward.
 
 ### Can hooks prevent rebase on paired branches?
 
 A local **`pre-rebase` hook** can reject the local rebase command. A **`pre-push` hook** can check publication. These are useful guardrails, but users can remove or bypass local hooks; they are not a complete enforcement boundary. Server-side update/pre-receive hooks can reject updates only where the hosting service supports and authorizes them. [Git hooks][hooks]
 
-For GitHub-managed paired branches, configure appropriate protection/rules to disallow unauthorized force pushes and deletion, while preserving allowed ordinary sync operations. Actual protection depends on the host, permissions, and bypass settings. No live branch settings have been changed as part of this planning work. [GitHub protected branches][protection]
+For GitHub-managed paired branches, the recommendation is to disallow unauthorized force pushes and deletion while still allowing ordinary fast-forward sync. That recommendation is written in [Git-centric workflows](git-workflows.md). Actual protection depends on the host, permissions, and bypass settings. No live branch settings or bypasses have been changed. [GitHub protected branches][protection]
 
 RepoSync's own ancestry validation remains necessary even with hooks and branch protection. Until the new behavior is qualified, avoid rewriting already-published paired history. An already-desynchronized pair should be investigated with its old/new tips and mappings preserved—not “repaired” by blind checkpoint edits or full reset.
 
