@@ -125,33 +125,30 @@ pub async fn reconcile_held_external_writes(
                 .filter(|path| path.join(".git").exists())
                 .and_then(|path| GitClient::new(path).ok());
             match git_client.as_ref() {
-                Some(git) => match git_push::apply_git_push_reconciliation(
-                    db,
-                    &repo.id,
-                    &op.id,
-                    git,
-                ) {
-                    Ok(reconciled) => {
-                        result.attempts.push(AutoReconcileAttempt {
-                            kind: HeldExternalWriteKind::SvnToGitPush,
-                            operation_id: op.id,
-                            finalized: reconciled.finalized,
-                            resume_authorized: reconciled.resume_authorized,
-                            skipped: false,
-                            skip_reason: None,
-                        });
+                Some(git) => {
+                    match git_push::apply_git_push_reconciliation(db, &repo.id, &op.id, git) {
+                        Ok(reconciled) => {
+                            result.attempts.push(AutoReconcileAttempt {
+                                kind: HeldExternalWriteKind::SvnToGitPush,
+                                operation_id: op.id,
+                                finalized: reconciled.finalized,
+                                resume_authorized: reconciled.resume_authorized,
+                                skipped: false,
+                                skip_reason: None,
+                            });
+                        }
+                        Err(error) => {
+                            result.attempts.push(AutoReconcileAttempt {
+                                kind: HeldExternalWriteKind::SvnToGitPush,
+                                operation_id: op.id,
+                                finalized: false,
+                                resume_authorized: false,
+                                skipped: true,
+                                skip_reason: Some(error.to_string()),
+                            });
+                        }
                     }
-                    Err(error) => {
-                        result.attempts.push(AutoReconcileAttempt {
-                            kind: HeldExternalWriteKind::SvnToGitPush,
-                            operation_id: op.id,
-                            finalized: false,
-                            resume_authorized: false,
-                            skipped: true,
-                            skip_reason: Some(error.to_string()),
-                        });
-                    }
-                },
+                }
                 None => {
                     result.attempts.push(AutoReconcileAttempt {
                         kind: HeldExternalWriteKind::SvnToGitPush,

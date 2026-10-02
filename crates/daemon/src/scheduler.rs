@@ -1248,7 +1248,9 @@ mod cancellation_tests {
 
         let audit = scheduler.db.list_audit_log(20, 0).unwrap();
         assert!(
-            !audit.iter().any(|entry| entry.action.starts_with("auto_reconcile")),
+            !audit
+                .iter()
+                .any(|entry| entry.action.starts_with("auto_reconcile")),
             "busy writer must defer auto-reconcile until the slot is free"
         );
         drop(guard);

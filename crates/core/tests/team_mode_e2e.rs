@@ -6534,7 +6534,9 @@ async fn candidate_rsc04_restart_held_until_reconcile() {
     );
 }
 
-async fn auto_reconcile_fixture(fixture: &QualifiedPair) -> reposync_core::auto_reconcile::AutoReconcileResult {
+async fn auto_reconcile_fixture(
+    fixture: &QualifiedPair,
+) -> reposync_core::auto_reconcile::AutoReconcileResult {
     let repo = fixture
         .engine
         .db()
@@ -6638,7 +6640,10 @@ async fn candidate_64d_svn_commit_lost_reply_auto_finalizes_without_second_commi
         git_to_svn_mappings(fixture.engine.db(), repo_id),
         mappings_before + 1
     );
-    assert_eq!(fixture.engine.db().get_repo_watermark(repo_id).unwrap().1, sha);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap().1,
+        sha
+    );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
