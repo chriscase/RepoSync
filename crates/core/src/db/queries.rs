@@ -1108,7 +1108,7 @@ impl Database {
 
     /// Advance ALL watermark locations atomically for a given repo.
     /// Updates repositories table, per-repo kv_state, and global kv_state.
-    /// Used by "skip commit" and path validation to move past a failing commit.
+    /// Admin `POST .../skip-commit` no longer calls this (live HEAD adoption is refused).
     pub fn advance_all_watermarks(
         &self,
         repo_id: &str,

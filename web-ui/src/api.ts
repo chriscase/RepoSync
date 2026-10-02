@@ -481,6 +481,7 @@ export const api = {
   triggerRepoSync: (id: string) =>
     fetchJson<{ ok: boolean }>(`/repos/${id}/sync`, { method: 'POST' }),
 
+  /** POST skip-commit is refused (409 skip_commit_disabled) until exact skip disposition exists. */
   skipCommit: (repoId: string) =>
     fetchJson<{ ok: boolean; message: string; old_sha: string; new_sha: string }>(
       `/repos/${repoId}/skip-commit`, { method: 'POST' }

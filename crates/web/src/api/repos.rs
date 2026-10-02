@@ -3175,8 +3175,11 @@ async fn test_repo_git(
 }
 
 // ---------------------------------------------------------------------------
-// Skip Commit — advance watermark past a stuck commit
+// Skip Commit — refuse live-HEAD adoption until exact skip disposition exists
 // ---------------------------------------------------------------------------
+
+/// Stable reason code for the disabled skip-to-HEAD shortcut (Astra RS-C04).
+const SKIP_COMMIT_DISABLED: &str = "skip_commit_disabled";
 
 async fn skip_commit(
     State(state): State<Arc<AppState>>,
@@ -3193,68 +3196,22 @@ async fn skip_commit(
     }
 
     let db = &state.db;
-    reject_held_import(db, &id)?;
-    let repo = db
+    let _repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
-    // Get HEAD SHA of the git branch to skip to
-    let git_token = db
-        .resolve_credential_chain(&id, "secret_git_token")
-        .unwrap_or_default();
-    let provider = match repo.git_provider.as_str() {
-        "gitea" => reposync_core::config::GitProvider::Gitea,
-        _ => reposync_core::config::GitProvider::GitHub,
-    };
-    let github_client =
-        reposync_core::git::github::GitHubClient::new(&repo.git_api_url, &git_token, provider);
-    let head_sha = github_client
-        .get_branch_sha(&repo.git_repo, &repo.git_branch)
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to get branch HEAD: {}", e)))?;
-
-    let old_sha = repo.last_git_sha.clone();
-
-    // Advance all watermarks atomically
-    db.advance_all_watermarks(&id, &head_sha)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
-    // Reset circuit breaker state
-    let _ = db.reset_consecutive_errors(&id);
-    let _ = db.conn().execute(
-        "UPDATE repositories SET sync_status = 'idle' WHERE id = ?1",
-        rusqlite::params![&id],
-    );
-
-    let _ = db.insert_audit_log_with_repo(AuditLogInput {
-        action: "skip_commit",
-        direction: None,
-        svn_rev: None,
-        git_sha: Some(&head_sha),
-        author: None,
-        details: Some(&format!(
-            "Skipped from {} to HEAD {}",
-            &old_sha[..8.min(old_sha.len())],
-            &head_sha[..8.min(head_sha.len())]
-        )),
-        success: true,
-        repo_id: Some(&id),
-    });
-
-    info!(
+    // Interim containment (#66 / RS-C04): do not fetch live HEAD, do not
+    // advance watermarks/checkpoints, and do not write Git or SVN.
+    warn!(
         repo_id = %id,
-        old_sha = %&old_sha[..8.min(old_sha.len())],
-        new_sha = %&head_sha[..8.min(head_sha.len())],
-        "skipped commit: watermark advanced to HEAD"
+        reason = SKIP_COMMIT_DISABLED,
+        "skip-commit refused: live HEAD adoption is disabled pending exact skip disposition"
     );
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "message": "Watermark advanced to HEAD",
-        "old_sha": old_sha,
-        "new_sha": head_sha,
-    })))
+    Err(AppError::Conflict(
+        "skip_commit_disabled: live HEAD adoption is refused until exact per-commit skip disposition exists; pending work is preserved"
+            .into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
