@@ -1153,6 +1153,60 @@ impl Database {
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
+    /// Advance the Git handled frontier for an exact skip and persist exclusion
+    /// receipts for each selected commit. Does not adopt live HEAD.
+    pub fn advance_exact_skip_watermarks(
+        &self,
+        repo_id: &str,
+        frontier_sha: &str,
+        excluded_commits: &[String],
+        reason: &str,
+    ) -> Result<(), DatabaseError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        tx.execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
+            params![frontier_sha, repo_id],
+        )?;
+
+        let kv_key = format!("last_git_sha_{}", repo_id);
+        tx.execute(
+            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            params![kv_key, frontier_sha, now],
+        )?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
+            params![frontier_sha, now],
+        )?;
+
+        for sha in excluded_commits {
+            let receipt = serde_json::json!({
+                "version": crate::skip_commit::EXCLUSION_RECEIPT_VERSION,
+                "repo_id": repo_id,
+                "git_sha": sha,
+                "reason": reason,
+                "frontier_sha": frontier_sha,
+            });
+            let key = crate::skip_commit::exclusion_receipt_key(repo_id, sha);
+            tx.execute(
+                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                params![key, receipt.to_string(), now],
+            )?;
+        }
+
+        tx.commit()?;
+        info!(
+            repo_id,
+            frontier_sha,
+            excluded = excluded_commits.len(),
+            "advanced Git frontier for exact skip"
+        );
+        Ok(())
+    }
+
     fn advance_git_watermarks(
         &self,
         repo_id: &str,

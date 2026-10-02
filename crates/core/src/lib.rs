@@ -27,6 +27,7 @@ pub mod path_projection;
 pub mod personal_config;
 pub mod process;
 pub mod snapshot;
+pub mod skip_commit;
 pub mod svn;
 pub mod svn_commit;
 pub mod sync_engine;

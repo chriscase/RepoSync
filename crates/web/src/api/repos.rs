@@ -31,6 +31,9 @@ use reposync_core::pair_refresh::{
     format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
     RefreshObservations, RefreshOperation,
 };
+use reposync_core::skip_commit::{
+    build_skip_context, execute_exact_skip, reason as skip_reason, SkipCommitRequest,
+};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
@@ -282,6 +285,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id/test-svn", post(test_repo_svn))
         .route("/api/repos/:id/test-git", post(test_repo_git))
         .route("/api/repos/:id/skip-commit", post(skip_commit))
+        .route("/api/repos/:id/skip-commit/context", get(skip_commit_context))
         .route("/api/repos/:id/retry", post(retry_repo))
         .route("/api/repos/:id/hooks/pre-commit", get(get_pre_commit_hook))
 }
@@ -3175,13 +3179,70 @@ async fn test_repo_git(
 }
 
 // ---------------------------------------------------------------------------
-// Skip Commit — refuse live-HEAD adoption until exact skip disposition exists
+// Skip Commit — exact per-commit disposition (#66 / RS-C04)
 // ---------------------------------------------------------------------------
 
-/// Stable reason code for the disabled skip-to-HEAD shortcut (Astra RS-C04).
-const SKIP_COMMIT_DISABLED: &str = "skip_commit_disabled";
+fn repo_git_workdir(state: &AppState, repo_id: &str) -> std::path::PathBuf {
+    state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(repo_id)
+        .join("git-repo")
+}
 
-async fn skip_commit(
+fn workdir_ready(path: &std::path::Path) -> bool {
+    path.join(".git").exists() || path.join("HEAD").exists()
+}
+
+async fn observed_remote_tip(
+    repo: &reposync_core::models::Repository,
+    db: &Database,
+    workdir: Option<&std::path::Path>,
+) -> Result<Option<String>, AppError> {
+    let git_token = db
+        .resolve_credential_chain(&repo.id, "secret_git_token")
+        .unwrap_or_default();
+    let provider = match repo.git_provider.as_str() {
+        "gitea" => reposync_core::config::GitProvider::Gitea,
+        _ => reposync_core::config::GitProvider::GitHub,
+    };
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        &repo.git_api_url,
+        &git_token,
+        provider,
+    );
+    match github_client
+        .get_branch_sha(&repo.git_repo, &repo.git_branch)
+        .await
+    {
+        Ok(sha) => Ok(Some(sha)),
+        Err(e) => {
+            warn!(
+                repo_id = %repo.id,
+                error = %e,
+                "could not fetch remote tip for skip-commit; falling back to local workdir"
+            );
+            if let Some(workdir) = workdir {
+                if workdir_ready(workdir) {
+                    return reposync_core::skip_commit::git_success(workdir, &["rev-parse", "HEAD"])
+                        .map(|output| {
+                            Some(
+                                String::from_utf8_lossy(&output.stdout)
+                                    .trim()
+                                    .to_ascii_lowercase(),
+                            )
+                        })
+                        .map_err(|refuse| AppError::Conflict(refuse.message()));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
+async fn skip_commit_context(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
@@ -3196,22 +3257,133 @@ async fn skip_commit(
     }
 
     let db = &state.db;
-    let _repo = db
+    let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
-    // Interim containment (#66 / RS-C04): do not fetch live HEAD, do not
-    // advance watermarks/checkpoints, and do not write Git or SVN.
-    warn!(
-        repo_id = %id,
-        reason = SKIP_COMMIT_DISABLED,
-        "skip-commit refused: live HEAD adoption is disabled pending exact skip disposition"
+    let workdir = repo_git_workdir(&state, &id);
+    if !workdir_ready(&workdir) {
+        return Err(AppError::Conflict(
+            format!(
+                "{}: local Git workdir is unavailable for exact skip planning",
+                skip_reason::WORKDIR_UNAVAILABLE
+            ),
+        ));
+    }
+
+    let remote_tip = observed_remote_tip(&repo, db, Some(&workdir)).await?;
+    let context = build_skip_context(db, &id, &workdir, remote_tip.as_deref()).map_err(|refuse| {
+        AppError::Conflict(refuse.message())
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "context": context })))
+}
+
+async fn skip_commit(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<SkipCommitRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let db = &state.db;
+    reject_held_import(db, &id)?;
+    let repo = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+
+    let workdir = repo_git_workdir(&state, &id);
+    if !workdir_ready(&workdir) {
+        return Err(AppError::Conflict(
+            format!(
+                "{}: local Git workdir is unavailable; exact skip requires proven ancestry",
+                skip_reason::WORKDIR_UNAVAILABLE
+            ),
+        ));
+    }
+
+    let remote_tip = observed_remote_tip(&repo, db, Some(&workdir))
+        .await?
+        .ok_or_else(|| {
+            AppError::Conflict(format!(
+                "{}: remote tip could not be observed for exact skip",
+                skip_reason::TIP_MISMATCH
+            ))
+        })?;
+
+    let bridge_tip = reposync_core::skip_commit::git_success(&workdir, &["rev-parse", "HEAD"])
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .ok();
+
+    let outcome = execute_exact_skip(
+        db,
+        &id,
+        &workdir,
+        &remote_tip,
+        bridge_tip.as_deref(),
+        &body,
+    )
+    .map_err(|refuse| AppError::Conflict(refuse.message()))?;
+
+    let _ = db.reset_consecutive_errors(&id);
+    let _ = db.conn().execute(
+        "UPDATE repositories SET sync_status = 'idle' WHERE id = ?1",
+        rusqlite::params![&id],
     );
-    Err(AppError::Conflict(
-        "skip_commit_disabled: live HEAD adoption is refused until exact per-commit skip disposition exists; pending work is preserved"
-            .into(),
-    ))
+
+    let excluded_summary = outcome
+        .excluded_commits
+        .iter()
+        .map(|sha| sha.chars().take(8).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = db.insert_audit_log_with_repo(AuditLogInput {
+        action: "skip_commit",
+        direction: Some("git_to_svn"),
+        svn_rev: None,
+        git_sha: Some(&outcome.new_cursor),
+        author: None,
+        details: Some(&format!(
+            "Exact skip from {} to {} excluded [{}]; {} pending commit(s) remain",
+            &outcome.old_cursor[..8.min(outcome.old_cursor.len())],
+            &outcome.new_cursor[..8.min(outcome.new_cursor.len())],
+            excluded_summary,
+            outcome.remaining_pending.len()
+        )),
+        success: true,
+        repo_id: Some(&id),
+    });
+
+    info!(
+        repo_id = %id,
+        old_cursor = %outcome.old_cursor,
+        new_cursor = %outcome.new_cursor,
+        excluded = outcome.excluded_commits.len(),
+        remaining_pending = outcome.remaining_pending.len(),
+        "exact skip-commit accepted"
+    );
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "Selected commits excluded; frontier advanced without adopting live HEAD",
+        "old_sha": outcome.old_cursor,
+        "new_sha": outcome.new_cursor,
+        "excluded_commits": outcome.excluded_commits,
+        "remaining_pending": outcome.remaining_pending,
+    })))
 }
 
 // ---------------------------------------------------------------------------
