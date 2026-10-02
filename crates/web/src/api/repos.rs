@@ -16,6 +16,7 @@ use reposync_core::db::import_operations::{
     import_target_fingerprint, ImportOperation, ImportOperationState, SnapshotPin,
 };
 use reposync_core::db::queries::AuditLogInput;
+use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::errors::DatabaseError;
@@ -271,6 +272,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route(
             "/api/repos/:id/svn-commit/:operation_id/reconcile",
             post(reconcile_svn_commit),
+        )
+        .route(
+            "/api/repos/:id/git-push/:operation_id",
+            get(git_push_status),
+        )
+        .route(
+            "/api/repos/:id/git-push/:operation_id/reconcile",
+            post(reconcile_git_push),
         )
         .route(
             "/api/repos/:id/import/cancel",
@@ -2027,6 +2036,145 @@ async fn svn_commit_status(
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("git-to-svn commit operation not found".into()))?;
     Ok(Json(svn_commit_status_json(&op)))
+}
+
+fn git_push_status_json(
+    op: &reposync_core::db::git_push_operations::GitPushOperation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "operation_id": op.id,
+        "lifecycle": op.state,
+        "operation_type": op.operation_type,
+        "source_svn_rev": op.source_svn_rev,
+        "pre_push_git_remote": op.pre_push_git_remote,
+        "pre_push_git_branch": op.pre_push_git_branch,
+        "pre_push_git_sha": op.pre_push_git_sha,
+        "pre_push_git_tree": op.pre_push_git_tree,
+        "intended_local_git_sha": op.intended_local_git_sha,
+        "intended_local_git_parent": op.intended_local_git_parent,
+        "intended_local_git_tree": op.intended_local_git_tree,
+        "last_confirmed_git_sha": op.last_confirmed_git_sha,
+        "last_confirmed_git_tree": op.last_confirmed_git_tree,
+        "resume_authorized": op.resume_authorized,
+        "outcome_detail": op.outcome_detail,
+    })
+}
+
+async fn git_push_status(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, operation_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+    state
+        .db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    let op = state
+        .db
+        .get_git_push_operation(&id, &operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("svn-to-git push operation not found".into()))?;
+    Ok(Json(git_push_status_json(&op)))
+}
+
+async fn reconcile_git_push(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, operation_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+    let mut busy_guard = None;
+    for _ in 0..100 {
+        busy_guard = reposync_core::busy::try_acquire(&id);
+        if busy_guard.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _busy_guard = busy_guard.ok_or_else(|| {
+        AppError::BadRequest("repository is busy; retry remote verification later".into())
+    })?;
+
+    let db = &state.db;
+    let requested = db
+        .get_git_push_operation(&id, &operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("svn-to-git push operation not found".into()))?;
+    if requested.state == GitPushOperationState::Completed
+        && db
+            .active_git_push_operation(&id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .is_none()
+    {
+        return Ok(Json(serde_json::json!({
+            "operation_id": requested.id,
+            "previous_lifecycle": requested.state,
+            "lifecycle": requested.state,
+            "publication_proved": true,
+            "checkpoint_completed": true,
+            "may_resume": false,
+            "remaining_reason": requested.outcome_detail,
+        })));
+    }
+
+    let workdir = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(&id)
+        .join("git-repo");
+    let git = GitClient::new(&workdir)
+        .map_err(|e| AppError::Internal(format!("git workdir unavailable: {e}")))?;
+    let reconciled = reposync_core::git_push::apply_git_push_reconciliation(
+        db,
+        &id,
+        &operation_id,
+        &git,
+    )
+    .map_err(import_write_error)?;
+    Ok(Json(serde_json::json!({
+        "operation_id": requested.id,
+        "previous_lifecycle": requested.state,
+        "lifecycle": reconciled.operation.state,
+        "recorded_intended_git_sha": requested.intended_local_git_sha,
+        "recorded_pre_push_git_sha": requested.pre_push_git_sha,
+        "observed": match &reconciled.inspect {
+            reposync_core::git_push::GitPushInspect::UniqueMatch { git_sha, git_tree } => {
+                serde_json::json!({"kind":"unique_match","git_sha":git_sha,"git_tree":git_tree})
+            }
+            reposync_core::git_push::GitPushInspect::AbsentUnchanged => {
+                serde_json::json!({"kind":"absent_unchanged"})
+            }
+            reposync_core::git_push::GitPushInspect::Conflict { reason } => {
+                serde_json::json!({"kind":"conflict","reason":reason})
+            }
+            reposync_core::git_push::GitPushInspect::Unavailable { reason } => {
+                serde_json::json!({"kind":"unavailable","reason":reason})
+            }
+        },
+        "publication_proved": reconciled.finalized,
+        "checkpoint_completed": reconciled.finalized,
+        "may_resume": reconciled.resume_authorized,
+        "remaining_reason": reconciled.operation.outcome_detail,
+        "resume_authorized": reconciled.operation.resume_authorized,
+    })))
 }
 
 async fn reconcile_svn_commit(
