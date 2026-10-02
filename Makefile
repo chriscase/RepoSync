@@ -73,9 +73,12 @@ validate-soak:
 validate-soak-dry-run:
 	scripts/enterprise-soak.sh --dry-run
 
+# Contacts the endpoints named by GHE_* and SVN_*. Not a local check.
+# Requires Chris/admin approval of an allowlisted disposable target.
 validate-ghe-live:
 	scripts/ghe-live-validation.sh --cycles 1
 
+# Local tool preflight only. Not enterprise qualification.
 validate-ghe-live-dry-run:
 	scripts/ghe-live-validation.sh --dry-run
 

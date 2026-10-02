@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
-# RepoSync Enterprise Soak/Canary Validation Script
+# RepoSync local soak (file:// only) — not enterprise qualification
 # ============================================================================
-# Non-interactive, CI-safe repeated-cycle soak test for enterprise readiness.
-# Runs configurable sync cycles against local SVN+Git repos with synthetic
-# change injection, health snapshots, and go/no-go gating.
+# Repeated-cycle stability test against a temporary local file:// SVN repo
+# and the log-probe subsystem. It does not contact GitHub Enterprise or a
+# network SVN server.
+#
+# QUALIFICATION-TIER: local-file-engine
+# Enterprise qualification: NOT RUN
+# local/offline PASS is not enterprise/live PASS.
 #
 # Usage:
 #   scripts/enterprise-soak.sh                              # default (5 cycles)
@@ -13,7 +17,8 @@
 #   scripts/enterprise-soak.sh --help
 #
 # Output: artifacts/enterprise-soak/<UTC_TIMESTAMP>/
-# Exit code: 0 = all cycles healthy (go), non-zero = failures detected (no-go)
+# Exit code: 0 = local error rate within threshold.
+# Exit code 0 is not a GO for GitHub Enterprise, live SVN, or production.
 # ============================================================================
 
 set -euo pipefail
@@ -50,8 +55,10 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo "  --cycles N         Number of soak cycles (default: 5)"
             echo "  --interval N       Seconds between cycles (default: 2)"
-            echo "  --dry-run          Run preflight only, skip soak cycles"
-            echo "  --max-error-rate F Failure fraction threshold for no-go (default: 0.2)"
+            echo "  --dry-run          Local preflight only, skip soak cycles"
+            echo "                     Not enterprise qualification"
+            echo "  --max-error-rate F Local failure-fraction threshold (default: 0.2)"
+            echo "                     Not an enterprise GO line"
             echo "  --help             Show this help"
             exit 0
             ;;
@@ -96,7 +103,9 @@ trap cleanup EXIT
 # Preflight checks
 # ============================================================================
 log "═══════════════════════════════════════════════════════════════"
-log "RepoSync Enterprise Soak Validation"
+log "RepoSync local soak (file:// only)"
+log "Qualification tier: local-file-engine"
+log "Enterprise qualification: NOT RUN"
 log "Timestamp: $TIMESTAMP"
 log "Cycles: $CYCLES | Interval: ${INTERVAL_SEC}s | Dry-run: $DRY_RUN"
 log "Max error rate: $MAX_ERROR_RATE"
@@ -154,9 +163,13 @@ if $DRY_RUN; then
 # Enterprise Soak Summary (Dry Run)
 
 **Timestamp:** $TIMESTAMP
+**Tier:** local-file-engine
 **Mode:** dry-run (preflight only)
-**Overall:** PASS — preflight checks passed
+**Enterprise qualification:** NOT RUN
+**Overall:** LOCAL-ONLY PREFLIGHT — not an enterprise or live GO
 **Cycles planned:** $CYCLES (not executed)
+
+local/offline PASS is not enterprise/live PASS.
 
 ## Preflight
 
@@ -166,10 +179,19 @@ if $DRY_RUN; then
 
 ## Go/No-Go
 
-**DRY RUN** — execute without --dry-run for soak results.
+**NOT ENTERPRISE QUALIFICATION.** This dry-run did not execute soak cycles and did not contact GitHub Enterprise or SVN. Do not record it as a candidate GO. Chris decides live acceptance.
 SUMMARY
 
-    echo '{"timestamp":"'"$TIMESTAMP"'","overall":"DRY_RUN","cycles_planned":'"$CYCLES"',"cycles_run":0}' > "$MANIFEST_FILE"
+    cat > "$MANIFEST_FILE" <<MANIFEST
+{
+  "timestamp": "$TIMESTAMP",
+  "decision": "LOCAL_ONLY_PREFLIGHT",
+  "qualification_tier": "local-file-engine",
+  "enterprise_qualification": "NOT RUN",
+  "cycles_planned": $CYCLES,
+  "cycles_run": 0
+}
+MANIFEST
     log "Artifacts: $ARTIFACT_DIR"
     exit 0
 fi
@@ -322,15 +344,31 @@ log "  Cycles: $CYCLES | Pass: $CYCLE_PASS | Fail: $CYCLE_FAIL"
 TOTAL=$CYCLES
 if [[ $TOTAL -eq 0 ]]; then
     ERROR_RATE="0.0"
-    GO_DECISION="GO"
+    RATE_GATE="WITHIN THRESHOLD"
 else
     # Use awk for floating-point division.
     ERROR_RATE=$(awk "BEGIN {printf \"%.3f\", $CYCLE_FAIL / $TOTAL}")
-    GO_DECISION=$(awk "BEGIN {print ($CYCLE_FAIL / $TOTAL <= $MAX_ERROR_RATE) ? \"GO\" : \"NO-GO\"}")
+    RATE_GATE=$(awk "BEGIN {print ($CYCLE_FAIL / $TOTAL <= $MAX_ERROR_RATE) ? \"WITHIN THRESHOLD\" : \"EXCEEDED\"}")
+fi
+
+if [[ $CYCLE_FAIL -eq 0 ]]; then
+    DATA_INTEGRITY="CLEAN"
+else
+    DATA_INTEGRITY="FAILURES PRESENT"
+fi
+
+if [[ "$RATE_GATE" == "EXCEEDED" ]]; then
+    LOCAL_DECISION="LOCAL_ONLY_NO_GO"
+else
+    LOCAL_DECISION="LOCAL_ONLY"
 fi
 
 log "  Error rate: $ERROR_RATE (threshold: $MAX_ERROR_RATE)"
-log "  Decision: $GO_DECISION"
+log "  Local error-rate gate: $RATE_GATE"
+log "  Local data integrity: $DATA_INTEGRITY"
+log "  Local decision: $LOCAL_DECISION"
+log "  Enterprise qualification: NOT RUN"
+log "  local/offline PASS is not enterprise/live PASS"
 log "═══════════════════════════════════════════════════════════════"
 
 # ============================================================================
@@ -347,7 +385,7 @@ fi
 # Generate summary and manifest
 # ============================================================================
 EXIT_CODE=0
-if [[ "$GO_DECISION" == "NO-GO" ]]; then
+if [[ "$LOCAL_DECISION" == "LOCAL_ONLY_NO_GO" ]]; then
     EXIT_CODE=1
 fi
 
@@ -355,27 +393,34 @@ cat > "$SUMMARY_FILE" <<SUMMARY
 # Enterprise Soak Validation Summary
 
 **Timestamp:** $TIMESTAMP
-**Decision:** $GO_DECISION
+**Tier:** local-file-engine
+**Local decision:** $LOCAL_DECISION
+**Enterprise qualification:** NOT RUN
 **Cycles:** $TOTAL | **Pass:** $CYCLE_PASS | **Fail:** $CYCLE_FAIL
 **Error rate:** $ERROR_RATE (threshold: $MAX_ERROR_RATE)
+**Local error-rate gate:** $RATE_GATE
+**Local data integrity:** $DATA_INTEGRITY
 **Interval:** ${INTERVAL_SEC}s between cycles
 **Secret leak scan:** $(if $LEAK_FOUND; then echo "⚠ TOKENS DETECTED"; else echo "✅ Clean"; fi)
 
-## Go/No-Go Checklist
+local/offline PASS is not enterprise/live PASS.
 
-- [$(if [[ $CYCLE_FAIL -eq 0 ]]; then echo "x"; else echo " "; fi)] All soak cycles passed
+This artifact is a local file:// soak. It is not a GO for disposable enterprise or active-production acceptance. Exit status follows only the local error-rate threshold. Any cycle failure is a data-integrity problem and is NO-GO for enterprise qualification even when this script exits 0. Chris decides live acceptance.
+
+## Local checklist
+
+- [$(if [[ $CYCLE_FAIL -eq 0 ]]; then echo "x"; else echo " "; fi)] All local soak cycles passed
 - [x] Health snapshots captured for each cycle
 - [$(if ! $LEAK_FOUND; then echo "x"; else echo " "; fi)] No secret leakage in artifacts
 - [x] Event timeline (events.ndjson) complete
-- [$(if [[ "$GO_DECISION" == "GO" ]]; then echo "x"; else echo " "; fi)] Error rate within threshold
+- [$(if [[ "$RATE_GATE" == "WITHIN THRESHOLD" ]]; then echo "x"; else echo " "; fi)] Local error rate within threshold
+- [ ] Enterprise qualification (NOT RUN — this script cannot check it)
 
-## Rollback Procedure
+## Rollback
 
-If issues are found post-enablement:
-1. Stop the reposync daemon: \`reposync-personal stop\`
-2. Review \`{data_dir}/personal.log\` and audit DB for last known-good state
-3. Reset watermarks if needed: \`sqlite3 personal.db "UPDATE watermarks SET value='<rev>' WHERE key='svn_rev'"\`
-4. Restart with previous known-good config
+Stop the writer and reconcile or roll forward under #63/#64.
+Do not blind-reset a watermark and do not restore an old database after new Git or SVN writes.
+See docs/enterprise-soak-runbook.md.
 
 ## Artifact Directory
 
@@ -395,7 +440,11 @@ MANIFEST_ENTRIES="${MANIFEST_ENTRIES%,}"
 cat > "$MANIFEST_FILE" <<MANIFEST
 {
   "timestamp": "$TIMESTAMP",
-  "decision": "$GO_DECISION",
+  "decision": "$LOCAL_DECISION",
+  "qualification_tier": "local-file-engine",
+  "enterprise_qualification": "NOT RUN",
+  "local_error_rate_gate": "$RATE_GATE",
+  "local_data_integrity": "$DATA_INTEGRITY",
   "cycles_total": $TOTAL,
   "cycles_pass": $CYCLE_PASS,
   "cycles_fail": $CYCLE_FAIL,

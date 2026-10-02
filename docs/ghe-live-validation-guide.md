@@ -1,6 +1,10 @@
 # GHE Live Validation Guide
 
-Real end-to-end bidirectional validation of RepoSync against a live GitHub Enterprise instance and a live SVN repository. Unlike `controlled-validation.sh` (which uses local `file://` SVN repos), this script exercises the **actual network path** your daemon will use in production.
+Real end-to-end bidirectional validation of RepoSync against a live GitHub Enterprise instance and a live SVN repository. Unlike `controlled-validation.sh` (which uses local `file://` SVN repos), a **non-dry-run** invocation exercises the network path named by the environment. That path is tier 3 or tier 4 in [`docs/enterprise-soak-runbook.md`](enterprise-soak-runbook.md), not a local soak.
+
+This guide is not approval to run it. Tier 3 needs Chris/admin approval, an explicit allowlist, and dedicated credentials on a disposable target. Tier 4 (active production) is Chris's decision. Agents do not self-authorize either. `--dry-run` never calls GitHub Enterprise or SVN, even if credentials are present, and it is not enterprise qualification.
+
+local/offline PASS is not enterprise/live PASS. Record any real run in [`docs/reliability/candidate-report-template.md`](reliability/candidate-report-template.md) at the exact candidate SHA. Do not combine this script's result with `enterprise-soak.sh` or offline self-tests into one green.
 
 ## Prerequisites
 
@@ -39,10 +43,13 @@ All tools must be on `$PATH`.
 ## Quick Start
 
 ```bash
-# 1. Preflight only (no live API calls, no env vars needed)
+# 1. Local preflight only (no live API calls, credentials ignored).
+#    Not enterprise qualification.
 scripts/ghe-live-validation.sh --dry-run
 
-# 2. Export your credentials
+# 2. Live steps below contact the named endpoints.
+#    Do not run them without Chris/admin approval of an allowlisted
+#    disposable target and dedicated credentials. Not production.
 export GHE_API_URL="https://github.example.com/api/v3"
 export GHE_TOKEN="ghp_your_token_here"
 export GHE_OWNER="myorg"
@@ -114,7 +121,8 @@ Each cycle executes these scenarios in order:
 Usage: scripts/ghe-live-validation.sh [OPTIONS]
 
 Options:
-  --dry-run          Preflight checks only (no live API calls)
+  --dry-run          Local tool preflight only (no live API calls).
+                     Not enterprise qualification.
   --cycles N         Number of validation cycles (default: 1)
   --interval N       Seconds between cycles (default: 5)
   --strict           Fail immediately on any scenario failure
@@ -178,15 +186,21 @@ artifacts/ghe-live-validation/<UTC_TIMESTAMP>/
 
 ### Manual Review
 
-Before declaring production readiness, verify:
+A scenario pass on one host is not Chris's active-environment GO and does not by itself qualify a candidate SHA. Apply the go/no-go checklist in [`docs/enterprise-soak-runbook.md`](enterprise-soak-runbook.md) and file [`docs/reliability/candidate-report-template.md`](reliability/candidate-report-template.md).
 
-- [ ] All 11 scenarios PASS for every cycle
+Before anyone treats a tier 3 bundle as evidence, verify:
+
+- [ ] The run was approved, allowlisted, and aimed at a disposable target
+- [ ] The report names this exact head SHA and artifact digest
+- [ ] All 11 scenarios PASS for every cycle, in both directions where the scenario says so
+- [ ] Content and provenance match this cycle (data-integrity failures are NO-GO)
 - [ ] No secret patterns in artifact files
 - [ ] Rate limit headroom is sufficient (>100 remaining)
 - [ ] SVN commit latency is acceptable
 - [ ] GHE API response times are acceptable
 - [ ] `personal.log` output is well-formed
 - [ ] No unexpected error patterns in `events.ndjson`
+- [ ] Dry-run output was not counted as a live PASS
 
 ## Failure Triage
 
@@ -202,40 +216,26 @@ Before declaring production readiness, verify:
 
 ## Rollback Procedure
 
-If issues are found post-enablement:
+If issues are found after an approved run, follow the backup and roll-forward rules in [`docs/enterprise-soak-runbook.md`](enterprise-soak-runbook.md). After new Git or SVN writes, stop, reconcile, and roll forward under #63/#64. Do not blind-reset a watermark or checkpoint, and do not restore an older database over a daemon that has already published commits.
 
-1. **Stop the daemon immediately:**
+1. **Stop the daemon immediately** and keep production writers quiescent:
    ```bash
    reposync-personal --config <path> stop
    ```
 
-2. **Verify it stopped:**
+2. **Verify it stopped** and that a single authoritative writer is identified:
    ```bash
    reposync-personal --config <path> status
    # Should show "○ Not running"
    ```
 
-3. **Capture incident artifacts:**
+3. **Copy incident artifacts** (a copy is not a restore):
    ```bash
    cp personal.db personal.db.incident-$(date +%Y%m%d)
    cp personal.log personal.log.incident-$(date +%Y%m%d)
    ```
 
-4. **Review audit log for last known-good state:**
-   ```bash
-   sqlite3 personal.db "SELECT * FROM audit_log ORDER BY id DESC LIMIT 10;"
-   sqlite3 personal.db "SELECT * FROM watermarks;"
-   ```
-
-5. **Reset watermark if needed:**
-   ```bash
-   sqlite3 personal.db "UPDATE watermarks SET value='<last_good_rev>' WHERE key='svn_rev';"
-   ```
-
-6. **Restart with corrected config:**
-   ```bash
-   reposync-personal --config <path> start --foreground
-   ```
+4. **Reconcile** the forensic copy with the actual Git and SVN revisions that were published. Roll forward from that external state. Verify configured targets before any resume.
 
 ## CI Integration
 
@@ -254,12 +254,13 @@ Both `ci.yml` and `e2e.yml` workflows run:
 
 ## Relationship to Other Validation Scripts
 
-| Script | Scope | Network Required | Use Case |
-|--------|-------|-----------------|----------|
-| `controlled-validation.sh` | Local only | No | CI gating, pre-merge checks |
-| `enterprise-soak.sh` | Local only | No | Repeated-cycle stability testing |
-| `ghe-live-validation.sh` | Live GHE+SVN | **Yes** | Pre-production readiness gate |
-| `test-s7-provenance.sh` | Offline | No | S7 metadata matching regression test |
-| `large-file-validation.sh` | Local only | No | File-policy + LFS validation |
+| Script | Tier | Network | What a pass is |
+|--------|------|---------|----------------|
+| `controlled-validation.sh` | Local | No | Local pre-merge checks only |
+| `enterprise-soak.sh` | 1 local `file://` | No | Local cycle stability only. Enterprise qualification stays NOT RUN. |
+| `test-s7-provenance.sh` | 2 offline | No | Provenance-matcher regression only |
+| `large-file-validation.sh` | Local | No | File-policy and LFS checks only |
+| `ghe-live-validation.sh --dry-run` | Preflight | No | Tool preflight. Not enterprise qualification. |
+| `ghe-live-validation.sh` | 3 or 4 | **Yes** | Live scenarios on the named target, only after approval. Not a combined green with the rows above. |
 
-Run them in order: controlled → soak → GHE live.
+Do not run the live script as the automatic next step after a local soak. Tier 3 requires the go/no-go checklist and a candidate report. Tier 4 requires Chris.
