@@ -510,4 +510,43 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn snapshot_materialize_writer_preserves_dotfiles_and_rejects_outside_canary() {
+        use crate::db::Database;
+        use crate::import::{
+            independent_tree_manifest, verify_against_independent_manifest, ManifestEntry,
+        };
+
+        let export = tempfile::tempdir().unwrap();
+        let workdir = tempfile::tempdir().unwrap();
+        std::fs::write(export.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(export.path().join("app.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir(workdir.path().join(".git")).unwrap();
+
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let policy = FilePolicy::new(0, vec![]);
+        let stats = copy_tree_with_policy(export.path(), workdir.path(), &policy, &db).unwrap();
+        assert_eq!(stats.copied, 2);
+        let manifest = independent_tree_manifest(export.path()).unwrap();
+        verify_against_independent_manifest(workdir.path(), &manifest, &policy).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let canary = b"SNAPSHOT-OUTSIDE-CANARY-88";
+        std::fs::write(outside.path().join("secret"), canary).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), export.path().join("escape"))
+            .unwrap();
+        let poisoned = tempfile::tempdir().unwrap();
+        let err = copy_tree_with_policy(export.path(), poisoned.path(), &policy, &db).unwrap_err();
+        assert!(err.to_string().contains("unsupported symlink"), "{err}");
+        assert!(!poisoned.path().join("escape").exists());
+
+        let src_manifest = independent_tree_manifest(export.path()).unwrap();
+        assert!(matches!(
+            src_manifest.entries.get("escape"),
+            Some(ManifestEntry::Unsupported { kind, .. }) if kind == "symlink"
+        ));
+        assert!(!src_manifest.contains_file_digest_of(canary));
+    }
 }

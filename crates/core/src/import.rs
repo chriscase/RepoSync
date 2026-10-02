@@ -6,16 +6,20 @@
 //! `ImportMode::Snapshot`.
 //!
 //! Also re-exports [`copy_tree_with_policy`] so both personal-mode and
-//! team-mode code can share the file-copy logic.
+//! team-mode code can share the file-copy logic. The copier is no-follow,
+//! preserves ordinary dotfiles, and excludes only reserved VCS metadata.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::ffi::OsStr;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -146,9 +150,31 @@ impl ImportProgress {
 // copy_tree_with_policy (moved from personal::svn_to_git)
 // ---------------------------------------------------------------------------
 
+/// Reserved VCS metadata names. These are excluded at any depth so an export
+/// cannot overwrite destination `.git/` (or similar) and so nested VCS dirs
+/// are not published. Ordinary dotfiles (`.gitignore`, `.editorconfig`,
+/// `.github/…`) are not reserved and are copied.
+pub const RESERVED_VCS_METADATA_NAMES: &[&str] = &[".git", ".svn", ".hg", ".bzr"];
+
+/// True when `name` is documented reserved VCS metadata (not an ordinary dotfile).
+pub fn is_reserved_vcs_metadata(name: &OsStr) -> bool {
+    RESERVED_VCS_METADATA_NAMES.iter().any(|n| name == *n)
+}
+
+/// Destination names `remove_stale_files` must keep even when they are absent
+/// from the SVN export. Reserved VCS dirs stay protected; `.gitattributes` is
+/// engine-written LFS tracking (not reserved during copy).
+pub fn is_stale_remove_protected(name: &OsStr) -> bool {
+    is_reserved_vcs_metadata(name) || name == ".gitattributes"
+}
+
 /// Recursively copy files from SVN export `src` into Git working tree `dst`,
-/// enforcing the given [`FilePolicy`].  Returns the number of files skipped,
-/// the number of LFS-tracked files, and total files copied.
+/// enforcing the given [`FilePolicy`].
+///
+/// Traversal is no-follow (`symlink_metadata` / `O_NOFOLLOW`). Symlinks,
+/// specials, and directory cycles are rejected before the target is read or
+/// published. Reserved VCS metadata is excluded and recorded; ordinary
+/// dotfiles are preserved.
 pub fn copy_tree_with_policy(
     src: &Path,
     dst: &Path,
@@ -156,9 +182,14 @@ pub fn copy_tree_with_policy(
     db: &Database,
 ) -> Result<CopyStats> {
     let mut stats = CopyStats::default();
-    copy_tree_policy_inner(src, dst, dst, src, true, policy, &mut stats)?;
+    let mut visited = HashSet::new();
+    admit_export_root(src, &mut visited)?;
+    copy_tree_policy_inner(src, dst, dst, src, policy, &mut stats, &mut visited)?;
+    record_copy_exclusions(db, &stats);
+    Ok(stats)
+}
 
-    // Audit skipped count if any.
+fn record_copy_exclusions(db: &Database, stats: &CopyStats) {
     if stats.skipped > 0 {
         let _ = db.insert_audit_log(
             "file_policy_skip",
@@ -167,14 +198,34 @@ pub fn copy_tree_with_policy(
             None,
             None,
             Some(&format!(
-                "Skipped {} files by policy during SVN→Git copy",
-                stats.skipped
+                "Skipped {} files by policy during SVN→Git copy: {}",
+                stats.skipped,
+                stats.exclusions.join("; ")
             )),
             true,
         );
     }
-
-    Ok(stats)
+    if stats.reserved_excluded > 0 {
+        let reserved: Vec<&str> = stats
+            .exclusions
+            .iter()
+            .filter(|e| e.starts_with("reserved:"))
+            .map(String::as_str)
+            .collect();
+        let _ = db.insert_audit_log(
+            "reserved_metadata_exclude",
+            Some("svn_to_git"),
+            None,
+            None,
+            None,
+            Some(&format!(
+                "Excluded {} reserved VCS metadata path(s): {}",
+                stats.reserved_excluded,
+                reserved.join("; ")
+            )),
+            true,
+        );
+    }
 }
 
 /// Statistics from a copy operation.
@@ -183,6 +234,33 @@ pub struct CopyStats {
     pub copied: usize,
     pub skipped: usize,
     pub lfs_tracked: usize,
+    /// Deliberate reserved-VCS exclusions (not file-policy skips).
+    pub reserved_excluded: usize,
+    /// Every deliberate exclusion, e.g. `reserved:.svn` or `policy:ignored:tmp.log`.
+    pub exclusions: Vec<String>,
+}
+
+fn admit_export_root(src: &Path, visited: &mut HashSet<(u64, u64)>) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("failed to stat export root: {}", src.display()))?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        bail!(
+            "unsupported symlink at export root '{}': refusing to follow outside the export root",
+            src.display()
+        );
+    }
+    if !ft.is_dir() {
+        bail!(
+            "export root '{}' is not a directory (type={})",
+            src.display(),
+            file_type_label(&ft)
+        );
+    }
+    if let Some(id) = dir_identity(&meta) {
+        visited.insert(id);
+    }
+    Ok(())
 }
 
 fn copy_tree_policy_inner(
@@ -190,9 +268,9 @@ fn copy_tree_policy_inner(
     dst: &Path,
     dst_root: &Path,
     export_root: &Path,
-    is_root: bool,
     policy: &FilePolicy,
     stats: &mut CopyStats,
+    visited: &mut HashSet<(u64, u64)>,
 ) -> Result<()> {
     let entries = std::fs::read_dir(src)
         .with_context(|| format!("failed to read directory: {}", src.display()))?;
@@ -200,19 +278,45 @@ fn copy_tree_policy_inner(
     for entry in entries {
         let entry = entry?;
         let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
+        let src_path = entry.path();
+        let dst_path = dst.join(&file_name);
+        let rel = src_path
+            .strip_prefix(export_root)
+            .unwrap_or(&src_path)
+            .to_string_lossy()
+            .replace('\\', "/");
 
-        // At the root level of the destination, skip dotfiles/dotdirs to
-        // avoid overwriting `.git/` and similar metadata.
-        if is_root && name_str.starts_with('.') {
-            debug!(name = %name_str, "skipping dotfile/dotdir in export root");
+        let meta = std::fs::symlink_metadata(&src_path).with_context(|| {
+            format!(
+                "failed to stat export entry without following: {}",
+                src_path.display()
+            )
+        })?;
+        let ft = meta.file_type();
+
+        if is_reserved_vcs_metadata(&file_name) {
+            let reason = format!("reserved:{rel}");
+            info!(path = rel.as_str(), "excluding reserved VCS metadata");
+            stats.reserved_excluded += 1;
+            stats.exclusions.push(reason);
             continue;
         }
 
-        let src_path = entry.path();
-        let dst_path = dst.join(&file_name);
-
-        if src_path.is_dir() {
+        if ft.is_symlink() {
+            bail!("unsupported symlink at '{rel}': refusing to follow outside the export root");
+        }
+        if is_special_file_type(&ft) {
+            bail!(
+                "unsupported special file at '{rel}' ({})",
+                file_type_label(&ft)
+            );
+        }
+        if ft.is_dir() {
+            if let Some(id) = dir_identity(&meta) {
+                if !visited.insert(id) {
+                    bail!("cycle detected at '{rel}': refusing to re-enter directory");
+                }
+            }
             if !dst_path.exists() {
                 std::fs::create_dir_all(&dst_path).with_context(|| {
                     format!("failed to create directory: {}", dst_path.display())
@@ -223,76 +327,64 @@ fn copy_tree_policy_inner(
                 &dst_path,
                 dst_root,
                 export_root,
-                false,
                 policy,
                 stats,
+                visited,
             )?;
-        } else {
-            // Compute relative path for policy evaluation.
-            let rel = src_path
-                .strip_prefix(export_root)
-                .unwrap_or(&src_path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            continue;
+        }
+        if !ft.is_file() {
+            bail!(
+                "unsupported file type at '{rel}' ({})",
+                file_type_label(&ft)
+            );
+        }
 
-            let decision = policy.evaluate_path(export_root, &rel);
-            match &decision {
-                FilePolicyDecision::Allow => {
-                    std::fs::copy(&src_path, &dst_path).with_context(|| {
-                        format!(
-                            "failed to copy {} -> {}",
-                            src_path.display(),
-                            dst_path.display()
-                        )
-                    })?;
-                    stats.copied += 1;
-                }
-                FilePolicyDecision::LfsTrack { size, threshold } => {
-                    // Copy the actual file content to the Git working tree.
-                    std::fs::copy(&src_path, &dst_path).with_context(|| {
-                        format!(
-                            "failed to copy {} -> {}",
-                            src_path.display(),
-                            dst_path.display()
-                        )
-                    })?;
-
-                    // Ensure `.gitattributes` has the appropriate LFS tracking pattern.
-                    let pattern = crate::lfs::pattern_for_path(&rel);
-                    if let Err(e) = crate::lfs::ensure_lfs_tracked(dst_root, &pattern) {
-                        warn!(
-                            path = rel.as_str(),
-                            pattern = pattern.as_str(),
-                            error = %e,
-                            "failed to update .gitattributes for LFS tracking"
-                        );
-                    } else {
-                        info!(
-                            path = rel.as_str(),
-                            size,
-                            threshold,
-                            pattern = pattern.as_str(),
-                            "LFS: file copied and .gitattributes updated"
-                        );
-                    }
-                    stats.copied += 1;
-                    stats.lfs_tracked += 1;
-                }
-                FilePolicyDecision::Ignored { pattern } => {
+        // Size comes from no-follow metadata; never call evaluate_path (it follows).
+        let decision = policy.evaluate(&rel, meta.len());
+        match &decision {
+            FilePolicyDecision::Allow => {
+                copy_regular_file_no_follow(&src_path, &dst_path, &meta)?;
+                stats.copied += 1;
+            }
+            FilePolicyDecision::LfsTrack { size, threshold } => {
+                copy_regular_file_no_follow(&src_path, &dst_path, &meta)?;
+                let pattern = crate::lfs::pattern_for_path(&rel);
+                if let Err(e) = crate::lfs::ensure_lfs_tracked(dst_root, &pattern) {
                     warn!(
                         path = rel.as_str(),
                         pattern = pattern.as_str(),
-                        "file ignored by policy — not copied to Git"
+                        error = %e,
+                        "failed to update .gitattributes for LFS tracking"
                     );
-                    stats.skipped += 1;
-                }
-                FilePolicyDecision::Oversize { size, limit } => {
-                    warn!(
+                } else {
+                    info!(
                         path = rel.as_str(),
-                        size, limit, "file exceeds max_file_size — not copied to Git"
+                        size,
+                        threshold,
+                        pattern = pattern.as_str(),
+                        "LFS: file copied and .gitattributes updated"
                     );
-                    stats.skipped += 1;
                 }
+                stats.copied += 1;
+                stats.lfs_tracked += 1;
+            }
+            FilePolicyDecision::Ignored { pattern } => {
+                warn!(
+                    path = rel.as_str(),
+                    pattern = pattern.as_str(),
+                    "file ignored by policy — not copied to Git"
+                );
+                stats.skipped += 1;
+                stats.exclusions.push(format!("policy:ignored:{rel}"));
+            }
+            FilePolicyDecision::Oversize { size, limit } => {
+                warn!(
+                    path = rel.as_str(),
+                    size, limit, "file exceeds max_file_size — not copied to Git"
+                );
+                stats.skipped += 1;
+                stats.exclusions.push(format!("policy:oversize:{rel}"));
             }
         }
     }
@@ -300,13 +392,402 @@ fn copy_tree_policy_inner(
     Ok(())
 }
 
-/// Remove files from `dst` (Git working tree) that no longer exist in `src`
-/// (SVN export).  Preserves root-level dotfiles/dirs (e.g. `.git/`).
-pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
-    remove_stale_inner(src, dst, true)
+fn copy_regular_file_no_follow(src: &Path, dst: &Path, src_meta: &std::fs::Metadata) -> Result<()> {
+    let mut reader = open_no_follow_read(src)?;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dst)
+        .with_context(|| format!("failed to create {}", dst.display()))?;
+    std::io::copy(&mut reader, &mut writer)
+        .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", dst.display()))?;
+    apply_source_permissions(dst, src_meta)?;
+    Ok(())
 }
 
-fn remove_stale_inner(src: &Path, dst: &Path, is_root: bool) -> Result<()> {
+fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+        .with_context(|| format!("failed to open {} without following", path.display()))
+}
+
+fn apply_source_permissions(dst: &Path, src_meta: &std::fs::Metadata) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dst,
+            std::fs::Permissions::from_mode(src_meta.permissions().mode()),
+        )
+        .with_context(|| format!("failed to set permissions on {}", dst.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dst, src_meta);
+    }
+    Ok(())
+}
+
+fn dir_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+fn is_special_file_type(ft: &std::fs::FileType) -> bool {
+    !ft.is_dir() && !ft.is_file() && !ft.is_symlink()
+}
+
+fn file_type_label(ft: &std::fs::FileType) -> &'static str {
+    if ft.is_symlink() {
+        "symlink"
+    } else if ft.is_dir() {
+        "directory"
+    } else if ft.is_file() {
+        "file"
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if ft.is_fifo() {
+                return "fifo";
+            }
+            if ft.is_socket() {
+                return "socket";
+            }
+            if ft.is_char_device() {
+                return "char_device";
+            }
+            if ft.is_block_device() {
+                return "block_device";
+            }
+        }
+        "special"
+    }
+}
+
+/// One independently observed export entry. Built without calling
+/// [`copy_tree_with_policy`], so a follow-y double-copy cannot hide itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestEntry {
+    File {
+        mode: u32,
+        size: u64,
+        sha256: String,
+    },
+    Directory {
+        mode: u32,
+    },
+    Reserved {
+        name: String,
+    },
+    Unsupported {
+        kind: String,
+        detail: String,
+    },
+}
+
+/// No-follow inventory of an export tree (paths, types/modes, bytes or
+/// an explicit unsupported outcome).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndependentTreeManifest {
+    pub entries: BTreeMap<String, ManifestEntry>,
+}
+
+impl IndependentTreeManifest {
+    pub fn has_unsupported(&self) -> bool {
+        self.entries
+            .values()
+            .any(|e| matches!(e, ManifestEntry::Unsupported { .. }))
+    }
+
+    /// True when any regular-file digest equals SHA-256 of `needle`.
+    pub fn contains_file_digest_of(&self, needle: &[u8]) -> bool {
+        let digest = hex::encode(Sha256::digest(needle));
+        self.entries.values().any(|e| match e {
+            ManifestEntry::File { sha256, .. } => sha256 == &digest,
+            _ => false,
+        })
+    }
+
+    pub fn unsupported_paths(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter_map(|(path, entry)| match entry {
+                ManifestEntry::Unsupported { .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Walk `root` with `symlink_metadata` only. Never follows links, never
+/// calls [`copy_tree_with_policy`], and never opens a non-regular file.
+pub fn independent_tree_manifest(root: &Path) -> Result<IndependentTreeManifest> {
+    let mut manifest = IndependentTreeManifest::default();
+    let mut visited = HashSet::new();
+    let root_meta = std::fs::symlink_metadata(root).with_context(|| {
+        format!(
+            "failed to stat independent-manifest root {}",
+            root.display()
+        )
+    })?;
+    if root_meta.file_type().is_symlink() {
+        manifest.entries.insert(
+            String::new(),
+            ManifestEntry::Unsupported {
+                kind: "symlink".into(),
+                detail: "export root is a symlink".into(),
+            },
+        );
+        return Ok(manifest);
+    }
+    if !root_meta.file_type().is_dir() {
+        manifest.entries.insert(
+            String::new(),
+            ManifestEntry::Unsupported {
+                kind: file_type_label(&root_meta.file_type()).into(),
+                detail: "export root is not a directory".into(),
+            },
+        );
+        return Ok(manifest);
+    }
+    if let Some(id) = dir_identity(&root_meta) {
+        visited.insert(id);
+    }
+    independent_manifest_inner(root, root, &mut visited, &mut manifest)?;
+    Ok(manifest)
+}
+
+fn independent_manifest_inner(
+    dir: &Path,
+    root: &Path,
+    visited: &mut HashSet<(u64, u64)>,
+    manifest: &mut IndependentTreeManifest,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read {} for independent manifest", dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let meta = std::fs::symlink_metadata(&path).with_context(|| {
+            format!("failed to stat {} for independent manifest", path.display())
+        })?;
+        let ft = meta.file_type();
+        if is_reserved_vcs_metadata(&name) {
+            manifest.entries.insert(
+                rel,
+                ManifestEntry::Reserved {
+                    name: name.to_string_lossy().into_owned(),
+                },
+            );
+            continue;
+        }
+        if ft.is_symlink() {
+            manifest.entries.insert(
+                rel,
+                ManifestEntry::Unsupported {
+                    kind: "symlink".into(),
+                    detail: "symlink (target not read)".into(),
+                },
+            );
+            continue;
+        }
+        if is_special_file_type(&ft) {
+            manifest.entries.insert(
+                rel,
+                ManifestEntry::Unsupported {
+                    kind: file_type_label(&ft).into(),
+                    detail: "special file (not opened)".into(),
+                },
+            );
+            continue;
+        }
+        if ft.is_dir() {
+            if let Some(id) = dir_identity(&meta) {
+                if !visited.insert(id) {
+                    manifest.entries.insert(
+                        rel,
+                        ManifestEntry::Unsupported {
+                            kind: "cycle".into(),
+                            detail: "directory cycle (not re-entered)".into(),
+                        },
+                    );
+                    continue;
+                }
+            }
+            manifest.entries.insert(
+                rel.clone(),
+                ManifestEntry::Directory {
+                    mode: unix_mode(&meta),
+                },
+            );
+            independent_manifest_inner(&path, root, visited, manifest)?;
+            continue;
+        }
+        if !ft.is_file() {
+            manifest.entries.insert(
+                rel,
+                ManifestEntry::Unsupported {
+                    kind: file_type_label(&ft).into(),
+                    detail: "unsupported type (not opened)".into(),
+                },
+            );
+            continue;
+        }
+        let (size, sha256) = hash_regular_file_no_follow(&path)?;
+        manifest.entries.insert(
+            rel,
+            ManifestEntry::File {
+                mode: unix_mode(&meta),
+                size,
+                sha256,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn hash_regular_file_no_follow(path: &Path) -> Result<(u64, String)> {
+    let mut file = open_no_follow_read(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buf).with_context(|| {
+            format!("failed to read {} for independent manifest", path.display())
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((size, hex::encode(hasher.finalize())))
+}
+
+fn unix_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+/// Verify `dest` against an independently built source manifest. Does not
+/// call [`copy_tree_with_policy`] to invent expectations. A destination that
+/// published a followed symlink (outside-root double-copy canary) fails.
+pub fn verify_against_independent_manifest(
+    dest: &Path,
+    source_manifest: &IndependentTreeManifest,
+    policy: &FilePolicy,
+) -> Result<()> {
+    let dest_manifest = independent_tree_manifest(dest)?;
+    if dest_manifest.has_unsupported() {
+        bail!(
+            "destination published unsupported entries: {:?}",
+            dest_manifest.unsupported_paths()
+        );
+    }
+
+    for (path, entry) in &source_manifest.entries {
+        match entry {
+            ManifestEntry::Unsupported { kind, detail } => {
+                if dest_manifest.entries.contains_key(path) {
+                    bail!("destination published unsupported {kind} at '{path}' ({detail})");
+                }
+            }
+            ManifestEntry::Reserved { .. } => match dest_manifest.entries.get(path) {
+                None | Some(ManifestEntry::Reserved { .. }) => {}
+                Some(other) => {
+                    bail!("destination published reserved VCS metadata at '{path}' as {other:?}")
+                }
+            },
+            ManifestEntry::Directory { .. } => match dest_manifest.entries.get(path) {
+                Some(ManifestEntry::Directory { .. }) => {}
+                Some(other) => bail!("destination type mismatch at '{path}': {other:?}"),
+                None => bail!("destination missing directory '{path}'"),
+            },
+            ManifestEntry::File { sha256, size, mode } => match policy.evaluate(path, *size) {
+                FilePolicyDecision::Ignored { .. } | FilePolicyDecision::Oversize { .. } => {
+                    if dest_manifest.entries.contains_key(path) {
+                        bail!("destination published policy-excluded file '{path}'");
+                    }
+                }
+                FilePolicyDecision::Allow | FilePolicyDecision::LfsTrack { .. } => {
+                    match dest_manifest.entries.get(path) {
+                        Some(ManifestEntry::File {
+                            sha256: dest_hash,
+                            mode: dest_mode,
+                            size: dest_size,
+                        }) => {
+                            if dest_hash != sha256 || dest_size != size {
+                                bail!("destination byte mismatch at '{path}'");
+                            }
+                            if file_exec_bit(*mode) != file_exec_bit(*dest_mode) {
+                                bail!("destination executable-bit mismatch at '{path}'");
+                            }
+                        }
+                        Some(other) => bail!("destination type mismatch at '{path}': {other:?}"),
+                        None => bail!("destination missing file '{path}'"),
+                    }
+                }
+            },
+        }
+    }
+
+    for (path, entry) in &dest_manifest.entries {
+        if matches!(entry, ManifestEntry::Reserved { .. }) {
+            continue;
+        }
+        if !source_manifest.entries.contains_key(path) {
+            bail!("destination has unpublished-from-source extra path '{path}'");
+        }
+    }
+    Ok(())
+}
+
+fn file_exec_bit(mode: u32) -> bool {
+    mode & 0o111 != 0
+}
+
+/// Remove files from `dst` (Git working tree) that no longer exist in `src`
+/// (SVN export). Preserves reserved VCS metadata (e.g. destination `.git/`)
+/// and engine-written `.gitattributes`. Ordinary root dotfiles such as
+/// `.gitignore` can be stale-removed.
+pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
+    remove_stale_inner(src, dst)
+}
+
+fn remove_stale_inner(src: &Path, dst: &Path) -> Result<()> {
     let entries = match std::fs::read_dir(dst) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -318,9 +799,7 @@ fn remove_stale_inner(src: &Path, dst: &Path, is_root: bool) -> Result<()> {
     for entry in entries {
         let entry = entry?;
         let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-
-        if is_root && name_str.starts_with('.') {
+        if is_stale_remove_protected(&file_name) {
             continue;
         }
 
@@ -329,7 +808,7 @@ fn remove_stale_inner(src: &Path, dst: &Path, is_root: bool) -> Result<()> {
 
         if dst_path.is_dir() {
             if src_path.is_dir() {
-                remove_stale_inner(&src_path, &dst_path, false)?;
+                remove_stale_inner(&src_path, &dst_path)?;
             } else {
                 std::fs::remove_dir_all(&dst_path).with_context(|| {
                     format!("failed to remove stale directory: {}", dst_path.display())
@@ -2091,4 +2570,446 @@ async fn async_git_push(
         "async push completed successfully"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_policy::FilePolicy;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::time::{Duration, Instant};
+
+    const CANARY: &[u8] = b"OUTSIDE-ROOT-CANARY-SECRET-RS-C01";
+
+    fn test_db() -> Database {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db
+    }
+
+    fn noop_policy() -> FilePolicy {
+        FilePolicy::new(0, vec![])
+    }
+
+    fn dest_contains_canary(dest: &Path) -> bool {
+        fn walk(dir: &Path) -> bool {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return false;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_dir() {
+                    if walk(&path) {
+                        return true;
+                    }
+                } else if meta.file_type().is_file() {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        if bytes.windows(CANARY.len()).any(|w| w == CANARY) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        walk(dest)
+    }
+
+    /// Historical follow-y copier used only to prove self-consistent verify
+    /// cannot detect an outside-root double-copy.
+    fn naive_follow_copy(src: &Path, dst: &Path) {
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == ".git" || name == ".svn" {
+                continue;
+            }
+            let src_path = entry.path();
+            let dst_path = dst.join(&name);
+            if src_path.is_dir() {
+                std::fs::create_dir_all(&dst_path).unwrap();
+                naive_follow_copy(&src_path, &dst_path);
+            } else {
+                std::fs::copy(&src_path, &dst_path).unwrap();
+            }
+        }
+    }
+
+    fn hash_tree_follow(root: &Path) -> BTreeMap<String, String> {
+        let mut files = BTreeMap::new();
+        fn walk(dir: &Path, root: &Path, files: &mut BTreeMap<String, String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, files);
+                } else {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.insert(rel, hex::encode(Sha256::digest(&bytes)));
+                }
+            }
+        }
+        walk(root, root, &mut files);
+        files
+    }
+
+    #[test]
+    fn import_copy_preserves_ordinary_dotfiles_and_records_reserved() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitignore"), "*.tmp\n").unwrap();
+        std::fs::write(src.path().join(".editorconfig"), "root = true\n").unwrap();
+        std::fs::create_dir_all(src.path().join(".github/workflows")).unwrap();
+        std::fs::write(src.path().join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        std::fs::create_dir(src.path().join(".svn")).unwrap();
+        std::fs::write(src.path().join(".svn/entries"), "skip-me").unwrap();
+        std::fs::create_dir(src.path().join(".git")).unwrap();
+        std::fs::write(src.path().join(".git/HEAD"), "should-not-copy").unwrap();
+        std::fs::create_dir(src.path().join("nested")).unwrap();
+        std::fs::write(src.path().join("nested/.hidden"), "keep").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(dst.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+
+        let db = test_db();
+        let stats = copy_tree_with_policy(src.path(), dst.path(), &noop_policy(), &db).unwrap();
+        assert_eq!(stats.copied, 4);
+        assert_eq!(stats.reserved_excluded, 2);
+        assert!(stats
+            .exclusions
+            .iter()
+            .any(|e| e == "reserved:.svn" || e == "reserved:.git"));
+
+        let audits = db.list_audit_log(10, 0).unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.action == "reserved_metadata_exclude"),
+            "reserved exclusion must be audited: {:?}",
+            audits.iter().map(|e| &e.action).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".gitignore")).unwrap(),
+            "*.tmp\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".editorconfig")).unwrap(),
+            "root = true\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".github/workflows/ci.yml")).unwrap(),
+            "on: push\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("nested/.hidden")).unwrap(),
+            "keep"
+        );
+        assert!(!dst.path().join(".svn").exists());
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main"
+        );
+
+        let manifest = independent_tree_manifest(src.path()).unwrap();
+        verify_against_independent_manifest(dst.path(), &manifest, &noop_policy()).unwrap();
+    }
+
+    #[test]
+    fn import_copy_preserves_executable_bit_and_ordinary_binary() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let script = src.path().join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = [0u8, 1, 255, 0, 10, 13, 0x89, b'P', b'N', b'G'];
+        std::fs::write(src.path().join("blob.bin"), binary).unwrap();
+
+        let db = test_db();
+        let stats = copy_tree_with_policy(src.path(), dst.path(), &noop_policy(), &db).unwrap();
+        assert_eq!(stats.copied, 2);
+
+        let dest_mode = std::fs::metadata(dst.path().join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(dest_mode & 0o111, 0, "executable bit must be preserved");
+        assert_eq!(std::fs::read(dst.path().join("blob.bin")).unwrap(), binary);
+
+        let manifest = independent_tree_manifest(src.path()).unwrap();
+        match manifest.entries.get("run.sh") {
+            Some(ManifestEntry::File { mode, .. }) => assert_ne!(mode & 0o111, 0),
+            other => panic!("expected file manifest for run.sh, got {other:?}"),
+        }
+        verify_against_independent_manifest(dst.path(), &manifest, &noop_policy()).unwrap();
+    }
+
+    #[test]
+    fn import_copy_rejects_file_symlink_before_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("target.txt"), "inside").unwrap();
+        symlink(src.join("target.txt"), src.join("link.txt")).unwrap();
+
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported symlink"),
+            "unexpected error: {err}"
+        );
+        assert!(!dst.join("link.txt").exists());
+
+        let manifest = independent_tree_manifest(&src).unwrap();
+        assert!(matches!(
+            manifest.entries.get("link.txt"),
+            Some(ManifestEntry::Unsupported { kind, .. }) if kind == "symlink"
+        ));
+    }
+
+    #[test]
+    fn import_copy_rejects_dir_symlink_before_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(src.join("realdir")).unwrap();
+        std::fs::write(src.join("realdir/a.txt"), "a").unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        symlink(src.join("realdir"), src.join("alias")).unwrap();
+
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(err.to_string().contains("unsupported symlink"), "{err}");
+        assert!(!dst.join("alias").exists());
+    }
+
+    #[test]
+    fn import_copy_rejects_dangling_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        symlink(src.join("missing.txt"), src.join("dangling")).unwrap();
+
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(err.to_string().contains("unsupported symlink"), "{err}");
+        assert!(!dst.join("dangling").exists());
+        let manifest = independent_tree_manifest(&src).unwrap();
+        assert!(matches!(
+            manifest.entries.get("dangling"),
+            Some(ManifestEntry::Unsupported { kind, .. }) if kind == "symlink"
+        ));
+    }
+
+    #[test]
+    fn import_copy_rejects_symlink_loop_without_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        symlink(src.join("loop_b"), src.join("loop_a")).unwrap();
+        symlink(src.join("loop_a"), src.join("loop_b")).unwrap();
+
+        let started = Instant::now();
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "symlink loop hung the copier"
+        );
+        assert!(err.to_string().contains("unsupported symlink"), "{err}");
+    }
+
+    #[test]
+    fn import_copy_rejects_fifo_special_without_opening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("ok.txt"), "ok").unwrap();
+        let fifo = src.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let started = Instant::now();
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "FIFO open blocked — special file was read"
+        );
+        assert!(
+            err.to_string().contains("unsupported special") || err.to_string().contains("fifo"),
+            "{err}"
+        );
+        assert!(!dst.join("pipe").exists());
+    }
+
+    #[test]
+    fn import_copy_outside_root_canary_unread_and_unpublished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let src = tmp.path().join("export");
+        let dst = tmp.path().join("dest");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(outside.join("secret.bin"), CANARY).unwrap();
+        std::fs::write(src.join("ok.txt"), "inside").unwrap();
+        symlink(outside.join("secret.bin"), src.join("escape")).unwrap();
+
+        let manifest = independent_tree_manifest(&src).unwrap();
+        assert!(
+            !manifest.contains_file_digest_of(CANARY),
+            "independent manifest ingested outside-root canary bytes"
+        );
+        assert!(matches!(
+            manifest.entries.get("escape"),
+            Some(ManifestEntry::Unsupported { kind, .. }) if kind == "symlink"
+        ));
+
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(err.to_string().contains("unsupported symlink"), "{err}");
+        assert!(!dst.join("escape").exists());
+        assert!(!dest_contains_canary(&dst));
+        assert_eq!(std::fs::read(outside.join("secret.bin")).unwrap(), CANARY);
+    }
+
+    #[test]
+    fn import_copy_outside_root_double_copy_canary_fails_independent_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let src = tmp.path().join("export");
+        let naive = tmp.path().join("naive");
+        let naive_expected = tmp.path().join("naive_expected");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&naive).unwrap();
+        std::fs::create_dir_all(&naive_expected).unwrap();
+        std::fs::write(outside.join("secret.bin"), CANARY).unwrap();
+        std::fs::write(src.join("ok.txt"), "inside").unwrap();
+        symlink(outside.join("secret.bin"), src.join("escape")).unwrap();
+
+        naive_follow_copy(&src, &naive);
+        naive_follow_copy(&src, &naive_expected);
+        assert_eq!(
+            hash_tree_follow(&naive),
+            hash_tree_follow(&naive_expected),
+            "self-consistent follow-copy verify must match (the bug #88 catches)"
+        );
+        assert_eq!(std::fs::read(naive.join("escape")).unwrap(), CANARY);
+
+        let manifest = independent_tree_manifest(&src).unwrap();
+        let err =
+            verify_against_independent_manifest(&naive, &manifest, &noop_policy()).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported") || err.to_string().contains("escape"),
+            "independent manifest must fail the double-copy canary: {err}"
+        );
+        assert!(!manifest.contains_file_digest_of(CANARY));
+    }
+
+    #[test]
+    fn import_copy_symlink_to_outside_fifo_does_not_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let fifo = outside.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        symlink(&fifo, src.join("escape")).unwrap();
+        std::fs::write(src.join("ok.txt"), "ok").unwrap();
+
+        let started = Instant::now();
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "followed outside FIFO (blocked)"
+        );
+        assert!(err.to_string().contains("unsupported symlink"), "{err}");
+        assert!(!dst.join("escape").exists());
+    }
+
+    #[test]
+    fn import_copy_records_policy_exclusions() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(src.path().join("noise.log"), "drop").unwrap();
+        let policy = FilePolicy::new(0, vec!["*.log".into()]);
+        let db = test_db();
+        let stats = copy_tree_with_policy(src.path(), dst.path(), &policy, &db).unwrap();
+        assert_eq!(stats.copied, 1);
+        assert_eq!(stats.skipped, 1);
+        assert!(stats
+            .exclusions
+            .iter()
+            .any(|e| e == "policy:ignored:noise.log"));
+        assert!(dst.path().join("keep.txt").exists());
+        assert!(!dst.path().join("noise.log").exists());
+        let audits = db.list_audit_log(10, 0).unwrap();
+        assert!(audits.iter().any(|e| e.action == "file_policy_skip"));
+        let manifest = independent_tree_manifest(src.path()).unwrap();
+        verify_against_independent_manifest(dst.path(), &manifest, &policy).unwrap();
+    }
+
+    #[test]
+    fn import_copy_lfs_gitattributes_survives_stale_remove() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("model.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        let policy = FilePolicy::with_lfs(0, vec![], 100, &[]);
+        let db = test_db();
+        let stats = copy_tree_with_policy(src.path(), dst.path(), &policy, &db).unwrap();
+        assert_eq!(stats.copied, 2);
+        assert_eq!(stats.lfs_tracked, 1);
+        let gitattr = dst.path().join(".gitattributes");
+        assert!(
+            gitattr.exists(),
+            ".gitattributes should be created for LFS-tracked files"
+        );
+        let before = std::fs::read_to_string(&gitattr).unwrap();
+        assert!(before.contains("filter=lfs"));
+
+        remove_stale_files(src.path(), dst.path()).unwrap();
+        assert!(
+            gitattr.exists(),
+            "stale-remove must not delete engine-written .gitattributes"
+        );
+        assert_eq!(std::fs::read_to_string(&gitattr).unwrap(), before);
+        assert!(dst.path().join(".git").exists());
+        assert!(!is_reserved_vcs_metadata(std::ffi::OsStr::new(
+            ".gitattributes"
+        )));
+    }
+
+    #[test]
+    fn import_full_history_writer_is_copy_tree_with_policy() {
+        // run_full_import calls copy_tree_with_policy; this exercises that
+        // same writer the way a full-export revision does.
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("README"), "full-import-path\n").unwrap();
+        std::fs::write(src.path().join(".gitignore"), "target\n").unwrap();
+        let stats =
+            copy_tree_with_policy(src.path(), dst.path(), &noop_policy(), &test_db()).unwrap();
+        assert_eq!(stats.copied, 2);
+        let manifest = independent_tree_manifest(src.path()).unwrap();
+        verify_against_independent_manifest(dst.path(), &manifest, &noop_policy()).unwrap();
+    }
 }
