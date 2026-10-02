@@ -217,9 +217,6 @@ fn finalize_tx(
             &format!("last_svn_rev_{}", op.repo_id),
             &svn_rev.to_string(),
         )?;
-        write_value(tx, &format!("last_git_sha_{}", op.repo_id), git_sha)?;
-        write_value(tx, "last_svn_revision", &svn_rev.to_string())?;
-        write_value(tx, "last_git_hash", git_sha)?;
     }
     if removed {
         op.outcome_detail =

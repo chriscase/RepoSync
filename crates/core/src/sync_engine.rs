@@ -1564,13 +1564,11 @@ impl SyncEngine {
                     let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                     if let Ok(prev) = git.head_sha() {
                         if prev == git_sha {
-                            if let Ok(pre) = git
+                            if let Ok(Some(prev_sha)) = git
                                 .commit_parent_and_tree(&git_sha)
                                 .map(|(parent, _)| parent)
                             {
-                                if let Some(prev_sha) = pre {
-                                    let _ = git.reset_hard(&prev_sha);
-                                }
+                                let _ = git.reset_hard(&prev_sha);
                             }
                         }
                     }
