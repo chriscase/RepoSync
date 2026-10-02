@@ -517,6 +517,39 @@ impl GitClient {
         Ok(commit.id().to_string())
     }
 
+    /// Read one exact remote branch tip via `git ls-remote --exit-code`.
+    #[instrument(skip(self))]
+    pub fn ls_remote_ref(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
+        let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
+        let ref_name = format!("refs/heads/{branch}");
+        let output = std::process::Command::new("git")
+            .args(["ls-remote", "--exit-code", remote, &ref_name])
+            .current_dir(repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(GitError::IoError)?;
+        if output.status.code() == Some(2) {
+            return Ok(None);
+        }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitError::RefNotFound(format!(
+                "git ls-remote {remote} {ref_name} failed: {}",
+                stderr.trim()
+            )));
+        }
+        let sha = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if sha.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sha))
+        }
+    }
+
     /// Walk commits from HEAD backwards until we reach `since_sha`.
     ///
     /// Returns an empty vec if HEAD is unborn (empty repo).

@@ -13,6 +13,7 @@ pub mod db;
 pub mod errors;
 pub mod file_policy;
 pub mod git;
+pub mod git_push;
 pub mod history_inspect;
 pub mod identity;
 pub mod import;

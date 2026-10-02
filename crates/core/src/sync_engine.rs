@@ -19,12 +19,15 @@ use chrono::Utc;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, SvnLayout};
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
+use crate::db::git_push_operations::{
+    git_push_target_fingerprint, GitPushIntent, GitPushOperation, GitPushOperationState,
+};
 use crate::db::queries::AuditLogInput;
 use crate::db::svn_commit_operations::{
     svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
@@ -32,6 +35,7 @@ use crate::db::svn_commit_operations::{
 use crate::db::Database;
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
+use crate::git_push::{observed_git_ref, observed_git_tree};
 use crate::history_inspect::{
     clear_transient_history_block, enforce_durable_history_block, history_block_key,
     inspect_fetched_history, is_full_git_oid, persist_history_block, HistoryInspectReject,
@@ -267,7 +271,8 @@ impl SyncEngine {
                 ),
             ),
             Err(e @ SyncError::HistoryBlocked { .. })
-            | Err(e @ SyncError::SvnCommitHeld { .. }) => {
+            | Err(e @ SyncError::SvnCommitHeld { .. })
+            | Err(e @ SyncError::GitPushHeld { .. }) => {
                 ("reconciliation_required", format!("sync blocked: {}", e))
             }
             Err(e) => ("error", format!("sync failed: {}", e)),
@@ -1050,6 +1055,15 @@ impl SyncEngine {
                     return Err(error);
                 }
             }
+            if let Some(op) = self
+                .db
+                .active_git_push_operation(rid)
+                .map_err(SyncError::DatabaseError)?
+            {
+                if let Some(error) = self.blocking_git_push_hold(&op) {
+                    return Err(error);
+                }
+            }
         }
         // SVN inspection may adopt a legacy checkpoint. Admit Git history
         // before that call, not merely before the later destructive reset.
@@ -1186,7 +1200,41 @@ impl SyncEngine {
         svn_changes: &[SvnChangeSet],
         applied: &mut usize,
     ) -> Result<(), SyncError> {
+        let resume_svn_rev = if let Some(rid) = self.effective_repo_id() {
+            match self
+                .db
+                .active_git_push_operation(rid)
+                .map_err(SyncError::DatabaseError)?
+            {
+                Some(op) => {
+                    if let Some(error) = self.blocking_git_push_hold(&op) {
+                        return Err(error);
+                    }
+                    if op.state == GitPushOperationState::ReconciliationRequired
+                        && op.resume_authorized
+                    {
+                        Some(op.source_svn_rev)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         for change in svn_changes {
+            if let Some(allowed) = resume_svn_rev {
+                if change.revision != allowed {
+                    debug!(
+                        rev = change.revision,
+                        allowed,
+                        "skipping SVN revision while one held push is authorized to resume"
+                    );
+                    continue;
+                }
+            }
             if self.is_echo_commit(&change.message) {
                 debug!(rev = change.revision, "skipping echo SVN revision");
                 continue;
@@ -1416,112 +1464,225 @@ impl SyncEngine {
             // remove tracked content; old wrong-path history needs separate
             // reviewed reconciliation.
 
-            // 3. Commit with identity and sync marker.
+            // 3. Commit with identity and sync marker, persist durable intent,
+            // push, then confirm only with observed Git ref/tree evidence.
             let commit_message = format!(
                 "{}\n\n{} synced from SVN r{}",
                 change.message, SYNC_MARKER, change.revision
             );
+            let branch = self.config.github.default_branch.clone();
+            let remote = "origin".to_string();
+            let repo_id = self.effective_repo_id().map(str::to_owned);
+            let (git_sha, intended_parent, intended_tree, pre_push_sha, pre_push_tree) =
+                tokio::task::block_in_place(|| {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    let pre_push_sha = git
+                        .ls_remote_ref(&remote, &branch)
+                        .map_err(SyncError::GitError)?
+                        .unwrap_or_default();
+                    let pre_push_tree = if pre_push_sha.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            git.commit_parent_and_tree(&pre_push_sha)
+                                .map_err(SyncError::GitError)?
+                                .1,
+                        )
+                    };
+                    let oid = git
+                        .commit_via_cli(
+                            &commit_message,
+                            &git_identity.name,
+                            &git_identity.email,
+                            "reposync",
+                            "sync@reposync.local",
+                        )
+                        .map_err(SyncError::GitError)?;
+                    let local_sha = oid.to_string();
+                    let (parent, tree) = git
+                        .commit_parent_and_tree(&local_sha)
+                        .map_err(SyncError::GitError)?;
+                    Ok::<_, SyncError>((local_sha, parent, tree, pre_push_sha, pre_push_tree))
+                })?;
 
-            // Wrap commit+push in block_in_place so the synchronous git
-            // CLI call doesn't block the tokio async runtime (which would
-            // make the web UI unresponsive during pushes).
-            //
-            // IMPORTANT: If the push fails, we must roll back the commit
-            // so it doesn't poison future pushes. Otherwise the local git
-            // history accumulates unpushable commits that block all
-            // subsequent syncs.
-            let git_sha = tokio::task::block_in_place(|| {
+            let mut intent: Option<GitPushOperation> = None;
+            if let Some(ref rid) = repo_id {
+                intent = Some(
+                    self.db
+                        .begin_svn_to_git_push(GitPushIntent {
+                            repo_id: rid,
+                            initiator_id: "team_worker",
+                            request_id: &format!("svn-r{}", change.revision),
+                            target_fingerprint: &git_push_target_fingerprint(rid, &remote, &branch),
+                            source_svn_rev: change.revision,
+                            source_svn_author: &change.author,
+                            source_svn_message: &change.message,
+                            pre_push_git_remote: &remote,
+                            pre_push_git_branch: &branch,
+                            pre_push_git_sha: &pre_push_sha,
+                            pre_push_git_tree: pre_push_tree.as_deref(),
+                            intended_local_git_sha: &git_sha,
+                            intended_local_git_parent: intended_parent.as_deref(),
+                            intended_local_git_tree: &intended_tree,
+                        })
+                        .map_err(SyncError::DatabaseError)?,
+                );
+                #[cfg(debug_assertions)]
+                if self.git_push_fixture_flag("REPOSYNC_GIT_PUSH_CRASH_BEFORE", rid) {
+                    let op = intent.as_ref().unwrap();
+                    let _ = self.db.hold_svn_to_git_reconciliation(
+                        rid,
+                        &op.id,
+                        "intent recorded; planned Git push was not issued",
+                    );
+                    return Err(SyncError::GitPushHeld {
+                        reason: "intent_recorded_push_not_issued".into(),
+                        detail: "fixture: crash after durable intent and before git push".into(),
+                    });
+                }
+            }
+
+            let push_result = tokio::task::block_in_place(|| {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                git.push(&remote, &branch).map_err(SyncError::GitError)
+            });
 
-                // Save HEAD before committing so we can roll back on push failure
-                let pre_commit_head = git.head_sha().ok();
-
-                // Use commit_via_cli instead of libgit2's commit() so that
-                // the git CLI's LFS clean filter runs.  libgit2 does not
-                // support LFS filters and will fail with "failed to read
-                // file into stream" when LFS-tracked files are present.
-                let oid = git
-                    .commit_via_cli(
-                        &commit_message,
-                        &git_identity.name,
-                        &git_identity.email,
-                        "reposync",
-                        "sync@reposync.local",
-                    )
-                    .map_err(SyncError::GitError)?;
-
-                // 4. Push to remote.
-                let branch = &self.config.github.default_branch;
-                match git.push("origin", branch) {
-                    Ok(()) => Ok::<_, SyncError>(oid.to_string()),
-                    Err(push_err) => {
-                        // Push failed — roll back the commit to keep local
-                        // history clean. The next sync cycle will re-detect
-                        // the SVN change and retry.
-                        warn!(
-                            sha = %oid,
-                            error = %push_err,
-                            "git push failed, rolling back commit to prevent history poisoning"
-                        );
-                        if let Some(ref prev_sha) = pre_commit_head {
-                            if let Err(reset_err) = git.reset_hard(prev_sha) {
-                                error!(
-                                    error = %reset_err,
-                                    "CRITICAL: failed to roll back git commit after push failure — manual intervention may be needed"
-                                );
-                            } else {
-                                info!(
-                                    rolled_back_to = %prev_sha,
-                                    "successfully rolled back git commit after push failure"
-                                );
+            if let Err(push_err) = push_result {
+                if let (Some(ref rid), Some(ref op)) = (&repo_id, &intent) {
+                    let _ = self.db.hold_svn_to_git_reconciliation(
+                        rid,
+                        &op.id,
+                        &format!("git push failed after intent was recorded: {push_err}"),
+                    );
+                    return Err(SyncError::GitPushHeld {
+                        reason: "push_outcome_uncertain".into(),
+                        detail: format!("git push failed after durable intent: {push_err}"),
+                    });
+                }
+                // Legacy path without durable intent: roll back the local commit.
+                tokio::task::block_in_place(|| {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Ok(prev) = git.head_sha() {
+                        if prev == git_sha {
+                            if let Ok(pre) = git
+                                .commit_parent_and_tree(&git_sha)
+                                .map(|(parent, _)| parent)
+                            {
+                                if let Some(prev_sha) = pre {
+                                    let _ = git.reset_hard(&prev_sha);
+                                }
                             }
                         }
-                        Err(SyncError::GitError(push_err))
+                    }
+                });
+                return Err(push_err);
+            }
+
+            if let (Some(ref rid), Some(ref op)) = (&repo_id, &intent) {
+                #[cfg(debug_assertions)]
+                if self.git_push_fixture_flag("REPOSYNC_GIT_PUSH_LOST_REPLY", rid) {
+                    let _ = self.db.hold_svn_to_git_reconciliation(
+                        rid,
+                        &op.id,
+                        "Git accepted the push but the reply was lost before local checkpoint",
+                    );
+                    return Err(SyncError::GitPushHeld {
+                        reason: "lost_push_reply".into(),
+                        detail: "fixture: accepted Git push reply lost before verification".into(),
+                    });
+                }
+                let (observed_sha, observed_tree) = tokio::task::block_in_place(|| {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    let observed_sha =
+                        observed_git_ref(&git, &remote, &branch).map_err(SyncError::GitError)?;
+                    let observed_tree =
+                        observed_git_tree(&git, &observed_sha).map_err(SyncError::GitError)?;
+                    Ok::<_, SyncError>((observed_sha, observed_tree))
+                })?;
+                #[cfg(debug_assertions)]
+                let observed_tree = if self
+                    .git_push_fixture_flag("REPOSYNC_GIT_PUSH_OBSERVED_TREE_MISMATCH", rid)
+                {
+                    "ffffffffffffffffffffffffffffffffffffffff".into()
+                } else {
+                    observed_tree
+                };
+                if observed_sha != git_sha {
+                    let detail = format!(
+                        "remote ref {branch} is {observed_sha} but intended local commit was {git_sha}"
+                    );
+                    let _ = self.db.hold_svn_to_git_reconciliation(rid, &op.id, &detail);
+                    return Err(SyncError::GitPushHeld {
+                        reason: "observed_ref_mismatch".into(),
+                        detail,
+                    });
+                }
+                if observed_tree != intended_tree {
+                    let detail = format!(
+                        "remote commit tree {observed_tree} does not match intended local tree {intended_tree}"
+                    );
+                    let _ = self.db.hold_svn_to_git_reconciliation(rid, &op.id, &detail);
+                    return Err(SyncError::GitPushHeld {
+                        reason: "observed_tree_mismatch".into(),
+                        detail,
+                    });
+                }
+                match self
+                    .db
+                    .confirm_svn_to_git_push(rid, &op.id, &observed_sha, &observed_tree)
+                {
+                    Ok(confirmed) => {
+                        debug!(
+                            operation_id = %confirmed.id,
+                            direction = "svn_to_git",
+                            svn_rev = change.revision,
+                            git_sha = %&observed_sha[..12.min(observed_sha.len())],
+                            git_tree = %&observed_tree[..12.min(observed_tree.len())],
+                            "svn-to-git push verified and checkpointed"
+                        );
+                    }
+                    Err(error) => {
+                        let _ = self.db.hold_svn_to_git_reconciliation(
+                            rid,
+                            &op.id,
+                            &format!(
+                                "Git push verified but the local checkpoint write failed: {error}"
+                            ),
+                        );
+                        return Err(SyncError::GitPushHeld {
+                            reason: "checkpoint_write_failed".into(),
+                            detail: format!("Git push verified but checkpoint failed: {error}"),
+                        });
                     }
                 }
-            })?;
-
-            // 5. Record the sync only after successful write.
-            let record = crate::models::SyncRecord {
-                id: uuid::Uuid::new_v4().to_string(),
-                repo_id: self.effective_repo_id().map(|s| s.to_string()),
-                svn_revision: Some(change.revision),
-                git_hash: Some(git_sha.clone()),
-                direction: crate::models::SyncDirection::SvnToGit,
-                author: change.author.clone(),
-                message: change.message.clone(),
-                timestamp: Utc::now(),
-                synced_at: Utc::now(),
-                status: crate::models::SyncRecordStatus::Applied,
-            };
-            self.db
-                .insert_sync_record(&record)
-                .map_err(SyncError::DatabaseError)?;
-            debug!(
-                record_id = %record.id,
-                direction = "svn_to_git",
-                svn_rev = change.revision,
-                git_sha = %&git_sha[..12.min(git_sha.len())],
-                "sync_record created"
-            );
-
-            // Update the SVN watermark (dual-write: kv_state + repo table).
-            self.db
-                .set_state(&self.svn_rev_key(), &change.revision.to_string())
-                .map_err(SyncError::DatabaseError)?;
-            if let Some(rid) = self.effective_repo_id() {
-                debug!(
-                    repo_id = %rid,
-                    new_svn_rev = change.revision,
-                    new_git_sha = %&git_sha[..12.min(git_sha.len())],
-                    "watermark updated"
-                );
+            } else {
+                // Legacy path when no repository scope is pinned.
+                let record = crate::models::SyncRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    repo_id: self.effective_repo_id().map(|s| s.to_string()),
+                    svn_revision: Some(change.revision),
+                    git_hash: Some(git_sha.clone()),
+                    direction: crate::models::SyncDirection::SvnToGit,
+                    author: change.author.clone(),
+                    message: change.message.clone(),
+                    timestamp: Utc::now(),
+                    synced_at: Utc::now(),
+                    status: crate::models::SyncRecordStatus::Applied,
+                };
                 self.db
-                    .update_repo_watermark(rid, change.revision, &git_sha)
+                    .insert_sync_record(&record)
                     .map_err(SyncError::DatabaseError)?;
                 self.db
-                    .increment_repo_sync_count(rid)
+                    .set_state(&self.svn_rev_key(), &change.revision.to_string())
                     .map_err(SyncError::DatabaseError)?;
+                if let Some(rid) = self.effective_repo_id() {
+                    self.db
+                        .update_repo_watermark(rid, change.revision, &git_sha)
+                        .map_err(SyncError::DatabaseError)?;
+                    self.db
+                        .increment_repo_sync_count(rid)
+                        .map_err(SyncError::DatabaseError)?;
+                }
             }
 
             *applied += 1;
@@ -1567,6 +1728,34 @@ impl SyncEngine {
     /// 3. Stage additions/deletions with `svn add`/`svn rm`.
     /// 4. Commit to SVN with a `[reposync]` marker.
     /// 5. Only then record the sync in the database.
+    fn blocking_git_push_hold(&self, op: &GitPushOperation) -> Option<SyncError> {
+        if op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized {
+            return Some(SyncError::GitPushHeld {
+                reason: "reconciliation_required".into(),
+                detail: op
+                    .outcome_detail
+                    .clone()
+                    .unwrap_or_else(|| "held SVN-to-Git push requires explicit reconcile".into()),
+            });
+        }
+        if !op.state.is_terminal() && op.state != GitPushOperationState::Running {
+            return Some(SyncError::GitPushHeld {
+                reason: "unfinished_write".into(),
+                detail: "an unfinished SVN-to-Git push is still active".into(),
+            });
+        }
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    fn git_push_fixture_flag(&self, var: &str, repo_id: &str) -> bool {
+        let scoped = format!("{}__{}", var, repo_id);
+        if std::env::var(&scoped).is_ok() {
+            return true;
+        }
+        std::env::var(var).ok().as_deref() == Some(repo_id)
+    }
+
     fn blocking_svn_commit_hold(&self, op: &SvnCommitOperation) -> Option<SyncError> {
         if op.state == SvnCommitOperationState::ReconciliationRequired && !op.resume_authorized {
             return Some(SyncError::SvnCommitHeld {
