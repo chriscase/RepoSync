@@ -9,12 +9,12 @@ use axum::Router;
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::db::Database;
+use reposync_core::errors::SyncError;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::import::ImportProgress;
 use reposync_core::models::Repository;
 use reposync_core::svn::SvnClient;
-use reposync_core::errors::SyncError;
 use reposync_core::sync_engine::SyncEngine;
 use reposync_web::api;
 use reposync_web::AppState;
@@ -268,7 +268,9 @@ token_env = ""
             .args(["rev-parse", "refs/heads/main"])
             .output()
             .unwrap();
-        let remote_before = String::from_utf8_lossy(&remote_before.stdout).trim().to_string();
+        let remote_before = String::from_utf8_lossy(&remote_before.stdout)
+            .trim()
+            .to_string();
         let mappings_before: i64 = engine
             .db()
             .conn()
@@ -296,7 +298,9 @@ token_env = ""
             .args(["rev-parse", "refs/heads/main"])
             .output()
             .unwrap();
-        let remote_after = String::from_utf8_lossy(&remote_after.stdout).trim().to_string();
+        let remote_after = String::from_utf8_lossy(&remote_after.stdout)
+            .trim()
+            .to_string();
         assert_ne!(remote_before, remote_after);
         assert_eq!(
             engine
@@ -310,7 +314,10 @@ token_env = ""
                 .unwrap(),
             mappings_before
         );
-        assert_eq!(engine.db().get_repo_watermark(repo_id).unwrap(), watermark_before);
+        assert_eq!(
+            engine.db().get_repo_watermark(repo_id).unwrap(),
+            watermark_before
+        );
 
         let op = engine
             .db()
@@ -320,11 +327,7 @@ token_env = ""
         assert_eq!(op.state, GitPushOperationState::ReconciliationRequired);
         drop(engine);
 
-        let repo_git = tmp
-            .path()
-            .join("repos")
-            .join(repo_id)
-            .join("git-repo");
+        let repo_git = tmp.path().join("repos").join(repo_id).join("git-repo");
         std::fs::create_dir_all(repo_git.parent().unwrap()).unwrap();
         git_cli(&bridge, &["clone", ".", repo_git.to_str().unwrap()]);
 
@@ -414,7 +417,9 @@ async fn candidate_rsc04_admin_reconcile_finalizes_lost_reply() {
         .args(["rev-parse", "refs/heads/main"])
         .output()
         .unwrap();
-    let remote_before = String::from_utf8_lossy(&remote_before.stdout).trim().to_string();
+    let remote_before = String::from_utf8_lossy(&remote_before.stdout)
+        .trim()
+        .to_string();
     let mappings_before: i64 = fixture
         .state
         .db

@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::db::import_operations::{
     import_target_fingerprint, ImportOperation, ImportOperationState, SnapshotPin,
 };
 use reposync_core::db::queries::AuditLogInput;
-use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::errors::DatabaseError;
@@ -2142,13 +2142,9 @@ async fn reconcile_git_push(
         .join("git-repo");
     let git = GitClient::new(&workdir)
         .map_err(|e| AppError::Internal(format!("git workdir unavailable: {e}")))?;
-    let reconciled = reposync_core::git_push::apply_git_push_reconciliation(
-        db,
-        &id,
-        &operation_id,
-        &git,
-    )
-    .map_err(import_write_error)?;
+    let reconciled =
+        reposync_core::git_push::apply_git_push_reconciliation(db, &id, &operation_id, &git)
+            .map_err(import_write_error)?;
     Ok(Json(serde_json::json!({
         "operation_id": requested.id,
         "previous_lifecycle": requested.state,

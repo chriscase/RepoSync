@@ -468,9 +468,10 @@ impl Database {
                     "stale or inactive svn-to-git push operation".into(),
                 ));
             }
-            let op = parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
-                DatabaseError::Other("missing svn-to-git push document".into())
-            })?)?;
+            let op =
+                parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
+                    DatabaseError::Other("missing svn-to-git push document".into())
+                })?)?;
             if op.repo_id != repo_id {
                 return Err(DatabaseError::Other(
                     "svn-to-git push repository mismatch".into(),

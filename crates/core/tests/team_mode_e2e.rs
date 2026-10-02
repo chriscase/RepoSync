@@ -6413,7 +6413,10 @@ async fn candidate_rsc04_mismatch_reconcile_stays_held_without_mutation() {
     git_cli(&fixture.bridge, &["fetch", "origin"]);
     std::fs::write(fixture.bridge.join("interference.txt"), "other\n").unwrap();
     git_cli(&fixture.bridge, &["add", "interference.txt"]);
-    git_cli(&fixture.bridge, &["commit", "-m", "Interfering Git advance"]);
+    git_cli(
+        &fixture.bridge,
+        &["commit", "-m", "Interfering Git advance"],
+    );
     git_cli(&fixture.bridge, &["push", "origin", "main"]);
     let git = GitClient::new(&fixture.bridge).unwrap();
     let result = reposync_core::git_push::apply_git_push_reconciliation(
@@ -6439,7 +6442,10 @@ async fn candidate_rsc04_mismatch_reconcile_stays_held_without_mutation() {
         held.state,
         reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
     );
-    assert_eq!(fixture.engine.db().get_repo_watermark(repo_id).unwrap(), watermark);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark
+    );
     assert_eq!(svn_to_git_mappings(fixture.engine.db(), repo_id), mappings);
     let blocked = fixture.engine.run_sync_cycle().await;
     assert!(
@@ -6491,7 +6497,10 @@ async fn candidate_rsc04_restart_held_until_reconcile() {
         held.state,
         reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
     );
-    assert_eq!(svn_to_git_mappings(fixture.engine.db(), repo_id), mappings_before);
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before
+    );
     let blocked = fixture.engine.run_sync_cycle().await;
     assert!(
         matches!(blocked, Err(SyncError::GitPushHeld { .. })),

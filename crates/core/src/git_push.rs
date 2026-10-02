@@ -21,17 +21,10 @@ pub fn observed_git_tree(git: &GitClient, sha: &str) -> Result<String, GitError>
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitPushInspect {
-    UniqueMatch {
-        git_sha: String,
-        git_tree: String,
-    },
+    UniqueMatch { git_sha: String, git_tree: String },
     AbsentUnchanged,
-    Conflict {
-        reason: String,
-    },
-    Unavailable {
-        reason: String,
-    },
+    Conflict { reason: String },
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -105,10 +98,7 @@ pub fn apply_git_push_reconciliation(
     if active.is_none() && requested.state == GitPushOperationState::Completed {
         return Ok(GitPushReconcileResult {
             inspect: GitPushInspect::UniqueMatch {
-                git_sha: requested
-                    .last_confirmed_git_sha
-                    .clone()
-                    .unwrap_or_default(),
+                git_sha: requested.last_confirmed_git_sha.clone().unwrap_or_default(),
                 git_tree: requested
                     .last_confirmed_git_tree
                     .clone()
@@ -177,7 +167,7 @@ pub fn apply_git_push_reconciliation(
                 })
             }
             Err(error) => Err(error),
-        }
+        },
         GitPushInspect::AbsentUnchanged => {
             let operation = db.authorize_svn_to_git_resume(
                 repo_id,
