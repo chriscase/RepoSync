@@ -413,6 +413,24 @@ impl Database {
         })
     }
 
+    pub fn note_git_push_reconciliation_reason(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        reason: &str,
+    ) -> Result<GitPushOperation, DatabaseError> {
+        self.update_git_push_operation(repo_id, op_id, |op| {
+            if op.state != GitPushOperationState::ReconciliationRequired {
+                return Err(DatabaseError::Other(
+                    "operation is not an active svn-to-git reconciliation hold".into(),
+                ));
+            }
+            op.outcome_detail = Some(reason.into());
+            op.resume_authorized = false;
+            Ok(())
+        })
+    }
+
     pub fn authorize_svn_to_git_resume(
         &self,
         repo_id: &str,
@@ -433,6 +451,59 @@ impl Database {
             op.resume_authorized = true;
             op.outcome_detail = Some(reason.into());
             Ok(())
+        })
+    }
+
+    pub fn finalize_verified_svn_to_git_push(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        observed_git_sha: &str,
+        observed_git_tree: &str,
+        fingerprint: &str,
+    ) -> Result<ReconciledGitPush, DatabaseError> {
+        self.transaction(|tx| {
+            if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
+                return Err(DatabaseError::Other(
+                    "stale or inactive svn-to-git push operation".into(),
+                ));
+            }
+            let op =
+                parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
+                    DatabaseError::Other("missing svn-to-git push document".into())
+                })?)?;
+            if op.repo_id != repo_id {
+                return Err(DatabaseError::Other(
+                    "svn-to-git push repository mismatch".into(),
+                ));
+            }
+            if op.state != GitPushOperationState::ReconciliationRequired {
+                return Err(DatabaseError::Other(
+                    "operation is not an active svn-to-git reconciliation hold".into(),
+                ));
+            }
+            if op.target_fingerprint != fingerprint {
+                return Err(DatabaseError::Other(
+                    "svn-to-git push target fingerprint changed".into(),
+                ));
+            }
+            if observed_git_sha != op.intended_local_git_sha {
+                return Err(DatabaseError::Other(
+                    "observed Git SHA differs from the recorded local intent".into(),
+                ));
+            }
+            if observed_git_tree != op.intended_local_git_tree {
+                return Err(DatabaseError::Other(
+                    "observed Git tree differs from the recorded local intent".into(),
+                ));
+            }
+            let svn_rev = op.source_svn_rev;
+            let operation = finalize_tx(tx, op, observed_git_sha, observed_git_tree, svn_rev)?;
+            Ok(ReconciledGitPush {
+                operation,
+                finalized: true,
+                resume_authorized: false,
+            })
         })
     }
 
@@ -536,6 +607,12 @@ impl Database {
         }
         Ok(())
     }
+}
+
+pub struct ReconciledGitPush {
+    pub operation: GitPushOperation,
+    pub finalized: bool,
+    pub resume_authorized: bool,
 }
 
 pub struct GitPushIntent<'a> {

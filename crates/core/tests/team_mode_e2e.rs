@@ -6325,3 +6325,211 @@ async fn candidate_rsc04_held_cycle_does_not_blind_repush() {
         })
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_unique_match_reconcile_finalizes_without_second_push() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-unique-reconcile").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "reconcile me\n",
+        "RS-C04 unique reconcile",
+    );
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let watermark_before = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let remote_after_push = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    let git = GitClient::new(&fixture.bridge).unwrap();
+    let result = reposync_core::git_push::apply_git_push_reconciliation(
+        fixture.engine.db(),
+        repo_id,
+        &op.id,
+        &git,
+    )
+    .unwrap();
+    assert!(result.finalized, "{result:?}");
+    assert_eq!(
+        result.operation.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::Completed
+    );
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_after_push
+    );
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    assert_ne!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark_before
+    );
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        !matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "completed reconcile must unblock the worker: {blocked:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_UNIQUE_MATCH",
+            "operation_id":op.id,
+            "remote_after_push":remote_after_push,
+            "finalized":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_mismatch_reconcile_stays_held_without_mutation() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-mismatch-reconcile").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "mismatch reconcile\n",
+        "RS-C04 mismatch reconcile",
+    );
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    let watermark = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let mappings = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    git_cli(&fixture.bridge, &["fetch", "origin"]);
+    std::fs::write(fixture.bridge.join("interference.txt"), "other\n").unwrap();
+    git_cli(&fixture.bridge, &["add", "interference.txt"]);
+    git_cli(
+        &fixture.bridge,
+        &["commit", "-m", "Interfering Git advance"],
+    );
+    git_cli(&fixture.bridge, &["push", "origin", "main"]);
+    let git = GitClient::new(&fixture.bridge).unwrap();
+    let result = reposync_core::git_push::apply_git_push_reconciliation(
+        fixture.engine.db(),
+        repo_id,
+        &op.id,
+        &git,
+    )
+    .unwrap();
+    assert!(!result.finalized);
+    assert!(!result.resume_authorized);
+    assert!(matches!(
+        result.inspect,
+        reposync_core::git_push::GitPushInspect::Conflict { .. }
+    ));
+    let held = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark
+    );
+    assert_eq!(svn_to_git_mappings(fixture.engine.db(), repo_id), mappings);
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "{blocked:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_MISMATCH_HELD",
+            "operation_id":op.id,
+            "finalized":false,
+            "watermark_unchanged":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc04_restart_held_until_reconcile() {
+    let fixture = QualifiedPair::new_with_repo_id("rsc04-restart-held").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "restart held\n",
+        "RS-C04 restart held",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let remote_after_push = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(remote_before, remote_after_push);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    fixture.engine.db().hold_interrupted_git_pushes().unwrap();
+    let held = fixture
+        .engine
+        .db()
+        .get_git_push_operation(repo_id, &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before
+    );
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "{blocked:?}"
+    );
+    let git = GitClient::new(&fixture.bridge).unwrap();
+    let reconciled = reposync_core::git_push::apply_git_push_reconciliation(
+        fixture.engine.db(),
+        repo_id,
+        &op.id,
+        &git,
+    )
+    .unwrap();
+    assert!(reconciled.finalized);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_after_push
+    );
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RSC04_RESTART_RECONCILE",
+            "operation_id":op.id,
+            "held_until_reconcile":true,
+            "finalized":true
+        })
+    );
+}
