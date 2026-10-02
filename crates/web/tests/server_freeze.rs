@@ -6052,12 +6052,34 @@ async fn snapshot_imported_parent() -> (
     );
     let status = wait_import_terminal(&client, &base).await;
     assert_eq!(status["lifecycle"], "completed", "{status}");
+    assert!(std::process::Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap()
+        .success());
     (addr, state, server, tmp, id, bare)
 }
 
 fn push_feature_commits(tmp: &std::path::Path, bare: &std::path::Path, n: usize) -> String {
     let work = clone_work(tmp, bare, "feature-work");
-    git_cmd(&work, &["checkout", "-b", "feature"]);
+    // Bare fixtures often keep unborn `master` as HEAD while the snapshot lives
+    // on `refs/heads/main`. Branch from that imported parent, not a new root.
+    git_cmd(
+        &work,
+        &[
+            "fetch",
+            "--",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    git_cmd(&work, &["checkout", "-B", "feature", "origin/main"]);
     for i in 1..=n {
         std::fs::write(work.join("feature.txt"), format!("step {i}\n")).unwrap();
         if i == 1 {
