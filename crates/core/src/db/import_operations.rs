@@ -36,6 +36,31 @@ impl ImportOperationState {
     }
 }
 
+/// Pinned SVN snapshot identity recorded once on a snapshot import.
+/// Old v1 import documents omit this field and deserialize as `None`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotPin {
+    pub svn_uuid: String,
+    pub canonical_url: String,
+    pub operative_rev: i64,
+    pub peg_rev: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_from_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_from_rev: Option<i64>,
+    /// Original request: `HEAD` or an explicit numeric revision.
+    pub requested: String,
+}
+
+impl SnapshotPin {
+    pub fn history_boundary(&self) -> String {
+        format!(
+            "SVN history before r{} was not imported; later revisions remain pending",
+            self.operative_rev
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportOperation {
     pub version: u8,
@@ -64,6 +89,9 @@ pub struct ImportOperation {
     pub intended_ref: Option<String>,
     pub intended_git_sha: Option<String>,
     pub outcome_detail: Option<String>,
+    /// Present for snapshot imports. Absent on pre-#68 full-import documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_pin: Option<SnapshotPin>,
 }
 
 // This is the original v1 fingerprint vocabulary. Keep its JSON representation
@@ -272,6 +300,7 @@ impl Database {
                 intended_ref: None,
                 intended_git_sha: None,
                 outcome_detail: None,
+                snapshot_pin: None,
             };
             write_value(
                 tx,
@@ -399,6 +428,58 @@ impl Database {
                 return Err(DatabaseError::Other("import no longer queued".into()));
             }
             op.state = ImportOperationState::Running;
+            Ok(())
+        })
+    }
+
+    pub fn mark_snapshot_import_request(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.update_import_operation(repo_id, op_id, |op| {
+            if !matches!(
+                op.state,
+                ImportOperationState::Queued | ImportOperationState::Running
+            ) {
+                return Err(DatabaseError::Other(
+                    "cannot mark snapshot mode on a terminal import".into(),
+                ));
+            }
+            op.operation_type = "snapshot_import".into();
+            op.total_revisions = Some(1);
+            Ok(())
+        })
+    }
+
+    /// Record the once-resolved snapshot pin on a queued or running import.
+    /// The pin is immutable after the first successful write.
+    pub fn pin_snapshot_import(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        pin: SnapshotPin,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.update_import_operation(repo_id, op_id, |op| {
+            if !matches!(
+                op.state,
+                ImportOperationState::Queued | ImportOperationState::Running
+            ) {
+                return Err(DatabaseError::Other(
+                    "cannot pin a snapshot on a terminal import".into(),
+                ));
+            }
+            if let Some(existing) = &op.snapshot_pin {
+                if existing != &pin {
+                    return Err(DatabaseError::Other(
+                        "snapshot pin already recorded and must not change".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            op.operation_type = "snapshot_import".into();
+            op.total_revisions = Some(1);
+            op.snapshot_pin = Some(pin);
             Ok(())
         })
     }
@@ -734,5 +815,46 @@ mod tests {
             .active_import_operation("repo-a")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn snapshot_pin_is_recorded_once_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("state.db")).unwrap();
+        db.initialize().unwrap();
+        let op = db
+            .create_import_operation("repo-s", "admin", "snap-1", "fingerprint")
+            .unwrap();
+        assert_eq!(op.operation_type, "full_import");
+        assert!(op.snapshot_pin.is_none());
+        let pin = SnapshotPin {
+            svn_uuid: "uuid-1".into(),
+            canonical_url: "file:///tmp/svn/trunk".into(),
+            operative_rev: 4,
+            peg_rev: 4,
+            copy_from_path: Some("/tags/cut".into()),
+            copy_from_rev: Some(3),
+            requested: "HEAD".into(),
+        };
+        let pinned = db
+            .pin_snapshot_import("repo-s", &op.id, pin.clone())
+            .unwrap();
+        assert_eq!(pinned.operation_type, "snapshot_import");
+        assert_eq!(pinned.snapshot_pin.as_ref(), Some(&pin));
+        assert_eq!(pinned.total_revisions, Some(1));
+        let changed = SnapshotPin {
+            operative_rev: 5,
+            ..pin.clone()
+        };
+        assert!(db.pin_snapshot_import("repo-s", &op.id, changed).is_err());
+        drop(db);
+        let reopened = Database::new(dir.path().join("state.db")).unwrap();
+        reopened.initialize().unwrap();
+        let loaded = reopened.latest_import_operation("repo-s").unwrap().unwrap();
+        assert_eq!(loaded.snapshot_pin.as_ref(), Some(&pin));
+        assert_eq!(
+            loaded.snapshot_pin.unwrap().history_boundary(),
+            pin.history_boundary()
+        );
     }
 }

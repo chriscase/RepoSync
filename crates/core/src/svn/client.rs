@@ -105,6 +105,18 @@ impl SvnClient {
         parse_svn_info(&output)
     }
 
+    /// `svn info` at a peg revision so identity is the selected snapshot,
+    /// not whatever HEAD has become.
+    #[instrument(skip(self), fields(url = %self.url, rev))]
+    pub async fn info_at_rev(&self, rev: i64) -> Result<SvnInfo, SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let peg_url = format!("{}@{}", self.url, rev);
+        let output = self.run_svn(&["info", "--xml", &peg_url]).await?;
+        parse_svn_info(&output)
+    }
+
     #[instrument(skip(self), fields(url = %self.url))]
     pub async fn log(&self, start_rev: i64, end_rev: i64) -> Result<Vec<SvnLogEntry>, SvnError> {
         let end_str = if end_rev < 0 {
@@ -333,7 +345,10 @@ impl SvnClient {
         };
         let rev_str = rev.to_string();
         let dest_str = dest.to_string_lossy().to_string();
-        self.run_svn(&["export", "--force", "-r", &rev_str, &src_url, &dest_str])
+        // Peg the path at `rev` so export stays on the pinned snapshot even
+        // if the live URL is later deleted, copied, or advanced.
+        let peg_url = format!("{}@{}", src_url, rev);
+        self.run_svn(&["export", "--force", "-r", &rev_str, &peg_url, &dest_str])
             .await?;
         info!(dest = %dest.display(), rev, "svn export completed");
         Ok(())

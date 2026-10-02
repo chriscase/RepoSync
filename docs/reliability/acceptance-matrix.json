@@ -3,10 +3,10 @@
   "epic": 61,
   "issue": 62,
   "reviewed_original_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "authored_against_main": "c2ab1d29535571a3ff12a9904ad6d2b1def9c137",
+  "authored_against_main": "43dda452dc38bc97991cd0830018d17bdbb31902",
   "deployed_version": "NOT ESTABLISHED",
   "goal_sha256": "16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8",
-  "scope": "Current-main #62 rollup after merged PR #72/#74/#75. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
   "harness_case_ids": [
     "EVIDENCE_SCAN_CLEAN",
     "EVIDENCE_SCAN_CANARY",
@@ -282,14 +282,23 @@
       "id": "R11",
       "title": "Snapshot at a pinned SVN revision",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "required_case_ids": [],
+      "candidate": "PARTIAL",
+      "tier": "actual_engine",
+      "required_case_ids": [
+        "R11_SNAPSHOT_FIXED_R",
+        "R11_PIN_HOLDS_AFTER_ADVANCE",
+        "R11_MISMATCHED_TARGET",
+        "R11_INVALID_REV"
+      ],
       "supporting_case_ids": [],
       "open": [
-        "Issue #68 is unimplemented in this catalog"
+        "Rich onboarding UI / wizard polish is later",
+        "Late-pair of a snapshot-derived branch is #67, not this slice",
+        "Optional reuse of a previously imported baseline is not implemented",
+        "Bidirectional incremental sync after snapshot is covered only by existing R01 cases on full-import baselines",
+        "Issue #68 remains open"
       ],
-      "evidence": "Personal snapshot import exists in production code and is not exercised here as an R11 required case. Default full import must stay unchanged (#68 / R12).",
+      "evidence": "Team snapshot init pins UUID/path/operative+peg revision once, materializes the selected SVN tree under file policy, verifies projected bytes, publishes through the #64 import journal, and records the verified baseline. R11_SNAPSHOT_FIXED_R imports r2 only (one Git commit, history.txt=first). R11_PIN_HOLDS_AFTER_ADVANCE keeps r3 after SVN advances. Mismatched non-empty Git targets and invalid revisions are refused without watermark advance. Status reports starting_revision/history_boundary and earlier_history_imported=false.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -301,14 +310,15 @@
       "required_case_ids": [
         "64A_ORDINARY",
         "74_APPLY_POSITIVE",
-        "74_LFS_POSITIVE"
+        "74_LFS_POSITIVE",
+        "R12_FULL_DEFAULT"
       ],
       "supporting_case_ids": [],
       "open": [
         "Installer/update-path full import of a deployed installation is NOT ESTABLISHED",
         "Personal full import is not in this catalog"
       ],
-      "evidence": "A real disposable full import completes with confirmed Git ref, cursors, and LFS pointer publication through supervised commands. reset=true remains refused. This does not qualify an unknown deployed binary.",
+      "evidence": "A real disposable full import completes with confirmed Git ref, cursors, and LFS pointer publication through supervised commands. reset=true remains refused. R12_FULL_DEFAULT proves omitted import_mode still replays every SVN revision (three Git commits on the history fixture). This does not qualify an unknown deployed binary.",
       "diagnostic_expected_baseline_failure": false
     },
     {

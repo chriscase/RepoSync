@@ -1,8 +1,9 @@
-//! Shared full-history import module.
+//! Shared full-history and snapshot import module.
 //!
 //! Provides [`run_full_import`] which replays every SVN revision as an
-//! individual Git commit, with identity mapping, file-policy enforcement
-//! (including LFS), and real-time progress reporting via [`ImportProgress`].
+//! individual Git commit, and [`run_snapshot_import`] which materializes one
+//! pinned SVN revision through the same file-policy helpers used by personal
+//! `ImportMode::Snapshot`.
 //!
 //! Also re-exports [`copy_tree_with_policy`] so both personal-mode and
 //! team-mode code can share the file-copy logic.
@@ -644,6 +645,200 @@ async fn import_lfs_command(
     let mut command = crate::process::import_git_command()?;
     command.args(args).current_dir(workdir);
     crate::process::run(command, Duration::from_secs(60), cancel).await
+}
+
+/// Materialize one pinned SVN snapshot, verify projected bytes, publish, and
+/// record the verified baseline. The pin must already be stored; this never
+/// re-resolves live HEAD.
+pub async fn run_snapshot_import(
+    svn_client: &SvnClient,
+    git_client: &Arc<std::sync::Mutex<GitClient>>,
+    db: &Database,
+    file_policy: &FilePolicy,
+    import_config: &ImportConfig,
+    pin: &crate::db::import_operations::SnapshotPin,
+    run_state: ImportRunState,
+) -> Result<ImportOutcome> {
+    let ImportRunState {
+        progress,
+        ws_broadcast,
+        repo_id,
+        operation_id,
+        cancel_signal,
+    } = run_state;
+
+    if stop_requested(&progress, cancel_signal.as_ref()).await {
+        let mut p = progress.write().await;
+        p.phase = ImportPhase::Cancelled;
+        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
+
+    {
+        let mut p = progress.write().await;
+        p.phase = ImportPhase::Importing;
+        p.current_rev = pin.operative_rev;
+        p.total_revs = 1;
+        p.push_log(format!(
+            "[info] snapshot pin uuid={} url={} r{} ({})",
+            pin.svn_uuid,
+            pin.canonical_url,
+            pin.operative_rev,
+            pin.history_boundary()
+        ));
+    }
+
+    let repo_path = {
+        let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
+        git.repo_path().to_path_buf()
+    };
+
+    if crate::snapshot::snapshot_workdir_is_born(&repo_path)? {
+        anyhow::bail!(
+            "existing non-empty Git workdir refuses snapshot overwrite; choose a new target"
+        );
+    }
+
+    #[cfg(feature = "reliability-fixture")]
+    if fixture_barrier(
+        "before_snapshot_export",
+        repo_id.as_deref(),
+        cancel_signal.as_ref(),
+    )
+    .await
+    {
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
+    if stop_requested(&progress, cancel_signal.as_ref()).await {
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
+
+    let stats =
+        crate::snapshot::materialize_snapshot(svn_client, &repo_path, file_policy, db, pin).await?;
+    {
+        let mut p = progress.write().await;
+        p.current_file_count = stats.copied as u64;
+        p.files_skipped = stats.skipped as u64;
+        p.push_log(format!(
+            "[info] materialized pinned r{} (copied={} skipped={})",
+            pin.operative_rev, stats.copied, stats.skipped
+        ));
+    }
+
+    let workdir_verify =
+        crate::snapshot::verify_projected_snapshot(svn_client, &repo_path, file_policy, db, pin)
+            .await?;
+    progress.write().await.verification = Some(workdir_verify.clone());
+
+    if stop_requested(&progress, cancel_signal.as_ref()).await {
+        return Ok(ImportOutcome::Cancelled { commits: 0 });
+    }
+
+    progress.write().await.phase = ImportPhase::Verifying;
+    let message = crate::snapshot::snapshot_commit_message(pin);
+    let sha = import_cli_commit(
+        &repo_path,
+        &message,
+        &import_config.committer_name,
+        &import_config.committer_email,
+        &import_config.committer_name,
+        &import_config.committer_email,
+        cancel_signal.as_ref(),
+    )
+    .await
+    .context("failed to create snapshot baseline Git commit")?
+    .to_string();
+
+    let projected =
+        crate::snapshot::project_snapshot_tree(svn_client, file_policy, db, pin).await?;
+    let commit_verify =
+        crate::snapshot::verify_commit_matches_projection(projected.path(), &repo_path, &sha)?;
+    {
+        let mut p = progress.write().await;
+        p.verification = Some(commit_verify);
+        p.commits_created = 1;
+        p.current_rev = pin.operative_rev;
+        p.push_log(format!(
+            "[ok] snapshot baseline {} at r{} (projected content verified)",
+            &sha[..8.min(sha.len())],
+            pin.operative_rev
+        ));
+    }
+
+    db.insert_commit_map(
+        pin.operative_rev,
+        &sha,
+        "svn_to_git",
+        "snapshot",
+        &format!(
+            "{} <{}>",
+            import_config.committer_name, import_config.committer_email
+        ),
+    )
+    .context("failed to persist snapshot baseline mapping")?;
+
+    if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+        db.note_import_local(repo, op, pin.operative_rev, &sha, 1, 1)
+            .context("failed to persist local snapshot baseline")?;
+        if stop_requested(&progress, cancel_signal.as_ref()).await {
+            return Ok(ImportOutcome::Cancelled { commits: 1 });
+        }
+        progress.write().await.phase = ImportPhase::FinalPush;
+        if let Err(reason) = publish_checked(
+            db,
+            repo,
+            op,
+            PublicationTarget {
+                workdir: &repo_path,
+                remote: &import_config.remote_name,
+                branch: &import_config.branch,
+                sha: &sha,
+                force: true,
+            },
+            cancel_signal.as_ref(),
+        )
+        .await
+        {
+            return Ok(ImportOutcome::ReconciliationRequired { commits: 1, reason });
+        }
+        progress.write().await.batches_pushed = 1;
+    }
+
+    db.insert_audit_log(
+        "import_snapshot",
+        Some("svn_to_git"),
+        Some(pin.operative_rev),
+        Some(&sha),
+        None,
+        Some(&format!(
+            "Snapshot import from SVN r{} ({})",
+            pin.operative_rev,
+            pin.history_boundary()
+        )),
+        true,
+    )
+    .ok();
+
+    if let Some(sender) = &ws_broadcast {
+        let p = progress.read().await;
+        let json = serde_json::json!({
+            "type": "import_progress",
+            "phase": "completed",
+            "current_rev": p.current_rev,
+            "total_revs": 1,
+            "commits_created": 1,
+            "import_mode": "snapshot",
+            "starting_revision": pin.operative_rev,
+            "history_boundary": pin.history_boundary(),
+        });
+        let _ = sender.send(json.to_string());
+    }
+
+    Ok(ImportOutcome::Completed {
+        commits: 1,
+        svn_rev: pin.operative_rev,
+        git_sha: sha,
+    })
 }
 
 pub async fn run_full_import(
