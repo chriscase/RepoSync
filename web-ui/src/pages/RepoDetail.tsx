@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, Link } from 'react-router-dom';
-import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry } from '../api';
+import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan } from '../api';
 import ImportProgressCard from '../components/ImportProgressCard';
 import ServerMonitor from '../components/ServerMonitor';
 import {
@@ -83,11 +83,12 @@ export default function RepoDetail() {
   const [branchForm, setBranchForm] = useState({
     svn_branch: '',
     git_branch: '',
-    skip_import: true,
+    skip_import: false,
     auto_create_svn_branch: true,
     auto_create_git_branch: true,
   });
   const [branchSuccess, setBranchSuccess] = useState(false);
+  const [branchPlan, setBranchPlan] = useState<LatePairPlan | null>(null);
 
   const { data: repo, isLoading, isError, error } = useQuery({
     queryKey: ['repo', id],
@@ -139,15 +140,15 @@ export default function RepoDetail() {
   });
 
   const branchMutation = useMutation({
-    mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean }) =>
-      api.createBranchPair(id!, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
-      queryClient.invalidateQueries({ queryKey: ['repos'] });
-      setShowBranchModal(false);
-      setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true });
+    mutationFn: (data: { svn_branch: string; git_branch: string; skip_import: boolean; auto_create_svn_branch: boolean; auto_create_git_branch: boolean }) =>
+      api.createBranchPair(id!, {
+        ...data,
+        dry_run: true,
+        preview: true,
+      }),
+    onSuccess: (plan) => {
+      setBranchPlan(plan);
       setBranchSuccess(true);
-      setTimeout(() => setBranchSuccess(false), 3000);
     },
   });
 
@@ -922,9 +923,12 @@ export default function RepoDetail() {
             </button>
           )}
         </div>
-        {branchSuccess && (
-          <div className="mx-6 mb-3 bg-green-900/30 border border-green-700 rounded-lg p-3 text-green-300 text-sm">
-            Branch pair created successfully.
+        {branchSuccess && branchPlan && (
+          <div className="mx-6 mb-3 bg-blue-900/30 border border-blue-700 rounded-lg p-3 text-blue-200 text-sm">
+            Preview only — pair stays preparing. Git tip {branchPlan.git_tip?.slice(0, 8) || 'unknown'},
+            SVN baseline r{branchPlan.svn_source_revision ?? '?'},
+            {branchPlan.pending_git.count} pending Git commit{branchPlan.pending_git.count === 1 ? '' : 's'}.
+            Replay/publish is not enabled in this slice.
           </div>
         )}
         {(branchPairs ?? []).length > 0 ? (
@@ -988,9 +992,9 @@ export default function RepoDetail() {
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-100">Create Branch</h2>
+              <h2 className="text-lg font-semibold text-gray-100">Preview Branch Pair</h2>
               <button
-                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true }); branchMutation.reset(); }}
+                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -999,7 +1003,19 @@ export default function RepoDetail() {
             <div className="p-6 space-y-4">
               {branchMutation.isError && (
                 <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
-                  Failed to create branch: {branchMutation.error?.message}
+                  Pairing refused: {branchMutation.error?.message}
+                </div>
+              )}
+              {branchPlan && (
+                <div className="bg-gray-900/70 border border-gray-600 rounded-lg p-3 text-xs text-gray-300 space-y-1 font-mono">
+                  <div>mode: {branchPlan.mode} · state: {branchPlan.pair_state}</div>
+                  <div>git tip: {branchPlan.git_tip || 'unknown'}</div>
+                  <div>SVN source: r{branchPlan.svn_source_revision ?? 'unknown'} · copy from r{branchPlan.proposed_svn_copy_source_revision ?? 'n/a'}</div>
+                  <div>pending Git: {branchPlan.pending_git.count} · published: {String(branchPlan.published)} · scheduler: {String(branchPlan.scheduler_active)}</div>
+                  {branchPlan.existing_svn_target.exists && (
+                    <div className="text-amber-300">existing SVN target is not equivalent</div>
+                  )}
+                  {branchPlan.skip_import_note && <div className="text-amber-200">{branchPlan.skip_import_note}</div>}
                 </div>
               )}
 
@@ -1089,18 +1105,8 @@ export default function RepoDetail() {
 
               {/* Import mode */}
               <div>
-                <label className="block text-sm text-gray-400 mb-2">Import Mode</label>
+                <label className="block text-sm text-gray-400 mb-2">Pairing mode</label>
                 <div className="space-y-2">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="importMode"
-                      checked={branchForm.skip_import}
-                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: true }))}
-                      className="text-blue-600"
-                    />
-                    <span className="text-sm text-gray-300">Start from now <span className="text-gray-500">(recommended)</span></span>
-                  </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
@@ -1109,14 +1115,24 @@ export default function RepoDetail() {
                       onChange={() => setBranchForm(prev => ({ ...prev, skip_import: false }))}
                       className="text-blue-600"
                     />
-                    <span className="text-sm text-gray-300">Import full history</span>
+                    <span className="text-sm text-gray-300">Preview from verified SVN baseline <span className="text-gray-500">(this slice)</span></span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="importMode"
+                      checked={branchForm.skip_import}
+                      onChange={() => setBranchForm(prev => ({ ...prev, skip_import: true }))}
+                      className="text-blue-600"
+                    />
+                    <span className="text-sm text-gray-300">Start from now <span className="text-amber-400">(unsafe — refused)</span></span>
                   </label>
                 </div>
               </div>
             </div>
             <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
-                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: true, auto_create_svn_branch: true, auto_create_git_branch: true }); branchMutation.reset(); }}
+                onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
               >
                 Cancel
@@ -1132,7 +1148,7 @@ export default function RepoDetail() {
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />
-                {branchMutation.isPending ? 'Creating...' : 'Create Branch'}
+                {branchMutation.isPending ? 'Previewing...' : 'Preview Pair'}
               </button>
             </div>
           </div>

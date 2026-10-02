@@ -23,6 +23,9 @@ use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress, ImportRunState};
+use reposync_core::late_pair::{
+    collect_verified_mappings, evaluate_admission, probe_svn_target, LatePairRequest,
+};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
@@ -2311,11 +2314,21 @@ struct CreateBranchPairRequest {
     git_branch: String,
     #[serde(default)]
     skip_import: bool,
+    /// Explicit compatibility flag for the historical skip_import / start-from-now
+    /// request. Even when set, this slice never applies watermarks or publishes.
+    #[serde(default)]
+    compatibility_skip_import: bool,
+    /// Preview/plan only. Defaults to true so this slice cannot publish.
+    #[serde(default = "default_true")]
+    dry_run: bool,
+    /// Alias for dry_run. When true, forces preview mode.
+    #[serde(default)]
+    preview: Option<bool>,
     /// Auto-create the SVN branch via `svn copy` from the parent's branch.
-    /// Defaults to true when not specified.
+    /// Ignored in preview; this slice does not copy.
     auto_create_svn_branch: Option<bool>,
     /// Auto-create the Git branch via the provider API from the parent's branch.
-    /// Defaults to true when not specified.
+    /// Ignored in preview; this slice does not create Git refs.
     auto_create_git_branch: Option<bool>,
 }
 
@@ -2454,178 +2467,39 @@ async fn create_branch_pair(
         )));
     }
 
-    // Auto-create SVN branch if requested (default: true)
-    let auto_svn = body.auto_create_svn_branch.unwrap_or(true);
-    let auto_git = body.auto_create_git_branch.unwrap_or(true);
-
-    if auto_svn {
-        let svn_password = db
-            .resolve_credential_chain(&parent.id, "secret_svn_password")
-            .unwrap_or_default();
-        let svn_client = SvnClient::new(&parent.svn_url, &parent.svn_username, &svn_password);
-        // Get current HEAD rev for the copy
-        let parent_svn_url = if parent.svn_branch.is_empty() {
-            parent.svn_url.clone()
-        } else {
-            format!(
-                "{}/{}",
-                parent.svn_url.trim_end_matches('/'),
-                parent.svn_branch.trim_start_matches('/')
-            )
-        };
-        let info_client = SvnClient::new(&parent_svn_url, &parent.svn_username, &svn_password);
-        match info_client.info().await {
-            Ok(info) => {
-                // Determine branches_path and branch name from svn_branch
-                // e.g., "branches/fix-123" → branches_path="branches", name="fix-123"
-                let (branches_path, branch_name) = if let Some(pos) = svn_branch.rfind('/') {
-                    (&svn_branch[..pos], &svn_branch[pos + 1..])
-                } else {
-                    ("branches", svn_branch.as_str())
-                };
-                match svn_client
-                    .create_branch(
-                        branch_name,
-                        &parent.svn_branch,
-                        branches_path,
-                        info.latest_rev,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        info!(
-                            branch = %svn_branch,
-                            from = %parent.svn_branch,
-                            rev = info.latest_rev,
-                            "auto-created SVN branch"
-                        );
-                    }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        // Treat "already exists" as success
-                        if err_str.contains("already exists") || err_str.contains("E160020") {
-                            info!(branch = %svn_branch, "SVN branch already exists, continuing");
-                        } else {
-                            return Err(AppError::Internal(format!(
-                                "failed to create SVN branch: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(AppError::Internal(format!(
-                    "failed to query SVN info for branch creation: {}",
-                    e
-                )));
-            }
-        }
-    }
-
-    // Auto-create Git branch if requested (default: true)
-    if auto_git {
-        let git_token = db
-            .resolve_credential_chain(&parent.id, "secret_git_token")
-            .unwrap_or_default();
-        let provider = match parent.git_provider.as_str() {
-            "gitea" => reposync_core::config::GitProvider::Gitea,
-            _ => reposync_core::config::GitProvider::GitHub,
-        };
-        let github_client = reposync_core::git::github::GitHubClient::new(
-            &parent.git_api_url,
-            &git_token,
-            provider,
-        );
-        match github_client
-            .create_branch(&parent.git_repo, &git_branch, &parent.git_branch)
-            .await
-        {
-            Ok(()) => {
-                info!(
-                    branch = %git_branch,
-                    from = %parent.git_branch,
-                    "auto-created Git branch"
-                );
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("already exists")
-                    || err_str.contains("Reference already exists")
-                {
-                    info!(branch = %git_branch, "Git branch already exists, continuing");
-                } else {
-                    return Err(AppError::Internal(format!(
-                        "failed to create Git branch: {}",
-                        e
-                    )));
-                }
-            }
-        }
-    }
-
-    let new_id = Uuid::new_v4().to_string();
-    let now = Utc::now().to_rfc3339();
-    // Build name: use root repo name + this branch name
-    let root_name = ancestors
-        .last()
-        .map(|r| r.name.as_str())
-        .unwrap_or(&parent.name);
-    let name = format!("{} / {}", root_name, git_branch);
-
-    let child = reposync_core::models::Repository {
-        id: new_id.clone(),
-        name,
-        svn_url: parent.svn_url.clone(),
-        svn_branch: svn_branch.clone(),
-        svn_username: parent.svn_username.clone(),
-        git_provider: parent.git_provider.clone(),
-        git_api_url: parent.git_api_url.clone(),
-        git_repo: parent.git_repo.clone(),
+    // #67 admission/preview: prove SVN-origin lineage before any copy,
+    // checkpoint, remote mutation, or scheduler-active child row.
+    let dry_run = body.preview.unwrap_or(body.dry_run);
+    let request = LatePairRequest {
+        parent_id: parent.id.clone(),
         git_branch: git_branch.clone(),
-        sync_mode: parent.sync_mode.clone(),
-        poll_interval_secs: parent.poll_interval_secs,
-        lfs_threshold_mb: parent.lfs_threshold_mb,
-        auto_merge: parent.auto_merge,
-        enabled: true,
-        created_by: parent.created_by.clone(),
-        parent_id: Some(parent.id.clone()),
-        created_at: now.clone(),
-        updated_at: now,
-        last_svn_rev: 0,
-        last_git_sha: String::new(),
-        last_sync_at: None,
-        sync_status: "idle".to_string(),
-        total_syncs: 0,
-        total_errors: 0,
-        allowed_paths: parent.allowed_paths.clone(),
-        blocked_patterns: parent.blocked_patterns.clone(),
-        consecutive_errors: 0,
-        teams_webhook_url: parent.teams_webhook_url.clone(),
+        svn_branch: svn_branch.clone(),
+        skip_import: body.skip_import,
+        compatibility_skip_import: body.compatibility_skip_import,
+        dry_run,
     };
+    let mappings = collect_verified_mappings(db, &parent.id)
+        .map_err(|e| AppError::Internal(format!("failed to read verified mappings: {e}")))?;
+    let git_workdir = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(&parent.id)
+        .join("git-repo");
+    let workdir = git_workdir
+        .join(".git")
+        .exists()
+        .then_some(git_workdir.as_path())
+        .or_else(|| {
+            git_workdir
+                .join("HEAD")
+                .exists()
+                .then_some(git_workdir.as_path())
+        });
 
-    db.insert_repository(&child)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
-    // skip_import: set watermarks to current state so we start from now
-    if body.skip_import {
-        let svn_url = format!(
-            "{}/{}",
-            parent.svn_url.trim_end_matches('/'),
-            svn_branch.trim_start_matches('/')
-        );
-
-        // Read credentials via ancestor chain
-        let svn_password = db.resolve_credential_chain(&parent.id, "secret_svn_password");
-
-        let svn_client = SvnClient::new(
-            &svn_url,
-            &parent.svn_username,
-            svn_password.as_deref().unwrap_or(""),
-        );
-
-        // Get the current HEAD SHA of the new Git branch so the sync engine
-        // doesn't try to replay every commit from the start of history.
+    let mut provider_tip = None;
+    if workdir.is_none() && !mappings.is_empty() {
         let git_token = db
             .resolve_credential_chain(&parent.id, "secret_git_token")
             .unwrap_or_default();
@@ -2638,81 +2512,92 @@ async fn create_branch_pair(
             &git_token,
             provider,
         );
-        let git_head_sha = match github_client
+        if let Ok(sha) = github_client
             .get_branch_sha(&parent.git_repo, &git_branch)
             .await
         {
-            Ok(sha) => sha,
-            Err(e) => {
-                warn!(
-                    repo_id = %new_id,
-                    error = %e,
-                    "could not query Git HEAD SHA for skip_import; git watermark not set"
-                );
-                String::new()
-            }
-        };
-
-        match svn_client.info().await {
-            Ok(svn_info) => {
-                let latest_rev = svn_info.latest_rev;
-                if let Err(e) = db.update_repo_watermark(&new_id, latest_rev, &git_head_sha) {
-                    warn!(repo_id = %new_id, error = %e, "failed to set watermark for branch pair");
-                } else {
-                    info!(
-                        repo_id = %new_id,
-                        latest_rev,
-                        git_head_sha = %git_head_sha,
-                        "Branch pair created in 'start from now' mode, watermark set to r{} / {}",
-                        latest_rev,
-                        &git_head_sha[..8.min(git_head_sha.len())]
-                    );
-                }
-            }
-            Err(e) => {
-                warn!(
-                    repo_id = %new_id,
-                    error = %e,
-                    "could not query SVN info for skip_import; watermark not set"
-                );
-            }
+            provider_tip = Some(sha);
         }
     }
 
-    // Return the newly created repo
-    let created = db
-        .get_repository(&new_id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::Internal("failed to read back created branch pair".into()))?;
+    let admission = evaluate_admission(&mappings, workdir, provider_tip.as_deref(), &request);
+    let mut plan = match admission {
+        Ok(plan) => plan,
+        Err(refuse) => {
+            info!(
+                parent_id = %parent.id,
+                reason = %refuse.reason,
+                "late-pair admission refused before remote mutation"
+            );
+            return Err(AppError::BadRequest(refuse.error_message()));
+        }
+    };
 
-    // Broadcast branch creation event (Teams + WebSocket)
-    let branch_event = serde_json::json!({
-        "type": "branch_pair_created",
-        "repo_name": created.name,
-        "git_branch": created.git_branch,
-        "svn_branch": created.svn_branch,
-    });
-    let _ = state.ws_broadcast.send(branch_event.to_string());
-
-    // Send Teams notification directly (for events not in ws_broadcast listener)
-    let teams_url = db
-        .get_state("teams_webhook_url")
-        .ok()
-        .flatten()
-        .filter(|v| !v.is_empty());
-    if let Some(url) = teams_url {
-        let card = reposync_core::notify::teams::format_branch_created(
-            &created.name,
-            &created.git_branch,
-            &created.svn_branch,
+    attach_svn_probe(&parent, db, &mut plan).await;
+    if body.auto_create_svn_branch.unwrap_or(true) || body.auto_create_git_branch.unwrap_or(true) {
+        plan.unknowns.push(
+            "auto_create_svn_branch / auto_create_git_branch are ignored in this preview slice; no remote refs are created".into(),
         );
-        let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);
-        let _ = notifier.send_card(card).await;
     }
+    info!(
+        parent_id = %parent.id,
+        git_branch = %git_branch,
+        svn_branch = %svn_branch,
+        git_tip = ?plan.git_tip,
+        baseline = ?plan.svn_source_revision,
+        "late-pair preview admitted; no child row or remote mutation"
+    );
 
-    Ok(Json(serde_json::to_value(created).map_err(|e| {
+    Ok(Json(serde_json::to_value(&plan).map_err(|e| {
         AppError::Internal(format!("serialization error: {}", e))
     })?))
+}
+
+async fn attach_svn_probe(
+    parent: &reposync_core::models::Repository,
+    db: &Database,
+    plan: &mut reposync_core::late_pair::LatePairPlan,
+) {
+    let svn_password = db
+        .resolve_credential_chain(&parent.id, "secret_svn_password")
+        .unwrap_or_default();
+    let parent_svn_url = if parent.svn_branch.is_empty() {
+        parent.svn_url.clone()
+    } else {
+        format!(
+            "{}/{}",
+            parent.svn_url.trim_end_matches('/'),
+            parent.svn_branch.trim_start_matches('/')
+        )
+    };
+    let target_url = format!(
+        "{}/{}",
+        parent.svn_url.trim_end_matches('/'),
+        plan.svn_branch.trim_start_matches('/')
+    );
+    let parent_client = SvnClient::new(&parent_svn_url, &parent.svn_username, &svn_password);
+    let target_client = SvnClient::new(&target_url, &parent.svn_username, &svn_password);
+    let (probe, pending) = probe_svn_target(
+        &parent_client,
+        &target_client,
+        &parent_svn_url,
+        &target_url,
+        plan.svn_source_revision,
+    )
+    .await;
+    plan.existing_svn_target = probe;
+    plan.pending_svn = pending;
+    plan.svn_target_revision = plan.existing_svn_target.revision;
+    if plan.existing_svn_target.exists {
+        plan.unknowns.push(
+            "existing SVN target is not treated as equivalent; reconcile/replay is later".into(),
+        );
+        plan.proposed_svn_copy_source_revision = None;
+        plan.conflicts.push(
+            "existing SVN target requires lineage/tree verification before any copy or checkpoint"
+                .into(),
+        );
+    }
 }
 
 async fn list_branch_pairs(

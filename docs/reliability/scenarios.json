@@ -1,7 +1,7 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "authored_against_main": "43dda452dc38bc97991cd0830018d17bdbb31902",
-  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
+  "authored_against_main": "4f985a24d1fede55bde88b521800ae9e5db0f5a3",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81 plus #67 admission/preview. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
   "scenarios": [
     {
       "id": "R01",
@@ -46,25 +46,25 @@
     {
       "id": "R06",
       "baseline": "FAIL",
-      "candidate": "NOT RUN",
-      "tier": "actual_engine",
-      "evidence": "R06_CHECKPOINT is a baseline_observation: after a real SVN import the fixture manually assigns a child checkpoint and shows two descendant Git commits omitted. R02_R03_ROUTE also records skip_import of a Git-first feature tip with no feature.txt in SVN and an empty commit_map. Those are reproductions, not candidate acceptance.",
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Candidate admission/preview proves an SVN-derived tip is planned with pinned Git tip and baseline SVN revision, snapshot-bounded ancestry is enough, unsafe skip_import is refused without watermark writes, an existing SVN target is not treated as equivalent, and dry_run=false does not insert a scheduler-active child. Replay and publish stay later.",
       "diagnostic_expected_baseline_failure": true
     },
     {
       "id": "R07",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Not executed on current main. The ignored team conflict control remains uncovered (#73).",
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "evidence": "R06_EXISTING_TARGET_NOT_EQUIVALENT probes an already-copied SVN feature path read-only, reports equivalent=false, and does not svn copy or advance youngest. Full R07 dual-side reconcile remains #67 follow-up. The ignored team conflict control remains uncovered (#73).",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R08",
       "baseline": "PARTIAL",
-      "candidate": "NOT RUN",
-      "tier": "local_api",
-      "evidence": "The API fixture in R02_R03_ROUTE accepts an unrelated Git-first feature branch via skip_import and stores the provider tip. That is a baseline admission diagnostic, not a candidate rejection. R09 rejects rewrites of already-handled SVN-origin history; it is not a Git-first pairing test.",
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "evidence": "R08_REFUSE_GIT_FIRST imports a verified snapshot baseline then refuses an orphan Git-first branch with unrelated_git_first before SVN copy, child insert, or checkpoint write. R02_R03_ROUTE now refuses skip_import of an unimported Git-first feature (missing_baseline) instead of recording the provider tip. Commit-message trailers are not treated as proof (core unit).",
       "diagnostic_expected_baseline_failure": true
     },
     {

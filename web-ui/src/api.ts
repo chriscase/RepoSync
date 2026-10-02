@@ -89,6 +89,49 @@ export interface SyncRecordResponse {
   total: number;
 }
 
+export interface LatePairPlan {
+  mode: string;
+  published: boolean;
+  admitted: boolean;
+  pair_state: string;
+  scheduler_active: boolean;
+  policy_version: string;
+  parent_id: string;
+  git_branch: string;
+  svn_branch: string;
+  git_tip: string | null;
+  svn_source_revision: number | null;
+  svn_target_revision: number | null;
+  verified_baseline: {
+    git_sha: string;
+    svn_revision: number;
+    evidence: string;
+  } | null;
+  baseline_missing_reason: string | null;
+  inherited_work: string[];
+  pending_git: { count: number; summary: string[] };
+  pending_svn: {
+    knowable: boolean;
+    parent_head_revision: number | null;
+    baseline_revision: number | null;
+    note: string;
+  };
+  conflicts: string[];
+  unknowns: string[];
+  proposed_svn_copy_source_revision: number | null;
+  existing_svn_target: {
+    exists: boolean;
+    equivalent: boolean;
+    uuid: string | null;
+    revision: number | null;
+    url: string;
+    note: string;
+  };
+  skip_import_requested: boolean;
+  skip_import_applied: boolean;
+  skip_import_note: string;
+}
+
 export interface ConfigResponse {
   daemon: { poll_interval_secs: number; log_level: string; data_dir: string };
   svn: { url: string; username: string; password: string; trunk_path: string };
@@ -322,11 +365,14 @@ export const api = {
   createBranchPair: (repoId: string, data: {
     svn_branch: string;
     git_branch: string;
-    skip_import: boolean;
+    skip_import?: boolean;
+    compatibility_skip_import?: boolean;
+    dry_run?: boolean;
+    preview?: boolean;
     auto_create_svn_branch?: boolean;
     auto_create_git_branch?: boolean;
   }) =>
-    fetchJson<Repository>(`/repos/${repoId}/branches`, { method: 'POST', body: JSON.stringify(data) }),
+    fetchJson<LatePairPlan>(`/repos/${repoId}/branches`, { method: 'POST', body: JSON.stringify(data) }),
 
   listBranchPairs: (repoId: string) =>
     fetchJson<Repository[]>(`/repos/${repoId}/branches`),
