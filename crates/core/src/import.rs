@@ -186,9 +186,29 @@ pub fn copy_tree_with_policy(
     let mut stats = CopyStats::default();
     let mut visited = HashSet::new();
     admit_export_root(src, &mut visited)?;
-    copy_tree_policy_inner(src, dst, dst, src, policy, db, &mut stats, &mut visited)?;
+    let mut ctx = CopyTreePolicyCtx {
+        dst_root: dst,
+        export_root: src,
+        policy,
+        db,
+        stats: &mut stats,
+        visited: &mut visited,
+    };
+    copy_tree_policy_inner(src, dst, &mut ctx)?;
     record_copy_exclusions(db, &stats);
     Ok(stats)
+}
+
+/// Shared no-follow copy context. Kept off the recursive signature so
+/// `copy_tree_policy_inner` stays under the clippy argument limit without
+/// changing traversal, rejection, or publish behavior.
+struct CopyTreePolicyCtx<'a> {
+    dst_root: &'a Path,
+    export_root: &'a Path,
+    policy: &'a FilePolicy,
+    db: &'a Database,
+    stats: &'a mut CopyStats,
+    visited: &'a mut HashSet<(u64, u64)>,
 }
 
 fn record_copy_exclusions(db: &Database, stats: &CopyStats) {
@@ -265,16 +285,7 @@ fn admit_export_root(src: &Path, visited: &mut HashSet<(u64, u64)>) -> Result<()
     Ok(())
 }
 
-fn copy_tree_policy_inner(
-    src: &Path,
-    dst: &Path,
-    dst_root: &Path,
-    export_root: &Path,
-    policy: &FilePolicy,
-    db: &Database,
-    stats: &mut CopyStats,
-    visited: &mut HashSet<(u64, u64)>,
-) -> Result<()> {
+fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_>) -> Result<()> {
     let entries = std::fs::read_dir(src)
         .with_context(|| format!("failed to read directory: {}", src.display()))?;
 
@@ -284,7 +295,7 @@ fn copy_tree_policy_inner(
         let src_path = entry.path();
         let dst_path = dst.join(&file_name);
         let rel = src_path
-            .strip_prefix(export_root)
+            .strip_prefix(ctx.export_root)
             .unwrap_or(&src_path)
             .to_string_lossy()
             .replace('\\', "/");
@@ -300,8 +311,8 @@ fn copy_tree_policy_inner(
         if is_reserved_vcs_metadata(&file_name) {
             let reason = format!("reserved:{rel}");
             info!(path = rel.as_str(), "excluding reserved VCS metadata");
-            stats.reserved_excluded += 1;
-            stats.exclusions.push(reason);
+            ctx.stats.reserved_excluded += 1;
+            ctx.stats.exclusions.push(reason);
             continue;
         }
 
@@ -316,7 +327,7 @@ fn copy_tree_policy_inner(
         }
         if ft.is_dir() {
             if let Some(id) = dir_identity(&meta) {
-                if !visited.insert(id) {
+                if !ctx.visited.insert(id) {
                     bail!("cycle detected at '{rel}': refusing to re-enter directory");
                 }
             }
@@ -325,16 +336,7 @@ fn copy_tree_policy_inner(
                     format!("failed to create directory: {}", dst_path.display())
                 })?;
             }
-            copy_tree_policy_inner(
-                &src_path,
-                &dst_path,
-                dst_root,
-                export_root,
-                policy,
-                db,
-                stats,
-                visited,
-            )?;
+            copy_tree_policy_inner(&src_path, &dst_path, ctx)?;
             continue;
         }
         if !ft.is_file() {
@@ -344,20 +346,20 @@ fn copy_tree_policy_inner(
             );
         }
         if is_hardlink_alias(&meta) {
-            reject_hardlink_alias(db, stats, &rel)?;
+            reject_hardlink_alias(ctx.db, ctx.stats, &rel)?;
         }
 
         // Size comes from no-follow metadata; never call evaluate_path (it follows).
-        let decision = policy.evaluate(&rel, meta.len());
+        let decision = ctx.policy.evaluate(&rel, meta.len());
         match &decision {
             FilePolicyDecision::Allow => {
                 copy_regular_file_no_follow(&src_path, &dst_path, &meta)?;
-                stats.copied += 1;
+                ctx.stats.copied += 1;
             }
             FilePolicyDecision::LfsTrack { size, threshold } => {
                 copy_regular_file_no_follow(&src_path, &dst_path, &meta)?;
                 let pattern = crate::lfs::pattern_for_path(&rel);
-                if let Err(e) = crate::lfs::ensure_lfs_tracked(dst_root, &pattern) {
+                if let Err(e) = crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern) {
                     warn!(
                         path = rel.as_str(),
                         pattern = pattern.as_str(),
@@ -373,8 +375,8 @@ fn copy_tree_policy_inner(
                         "LFS: file copied and .gitattributes updated"
                     );
                 }
-                stats.copied += 1;
-                stats.lfs_tracked += 1;
+                ctx.stats.copied += 1;
+                ctx.stats.lfs_tracked += 1;
             }
             FilePolicyDecision::Ignored { pattern } => {
                 warn!(
@@ -382,16 +384,16 @@ fn copy_tree_policy_inner(
                     pattern = pattern.as_str(),
                     "file ignored by policy — not copied to Git"
                 );
-                stats.skipped += 1;
-                stats.exclusions.push(format!("policy:ignored:{rel}"));
+                ctx.stats.skipped += 1;
+                ctx.stats.exclusions.push(format!("policy:ignored:{rel}"));
             }
             FilePolicyDecision::Oversize { size, limit } => {
                 warn!(
                     path = rel.as_str(),
                     size, limit, "file exceeds max_file_size — not copied to Git"
                 );
-                stats.skipped += 1;
-                stats.exclusions.push(format!("policy:oversize:{rel}"));
+                ctx.stats.skipped += 1;
+                ctx.stats.exclusions.push(format!("policy:oversize:{rel}"));
             }
         }
     }
