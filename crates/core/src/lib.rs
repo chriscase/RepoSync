@@ -13,6 +13,7 @@ pub mod db;
 pub mod errors;
 pub mod file_policy;
 pub mod git;
+pub mod history_inspect;
 pub mod identity;
 pub mod import;
 pub mod ldap_auth;

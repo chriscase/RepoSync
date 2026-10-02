@@ -223,15 +223,18 @@
         "R09_LOCAL",
         "R09_IGNORED_FILE_COLLISION",
         "R09_IGNORED_DIRECTORY_COLLISION",
-        "R09_READONLY_INDEX"
+        "R09_READONLY_INDEX",
+        "R09_POLLING_ONLY",
+        "R09_DURABLE_BLOCK",
+        "R09_PERSONAL",
+        "R09_WEBHOOK_FORCED_HINT"
       ],
       "supporting_case_ids": [],
       "open": [
         "Automatic rebase/reconciliation of rewritten history is not implemented",
-        "Webhook forced is a hint only; polling is the safety gate",
-        "Personal-mode rewrite containment is not in this catalog"
+        "Issue #66 remains open until remaining rewrite/unproven-history cases (merge DAG replay, >1000 continuation, live acceptance) are reviewed"
       ],
-      "evidence": "Baseline replacement of an already-handled SHA writes another SVN revision. Candidate independent developer/bridge/bare-remote replacement and metadata-only amend reject with non_fast_forward before reset, with repeat/reopen and remote/SVN/checkpoint/mapping preservation. Local dirty index, unpublished commits, and ignored-path collisions are retained.",
+      "evidence": "Baseline replacement of an already-handled SHA writes another SVN revision. Candidate independent developer/bridge/bare-remote replacement and metadata-only amend reject with non_fast_forward before reset, with repeat/reopen and remote/SVN/checkpoint/mapping preservation. Polling-only force-push is a named case. A durable reconciliation_required block survives restart after the live remote is restored to equal-looking original history. Personal-mode Git→SVN uses the same P/O/R/L inspect. Webhook forced is parsed as a hint and triggers the same polling inspection; it does not reset. Local dirty index, unpublished commits, and ignored-path collisions are retained.",
       "diagnostic_expected_baseline_failure": true
     },
     {

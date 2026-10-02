@@ -659,15 +659,15 @@ impl QualifiedPair {
             .db()
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair'",
-                [],
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+                [&self.repo_id],
                 |row| row.get(0),
             )
             .unwrap();
         let repo_sync_count = self
             .engine
             .db()
-            .get_repository("pair")
+            .get_repository(&self.repo_id)
             .unwrap()
             .unwrap()
             .total_syncs;
@@ -684,8 +684,12 @@ impl QualifiedPair {
             bridge_index,
             bridge_status,
             bridge_feature: std::fs::read_to_string(self.bridge.join("feature.txt")).ok(),
-            watermark: self.engine.db().get_repo_watermark("pair").unwrap(),
-            kv_cursor: self.engine.db().get_state("last_git_sha_pair").unwrap(),
+            watermark: self.engine.db().get_repo_watermark(&self.repo_id).unwrap(),
+            kv_cursor: self
+                .engine
+                .db()
+                .get_state(&format!("last_git_sha_{}", self.repo_id))
+                .unwrap(),
             mapping_count,
             repo_sync_count,
         }
@@ -726,7 +730,7 @@ async fn assert_pair_blocked_without_damage(fixture: &QualifiedPair, reason: &st
         &fixture
             .engine
             .db()
-            .get_state("team_history_block_pair")
+            .get_state(&format!("team_history_block_{}", fixture.repo_id))
             .unwrap()
             .unwrap(),
     )
@@ -1053,7 +1057,7 @@ async fn run_candidate_r09_rewrite(metadata_only_amend: bool) {
         &fixture
             .engine
             .db()
-            .get_state("team_history_block_pair")
+            .get_state(&format!("team_history_block_{}", fixture.repo_id))
             .unwrap()
             .unwrap(),
     )
@@ -1087,6 +1091,161 @@ async fn candidate_r09_changed_content_rewrite_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r09_metadata_amend_rejected() {
     run_candidate_r09_rewrite(true).await;
+}
+
+fn unique_pair_id(label: &str) -> String {
+    format!("{label}-{}", uuid::Uuid::new_v4().simple())
+}
+
+fn history_block_json(fixture: &QualifiedPair) -> serde_json::Value {
+    serde_json::from_str(
+        &fixture
+            .engine
+            .db()
+            .get_state(&format!("team_history_block_{}", fixture.repo_id))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Named polling-only force-push: no webhook is delivered; inspection still
+/// refuses the rewrite before reset/replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_polling_only_force_push() {
+    let repo_id = unique_pair_id("r09-poll");
+    let fixture = QualifiedPair::new_with_repo_id(&repo_id).await;
+    let old_synced = fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    git_cli(
+        &fixture.developer,
+        &["reset", "--hard", &fixture.imported_base],
+    );
+    fixture.developer_commit(
+        "feature.txt",
+        "rewritten version\n",
+        "Polling-only replacement",
+    );
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    let replacement = get_head_sha(&fixture.developer);
+    let before = fixture.snapshot().await;
+    assert_pair_blocked_without_damage(&fixture, "non_fast_forward").await;
+    let block = history_block_json(&fixture);
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(block["durable"], true);
+    assert_eq!(block["p_handled"], old_synced);
+    assert_eq!(block["r_fresh_remote"], replacement);
+    assert_eq!(fixture.snapshot().await, before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_POLLING_ONLY", "webhook":false, "p":old_synced,
+            "r":replacement, "reason":"non_fast_forward",
+            "durable":true, "svn_revision_before_after":before.svn_rev,
+            "remote_tree_before_after":before.remote_tree,
+            "watermark_before_after":before.watermark,
+            "mapping_count_before_after":before.mapping_count
+        })
+    );
+}
+
+/// Durable quarantine must survive restart after the live remote is restored
+/// to the original handled SHA. Re-inspection would admit; the block must not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_durable_block_survives_restored_remote() {
+    let repo_id = unique_pair_id("r09-durable");
+    let fixture = QualifiedPair::new_with_repo_id(&repo_id).await;
+    let old_synced = fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    git_cli(
+        &fixture.developer,
+        &["reset", "--hard", &fixture.imported_base],
+    );
+    fixture.developer_commit(
+        "feature.txt",
+        "equal looking rewrite\n",
+        "Different provenance",
+    );
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    let rewritten = get_head_sha(&fixture.developer);
+    assert_ne!(rewritten, old_synced);
+    assert_pair_blocked_without_damage(&fixture, "non_fast_forward").await;
+    let blocked_record = history_block_json(&fixture);
+    assert_eq!(blocked_record["p_handled"], old_synced);
+    assert_eq!(blocked_record["r_fresh_remote"], rewritten);
+    assert_eq!(blocked_record["durable"], true);
+    let quarantined = fixture.snapshot().await;
+
+    git_cli(&fixture.developer, &["reset", "--hard", &old_synced]);
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        old_synced,
+        "live remote restored to the original handled SHA"
+    );
+
+    let restarted = reopen_pair(&fixture);
+    let result = restarted.run_sync_cycle().await;
+    assert!(
+        matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "non_fast_forward"),
+        "restored remote must still be refused from the durable block: {result:?}"
+    );
+    assert_eq!(
+        fixture.snapshot().await.svn_rev,
+        quarantined.svn_rev,
+        "SVN must not advance after restored-looking fetch"
+    );
+    assert_eq!(fixture.snapshot().await.watermark, quarantined.watermark);
+    assert_eq!(
+        fixture.snapshot().await.mapping_count,
+        quarantined.mapping_count
+    );
+    assert_eq!(
+        git_output(&fixture.bridge, &["rev-parse", "HEAD"]),
+        quarantined.bridge_sha,
+        "bridge must not reset after restored remote"
+    );
+    let still = history_block_json(&fixture);
+    assert_eq!(still["state"], "reconciliation_required");
+    assert_eq!(still["p_handled"], old_synced);
+    assert_eq!(
+        still["r_fresh_remote"], rewritten,
+        "original rewritten R must be retained; a later identical fetch is not new authority"
+    );
+    assert_eq!(
+        restarted.db().get_state("sync_state").unwrap().as_deref(),
+        Some("reconciliation_required")
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_DURABLE_BLOCK", "p":old_synced, "blocked_r":rewritten,
+            "restored_remote":old_synced, "live_remote_matches_p":true,
+            "reason":"non_fast_forward", "durable":true,
+            "restart_without_live_rewrite":true,
+            "svn_revision_before_after":quarantined.svn_rev,
+            "watermark_before_after":quarantined.watermark,
+            "mapping_count_before_after":quarantined.mapping_count
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

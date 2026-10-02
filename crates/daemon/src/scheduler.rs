@@ -152,9 +152,10 @@ impl Scheduler {
                         }
                     }
                 }
-                // Webhook-triggered immediate sync
+                // Webhook-triggered immediate sync. GitHub `forced` is only a
+                // hint on the webhook; this runs the same inspection as polling.
                 Some(()) = self.sync_rx.recv() => {
-                    info!("immediate sync requested via webhook");
+                    info!("immediate sync requested via webhook (same polling inspection)");
                     self.maybe_run_repo_cycles().await;
                     // Reset the interval so we don't sync again too soon
                     interval.reset();

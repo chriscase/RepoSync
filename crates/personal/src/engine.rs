@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use reposync_core::db::Database;
 use reposync_core::git::client::GitClient;
 use reposync_core::git::github::GitHubClient;
+use reposync_core::history_inspect::inspect_personal_history;
 use reposync_core::models::PersonalSyncStats;
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
@@ -123,6 +124,24 @@ impl PersonalSyncEngine {
             started_at: Some(chrono::Utc::now()),
             ..Default::default()
         };
+
+        // Same P/O/R/L inspection as team Git→SVN, before any reset/replay.
+        if let Err(e) = self.inspect_git_history() {
+            self.set_state(PersonalSyncState::Error);
+            error!(error = %e, "personal Git history inspection blocked");
+            self.db
+                .insert_audit_log(
+                    "history_blocked",
+                    Some("git_to_svn"),
+                    None,
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                    false,
+                )
+                .ok();
+            return Err(e);
+        }
 
         // Phase 1: SVN → Git
         self.set_state(PersonalSyncState::PollingSvn);
@@ -252,6 +271,26 @@ impl PersonalSyncEngine {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         info!(from = %*state, to = %new_state, "state transition");
         *state = new_state;
+    }
+
+    /// Inspect the configured Git branch against the last handled SHA before
+    /// SVN→Git or Git→SVN writes. Webhook `forced` is not consulted here.
+    fn inspect_git_history(&self) -> Result<()> {
+        let git_path = {
+            let git = self
+                .git_client
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            git.repo_path().to_path_buf()
+        };
+        inspect_personal_history(
+            &self.db,
+            &git_path,
+            &self.config.github.default_branch,
+            "personal",
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!(e))
     }
 }
 
