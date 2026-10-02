@@ -117,7 +117,11 @@ pub fn normalize_svn_path(path: &str) -> String {
     git_intent_path(path)
 }
 
-async fn hash_exported_revision(svn: &SvnClient, revision: i64) -> Result<String, SvnError> {
+/// Re-read the regular-file tree hash for an exact SVN revision export.
+pub async fn observed_svn_tree_at_revision(
+    svn: &SvnClient,
+    revision: i64,
+) -> Result<String, SvnError> {
     let snapshot = tempfile::tempdir().map_err(SvnError::IoError)?;
     let dest = snapshot.path().join("export");
     svn.export("", revision, &dest).await?;
@@ -208,7 +212,7 @@ pub async fn inspect_git_to_svn_commit(
         };
     }
     if info.latest_rev == op.pre_write_svn_rev {
-        return match hash_exported_revision(svn, info.latest_rev).await {
+        return match observed_svn_tree_at_revision(svn, info.latest_rev).await {
             Ok(tree) if tree == op.pre_write_svn_tree => SvnCommitInspect::AbsentUnchanged,
             Ok(_) => SvnCommitInspect::Conflict {
                 reason: "pre-write revision is unchanged but its tree is not".into(),
@@ -283,7 +287,7 @@ pub async fn inspect_git_to_svn_commit(
         })
         .collect();
     observed.sort_by(|a, b| a.path.cmp(&b.path));
-    let tree = match hash_exported_revision(svn, info.latest_rev).await {
+    let tree = match observed_svn_tree_at_revision(svn, info.latest_rev).await {
         Ok(tree) => tree,
         Err(error) => {
             return SvnCommitInspect::Unavailable {
