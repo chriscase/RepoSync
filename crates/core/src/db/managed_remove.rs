@@ -3,9 +3,10 @@
 //! Documents live in `kv_state` under `managed_remove_v1:`. Ordinary schema
 //! stays v12. Legacy root DELETE does not write this journal.
 //!
-//! Removal disables the registration, waits until #64 import / Git→SVN
-//! ownership is quiet, then deletes only exact per-repo secret keys and the
-//! repository row. Commit mappings, audit rows, and remote history are kept.
+//! Removal disables the registration, waits until #64 import / Git→SVN /
+//! SVN→Git ownership is quiet, then deletes only exact per-repo secret keys
+//! and the repository row. Commit mappings, audit rows, and remote history
+//! are kept.
 //! Restore is not supported. A tombstone blocks a stale job from inserting
 //! the same id again.
 
@@ -89,6 +90,8 @@ pub enum RemovalBlocker {
     ImportReconciliationRequired,
     SvnCommitRunning,
     SvnCommitReconciliationRequired,
+    GitPushRunning,
+    GitPushReconciliationRequired,
     ChildRegistrations { count: i64 },
 }
 
@@ -110,6 +113,14 @@ impl RemovalBlocker {
                 "Git-to-SVN commit has an unresolved external effect; registration and local data were kept"
                     .into()
             }
+            Self::GitPushRunning => {
+                "in-flight SVN-to-Git push still owns the repository; local data was not deleted"
+                    .into()
+            }
+            Self::GitPushReconciliationRequired => {
+                "SVN-to-Git push has an unresolved external effect; registration and local data were kept"
+                    .into()
+            }
             Self::ChildRegistrations { count } => format!(
                 "parent removal is blocked while {count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
             ),
@@ -118,11 +129,13 @@ impl RemovalBlocker {
 
     pub fn waiting_state(&self) -> ManagedRemoveState {
         match self {
-            Self::ImportReconciliationRequired | Self::SvnCommitReconciliationRequired => {
-                ManagedRemoveState::ReconciliationRequired
-            }
+            Self::ImportReconciliationRequired
+            | Self::SvnCommitReconciliationRequired
+            | Self::GitPushReconciliationRequired => ManagedRemoveState::ReconciliationRequired,
             Self::ChildRegistrations { .. } => ManagedRemoveState::Failed,
-            Self::ImportRunning | Self::SvnCommitRunning => ManagedRemoveState::Cancelling,
+            Self::ImportRunning | Self::SvnCommitRunning | Self::GitPushRunning => {
+                ManagedRemoveState::Cancelling
+            }
         }
     }
 }
@@ -358,6 +371,25 @@ fn svn_commit_blocker(
     })
 }
 
+fn git_push_blocker(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<RemovalBlocker>, DatabaseError> {
+    let Some(op_id) = read_value(conn, &format!("svn_to_git_push_v1:active:{repo_id}"))? else {
+        return Ok(None);
+    };
+    let Some(raw) = read_value(conn, &format!("svn_to_git_push_v1:document:{op_id}"))? else {
+        return Ok(Some(RemovalBlocker::GitPushRunning));
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+    let state = value.get("state").and_then(|s| s.as_str());
+    Ok(match state {
+        Some("completed" | "failed") => None,
+        Some("reconciliation_required") => Some(RemovalBlocker::GitPushReconciliationRequired),
+        _ => Some(RemovalBlocker::GitPushRunning),
+    })
+}
+
 fn writer_blocker(
     conn: &Connection,
     repo_id: &str,
@@ -365,7 +397,10 @@ fn writer_blocker(
     if let Some(blocker) = import_blocker(conn, repo_id)? {
         return Ok(Some(blocker));
     }
-    svn_commit_blocker(conn, repo_id)
+    if let Some(blocker) = svn_commit_blocker(conn, repo_id)? {
+        return Ok(Some(blocker));
+    }
+    git_push_blocker(conn, repo_id)
 }
 
 fn fresh_op(repo: &Repository, initiator_id: &str, request_id: &str) -> ManagedRemoveOperation {
@@ -649,6 +684,7 @@ fn require_active(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::git_push_operations::{GitPushIntent, GitPushOperationState};
     use crate::db::import_operations::ImportOperationState;
 
     fn setup() -> Database {
@@ -876,5 +912,149 @@ mod tests {
         let error = db.insert_repository(&parent).unwrap_err();
         assert!(error.to_string().contains("cannot recreate"), "{error}");
         assert!(db.list_repositories().unwrap().is_empty());
+    }
+
+    fn push_intent(repo_id: &str) -> GitPushIntent<'_> {
+        GitPushIntent {
+            repo_id,
+            initiator_id: "worker",
+            request_id: "push-req",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        }
+    }
+
+    fn plant_owned_local(db: &Database, repo_id: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        db.set_state(&format!("secret_svn_password_{repo_id}"), "owned-secret")
+            .unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let owned = data.path().join("repos").join(repo_id);
+        std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+        std::fs::write(owned.join("git-repo").join("owned.txt"), "owned\n").unwrap();
+        (data, owned)
+    }
+
+    fn assert_registration_and_local_kept(db: &Database, repo_id: &str, owned: &std::path::Path) {
+        assert!(
+            db.get_repository(repo_id).unwrap().is_some(),
+            "registration must remain while a push journal blocks removal"
+        );
+        assert_eq!(
+            db.get_state(&format!("secret_svn_password_{repo_id}"))
+                .unwrap()
+                .as_deref(),
+            Some("owned-secret")
+        );
+        assert!(
+            owned.join("git-repo").join("owned.txt").exists(),
+            "owned local data must remain while a push journal blocks removal"
+        );
+        assert!(db.removal_tombstone(repo_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn candidate_r02_active_svn_to_git_push_blocks_managed_remove() {
+        let db = setup();
+        db.insert_repository(&repo("pair-1", "Pair", None)).unwrap();
+        let (_data, owned) = plant_owned_local(&db, "pair-1");
+        let push = db.begin_svn_to_git_push(push_intent("pair-1")).unwrap();
+        assert_eq!(push.state, GitPushOperationState::Running);
+
+        match db
+            .prepare_managed_remove("pair-1", "admin", "req-push-running")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::GitPushRunning);
+                assert_eq!(operation.state, ManagedRemoveState::Cancelling);
+                assert!(!operation.state.is_terminal_success());
+                assert!(operation
+                    .outcome_detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("in-flight SVN-to-Git push"));
+                let refused = db
+                    .complete_managed_remove("pair-1", &operation.id)
+                    .unwrap_err();
+                assert!(
+                    refused.to_string().contains("in-flight SVN-to-Git push"),
+                    "{refused}"
+                );
+            }
+            other => panic!("expected git-push running wait, got {other:?}"),
+        }
+        assert_registration_and_local_kept(&db, "pair-1", &owned);
+    }
+
+    #[test]
+    fn candidate_r02_git_push_reconciliation_hold_blocks_managed_remove() {
+        let db = setup();
+        db.insert_repository(&repo("pair-1", "Pair", None)).unwrap();
+        let (_data, owned) = plant_owned_local(&db, "pair-1");
+        let push = db.begin_svn_to_git_push(push_intent("pair-1")).unwrap();
+        db.hold_svn_to_git_reconciliation("pair-1", &push.id, "lost_push_reply")
+            .unwrap();
+
+        match db
+            .prepare_managed_remove("pair-1", "admin", "req-push-hold")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { blocker, operation } => {
+                assert_eq!(blocker, RemovalBlocker::GitPushReconciliationRequired);
+                assert_eq!(operation.state, ManagedRemoveState::ReconciliationRequired);
+                assert!(!operation.state.is_terminal_success());
+                assert!(operation
+                    .outcome_detail
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("unresolved external effect"));
+                let refused = db
+                    .complete_managed_remove("pair-1", &operation.id)
+                    .unwrap_err();
+                assert!(
+                    refused.to_string().contains("unresolved external effect"),
+                    "{refused}"
+                );
+            }
+            other => panic!("expected git-push reconciliation wait, got {other:?}"),
+        }
+        assert_registration_and_local_kept(&db, "pair-1", &owned);
+        assert!(!db.get_repository("pair-1").unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn candidate_r02_managed_remove_not_blocked_without_push_journal() {
+        let db = setup();
+        db.insert_repository(&repo("pair-1", "Pair", None)).unwrap();
+        let (data, owned) = plant_owned_local(&db, "pair-1");
+        assert!(db.active_git_push_operation("pair-1").unwrap().is_none());
+
+        match db
+            .prepare_managed_remove("pair-1", "admin", "req-quiet")
+            .unwrap()
+        {
+            RemovalAdvance::Cleanup { operation } => {
+                assert_eq!(operation.state, ManagedRemoveState::Running);
+                crate::managed_remove::remove_owned_repo_tree(data.path(), "pair-1").unwrap();
+                let done = db.complete_managed_remove("pair-1", &operation.id).unwrap();
+                assert_eq!(done.state, ManagedRemoveState::Completed);
+            }
+            other => panic!("expected cleanup with no push journal, got {other:?}"),
+        }
+        assert!(!owned.exists());
+        assert!(db.get_repository("pair-1").unwrap().is_none());
+        assert!(db
+            .get_state("secret_svn_password_pair-1")
+            .unwrap()
+            .is_none());
     }
 }
