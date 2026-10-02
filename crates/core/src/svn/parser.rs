@@ -58,6 +58,13 @@ pub fn parse_svn_info(xml: &str) -> Result<SvnInfo, SvnError> {
     })
 }
 
+/// Revision of the last commit that changed this path, not the repository HEAD.
+pub fn parse_svn_last_changed_revision(xml: &str) -> Result<i64, SvnError> {
+    extract_attribute(xml, "commit", "revision")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| SvnError::XmlParseError("missing commit revision in svn info".into()))
+}
+
 pub fn parse_svn_log(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
     debug!("parsing svn log XML ({} bytes)", xml.len());
     let mut entries = Vec::new();

@@ -105,6 +105,12 @@ impl SvnClient {
         parse_svn_info(&output)
     }
 
+    /// Last changed revision of this URL. Repository HEAD is not path identity.
+    pub async fn last_changed_revision(&self) -> Result<i64, SvnError> {
+        let output = self.run_svn(&["info", "--xml", &self.url]).await?;
+        super::parser::parse_svn_last_changed_revision(&output)
+    }
+
     /// `svn info` at a peg revision so identity is the selected snapshot,
     /// not whatever HEAD has become.
     #[instrument(skip(self), fields(url = %self.url, rev))]

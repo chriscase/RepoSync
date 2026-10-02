@@ -26,6 +26,11 @@ use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress, Imp
 use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, probe_svn_target, LatePairRequest,
 };
+use reposync_core::pair_refresh::{
+    analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
+    format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
+    RefreshObservations, RefreshOperation,
+};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
@@ -272,6 +277,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id/credentials", post(save_credentials))
         .route("/api/repos/:id/branches", post(create_branch_pair))
         .route("/api/repos/:id/branches", get(list_branch_pairs))
+        .route("/api/repos/:id/refresh", post(preview_pair_refresh))
         .route("/api/repos/:id/branch-pair", delete(delete_branch_pair))
         .route("/api/repos/:id/test-svn", post(test_repo_svn))
         .route("/api/repos/:id/test-git", post(test_repo_git))
@@ -2597,6 +2603,190 @@ async fn attach_svn_probe(
             "existing SVN target requires lineage/tree verification before any copy or checkpoint"
                 .into(),
         );
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshPreviewRequest {
+    #[serde(default)]
+    operation: String,
+    #[serde(default)]
+    execute: bool,
+    /// `false` is an execute attempt and is refused. Omitted means preview.
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+async fn preview_pair_refresh(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<RefreshPreviewRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+
+    let operation = parse_operation(&body.operation).map_err(|other| {
+        AppError::BadRequest(format!(
+            "unknown_refresh_operation: '{other}' is not a refresh mode. Supported preview is update_pair_from_parent. reanchor is NOT IMPLEMENTED."
+        ))
+    })?;
+    if operation == RefreshOperation::Reanchor {
+        let (reason, detail) = reanchor_refusal();
+        info!(pair_id = %id, "pair refresh re-anchor refused; not implemented");
+        return Err(AppError::BadRequest(format_refusal(reason, detail)));
+    }
+
+    let db = &state.db;
+    let pair = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(format!("database error: {e}")))?
+        .ok_or_else(|| AppError::NotFound(format!("repository {id} not found")))?;
+    let parent_id = pair.parent_id.clone().ok_or_else(|| {
+        AppError::BadRequest(
+            "not_a_branch_pair: coordinated refresh applies to an existing child pair; this repository has no parent"
+                .into(),
+        )
+    })?;
+    let parent = db
+        .get_repository(&parent_id)
+        .map_err(|e| AppError::Internal(format!("database error: {e}")))?
+        .ok_or_else(|| AppError::NotFound(format!("parent repository {parent_id} not found")))?;
+
+    let pair_mappings = collect_verified_mappings(db, &pair.id)
+        .map_err(|e| AppError::Internal(format!("failed to read pair mappings: {e}")))?;
+    let parent_mappings = collect_verified_mappings(db, &parent.id)
+        .map_err(|e| AppError::Internal(format!("failed to read parent mappings: {e}")))?;
+    let parent_dir = pair_refresh_git_dir(&state, &parent.id);
+    let pair_dir = pair_refresh_git_dir(&state, &pair.id);
+    let same_remote = pair.git_repo == parent.git_repo && pair.git_api_url == parent.git_api_url;
+    let facts = analyze_git_preview(
+        GitLayout {
+            parent_dir: parent_dir.as_deref(),
+            pair_dir: pair_dir.as_deref(),
+            same_remote,
+        },
+        &pair_mappings,
+        &parent_mappings,
+        &pair.git_branch,
+        &parent.git_branch,
+    );
+
+    let parent_password = db
+        .resolve_credential_chain(&parent.id, "secret_svn_password")
+        .unwrap_or_default();
+    let pair_password = db
+        .resolve_credential_chain(&pair.id, "secret_svn_password")
+        .unwrap_or_default();
+    let parent_url = branch_svn_url(&parent.svn_url, &parent.svn_branch);
+    let pair_url = branch_svn_url(&pair.svn_url, &pair.svn_branch);
+    let parent_client = SvnClient::new(&parent_url, &parent.svn_username, &parent_password);
+    let pair_client = SvnClient::new(&pair_url, &pair.svn_username, &pair_password);
+    let parent_pin = read_svn_pin(
+        parent_client.info().await,
+        parent_client.last_changed_revision().await,
+    );
+    let pair_pin = read_svn_pin(
+        pair_client.info().await,
+        pair_client.last_changed_revision().await,
+    );
+    let (parent_revision, parent_uuid, parent_missing, parent_svn_note) = parent_pin;
+    let (pair_revision, pair_uuid, pair_missing, pair_svn_note) = pair_pin;
+    let mut notes = facts.notes;
+    if let Some(note) = parent_svn_note {
+        notes.push(format!("parent SVN info: {note}"));
+    }
+    if let Some(note) = pair_svn_note {
+        notes.push(format!("pair SVN info: {note}"));
+    }
+
+    let observations = RefreshObservations {
+        pair_id: pair.id.clone(),
+        parent_id: parent.id.clone(),
+        pair_git_branch: pair.git_branch.clone(),
+        parent_git_branch: parent.git_branch.clone(),
+        pair_git_tip: facts.pair.remote_tip.clone(),
+        parent_git_tip: facts.parent.remote_tip.clone(),
+        pair_local_tip: facts.pair.local_tip.clone(),
+        parent_local_tip: facts.parent.local_tip.clone(),
+        pair_baseline: facts.pair_baseline.clone(),
+        parent_baseline: facts.parent_baseline.clone(),
+        pair_pending_git: facts.pair_pending.clone(),
+        parent_pending_git: facts.parent_pending.clone(),
+        svn_uuid: parent_uuid.clone(),
+        pair_svn_uuid: pair_uuid,
+        pair_svn_path: pair.svn_branch.clone(),
+        parent_svn_path: parent.svn_branch.clone(),
+        pair_svn_url: pair_url,
+        parent_svn_url: parent_url,
+        pair_svn_revision: pair_revision,
+        parent_svn_revision: parent_revision,
+        pair_svn_missing: pair_missing,
+        parent_svn_missing: parent_missing,
+        pair_local_ahead: facts.pair.local_ahead.clone(),
+        parent_local_ahead: facts.parent.local_ahead.clone(),
+        pair_local_ahead_complete: facts.pair.local_ahead_complete,
+        parent_local_ahead_complete: facts.parent.local_ahead_complete,
+        pair_local_diverged: facts.pair.local_diverged,
+        parent_local_diverged: facts.parent.local_diverged,
+        notes,
+    };
+    let plan = build_preview(&observations);
+    info!(
+        pair_id = %pair.id,
+        parent_id = %parent.id,
+        plan_digest = %plan.plan_digest,
+        pins_complete = plan.pins_complete,
+        "pair refresh preview; no durable job and no external write"
+    );
+    if execution_requested(body.execute, body.dry_run) {
+        let (reason, detail) = execute_refusal(Some(&plan.plan_digest));
+        return Err(AppError::BadRequest(format_refusal(&reason, &detail)));
+    }
+    Ok(Json(serde_json::to_value(&plan).map_err(|e| {
+        AppError::Internal(format!("serialization error: {e}"))
+    })?))
+}
+
+fn pair_refresh_git_dir(state: &AppState, repo_id: &str) -> Option<std::path::PathBuf> {
+    let path = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(repo_id)
+        .join("git-repo");
+    (path.join(".git").exists() || path.join("HEAD").exists()).then_some(path)
+}
+
+fn read_svn_pin(
+    info: Result<reposync_core::svn::SvnInfo, reposync_core::errors::SvnError>,
+    last_changed: Result<i64, reposync_core::errors::SvnError>,
+) -> (Option<i64>, Option<String>, bool, Option<String>) {
+    match info {
+        Ok(info) => {
+            let (revision, note) = match last_changed {
+                Ok(revision) => (Some(revision), None),
+                Err(err) => (
+                    Some(info.latest_rev),
+                    Some(format!(
+                        "last-changed revision unreadable ({err}); pinned repository HEAD instead"
+                    )),
+                ),
+            };
+            (revision, Some(info.uuid), false, note)
+        }
+        Err(err) => {
+            let text = err.to_string();
+            let missing = svn_path_missing(&text);
+            (None, None, missing, Some(text))
+        }
     }
 }
 

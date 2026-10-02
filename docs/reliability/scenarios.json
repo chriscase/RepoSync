@@ -1,7 +1,7 @@
 {
   "reviewed_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
   "authored_against_main": "4f985a24d1fede55bde88b521800ae9e5db0f5a3",
-  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81 plus #67 admission/preview. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81/#82 plus #69 update-pair preview. Named isolated subcases are mapped; issue-complete PASS is not claimed. Re-anchor and refresh execution remain NOT IMPLEMENTED. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
   "scenarios": [
     {
       "id": "R01",
@@ -102,9 +102,9 @@
     {
       "id": "R13",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "evidence": "Phase 0 and later reliability slices did not execute this scenario.",
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "evidence": "R13_PREVIEW_PINS_INPUTS pins Git tips, SVN UUID/paths/revisions, policy, and compatibility generation, and leaves remotes, watermarks, and durable jobs unchanged. R13_PENDING_BOTH_SIDES reports unsynced work on both sides and does not claim discard. R13_EXECUTE_REFUSED and R13_REANCHOR_NOT_IMPLEMENTED refuse execution and re-anchor. R13_REWRITTEN_LINEAGE does not count a replaced mapped commit as new work. R13_DIGEST_BINDS_INPUTS keeps the digest stable until a tip moves. This is not full #69 acceptance.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -112,7 +112,7 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "not_run",
-      "evidence": "Not executed. Import-journal interruption (R03/R05) is a different operation type.",
+      "evidence": "Not executed. The #69 preview slice does not perform external effects, so interruption and re-anchor recovery are not covered. Import-journal interruption (R03/R05) is a different operation type.",
       "diagnostic_expected_baseline_failure": false
     },
     {

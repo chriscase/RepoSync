@@ -5413,7 +5413,11 @@ async fn candidate_r02_managed_remove_waits_and_retries_without_touching_remotes
 
 async fn wait_import_terminal(client: &reqwest::Client, base: &str) -> serde_json::Value {
     let mut last = serde_json::Value::Null;
-    for _ in 0..200 {
+    // Snapshot workers record verification before `git commit`. A 10s budget
+    // expired while that commit was still running under a parallel workspace
+    // test load, so the waiter covers a slower commit without treating
+    // `verifying` as terminal.
+    for _ in 0..600 {
         last = client
             .get(format!("{base}/status"))
             .send()
@@ -6392,6 +6396,771 @@ async fn candidate_r06_no_active_on_partial() {
             "case":"R06_NO_ACTIVE_ON_PARTIAL",
             "child_rows":0,
             "publish_refused":true
+        })
+    );
+    server.abort();
+}
+
+fn bare_tip(bare: &std::path::Path, branch: &str) -> String {
+    use std::process::Command;
+    let out = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn bare_refs(bare: &std::path::Path) -> String {
+    use std::process::Command;
+    let out = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn svn_uuid(repo: &std::path::Path) -> String {
+    use std::process::Command;
+    let out = Command::new("svnlook")
+        .args(["uuid", repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn svn_path_rev(url: &str) -> i64 {
+    use std::process::Command;
+    let out = Command::new("svn")
+        .args([
+            "info",
+            "--show-item",
+            "last-changed-revision",
+            "--non-interactive",
+            url,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+fn durable_job_rows(state: &AppState) -> i64 {
+    state
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM kv_state WHERE key LIKE 'import_operation_v1:%' OR key LIKE 'git_to_svn_commit_v1:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn push_commit_on(
+    tmp: &std::path::Path,
+    bare: &std::path::Path,
+    branch: &str,
+    file: &str,
+    body: &str,
+    message: &str,
+) {
+    let name = format!(
+        "extra-{}-{}",
+        branch.replace('/', "-"),
+        file.replace('/', "-")
+    );
+    let work = clone_work(tmp, bare, &name);
+    git_cmd(
+        &work,
+        &[
+            "fetch",
+            "--",
+            "origin",
+            &format!("refs/heads/{branch}:refs/remotes/origin/{branch}"),
+        ],
+    );
+    git_cmd(
+        &work,
+        &["checkout", "-B", branch, &format!("origin/{branch}")],
+    );
+    std::fs::write(work.join(file), body).unwrap();
+    git_cmd(&work, &["add", file]);
+    git_cmd(&work, &["commit", "-m", message]);
+    git_cmd(&work, &["push", "origin", branch]);
+}
+
+fn svn_commit_on(
+    tmp: &std::path::Path,
+    url: &str,
+    dir_name: &str,
+    file: &str,
+    body: &str,
+    message: &str,
+) {
+    use std::process::Command;
+    let wc = tmp.join(dir_name);
+    let checkout = Command::new("svn")
+        .args([
+            "checkout",
+            "--non-interactive",
+            "--username",
+            "fixture",
+            url,
+            wc.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        checkout.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+    std::fs::write(wc.join(file), body).unwrap();
+    let add = Command::new("svn")
+        .args(["add", file])
+        .current_dir(&wc)
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            message,
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .current_dir(&wc)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
+async fn refresh_pair_fixture() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<AppState>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    String,
+    String,
+    std::path::PathBuf,
+) {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _feature = push_feature_commits(tmp.path(), &bare, 1);
+    let parent = state.db.get_repository(&id).unwrap().unwrap();
+    let svn_url = parent.svn_url.clone();
+    assert!(Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/branches"),
+            "-m",
+            "branches",
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("svn")
+        .args([
+            "copy",
+            &format!("{svn_url}/trunk"),
+            &format!("{svn_url}/branches/feature"),
+            "-m",
+            "pair path",
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let mut child = parent.clone();
+    let pair_id = format!("{id}-pair");
+    child.id = pair_id.clone();
+    child.name = format!("{}-pair", parent.name);
+    child.parent_id = Some(id.clone());
+    child.git_branch = "feature".into();
+    child.svn_branch = "branches/feature".into();
+    child.last_svn_rev = 0;
+    child.last_git_sha.clear();
+    state.db.insert_repository(&child).unwrap();
+    (addr, state, server, tmp, id, pair_id, bare)
+}
+
+fn refresh_unchanged(
+    state: &AppState,
+    parent_id: &str,
+    pair_id: &str,
+    bare: &std::path::Path,
+    svn_repo: &std::path::Path,
+) -> (String, i64, i64, (i64, String), (i64, String), i64) {
+    (
+        bare_refs(bare),
+        svn_youngest(svn_repo),
+        durable_job_rows(state),
+        state.db.get_repo_watermark(parent_id).unwrap(),
+        state.db.get_repo_watermark(pair_id).unwrap(),
+        state.db.count_sync_records().unwrap(),
+    )
+}
+
+/// R13: preview pins both sides and does not mutate checkpoints or remotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r13_preview_pins_inputs() {
+    let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
+    let svn_repo = tmp.path().join("svn-repo");
+    let svn_url = state
+        .db
+        .get_repository(&parent_id)
+        .unwrap()
+        .unwrap()
+        .svn_url;
+    let before = refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo);
+    let workdir = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(&parent_id)
+        .join("git-repo");
+    let head_before = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&workdir)
+        .output()
+        .unwrap();
+    let head_before = String::from_utf8_lossy(&head_before.stdout)
+        .trim()
+        .to_string();
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "preview");
+    assert_eq!(plan["operation"], "update_pair_from_parent");
+    assert_eq!(plan["executed"], false);
+    assert_eq!(plan["published"], false);
+    assert_eq!(plan["durable_job_started"], false);
+    assert_eq!(plan["policy_version"], "pair_refresh_preview_v1");
+    assert_eq!(plan["pair_generation"], 1);
+    assert_eq!(
+        plan["generation_source"],
+        "compatibility_single_registration"
+    );
+    assert_eq!(plan["git"]["pair_tip"], bare_tip(&bare, "feature"));
+    assert_eq!(plan["git"]["parent_tip"], bare_tip(&bare, "main"));
+    assert_eq!(plan["svn"]["uuid"], svn_uuid(&svn_repo));
+    assert_eq!(plan["svn"]["pair_path"], "branches/feature");
+    assert_eq!(plan["svn"]["parent_path"], "trunk");
+    assert_eq!(
+        plan["svn"]["pair_revision"],
+        svn_path_rev(&format!("{svn_url}/branches/feature"))
+    );
+    assert_eq!(
+        plan["svn"]["parent_revision"],
+        svn_path_rev(&format!("{svn_url}/trunk"))
+    );
+    let digest = plan["plan_digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert_eq!(plan["plan_id"], digest);
+    assert_eq!(plan["approval"]["eligible"], false);
+    assert_eq!(plan["approval"]["binds_to"], "plan_digest");
+    assert_eq!(plan["reanchor_status"], "NOT_IMPLEMENTED");
+    assert_eq!(plan["execute_status"], "NOT_IMPLEMENTED");
+    assert_eq!(plan["intended_result"]["discards_unsynced_work"], false);
+    assert_eq!(plan["inspection"]["external_git_writes"], false);
+    assert_eq!(plan["inspection"]["external_svn_writes"], false);
+    assert_eq!(plan["inspection"]["checkpoint_mutation"], false);
+    assert!(plan["pins_complete"].as_bool().unwrap(), "{plan}");
+    let again = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({"operation":"update_pair_from_parent","execute":false}))
+        .send()
+        .await
+        .unwrap();
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["plan_digest"], digest);
+    let root = client
+        .post(format!("http://{addr}/api/repos/{parent_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root.status(), reqwest::StatusCode::BAD_REQUEST);
+    let root_body: serde_json::Value = root.json().await.unwrap();
+    assert!(
+        root_body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not_a_branch_pair"),
+        "{root_body}"
+    );
+    assert_eq!(
+        refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
+        before
+    );
+    let head_after = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&workdir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&head_after.stdout).trim(),
+        head_before
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R13_PREVIEW_PINS_INPUTS",
+            "pins_complete":true,
+            "digest_stable":true,
+            "remotes_unchanged":true,
+            "jobs_unchanged":true
+        })
+    );
+    server.abort();
+}
+
+/// R13: unsynced work on both Git and SVN sides is reported and not discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r13_pending_both_sides() {
+    let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
+    let svn_url = state
+        .db
+        .get_repository(&parent_id)
+        .unwrap()
+        .unwrap()
+        .svn_url;
+    let client = authed_client();
+    let first: serde_json::Value = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["executed"], false, "{first}");
+    let pair_git = first["pending"]["pair_git"]["count"].as_u64().unwrap();
+    let parent_git = first["pending"]["parent_git"]["count"].as_u64().unwrap();
+    let pair_svn = first["pending"]["pair_svn"]["count"].as_u64().unwrap();
+    let parent_svn = first["pending"]["parent_svn"]["count"].as_u64().unwrap();
+    push_commit_on(
+        tmp.path(),
+        &bare,
+        "main",
+        "parent.txt",
+        "parent\n",
+        "parent git",
+    );
+    push_commit_on(
+        tmp.path(),
+        &bare,
+        "feature",
+        "pair.txt",
+        "pair\n",
+        "pair git",
+    );
+    svn_commit_on(
+        tmp.path(),
+        &format!("{svn_url}/trunk"),
+        "wc-trunk",
+        "parent-svn.txt",
+        "parent svn\n",
+        "parent svn",
+    );
+    svn_commit_on(
+        tmp.path(),
+        &format!("{svn_url}/branches/feature"),
+        "wc-feature",
+        "pair-svn.txt",
+        "pair svn\n",
+        "pair svn",
+    );
+    let svn_repo = tmp.path().join("svn-repo");
+    let before_refs = bare_refs(&bare);
+    let before_rev = svn_youngest(&svn_repo);
+    let before_jobs = durable_job_rows(&state);
+    let response = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(
+        plan["pending"]["pair_git"]["count"].as_u64().unwrap(),
+        pair_git + 1,
+        "{plan}"
+    );
+    assert_eq!(
+        plan["pending"]["parent_git"]["count"].as_u64().unwrap(),
+        parent_git + 1,
+        "{plan}"
+    );
+    assert!(
+        plan["pending"]["pair_svn"]["head_revision"]
+            .as_i64()
+            .unwrap()
+            > first["pending"]["pair_svn"]["head_revision"]
+                .as_i64()
+                .unwrap(),
+        "{plan}"
+    );
+    assert!(
+        plan["pending"]["parent_svn"]["head_revision"]
+            .as_i64()
+            .unwrap()
+            > first["pending"]["parent_svn"]["head_revision"]
+                .as_i64()
+                .unwrap(),
+        "{plan}"
+    );
+    assert!(plan["pending"]["pair_svn"]["count"].as_u64().unwrap() > pair_svn);
+    assert!(plan["pending"]["parent_svn"]["count"].as_u64().unwrap() > parent_svn);
+    assert!(
+        plan["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "both_advanced"),
+        "{plan}"
+    );
+    assert_eq!(plan["intended_result"]["discards_unsynced_work"], false);
+    let summary = plan["intended_result"]["summary"].as_str().unwrap();
+    assert!(summary.contains("preserved"), "{summary}");
+    assert!(summary.contains("not discarded"), "{summary}");
+    assert_eq!(plan["executed"], false);
+    assert_eq!(bare_refs(&bare), before_refs);
+    assert_eq!(svn_youngest(&svn_repo), before_rev);
+    assert_eq!(durable_job_rows(&state), before_jobs);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R13_PENDING_BOTH_SIDES",
+            "both_advanced":true,
+            "discards_unsynced_work":false
+        })
+    );
+    server.abort();
+}
+
+/// R13: execution is refused and does not start a durable job.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r13_execute_refused() {
+    let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo);
+    let client = authed_client();
+    for body in [
+        serde_json::json!({"execute":true}),
+        serde_json::json!({"dry_run":false}),
+    ] {
+        let response = client
+            .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{payload}");
+        let error = payload["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("refresh_execute_not_implemented"),
+            "{payload}"
+        );
+        assert!(error.contains("No durable job"), "{payload}");
+        assert!(error.contains("plan_digest="), "{payload}");
+    }
+    assert_eq!(
+        refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
+        before
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R13_EXECUTE_REFUSED",
+            "refused":true,
+            "jobs_unchanged":true,
+            "remotes_unchanged":true
+        })
+    );
+    server.abort();
+}
+
+/// R13: re-anchor/recreate is an explicit NOT IMPLEMENTED refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r13_reanchor_not_implemented() {
+    let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo);
+    let client = authed_client();
+    for operation in ["reanchor", "recreate", "re-anchor"] {
+        let response = client
+            .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+            .json(&serde_json::json!({"operation": operation, "execute": true}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{payload}");
+        let error = payload["error"].as_str().unwrap_or("");
+        assert!(error.contains("reanchor_not_implemented"), "{payload}");
+        assert!(error.contains("NOT IMPLEMENTED"), "{payload}");
+    }
+    assert_eq!(
+        refresh_unchanged(&state, &parent_id, &pair_id, &bare, &svn_repo),
+        before
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R13_REANCHOR_NOT_IMPLEMENTED",
+            "refused":true,
+            "remotes_unchanged":true
+        })
+    );
+    server.abort();
+}
+
+/// R13: a replaced mapped commit is not counted as new pair work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r13_rewritten_lineage_not_new_work() {
+    let (addr, state, server, tmp, parent_id, pair_id, bare) = refresh_pair_fixture().await;
+    let workdir = state
+        .config
+        .daemon
+        .data_dir
+        .join("repos")
+        .join(&parent_id)
+        .join("git-repo");
+    git_cmd(
+        &workdir,
+        &[
+            "fetch",
+            "--no-tags",
+            "--",
+            "origin",
+            "refs/heads/feature:refs/reposync/pair-refresh/keep",
+        ],
+    );
+    let feature = bare_tip(&bare, "feature");
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+             VALUES ('r13-mapped-feature', ?1, 2, ?2, 'svn_to_git', 'fixture', 'mapped', 't', 't', 'applied')",
+            rusqlite::params![pair_id, feature],
+        )
+        .unwrap();
+    let tree = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", &format!("{feature}^{{tree}}")])
+            .current_dir(&workdir)
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let base = {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", &format!("{feature}^")])
+            .current_dir(&workdir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let sibling = {
+        let out = std::process::Command::new("git")
+            .args([
+                "commit-tree",
+                &tree,
+                "-p",
+                &base,
+                "-m",
+                "rebased equivalent",
+            ])
+            .current_dir(&workdir)
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git_cmd(
+        &workdir,
+        &[
+            "push",
+            "--force",
+            "origin",
+            &format!("{sibling}:refs/heads/feature"),
+        ],
+    );
+    let svn_repo = tmp.path().join("svn-repo");
+    let before_refs = bare_refs(&bare);
+    let before_rev = svn_youngest(&svn_repo);
+    let before_jobs = durable_job_rows(&state);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(plan["baseline"]["pair"]["git_sha"], feature, "{plan}");
+    assert_eq!(plan["baseline"]["pair"]["evidence"], "applied_sync_record");
+    assert_eq!(plan["git"]["pair_tip"], sibling);
+    assert_eq!(plan["pending"]["pair_git"]["rewritten"], true, "{plan}");
+    assert_eq!(plan["pending"]["pair_git"]["count"], 0);
+    assert!(plan["pending"]["pair_git"]["shas"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        plan["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item == "rewritten_pair_lineage"),
+        "{plan}"
+    );
+    assert_eq!(plan["intended_result"]["discards_unsynced_work"], false);
+    assert!(plan["intended_result"]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("not discarded"));
+    assert_eq!(bare_refs(&bare), before_refs);
+    assert_eq!(svn_youngest(&svn_repo), before_rev);
+    assert_eq!(durable_job_rows(&state), before_jobs);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R13_REWRITTEN_LINEAGE",
+            "rewritten":true,
+            "counted_as_new_work":false
+        })
+    );
+    server.abort();
+}
+
+/// R13: the plan digest is stable for the same inputs and changes when a tip moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r13_digest_binds_inputs() {
+    let (addr, _state, server, tmp, _parent_id, pair_id, bare) = refresh_pair_fixture().await;
+    let client = authed_client();
+    let first: serde_json::Value = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let digest = first["plan_digest"].as_str().unwrap().to_string();
+    let second: serde_json::Value = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["plan_digest"], digest);
+    push_commit_on(
+        tmp.path(),
+        &bare,
+        "main",
+        "moved.txt",
+        "moved\n",
+        "move parent tip",
+    );
+    let third: serde_json::Value = client
+        .post(format!("http://{addr}/api/repos/{pair_id}/refresh"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(third["plan_digest"], digest, "{third}");
+    assert_eq!(third["git"]["parent_tip"], bare_tip(&bare, "main"));
+    assert_eq!(third["executed"], false);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R13_DIGEST_BINDS_INPUTS",
+            "stable":true,
+            "changes_when_tip_moves":true
         })
     );
     server.abort();

@@ -607,6 +607,12 @@
     {"id":"R06_SNAPSHOT_BASELINE", "binary":"server_freeze", "test":"candidate_r06_snapshot_baseline_late_pair", "tier":"candidate_regression"},
     {"id":"R06_SKIP_IMPORT_BLOCKED", "binary":"server_freeze", "test":"candidate_r06_unsafe_skip_import_blocked", "tier":"candidate_regression"},
     {"id":"R06_EXISTING_TARGET_NOT_EQUIVALENT", "binary":"server_freeze", "test":"candidate_r06_existing_target_not_equivalent", "tier":"candidate_regression"},
-    {"id":"R06_NO_ACTIVE_ON_PARTIAL", "binary":"server_freeze", "test":"candidate_r06_no_active_on_partial", "tier":"candidate_regression"}
+    {"id":"R06_NO_ACTIVE_ON_PARTIAL", "binary":"server_freeze", "test":"candidate_r06_no_active_on_partial", "tier":"candidate_regression"},
+    {"id":"R13_PREVIEW_PINS_INPUTS", "binary":"server_freeze", "test":"candidate_r13_preview_pins_inputs", "tier":"candidate_regression"},
+    {"id":"R13_PENDING_BOTH_SIDES", "binary":"server_freeze", "test":"candidate_r13_pending_both_sides", "tier":"candidate_regression"},
+    {"id":"R13_EXECUTE_REFUSED", "binary":"server_freeze", "test":"candidate_r13_execute_refused", "tier":"candidate_regression"},
+    {"id":"R13_REANCHOR_NOT_IMPLEMENTED", "binary":"server_freeze", "test":"candidate_r13_reanchor_not_implemented", "tier":"candidate_regression"},
+    {"id":"R13_REWRITTEN_LINEAGE", "binary":"server_freeze", "test":"candidate_r13_rewritten_lineage_not_new_work", "tier":"candidate_regression"},
+    {"id":"R13_DIGEST_BINDS_INPUTS", "binary":"server_freeze", "test":"candidate_r13_digest_binds_inputs", "tier":"candidate_regression"}
   ]
 }
