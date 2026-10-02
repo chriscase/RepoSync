@@ -520,9 +520,11 @@ Files blocked by policy are never silently passed through. Every skip produces a
 
 ## How to Reset Sync State
 
-If sync state becomes inconsistent and you need to start fresh, you can delete the watermarks and re-import.
+If sync state becomes inconsistent, stop the writer first. After RepoSync has already published commits to Git or SVN, do not treat a local database edit as rollback. Stop, reconcile, and roll forward under the rules in [`docs/enterprise-soak-runbook.md`](../enterprise-soak-runbook.md). Do not move a stored cursor backward, and do not restore an older database over those published commits.
 
-### Full reset (recommended)
+A full local wipe below is only for a disposable personal data directory you are willing to re-import. It is not a production recovery step, and it is not qualified enterprise rollback.
+
+### Full reset (disposable local data only)
 
 ```bash
 # Stop the daemon
@@ -547,25 +549,9 @@ reposync personal import --full       # slow: replay all SVN history
 reposync personal start
 ```
 
-### Partial reset (watermarks only)
+### Cursor does not match the working copies
 
-If the Git repo and SVN working copy are in a good state but the watermarks are wrong, you can reset just the watermarks using SQLite directly:
-
-```bash
-reposync personal stop
-
-# Reset SVN watermark to a specific revision
-sqlite3 ~/.local/share/reposync/personal.db \
-  "UPDATE watermarks SET value = '1040' WHERE key = 'svn_rev';"
-
-# Reset Git watermark to a specific commit
-sqlite3 ~/.local/share/reposync/personal.db \
-  "UPDATE watermarks SET value = 'abc123def456' WHERE key = 'git_sha';"
-
-reposync personal start
-```
-
-Use this approach with caution. Setting watermarks to incorrect values can cause duplicate commits or missed revisions.
+Stop the daemon and compare the recorded positions with the actual Git and SVN history. Reconcile from those external revisions. Do not hand-edit cursor rows to skip or replay history. A wrong cursor is a data-integrity problem: fixing it by guessing a revision can duplicate or drop commits.
 
 ## Log File Location and Verbosity
 

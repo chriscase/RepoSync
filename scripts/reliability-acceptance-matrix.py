@@ -3,9 +3,11 @@
 
 Validates that every isolated required-case ID is classified against the
 stable R01–R24 scenario list, that GOAL.md is unchanged, and that no
-scenario is marked PASS while criteria remain open. This is a catalog and
-honesty gate. Isolated real-engine proof remains
-scripts/reliability-container.sh.
+scenario is marked PASS while criteria remain open. Also checks that the
+#41 qualification-gate docs still separate local evidence from enterprise
+qualification and do not recommend a blind watermark reset. This is a
+catalog and honesty gate. Isolated real-engine proof remains
+scripts/reliability-container.sh. It does not execute a live enterprise run.
 """
 from __future__ import annotations
 
@@ -71,6 +73,88 @@ def check_goal() -> None:
         raise SystemExit(
             f"FAIL: docs/reliability/GOAL.md digest {digest} != pinned {GOAL_SHA256}"
         )
+
+
+# Stable phrases the #41 qualification docs must keep. Changing the wording
+# is fine only when this list is updated in the same change.
+QUALIFICATION_MARKERS: dict[str, list[str]] = {
+    "docs/enterprise-soak-runbook.md": [
+        "QUALIFICATION-TIER: local-file-engine",
+        "local/offline PASS is not enterprise/live PASS",
+        "local HTTP-provider",
+        "Disposable allowlisted enterprise",
+        "active-production acceptance",
+        "Chris/admin approval",
+        "migration coverage as **NOT RUN**",
+        "Data-integrity failures are NO-GO",
+        "do not restore an older database",
+    ],
+    "docs/ghe-live-validation-guide.md": [
+        "local/offline PASS is not enterprise/live PASS",
+        "not enterprise qualification",
+        "Chris/admin approval",
+        "candidate-report-template.md",
+    ],
+    "docs/reliability/candidate-report-template.md": [
+        "ILLUSTRATIVE / NOT a live run",
+        "REVIEW BASE SHA:",
+        "CURRENT HEAD SHA:",
+        "ARTIFACT DIGEST:",
+        "MIGRATION COVERAGE FOR THAT VERSION:",
+        "RECOMMENDATION FOR CHRIS: GO | NO-GO",
+        "local/offline PASS is not enterprise/live PASS",
+        "de9ef4725e314e1cec62bb8378bceaf091a07e7f",
+    ],
+    "scripts/enterprise-soak.sh": [
+        "local-file-engine",
+        "Enterprise qualification:** NOT RUN",
+        "local/offline PASS is not enterprise/live PASS",
+        "NOT ENTERPRISE QUALIFICATION",
+    ],
+    "scripts/ghe-live-validation.sh": [
+        "NOT ENTERPRISE QUALIFICATION",
+        "local/offline PASS is not enterprise/live PASS",
+        "not a production GO",
+    ],
+    "docs/personal-branch/troubleshooting.md": [
+        "Stop, reconcile, and roll forward",
+        "do not restore an older database",
+    ],
+}
+
+
+def qualification_text_errors(
+    label: str,
+    text: str,
+    required: list[str],
+    *,
+    forbid_watermark_reset: bool = True,
+) -> list[str]:
+    errors: list[str] = []
+    for marker in required:
+        if marker not in text:
+            errors.append(f"{label}: missing marker {marker!r}")
+    # "do not reset a watermark" is the required warning and stays legal.
+    # The rejected phrase is the old rollback statement that updates the table.
+    if forbid_watermark_reset and "update watermarks" in " ".join(text.lower().split()):
+        errors.append(f"{label}: forbids blind rollback via UPDATE watermarks")
+    if "all scenarios passed against live GHE+SVN" in text:
+        errors.append(f"{label}: dry-run/preflight must not claim a live GHE GO")
+    return errors
+
+
+def check_qualification_docs() -> None:
+    errors: list[str] = []
+    for rel, markers in QUALIFICATION_MARKERS.items():
+        path = ROOT / rel
+        if not path.is_file():
+            errors.append(f"{rel}: missing qualification document")
+            continue
+        errors.extend(
+            qualification_text_errors(rel, path.read_text(), markers)
+        )
+    if errors:
+        raise SystemExit("FAIL: qualification gate docs\n- " + "\n- ".join(errors))
 
 
 def validate(matrix: dict, manifest: dict) -> list[str]:
@@ -221,6 +305,7 @@ def self_test() -> None:
     matrix = load_json(MATRIX_PATH)
     manifest = load_json(REQUIRED_PATH)
     check_goal()
+    check_qualification_docs()
     errors = validate(matrix, manifest)
     if errors:
         raise SystemExit("SELF-TEST FAIL:\n- " + "\n- ".join(errors))
@@ -247,6 +332,25 @@ def self_test() -> None:
         raise SystemExit(
             "SELF-TEST FAIL: docs/reliability/scenarios.json is stale; "
             "run with --sync-scenarios"
+        )
+    synthetic_errors = qualification_text_errors(
+        "synthetic.md",
+        "rollback with UPDATE watermarks SET value='1'",
+        required=["local/offline PASS is not enterprise/live PASS"],
+    )
+    if not any("UPDATE watermarks" in item for item in synthetic_errors):
+        raise SystemExit("SELF-TEST FAIL: watermark reset was not rejected")
+    if not any("missing marker" in item for item in synthetic_errors):
+        raise SystemExit("SELF-TEST FAIL: missing qualification marker was not rejected")
+    allowed = qualification_text_errors(
+        "warning.md",
+        "Do not blind-reset a watermark after new Git or SVN writes. "
+        "local/offline PASS is not enterprise/live PASS.",
+        required=["local/offline PASS is not enterprise/live PASS"],
+    )
+    if allowed:
+        raise SystemExit(
+            "SELF-TEST FAIL: rollback warning was rejected\n- " + "\n- ".join(allowed)
         )
     print("SELF-TEST: PASS")
 
@@ -293,6 +397,7 @@ def main() -> int:
     manifest = load_json(REQUIRED_PATH)
     if args.check:
         check_goal()
+        check_qualification_docs()
         errors = validate(matrix, manifest)
         if errors:
             print("FAIL: acceptance matrix is inconsistent", file=sys.stderr)

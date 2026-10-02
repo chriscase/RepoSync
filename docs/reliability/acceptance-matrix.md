@@ -16,6 +16,8 @@ A scenario may be marked **PARTIAL** when named subcases pass and required issue
 
 The deployed executable/schema is **NOT ESTABLISHED**. No live acceptance is authorized from this matrix.
 
+Host catalog PASS is not enterprise or live acceptance. Qualification tiers, the #41 go/no-go checklist, and the candidate report Chris uses to decide are in [the enterprise soak runbook](../enterprise-soak-runbook.md) and [candidate-report-template.md](candidate-report-template.md). Until the installed version is known, that version's migration coverage stays **NOT RUN**. local/offline PASS is not enterprise/live PASS.
+
 ## Regenerating the human scenario file
 
 ```sh

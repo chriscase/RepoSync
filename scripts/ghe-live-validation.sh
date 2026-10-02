@@ -5,6 +5,13 @@
 # Real end-to-end bidirectional validation against a live GitHub Enterprise
 # instance and a real SVN repository.  This is NOT a local simulation.
 #
+# --dry-run is local tool preflight only. It never calls GHE or SVN.
+# Dry-run and scenario results are NOT ENTERPRISE QUALIFICATION.
+# local/offline PASS is not enterprise/live PASS.
+# A scenario pass is not Chris's active-environment GO.
+# Live mode requires Chris/admin approval, an allowlisted disposable target,
+# and dedicated credentials. This script does not self-authorize that.
+#
 # Environment variables (required for live run; not needed for --dry-run):
 #   GHE_API_URL     — GitHub Enterprise API base URL
 #   GHE_TOKEN       — GitHub PAT (repo scope)
@@ -26,7 +33,8 @@
 #   scripts/ghe-live-validation.sh --help
 #
 # Output: artifacts/ghe-live-validation/<UTC_TIMESTAMP>/
-# Exit code: 0 on all PASS, non-zero on any FAIL
+# Exit code: 0 when executed scenarios meet the script gate, or when --dry-run
+# finishes local preflight. Exit code 0 is not production acceptance.
 # ============================================================================
 
 set -euo pipefail
@@ -69,7 +77,8 @@ while [[ $# -gt 0 ]]; do
 Usage: scripts/ghe-live-validation.sh [OPTIONS]
 
 Options:
-  --dry-run          Preflight checks only (no live API calls)
+  --dry-run          Local tool preflight only. Never calls GHE or SVN.
+                     Not enterprise qualification, even if credentials are set.
   --cycles N         Number of validation cycles (default: 1)
   --interval N       Seconds between cycles (default: 5)
   --strict           Fail immediately on any scenario failure
@@ -188,7 +197,26 @@ trap cleanup EXIT
 write_summary() {
     local total=$((SCENARIO_PASS + SCENARIO_FAIL + SCENARIO_SKIP))
     local overall="PASS"
-    if [[ $SCENARIO_FAIL -gt 0 || $CYCLE_FAIL -gt 0 ]]; then overall="FAIL"; fi
+    local qualification_note
+    if $DRY_RUN; then
+        overall="DRY_RUN"
+        qualification_note="**NOT ENTERPRISE QUALIFICATION** — dry-run/preflight only.
+
+No live soak cycles ran. Dry-run does not call GitHub Enterprise or SVN.
+local/offline PASS is not enterprise/live PASS.
+Do not record this artifact as a GO for a candidate SHA. Chris decides live acceptance."
+    elif [[ $SCENARIO_FAIL -gt 0 || $CYCLE_FAIL -gt 0 ]]; then
+        overall="FAIL"
+        qualification_note="**NO-GO** — failures detected; review timeline.log and verification/ artifacts.
+
+Data-integrity failures are NO-GO even if other cycles passed."
+    else
+        qualification_note="**SCENARIO PASS — not production acceptance.**
+
+Recorded scenarios passed on this host. This is not Chris's active-environment GO.
+**NOT ENTERPRISE QUALIFICATION** of a candidate SHA until the candidate report records this exact head, artifact digest, and tier.
+Data-integrity failures elsewhere remain NO-GO even if this run's error count is zero."
+    fi
 
     cat > "$SUMMARY_FILE" <<SUMMARY
 # GHE Live Validation Summary
@@ -224,7 +252,7 @@ done)
 
 ## Go/No-Go
 
-$(if [[ "$overall" == "PASS" ]]; then echo "**GO** — all scenarios passed against live GHE+SVN."; else echo "**NO-GO** — failures detected; review timeline.log and verification/ artifacts."; fi)
+$qualification_note
 SUMMARY
 
     # Manifest.
@@ -242,6 +270,8 @@ SUMMARY
   "run_id": "$RUN_ID",
   "timestamp": "$TIMESTAMP",
   "overall": "$overall",
+  "enterprise_qualification": "NOT RUN",
+  "production_acceptance": "NOT DECIDED",
   "cycles": $CYCLES,
   "cycle_pass": $CYCLE_PASS,
   "cycle_fail": $CYCLE_FAIL,
@@ -334,66 +364,39 @@ check_var SVN_URL
 check_var SVN_USERNAME
 check_var SVN_PASSWORD
 
-if ! $ENV_OK; then
-    emit_event "preflight" "env-vars" "fail" 0
-    if $DRY_RUN; then
-        log ""
-        log "⚠ Missing environment variables (expected for --dry-run):"
-        printf "  %b" "$MISSING_VARS" | tee -a "$TIMELINE_LOG"
-        log ""
-        log "DRY RUN COMPLETE — preflight tools passed."
-        log "Set the missing variables above, then run without --dry-run."
-        emit_event "dry-run" "complete" "pass" 0
-        write_summary
-        log "Artifacts: $ARTIFACT_DIR"
-        exit 0
-    else
-        log ""
-        log "FATAL: Missing required environment variables:"
-        printf "  %b" "$MISSING_VARS" | tee -a "$TIMELINE_LOG"
-        log ""
-        log "Set these variables and re-run, or use --dry-run for preflight only."
-        exit 1
-    fi
-fi
-emit_event "preflight" "env-vars" "pass" 0
-
 if $DRY_RUN; then
     log ""
-    log "──────────────────────────────────────────────────────────────"
-    log "Preflight: connectivity check"
-    log "──────────────────────────────────────────────────────────────"
-
-    # Test GHE API.
-    GH_RESP=$(gh_api GET "/user" "")
-    GH_CODE=$(gh_status "$GH_RESP")
-    GH_LOGIN=$(gh_body "$GH_RESP" | jq -r '.login // "unknown"' 2>/dev/null || echo "parse-error")
-    if [[ "$GH_CODE" == "200" ]]; then
-        log "  ✓ GHE API: authenticated as $GH_LOGIN"
-        emit_event "preflight" "ghe-api" "pass" 0
+    if $ENV_OK; then
+        emit_event "preflight" "env-vars" "pass" 0
+        log "Credential variables are present and were not used."
     else
-        log "  ✗ GHE API: HTTP $GH_CODE"
-        emit_event "preflight" "ghe-api" "fail" 0
+        emit_event "preflight" "env-vars" "not-run" 0
+        log "Credential variables are unset (expected for local preflight):"
+        printf "  %b" "$MISSING_VARS" | tee -a "$TIMELINE_LOG"
     fi
-
-    # Test SVN.
-    if svn info "$SVN_URL" --username "$SVN_USERNAME" --password "$SVN_PASSWORD" \
-        --non-interactive --no-auth-cache > "$VERIFY_DIR/svn-info.txt" 2>&1; then
-        SVN_REV=$(grep "Revision:" "$VERIFY_DIR/svn-info.txt" | awk '{print $2}')
-        log "  ✓ SVN: accessible, HEAD r${SVN_REV:-?}"
-        emit_event "preflight" "svn" "pass" 0
-    else
-        log "  ✗ SVN: connection failed — see $VERIFY_DIR/svn-info.txt"
-        emit_event "preflight" "svn" "fail" 0
-    fi
-
     log ""
-    log "DRY RUN COMPLETE — all preflight checks passed."
-    emit_event "dry-run" "complete" "pass" 0
+    log "DRY RUN COMPLETE — local preflight only."
+    log "NOT ENTERPRISE QUALIFICATION"
+    log "local/offline PASS is not enterprise/live PASS"
+    log "Dry-run does not call GitHub Enterprise or SVN."
+    emit_event "dry-run" "complete" "pass" 0 "enterprise_qualification=NOT RUN"
     write_summary
     log "Artifacts: $ARTIFACT_DIR"
     exit 0
 fi
+
+if ! $ENV_OK; then
+    emit_event "preflight" "env-vars" "fail" 0
+    log ""
+    log "FATAL: Missing required environment variables:"
+    printf "  %b" "$MISSING_VARS" | tee -a "$TIMELINE_LOG"
+    log ""
+    log "Set these variables and re-run, or use --dry-run for local preflight only."
+    log "A live run needs Chris/admin approval and an allowlisted disposable target."
+    log "This script does not self-authorize that run."
+    exit 1
+fi
+emit_event "preflight" "env-vars" "pass" 0
 
 # ============================================================================
 # Live validation — set up working directories
@@ -961,7 +964,8 @@ fi
 log ""
 log "═══════════════════════════════════════════════════════════════"
 if [[ $EXIT_CODE -eq 0 ]]; then
-    log "VALIDATION COMPLETE — GO"
+    log "VALIDATION COMPLETE — SCENARIO PASS (not a production GO)"
+    log "NOT ENTERPRISE QUALIFICATION until a candidate report records this SHA."
 else
     log "VALIDATION COMPLETE — NO-GO"
 fi
