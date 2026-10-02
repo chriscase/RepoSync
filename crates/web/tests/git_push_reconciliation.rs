@@ -129,7 +129,6 @@ struct HeldPair {
     _tmp: tempfile::TempDir,
     id: String,
     operation_id: String,
-    bridge: std::path::PathBuf,
     bare: std::path::PathBuf,
 }
 
@@ -387,7 +386,6 @@ token_env = ""
             _tmp: tmp,
             id: repo_id.into(),
             operation_id: op.id,
-            bridge,
             bare,
         }
     }
