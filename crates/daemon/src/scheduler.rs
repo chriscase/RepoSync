@@ -16,6 +16,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use reposync_core::config::AppConfig;
+use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -417,13 +418,31 @@ impl Scheduler {
                 }
             }
 
-            // Check if this repo is already busy (another sync cycle OR
-            // an import is holding the working tree). The busy lock is
-            // process-wide and shared with the web API import handler.
-            if reposync_core::busy::is_busy(&repo.id) {
-                debug!(repo_name = %repo.name, "skipping: repo is busy (sync or import in progress)");
-                continue;
-            }
+            let repo_id = repo.id.clone();
+            let repo_name = repo.name.clone();
+
+            // RS-C07 (#64): acquire exclusive writer ownership before any
+            // mutable prep that touches this repo's Git/SVN working tree.
+            let busy_guard = match reposync_core::busy::try_acquire(&repo_id) {
+                Some(g) => g,
+                None => {
+                    debug!(
+                        repo_name = %repo_name,
+                        "refusing sync prep: writer busy (sync or import in progress)"
+                    );
+                    let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+                        action: "sync_refused",
+                        direction: None,
+                        svn_rev: None,
+                        git_sha: None,
+                        author: Some("scheduler"),
+                        details: Some("writer busy; refused mutable prep"),
+                        success: false,
+                        repo_id: Some(&repo_id),
+                    });
+                    continue;
+                }
+            };
 
             // Read credentials from kv_state.
             // Chain: repo_id → parent → grandparent → … → global
@@ -613,19 +632,7 @@ impl Scheduler {
                 debug!(repo_name = %repo.name, "path validation rules configured");
             }
 
-            let repo_id = repo.id.clone();
-            let repo_name = repo.name.clone();
             let ws = self.ws_broadcast.clone();
-
-            // Acquire the process-wide busy slot. If we can't, another
-            // task beat us to it — skip cleanly.
-            let busy_guard = match reposync_core::busy::try_acquire(&repo_id) {
-                Some(g) => g,
-                None => {
-                    debug!(repo_name = %repo_name, "lost race for busy slot, skipping");
-                    continue;
-                }
-            };
 
             info!(repo_name = %repo_name, repo_id = %repo_id, "starting per-repo sync cycle");
 
@@ -829,6 +836,210 @@ mod cancellation_tests {
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64A_SCHEDULER",
             "operation_id":operation.id,"checkpoint":2,"worker_spawned":false,"workdir_created":false})
+        );
+    }
+
+    fn scheduler_fixture(
+        tmp: &tempfile::TempDir,
+        repo_id: &str,
+        last_sync_at: &str,
+    ) -> (Scheduler, std::path::PathBuf) {
+        let config_file = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_file,
+            format!(
+                "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"file:///nonexistent\"\nusername = \"fixture\"\n[github]\nrepo = \"local/fixture\"\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let config = AppConfig::load_from_file(&config_file).unwrap();
+        let db_path = tmp.path().join("reposync.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        let now = Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: repo_id.into(),
+            name: "fixture".into(),
+            svn_url: "file:///nonexistent".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "gitea".into(),
+            git_api_url: "file:///nonexistent".into(),
+            git_repo: "local/fixture".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 1,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 2,
+            last_git_sha: "verified-old".into(),
+            last_sync_at: Some(last_sync_at.into()),
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        let dummy_git = tmp.path().join("dummy-git");
+        assert!(std::process::Command::new("git")
+            .args(["init", dummy_git.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let engine = SyncEngine::new(
+            config.clone(),
+            Database::in_memory().unwrap(),
+            SvnClient::new("file:///nonexistent", "fixture", ""),
+            GitClient::new(&dummy_git).unwrap(),
+            Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap()),
+        );
+        let (_, rx) = mpsc::channel(1);
+        let (ws, _) = broadcast::channel(1);
+        let git_repo_path = tmp.path().join("repos").join(repo_id).join("git-repo");
+        let scheduler = Scheduler::new(
+            Arc::new(engine),
+            Duration::from_secs(1),
+            rx,
+            ws,
+            Arc::new(RwLock::new(ImportProgress::default())),
+            db,
+            config,
+        );
+        (scheduler, git_repo_path)
+    }
+
+    #[tokio::test]
+    async fn candidate_64c07_busy_refusal_skips_mutable_prep_without_workdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, git_repo_path) =
+            scheduler_fixture(&tmp, "busy-repo", "2000-01-01T00:00:00Z");
+        let guard = reposync_core::busy::try_acquire("busy-repo").unwrap();
+        assert!(!git_repo_path.exists());
+
+        scheduler.maybe_run_repo_cycles().await;
+
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+        assert!(
+            !git_repo_path.exists(),
+            "scheduler must not create git workdir while writer is busy"
+        );
+        assert_eq!(
+            scheduler.db.get_repo_watermark("busy-repo").unwrap(),
+            (2, "verified-old".into())
+        );
+        let audit = scheduler
+            .db
+            .list_audit_log(10, 0)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.action == "sync_refused")
+            .expect("busy refusal must be recorded durably");
+        assert!(audit
+            .details
+            .as_deref()
+            .unwrap_or("")
+            .contains("writer busy"));
+        drop(guard);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64C07_BUSY_SKIP",
+            "workdir_created":false,"worker_spawned":false,"audit_action":"sync_refused"})
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_64c07_busy_refusal_leaves_existing_workdir_pristine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, git_repo_path) =
+            scheduler_fixture(&tmp, "pristine-repo", "2000-01-01T00:00:00Z");
+        std::fs::create_dir_all(&git_repo_path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--initial-branch", "main"])
+            .current_dir(&git_repo_path)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(git_repo_path.join("sentinel.txt"), "unchanged").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "sentinel.txt"])
+            .current_dir(&git_repo_path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-m", "baseline"])
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@test")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@test")
+            .current_dir(&git_repo_path)
+            .status()
+            .unwrap()
+            .success());
+        let head_before = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&git_repo_path)
+            .output()
+            .unwrap();
+        let guard = reposync_core::busy::try_acquire("pristine-repo").unwrap();
+
+        scheduler.maybe_run_repo_cycles().await;
+
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+        let head_after = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&git_repo_path)
+            .output()
+            .unwrap();
+        assert_eq!(head_before.stdout, head_after.stdout);
+        assert_eq!(
+            std::fs::read_to_string(git_repo_path.join("sentinel.txt")).unwrap(),
+            "unchanged"
+        );
+        drop(guard);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64C07_PRISTINE_WC",
+            "head_unchanged":true,"sentinel_unchanged":true,"worker_spawned":false})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_64c07_acquire_precedes_clone_prep_on_due_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, git_repo_path) =
+            scheduler_fixture(&tmp, "due-repo", "2000-01-01T00:00:00Z");
+        assert!(!git_repo_path.exists());
+
+        scheduler.maybe_run_repo_cycles().await;
+
+        // Without a competing writer, ownership is acquired before clone/init
+        // prep and the cycle proceeds far enough to create the workdir.
+        assert!(
+            git_repo_path.exists(),
+            "due repo should acquire ownership then perform mutable prep"
+        );
+        let handles: Vec<_> = scheduler.sync_handles.lock().await.drain(..).collect();
+        assert!(
+            !handles.is_empty(),
+            "sync worker should spawn only after ownership is held through prep"
+        );
+        for handle in handles {
+            let _ = handle.await;
+        }
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64C07_ACQUIRE_BEFORE_PREP",
+            "workdir_created":true,"worker_spawned":true})
         );
     }
 }

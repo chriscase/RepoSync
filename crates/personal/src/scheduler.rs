@@ -1,4 +1,8 @@
 //! Polling scheduler for the personal sync daemon.
+//!
+//! RS-C07 (#64 ownership-before-mutable-prep): NOT RUN here — personal mode is
+//! a single-repo CLI daemon without per-repo `busy` slots or team import/sync
+//! prep helpers; the team scheduler and web import paths own that contract.
 
 use std::time::Duration;
 
