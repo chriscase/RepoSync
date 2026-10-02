@@ -446,6 +446,27 @@ async fn fixture_barrier(
     }
 }
 
+#[cfg(feature = "reliability-fixture")]
+fn fixture_barrier_ready_only(stage: &str, repo: Option<&str>) -> bool {
+    let Ok(root) = std::env::var("REPOSYNC_FIXTURE_ROOT") else {
+        return false;
+    };
+    let Ok(dir) = std::env::var("REPOSYNC_IMPORT_BARRIER_DIR") else {
+        return false;
+    };
+    let Ok(root) = Path::new(&root).canonicalize() else {
+        return false;
+    };
+    let Ok(dir) = Path::new(&dir).canonicalize() else {
+        return false;
+    };
+    if !dir.starts_with(root) || repo.is_none_or(|id| !dir.ends_with(id)) {
+        return false;
+    }
+    std::fs::write(dir.join(format!("{stage}.ready")), b"ready").expect("fixture barrier ready");
+    false
+}
+
 struct PublicationTarget<'a> {
     workdir: &'a Path,
     remote: &'a str,
@@ -810,15 +831,12 @@ pub async fn run_snapshot_import(
         }
     }
 
+    // Observability only. No test coordinates this stage; waiting here would
+    // swallow the ordinary full-import `after_first_local` barrier whenever
+    // `REPOSYNC_IMPORT_BARRIER_DIR` is set on a snapshot worker.
     #[cfg(feature = "reliability-fixture")]
-    if fixture_barrier(
-        "before_snapshot_export",
-        repo_id.as_deref(),
-        cancel_signal.as_ref(),
-    )
-    .await
     {
-        return Ok(ImportOutcome::Cancelled { commits: 0 });
+        let _ = fixture_barrier_ready_only("before_snapshot_export", repo_id.as_deref());
     }
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         return Ok(ImportOutcome::Cancelled { commits: 0 });
@@ -996,53 +1014,60 @@ pub async fn run_full_import(
         }
     };
 
-    // LFS preflight: check availability and install hooks in the repo.
-    // Full import still warns and may commit without pointers. Snapshot
-    // import uses the same helper and fails closed instead.
-    let lfs_repo = {
-        let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
-        git_guard.repo_workdir()
-    };
-    let lfs_available = match prepare_import_lfs(
-        file_policy,
-        &lfs_repo,
-        operation_id.is_some(),
-        &progress,
-        &ws_broadcast,
-        cancel_signal.as_ref(),
-    )
-    .await?
-    {
-        ImportLfsPrep::Cancelled => return Ok(ImportOutcome::Cancelled { commits: 0 }),
-        ImportLfsPrep::NotRequired => false,
-        ImportLfsPrep::Ready => true,
-        ImportLfsPrep::PreflightFailed(e) => {
-            log(
-                &progress,
-                &ws_broadcast,
-                format!(
-                    "[warn] Git LFS not available: {e} — large files will be committed directly"
-                ),
-            )
-            .await;
-            false
-        }
-        ImportLfsPrep::InstallFailed(e) => {
-            log(
-                &progress,
-                &ws_broadcast,
-                format!("[warn] git lfs install failed: {e} — LFS tracking will not work"),
-            )
-            .await;
-            false
-        }
-    };
-
-    // Get SVN info
+    // Get SVN info / fixture handshake before LFS so a slow or hung git-lfs
+    // preflight cannot prevent `after_first_local.ready` from being reachable
+    // on the ordinary full-import browser path.
     #[cfg(feature = "reliability-fixture")]
     if fixture_barrier("connecting", repo_id.as_deref(), cancel_signal.as_ref()).await {
         return Ok(ImportOutcome::Cancelled { commits: 0 });
     }
+
+    // LFS preflight: check availability and install hooks in the repo.
+    // Full import still warns and may commit without pointers. Snapshot
+    // import uses the same helper and fails closed instead.
+    let lfs_available = if file_policy.lfs_enabled() {
+        let lfs_repo = {
+            let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git_guard.repo_workdir()
+        };
+        match prepare_import_lfs(
+            file_policy,
+            &lfs_repo,
+            operation_id.is_some(),
+            &progress,
+            &ws_broadcast,
+            cancel_signal.as_ref(),
+        )
+        .await?
+        {
+            ImportLfsPrep::Cancelled => return Ok(ImportOutcome::Cancelled { commits: 0 }),
+            ImportLfsPrep::NotRequired => false,
+            ImportLfsPrep::Ready => true,
+            ImportLfsPrep::PreflightFailed(e) => {
+                log(
+                    &progress,
+                    &ws_broadcast,
+                    format!(
+                        "[warn] Git LFS not available: {e} — large files will be committed directly"
+                    ),
+                )
+                .await;
+                false
+            }
+            ImportLfsPrep::InstallFailed(e) => {
+                log(
+                    &progress,
+                    &ws_broadcast,
+                    format!("[warn] git lfs install failed: {e} — LFS tracking will not work"),
+                )
+                .await;
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     log(
         &progress,
         &ws_broadcast,

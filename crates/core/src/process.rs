@@ -185,6 +185,20 @@ pub async fn run_with_input(
     run(command, timeout, cancel).await
 }
 
+/// Keep import Git/LFS children on the command's workdir instead of an
+/// ambient checkout. CI runs `git lfs install` globally; without this, a
+/// supervised `git lfs version` / clone can inherit `GIT_DIR` or smudge
+/// against the RepoSync workspace LFS remote and never finish.
+fn isolate_import_git_env(command: &mut Command) {
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command.env("GIT_LFS_SKIP_SMUDGE", "1");
+    command.env_remove("GIT_DIR");
+    command.env_remove("GIT_WORK_TREE");
+    command.env_remove("GIT_OBJECT_DIRECTORY");
+    command.env_remove("GIT_COMMON_DIR");
+    command.env_remove("GIT_INDEX_FILE");
+}
+
 pub async fn run(
     mut command: Command,
     timeout: Duration,
@@ -195,6 +209,7 @@ pub async fn run(
     }
     #[cfg(feature = "reliability-fixture")]
     fixture_cleanup_fault(&command).await?;
+    isolate_import_git_env(&mut command);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     command.kill_on_drop(true);
     #[cfg(unix)]
