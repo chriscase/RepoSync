@@ -23,6 +23,7 @@ pub mod models;
 pub mod notify;
 pub mod personal_config;
 pub mod process;
+pub mod snapshot;
 pub mod svn;
 pub mod svn_commit;
 pub mod sync_engine;

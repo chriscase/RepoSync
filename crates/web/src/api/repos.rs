@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use reposync_core::db::import_operations::{
-    import_target_fingerprint, ImportOperation, ImportOperationState,
+    import_target_fingerprint, ImportOperation, ImportOperationState, SnapshotPin,
 };
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
@@ -140,6 +140,16 @@ struct RepoDetail {
     updated_at: String,
     /// Current sync status label, if available.
     status: String,
+    /// True until a verified baseline mapping is recorded.
+    initializing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    starting_revision: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_boundary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_pin: Option<SnapshotPin>,
 }
 
 impl From<reposync_core::models::Repository> for RepoDetail {
@@ -163,9 +173,44 @@ impl From<reposync_core::models::Repository> for RepoDetail {
             created_by: r.created_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
-            status: "unknown".to_string(),
+            status: if r.last_sync_at.is_none() && r.last_svn_rev == 0 {
+                "initializing".to_string()
+            } else {
+                r.sync_status
+            },
+            initializing: r.last_sync_at.is_none() && r.last_svn_rev == 0,
+            import_mode: None,
+            starting_revision: None,
+            history_boundary: None,
+            snapshot_pin: None,
         }
     }
+}
+
+fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetail, AppError> {
+    if let Some(op) = db
+        .latest_import_operation(&detail.id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        let mode = if op.snapshot_pin.is_some() || op.operation_type == "snapshot_import" {
+            "snapshot"
+        } else {
+            "full"
+        };
+        detail.import_mode = Some(mode.into());
+        if let Some(pin) = op.snapshot_pin.clone() {
+            detail.starting_revision = Some(pin.operative_rev);
+            detail.history_boundary = Some(pin.history_boundary());
+            detail.snapshot_pin = Some(pin);
+        }
+        if !op.state.is_terminal() || op.state != ImportOperationState::Completed {
+            detail.initializing = true;
+            if detail.status == "unknown" || detail.status == "idle" {
+                detail.status = "initializing".into();
+            }
+        }
+    }
+    Ok(detail)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +399,7 @@ async fn get_repo(
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
-    Ok(Json(RepoDetail::from(repo)))
+    Ok(Json(enrich_repo_detail(db, RepoDetail::from(repo))?))
 }
 
 async fn update_repo(
@@ -835,6 +880,36 @@ impl Drop for ImportPreparationGuard<'_> {
 struct ImportQuery {
     #[serde(default)]
     reset: bool,
+    #[serde(default)]
+    import_mode: Option<String>,
+    #[serde(default)]
+    svn_revision: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct StartImportBody {
+    #[serde(default)]
+    import_mode: Option<String>,
+    #[serde(default)]
+    svn_revision: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeamImportMode {
+    Full,
+    Snapshot,
+}
+
+fn parse_team_import_mode(raw: Option<&str>) -> Result<TeamImportMode, AppError> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("full") | Some("full-history") | Some("full_history") => {
+            Ok(TeamImportMode::Full)
+        }
+        Some("snapshot") => Ok(TeamImportMode::Snapshot),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "import_mode must be full or snapshot, got {other}"
+        ))),
+    }
 }
 
 async fn start_repo_import(
@@ -842,6 +917,7 @@ async fn start_repo_import(
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     axum::extract::Query(import_query): axum::extract::Query<ImportQuery>,
+    body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let (user_id, role) = validate_session_with_role(
         &state,
@@ -881,6 +957,27 @@ async fn start_repo_import(
     if import_query.reset {
         return Err(AppError::BadRequest(
             "Reset & Reimport is unavailable while safe import cancellation is in effect; request a separately reviewed recovery plan".into(),
+        ));
+    }
+
+    let body: StartImportBody = if body.is_empty() {
+        StartImportBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::BadRequest(format!("invalid import request body: {e}")))?
+    };
+    let import_mode = parse_team_import_mode(
+        body.import_mode
+            .as_deref()
+            .or(import_query.import_mode.as_deref()),
+    )?;
+    let requested_revision = body
+        .svn_revision
+        .as_deref()
+        .or(import_query.svn_revision.as_deref());
+    if import_mode == TeamImportMode::Full && requested_revision.is_some() {
+        return Err(AppError::BadRequest(
+            "svn_revision is only valid with import_mode=snapshot".into(),
         ));
     }
 
@@ -1152,6 +1249,51 @@ async fn start_repo_import(
         }
     }
 
+    if reposync_core::snapshot::snapshot_workdir_is_born(&git_repo_path).unwrap_or(false) {
+        return Err(AppError::BadRequest(
+            "existing non-empty Git workdir refuses import overwrite; choose a new target".into(),
+        ));
+    }
+
+    let snapshot_pin = if import_mode == TeamImportMode::Snapshot {
+        db.mark_snapshot_import_request(&id, &operation_id)
+            .map_err(import_write_error)?;
+        let requested = match reposync_core::snapshot::SnapshotRevision::parse(requested_revision) {
+            Ok(requested) => requested,
+            Err(e) => {
+                let detail = format!("invalid snapshot revision: {e:#}");
+                let _ = db.finish_import_operation(
+                    &id,
+                    &operation_id,
+                    ImportOperationState::Failed,
+                    &detail,
+                );
+                preparation_guard.armed = false;
+                return Err(AppError::BadRequest(detail));
+            }
+        };
+        match reposync_core::snapshot::resolve_snapshot_pin(&svn_client, requested).await {
+            Ok(pin) => {
+                db.pin_snapshot_import(&id, &operation_id, pin.clone())
+                    .map_err(import_write_error)?;
+                Some(pin)
+            }
+            Err(e) => {
+                let detail = format!("invalid or inaccessible snapshot revision: {e:#}");
+                let _ = db.finish_import_operation(
+                    &id,
+                    &operation_id,
+                    ImportOperationState::Failed,
+                    &detail,
+                );
+                preparation_guard.armed = false;
+                return Err(AppError::BadRequest(detail));
+            }
+        }
+    } else {
+        None
+    };
+
     let git_client = Arc::new(std::sync::Mutex::new(git_client));
 
     // 9. Create IdentityMapper and FilePolicy (use defaults for per-repo)
@@ -1186,6 +1328,7 @@ async fn start_repo_import(
     let repo_id_clone = id.clone();
     let worker_operation_id = operation_id.clone();
     let cancel_signal = progress.read().await.cancel_signal.clone();
+    let worker_pin = snapshot_pin.clone();
 
     // 12. Spawn the import task (tracked for graceful shutdown)
     let state_for_handle = state.clone();
@@ -1200,23 +1343,37 @@ async fn start_repo_import(
             }
             Ok(Some(_)) => {
                 match import_db.start_import_operation(&repo_id_clone, &worker_operation_id) {
-                    Ok(_) => {
-                        import::run_full_import(
-                            &svn_client,
-                            &git_client,
-                            &identity_mapper,
-                            &import_db,
-                            &file_policy,
-                            &import_config,
-                            ImportRunState {
-                                progress: progress.clone(),
-                                ws_broadcast: ws_broadcast.clone(),
-                                repo_id: Some(repo_id_clone.clone()),
-                                operation_id: Some(worker_operation_id.clone()),
-                                cancel_signal: Some(cancel_signal),
-                            },
-                        )
-                        .await
+                    Ok(started) => {
+                        let run_state = ImportRunState {
+                            progress: progress.clone(),
+                            ws_broadcast: ws_broadcast.clone(),
+                            repo_id: Some(repo_id_clone.clone()),
+                            operation_id: Some(worker_operation_id.clone()),
+                            cancel_signal: Some(cancel_signal),
+                        };
+                        if let Some(pin) = started.snapshot_pin.or(worker_pin) {
+                            import::run_snapshot_import(
+                                &svn_client,
+                                &git_client,
+                                &import_db,
+                                &file_policy,
+                                &import_config,
+                                &pin,
+                                run_state,
+                            )
+                            .await
+                        } else {
+                            import::run_full_import(
+                                &svn_client,
+                                &git_client,
+                                &identity_mapper,
+                                &import_db,
+                                &file_policy,
+                                &import_config,
+                                run_state,
+                            )
+                            .await
+                        }
                     }
                     Err(e) => Err(e.into()),
                 }
@@ -1338,12 +1495,22 @@ async fn start_repo_import(
     }
     preparation_guard.armed = false;
 
-    Ok(Json(serde_json::json!({
+    let mut started = serde_json::json!({
         "ok": true,
         "message": "Import started",
         "operation_id": operation_id,
         "lifecycle": "queued",
-    })))
+        "import_mode": match import_mode {
+            TeamImportMode::Full => "full",
+            TeamImportMode::Snapshot => "snapshot",
+        },
+    });
+    if let Some(pin) = snapshot_pin {
+        started["starting_revision"] = serde_json::json!(pin.operative_rev);
+        started["history_boundary"] = serde_json::json!(pin.history_boundary());
+        started["snapshot_pin"] = serde_json::to_value(pin).unwrap_or(serde_json::Value::Null);
+    }
+    Ok(Json(started))
 }
 
 async fn repo_import_status(
@@ -1438,6 +1605,29 @@ async fn repo_import_status(
             "outcome_detail".into(),
             serde_json::json!(op.outcome_detail),
         );
+        let import_mode = if op.snapshot_pin.is_some() || op.operation_type == "snapshot_import" {
+            "snapshot"
+        } else {
+            "full"
+        };
+        object.insert("import_mode".into(), serde_json::json!(import_mode));
+        if let Some(pin) = &op.snapshot_pin {
+            object.insert(
+                "starting_revision".into(),
+                serde_json::json!(pin.operative_rev),
+            );
+            object.insert(
+                "history_boundary".into(),
+                serde_json::json!(pin.history_boundary()),
+            );
+            object.insert(
+                "snapshot_pin".into(),
+                serde_json::to_value(pin).unwrap_or(serde_json::Value::Null),
+            );
+            object.insert("earlier_history_imported".into(), serde_json::json!(false));
+        } else {
+            object.insert("earlier_history_imported".into(), serde_json::json!(true));
+        }
         object.insert("started_at".into(), serde_json::json!(op.created_at));
         if op.state.is_terminal() {
             object.insert("completed_at".into(), serde_json::json!(op.updated_at));
@@ -1622,7 +1812,10 @@ async fn reconcile_repo_import(
     }
     if active.as_ref().is_none_or(|op| op.id != operation_id)
         || requested.state != ImportOperationState::ReconciliationRequired
-        || requested.operation_type != "full_import"
+        || !matches!(
+            requested.operation_type.as_str(),
+            "full_import" | "snapshot_import"
+        )
     {
         return Err(AppError::BadRequest(
             "operation is not this repository's active reconciliation hold".into(),
@@ -1740,6 +1933,9 @@ async fn reconcile_repo_import(
                         | "incomplete prior publication receipt"
                         | "remote SHA differs from publication evidence"
                         | "invalid publication counter"
+                        | "snapshot import is missing its pin"
+                        | "snapshot import is not a single verified baseline"
+                        | "snapshot pin does not match the recorded local revision"
                 ) =>
             {
                 return reconciliation_held(

@@ -123,18 +123,27 @@ impl<'a> InitialImport<'a> {
         Ok(())
     }
 
-    /// Snapshot import: export HEAD, commit, push.
+    /// Snapshot import: pin HEAD once, export that revision, commit, push.
+    ///
+    /// Reuses the shared core snapshot engine (`resolve_snapshot_pin` +
+    /// `materialize_snapshot` + projected-content verify). Team onboarding
+    /// uses the same functions; do not add a second snapshot implementation.
     async fn import_snapshot(&self) -> Result<u64> {
         info!("starting snapshot import");
 
-        // Get SVN HEAD info
-        let svn_info = self
-            .svn_client
-            .info()
-            .await
-            .context("failed to get SVN info")?;
-        let head_rev = svn_info.latest_rev;
-        info!(head_rev, "SVN HEAD revision");
+        let pin = reposync_core::snapshot::resolve_snapshot_pin(
+            self.svn_client,
+            reposync_core::snapshot::SnapshotRevision::Head,
+        )
+        .await
+        .context("failed to pin SVN snapshot revision")?;
+        let head_rev = pin.operative_rev;
+        info!(
+            head_rev,
+            uuid = %pin.svn_uuid,
+            url = %pin.canonical_url,
+            "SVN snapshot pinned"
+        );
 
         // Build file policy from config.
         let policy = FilePolicy::from(&self.config.options);
@@ -148,54 +157,99 @@ impl<'a> InitialImport<'a> {
             );
         }
 
-        // Export HEAD to a temp dir, then copy with policy into Git working tree.
-        let export_dir =
-            tempfile::tempdir().context("failed to create temporary directory for SVN export")?;
+        let repo_path = {
+            let git_client = self.git_client.lock().unwrap();
+            git_client.repo_path().to_path_buf()
+        };
 
-        self.svn_client
-            .export("", head_rev, export_dir.path())
-            .await
-            .context("failed to export SVN HEAD")?;
+        let stats = reposync_core::snapshot::materialize_snapshot(
+            self.svn_client,
+            &repo_path,
+            &policy,
+            self.db,
+            &pin,
+        )
+        .await
+        .context("failed to materialize pinned SVN snapshot")?;
 
-        let git_client = self.git_client.lock().unwrap();
-        let repo_path = git_client.repo_path().to_path_buf();
-        drop(git_client);
+        if stats.skipped > 0 {
+            info!(
+                skipped = stats.skipped,
+                "snapshot import: files skipped by policy"
+            );
+        }
 
-        let skipped =
-            SvnToGitSync::copy_tree_with_policy(export_dir.path(), &repo_path, &policy, self.db)
-                .context("failed to copy exported files to Git")?;
+        reposync_core::snapshot::verify_projected_snapshot(
+            self.svn_client,
+            &repo_path,
+            &policy,
+            self.db,
+            &pin,
+        )
+        .await
+        .context("snapshot working tree does not match pinned projection")?;
 
-        if skipped > 0 {
-            info!(skipped, "snapshot import: files skipped by policy");
+        if policy.lfs_enabled() {
+            reposync_core::lfs::install_lfs_hooks(&repo_path).map_err(|e| {
+                anyhow::anyhow!("Git LFS is configured but git lfs install --local failed: {e}")
+            })?;
         }
 
         // Commit
         let message = self.formatter.format_svn_to_git(
-            &format!("Initial import from SVN (snapshot at r{})", head_rev),
+            &format!(
+                "Initial import from SVN (snapshot at r{})\n\n{}",
+                head_rev,
+                pin.history_boundary()
+            ),
             head_rev,
             &self.config.developer.svn_username,
             &chrono::Utc::now().to_rfc3339(),
         );
 
-        let git_client = self.git_client.lock().unwrap();
-        let oid = git_client
-            .commit(
-                &message,
-                &self.config.developer.name,
-                &self.config.developer.email,
-                &self.config.developer.name,
-                &self.config.developer.email,
-            )
+        let sha = {
+            let git_client = self.git_client.lock().unwrap();
+            let oid = if policy.lfs_enabled() {
+                git_client.commit_via_cli(
+                    &message,
+                    &self.config.developer.name,
+                    &self.config.developer.email,
+                    &self.config.developer.name,
+                    &self.config.developer.email,
+                )
+            } else {
+                git_client.commit(
+                    &message,
+                    &self.config.developer.name,
+                    &self.config.developer.email,
+                    &self.config.developer.name,
+                    &self.config.developer.email,
+                )
+            }
             .context("failed to create initial commit")?;
-
-        let sha = oid.to_string();
+            oid.to_string()
+        };
         info!(sha = %sha, rev = head_rev, "created snapshot commit");
 
+        let projected =
+            reposync_core::snapshot::project_snapshot_tree(self.svn_client, &policy, self.db, &pin)
+                .await
+                .context("failed to re-project snapshot for commit verification")?;
+        reposync_core::snapshot::verify_commit_matches_projection(
+            projected.path(),
+            &repo_path,
+            &sha,
+            &policy,
+        )
+        .context("snapshot Git commit does not match pinned SVN projection")?;
+
         // Push (credentials via remote URL)
-        git_client
-            .push("origin", &self.config.github.default_branch)
-            .context("failed to push to GitHub")?;
-        drop(git_client);
+        {
+            let git_client = self.git_client.lock().unwrap();
+            git_client
+                .push("origin", &self.config.github.default_branch)
+                .context("failed to push to GitHub")?;
+        }
 
         // Record in database
         self.db

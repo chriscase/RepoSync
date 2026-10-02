@@ -5387,3 +5387,581 @@ async fn candidate_r02_managed_remove_waits_and_retries_without_touching_remotes
     );
     server.abort();
 }
+
+async fn wait_import_terminal(client: &reqwest::Client, base: &str) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..200 {
+        last = client
+            .get(format!("{base}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if matches!(
+            last["lifecycle"].as_str(),
+            Some("completed" | "cancelled" | "failed" | "reconciliation_required")
+        ) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    last
+}
+
+fn git_show(bare: &std::path::Path, spec: &str) -> Vec<u8> {
+    use std::process::Command;
+    let out = Command::new("git")
+        .args(["--git-dir", bare.to_str().unwrap(), "show", spec])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn git_rev_list_count(bare: &std::path::Path) -> usize {
+    use std::process::Command;
+    let out = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-list",
+            "--count",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+fn svn_commit_extra(tmp: &std::path::Path, name: &str, body: &str) {
+    use std::process::Command;
+    let svn_url = format!("file://{}", tmp.join("svn-repo").display());
+    let checkout = tmp.join(format!("svn-wc-{name}"));
+    assert!(Command::new("svn")
+        .args([
+            "checkout",
+            &format!("{svn_url}/trunk"),
+            checkout.to_str().unwrap()
+        ])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(checkout.join(name), body).unwrap();
+    assert!(Command::new("svn")
+        .args(["add", name])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("svn")
+        .args(["commit", "-m", "advance after pin", "--username", "fixture"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+}
+
+/// R11: snapshot at a selected numeric revision materializes that tree only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r11_snapshot_at_fixed_revision() {
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"2"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let started: serde_json::Value = start.json().await.unwrap();
+    assert_eq!(started["import_mode"], "snapshot");
+    assert_eq!(started["starting_revision"], 2);
+    assert!(started["history_boundary"]
+        .as_str()
+        .unwrap()
+        .contains("before r2"));
+    let status = wait_import_terminal(&client, &base).await;
+    assert_eq!(status["lifecycle"], "completed", "{status}");
+    assert_eq!(status["import_mode"], "snapshot");
+    assert_eq!(status["starting_revision"], 2);
+    assert_eq!(status["earlier_history_imported"], false);
+    assert_eq!(status["snapshot_pin"]["operative_rev"], 2);
+    assert_eq!(status["snapshot_pin"]["peg_rev"], 2);
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+    let (rev, sha) = state.db.get_repo_watermark(&id).unwrap();
+    assert_eq!(rev, 2);
+    assert_eq!(status["last_confirmed_svn_rev"], 2);
+    assert_eq!(status["last_confirmed_git_sha"].as_str().unwrap(), sha);
+    let repo: serde_json::Value = client
+        .get(format!("http://{addr}/api/repos/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repo["import_mode"], "snapshot");
+    assert_eq!(repo["starting_revision"], 2);
+    assert_eq!(repo["initializing"], false);
+    assert!(!repo["history_boundary"]
+        .as_str()
+        .unwrap()
+        .to_lowercase()
+        .contains("full history"));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R11_SNAPSHOT_FIXED_R",
+            "starting_revision":2,
+            "git_commits":1,
+            "history_txt":"first",
+            "watermark":rev,
+            "earlier_history_imported":false
+        })
+    );
+    let _ = tmp;
+    server.abort();
+}
+
+/// R11: pin is sticky after SVN advances past the selected revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r11_pin_holds_when_svn_advances() {
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"HEAD"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let started: serde_json::Value = start.json().await.unwrap();
+    assert_eq!(started["starting_revision"], 3);
+    svn_commit_extra(tmp.path(), "later.txt", "after-pin\n");
+    let status = wait_import_terminal(&client, &base).await;
+    assert_eq!(status["lifecycle"], "completed", "{status}");
+    assert_eq!(status["starting_revision"], 3);
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"second\n");
+    let later = std::process::Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "cat-file",
+            "-e",
+            "main:later.txt",
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        !later.success(),
+        "later SVN revision must not appear in snapshot"
+    );
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 3);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R11_PIN_HOLDS_AFTER_ADVANCE",
+            "pinned":3,
+            "svn_after_pin":4,
+            "git_has_later_txt":false
+        })
+    );
+    server.abort();
+}
+
+/// R12: omitted import_mode stays full-history (upgrade-compatible default).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r12_omitted_mode_is_full_history() {
+    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client.post(&base).send().await.unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let started: serde_json::Value = start.json().await.unwrap();
+    assert_eq!(started["import_mode"], "full");
+    assert!(started["starting_revision"].is_null());
+    let status = wait_import_terminal(&client, &base).await;
+    assert_eq!(status["lifecycle"], "completed", "{status}");
+    assert_eq!(status["import_mode"], "full");
+    assert_eq!(status["earlier_history_imported"], true);
+    assert_eq!(git_rev_list_count(&bare), 3);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"second\n");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 3);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R12_FULL_DEFAULT","import_mode":"full","git_commits":3})
+    );
+    server.abort();
+}
+
+/// R11: mismatched existing Git target is refused without reset or overwrite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r11_mismatched_target_is_refused() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let work = tmp.path().join("existing-target");
+    assert!(Command::new("git")
+        .args(["init", "-b", "main", work.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(work.join("keep.txt"), "existing independent history\n").unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&work)
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["add", "keep.txt"]);
+    git(&["commit", "-m", "preexisting"]);
+    git(&["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&["push", "origin", "main"]);
+    let before = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let rejected = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"2"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = rejected.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("already exists")
+            || body["error"].as_str().unwrap().contains("new target"),
+        "{body}"
+    );
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    let after = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(before.stdout, after.stdout);
+    assert_eq!(
+        git_show(&bare, "main:keep.txt"),
+        b"existing independent history\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R11_MISMATCHED_TARGET","refused":true,"remote":"unchanged"})
+    );
+    server.abort();
+}
+
+/// R11: invalid / inaccessible revision fails closed without a baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r11_invalid_revision_is_refused() {
+    use std::process::Command;
+    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let rejected = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"99"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = rejected.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("revision"),
+        "{body}"
+    );
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let status: serde_json::Value = client
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["lifecycle"], "failed");
+    assert_eq!(status["import_mode"], "snapshot");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"R11_INVALID_REV","refused":true,"watermark":0})
+    );
+    server.abort();
+}
+
+/// R11: snapshot import with an LFS threshold publishes a pointer, not a fat blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r11_snapshot_lfs_pointer_publication() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET lfs_threshold_mb=1 WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    let checkout = tmp.path().join("svn-wc");
+    let large = vec![0u8; 1_100_000];
+    std::fs::write(checkout.join("large.bin"), &large).unwrap();
+    assert!(Command::new("svn")
+        .args(["add", "large.bin"])
+        .current_dir(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    let commit = Command::new("svn")
+        .args(["commit", "-m", "large binary", "--username", "fixture"])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"HEAD"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let status = wait_import_terminal(&client, &base).await;
+    assert_eq!(status["lifecycle"], "completed", "{status}");
+    assert_eq!(status["import_mode"], "snapshot");
+    assert_eq!(status["starting_revision"], 4);
+    assert_eq!(status["earlier_history_imported"], false);
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"second\n");
+    let pointer = git_show(&bare, "main:large.bin");
+    assert!(pointer.starts_with(b"version https://git-lfs.github.com/spec/v1\n"));
+    assert!(String::from_utf8_lossy(&pointer).contains("size 1100000"));
+    assert!(status["log_lines"].as_array().unwrap().iter().any(|line| {
+        line.as_str()
+            .unwrap_or("")
+            .contains("Git LFS installed in repo")
+    }));
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 4);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R11_SNAPSHOT_LFS",
+            "starting_revision":4,
+            "git_commits":1,
+            "pointer_published":true,
+            "source_bytes":large.len()
+        })
+    );
+    server.abort();
+}
+
+/// R11: a snapshot held after publication can finish only when the remote SHA matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r11_snapshot_reconcile_finishes_exact_baseline() {
+    use std::process::Command;
+    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_import_finalization BEFORE UPDATE OF last_svn_rev ON repositories
+             BEGIN SELECT RAISE(FAIL, 'fixture finalizer failure'); END;",
+        )
+        .unwrap();
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"2"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let started: serde_json::Value = start.json().await.unwrap();
+    let operation_id = started["operation_id"].as_str().unwrap();
+    let status = wait_import_terminal(&client, &base).await;
+    assert_eq!(status["lifecycle"], "reconciliation_required", "{status}");
+    state
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_import_finalization")
+        .unwrap();
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+    let op = state
+        .db
+        .get_import_operation(&id, operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.operation_type, "snapshot_import");
+    assert_eq!(op.snapshot_pin.as_ref().unwrap().operative_rev, 2);
+    let intended = op.last_confirmed_git_sha.clone().unwrap();
+
+    let tree = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main^{tree}",
+        ])
+        .output()
+        .unwrap();
+    assert!(tree.status.success());
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_owned();
+    let child = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "commit-tree",
+            &tree,
+            "-m",
+            "unrelated",
+        ])
+        .env("GIT_AUTHOR_NAME", "external")
+        .env("GIT_AUTHOR_EMAIL", "external@example.invalid")
+        .env("GIT_COMMITTER_NAME", "external")
+        .env("GIT_COMMITTER_EMAIL", "external@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let child = String::from_utf8_lossy(&child.stdout).trim().to_owned();
+    assert!(Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            &child,
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let mismatch = client
+        .post(format!("{base}/{operation_id}/reconcile"))
+        .send()
+        .await
+        .unwrap();
+    assert!(mismatch.status().is_success());
+    let mismatch: serde_json::Value = mismatch.json().await.unwrap();
+    assert_eq!(
+        mismatch["lifecycle"], "reconciliation_required",
+        "{mismatch}"
+    );
+    assert_eq!(mismatch["checkpoint_completed"], false);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+
+    assert!(Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            &intended,
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let done = client
+        .post(format!("{base}/{operation_id}/reconcile"))
+        .send()
+        .await
+        .unwrap();
+    assert!(done.status().is_success(), "{}", done.text().await.unwrap());
+    let done: serde_json::Value = done.json().await.unwrap();
+    assert_eq!(done["lifecycle"], "completed", "{done}");
+    assert_eq!(done["checkpoint_completed"], true);
+    assert_eq!(done["publication_proved"], true);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 2);
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+    let again = client
+        .post(format!("{base}/{operation_id}/reconcile"))
+        .send()
+        .await
+        .unwrap();
+    assert!(again.status().is_success());
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["lifecycle"], "completed");
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 2);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R11_SNAPSHOT_RECONCILE",
+            "mismatch_held":true,
+            "watermark":2,
+            "git_commits":1
+        })
+    );
+    server.abort();
+}
