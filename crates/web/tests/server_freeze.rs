@@ -1430,16 +1430,19 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
     let pair = client.post(format!("{base}/api/repos/{id}/branches"))
         .json(&serde_json::json!({"svn_branch":"branches/feature", "git_branch":"feature", "skip_import":true, "auto_create_svn_branch":false, "auto_create_git_branch":false}))
         .send().await.unwrap();
-    assert!(
-        pair.status().is_success(),
-        "late pair: {}",
-        pair.text().await.unwrap()
-    );
+    let pair_status = pair.status();
     let pair: serde_json::Value = pair.json().await.unwrap();
-    assert_eq!(pair["last_git_sha"], feature_tip);
-    assert!(pair["last_svn_rev"].as_i64().unwrap() > 0);
-    let pair_id = pair["id"].as_str().unwrap();
-    assert_eq!(state.db.get_repo_watermark(pair_id).unwrap().1, feature_tip);
+    assert_eq!(
+        pair_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "late pair of unproven Git-first history must refuse: {pair}"
+    );
+    let err = pair["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("missing_baseline") || err.contains("unrelated_git_first"),
+        "expected lineage refusal, got {pair}"
+    );
+    assert!(state.db.list_child_repositories(id).unwrap().is_empty());
     assert!(state.db.list_commit_map(100).unwrap().is_empty());
     let svn_tree = Command::new("svn")
         .args(["list", &target_url, "--non-interactive"])
@@ -1447,7 +1450,9 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
         .unwrap();
     assert!(svn_tree.status.success());
     assert!(!String::from_utf8_lossy(&svn_tree.stdout).contains("feature.txt"));
-    eprintln!("EXPECTED BASELINE FAILURE R06 API: skip_import recorded provider ref {feature_tip} while disposable SVN target had no feature.txt and no mapping");
+    eprintln!(
+        "R08 API: skip_import of Git-first feature was refused before watermark or child row"
+    );
 
     let progress = state.get_repo_import_progress(id).await;
     progress.write().await.phase = ImportPhase::Importing;
@@ -5979,6 +5984,414 @@ async fn candidate_r11_snapshot_reconcile_finishes_exact_baseline() {
             "mismatch_held":true,
             "watermark":2,
             "git_commits":1
+        })
+    );
+    server.abort();
+}
+
+fn git_cmd(dir: &std::path::Path, args: &[&str]) {
+    use std::process::Command;
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{} {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn clone_work(tmp: &std::path::Path, bare: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let work = tmp.join(name);
+    git_cmd(
+        tmp,
+        &["clone", bare.to_str().unwrap(), work.to_str().unwrap()],
+    );
+    work
+}
+
+fn svn_youngest(svn_repo: &std::path::Path) -> i64 {
+    use std::process::Command;
+    let out = Command::new("svnlook")
+        .args(["youngest", svn_repo.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+async fn snapshot_imported_parent() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<AppState>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+    String,
+    std::path::PathBuf,
+) {
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"2"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        start.status().is_success(),
+        "{}",
+        start.text().await.unwrap()
+    );
+    let status = wait_import_terminal(&client, &base).await;
+    assert_eq!(status["lifecycle"], "completed", "{status}");
+    assert!(std::process::Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    (addr, state, server, tmp, id, bare)
+}
+
+fn push_feature_commits(tmp: &std::path::Path, bare: &std::path::Path, n: usize) -> String {
+    let work = clone_work(tmp, bare, "feature-work");
+    // Bare fixtures often keep unborn `master` as HEAD while the snapshot lives
+    // on `refs/heads/main`. Branch from that imported parent, not a new root.
+    git_cmd(
+        &work,
+        &[
+            "fetch",
+            "--",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+    git_cmd(&work, &["checkout", "-B", "feature", "origin/main"]);
+    for i in 1..=n {
+        std::fs::write(work.join("feature.txt"), format!("step {i}\n")).unwrap();
+        if i == 1 {
+            git_cmd(&work, &["add", "feature.txt"]);
+            git_cmd(&work, &["commit", "-m", &format!("Feature step {i}")]);
+        } else {
+            git_cmd(&work, &["commit", "-am", &format!("Feature step {i}")]);
+        }
+    }
+    git_cmd(&work, &["push", "-u", "origin", "feature"]);
+    let tip = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&tip.stdout).trim().to_string()
+}
+
+fn push_orphan_branch(tmp: &std::path::Path, bare: &std::path::Path) {
+    let work = clone_work(tmp, bare, "orphan-work");
+    git_cmd(&work, &["checkout", "--orphan", "unrelated"]);
+    let _ = std::process::Command::new("git")
+        .args(["rm", "-rf", "--ignore-unmatch", "."])
+        .current_dir(&work)
+        .output();
+    std::fs::write(work.join("git-first.txt"), "unrelated git-first root\n").unwrap();
+    git_cmd(&work, &["add", "git-first.txt"]);
+    git_cmd(&work, &["commit", "-m", "Unrelated Git-first root"]);
+    git_cmd(&work, &["push", "-u", "origin", "unrelated"]);
+}
+
+/// R06: SVN-derived Git feature commits are admitted in preview; tips are pinned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_svn_derived_preview_pins_tips() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let feature_tip = push_feature_commits(tmp.path(), &bare, 2);
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = svn_youngest(&svn_repo);
+    let children_before = state.db.list_child_repositories(&id).unwrap().len();
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":false,
+            "dry_run":true,
+            "auto_create_svn_branch":true,
+            "auto_create_git_branch":true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "preview");
+    assert_eq!(plan["admitted"], true);
+    assert_eq!(plan["published"], false);
+    assert_eq!(plan["scheduler_active"], false);
+    assert_eq!(plan["pair_state"], "preparing");
+    assert_eq!(plan["policy_version"], "late_pair_admission_v1");
+    assert_eq!(plan["git_tip"], feature_tip);
+    assert_eq!(plan["svn_source_revision"], 2);
+    assert_eq!(plan["proposed_svn_copy_source_revision"], 2);
+    assert_eq!(plan["pending_git"]["count"], 2);
+    assert_eq!(plan["skip_import_applied"], false);
+    assert_eq!(plan["existing_svn_target"]["equivalent"], false);
+    assert_eq!(
+        state.db.list_child_repositories(&id).unwrap().len(),
+        children_before
+    );
+    assert_eq!(svn_youngest(&svn_repo), before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_SVN_DERIVED_PREVIEW",
+            "admitted":true,
+            "pending_git":2,
+            "svn_source_revision":2,
+            "published":false,
+            "child_rows":0
+        })
+    );
+    server.abort();
+}
+
+/// R06/R11: snapshot-bounded ancestry is enough for late-pair admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_snapshot_baseline_late_pair() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    assert_eq!(git_rev_list_count(&bare), 1);
+    let _ = push_feature_commits(tmp.path(), &bare, 1);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":false,
+            "preview":true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(plan["admitted"], true, "{plan}");
+    assert_eq!(plan["verified_baseline"]["svn_revision"], 2);
+    assert_eq!(
+        plan["verified_baseline"]["evidence"],
+        "snapshot_import_confirmed"
+    );
+    assert_eq!(plan["pending_git"]["count"], 1);
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_SNAPSHOT_BASELINE",
+            "parent_git_commits":1,
+            "pending_git":1,
+            "admitted":true
+        })
+    );
+    server.abort();
+}
+
+/// R08: unrelated Git-first / orphan history is refused before remote mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r08_refuse_unrelated_git_first() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    push_orphan_branch(tmp.path(), &bare);
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = svn_youngest(&svn_repo);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"unrelated",
+            "skip_import":false,
+            "dry_run":true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unrelated_git_first"),
+        "{body}"
+    );
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    assert_eq!(svn_youngest(&svn_repo), before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R08_REFUSE_GIT_FIRST",
+            "refused":true,
+            "reason":"unrelated_git_first",
+            "svn_unchanged":true,
+            "child_rows":0
+        })
+    );
+    server.abort();
+}
+
+/// R06: unsafe skip_import is refused and does not set watermarks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_unsafe_skip_import_blocked() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    let parent_mark = state.db.get_repo_watermark(&id).unwrap();
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":true,
+            "dry_run":true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unsafe_skip_import"),
+        "{body}"
+    );
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap(), parent_mark);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_SKIP_IMPORT_BLOCKED",
+            "refused":true,
+            "watermark_unchanged":true
+        })
+    );
+    server.abort();
+}
+
+/// R07 partial: an existing SVN target is reported as not equivalent; no copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_existing_target_not_equivalent() {
+    use std::process::Command;
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 1);
+    let svn_url = format!("file://{}", tmp.path().join("svn-repo").display());
+    let svn_repo = tmp.path().join("svn-repo");
+    assert!(Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/branches"),
+            "-m",
+            "branches",
+            "--non-interactive"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("svn")
+        .args([
+            "copy",
+            &format!("{svn_url}/trunk"),
+            &format!("{svn_url}/branches/feature"),
+            "-m",
+            "existing target",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let before = svn_youngest(&svn_repo);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":false,
+            "dry_run":true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(plan["admitted"], true, "{plan}");
+    assert_eq!(plan["existing_svn_target"]["exists"], true);
+    assert_eq!(plan["existing_svn_target"]["equivalent"], false);
+    assert!(plan["proposed_svn_copy_source_revision"].is_null());
+    assert_eq!(svn_youngest(&svn_repo), before);
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_EXISTING_TARGET_NOT_EQUIVALENT",
+            "exists":true,
+            "equivalent":false,
+            "svn_unchanged":true
+        })
+    );
+    server.abort();
+}
+
+/// R06: explicit publish is refused; no scheduler-active child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_no_active_on_partial() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 1);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":false,
+            "dry_run":false,
+            "preview":false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("publish_not_implemented"),
+        "{body}"
+    );
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    let parent = state.db.get_repository(&id).unwrap().unwrap();
+    assert!(parent.enabled);
+    assert_ne!(parent.sync_status, "reconciling");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_NO_ACTIVE_ON_PARTIAL",
+            "child_rows":0,
+            "publish_refused":true
         })
     );
     server.abort();

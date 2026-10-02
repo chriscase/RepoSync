@@ -601,6 +601,12 @@
     {"id":"R11_INVALID_REV", "binary":"server_freeze", "test":"candidate_r11_invalid_revision_is_refused", "tier":"candidate_regression"},
     {"id":"R12_FULL_DEFAULT", "binary":"server_freeze", "test":"candidate_r12_omitted_mode_is_full_history", "tier":"candidate_regression"},
     {"id":"R11_SNAPSHOT_LFS", "binary":"server_freeze", "test":"candidate_r11_snapshot_lfs_pointer_publication", "tier":"candidate_regression"},
-    {"id":"R11_SNAPSHOT_RECONCILE", "binary":"server_freeze", "test":"candidate_r11_snapshot_reconcile_finishes_exact_baseline", "tier":"candidate_regression"}
+    {"id":"R11_SNAPSHOT_RECONCILE", "binary":"server_freeze", "test":"candidate_r11_snapshot_reconcile_finishes_exact_baseline", "tier":"candidate_regression"},
+    {"id":"R08_REFUSE_GIT_FIRST", "binary":"server_freeze", "test":"candidate_r08_refuse_unrelated_git_first", "tier":"candidate_regression"},
+    {"id":"R06_SVN_DERIVED_PREVIEW", "binary":"server_freeze", "test":"candidate_r06_svn_derived_preview_pins_tips", "tier":"candidate_regression"},
+    {"id":"R06_SNAPSHOT_BASELINE", "binary":"server_freeze", "test":"candidate_r06_snapshot_baseline_late_pair", "tier":"candidate_regression"},
+    {"id":"R06_SKIP_IMPORT_BLOCKED", "binary":"server_freeze", "test":"candidate_r06_unsafe_skip_import_blocked", "tier":"candidate_regression"},
+    {"id":"R06_EXISTING_TARGET_NOT_EQUIVALENT", "binary":"server_freeze", "test":"candidate_r06_existing_target_not_equivalent", "tier":"candidate_regression"},
+    {"id":"R06_NO_ACTIVE_ON_PARTIAL", "binary":"server_freeze", "test":"candidate_r06_no_active_on_partial", "tier":"candidate_regression"}
   ]
 }

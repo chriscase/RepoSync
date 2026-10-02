@@ -3,10 +3,10 @@
   "epic": 61,
   "issue": 62,
   "reviewed_original_base": "87379741779a6259f7eeb52a68cc6f061174e5ef",
-  "authored_against_main": "43dda452dc38bc97991cd0830018d17bdbb31902",
+  "authored_against_main": "4f985a24d1fede55bde88b521800ae9e5db0f5a3",
   "deployed_version": "NOT ESTABLISHED",
   "goal_sha256": "16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8",
-  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
+  "scope": "Current-main #62 rollup after merged PR #72/#74/#75/#77/#78/#79/#80/#81 plus #67 admission/preview. Named isolated subcases are mapped; issue-complete PASS is not claimed. Copy-only v13/v14 and candidate inspection routes remain unactivated. Live acceptance is not authorized.",
   "harness_case_ids": [
     "EVIDENCE_SCAN_CLEAN",
     "EVIDENCE_SCAN_CANARY",
@@ -175,48 +175,62 @@
       "id": "R06",
       "title": "Late pair of an SVN-derived Git branch with earlier commits",
       "baseline": "FAIL",
-      "candidate": "NOT RUN",
-      "tier": "actual_engine",
-      "required_case_ids": [],
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "required_case_ids": [
+        "R06_SVN_DERIVED_PREVIEW",
+        "R06_SNAPSHOT_BASELINE",
+        "R06_SKIP_IMPORT_BLOCKED",
+        "R06_EXISTING_TARGET_NOT_EQUIVALENT",
+        "R06_NO_ACTIVE_ON_PARTIAL"
+      ],
       "supporting_case_ids": [
         "R06_CHECKPOINT"
       ],
       "open": [
-        "Integrated API pair creation + persisted child row + child engine is NOT RUN",
-        "Issue #67 implementation is not in this PR"
+        "Replay of pending Git commits into SVN is not implemented",
+        "Conflict resolution for overlapping SVN/Git edits is not implemented",
+        "Default publish of a fully reconciled scheduler-active pair is not implemented",
+        "Issue #67 remains open"
       ],
-      "evidence": "R06_CHECKPOINT is a baseline_observation: after a real SVN import the fixture manually assigns a child checkpoint and shows two descendant Git commits omitted. R02_R03_ROUTE also records skip_import of a Git-first feature tip with no feature.txt in SVN and an empty commit_map. Those are reproductions, not candidate acceptance.",
+      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Candidate admission/preview proves an SVN-derived tip is planned with pinned Git tip and baseline SVN revision, snapshot-bounded ancestry is enough, unsafe skip_import is refused without watermark writes, an existing SVN target is not treated as equivalent, and dry_run=false does not insert a scheduler-active child. Replay and publish stay later.",
       "diagnostic_expected_baseline_failure": true
     },
     {
       "id": "R07",
       "title": "Parent SVN ahead and existing SVN target ahead",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
-      "tier": "not_run",
-      "required_case_ids": [],
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "required_case_ids": [
+        "R06_EXISTING_TARGET_NOT_EQUIVALENT"
+      ],
       "supporting_case_ids": [],
       "open": [
-        "No exact required case exists; #67 owns the workflow"
+        "Parent-ahead retention into Git is not implemented",
+        "Target-ahead reconcile of independent SVN changes is not implemented",
+        "Overlapping/binary conflict stop is not implemented"
       ],
-      "evidence": "Not executed on current main. The ignored team conflict control remains uncovered (#73).",
+      "evidence": "R06_EXISTING_TARGET_NOT_EQUIVALENT probes an already-copied SVN feature path read-only, reports equivalent=false, and does not svn copy or advance youngest. Full R07 dual-side reconcile remains #67 follow-up. The ignored team conflict control remains uncovered (#73).",
       "diagnostic_expected_baseline_failure": false
     },
     {
       "id": "R08",
       "title": "Reject unrelated Git-first or unproven lineage",
       "baseline": "PARTIAL",
-      "candidate": "NOT RUN",
-      "tier": "local_api",
-      "required_case_ids": [],
+      "candidate": "PARTIAL",
+      "tier": "local_api_real_remotes",
+      "required_case_ids": [
+        "R08_REFUSE_GIT_FIRST"
+      ],
       "supporting_case_ids": [
         "R02_R03_ROUTE"
       ],
       "open": [
-        "Candidate admission must refuse Git-first roots before remote mutation",
-        "Complete lineage proof is #63/#67, not this matrix row"
+        "Complete lineage certificate across all mapping shapes remains #63/#67",
+        "Ambiguous rewritten-branch pairing is still the #66/#67 follow-up, not this admission slice"
       ],
-      "evidence": "The API fixture in R02_R03_ROUTE accepts an unrelated Git-first feature branch via skip_import and stores the provider tip. That is a baseline admission diagnostic, not a candidate rejection. R09 rejects rewrites of already-handled SVN-origin history; it is not a Git-first pairing test.",
+      "evidence": "R08_REFUSE_GIT_FIRST imports a verified snapshot baseline then refuses an orphan Git-first branch with unrelated_git_first before SVN copy, child insert, or checkpoint write. R02_R03_ROUTE now refuses skip_import of an unimported Git-first feature (missing_baseline) instead of recording the provider tip. Commit-message trailers are not treated as proof (core unit).",
       "diagnostic_expected_baseline_failure": true
     },
     {
@@ -296,7 +310,7 @@
       ],
       "open": [
         "Rich onboarding UI / wizard polish is later",
-        "Late-pair of a snapshot-derived branch is #67, not this slice",
+        "Late-pair replay of a snapshot-derived branch remains #67 (admission/preview is R06_SNAPSHOT_BASELINE)",
         "Optional reuse of a previously imported baseline is not implemented",
         "Bidirectional incremental sync after snapshot is covered only by existing R01 cases on full-import baselines",
         "Issue #68 remains open"

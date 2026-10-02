@@ -11,6 +11,7 @@ acceptance.
 | #66 | [66-history-containment.md](66-history-containment.md) | No |
 | #65 | [65-managed-remove.md](65-managed-remove.md) | Additive removal API only; does not close #65 |
 | #68 | [68-snapshot-init.md](68-snapshot-init.md) | Team snapshot/selected-revision init; does not close #68 |
+| #67 | [67-late-pair-admission.md](67-late-pair-admission.md) | Late-pair admission/preview only; does not close #67 |
 
 Authoritative sources that these contracts must not silently rewrite:
 
