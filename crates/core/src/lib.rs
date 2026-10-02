@@ -4,6 +4,7 @@
 //! synchronization: configuration, database persistence, identity mapping,
 //! conflict detection and resolution, repository clients, and the sync engine.
 
+pub mod auto_reconcile;
 pub mod busy;
 pub mod config;
 pub mod conflict;

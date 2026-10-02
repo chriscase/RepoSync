@@ -6533,3 +6533,268 @@ async fn candidate_rsc04_restart_held_until_reconcile() {
         })
     );
 }
+
+async fn auto_reconcile_fixture(fixture: &QualifiedPair) -> reposync_core::auto_reconcile::AutoReconcileResult {
+    let repo = fixture
+        .engine
+        .db()
+        .get_repository(&fixture.repo_id)
+        .unwrap()
+        .unwrap();
+    let svn = SvnClient::new(&fixture.svn_url, "", "");
+    reposync_core::auto_reconcile::reconcile_held_external_writes(
+        fixture.engine.db(),
+        &repo,
+        &svn,
+        Some(fixture.bridge.as_path()),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64d_git_push_lost_reply_auto_finalizes_without_second_push() {
+    let fixture = QualifiedPair::new_with_repo_id("64d-auto-git-push").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "auto reconcile me\n",
+        "RS-64D auto git push",
+    );
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let watermark_before = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let remote_after_push = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush)
+        .expect("svn-to-git auto-reconcile attempt");
+    assert!(attempt.finalized, "{attempt:?}");
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_after_push
+    );
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    assert_ne!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark_before
+    );
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        !matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "auto-reconcile finalize must unblock: {blocked:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64D_AUTO_GIT_PUSH",
+            "operation_id":op.id,
+            "remote_after_push":remote_after_push,
+            "finalized":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64d_svn_commit_lost_reply_auto_finalizes_without_second_commit() {
+    let fixture = QualifiedPair::new_with_repo_id("64d-auto-svn-commit").await;
+    let repo_id = fixture.repo_id.as_str();
+    let sha = fixture.developer_commit("feature.txt", "one\n", "Auto reconcile Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let _fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let mappings_before = git_to_svn_mappings(fixture.engine.db(), repo_id);
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::GitToSvnCommit)
+        .expect("git-to-svn auto-reconcile attempt");
+    assert!(attempt.finalized, "{attempt:?}");
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before);
+    assert_eq!(
+        git_to_svn_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    assert_eq!(fixture.engine.db().get_repo_watermark(repo_id).unwrap().1, sha);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64D_AUTO_SVN_COMMIT",
+            "operation_id":op.id,
+            "svn_before_after":svn_before,
+            "finalized":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64d_mismatch_auto_reconcile_stays_held_without_mutation() {
+    let fixture = QualifiedPair::new_with_repo_id("64d-auto-mismatch").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "mismatch auto\n",
+        "RS-64D mismatch auto",
+    );
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let watermark = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let mappings = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    git_cli(&fixture.bridge, &["fetch", "origin"]);
+    std::fs::write(fixture.bridge.join("interference.txt"), "other\n").unwrap();
+    git_cli(&fixture.bridge, &["add", "interference.txt"]);
+    git_cli(
+        &fixture.bridge,
+        &["commit", "-m", "Interfering Git advance"],
+    );
+    git_cli(&fixture.bridge, &["push", "origin", "main"]);
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush)
+        .expect("svn-to-git auto-reconcile attempt");
+    assert!(!attempt.finalized);
+    assert!(!attempt.resume_authorized);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark
+    );
+    assert_eq!(svn_to_git_mappings(fixture.engine.db(), repo_id), mappings);
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "{blocked:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64D_MISMATCH_HELD",
+            "finalized":false,
+            "watermark_unchanged":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64d_restart_still_auto_reconciles() {
+    let fixture = QualifiedPair::new_with_repo_id("64d-auto-restart").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "restart auto\n",
+        "RS-64D restart auto",
+    );
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    fixture.engine.db().hold_interrupted_git_pushes().unwrap();
+    let held = fixture
+        .engine
+        .db()
+        .get_git_push_operation(repo_id, &op.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "{blocked:?}"
+    );
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush)
+        .expect("svn-to-git auto-reconcile attempt");
+    assert!(attempt.finalized, "{attempt:?}");
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64D_RESTART_AUTO",
+            "operation_id":op.id,
+            "held_until_auto_reconcile":true,
+            "finalized":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64d_concurrent_cycle_blocked_while_held_without_resume() {
+    let fixture = QualifiedPair::new_with_repo_id("64d-auto-blocked").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "blocked auto\n",
+        "RS-64D blocked auto",
+    );
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let held = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        held.state
+            == reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    assert!(!held.resume_authorized);
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "{blocked:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64D_CYCLE_BLOCKED",
+            "operation_id":held.id,
+            "resume_authorized":false,
+            "second_cycle_blocked":true
+        })
+    );
+}
