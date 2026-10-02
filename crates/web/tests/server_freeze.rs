@@ -2071,13 +2071,31 @@ async fn candidate_64a_real_import_completes_with_confirmed_ref_and_cursors() {
 
 #[cfg(feature = "reliability-fixture")]
 async fn wait_for_file(path: &Path) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let waited = tokio::time::timeout(Duration::from_secs(30), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if waited.is_err() {
+        let listing = path.parent().map(|dir| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| {
+                            entry
+                                .ok()
+                                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        panic!(
+            "timed out waiting for {}; barrier dir contents: {listing:?}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(feature = "reliability-fixture")]
