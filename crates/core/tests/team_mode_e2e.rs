@@ -75,6 +75,73 @@ fn branch_svn_url(repo_root: &str, svn_branch: &str) -> String {
     }
 }
 
+fn copy_export_tree(source: &Path, dest: &Path) {
+    fn visit(source: &Path, root: &Path, dest: &Path) {
+        for entry in std::fs::read_dir(root).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_name() == ".svn" {
+                continue;
+            }
+            let rel = path.strip_prefix(source).unwrap();
+            let target = dest.join(rel);
+            if path.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                visit(source, &path, dest);
+            } else if path.is_file() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+    visit(source, source, dest);
+}
+
+fn init_git_from_svn_export(export_dir: &Path, bridge: &Path, bare: &Path) -> GitClient {
+    assert_fixture_owned(bridge.parent().unwrap());
+    assert_fixture_owned(bare.parent().unwrap());
+    git2::Repository::init(bridge).expect("failed to init git repo");
+    git2::Repository::init_bare(bare).expect("failed to init bare repo");
+    git_cli(bridge, &["config", "user.name", "Fixture"]);
+    git_cli(bridge, &["config", "user.email", "fixture@example.invalid"]);
+    copy_export_tree(export_dir, bridge);
+    git_cli(bridge, &["add", "-A"]);
+    git_cli(bridge, &["commit", "-m", "SVN baseline"]);
+    git_cli(bridge, &["branch", "-M", "main"]);
+    git_cli(bridge, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git_cli(bridge, &["push", "-u", "origin", "main"]);
+    GitClient::new(bridge).expect("failed to open git client")
+}
+
+fn seed_svn_to_git_baseline(db: &Database, repo_id: &str, svn_rev: i64, git_sha: &str) {
+    let now = chrono::Utc::now();
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev=?1, last_git_sha=?2, updated_at=?3 WHERE id=?4",
+            rusqlite::params![svn_rev, git_sha, now.to_rfc3339(), repo_id],
+        )
+        .unwrap();
+    db.set_state(&format!("last_git_sha_{repo_id}"), git_sha)
+        .unwrap();
+    db.set_state(&format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())
+        .unwrap();
+    db.insert_sync_record(&reposync_core::models::SyncRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        repo_id: Some(repo_id.into()),
+        svn_revision: Some(svn_rev),
+        git_hash: Some(git_sha.into()),
+        direction: reposync_core::models::SyncDirection::SvnToGit,
+        author: "fixture".into(),
+        message: "Verified SVN origin".into(),
+        timestamp: now,
+        synced_at: now,
+        status: reposync_core::models::SyncRecordStatus::Applied,
+    })
+    .unwrap();
+}
+
 fn create_svn_repo(dir: &Path) -> String {
     assert_fixture_owned(dir);
     let repo_dir = dir.join("svn_repo");
@@ -556,7 +623,7 @@ impl QualifiedPair {
             let branch_url = branch_svn_url(&svn_repo_root, svn_branch);
             assert!(
                 Command::new("svn")
-                    .args(["mkdir", "-m", "RepoSync layout", &branch_url])
+                    .args(["mkdir", "--parents", "-m", "RepoSync layout", &branch_url])
                     .status()
                     .unwrap()
                     .success(),
@@ -568,9 +635,26 @@ impl QualifiedPair {
         svn_checkout(&svn_url, &wc);
         svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
         svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+        let baseline_svn_rev = svn_youngest(&svn_repo_root);
         let bridge = tmp.path().join("bridge");
         let bare = tmp.path().join("origin.git");
-        let git = setup_git_with_bare_origin(&bridge, &bare);
+        let use_standard_trunk = svn_branch == "trunk";
+        let manual_branch_bootstrap = !svn_branch.is_empty() && !use_standard_trunk;
+        let initial_svn_watermark = if manual_branch_bootstrap {
+            baseline_svn_rev
+        } else {
+            baseline_svn_rev - 1
+        };
+        let git = if manual_branch_bootstrap {
+            let export = tmp.path().join("baseline-export");
+            SvnClient::new(&svn_url, "", "")
+                .export("", baseline_svn_rev, &export)
+                .await
+                .unwrap();
+            init_git_from_svn_export(&export, &bridge, &bare)
+        } else {
+            setup_git_with_bare_origin(&bridge, &bare)
+        };
         let initial = get_head_sha(&bridge);
         let db_path = tmp.path().join("sync.db");
         let db = setup_db(&db_path);
@@ -594,8 +678,8 @@ impl QualifiedPair {
             parent_id: None,
             created_at: now.clone(),
             updated_at: now,
-            last_svn_rev: 1,
-            last_git_sha: initial,
+            last_svn_rev: initial_svn_watermark,
+            last_git_sha: initial.clone(),
             last_sync_at: None,
             sync_status: "idle".into(),
             total_syncs: 0,
@@ -607,7 +691,12 @@ impl QualifiedPair {
         })
         .unwrap();
         let mut config = make_app_config(&svn_repo_root, tmp.path());
-        config.svn.layout = reposync_core::config::SvnLayout::Custom;
+        if use_standard_trunk {
+            config.svn.layout = reposync_core::config::SvnLayout::Standard;
+            config.svn.trunk_path = "trunk".into();
+        } else {
+            config.svn.layout = reposync_core::config::SvnLayout::Custom;
+        }
         let mut engine = SyncEngine::new(
             config,
             db,
@@ -616,15 +705,20 @@ impl QualifiedPair {
             Arc::new(make_identity_mapper()),
         );
         engine.set_repo_id(repo_id.into());
-        assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
-        let imported_base = get_head_sha(&bridge);
+        let imported_base = if manual_branch_bootstrap {
+            seed_svn_to_git_baseline(engine.db(), repo_id, baseline_svn_rev, &initial);
+            initial.clone()
+        } else {
+            assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+            get_head_sha(&bridge)
+        };
         assert_eq!(
             engine.db().get_repo_watermark(repo_id).unwrap(),
-            (2, imported_base.clone())
+            (baseline_svn_rev, imported_base.clone())
         );
         let mapped: i64 = engine.db().conn().query_row(
-            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = 2 AND git_sha = ?2",
-            rusqlite::params![repo_id, &imported_base],
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND git_sha = ?3",
+            rusqlite::params![repo_id, baseline_svn_rev, &imported_base],
             |row| row.get(0),
         ).unwrap();
         assert_eq!(
