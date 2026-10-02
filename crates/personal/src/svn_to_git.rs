@@ -391,6 +391,11 @@ mod tests {
         std::fs::write(dst.path().join("stale.txt"), "remove me").unwrap();
         std::fs::create_dir(dst.path().join(".git")).unwrap();
         std::fs::write(dst.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::write(
+            dst.path().join(".gitattributes"),
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
 
         SvnToGitSync::remove_stale_files(src.path(), dst.path()).unwrap();
 
@@ -398,6 +403,10 @@ mod tests {
         assert!(!dst.path().join("stale.txt").exists());
         // .git must be preserved (root dotdir).
         assert!(dst.path().join(".git/HEAD").exists());
+        assert!(
+            dst.path().join(".gitattributes").exists(),
+            "engine-written .gitattributes must survive stale-remove"
+        );
     }
 
     #[test]

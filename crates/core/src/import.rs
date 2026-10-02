@@ -161,6 +161,13 @@ pub fn is_reserved_vcs_metadata(name: &OsStr) -> bool {
     RESERVED_VCS_METADATA_NAMES.iter().any(|n| name == *n)
 }
 
+/// Destination names `remove_stale_files` must keep even when they are absent
+/// from the SVN export. Reserved VCS dirs stay protected; `.gitattributes` is
+/// engine-written LFS tracking (not reserved during copy).
+pub fn is_stale_remove_protected(name: &OsStr) -> bool {
+    is_reserved_vcs_metadata(name) || name == ".gitattributes"
+}
+
 /// Recursively copy files from SVN export `src` into Git working tree `dst`,
 /// enforcing the given [`FilePolicy`].
 ///
@@ -773,8 +780,9 @@ fn file_exec_bit(mode: u32) -> bool {
 }
 
 /// Remove files from `dst` (Git working tree) that no longer exist in `src`
-/// (SVN export). Preserves reserved VCS metadata (e.g. destination `.git/`).
-/// Ordinary root dotfiles such as `.gitignore` can be stale-removed.
+/// (SVN export). Preserves reserved VCS metadata (e.g. destination `.git/`)
+/// and engine-written `.gitattributes`. Ordinary root dotfiles such as
+/// `.gitignore` can be stale-removed.
 pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
     remove_stale_inner(src, dst)
 }
@@ -791,7 +799,7 @@ fn remove_stale_inner(src: &Path, dst: &Path) -> Result<()> {
     for entry in entries {
         let entry = entry?;
         let file_name = entry.file_name();
-        if is_reserved_vcs_metadata(&file_name) {
+        if is_stale_remove_protected(&file_name) {
             continue;
         }
 
@@ -2956,6 +2964,38 @@ mod tests {
         assert!(audits.iter().any(|e| e.action == "file_policy_skip"));
         let manifest = independent_tree_manifest(src.path()).unwrap();
         verify_against_independent_manifest(dst.path(), &manifest, &policy).unwrap();
+    }
+
+    #[test]
+    fn import_copy_lfs_gitattributes_survives_stale_remove() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("model.bin"), vec![0u8; 200]).unwrap();
+        std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        let policy = FilePolicy::with_lfs(0, vec![], 100, &[]);
+        let db = test_db();
+        let stats = copy_tree_with_policy(src.path(), dst.path(), &policy, &db).unwrap();
+        assert_eq!(stats.copied, 2);
+        assert_eq!(stats.lfs_tracked, 1);
+        let gitattr = dst.path().join(".gitattributes");
+        assert!(
+            gitattr.exists(),
+            ".gitattributes should be created for LFS-tracked files"
+        );
+        let before = std::fs::read_to_string(&gitattr).unwrap();
+        assert!(before.contains("filter=lfs"));
+
+        remove_stale_files(src.path(), dst.path()).unwrap();
+        assert!(
+            gitattr.exists(),
+            "stale-remove must not delete engine-written .gitattributes"
+        );
+        assert_eq!(std::fs::read_to_string(&gitattr).unwrap(), before);
+        assert!(dst.path().join(".git").exists());
+        assert!(!is_reserved_vcs_metadata(std::ffi::OsStr::new(
+            ".gitattributes"
+        )));
     }
 
     #[test]
