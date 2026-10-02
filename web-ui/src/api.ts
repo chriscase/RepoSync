@@ -1,3 +1,5 @@
+import type { BranchPairRemovalResult } from './branchPairRemoval';
+
 const API_BASE = '/api';
 
 export interface SyncStatus {
@@ -435,14 +437,45 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  deleteBranchPair: (repoId: string, opts?: { delete_git?: boolean; delete_svn?: boolean }) => {
+  deleteBranchPair: async (
+    repoId: string,
+    opts?: { delete_git?: boolean; delete_svn?: boolean },
+  ): Promise<BranchPairRemovalResult> => {
     const params = new URLSearchParams();
-    if (opts?.delete_git !== undefined) params.set('delete_git', String(opts.delete_git));
-    if (opts?.delete_svn !== undefined) params.set('delete_svn', String(opts.delete_svn));
-    const qs = params.toString() ? `?${params.toString()}` : '';
-    return fetchJson<{ ok: boolean; message: string; warnings: string[] }>(
-      `/repos/${repoId}/branch-pair${qs}`, { method: 'DELETE' }
-    );
+    // Always send the caller's explicit choices. Omitted query params are
+    // destructive server defaults and are not used by this UI.
+    params.set('delete_git', String(opts?.delete_git ?? false));
+    params.set('delete_svn', String(opts?.delete_svn ?? false));
+    const token = localStorage.getItem('session_token');
+    const res = await fetch(`${API_BASE}/repos/${repoId}/branch-pair?${params.toString()}`, {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+    const text = await res.text();
+    let body: BranchPairRemovalResult & { error?: string } = {};
+    if (text) {
+      try {
+        body = JSON.parse(text) as BranchPairRemovalResult & { error?: string };
+      } catch {
+        body = { message: text };
+      }
+    }
+    const message = body.error || body.message || text || `API error ${res.status}`;
+    if (res.status === 401 && !/admin access required/i.test(message)) {
+      localStorage.removeItem('session_token');
+      localStorage.removeItem('user');
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login';
+      }
+      throw new Error(message || 'Session expired — please log in again');
+    }
+    if (!res.ok) {
+      throw new Error(message);
+    }
+    return body;
   },
 
   triggerRepoSync: (id: string) =>
