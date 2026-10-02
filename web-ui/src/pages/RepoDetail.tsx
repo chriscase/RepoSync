@@ -799,17 +799,17 @@ export default function RepoDetail() {
             <p className="text-red-300 font-medium">Sync Paused — Permanent Error</p>
             <p className="text-sm text-red-400 mt-1">
               The sync engine encountered repeated permanent errors and has been automatically paused.
-              You can skip the failing commit to advance past it, or retry if the issue has been resolved.
+              Skipping to live branch HEAD is disabled until exact per-commit skip disposition exists;
+              pending work is preserved. Retry if the issue has been resolved.
             </p>
           </div>
           <div className="flex gap-2 ml-4 flex-shrink-0">
             <button
-              onClick={async () => {
-                await api.skipCommit(id!);
-                queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
-                queryClient.invalidateQueries({ queryKey: ['repo', id] });
-              }}
-              className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 text-white text-sm font-medium transition-colors"
+              type="button"
+              disabled
+              title="Skip-to-HEAD is disabled until exact per-commit skip disposition exists. Pending work is preserved."
+              data-testid="skip-commit-button"
+              className="px-3 py-1.5 rounded-lg bg-yellow-600 text-white text-sm font-medium opacity-50 cursor-not-allowed"
             >
               Skip Commit
             </button>

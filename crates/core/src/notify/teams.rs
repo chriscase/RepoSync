@@ -526,7 +526,7 @@ pub fn format_circuit_breaker(repo_name: &str, consecutive_errors: i64) -> serde
         {
             "type": "TextBlock",
             "text": format!(
-                "Sync has been paused after {} consecutive permanent errors. Manual intervention is required — use **Skip Commit** or **Retry** from the RepoSync dashboard to resume.",
+                "Sync has been paused after {} consecutive permanent errors. Skip-to-HEAD is disabled until exact per-commit skip disposition exists; pending work is preserved. Use **Retry** from the RepoSync dashboard if the issue has been resolved.",
                 consecutive_errors
             ),
             "wrap": true,
@@ -621,6 +621,9 @@ mod tests {
         let text = card[0]["text"].as_str().unwrap();
         assert!(text.contains("Circuit breaker"));
         assert!(text.contains("EDM Repo"));
+        let body = card[1]["text"].as_str().unwrap();
+        assert!(body.contains("Skip-to-HEAD is disabled"));
+        assert!(!body.contains("Skip Commit"));
     }
 
     #[test]
