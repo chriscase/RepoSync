@@ -7,7 +7,8 @@
 //!
 //! Also re-exports [`copy_tree_with_policy`] so both personal-mode and
 //! team-mode code can share the file-copy logic. The copier is no-follow,
-//! preserves ordinary dotfiles, and excludes only reserved VCS metadata.
+//! preserves ordinary dotfiles, excludes only reserved VCS metadata, and
+//! rejects regular files with `nlink > 1` before reading or publishing them.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsStr;
@@ -172,9 +173,10 @@ pub fn is_stale_remove_protected(name: &OsStr) -> bool {
 /// enforcing the given [`FilePolicy`].
 ///
 /// Traversal is no-follow (`symlink_metadata` / `O_NOFOLLOW`). Symlinks,
-/// specials, and directory cycles are rejected before the target is read or
-/// published. Reserved VCS metadata is excluded and recorded; ordinary
-/// dotfiles are preserved.
+/// specials, directory cycles, and regular files with `nlink > 1` (hardlink
+/// aliases that may name outside-root bytes) are rejected before the target
+/// is read or published. Reserved VCS metadata is excluded and recorded;
+/// ordinary dotfiles are preserved.
 pub fn copy_tree_with_policy(
     src: &Path,
     dst: &Path,
@@ -184,7 +186,7 @@ pub fn copy_tree_with_policy(
     let mut stats = CopyStats::default();
     let mut visited = HashSet::new();
     admit_export_root(src, &mut visited)?;
-    copy_tree_policy_inner(src, dst, dst, src, policy, &mut stats, &mut visited)?;
+    copy_tree_policy_inner(src, dst, dst, src, policy, db, &mut stats, &mut visited)?;
     record_copy_exclusions(db, &stats);
     Ok(stats)
 }
@@ -269,6 +271,7 @@ fn copy_tree_policy_inner(
     dst_root: &Path,
     export_root: &Path,
     policy: &FilePolicy,
+    db: &Database,
     stats: &mut CopyStats,
     visited: &mut HashSet<(u64, u64)>,
 ) -> Result<()> {
@@ -328,6 +331,7 @@ fn copy_tree_policy_inner(
                 dst_root,
                 export_root,
                 policy,
+                db,
                 stats,
                 visited,
             )?;
@@ -338,6 +342,9 @@ fn copy_tree_policy_inner(
                 "unsupported file type at '{rel}' ({})",
                 file_type_label(&ft)
             );
+        }
+        if is_hardlink_alias(&meta) {
+            reject_hardlink_alias(db, stats, &rel)?;
         }
 
         // Size comes from no-follow metadata; never call evaluate_path (it follows).
@@ -455,6 +462,50 @@ fn is_special_file_type(ft: &std::fs::FileType) -> bool {
     !ft.is_dir() && !ft.is_file() && !ft.is_symlink()
 }
 
+/// Regular files with more than one directory entry can alias bytes that live
+/// outside the export root. `symlink_metadata` still reports them as ordinary
+/// files, so link count is the fail-closed signal. Directories are not
+/// aliases: their link count includes `.` and child subdirectories.
+fn is_hardlink_alias(meta: &std::fs::Metadata) -> bool {
+    if !meta.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Record the hardlink rejection, then fail closed before any read or publish.
+fn reject_hardlink_alias(db: &Database, stats: &mut CopyStats, rel: &str) -> Result<()> {
+    let decision = format!("unsupported:hardlink:{rel}");
+    warn!(
+        path = rel,
+        decision = decision.as_str(),
+        "rejecting hardlink alias before read or publish"
+    );
+    stats.exclusions.push(decision);
+    let _ = db.insert_audit_log(
+        "unsupported_hardlink_reject",
+        Some("svn_to_git"),
+        None,
+        None,
+        None,
+        Some(&format!(
+            "Rejected hardlink alias at '{rel}' (nlink>1): refusing to read or publish a file that may alias outside-root bytes"
+        )),
+        false,
+    );
+    bail!(
+        "unsupported hardlink at '{rel}' (nlink>1): refusing to read or publish a file that may alias outside-root bytes"
+    );
+}
+
 fn file_type_label(ft: &std::fs::FileType) -> &'static str {
     if ft.is_symlink() {
         "symlink"
@@ -539,7 +590,8 @@ impl IndependentTreeManifest {
 }
 
 /// Walk `root` with `symlink_metadata` only. Never follows links, never
-/// calls [`copy_tree_with_policy`], and never opens a non-regular file.
+/// calls [`copy_tree_with_policy`], and never opens a non-regular file or a
+/// regular file with `nlink > 1`.
 pub fn independent_tree_manifest(root: &Path) -> Result<IndependentTreeManifest> {
     let mut manifest = IndependentTreeManifest::default();
     let mut visited = HashSet::new();
@@ -658,6 +710,16 @@ fn independent_manifest_inner(
             );
             continue;
         }
+        if is_hardlink_alias(&meta) {
+            manifest.entries.insert(
+                rel,
+                ManifestEntry::Unsupported {
+                    kind: "hardlink".into(),
+                    detail: "nlink>1 (not opened)".into(),
+                },
+            );
+            continue;
+        }
         let (size, sha256) = hash_regular_file_no_follow(&path)?;
         manifest.entries.insert(
             rel,
@@ -704,7 +766,8 @@ fn unix_mode(meta: &std::fs::Metadata) -> u32 {
 
 /// Verify `dest` against an independently built source manifest. Does not
 /// call [`copy_tree_with_policy`] to invent expectations. A destination that
-/// published a followed symlink (outside-root double-copy canary) fails.
+/// published a followed symlink or a hardlink alias (outside-root canary)
+/// fails.
 pub fn verify_against_independent_manifest(
     dest: &Path,
     source_manifest: &IndependentTreeManifest,
@@ -2576,7 +2639,7 @@ async fn async_git_push(
 mod tests {
     use super::*;
     use crate::file_policy::FilePolicy;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::time::{Duration, Instant};
 
     const CANARY: &[u8] = b"OUTSIDE-ROOT-CANARY-SECRET-RS-C01";
@@ -2916,6 +2979,144 @@ mod tests {
             "independent manifest must fail the double-copy canary: {err}"
         );
         assert!(!manifest.contains_file_digest_of(CANARY));
+    }
+
+    #[test]
+    fn import_copy_rejects_hardlink_nlink_gt_1_before_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let original = src.join("original.txt");
+        std::fs::write(&original, b"in-tree-bytes").unwrap();
+        std::fs::hard_link(&original, src.join("alias.txt")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&original).unwrap().nlink() > 1,
+            "fixture must be a multi-linked regular file"
+        );
+
+        let db = test_db();
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &db).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported hardlink") && err.to_string().contains("nlink>1"),
+            "{err}"
+        );
+        assert!(!dst.join("alias.txt").exists());
+        assert!(
+            !dst.join("original.txt").exists(),
+            "every nlink>1 name is rejected before publish"
+        );
+
+        let audits = db.list_audit_log(10, 0).unwrap();
+        assert!(
+            audits.iter().any(|e| {
+                e.action == "unsupported_hardlink_reject"
+                    && !e.success
+                    && e.details.as_deref().unwrap_or("").contains("nlink>1")
+            }),
+            "hardlink rejection must be recorded: {:?}",
+            audits
+                .iter()
+                .map(|e| (&e.action, e.success, &e.details))
+                .collect::<Vec<_>>()
+        );
+
+        let manifest = independent_tree_manifest(&src).unwrap();
+        for name in ["original.txt", "alias.txt"] {
+            assert!(
+                matches!(
+                    manifest.entries.get(name),
+                    Some(ManifestEntry::Unsupported { kind, detail })
+                        if kind == "hardlink" && detail.contains("not opened")
+                ),
+                "{name}: {:?}",
+                manifest.entries.get(name)
+            );
+        }
+        assert!(
+            !manifest.contains_file_digest_of(b"in-tree-bytes"),
+            "independent manifest must not read a multi-linked file"
+        );
+    }
+
+    #[test]
+    fn import_copy_outside_root_hardlink_canary_unread_and_unpublished() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let src = tmp.path().join("export");
+        let dst = tmp.path().join("dest");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let secret = outside.join("secret.bin");
+        std::fs::write(&secret, CANARY).unwrap();
+        std::fs::write(src.join("ok.txt"), "inside").unwrap();
+        std::fs::hard_link(&secret, src.join("escape")).unwrap();
+        assert!(
+            std::fs::symlink_metadata(src.join("escape"))
+                .unwrap()
+                .nlink()
+                > 1
+        );
+
+        let manifest = independent_tree_manifest(&src).unwrap();
+        assert!(
+            !manifest.contains_file_digest_of(CANARY),
+            "independent manifest ingested outside-root hardlink canary bytes"
+        );
+        assert!(matches!(
+            manifest.entries.get("escape"),
+            Some(ManifestEntry::Unsupported { kind, detail })
+                if kind == "hardlink" && detail.contains("nlink>1") && detail.contains("not opened")
+        ));
+        assert!(matches!(
+            manifest.entries.get("ok.txt"),
+            Some(ManifestEntry::File { .. })
+        ));
+
+        let err = copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap_err();
+        assert!(err.to_string().contains("unsupported hardlink"), "{err}");
+        assert!(!dst.join("escape").exists());
+        assert!(!dest_contains_canary(&dst));
+        assert_eq!(std::fs::read(&secret).unwrap(), CANARY);
+    }
+
+    #[test]
+    fn import_copy_outside_root_hardlink_canary_fails_independent_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let src = tmp.path().join("export");
+        let published = tmp.path().join("published");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&published).unwrap();
+        let secret = outside.join("secret.bin");
+        std::fs::write(&secret, CANARY).unwrap();
+        std::fs::write(src.join("ok.txt"), "inside").unwrap();
+        std::fs::hard_link(&secret, src.join("escape")).unwrap();
+
+        // Publisher reads the alias and writes a fresh regular file. Expectations
+        // come from independent_tree_manifest, not copy_tree_with_policy.
+        std::fs::copy(src.join("escape"), published.join("escape")).unwrap();
+        std::fs::copy(src.join("ok.txt"), published.join("ok.txt")).unwrap();
+        assert_eq!(std::fs::read(published.join("escape")).unwrap(), CANARY);
+        assert_eq!(
+            std::fs::symlink_metadata(published.join("escape"))
+                .unwrap()
+                .nlink(),
+            1,
+            "published canary must be a normal file so only the source manifest can catch it"
+        );
+
+        let manifest = independent_tree_manifest(&src).unwrap();
+        assert!(!manifest.contains_file_digest_of(CANARY));
+        let err =
+            verify_against_independent_manifest(&published, &manifest, &noop_policy()).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported") && err.to_string().contains("escape"),
+            "independent manifest must fail the hardlink canary: {err}"
+        );
     }
 
     #[test]
