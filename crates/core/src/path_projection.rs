@@ -47,6 +47,74 @@ pub fn normalize_policy_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches('/').to_string()
 }
 
+/// Trim trailing slashes from an SVN URL for stable prefix comparison.
+pub fn normalize_svn_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+/// Pinned SVN path identity for Git→SVN journal and lost-reply matching.
+///
+/// Repository-relative SVN log paths and Git intent paths are compared only
+/// after mapping both sides into the same branch-relative namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvnPathIdentity {
+    /// Repository root URL from `svn info` (for example `file:///repo`).
+    pub root_url: String,
+    /// Branch path relative to root (`trunk`, `branches/feature`, or empty at repo root).
+    pub branch_path: String,
+}
+
+impl SvnPathIdentity {
+    pub fn new(root_url: impl Into<String>, target_url: impl Into<String>) -> Self {
+        svn_path_identity(&root_url.into(), &target_url.into())
+    }
+}
+
+/// Derive the canonical branch-relative namespace from pinned SVN URLs.
+pub fn svn_path_identity(root_url: &str, target_url: &str) -> SvnPathIdentity {
+    let root = normalize_svn_url(root_url);
+    let target = normalize_svn_url(target_url);
+    let branch_path = if target == root {
+        String::new()
+    } else if let Some(rest) = target.strip_prefix(&format!("{root}/")) {
+        normalize_policy_path(rest)
+    } else {
+        String::new()
+    };
+    SvnPathIdentity {
+        root_url: root,
+        branch_path,
+    }
+}
+
+/// Git intent paths are already branch-relative; normalize separators only.
+pub fn git_intent_path(path: &str) -> String {
+    normalize_policy_path(path)
+}
+
+/// Map a repository-relative SVN log path into the pinned branch-relative namespace.
+///
+/// Returns `None` when the path is outside the pinned branch (component-aware;
+/// no suffix-only matching).
+pub fn svn_log_path_to_branch_relative(
+    log_path: &str,
+    identity: &SvnPathIdentity,
+) -> Option<String> {
+    let repo_relative = normalize_policy_path(log_path);
+    if identity.branch_path.is_empty() {
+        return Some(repo_relative);
+    }
+    let prefix = identity.branch_path.trim_end_matches('/');
+    if repo_relative == prefix {
+        return Some(String::new());
+    }
+    let with_slash = format!("{prefix}/");
+    if repo_relative.starts_with(&with_slash) {
+        return Some(repo_relative[with_slash.len()..].to_string());
+    }
+    None
+}
+
 /// Component-aware prefix match.
 ///
 /// `team` matches `team` and `team/foo`, not sibling `team-other`.
@@ -230,5 +298,60 @@ mod tests {
         let projected = project_git_to_svn_changeset(files, &[], &[]);
         assert_eq!(projected.included.len(), 2);
         assert!(projected.excluded.is_empty());
+    }
+
+    #[test]
+    fn svn_path_identity_maps_trunk_and_branches() {
+        let root = "file:///srv/repo";
+        assert_eq!(svn_path_identity(root, root).branch_path, "");
+        assert_eq!(
+            svn_path_identity(root, "file:///srv/repo/trunk").branch_path,
+            "trunk"
+        );
+        assert_eq!(
+            svn_path_identity(root, "file:///srv/repo/branches/feature").branch_path,
+            "branches/feature"
+        );
+        assert_eq!(
+            svn_path_identity(root, "file:///srv/repo/projects/app").branch_path,
+            "projects/app"
+        );
+    }
+
+    #[test]
+    fn svn_log_path_maps_into_branch_relative_namespace() {
+        let trunk = SvnPathIdentity::new("file:///repo", "file:///repo/trunk");
+        assert_eq!(
+            svn_log_path_to_branch_relative("/trunk/feature.txt", &trunk),
+            Some("feature.txt".into())
+        );
+        assert_eq!(
+            svn_log_path_to_branch_relative("trunk/nested/x.txt", &trunk),
+            Some("nested/x.txt".into())
+        );
+        let branch = SvnPathIdentity::new("file:///repo", "file:///repo/branches/team");
+        assert_eq!(
+            svn_log_path_to_branch_relative("/branches/team/a.txt", &branch),
+            Some("a.txt".into())
+        );
+        assert_eq!(
+            svn_log_path_to_branch_relative("/branches/team-other/a.txt", &branch),
+            None
+        );
+        let root = SvnPathIdentity::new("file:///repo", "file:///repo");
+        assert_eq!(
+            svn_log_path_to_branch_relative("/feature.txt", &root),
+            Some("feature.txt".into())
+        );
+    }
+
+    #[test]
+    fn svn_log_path_rejects_sibling_same_basename_prefix() {
+        let allow = SvnPathIdentity::new("file:///repo", "file:///repo/allow");
+        assert_eq!(svn_log_path_to_branch_relative("/allow.txt", &allow), None);
+        assert_eq!(
+            svn_log_path_to_branch_relative("/allow/x.txt", &allow),
+            Some("x.txt".into())
+        );
     }
 }

@@ -63,6 +63,18 @@ fn assert_fixture_owned(path: &Path) {
     }
 }
 
+fn branch_svn_url(repo_root: &str, svn_branch: &str) -> String {
+    if svn_branch.is_empty() {
+        repo_root.to_string()
+    } else {
+        format!(
+            "{}/{}",
+            repo_root.trim_end_matches('/'),
+            svn_branch.trim_start_matches('/')
+        )
+    }
+}
+
 fn create_svn_repo(dir: &Path) -> String {
     assert_fixture_owned(dir);
     let repo_dir = dir.join("svn_repo");
@@ -511,7 +523,10 @@ fn git_output(repo_path: &Path, args: &[&str]) -> String {
 struct QualifiedPair {
     repo_id: String,
     tmp: TempDir,
+    /// SVN URL the engine client uses (repository root or pinned branch URL).
     svn_url: String,
+    /// Repository root URL for `svnlook` and repository records.
+    svn_repo_root: String,
     wc: PathBuf,
     bridge: PathBuf,
     developer: PathBuf,
@@ -527,12 +542,28 @@ impl QualifiedPair {
     }
 
     async fn new_with_repo_id(repo_id: &str) -> Self {
+        Self::new_with_svn_branch(repo_id, "").await
+    }
+
+    async fn new_with_svn_branch(repo_id: &str, svn_branch: &str) -> Self {
         assert!(
             svn_available(),
             "SVN tools are required for candidate evidence"
         );
         let tmp = TempDir::new().unwrap();
-        let svn_url = create_svn_repo(tmp.path());
+        let svn_repo_root = create_svn_repo(tmp.path());
+        if !svn_branch.is_empty() {
+            let branch_url = branch_svn_url(&svn_repo_root, svn_branch);
+            assert!(
+                Command::new("svn")
+                    .args(["mkdir", "-m", "RepoSync layout", &branch_url])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "failed to create SVN branch path {branch_url}"
+            );
+        }
+        let svn_url = branch_svn_url(&svn_repo_root, svn_branch);
         let wc = tmp.path().join("wc");
         svn_checkout(&svn_url, &wc);
         svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
@@ -547,8 +578,8 @@ impl QualifiedPair {
         db.insert_repository(&Repository {
             id: repo_id.into(),
             name: "qualified pair".into(),
-            svn_url: svn_url.clone(),
-            svn_branch: "".into(),
+            svn_url: svn_repo_root.clone(),
+            svn_branch: svn_branch.into(),
             svn_username: "fixture".into(),
             git_provider: "local".into(),
             git_api_url: "".into(),
@@ -575,7 +606,7 @@ impl QualifiedPair {
             teams_webhook_url: None,
         })
         .unwrap();
-        let mut config = make_app_config(&svn_url, tmp.path());
+        let mut config = make_app_config(&svn_repo_root, tmp.path());
         config.svn.layout = reposync_core::config::SvnLayout::Custom;
         let mut engine = SyncEngine::new(
             config,
@@ -629,6 +660,7 @@ impl QualifiedPair {
             repo_id: repo_id.into(),
             tmp,
             svn_url,
+            svn_repo_root,
             wc,
             bridge,
             developer,
@@ -5803,4 +5835,116 @@ async fn candidate_rsc02_out_of_scope_delete_leaves_svn_file() {
             "sha":sha, "origin_preserved":true
         })
     );
+}
+
+// ---------------------------------------------------------------------------
+// RS-C14 / #64: branch-relative path identity for lost-reply reconciliation
+// ---------------------------------------------------------------------------
+
+async fn finalize_lost_reply_without_second_commit(
+    fixture: &QualifiedPair,
+    repo_id: &str,
+    filename: &str,
+    content: &str,
+    case: &str,
+) {
+    let _sha = fixture.developer_commit(filename, content, "Git change for path identity");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let _fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_svn_commit_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        op.target_svn_root_url, fixture.svn_repo_root,
+        "journal must persist repository root URL"
+    );
+    assert!(!op.target_svn_root_url.is_empty());
+    let svn_before = svn_youngest(&fixture.svn_repo_root);
+    let mappings_before = git_to_svn_mappings(fixture.engine.db(), repo_id);
+    let engine = reopen_pair(fixture);
+    let svn = SvnClient::new(&fixture.svn_url, "", "");
+    let result = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        engine.db(),
+        repo_id,
+        &op.id,
+        &svn,
+        &serde_json::json!({"allowed_paths":Vec::<String>::new(),"blocked_patterns":Vec::<String>::new()})
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(result.finalized, "{result:?}");
+    assert_eq!(svn_youngest(&fixture.svn_repo_root), svn_before);
+    assert_eq!(
+        git_to_svn_mappings(engine.db(), repo_id),
+        mappings_before + 1
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": case,
+            "operation_id": op.id,
+            "target_svn_branch_path": op.target_svn_branch_path,
+            "svn_before_after": svn_before,
+            "finalized": true,
+            "second_commit": false
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc14_repo_root_lost_reply_finalizes_without_second_commit() {
+    let fixture = QualifiedPair::new_with_repo_id("64c-rsc14-root").await;
+    finalize_lost_reply_without_second_commit(
+        &fixture,
+        "64c-rsc14-root",
+        "feature.txt",
+        "repo root path\n",
+        "64C_RSC14_REPO_ROOT",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc14_trunk_lost_reply_finalizes_without_second_commit() {
+    let fixture = QualifiedPair::new_with_svn_branch("64c-rsc14-trunk", "trunk").await;
+    finalize_lost_reply_without_second_commit(
+        &fixture,
+        "64c-rsc14-trunk",
+        "feature.txt",
+        "trunk path\n",
+        "64C_RSC14_TRUNK",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc14_branch_lost_reply_finalizes_without_second_commit() {
+    let fixture = QualifiedPair::new_with_svn_branch("64c-rsc14-branch", "branches/feature").await;
+    finalize_lost_reply_without_second_commit(
+        &fixture,
+        "64c-rsc14-branch",
+        "feature.txt",
+        "branch path\n",
+        "64C_RSC14_BRANCH",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc14_nested_project_lost_reply_finalizes_without_second_commit() {
+    let fixture = QualifiedPair::new_with_svn_branch("64c-rsc14-nested", "projects/app").await;
+    finalize_lost_reply_without_second_commit(
+        &fixture,
+        "64c-rsc14-nested",
+        "src/main.txt",
+        "nested project path\n",
+        "64C_RSC14_NESTED",
+    )
+    .await;
 }
