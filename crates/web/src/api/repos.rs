@@ -1048,11 +1048,11 @@ async fn start_repo_import(
         }
     }
 
-    // 2b. Acquire the process-wide busy slot so that no scheduler cycle
-    // can touch this repo's working tree while the import runs. If the
-    // scheduler is currently in the middle of a cycle we wait briefly
-    // for it to finish before starting the import. The guard is moved
-    // into the background task and released when the import completes.
+    // 2b. RS-C07 (#64): acquire exclusive writer ownership before any mutable
+    // prep that touches this repo's Git/SVN working tree. If the scheduler is
+    // currently in the middle of a cycle we wait briefly for it to finish
+    // before starting the import. The guard is moved into the background task
+    // and released when the import completes.
     let busy_guard = {
         let mut guard = None;
         for attempt in 0..30 {
