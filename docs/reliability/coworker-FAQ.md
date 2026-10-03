@@ -6,7 +6,7 @@ The new per-repository full-import flow assigns a persistent operation ID. Its S
 
 If a Git push may have succeeded but its result cannot be verified, RepoSync records **reconciliation required** and holds that repository. A cancelled partial import is also held. Restart does not restart the import or let the ordinary scheduler treat it as complete. Another, independent repository can keep working. An operator must compare the local and remote histories with the recorded operation before choosing a later recovery action; resetting checkpoints or reimporting is not the cancellation procedure.
 
-This is the first bounded #64 implementation, not automatic recovery for every interrupted external write. The old setup-wizard cancellation flow remains available, and the existing #73 conflict test remains ignored until its fixture and behavior are corrected.
+This is the first bounded #64 implementation, not automatic recovery for every interrupted external write. Setup-wizard import now occupies the same per-repository busy slot and `import_operation_v1` journal as ordinary imports. The existing #73 conflict test remains ignored until its fixture and behavior are corrected.
 
 ## October 2026 status: current, implemented, and planned
 
@@ -58,7 +58,7 @@ Removal must first establish that workers have stopped, handle child-pair depend
 
 ### 2. “Why can’t I cancel a full-history import?”
 
-**Current code:** Cancellation exists in the setup-wizard path and the shared importer has a cancellation flag. However, the reviewed per-repository routes expose import start/status without an equivalent cancel route. Disabling a repository is not the same as stopping an already-running task. Deleting the Git destination is not a reliable cancellation mechanism. [Sources: repository API][repo-api], [shared importer][import], [setup API][setup]
+**Current code:** Per-repository import start/status/cancel and the setup-wizard import path both use a durable `import_operation_v1` row plus the process-wide busy slot. Cancellation means stop safely, not undo published history. Disabling a repository is not the same as stopping an already-running task. Deleting the Git destination is not a reliable cancellation mechanism. [Sources: repository API][repo-api], [shared importer][import], [setup API][setup]
 
 **Plan:** Give each import a persistent operation ID, a real Cancel action, and accurate queued/running/cancelling/cancelled/failed/completed states. Cancellation requests will survive a restart and target the intended operation, not a later import. Long-running subprocesses need bounded stop behavior and cleanup.
 
