@@ -147,7 +147,9 @@ pub fn pending_commits(
         return Ok(Vec::new());
     }
     let range = format!("{cursor}..{tip}");
-    let output = git_success(workdir, &["rev-list", "--reverse", &range])?;
+    // Topo-order reverse is the ancestry frontier (parents before children),
+    // not a date/visited walk that can omit older merge-side commits.
+    let output = git_success(workdir, &["rev-list", "--topo-order", "--reverse", &range])?;
     Ok(stdout_trim(&output)
         .lines()
         .map(str::trim)

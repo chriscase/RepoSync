@@ -4,7 +4,10 @@
 pre-reset gate. Team `inspect_team_history` classifications are unchanged;
 this slice persists a durable `reconciliation_required` rewrite block, applies
 the same P/O/R/L inspect to personal-mode Git→SVN, and treats webhook `forced`
-as a hint. Automatic rewrite reconciliation and merge-DAG replay remain later.
+as a hint. Automatic rewrite reconciliation and merge-DAG *replay* remain later.
+Pending-commit selection uses a hide/push ancestry frontier (`P..R`) so a
+visited-order stop at `P` cannot omit older pending commits. Unqualified merge
+DAGs still reject before mutation.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
@@ -85,18 +88,13 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 
 ## Smallest next implementation slice (after this review)
 
-Do **not** implement rebase-into-SVN or merge-DAG replay.
+Durable rewrite block, personal inspect, webhook `forced` hint, and exact skip
+disposition have landed. This slice is pending-commit **selection** only:
 
-1. Persist a repository-scoped durable block record (existing storage is
-   acceptable) whose semantics are `reconciliation_required` for that pair:
-   old P, new R, reason, and timestamps. Restart and the next poll must read
-   that record and refuse writes even if a later fetch looks identical.
-   A generic error string alone is not this workflow.
-2. Apply the same P/O/R/L inspection to **personal-mode** Git→SVN before
-   reset/replay, or explicitly document that personal mode remains uncovered
-   and keep it visible in the #62 matrix.
-3. Treat webhook `forced` as a hint that triggers the same inspection; never
-   as authority to reset.
+1. Select `P..R` by hiding `P` and pushing `R` (ancestry frontier), not by
+   walking until `P` happens to be visited.
+2. Unqualified merge DAGs and >1000-commit backlogs still **reject before
+   writes**. Do not implement merge-DAG replay or overflow continuation here.
 
 Automatic rewrite reconciliation, merge-DAG support, and >1000 continuation
 algorithms stay later slices with their own proofs.
@@ -105,8 +103,9 @@ algorithms stay later slices with their own proofs.
 
 Already present: ordinary fast-forward; unchanged tip with new SVN work;
 L=R lagging P; rewrite of already-synced work; metadata amend; missing
-branch/object/shallow; ancestry-command error; merge DAG reject; >1000
-reject; ignored-path preservation; repo scoping.
+branch/object/shallow; ancestry-command error; merge DAG reject (including
+older-side hide/push frontier vs visited-order skip); >1000 reject;
+ignored-path preservation; repo scoping.
 
 Still required before claiming #66:
 
