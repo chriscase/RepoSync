@@ -272,7 +272,11 @@ impl SvnToGitSync {
                 .with_context(|| format!("failed to record svn-to-git push intent for r{}", rev))?;
 
             #[cfg(debug_assertions)]
-            if git_push_fixture_flag("REPOSYNC_GIT_PUSH_CRASH_BEFORE", PERSONAL_REPO_ID) {
+            if git_push_fixture_flag(
+                "REPOSYNC_GIT_PUSH_CRASH_BEFORE",
+                PERSONAL_REPO_ID,
+                &repo_path,
+            ) {
                 let _ = self.db.hold_svn_to_git_reconciliation(
                     PERSONAL_REPO_ID,
                     &push_op.id,
@@ -308,7 +312,7 @@ impl SvnToGitSync {
             info!(rev, sha = %sha_str, "pushed to origin");
 
             #[cfg(debug_assertions)]
-            if git_push_fixture_flag("REPOSYNC_GIT_PUSH_LOST_REPLY", PERSONAL_REPO_ID) {
+            if git_push_fixture_flag("REPOSYNC_GIT_PUSH_LOST_REPLY", PERSONAL_REPO_ID, &repo_path) {
                 let _ = self.db.hold_svn_to_git_reconciliation(
                     PERSONAL_REPO_ID,
                     &push_op.id,
@@ -334,6 +338,7 @@ impl SvnToGitSync {
             let observed_tree = if git_push_fixture_flag(
                 "REPOSYNC_GIT_PUSH_OBSERVED_TREE_MISMATCH",
                 PERSONAL_REPO_ID,
+                &repo_path,
             ) {
                 "ffffffffffffffffffffffffffffffffffffffff".to_string()
             } else {
@@ -471,9 +476,35 @@ fn blocking_git_push_hold(op: &GitPushOperation) -> Option<String> {
     None
 }
 
+/// Personal mode journals every checkout under `repo_id = "personal"`. Team
+/// tests isolate debug fixtures with unique repo ids; personal tests isolate
+/// with the Git work-tree suffix so a lost-reply hold cannot trip parallel
+/// LFS / happy-path syncs in the same process.
+fn git_push_fixture_scope(git_repo_path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    git_repo_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Env key for a personal SVN→Git debug fixture, unique to one Git work tree.
+pub fn personal_git_push_fixture_env_key(var: &str, git_repo_path: &Path) -> String {
+    format!(
+        "{}__{}__{}",
+        var,
+        PERSONAL_REPO_ID,
+        git_push_fixture_scope(git_repo_path)
+    )
+}
+
 #[cfg(debug_assertions)]
-fn git_push_fixture_flag(var: &str, repo_id: &str) -> bool {
-    let scoped = format!("{}__{}", var, repo_id);
+fn git_push_fixture_flag(var: &str, repo_id: &str, git_repo_path: &Path) -> bool {
+    let scoped = format!(
+        "{}__{}__{}",
+        var,
+        repo_id,
+        git_push_fixture_scope(git_repo_path)
+    );
     if std::env::var(&scoped).is_ok() {
         return true;
     }
@@ -652,5 +683,53 @@ mod tests {
     #[test]
     fn test_watermark_key_constant() {
         assert_eq!(WATERMARK_KEY, "svn_rev");
+    }
+
+    #[test]
+    fn personal_git_push_fixture_key_differs_per_work_tree() {
+        let a = personal_git_push_fixture_env_key(
+            "REPOSYNC_GIT_PUSH_LOST_REPLY",
+            Path::new("/tmp/personal-a"),
+        );
+        let b = personal_git_push_fixture_env_key(
+            "REPOSYNC_GIT_PUSH_LOST_REPLY",
+            Path::new("/tmp/personal-b"),
+        );
+        assert_ne!(a, b);
+        assert!(a.starts_with("REPOSYNC_GIT_PUSH_LOST_REPLY__personal__"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn git_push_fixture_flag_ignores_shared_personal_env_key() {
+        let leaked = "REPOSYNC_GIT_PUSH_LOST_REPLY__personal";
+        std::env::set_var(leaked, "1");
+        let fired = git_push_fixture_flag(
+            "REPOSYNC_GIT_PUSH_LOST_REPLY",
+            PERSONAL_REPO_ID,
+            Path::new("/tmp/lfs-work-tree"),
+        );
+        std::env::remove_var(leaked);
+        assert!(
+            !fired,
+            "unscoped personal fixture key must not hold unrelated work trees"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn git_push_fixture_flag_honors_work_tree_scoped_key() {
+        let path = Path::new("/tmp/lost-reply-work-tree");
+        let key = personal_git_push_fixture_env_key("REPOSYNC_GIT_PUSH_LOST_REPLY", path);
+        std::env::set_var(&key, "1");
+        let fired = git_push_fixture_flag("REPOSYNC_GIT_PUSH_LOST_REPLY", PERSONAL_REPO_ID, path);
+        let other = git_push_fixture_flag(
+            "REPOSYNC_GIT_PUSH_LOST_REPLY",
+            PERSONAL_REPO_ID,
+            Path::new("/tmp/other-work-tree"),
+        );
+        std::env::remove_var(&key);
+        assert!(fired, "path-scoped fixture must fire for that work tree");
+        assert!(!other, "path-scoped fixture must not fire for other trees");
     }
 }

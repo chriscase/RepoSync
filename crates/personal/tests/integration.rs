@@ -24,7 +24,7 @@ use reposync_core::personal_config::{
 };
 use reposync_core::svn::SvnClient;
 use reposync_personal::commit_format::CommitFormatter;
-use reposync_personal::svn_to_git::SvnToGitSync;
+use reposync_personal::svn_to_git::{personal_git_push_fixture_env_key, SvnToGitSync};
 
 // ===========================================================================
 // Helper functions
@@ -2304,10 +2304,19 @@ async fn test_lfs_threshold_creates_gitattributes() {
     config.options.lfs_threshold = 100;
 
     let svn_client = SvnClient::new(&svn_url, "", "");
-    let sync = SvnToGitSync::new(svn_client, git_client, db, config);
+    let sync = SvnToGitSync::new(svn_client, git_client, db.clone(), config);
 
     let count = sync.sync().await.unwrap();
     assert_eq!(count, 2, "two revisions should sync");
+    assert!(
+        db.active_git_push_operation("personal").unwrap().is_none(),
+        "LFS threshold sync must confirm the journal, not leave a hold"
+    );
+    assert_eq!(
+        db.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("2"),
+        "LFS threshold sync must advance the watermark through journal confirm"
+    );
 
     // Verify model.bin was copied.
     assert!(
@@ -2954,9 +2963,9 @@ struct GitPushFaultGuard {
 }
 
 impl GitPushFaultGuard {
-    fn lost_reply(repo: &str) -> Self {
-        let key = "REPOSYNC_GIT_PUSH_LOST_REPLY";
-        let scoped_key = format!("{}__{}", key, repo);
+    fn lost_reply(git_repo_path: &Path) -> Self {
+        let scoped_key =
+            personal_git_push_fixture_env_key("REPOSYNC_GIT_PUSH_LOST_REPLY", git_repo_path);
         std::env::set_var(&scoped_key, "1");
         Self { scoped_key }
     }
@@ -2999,7 +3008,7 @@ async fn test_personal_svn_to_git_lost_reply_holds_without_checkpoint() {
     let db_arc = Arc::new(db);
 
     let syncer = SvnToGitSync::new(svn_client, git_arc.clone(), db_arc.clone(), config);
-    let _fault = GitPushFaultGuard::lost_reply("personal");
+    let _fault = GitPushFaultGuard::lost_reply(&git_work_dir);
     let err = syncer
         .sync()
         .await
