@@ -488,6 +488,10 @@ fn git_push_fixture_scope(git_repo_path: &Path) -> String {
 }
 
 /// Env key for a personal SVN→Git debug fixture, unique to one Git work tree.
+///
+/// Public for integration tests. The personal binary compiles this module
+/// privately, so the helper looks unused there.
+#[allow(dead_code)]
 pub fn personal_git_push_fixture_env_key(var: &str, git_repo_path: &Path) -> String {
     format!(
         "{}__{}__{}",
