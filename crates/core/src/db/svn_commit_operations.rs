@@ -253,6 +253,48 @@ fn finalize_tx(
     Ok(op)
 }
 
+fn personal_finalize_tx(
+    tx: &Connection,
+    mut op: SvnCommitOperation,
+    svn_rev: i64,
+    svn_tree: &str,
+    git_author: &str,
+) -> Result<SvnCommitOperation, DatabaseError> {
+    if op.source_git_sha.len() != 40 || !op.source_git_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DatabaseError::Other(
+            "git-to-svn commit lacks a full source SHA".into(),
+        ));
+    }
+    if svn_rev <= op.pre_write_svn_rev {
+        return Err(DatabaseError::Other(
+            "observed SVN revision is not after the pre-write revision".into(),
+        ));
+    }
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commit_map WHERE git_sha = ?1 AND direction = 'git_to_svn')",
+        params![op.source_git_sha],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author)
+             VALUES (?1, ?2, 'git_to_svn', ?3, ?4, ?5)",
+            params![svn_rev, op.source_git_sha, now, op.author, git_author],
+        )?;
+    }
+    let now = Utc::now().to_rfc3339();
+    op.state = SvnCommitOperationState::Completed;
+    op.last_confirmed_svn_rev = Some(svn_rev);
+    op.last_confirmed_svn_tree = Some(svn_tree.into());
+    op.resume_authorized = false;
+    op.updated_at = now;
+    op.outcome_detail = Some("personal Git-to-SVN commit verified and recorded".into());
+    write_op(tx, &op)?;
+    clear_active(tx, &op.repo_id, &op.id)?;
+    Ok(op)
+}
+
 impl Database {
     pub fn get_svn_commit_operation(
         &self,
@@ -557,6 +599,33 @@ impl Database {
         })
     }
 
+    /// Personal-mode checkpoint: journal completion plus `commit_map`.
+    pub fn confirm_personal_git_to_svn_commit(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        svn_rev: i64,
+        svn_tree: &str,
+        git_author: &str,
+    ) -> Result<SvnCommitOperation, DatabaseError> {
+        self.transaction(|tx| {
+            if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
+                return Err(DatabaseError::Other(
+                    "stale or inactive git-to-svn commit operation".into(),
+                ));
+            }
+            let op = parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
+                DatabaseError::Other("missing git-to-svn commit document".into())
+            })?)?;
+            if op.repo_id != repo_id || op.state != SvnCommitOperationState::Running {
+                return Err(DatabaseError::Other(
+                    "git-to-svn commit is not running".into(),
+                ));
+            }
+            personal_finalize_tx(tx, op, svn_rev, svn_tree, git_author)
+        })
+    }
+
     fn update_svn_commit_operation<F>(
         &self,
         repo_id: &str,
@@ -783,5 +852,41 @@ mod tests {
             .unwrap();
         assert_eq!(held.state, SvnCommitOperationState::ReconciliationRequired);
         assert!(!held.resume_authorized);
+    }
+
+    #[test]
+    fn personal_confirm_records_commit_map_without_repo_row() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let paths = vec![IntendedPath {
+            action: "A".into(),
+            path: "feature.txt".into(),
+            content_sha256: Some("d".repeat(64)),
+        }];
+        let (intent, _, _) = sample_intent(paths, "post-tree");
+        let op = db.begin_git_to_svn_commit(intent).unwrap();
+        let done = db
+            .confirm_personal_git_to_svn_commit("pair", &op.id, 3, "post-tree", "Dev User")
+            .unwrap();
+        assert_eq!(done.state, SvnCommitOperationState::Completed);
+        assert!(db.active_svn_commit_operation("pair").unwrap().is_none());
+        let mapped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE svn_rev=3 AND git_sha=?1 AND direction='git_to_svn'",
+                ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapped, 1);
+        let git_author: String = db
+            .conn()
+            .query_row(
+                "SELECT git_author FROM commit_map WHERE git_sha=?1",
+                ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(git_author, "Dev User");
     }
 }
