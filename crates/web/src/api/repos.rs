@@ -1731,65 +1731,6 @@ fn reconciliation_result(
     }))
 }
 
-fn reconciliation_held(
-    db: &Database,
-    before: &ImportOperation,
-    reason: &str,
-    observed_ref: Option<&str>,
-    observed_sha: Option<&str>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let after = db
-        .note_import_reconciliation_reason(&before.repo_id, &before.id, reason)
-        .map_err(import_write_error)?;
-    Ok(reconciliation_result(
-        before,
-        &after,
-        observed_ref,
-        observed_sha,
-        false,
-        false,
-        false,
-    ))
-}
-
-async fn fresh_import_remote_ref(
-    workdir: &std::path::Path,
-    reference: &str,
-) -> Result<Option<String>, &'static str> {
-    let mut inspect = reposync_core::process::import_git_command()
-        .map_err(|_| "remote inspection command unavailable")?;
-    inspect
-        .args(["ls-remote", "--exit-code", "origin", reference])
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    let output = reposync_core::process::run(inspect, std::time::Duration::from_secs(60), None)
-        .await
-        .map_err(|_| "remote inspection failed or timed out")?;
-    match output.status.code() {
-        Some(2) => Ok(None),
-        Some(0) => {
-            let stdout = String::from_utf8(output.stdout)
-                .map_err(|_| "remote inspection returned malformed data")?;
-            let mut lines = stdout.lines();
-            let line = lines
-                .next()
-                .ok_or("remote inspection returned no exact ref")?;
-            let (sha, found_ref) = line
-                .split_once('\t')
-                .ok_or("remote inspection returned malformed data")?;
-            if lines.next().is_some()
-                || found_ref != reference
-                || sha.len() != 40
-                || !sha.bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                return Err("remote inspection did not return one exact full ref");
-            }
-            Ok(Some(sha.to_string()))
-        }
-        _ => Err("remote inspection unavailable (authentication or transport failure)"),
-    }
-}
-
 async fn reconcile_repo_import(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -1853,140 +1794,29 @@ async fn reconcile_repo_import(
         .join("repos")
         .join(&id)
         .join("git-repo");
-    if requested.target_fingerprint.is_empty()
-        || requested.target_fingerprint != import_target_fingerprint(&repo, &workdir)
-    {
-        return reconciliation_held(
-            db,
-            &requested,
-            "Import target configuration changed; review required",
-            None,
-            None,
-        );
-    }
-    let reference = format!("refs/heads/{}", repo.git_branch);
-    let expected_sha = match (&requested.intended_ref, &requested.intended_git_sha) {
-        (Some(intent_ref), Some(sha))
-            if intent_ref == &reference && requested.last_local_git_sha.as_deref() == Some(sha) =>
-        {
-            sha.as_str()
-        }
-        (None, None)
-            if requested.last_confirmed_svn_rev == requested.last_local_svn_rev
-                && requested.last_confirmed_git_sha == requested.last_local_git_sha =>
-        {
-            requested.last_confirmed_git_sha.as_deref().unwrap_or("")
-        }
-        _ => {
-            return reconciliation_held(
-                db,
-                &requested,
-                "Publication evidence is incomplete or inconsistent",
-                None,
-                None,
-            )
-        }
-    };
-    let configured_url = reposync_core::git::remote_url::derive_git_remote_url(
-        &repo.git_api_url,
-        None,
-        &repo.git_repo,
-    );
-    let local_tree = match import::verify_import_local_tip(
-        &workdir,
-        &reference,
-        expected_sha,
-        &configured_url,
-    ) {
-        Ok(tree) => tree,
-        Err(error) => {
-            warn!(repo_id = %id, operation_id = %operation_id, error = %error, "local reconciliation proof failed");
-            return reconciliation_held(
-                db,
-                &requested,
-                "Recorded local Git object, tree, branch or origin is unavailable or changed",
-                None,
-                None,
-            );
-        }
-    };
-    let observed = match fresh_import_remote_ref(&workdir, &reference).await {
-        Ok(Some(sha)) => sha,
-        Ok(None) => {
-            return reconciliation_held(
-                db,
-                &requested,
-                "Configured remote ref is missing; no publication was inferred",
-                None,
-                None,
-            )
-        }
-        Err(reason) => return reconciliation_held(db, &requested, reason, None, None),
-    };
-    if observed != expected_sha {
-        return reconciliation_held(
-            db,
-            &requested,
-            "Remote ref differs from the recorded full Git SHA",
-            Some(&reference),
-            Some(&observed),
-        );
-    }
-    if import::verify_import_local_tip(&workdir, &reference, expected_sha, &configured_url)
-        .ok()
-        .as_deref()
-        != Some(local_tree.as_str())
-    {
-        return reconciliation_held(
-            db,
-            &requested,
-            "Managed local Git evidence changed during remote inspection",
-            Some(&reference),
-            Some(&observed),
-        );
-    }
     let reconciled =
-        match db.reconcile_verified_import(&id, &operation_id, &workdir, &reference, &observed) {
+        match import::apply_import_reconciliation(db, &repo, &operation_id, &workdir).await {
             Ok(reconciled) => reconciled,
-            Err(DatabaseError::Other(reason))
-                if matches!(
-                    reason.as_str(),
-                    "import target fingerprint changed"
-                        | "repository checkpoint changed during held import"
-                        | "missing import revision total"
-                        | "remote SHA is not the recorded local import tip"
-                        | "incomplete prior publication receipt"
-                        | "remote SHA differs from publication evidence"
-                        | "invalid publication counter"
-                        | "snapshot import is missing its pin"
-                        | "snapshot import is not a single verified baseline"
-                        | "snapshot pin does not match the recorded local revision"
-                ) =>
-            {
-                return reconciliation_held(
-                    db,
-                    &requested,
-                    &reason,
-                    Some(&reference),
-                    Some(&observed),
-                );
-            }
             Err(error) => return Err(import_write_error(error)),
         };
-    if reconciled.completed {
+    if reconciled.finalized {
         let progress = state.get_repo_import_progress(&id).await;
         let mut progress = progress.write().await;
         progress.phase = ImportPhase::Completed;
         progress.completed_at = Some(chrono::Utc::now().to_rfc3339());
     }
+    let publication_proved = matches!(
+        reconciled.inspect,
+        import::ImportInspect::UniqueMatch { .. }
+    );
     Ok(reconciliation_result(
         &requested,
         &reconciled.operation,
-        Some(&reference),
-        Some(&observed),
-        true,
+        reconciled.observed_ref.as_deref(),
+        reconciled.observed_sha.as_deref(),
+        publication_proved,
         reconciled.publication_recorded,
-        reconciled.completed,
+        reconciled.finalized,
     ))
 }
 
