@@ -134,6 +134,10 @@ pub enum GitError {
     #[error("git apply failed: {0}")]
     ApplyFailed(String),
 
+    /// Pending history is a merge DAG, overflow, or unproven range.
+    #[error("unsupported git history ({reason}): {detail}")]
+    UnsupportedHistory { reason: String, detail: String },
+
     /// Generic I/O wrapper.
     #[error("git I/O error: {0}")]
     IoError(#[from] std::io::Error),
@@ -154,6 +158,7 @@ impl GitError {
                     || detail.contains("exceeds GitHub")
                     || detail.contains("GH001")
             }
+            GitError::UnsupportedHistory { .. } => true,
             _ => false,
         }
     }
@@ -591,6 +596,15 @@ mod tests {
     fn test_git_error_other_not_permanent() {
         let err = GitError::RefNotFound("main".into());
         assert!(!err.is_permanent());
+    }
+
+    #[test]
+    fn test_git_error_unsupported_history_is_permanent() {
+        let err = GitError::UnsupportedHistory {
+            reason: "unsupported_merge_dag".into(),
+            detail: "pending Git history contains a merge commit".into(),
+        };
+        assert!(err.is_permanent());
     }
 
     #[test]

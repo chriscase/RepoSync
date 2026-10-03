@@ -412,34 +412,24 @@ pub fn inspect_fetched_history(
             ),
         }
     }
-    let range = format!("{}..{}", checkpoint, fetched);
-    let pending = match run(&["rev-list", "--count", &range]) {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<usize>()
-            .ok(),
-        _ => blocked!(
+    let inspect_repo = match git2::Repository::open(path) {
+        Ok(repo) => repo,
+        Err(_) => blocked!(
             "selection_command_failed",
-            "pending Git commits could not be counted"
+            "pending Git repository could not be opened"
         ),
     };
-    let pending = match pending {
-        Some(count) => count,
-        None => blocked!("selection_command_failed", "pending Git count was invalid"),
-    };
-    if pending > 1000 {
-        blocked!(
-            "unsupported_backlog",
-            "more than 1000 pending Git commits require a reviewed continuation algorithm"
-        );
-    }
-    match run(&["rev-list", "--min-parents=2", &range]) {
-        Ok(output) if output.status.success() && output.stdout.is_empty() => (),
-        Ok(output) if output.status.success() => blocked!(
-            "unsupported_merge_dag",
-            "pending Git history contains a merge commit"
-        ),
-        _ => blocked!(
+    match crate::pending_frontier::select_pending_oids(
+        &inspect_repo,
+        checkpoint,
+        &fetched,
+        crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP,
+    ) {
+        Ok(_) => {}
+        Err(crate::errors::GitError::UnsupportedHistory { reason, detail }) => {
+            blocked!(reason, detail);
+        }
+        Err(_) => blocked!(
             "selection_command_failed",
             "pending Git topology could not be inspected"
         ),

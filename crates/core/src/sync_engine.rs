@@ -2917,6 +2917,20 @@ impl SyncEngine {
     ) -> Result<Vec<GitChangeSet>, SyncError> {
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
 
+        info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
+
+        // Select P..R from the pinned inspection objects before reset so a
+        // visited-order HEAD walk cannot skip older pending work, and so an
+        // unqualified merge/backlog still fails closed with no mutation.
+        let commits = git
+            .pending_commits_between(&admission.checkpoint, &admission.remote_tip, None)
+            .map_err(|error| match error {
+                crate::errors::GitError::UnsupportedHistory { reason, detail } => {
+                    SyncError::HistoryBlocked { reason, detail }
+                }
+                other => SyncError::GitError(other),
+            })?;
+
         // Reset only to the commit fetched and inspected above. A second pull
         // of a mutable branch would invalidate the admission decision.
         let reset = tokio::task::block_in_place(|| {
@@ -2938,12 +2952,6 @@ impl SyncEngine {
                 detail: "bridge did not reach the admitted Git commit".into(),
             });
         }
-
-        info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
-
-        let commits = git
-            .get_commits_since(Some(&admission.checkpoint), None)
-            .map_err(SyncError::GitError)?;
 
         let mut change_sets: Vec<GitChangeSet> = Vec::new();
         for c in commits {
@@ -2978,11 +2986,8 @@ impl SyncEngine {
             });
         }
 
-        // Reverse so oldest commits are replayed first.  get_commits_since
-        // returns newest-first (revwalk order), but sync_git_to_svn must
-        // apply changes chronologically so the final SVN tree matches the
-        // latest Git state and intermediate revisions map correctly.
-        change_sets.reverse();
+        // pending_commits_between already returns oldest-first (parents before
+        // children) so Git→SVN replay matches intermediate mapping order.
 
         debug!(count = change_sets.len(), "fetched Git change sets");
         Ok(change_sets)

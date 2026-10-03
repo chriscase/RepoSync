@@ -550,46 +550,48 @@ impl GitClient {
         }
     }
 
-    /// Walk commits from HEAD backwards until we reach `since_sha`.
+    /// Pending commits on the ancestry frontier from `since_sha` to `tip_sha`.
     ///
-    /// Returns an empty vec if HEAD is unborn (empty repo).
+    /// Uses hide/push (`since..tip`), not a visited-order stop at `since_sha`.
+    /// Merge DAGs and overflow fail closed rather than returning a truncated list.
+    pub fn pending_commits_between(
+        &self,
+        since_sha: &str,
+        tip_sha: &str,
+        max_commits: Option<usize>,
+    ) -> Result<Vec<GitCommitInfo>, GitError> {
+        let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
+        let oids =
+            crate::pending_frontier::select_pending_oids(&self.repo, since_sha, tip_sha, cap)?;
+        let mut commits = Vec::with_capacity(oids.len());
+        for oid in oids {
+            let commit = self.repo.find_commit(oid)?;
+            commits.push(git_commit_info(&commit));
+        }
+        debug!(count = commits.len(), "collected pending commits");
+        Ok(commits)
+    }
+
+    /// Pending commits from `since_sha` to HEAD using the ancestry frontier.
+    ///
+    /// Returns an empty vec if HEAD is unborn (empty repo). A missing
+    /// `since_sha` is not treated as start-from-zero.
     pub fn get_commits_since(
         &self,
         since_sha: Option<&str>,
         max_commits: Option<usize>,
     ) -> Result<Vec<GitCommitInfo>, GitError> {
-        let cap = max_commits.unwrap_or(1000);
-        // If HEAD doesn't exist (empty repo), return empty list.
         if self.repo.head().is_err() {
             return Ok(Vec::new());
         }
-        let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
-        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
-        let since_oid = since_sha.map(Oid::from_str).transpose()?;
-        let mut commits = Vec::new();
-        for oid_result in revwalk {
-            let oid = oid_result?;
-            if Some(oid) == since_oid {
-                break;
-            }
-            let commit = self.repo.find_commit(oid)?;
-            commits.push(GitCommitInfo {
-                sha: oid.to_string(),
-                message: commit.message().unwrap_or("").to_string(),
-                author_name: commit.author().name().unwrap_or("").to_string(),
-                author_email: commit.author().email().unwrap_or("").to_string(),
-                author_time: commit.author().when().seconds(),
-                committer_name: commit.committer().name().unwrap_or("").to_string(),
-                committer_email: commit.committer().email().unwrap_or("").to_string(),
+        let Some(since_sha) = since_sha else {
+            return Err(GitError::UnsupportedHistory {
+                reason: "missing_checkpoint".into(),
+                detail: "pending Git selection requires a handled checkpoint".into(),
             });
-            if commits.len() >= cap {
-                info!(cap, "reached commit limit for get_commits_since");
-                break;
-            }
-        }
-        debug!(count = commits.len(), "collected commits");
-        Ok(commits)
+        };
+        let tip = self.head_sha()?;
+        self.pending_commits_between(since_sha, &tip, max_commits)
     }
 
     /// Create a new branch pointing at `from_sha`.
@@ -810,6 +812,18 @@ impl GitClient {
     }
 }
 
+fn git_commit_info(commit: &git2::Commit<'_>) -> GitCommitInfo {
+    GitCommitInfo {
+        sha: commit.id().to_string(),
+        message: commit.message().unwrap_or("").to_string(),
+        author_name: commit.author().name().unwrap_or("").to_string(),
+        author_email: commit.author().email().unwrap_or("").to_string(),
+        author_time: commit.author().when().seconds(),
+        committer_name: commit.committer().name().unwrap_or("").to_string(),
+        committer_email: commit.committer().email().unwrap_or("").to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,6 +949,40 @@ mod tests {
 
         // Second commit has 1 parent
         assert_eq!(client.get_parent_count(&oid2.to_string()).unwrap(), 1);
+    }
+
+    #[test]
+    fn pending_commits_between_linear_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        let client = GitClient::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let a = client
+            .commit("A", "T", "t@t.com", "T", "t@t.com")
+            .unwrap()
+            .to_string();
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        let b = client
+            .commit("B", "T", "t@t.com", "T", "t@t.com")
+            .unwrap()
+            .to_string();
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        let c = client
+            .commit("C", "T", "t@t.com", "T", "t@t.com")
+            .unwrap()
+            .to_string();
+        let pending = client.pending_commits_between(&a, &c, None).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|info| info.sha.as_str())
+                .collect::<Vec<_>>(),
+            vec![b.as_str(), c.as_str()]
+        );
+        assert!(client
+            .pending_commits_between(&c, &c, None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
