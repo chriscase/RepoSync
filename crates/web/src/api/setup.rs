@@ -1058,7 +1058,9 @@ async fn cancel_import(
 
 /// Resolve config, build clients, and spawn the background import task.
 /// Used by both `start_import` and `reset_and_reimport`. Caller must already
-/// hold `busy_guard` and a durable `import_operation_v1` row.
+/// hold `busy_guard` and a durable `import_operation_v1` row, and must keep
+/// `SetupPreparationGuard` armed until this returns `Ok` so a failed clone
+/// (or any other error before the worker starts) holds the enrolled row.
 async fn spawn_import_task(
     state: &Arc<AppState>,
     repo_id: String,
@@ -1476,13 +1478,30 @@ async fn reset_and_reimport(
         .create_import_operation(&repo.id, &user_id, &request_id, &fingerprint)
         .map_err(import_write_error)?;
     let operation_id = operation.id.clone();
+    let mut preparation_guard = SetupPreparationGuard {
+        db: &state.db,
+        repo_id: repo.id.clone(),
+        operation_id: operation_id.clone(),
+        armed: true,
+    };
     {
         let mut p = state.import_progress.write().await;
         p.phase = ImportPhase::Importing;
         p.push_log("[info] Starting full SVN import from revision 0...".into());
     }
 
-    spawn_import_task(&state, repo.id.clone(), operation_id.clone(), busy_guard).await?;
+    if let Err(e) =
+        spawn_import_task(&state, repo.id.clone(), operation_id.clone(), busy_guard).await
+    {
+        {
+            let mut p = state.import_progress.write().await;
+            p.phase = ImportPhase::Failed;
+            p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            p.push_log("[error] setup import preparation failed".into());
+        }
+        return Err(e);
+    }
+    preparation_guard.armed = false;
 
     Ok(Json(ImportActionResponse {
         ok: true,
