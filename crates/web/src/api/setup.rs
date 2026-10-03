@@ -1130,32 +1130,15 @@ async fn spawn_import_task(
         GitClient::new(&git_repo_path)
             .map_err(|e| AppError::Internal(format!("failed to open git repo: {}", e)))?
     } else {
+        // A missing/unreachable target must never be replaced with a freshly
+        // inited local repository. Leave the enrolled import_operation_v1 row
+        // held; do not start the importer.
         let clone_url = config.github.clone_url();
-        match GitClient::clone_repo(&clone_url, &git_repo_path, git_token.as_deref()) {
-            Ok(client) => client,
-            Err(_) => {
-                info!("Clone failed, initializing empty repo with remote");
-                std::fs::create_dir_all(&git_repo_path)
-                    .map_err(|e| AppError::Internal(format!("mkdir failed: {}", e)))?;
-                let output = std::process::Command::new("git")
-                    .args(["init", "--initial-branch", &config.github.default_branch])
-                    .current_dir(&git_repo_path)
-                    .output()
-                    .map_err(|e| AppError::Internal(format!("git init failed: {}", e)))?;
-                if !output.status.success() {
-                    let _ = std::process::Command::new("git")
-                        .args(["init"])
-                        .current_dir(&git_repo_path)
-                        .output();
-                }
-                let _ = std::process::Command::new("git")
-                    .args(["remote", "add", "origin", &clone_url])
-                    .current_dir(&git_repo_path)
-                    .output();
-                GitClient::new(&git_repo_path)
-                    .map_err(|e| AppError::Internal(format!("git open failed: {}", e)))?
-            }
-        }
+        GitClient::clone_repo(&clone_url, &git_repo_path, git_token.as_deref()).map_err(|e| {
+            AppError::BadRequest(format!(
+                "Git target could not be cloned; import held for inspection: {e}"
+            ))
+        })?
     };
 
     git_client

@@ -14,7 +14,7 @@ use reposync_core::db::import_operations::ImportOperationState;
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
-use reposync_core::import::ImportProgress;
+use reposync_core::import::{ImportPhase, ImportProgress};
 use reposync_core::models::Repository;
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
@@ -476,6 +476,93 @@ async fn candidate_64c07_setup_wizard_held_operation_refuses_duplicate_start() {
             .id,
         held.id
     );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c07_setup_wizard_failed_clone_refuses_replacement_and_holds() {
+    if !svn_available() {
+        eprintln!("SKIP: svnadmin not available");
+        return;
+    }
+    let (addr, state, server, tmp, repo_id, bare) = setup_wizard_fixture().await;
+    // Clone target is gone: GitClient::clone_repo must fail. The old path then
+    // git-inited a replacement, added origin, and started a full import.
+    assert!(std::fs::remove_dir_all(&bare).is_ok());
+    let workdir = tmp.path().join("git-repo");
+    assert!(!workdir.join(".git").exists());
+
+    let client = authed_client();
+    let started = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "setup-clone-fail")
+        .send()
+        .await
+        .unwrap();
+    let status = started.status();
+    let body: serde_json::Value = started.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{status} {body}");
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("could not be cloned") && error.contains("held"),
+        "{body}"
+    );
+    assert_ne!(body["ok"], true, "{body}");
+
+    let held = state
+        .db
+        .active_import_operation(&repo_id)
+        .unwrap()
+        .expect("enrolled operation must remain held");
+    assert_eq!(held.state, ImportOperationState::ReconciliationRequired);
+    assert_eq!(held.request_id, "setup-clone-fail");
+    assert_eq!(
+        state
+            .db
+            .get_repository(&repo_id)
+            .unwrap()
+            .unwrap()
+            .last_svn_rev,
+        0
+    );
+    assert!(!reposync_core::busy::is_busy(&repo_id));
+
+    let progress = state.import_progress.read().await.clone();
+    assert_eq!(progress.phase, ImportPhase::Failed);
+    assert_eq!(progress.commits_created, 0);
+
+    // Failed clone must not become a replacement that the importer then fills.
+    // A leftover dest from the clone attempt itself is not a successful import.
+    if workdir.join(".git").exists() {
+        let commits = Command::new("git")
+            .args([
+                "-C",
+                workdir.to_str().unwrap(),
+                "rev-list",
+                "--all",
+                "--count",
+            ])
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&commits.stdout).trim().to_string();
+        assert!(
+            count == "0" || !commits.status.success(),
+            "importer must not run on a replacement: {count}"
+        );
+    }
+    assert!(!workdir.join("history.txt").exists());
+
+    let retry: serde_json::Value = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "setup-clone-fail-retry")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retry["ok"], false, "{retry}");
+    assert_eq!(retry["operation_id"], held.id);
     server.abort();
 }
 
