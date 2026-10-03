@@ -24,6 +24,7 @@ use reposync_core::personal_config::{
 };
 use reposync_core::svn::SvnClient;
 use reposync_personal::commit_format::CommitFormatter;
+use reposync_personal::git_to_svn::{personal_svn_commit_fixture_env_key, GitToSvnSync};
 use reposync_personal::svn_to_git::{personal_git_push_fixture_env_key, SvnToGitSync};
 
 // ===========================================================================
@@ -2971,6 +2972,77 @@ impl GitPushFaultGuard {
     }
 }
 
+struct SvnCommitFaultGuard {
+    scoped_key: String,
+}
+
+impl SvnCommitFaultGuard {
+    fn lost_reply(svn_wc_path: &Path) -> Self {
+        let scoped_key =
+            personal_svn_commit_fixture_env_key("REPOSYNC_SVN_COMMIT_LOST_REPLY", svn_wc_path);
+        std::env::set_var(&scoped_key, "1");
+        Self { scoped_key }
+    }
+}
+
+impl Drop for SvnCommitFaultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(&self.scoped_key);
+    }
+}
+
+fn svn_youngest(svn_url: &str) -> i64 {
+    let repo = svn_url.strip_prefix("file://").unwrap();
+    String::from_utf8_lossy(
+        &Command::new("svnlook")
+            .args(["youngest", repo])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .parse::<i64>()
+    .unwrap()
+}
+
+fn github_commit(sha: String, message: &str) -> reposync_core::git::github::GitHubCommit {
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
+    GitHubCommit {
+        sha,
+        commit: GitHubCommitDetail {
+            message: message.into(),
+            author: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+            committer: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+        },
+        author: None,
+    }
+}
+
+fn personal_git_to_svn(
+    svn_url: &str,
+    db: Arc<Database>,
+    svn_wc: PathBuf,
+    git_work: PathBuf,
+    data_dir: &Path,
+) -> GitToSvnSync {
+    let config = make_test_config(svn_url, data_dir);
+    let svn_client = SvnClient::new(svn_url, "", "");
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        "https://localhost:0/unused",
+        "unused",
+        reposync_core::config::GitProvider::default(),
+    );
+    GitToSvnSync::new(svn_client, github_client, db, &config, svn_wc, git_work)
+}
+
 impl Drop for GitPushFaultGuard {
     fn drop(&mut self) {
         std::env::remove_var(&self.scoped_key);
@@ -3066,6 +3138,189 @@ async fn test_personal_svn_to_git_lost_reply_holds_without_checkpoint() {
             "operation_id": op.id,
             "remote_before": remote_before,
             "remote_after": remote_after,
+            "lifecycle": "reconciliation_required",
+            "mode": "personal"
+        })
+    );
+}
+
+#[tokio::test]
+async fn test_personal_git_to_svn_confirm_writes_commit_map() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("feature.txt"), "from git\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work,
+        tmp.path(),
+    );
+    let svn_rev = syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            7,
+            "feature/x",
+        )
+        .await
+        .expect("personal git-to-svn confirm must succeed");
+
+    assert!(
+        svn_rev > svn_before,
+        "SVN must advance after a confirmed write"
+    );
+    assert_eq!(svn_youngest(&svn_url), svn_rev);
+    assert!(
+        db_arc
+            .active_svn_commit_operation("personal")
+            .unwrap()
+            .is_none(),
+        "confirmed journal must clear the active hold"
+    );
+    let mapped = db_arc.list_commit_map(10).unwrap();
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(mapped[0].git_sha, git_sha);
+    assert_eq!(mapped[0].svn_rev, svn_rev);
+    assert_eq!(mapped[0].direction, "git_to_svn");
+}
+
+#[tokio::test]
+async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("feature.txt"), "lost reply\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let _fault = SvnCommitFaultGuard::lost_reply(&svn_wc);
+    let err = syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            8,
+            "feature/x",
+        )
+        .await
+        .expect_err("lost reply must hold, not succeed");
+    let err_text = format!("{err:#}");
+    assert!(
+        err_text.contains("reconciliation_required"),
+        "expected reconciliation hold: {err_text}"
+    );
+    drop(_fault);
+
+    let svn_after = svn_youngest(&svn_url);
+    assert!(
+        svn_after > svn_before,
+        "SVN commit must have landed before the hold"
+    );
+    assert_eq!(
+        db_arc.list_commit_map(10).unwrap().len(),
+        0,
+        "commit_map must not advance on uncertain outcome"
+    );
+    let op = db_arc
+        .active_svn_commit_operation("personal")
+        .unwrap()
+        .expect("active personal git-to-svn commit journal");
+    assert_eq!(
+        op.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::ReconciliationRequired
+    );
+    assert!(!op.resume_authorized);
+
+    let syncer2 = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work,
+        tmp.path(),
+    );
+    let again = syncer2
+        .sync()
+        .await
+        .expect_err("held commit must block retry");
+    assert!(
+        format!("{again:#}").contains("reconciliation_required"),
+        "{again:#}"
+    );
+    let replay_again = syncer2
+        .replay_commit(&github_commit(git_sha, "Add feature.txt"), 8, "feature/x")
+        .await
+        .expect_err("held commit must block another write");
+    assert!(
+        format!("{replay_again:#}").contains("reconciliation_required"),
+        "{replay_again:#}"
+    );
+    assert_eq!(
+        svn_youngest(&svn_url),
+        svn_after,
+        "held retry must not write SVN again"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "PERSONAL_GIT_TO_SVN_LOST_REPLY",
+            "operation_id": op.id,
+            "svn_before": svn_before,
+            "svn_after": svn_after,
             "lifecycle": "reconciliation_required",
             "mode": "personal"
         })

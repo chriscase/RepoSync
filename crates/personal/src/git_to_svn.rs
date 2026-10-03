@@ -5,20 +5,30 @@
 //! SVN with metadata trailers (Git SHA, PR number, branch) for traceability
 //! and echo suppression.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, instrument, warn};
 
+use reposync_core::db::svn_commit_operations::{
+    svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
+};
 use reposync_core::db::Database;
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
+use reposync_core::path_projection::svn_path_identity;
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
+use reposync_core::svn_commit::{
+    hash_regular_file_tree, intended_paths_from_contents, observed_svn_tree_at_revision,
+};
 
 use crate::commit_format::CommitFormatter;
+
+/// Personal-mode repository scope for the shared Git→SVN commit journal.
+const PERSONAL_REPO_ID: &str = "personal";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -148,6 +158,16 @@ impl GitToSvnSync {
     /// Returns a summary of what was synced.
     #[instrument(skip(self), fields(repo = %self.github_repo))]
     pub async fn sync(&self) -> Result<GitToSvnResult> {
+        if let Some(op) = self
+            .db
+            .active_svn_commit_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal git-to-svn commit")?
+        {
+            if let Some(reason) = blocking_svn_commit_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+
         info!("starting git-to-svn sync cycle");
         let mut result = GitToSvnResult::default();
 
@@ -301,24 +321,7 @@ impl GitToSvnSync {
                     last_svn_rev = Some(svn_rev);
                     synced_count += 1;
 
-                    // Record the commit mapping.
-                    let git_author = commit.commit.author.name.as_str();
-                    if let Err(e) = self.db.insert_commit_map(
-                        svn_rev,
-                        &commit.sha,
-                        "git_to_svn",
-                        &self.svn_author,
-                        git_author,
-                    ) {
-                        warn!(
-                            svn_rev,
-                            git_sha = %commit.sha,
-                            error = %e,
-                            "failed to record commit mapping (continuing)"
-                        );
-                    }
-
-                    // Audit log entry.
+                    // Audit log entry. Mapping is written only in journal confirm.
                     if let Err(e) = self.db.insert_audit_log(
                         "git_to_svn_commit",
                         Some("git_to_svn"),
@@ -343,8 +346,10 @@ impl GitToSvnSync {
                         "failed to replay commit to SVN"
                     );
 
-                    // Mark PR sync as failed.
-                    let _ = self.db.fail_pr_sync(sync_id, &format!("{:#}", e));
+                    let err_text = format!("{:#}", e);
+                    if !err_text.contains("reconciliation_required") {
+                        let _ = self.db.fail_pr_sync(sync_id, &err_text);
+                    }
 
                     // Audit failure.
                     let _ = self.db.insert_audit_log(
@@ -383,21 +388,42 @@ impl GitToSvnSync {
     /// 1. `svn update` the working copy to HEAD.
     /// 2. Copy changed files from the Git repo into the SVN working copy.
     /// 3. Detect added/deleted files and run `svn add` / `svn rm`.
-    /// 4. `svn commit` with formatted message including metadata trailers.
+    /// 4. Record durable Git→SVN intent, then `svn commit`.
+    /// 5. Confirm only after the observed SVN revision/tree matches.
     ///
     /// Returns the new SVN revision number.
+    ///
+    /// Public for integration testing of the crash-safe journal path.
     #[instrument(skip(self, commit), fields(git_sha = %commit.sha))]
-    async fn replay_commit(
+    pub async fn replay_commit(
         &self,
         commit: &GitHubCommit,
         pr_number: u64,
         pr_branch: &str,
     ) -> Result<i64> {
+        if let Some(op) = self
+            .db
+            .active_svn_commit_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal git-to-svn commit")?
+        {
+            if let Some(reason) = blocking_svn_commit_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+
         // 1. Update SVN working copy to latest.
         self.svn
             .update(&self.svn_wc_path)
             .await
             .context("svn update failed")?;
+
+        let info = self
+            .svn
+            .info()
+            .await
+            .context("failed to read SVN info before personal git-to-svn write")?;
+        let pre_write_svn_tree = hash_regular_file_tree(&self.svn_wc_path)
+            .context("failed to hash pre-write SVN working copy")?;
 
         // 2. Copy files from Git repo to SVN working copy.
         self.apply_git_changes_to_svn(commit)
@@ -439,7 +465,85 @@ impl GitToSvnSync {
             );
         }
 
-        // 4. Format commit message with trailers and commit.
+        let git_client = GitClient::new(&self.git_repo_path)
+            .context("failed to open local git repo for git-to-svn intent")?;
+        let (parent, tree) = git_client
+            .commit_parent_and_tree(&commit.sha)
+            .context("failed to read source Git parent and tree")?;
+        let changed_files = git_client
+            .get_changed_files(&commit.sha)
+            .context("failed to read source Git changed files")?;
+        let mut file_contents = Vec::new();
+        for (action, path) in &changed_files {
+            let content = if action != "D" {
+                git_client
+                    .get_file_content_at_commit(&commit.sha, path)
+                    .with_context(|| format!("failed to read '{path}' at {}", commit.sha))?
+            } else {
+                None
+            };
+            file_contents.push((action.clone(), path.clone(), content));
+        }
+        let intended_changed_paths = intended_paths_from_contents(&file_contents);
+        let intended_svn_tree = hash_regular_file_tree(&self.svn_wc_path)
+            .context("failed to hash intended SVN working copy")?;
+        let fingerprint = svn_commit_target_fingerprint(
+            PERSONAL_REPO_ID,
+            &info.uuid,
+            self.svn.url(),
+            &info.url,
+            "{}",
+        );
+        let identity = svn_path_identity(&info.root_url, &info.url);
+        let request_id = format!("git-{}", commit.sha);
+        let git_author = commit.commit.author.name.as_str();
+        let op = self
+            .db
+            .begin_git_to_svn_commit(SvnCommitIntent {
+                repo_id: PERSONAL_REPO_ID,
+                initiator_id: "personal_worker",
+                request_id: &request_id,
+                target_fingerprint: &fingerprint,
+                source_git_sha: &commit.sha,
+                source_git_parent: parent.as_deref(),
+                source_git_tree: &tree,
+                target_svn_uuid: &info.uuid,
+                target_svn_path: &info.url,
+                target_svn_root_url: &identity.root_url,
+                target_svn_branch_path: &identity.branch_path,
+                pre_write_svn_rev: info.latest_rev,
+                pre_write_svn_tree: &pre_write_svn_tree,
+                projection: "{}",
+                intended_changed_paths,
+                intended_svn_tree: &intended_svn_tree,
+                author: &self.svn_author,
+                source_message: &commit.commit.message,
+            })
+            .with_context(|| {
+                format!(
+                    "failed to record git-to-svn commit intent for {}",
+                    commit.sha
+                )
+            })?;
+
+        #[cfg(debug_assertions)]
+        if svn_commit_fixture_flag(
+            "REPOSYNC_SVN_COMMIT_CRASH_BEFORE",
+            PERSONAL_REPO_ID,
+            &self.svn_wc_path,
+        ) {
+            let _ = self.db.hold_git_to_svn_reconciliation(
+                PERSONAL_REPO_ID,
+                &op.id,
+                "intent recorded; planned SVN write was not issued",
+            );
+            anyhow::bail!(
+                "reconciliation_required: intent recorded before personal svn commit for {}",
+                commit.sha
+            );
+        }
+
+        // 4. Format commit message with trailers and commit after durable intent.
         let formatted_message = self.formatter.format_git_to_svn(
             &commit.commit.message,
             &commit.sha,
@@ -447,17 +551,110 @@ impl GitToSvnSync {
             pr_branch,
         );
 
-        let svn_rev = self
+        let svn_rev = match self
             .svn
             .commit(&self.svn_wc_path, &formatted_message, &self.svn_author)
             .await
-            .context("svn commit failed")?;
+        {
+            Ok(rev) => rev,
+            Err(e) => {
+                let _ = self.db.hold_git_to_svn_reconciliation(
+                    PERSONAL_REPO_ID,
+                    &op.id,
+                    &format!("svn commit failed after intent was recorded: {e}"),
+                );
+                return Err(e).context(format!(
+                    "svn commit failed after intent was recorded for {}; held for reconcile",
+                    commit.sha
+                ));
+            }
+        };
 
         info!(
             svn_rev,
             git_sha = %commit.sha,
             "replayed git commit to SVN"
         );
+
+        #[cfg(debug_assertions)]
+        if svn_commit_fixture_flag(
+            "REPOSYNC_SVN_COMMIT_LOST_REPLY",
+            PERSONAL_REPO_ID,
+            &self.svn_wc_path,
+        ) {
+            let _ = self.db.hold_git_to_svn_reconciliation(
+                PERSONAL_REPO_ID,
+                &op.id,
+                "SVN accepted the commit but the reply was lost before local checkpoint",
+            );
+            anyhow::bail!(
+                "reconciliation_required: lost commit reply for personal git-to-svn {}",
+                commit.sha
+            );
+        }
+
+        let observed_svn_tree = match observed_svn_tree_at_revision(&self.svn, svn_rev).await {
+            Ok(tree) => tree,
+            Err(error) => {
+                let detail = format!(
+                    "SVN accepted the commit but the observed tree could not be re-read: {error}"
+                );
+                let _ = self
+                    .db
+                    .hold_git_to_svn_reconciliation(PERSONAL_REPO_ID, &op.id, &detail);
+                anyhow::bail!("reconciliation_required: {detail}");
+            }
+        };
+        #[cfg(debug_assertions)]
+        let observed_svn_tree = if svn_commit_fixture_flag(
+            "REPOSYNC_SVN_COMMIT_OBSERVED_TREE_MISMATCH",
+            PERSONAL_REPO_ID,
+            &self.svn_wc_path,
+        ) {
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string()
+        } else {
+            observed_svn_tree
+        };
+        if observed_svn_tree != intended_svn_tree {
+            let detail =
+                format!("SVN revision {svn_rev} tree does not match the intended Git-to-SVN tree");
+            let _ = self
+                .db
+                .hold_git_to_svn_reconciliation(PERSONAL_REPO_ID, &op.id, &detail);
+            anyhow::bail!("reconciliation_required: {detail}");
+        }
+
+        match self.db.confirm_personal_git_to_svn_commit(
+            PERSONAL_REPO_ID,
+            &op.id,
+            svn_rev,
+            &observed_svn_tree,
+            git_author,
+        ) {
+            Ok(confirmed) => {
+                info!(
+                    svn_rev,
+                    operation_id = %confirmed.id,
+                    git_sha = %commit.sha,
+                    "personal git-to-svn commit verified and checkpointed"
+                );
+            }
+            Err(error) => {
+                let _ = self.db.hold_git_to_svn_reconciliation(
+                    PERSONAL_REPO_ID,
+                    &op.id,
+                    &format!(
+                        "SVN accepted the commit but the local checkpoint write failed: {error}"
+                    ),
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to checkpoint personal git-to-svn commit for {}; held for reconcile",
+                        commit.sha
+                    )
+                });
+            }
+        }
 
         Ok(svn_rev)
     }
@@ -717,6 +914,62 @@ impl GitToSvnSync {
     }
 }
 
+fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {
+    if op.state == SvnCommitOperationState::ReconciliationRequired && !op.resume_authorized {
+        return Some(format!(
+            "reconciliation_required: personal git-to-svn commit held ({})",
+            op.outcome_detail
+                .as_deref()
+                .unwrap_or("inspect the exact SVN revision before retrying")
+        ));
+    }
+    if !op.state.is_terminal() {
+        return Some(
+            "repository has an active personal git-to-svn commit; wait for the current operation"
+                .into(),
+        );
+    }
+    None
+}
+
+/// Personal mode journals every checkout under `repo_id = "personal"`. Tests
+/// isolate debug fixtures with the SVN working-copy path so a lost-reply hold
+/// cannot trip parallel personal tests in the same process.
+fn svn_commit_fixture_scope(svn_wc_path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    svn_wc_path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Env key for a personal Git→SVN debug fixture, unique to one SVN working copy.
+///
+/// Public for integration tests. The personal binary compiles this module
+/// privately, so the helper looks unused there.
+#[allow(dead_code)]
+pub fn personal_svn_commit_fixture_env_key(var: &str, svn_wc_path: &Path) -> String {
+    format!(
+        "{}__{}__{}",
+        var,
+        PERSONAL_REPO_ID,
+        svn_commit_fixture_scope(svn_wc_path)
+    )
+}
+
+#[cfg(debug_assertions)]
+fn svn_commit_fixture_flag(var: &str, repo_id: &str, svn_wc_path: &Path) -> bool {
+    let scoped = format!(
+        "{}__{}__{}",
+        var,
+        repo_id,
+        svn_commit_fixture_scope(svn_wc_path)
+    );
+    if std::env::var(&scoped).is_ok() {
+        return true;
+    }
+    std::env::var(var).ok().as_deref() == Some(repo_id)
+}
+
 // ---------------------------------------------------------------------------
 // File-level helpers (retained for tests)
 // ---------------------------------------------------------------------------
@@ -936,5 +1189,54 @@ M       Cargo.toml
         assert_eq!(result.prs_synced, 0);
         assert_eq!(result.prs_skipped, 0);
         assert_eq!(result.prs_failed, 0);
+    }
+
+    #[test]
+    fn personal_svn_commit_fixture_key_differs_per_working_copy() {
+        let a = personal_svn_commit_fixture_env_key(
+            "REPOSYNC_SVN_COMMIT_LOST_REPLY",
+            Path::new("/tmp/personal-svn-a"),
+        );
+        let b = personal_svn_commit_fixture_env_key(
+            "REPOSYNC_SVN_COMMIT_LOST_REPLY",
+            Path::new("/tmp/personal-svn-b"),
+        );
+        assert_ne!(a, b);
+        assert!(a.starts_with("REPOSYNC_SVN_COMMIT_LOST_REPLY__personal__"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn svn_commit_fixture_flag_ignores_shared_personal_env_key() {
+        let leaked = "REPOSYNC_SVN_COMMIT_LOST_REPLY__personal";
+        std::env::set_var(leaked, "1");
+        let fired = svn_commit_fixture_flag(
+            "REPOSYNC_SVN_COMMIT_LOST_REPLY",
+            PERSONAL_REPO_ID,
+            Path::new("/tmp/other-svn-wc"),
+        );
+        std::env::remove_var(leaked);
+        assert!(
+            !fired,
+            "unscoped personal fixture key must not hold unrelated working copies"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn svn_commit_fixture_flag_honors_working_copy_scoped_key() {
+        let path = Path::new("/tmp/lost-reply-svn-wc");
+        let key = personal_svn_commit_fixture_env_key("REPOSYNC_SVN_COMMIT_LOST_REPLY", path);
+        std::env::set_var(&key, "1");
+        let fired =
+            svn_commit_fixture_flag("REPOSYNC_SVN_COMMIT_LOST_REPLY", PERSONAL_REPO_ID, path);
+        let other = svn_commit_fixture_flag(
+            "REPOSYNC_SVN_COMMIT_LOST_REPLY",
+            PERSONAL_REPO_ID,
+            Path::new("/tmp/other-svn-wc"),
+        );
+        std::env::remove_var(&key);
+        assert!(fired, "path-scoped fixture must fire for that working copy");
+        assert!(!other, "path-scoped fixture must not fire for other copies");
     }
 }
