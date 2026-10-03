@@ -24,10 +24,16 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::db::import_operations::{
+    import_target_fingerprint, ImportOperation, ImportOperationState,
+};
 use crate::db::Database;
+use crate::errors::DatabaseError;
 use crate::file_policy::{FilePolicy, FilePolicyDecision};
+use crate::git::remote_url;
 use crate::git::GitClient;
 use crate::identity::mapper::{GitIdentity, IdentityMapper};
+use crate::models::Repository;
 use crate::svn::SvnClient;
 
 // ---------------------------------------------------------------------------
@@ -1152,6 +1158,304 @@ pub fn verify_import_local_tip(
         .tree()
         .context("recorded local Git tree is missing")?;
     Ok(tree.id().to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportInspect {
+    UniqueMatch { git_sha: String, git_tree: String },
+    Absent,
+    Conflict { reason: String },
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportReconcileResult {
+    pub operation: ImportOperation,
+    pub inspect: ImportInspect,
+    pub finalized: bool,
+    pub resume_authorized: bool,
+    pub publication_recorded: bool,
+    pub observed_ref: Option<String>,
+    pub observed_sha: Option<String>,
+}
+
+/// Bounded `git ls-remote --exit-code origin <exact-ref>` inspection for held
+/// import reconciliation. Exit 2 means the ref is absent.
+pub async fn fresh_import_remote_ref(
+    workdir: &Path,
+    reference: &str,
+) -> Result<Option<String>, &'static str> {
+    let mut inspect = crate::process::import_git_command()
+        .map_err(|_| "remote inspection command unavailable")?;
+    inspect
+        .args(["ls-remote", "--exit-code", "origin", reference])
+        .current_dir(workdir)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = crate::process::run(inspect, Duration::from_secs(60), None)
+        .await
+        .map_err(|_| "remote inspection failed or timed out")?;
+    match output.status.code() {
+        Some(2) => Ok(None),
+        Some(0) => {
+            let stdout = String::from_utf8(output.stdout)
+                .map_err(|_| "remote inspection returned malformed data")?;
+            let mut lines = stdout.lines();
+            let line = lines
+                .next()
+                .ok_or("remote inspection returned no exact ref")?;
+            let (sha, found_ref) = line
+                .split_once('\t')
+                .ok_or("remote inspection returned malformed data")?;
+            if lines.next().is_some()
+                || found_ref != reference
+                || sha.len() != 40
+                || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("remote inspection did not return one exact full ref");
+            }
+            Ok(Some(sha.to_string()))
+        }
+        _ => Err("remote inspection unavailable (authentication or transport failure)"),
+    }
+}
+
+fn import_reconcile_held_reasons() -> [&'static str; 10] {
+    [
+        "import target fingerprint changed",
+        "repository checkpoint changed during held import",
+        "missing import revision total",
+        "remote SHA is not the recorded local import tip",
+        "incomplete prior publication receipt",
+        "remote SHA differs from publication evidence",
+        "invalid publication counter",
+        "snapshot import is missing its pin",
+        "snapshot import is not a single verified baseline",
+        "snapshot pin does not match the recorded local revision",
+    ]
+}
+
+/// Observe-first reconciliation for held `import_operation_v1` journals.
+///
+/// Reuses the same inspect+finalize path as the admin reconcile endpoint.
+/// Finalizes only on a unique verified remote match. Import resume is not
+/// implemented in this slice, so `resume_authorized` is always false.
+pub async fn apply_import_reconciliation(
+    db: &Database,
+    repo: &Repository,
+    op_id: &str,
+    git_workdir: &Path,
+) -> Result<ImportReconcileResult, DatabaseError> {
+    let requested = db
+        .get_import_operation(&repo.id, op_id)?
+        .ok_or_else(|| DatabaseError::Other("import operation not found".into()))?;
+    let active = db.active_import_operation(&repo.id)?;
+    if active.is_none() && requested.state == ImportOperationState::Completed {
+        let git_sha = requested.last_confirmed_git_sha.clone().unwrap_or_default();
+        return Ok(ImportReconcileResult {
+            operation: requested,
+            inspect: ImportInspect::UniqueMatch {
+                git_sha,
+                git_tree: String::new(),
+            },
+            finalized: true,
+            resume_authorized: false,
+            publication_recorded: false,
+            observed_ref: None,
+            observed_sha: None,
+        });
+    }
+    if active.as_ref().is_none_or(|op| op.id != op_id)
+        || requested.state != ImportOperationState::ReconciliationRequired
+        || !matches!(
+            requested.operation_type.as_str(),
+            "full_import" | "snapshot_import"
+        )
+    {
+        return Err(DatabaseError::Other(
+            "operation is not this repository's active reconciliation hold".into(),
+        ));
+    }
+    if requested.target_fingerprint.is_empty()
+        || requested.target_fingerprint != import_target_fingerprint(repo, git_workdir)
+    {
+        let operation = db.note_import_reconciliation_reason(
+            &repo.id,
+            op_id,
+            "Import target configuration changed; review required",
+        )?;
+        return Ok(ImportReconcileResult {
+            operation,
+            inspect: ImportInspect::Conflict {
+                reason: "Import target configuration changed; review required".into(),
+            },
+            finalized: false,
+            resume_authorized: false,
+            publication_recorded: false,
+            observed_ref: None,
+            observed_sha: None,
+        });
+    }
+    let reference = format!("refs/heads/{}", repo.git_branch);
+    let expected_sha = match (&requested.intended_ref, &requested.intended_git_sha) {
+        (Some(intent_ref), Some(sha))
+            if intent_ref == &reference && requested.last_local_git_sha.as_deref() == Some(sha) =>
+        {
+            sha.as_str()
+        }
+        (None, None)
+            if requested.last_confirmed_svn_rev == requested.last_local_svn_rev
+                && requested.last_confirmed_git_sha == requested.last_local_git_sha =>
+        {
+            requested.last_confirmed_git_sha.as_deref().unwrap_or("")
+        }
+        _ => {
+            let operation = db.note_import_reconciliation_reason(
+                &repo.id,
+                op_id,
+                "Publication evidence is incomplete or inconsistent",
+            )?;
+            return Ok(ImportReconcileResult {
+                operation,
+                inspect: ImportInspect::Conflict {
+                    reason: "Publication evidence is incomplete or inconsistent".into(),
+                },
+                finalized: false,
+                resume_authorized: false,
+                publication_recorded: false,
+                observed_ref: None,
+                observed_sha: None,
+            });
+        }
+    };
+    let configured_url = remote_url::derive_git_remote_url(&repo.git_api_url, None, &repo.git_repo);
+    let local_tree = match verify_import_local_tip(
+        git_workdir,
+        &reference,
+        expected_sha,
+        &configured_url,
+    ) {
+        Ok(tree) => tree,
+        Err(_) => {
+            let operation = db.note_import_reconciliation_reason(
+                &repo.id,
+                op_id,
+                "Recorded local Git object, tree, branch or origin is unavailable or changed",
+            )?;
+            return Ok(ImportReconcileResult {
+                operation,
+                inspect: ImportInspect::Conflict {
+                    reason: "Recorded local Git object, tree, branch or origin is unavailable or changed".into(),
+                },
+                finalized: false,
+                resume_authorized: false,
+                publication_recorded: false,
+                observed_ref: None,
+                observed_sha: None,
+            });
+        }
+    };
+    let observed = match fresh_import_remote_ref(git_workdir, &reference).await {
+        Ok(Some(sha)) => sha,
+        Ok(None) => {
+            let operation = db.note_import_reconciliation_reason(
+                &repo.id,
+                op_id,
+                "Configured remote ref is missing; no publication was inferred",
+            )?;
+            return Ok(ImportReconcileResult {
+                operation,
+                inspect: ImportInspect::Absent,
+                finalized: false,
+                resume_authorized: false,
+                publication_recorded: false,
+                observed_ref: Some(reference),
+                observed_sha: None,
+            });
+        }
+        Err(reason) => {
+            let operation = db.note_import_reconciliation_reason(&repo.id, op_id, reason)?;
+            return Ok(ImportReconcileResult {
+                operation,
+                inspect: ImportInspect::Unavailable {
+                    reason: reason.into(),
+                },
+                finalized: false,
+                resume_authorized: false,
+                publication_recorded: false,
+                observed_ref: None,
+                observed_sha: None,
+            });
+        }
+    };
+    if observed != expected_sha {
+        let operation = db.note_import_reconciliation_reason(
+            &repo.id,
+            op_id,
+            "Remote ref differs from the recorded full Git SHA",
+        )?;
+        return Ok(ImportReconcileResult {
+            operation,
+            inspect: ImportInspect::Conflict {
+                reason: "Remote ref differs from the recorded full Git SHA".into(),
+            },
+            finalized: false,
+            resume_authorized: false,
+            publication_recorded: false,
+            observed_ref: Some(reference),
+            observed_sha: Some(observed),
+        });
+    }
+    if verify_import_local_tip(git_workdir, &reference, expected_sha, &configured_url)
+        .ok()
+        .as_deref()
+        != Some(local_tree.as_str())
+    {
+        let operation = db.note_import_reconciliation_reason(
+            &repo.id,
+            op_id,
+            "Managed local Git evidence changed during remote inspection",
+        )?;
+        return Ok(ImportReconcileResult {
+            operation,
+            inspect: ImportInspect::Conflict {
+                reason: "Managed local Git evidence changed during remote inspection".into(),
+            },
+            finalized: false,
+            resume_authorized: false,
+            publication_recorded: false,
+            observed_ref: Some(reference),
+            observed_sha: Some(observed),
+        });
+    }
+    match db.reconcile_verified_import(&repo.id, op_id, git_workdir, &reference, &observed) {
+        Ok(reconciled) => Ok(ImportReconcileResult {
+            operation: reconciled.operation,
+            inspect: ImportInspect::UniqueMatch {
+                git_sha: observed.clone(),
+                git_tree: local_tree,
+            },
+            finalized: reconciled.completed,
+            resume_authorized: false,
+            publication_recorded: reconciled.publication_recorded,
+            observed_ref: Some(reference),
+            observed_sha: Some(observed),
+        }),
+        Err(DatabaseError::Other(reason))
+            if import_reconcile_held_reasons().contains(&reason.as_str()) =>
+        {
+            let operation = db.note_import_reconciliation_reason(&repo.id, op_id, &reason)?;
+            Ok(ImportReconcileResult {
+                operation,
+                inspect: ImportInspect::Conflict { reason },
+                finalized: false,
+                resume_authorized: false,
+                publication_recorded: false,
+                observed_ref: Some(reference),
+                observed_sha: Some(observed),
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn publish_checked(
