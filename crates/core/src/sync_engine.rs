@@ -35,7 +35,9 @@ use crate::db::svn_commit_operations::{
 use crate::db::Database;
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
-use crate::git_push::{observed_git_ref, observed_git_tree};
+use crate::git_push::{
+    inspect_svn_to_git_push, observed_git_ref, observed_git_tree, GitPushInspect,
+};
 use crate::history_inspect::{
     clear_transient_history_block, enforce_durable_history_block, history_block_key,
     inspect_fetched_history, is_full_git_oid, persist_history_block, HistoryInspectReject,
@@ -1065,6 +1067,11 @@ impl SyncEngine {
                 }
             }
         }
+        // Authorized SVN→Git resume must publish the recorded local commit
+        // before history inspect. The unpushed bridge tip is the intended
+        // SHA; inspect would otherwise classify it as unpublished_local_history
+        // and never issue that one push.
+        self.resume_authorized_svn_to_git_push(stats)?;
         // SVN inspection may adopt a legacy checkpoint. Admit Git history
         // before that call, not merely before the later destructive reset.
         let admission = tokio::task::block_in_place(|| self.inspect_team_history())?;
@@ -1712,6 +1719,228 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    /// Issue the one recorded SVN→Git push after observe-first resume, or
+    /// finalize a unique match that landed before the worker ran.
+    ///
+    /// Re-reads the remote first. Conflict and unavailable stay held without a
+    /// push, watermark, mapping, or remote mutation. The local branch tip must
+    /// still be the recorded intended commit — this is not a new SHA and not a
+    /// blind re-push.
+    fn resume_authorized_svn_to_git_push(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
+        let Some(rid) = self.effective_repo_id() else {
+            return Ok(());
+        };
+        let Some(op) = self
+            .db
+            .active_git_push_operation(rid)
+            .map_err(SyncError::DatabaseError)?
+        else {
+            return Ok(());
+        };
+        if op.state != GitPushOperationState::ReconciliationRequired || !op.resume_authorized {
+            return Ok(());
+        }
+
+        let inspect = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            inspect_svn_to_git_push(&git, &op)
+        };
+        match inspect {
+            GitPushInspect::UniqueMatch { git_sha, git_tree } => {
+                let fingerprint = git_push_target_fingerprint(
+                    rid,
+                    &op.pre_push_git_remote,
+                    &op.pre_push_git_branch,
+                );
+                self.db
+                    .finalize_verified_svn_to_git_push(
+                        rid,
+                        &op.id,
+                        &git_sha,
+                        &git_tree,
+                        &fingerprint,
+                    )
+                    .map_err(SyncError::DatabaseError)?;
+                self.record_resumed_svn_to_git_push(&op, &git_sha, false);
+                stats.svn_to_git_count += 1;
+                return Ok(());
+            }
+            GitPushInspect::Conflict { reason } | GitPushInspect::Unavailable { reason } => {
+                let _ = self
+                    .db
+                    .note_git_push_reconciliation_reason(rid, &op.id, &reason);
+                return Err(SyncError::GitPushHeld {
+                    reason: "reconciliation_required".into(),
+                    detail: reason,
+                });
+            }
+            GitPushInspect::AbsentUnchanged => {}
+        }
+
+        let local_tip = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            let spec = format!("refs/heads/{}", op.pre_push_git_branch);
+            let output = Command::new("git")
+                .args(["rev-parse", "--verify", &spec])
+                .current_dir(git.repo_path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
+            if !output.status.success() {
+                let detail = format!(
+                    "could not read local branch {} for the recorded push",
+                    op.pre_push_git_branch
+                );
+                let _ = self
+                    .db
+                    .note_git_push_reconciliation_reason(rid, &op.id, &detail);
+                return Err(SyncError::GitPushHeld {
+                    reason: "intended_commit_unreadable".into(),
+                    detail,
+                });
+            }
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        if local_tip != op.intended_local_git_sha {
+            let detail = format!(
+                "bridge branch {} is {local_tip} but the recorded intended commit was {}",
+                op.pre_push_git_branch, op.intended_local_git_sha
+            );
+            let _ = self
+                .db
+                .note_git_push_reconciliation_reason(rid, &op.id, &detail);
+            return Err(SyncError::GitPushHeld {
+                reason: "intended_commit_not_at_branch_tip".into(),
+                detail,
+            });
+        }
+        let local_tree = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            observed_git_tree(&git, &op.intended_local_git_sha).map_err(SyncError::GitError)?
+        };
+        if local_tree != op.intended_local_git_tree {
+            let detail = format!(
+                "recorded intended tree {} does not match local tree {local_tree}",
+                op.intended_local_git_tree
+            );
+            let _ = self
+                .db
+                .note_git_push_reconciliation_reason(rid, &op.id, &detail);
+            return Err(SyncError::GitPushHeld {
+                reason: "intended_tree_mismatch".into(),
+                detail,
+            });
+        }
+
+        self.db
+            .begin_svn_to_git_push(op.intent())
+            .map_err(SyncError::DatabaseError)?;
+
+        let push_result = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git.push(&op.pre_push_git_remote, &op.pre_push_git_branch)
+                .map_err(SyncError::GitError)
+        };
+        if let Err(push_err) = push_result {
+            let detail = format!("git push failed after resume was authorized: {push_err}");
+            let _ = self.db.hold_svn_to_git_reconciliation(rid, &op.id, &detail);
+            return Err(SyncError::GitPushHeld {
+                reason: "push_outcome_uncertain".into(),
+                detail,
+            });
+        }
+
+        let (observed_sha, observed_tree) = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            let observed_sha =
+                observed_git_ref(&git, &op.pre_push_git_remote, &op.pre_push_git_branch)
+                    .map_err(SyncError::GitError)?;
+            let observed_tree =
+                observed_git_tree(&git, &observed_sha).map_err(SyncError::GitError)?;
+            (observed_sha, observed_tree)
+        };
+        if observed_sha != op.intended_local_git_sha {
+            let detail = format!(
+                "remote ref {} is {observed_sha} but intended local commit was {}",
+                op.pre_push_git_branch, op.intended_local_git_sha
+            );
+            let _ = self.db.hold_svn_to_git_reconciliation(rid, &op.id, &detail);
+            return Err(SyncError::GitPushHeld {
+                reason: "observed_ref_mismatch".into(),
+                detail,
+            });
+        }
+        if observed_tree != op.intended_local_git_tree {
+            let detail = format!(
+                "remote commit tree {observed_tree} does not match intended local tree {}",
+                op.intended_local_git_tree
+            );
+            let _ = self.db.hold_svn_to_git_reconciliation(rid, &op.id, &detail);
+            return Err(SyncError::GitPushHeld {
+                reason: "observed_tree_mismatch".into(),
+                detail,
+            });
+        }
+        match self
+            .db
+            .confirm_svn_to_git_push(rid, &op.id, &observed_sha, &observed_tree)
+        {
+            Ok(_) => {
+                self.record_resumed_svn_to_git_push(&op, &observed_sha, true);
+                stats.svn_to_git_count += 1;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.db.hold_svn_to_git_reconciliation(
+                    rid,
+                    &op.id,
+                    &format!("Git push verified but the local checkpoint write failed: {error}"),
+                );
+                Err(SyncError::GitPushHeld {
+                    reason: "checkpoint_write_failed".into(),
+                    detail: format!("Git push verified but checkpoint failed: {error}"),
+                })
+            }
+        }
+    }
+
+    fn record_resumed_svn_to_git_push(
+        &self,
+        op: &GitPushOperation,
+        git_sha: &str,
+        issued_push: bool,
+    ) {
+        let details = if issued_push {
+            format!(
+                "resumed the one recorded SVN r{} -> Git {} push",
+                op.source_svn_rev,
+                &git_sha[..8.min(git_sha.len())]
+            )
+        } else {
+            format!(
+                "finalized the recorded SVN r{} -> Git {} push without a second push",
+                op.source_svn_rev,
+                &git_sha[..8.min(git_sha.len())]
+            )
+        };
+        let _ = self.db.insert_audit_log_with_repo(AuditLogInput {
+            action: "sync_cycle",
+            direction: Some("svn_to_git"),
+            svn_rev: Some(op.source_svn_rev),
+            git_sha: Some(git_sha),
+            author: Some(&op.source_svn_author),
+            details: Some(&details),
+            success: true,
+            repo_id: self.repo_id.as_deref(),
+        });
+        info!(
+            rev = op.source_svn_rev,
+            git_sha = %git_sha,
+            issued_push,
+            "resumed recorded SVN-to-Git push"
+        );
     }
 
     // -----------------------------------------------------------------------
