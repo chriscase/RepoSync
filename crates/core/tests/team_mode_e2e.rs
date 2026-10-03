@@ -6883,14 +6883,12 @@ async fn candidate_64e_absent_unchanged_svn_to_git_resumes_one_recorded_push() {
         .unwrap()
         .is_none());
     assert!(
-        fixture
-            .engine
-            .db()
-            .get_state(&reposync_core::history_inspect::history_block_key(Some(
-                repo_id
-            )))
-            .unwrap()
-            .is_none(),
+        reposync_core::history_inspect::load_history_block(
+            fixture.engine.db(),
+            &reposync_core::history_inspect::history_block_key(Some(repo_id)),
+        )
+        .unwrap()
+        .is_none(),
         "resume must not persist a history block"
     );
     let quiet = fixture.engine.run_sync_cycle().await.unwrap();
