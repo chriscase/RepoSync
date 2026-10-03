@@ -566,6 +566,128 @@ async fn candidate_64c07_setup_wizard_failed_clone_refuses_replacement_and_holds
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds() {
+    if !svn_available() {
+        eprintln!("SKIP: svnadmin not available");
+        return;
+    }
+    let (addr, state, server, tmp, repo_id, bare) = setup_wizard_fixture().await;
+    // Clone target is gone: after enrollment, spawn_import_task must fail
+    // the same way start_import does, not leave Queued with no worker.
+    assert!(std::fs::remove_dir_all(&bare).is_ok());
+    let workdir = tmp.path().join("git-repo");
+    assert!(!workdir.join(".git").exists());
+
+    // Force-push is out of scope. Succeed that git push so enrollment and
+    // the spawn_import_task clone run against the missing target.
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(!real_git.is_empty(), "git binary required");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"push\" ]; then\n  exit 0\nfi\nexec {real_git} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&wrapper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, perms).unwrap();
+    }
+    let prev_path = std::env::var("PATH").unwrap();
+    std::env::set_var("PATH", format!("{}:{prev_path}", bin.display()));
+    std::env::set_var("GIT_AUTHOR_NAME", "RepoSync Test");
+    std::env::set_var("GIT_AUTHOR_EMAIL", "reposync@localhost");
+    std::env::set_var("GIT_COMMITTER_NAME", "RepoSync Test");
+    std::env::set_var("GIT_COMMITTER_EMAIL", "reposync@localhost");
+
+    let client = authed_client();
+    let started = client
+        .post(format!("http://{addr}/api/setup/reset-reimport"))
+        .send()
+        .await
+        .unwrap();
+    std::env::set_var("PATH", prev_path);
+    let status = started.status();
+    let body: serde_json::Value = started.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{status} {body}");
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("could not be cloned") && error.contains("held"),
+        "{body}"
+    );
+    assert_ne!(body["ok"], true, "{body}");
+
+    let held = state
+        .db
+        .active_import_operation(&repo_id)
+        .unwrap()
+        .expect("enrolled reset-reimport operation must remain held");
+    assert_eq!(held.state, ImportOperationState::ReconciliationRequired);
+    assert!(held.request_id.starts_with("setup-reset-"), "{held:?}");
+    assert!(!reposync_core::busy::is_busy(&repo_id));
+
+    let progress = state.import_progress.read().await.clone();
+    assert_eq!(progress.phase, ImportPhase::Failed);
+    assert_eq!(progress.commits_created, 0);
+
+    if workdir.join(".git").exists() {
+        let commits = Command::new("git")
+            .args([
+                "-C",
+                workdir.to_str().unwrap(),
+                "rev-list",
+                "--all",
+                "--count",
+            ])
+            .output()
+            .unwrap();
+        let count = String::from_utf8_lossy(&commits.stdout).trim().to_string();
+        assert!(
+            count == "0" || !commits.status.success(),
+            "importer must not run on a replacement: {count}"
+        );
+    }
+    assert!(!workdir.join("history.txt").exists());
+
+    let retry_start: serde_json::Value = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "setup-reset-clone-fail-retry")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retry_start["ok"], false, "{retry_start}");
+    assert_eq!(retry_start["operation_id"], held.id);
+
+    let retry_reset: serde_json::Value = client
+        .post(format!("http://{addr}/api/setup/reset-reimport"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retry_reset["ok"], false, "{retry_reset}");
+    assert_eq!(retry_reset["operation_id"], held.id);
+    server.abort();
+}
+
 #[cfg(feature = "reliability-fixture")]
 async fn wait_for_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(30), async {
