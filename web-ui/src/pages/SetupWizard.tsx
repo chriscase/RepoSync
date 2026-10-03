@@ -212,7 +212,17 @@ export default function SetupWizard() {
     (async () => {
       try {
         const status: ImportStatus = await api.getImportStatus();
-        if (status.phase === 'importing' || status.phase === 'connecting' || status.phase === 'verifying' || status.phase === 'final_push') {
+        const running =
+          status.phase === 'importing' ||
+          status.phase === 'connecting' ||
+          status.phase === 'verifying' ||
+          status.phase === 'final_push' ||
+          status.busy === true ||
+          status.lifecycle === 'queued' ||
+          status.lifecycle === 'running' ||
+          status.lifecycle === 'cancel_requested' ||
+          status.lifecycle === 'cancelling';
+        if (running) {
           setStep(7); // Jump to Import step
         }
       } catch {
@@ -1558,7 +1568,14 @@ function ImportStep() {
   };
 
   const phase = status?.phase ?? 'idle';
-  const isActive = ['connecting', 'importing', 'verifying', 'final_push'].includes(phase);
+  const isCancelling =
+    status?.lifecycle === 'cancel_requested' ||
+    status?.lifecycle === 'cancelling' ||
+    status?.cancelling === true;
+  const isActive =
+    ['connecting', 'importing', 'verifying', 'final_push'].includes(phase) ||
+    status?.busy === true ||
+    isCancelling;
   const isComplete = phase === 'completed';
   const isFailed = phase === 'failed';
   const isCancelled = phase === 'cancelled';
@@ -1675,15 +1692,24 @@ function ImportStep() {
             </div>
           )}
 
-          {/* Cancel button */}
+          {/* Cancel / cancelling */}
           {isActive && (
-            <div className="text-center">
-              <button
-                onClick={handleCancel}
-                className="px-4 py-2 border border-red-600 text-red-400 hover:bg-red-900/30 rounded-lg text-sm transition-colors"
-              >
-                Cancel Import
-              </button>
+            <div className="text-center space-y-2">
+              {status?.operation_id && (
+                <p className="text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>
+              )}
+              {isCancelling ? (
+                <p className="text-sm text-yellow-300">
+                  Cancellation requested — stopping. Published history is not undone.
+                </p>
+              ) : (
+                <button
+                  onClick={handleCancel}
+                  className="px-4 py-2 border border-red-600 text-red-400 hover:bg-red-900/30 rounded-lg text-sm transition-colors"
+                >
+                  Cancel Import
+                </button>
+              )}
             </div>
           )}
         </div>

@@ -5,20 +5,29 @@
 //! - Trigger full SVN→Git history import with progress tracking
 //! - Poll import status
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
+use reposync_core::busy::BusyGuard;
 use reposync_core::config::AppConfig;
+use reposync_core::db::import_operations::{
+    import_target_fingerprint, ImportOperation, ImportOperationState,
+};
 use reposync_core::db::Database;
+use reposync_core::errors::DatabaseError;
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress};
+use reposync_core::models::Repository;
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::validate_session_with_role;
@@ -118,6 +127,10 @@ pub struct ApplyConfigResponse {
 pub struct ImportActionResponse {
     pub ok: bool,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<ImportOperationState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -640,97 +653,402 @@ async fn apply_config(
 // Import
 // ---------------------------------------------------------------------------
 
-async fn start_import(
-    State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<ImportActionResponse>, AppError> {
+fn setup_import_phase_busy(phase: &ImportPhase) -> bool {
+    matches!(
+        phase,
+        ImportPhase::Connecting
+            | ImportPhase::Importing
+            | ImportPhase::Verifying
+            | ImportPhase::FinalPush
+    )
+}
+
+fn setup_repository(db: &Database) -> Result<Repository, AppError> {
+    db.list_repositories()
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::BadRequest("apply configuration before starting import".into()))
+}
+
+fn import_write_error(error: DatabaseError) -> AppError {
+    match error {
+        DatabaseError::Other(message) => AppError::BadRequest(message),
+        other => AppError::Internal(format!("import operation persistence failed: {other}")),
+    }
+}
+
+fn action_response(
+    ok: bool,
+    message: impl Into<String>,
+    op: Option<&ImportOperation>,
+) -> Json<ImportActionResponse> {
+    Json(ImportActionResponse {
+        ok,
+        message: message.into(),
+        operation_id: op.map(|o| o.id.clone()),
+        lifecycle: op.map(|o| o.state.clone()),
+    })
+}
+
+fn overlay_setup_import_status(
+    progress: &ImportProgress,
+    op: Option<&ImportOperation>,
+    repo_id: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(progress).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let busy = repo_id.is_some_and(reposync_core::busy::is_busy)
+        || setup_import_phase_busy(&progress.phase)
+        || op.is_some_and(|o| !o.state.is_terminal());
+    object.insert("busy".into(), serde_json::json!(busy));
+    if let Some(op) = op {
+        let terminal_phase = match op.state {
+            ImportOperationState::Queued
+            | ImportOperationState::Running
+            | ImportOperationState::CancelRequested
+            | ImportOperationState::Cancelling => None,
+            ImportOperationState::Completed => Some("completed"),
+            ImportOperationState::Cancelled => Some("cancelled"),
+            ImportOperationState::Failed | ImportOperationState::ReconciliationRequired => {
+                Some("failed")
+            }
+        };
+        if let Some(phase) = terminal_phase {
+            object.insert("phase".into(), serde_json::json!(phase));
+        } else if op.state == ImportOperationState::CancelRequested
+            || op.state == ImportOperationState::Cancelling
+        {
+            object.insert("cancelling".into(), serde_json::json!(true));
+        }
+        object.insert("operation_id".into(), serde_json::json!(op.id));
+        object.insert("lifecycle".into(), serde_json::to_value(&op.state).unwrap());
+        object.insert(
+            "last_local_svn_rev".into(),
+            serde_json::json!(op.last_local_svn_rev),
+        );
+        object.insert(
+            "last_local_git_sha".into(),
+            serde_json::json!(op.last_local_git_sha),
+        );
+        object.insert(
+            "last_confirmed_svn_rev".into(),
+            serde_json::json!(op.last_confirmed_svn_rev),
+        );
+        object.insert(
+            "last_confirmed_git_sha".into(),
+            serde_json::json!(op.last_confirmed_git_sha),
+        );
+        object.insert("intended_ref".into(), serde_json::json!(op.intended_ref));
+        object.insert(
+            "intended_git_sha".into(),
+            serde_json::json!(op.intended_git_sha),
+        );
+        object.insert(
+            "outcome_detail".into(),
+            serde_json::json!(op.outcome_detail),
+        );
+        object.insert("started_at".into(), serde_json::json!(op.created_at));
+        if op.state.is_terminal() {
+            object.insert("completed_at".into(), serde_json::json!(op.updated_at));
+        }
+    }
+    value
+}
+
+async fn setup_auth(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<(String, String), AppError> {
     let has_users = state.db.count_users().unwrap_or(0) > 0;
     if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
-            &state,
+        validate_session_with_role(
+            state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
         )
-        .await?;
+        .await
+    } else {
+        Ok(("setup-wizard".into(), "admin".into()))
     }
-    // Check if already running
+}
+
+enum SetupAdmission {
+    Ready {
+        repo: Box<Repository>,
+        operation: Box<ImportOperation>,
+        busy_guard: BusyGuard,
+    },
+    AlreadyRecorded(Box<ImportOperation>),
+    Busy {
+        message: String,
+        operation: Option<Box<ImportOperation>>,
+    },
+}
+
+/// RS-C07 (#64): acquire the per-repository busy slot and enroll a durable
+/// `import_operation_v1` row *before* clone/init/credential rewrite.
+async fn admit_setup_import(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    user_id: &str,
+) -> Result<SetupAdmission, AppError> {
+    let db = &state.db;
+    let repo = setup_repository(db)?;
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 128)
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    if let Some(previous) = db
+        .latest_import_operation(&repo.id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        if previous.request_id == request_id && previous.initiator_id == user_id {
+            return Ok(SetupAdmission::AlreadyRecorded(Box::new(previous)));
+        }
+    }
+    if let Some(active) = db
+        .active_import_operation(&repo.id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        return Ok(SetupAdmission::Busy {
+            message: "An import is already running".into(),
+            operation: Some(Box::new(active)),
+        });
+    }
+    if repo.last_svn_rev > 0 {
+        return Ok(SetupAdmission::Busy {
+            message: "repository already has a completed baseline; refusing implicit full replay"
+                .into(),
+            operation: db
+                .latest_import_operation(&repo.id)
+                .ok()
+                .flatten()
+                .map(Box::new),
+        });
+    }
     {
         let p = state.import_progress.read().await;
-        if p.phase == ImportPhase::Importing {
-            return Ok(Json(ImportActionResponse {
-                ok: false,
+        if setup_import_phase_busy(&p.phase) {
+            return Ok(SetupAdmission::Busy {
                 message: "An import is already running".into(),
-            }));
+                operation: None,
+            });
         }
     }
 
-    // Reset progress
-    {
-        let mut p = state.import_progress.write().await;
-        *p = ImportProgress::default();
-        p.phase = ImportPhase::Importing;
-        p.started_at = Some(chrono::Utc::now().to_rfc3339());
+    let busy_guard = {
+        let mut guard = None;
+        for attempt in 0..30 {
+            if let Some(active) = db
+                .active_import_operation(&repo.id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+            {
+                if active.request_id == request_id && active.initiator_id == user_id {
+                    return Ok(SetupAdmission::AlreadyRecorded(Box::new(active)));
+                }
+                return Ok(SetupAdmission::Busy {
+                    message: "An import is already running".into(),
+                    operation: Some(Box::new(active)),
+                });
+            }
+            if let Some(g) = reposync_core::busy::try_acquire(&repo.id) {
+                guard = Some(g);
+                break;
+            }
+            if attempt == 0 {
+                info!(repo_id = %repo.id, "waiting for in-flight writer before setup import");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match guard {
+            Some(g) => g,
+            None => {
+                return Ok(SetupAdmission::Busy {
+                    message: "A sync cycle is currently running for this repository. Please retry in a moment.".into(),
+                    operation: None,
+                });
+            }
+        }
+    };
+
+    let workdir = state.config.daemon.data_dir.join("git-repo");
+    let fingerprint = import_target_fingerprint(&repo, &workdir);
+    let operation = db
+        .create_import_operation(&repo.id, user_id, &request_id, &fingerprint)
+        .map_err(import_write_error)?;
+    Ok(SetupAdmission::Ready {
+        repo: Box::new(repo),
+        operation: Box::new(operation),
+        busy_guard,
+    })
+}
+
+struct SetupPreparationGuard<'a> {
+    db: &'a Database,
+    repo_id: String,
+    operation_id: String,
+    armed: bool,
+}
+
+impl Drop for SetupPreparationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(e) = self.db.finish_import_operation(
+            &self.repo_id,
+            &self.operation_id,
+            ImportOperationState::ReconciliationRequired,
+            "preparation stopped before worker start; inspect local work and target",
+        ) {
+            error!(repo_id = %self.repo_id, error = %e, "failed to persist setup import preparation outcome");
+        }
     }
+}
 
-    spawn_import_task(&state).await?;
+async fn start_import(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<ImportActionResponse>, AppError> {
+    let (user_id, _role) = setup_auth(&state, &headers).await?;
+    match admit_setup_import(&state, &headers, &user_id).await? {
+        SetupAdmission::AlreadyRecorded(operation) => Ok(Json(ImportActionResponse {
+            ok: true,
+            message: "Import request already recorded".into(),
+            operation_id: Some(operation.id),
+            lifecycle: Some(operation.state),
+        })),
+        SetupAdmission::Busy { message, operation } => {
+            Ok(action_response(false, message, operation.as_deref()))
+        }
+        SetupAdmission::Ready {
+            repo,
+            operation,
+            busy_guard,
+        } => {
+            let operation_id = operation.id.clone();
+            let mut preparation_guard = SetupPreparationGuard {
+                db: &state.db,
+                repo_id: repo.id.clone(),
+                operation_id: operation_id.clone(),
+                armed: true,
+            };
 
-    Ok(Json(ImportActionResponse {
-        ok: true,
-        message: "Import started".into(),
-    }))
+            {
+                let mut p = state.import_progress.write().await;
+                *p = ImportProgress::default();
+                p.phase = ImportPhase::Importing;
+                p.started_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+
+            if let Err(e) =
+                spawn_import_task(&state, repo.id.clone(), operation_id.clone(), busy_guard).await
+            {
+                {
+                    let mut p = state.import_progress.write().await;
+                    p.phase = ImportPhase::Failed;
+                    p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                    p.push_log("[error] setup import preparation failed".into());
+                }
+                return Err(e);
+            }
+            preparation_guard.armed = false;
+
+            Ok(Json(ImportActionResponse {
+                ok: true,
+                message: "Import started".into(),
+                operation_id: Some(operation_id),
+                lifecycle: Some(ImportOperationState::Queued),
+            }))
+        }
+    }
 }
 
 async fn import_status(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<ImportProgress>, AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
-            &state,
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        )
-        .await?;
-    }
-    let p = state.import_progress.read().await;
-
-    // If in-memory progress shows Idle, check the DB for persisted state
-    // (e.g. after a daemon restart mid-import).
-    if p.phase == ImportPhase::Idle {
-        let db = &state.db;
-        if let Ok(Some(db_progress)) = db.load_import_progress() {
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    setup_auth(&state, &headers).await?;
+    let mut progress = state.import_progress.read().await.clone();
+    if progress.phase == ImportPhase::Idle {
+        if let Ok(Some(db_progress)) = state.db.load_import_progress() {
             if db_progress.phase != ImportPhase::Idle {
-                return Ok(Json(db_progress));
+                progress = db_progress;
             }
         }
     }
-
-    Ok(Json(p.clone()))
+    let repo = state
+        .db
+        .list_repositories()
+        .ok()
+        .and_then(|repos| repos.into_iter().next());
+    let op = repo.as_ref().and_then(|repo| {
+        state
+            .db
+            .active_import_operation(&repo.id)
+            .ok()
+            .flatten()
+            .or_else(|| state.db.latest_import_operation(&repo.id).ok().flatten())
+    });
+    Ok(Json(overlay_setup_import_status(
+        &progress,
+        op.as_ref(),
+        repo.as_ref().map(|r| r.id.as_str()),
+    )))
 }
 
 async fn cancel_import(
     State(state): State<Arc<AppState>>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Json<ImportActionResponse>, AppError> {
-    let has_users = state.db.count_users().unwrap_or(0) > 0;
-    if state.config.web.admin_password.is_some() || has_users {
-        crate::api::auth::validate_session(
-            &state,
-            headers.get("authorization").and_then(|v| v.to_str().ok()),
-        )
-        .await?;
+    setup_auth(&state, &headers).await?;
+    if let Ok(repo) = setup_repository(&state.db) {
+        if let Some(active) = state
+            .db
+            .active_import_operation(&repo.id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            let op = state
+                .db
+                .request_import_cancel(&repo.id, &active.id)
+                .map_err(import_write_error)?;
+            if !op.state.is_terminal() {
+                let mut p = state.import_progress.write().await;
+                p.cancel_requested = true;
+                p.cancel_signal.store(true, Ordering::Release);
+            }
+            return Ok(Json(ImportActionResponse {
+                ok: true,
+                message: if op.state.is_terminal() {
+                    "terminal outcome retained; published history is not undone".into()
+                } else {
+                    "cancellation durably requested; worker still stopping; published history is not undone".into()
+                },
+                operation_id: Some(op.id.clone()),
+                lifecycle: Some(op.state),
+            }));
+        }
     }
     let mut p = state.import_progress.write().await;
-    if p.phase == ImportPhase::Importing {
+    if setup_import_phase_busy(&p.phase) {
         p.cancel_requested = true;
-        Ok(Json(ImportActionResponse {
-            ok: true,
-            message: "Cancellation requested".into(),
-        }))
+        p.cancel_signal.store(true, Ordering::Release);
+        Ok(action_response(
+            true,
+            "Cancellation requested; published history is not undone",
+            None,
+        ))
     } else {
-        Ok(Json(ImportActionResponse {
-            ok: false,
-            message: "No import is currently running".into(),
-        }))
+        Ok(action_response(
+            false,
+            "No import is currently running",
+            None,
+        ))
     }
 }
 
@@ -739,8 +1057,14 @@ async fn cancel_import(
 // ---------------------------------------------------------------------------
 
 /// Resolve config, build clients, and spawn the background import task.
-/// Used by both `start_import` and `reset_and_reimport`.
-async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
+/// Used by both `start_import` and `reset_and_reimport`. Caller must already
+/// hold `busy_guard` and a durable `import_operation_v1` row.
+async fn spawn_import_task(
+    state: &Arc<AppState>,
+    repo_id: String,
+    operation_id: String,
+    busy_guard: BusyGuard,
+) -> Result<(), AppError> {
     // Load config from file
     let config_content = std::fs::read_to_string(&state.config_path)
         .map_err(|e| AppError::Internal(format!("failed to read config: {}", e)))?;
@@ -792,7 +1116,9 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
         }
     };
     info!(svn_import_url = %svn_import_url, "SVN import URL");
-    let svn_client = SvnClient::new(&svn_import_url, &config.svn.username, &svn_password);
+    let cancel_signal = state.import_progress.read().await.cancel_signal.clone();
+    let svn_client = SvnClient::new(&svn_import_url, &config.svn.username, &svn_password)
+        .with_cancel_signal(cancel_signal.clone());
 
     let git_token = config.github.token.clone().or(db_git_token);
     let git_repo_path = config.daemon.data_dir.join("git-repo");
@@ -856,56 +1182,128 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
 
     let progress = state.import_progress.clone();
     let ws_broadcast = Some(state.ws_broadcast.clone());
+    let worker_repo_id = repo_id;
+    let worker_operation_id = operation_id;
+    let worker_cancel = cancel_signal;
 
     tokio::spawn(async move {
-        let result = import::run_full_import(
-            &svn_client,
-            &git_client,
-            &identity_mapper,
-            &import_db,
-            &file_policy,
-            &import_config,
-            import::ImportRunState {
-                progress: progress.clone(),
-                ws_broadcast: ws_broadcast.clone(),
-                repo_id: None, // setup wizard doesn't have a repo_id yet
-                operation_id: None,
-                cancel_signal: None,
-            },
-        )
-        .await;
-
-        let mut p = progress.write().await;
-        match result {
-            Ok(import::ImportOutcome::Completed { commits: count, .. }) => {
-                if p.phase != ImportPhase::Cancelled {
-                    p.phase = ImportPhase::Completed;
+        let _busy_guard = busy_guard;
+        let current = import_db.get_import_operation(&worker_repo_id, &worker_operation_id);
+        let result = match current {
+            Ok(Some(op)) if op.cancel_requested => {
+                Ok(import::ImportOutcome::Cancelled { commits: 0 })
+            }
+            Ok(Some(_)) => {
+                match import_db.start_import_operation(&worker_repo_id, &worker_operation_id) {
+                    Ok(_) => {
+                        import::run_full_import(
+                            &svn_client,
+                            &git_client,
+                            &identity_mapper,
+                            &import_db,
+                            &file_policy,
+                            &import_config,
+                            import::ImportRunState {
+                                progress: progress.clone(),
+                                ws_broadcast: ws_broadcast.clone(),
+                                repo_id: Some(worker_repo_id.clone()),
+                                operation_id: Some(worker_operation_id.clone()),
+                                cancel_signal: Some(worker_cancel),
+                            },
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e.into()),
                 }
-                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                p.push_log(format!("[info] Import complete: {} commits created", count));
-                info!(count, "import completed successfully");
+            }
+            Ok(None) => Err(anyhow::anyhow!("operation disappeared before start")),
+            Err(e) => Err(e.into()),
+        };
+
+        let terminal = match result {
+            Ok(import::ImportOutcome::Completed {
+                commits,
+                svn_rev,
+                git_sha,
+            }) => {
+                match import_db.complete_import_operation(
+                    &worker_repo_id,
+                    &worker_operation_id,
+                    svn_rev,
+                    &git_sha,
+                ) {
+                    Ok(_) => {
+                        info!(repo_id = %worker_repo_id, commits, "setup import completed and confirmed");
+                        ImportPhase::Completed
+                    }
+                    Err(e) => {
+                        error!(repo_id = %worker_repo_id, error = %e, "setup import finalization failed");
+                        let _ = import_db.finish_import_operation(
+                            &worker_repo_id,
+                            &worker_operation_id,
+                            ImportOperationState::ReconciliationRequired,
+                            &format!("finalization failed: {e}"),
+                        );
+                        ImportPhase::Failed
+                    }
+                }
             }
             Ok(import::ImportOutcome::Cancelled { commits }) => {
-                p.phase = ImportPhase::Cancelled;
-                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                p.push_log(format!(
-                    "[info] Import stopped after {} local commits",
-                    commits
-                ));
+                let op = import_db
+                    .get_import_operation(&worker_repo_id, &worker_operation_id)
+                    .ok()
+                    .flatten();
+                let uncertain = op.as_ref().is_some_and(|o| o.intended_git_sha.is_some());
+                let state = if uncertain {
+                    ImportOperationState::ReconciliationRequired
+                } else {
+                    ImportOperationState::Cancelled
+                };
+                let detail = format!(
+                    "stopped after {commits} local commits; published history is not undone"
+                );
+                if let Err(e) = import_db.finish_import_operation(
+                    &worker_repo_id,
+                    &worker_operation_id,
+                    state,
+                    &detail,
+                ) {
+                    error!(repo_id = %worker_repo_id, error = %e, "setup cancel finalization failed");
+                    ImportPhase::Failed
+                } else if uncertain {
+                    ImportPhase::Failed
+                } else {
+                    ImportPhase::Cancelled
+                }
             }
             Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
-                p.phase = ImportPhase::Failed;
-                p.errors.push(reason);
+                if let Err(e) = import_db.finish_import_operation(
+                    &worker_repo_id,
+                    &worker_operation_id,
+                    ImportOperationState::ReconciliationRequired,
+                    &reason,
+                ) {
+                    error!(repo_id = %worker_repo_id, error = %e, "uncertain setup outcome persistence failed");
+                }
+                ImportPhase::Failed
             }
             Err(e) => {
-                p.phase = ImportPhase::Failed;
-                p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                let msg = format!("[error] Import failed: {}", e);
-                p.push_log(msg.clone());
-                p.errors.push(msg);
-                error!("import failed: {}", e);
+                let detail = format!("import stopped with error; inspect local work: {e:#}");
+                if let Err(write_error) = import_db.finish_import_operation(
+                    &worker_repo_id,
+                    &worker_operation_id,
+                    ImportOperationState::Failed,
+                    &detail,
+                ) {
+                    error!(repo_id = %worker_repo_id, error = %write_error, "setup failure persistence failed");
+                }
+                ImportPhase::Failed
             }
-        }
+        };
+
+        let mut p = progress.write().await;
+        p.phase = terminal;
+        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
         if let Err(e) = import_db.persist_import_progress(&p) {
             tracing::warn!("failed to persist final import progress: {}", e);
@@ -935,7 +1333,7 @@ async fn reset_and_reimport(
     headers: axum::http::HeaderMap,
 ) -> Result<Json<ImportActionResponse>, AppError> {
     // Admin only
-    let (_user_id, role) = validate_session_with_role(
+    let (user_id, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -944,50 +1342,35 @@ async fn reset_and_reimport(
         return Err(AppError::Unauthorized("admin access required".into()));
     }
 
-    // If an import is already running, cancel it and wait for it to stop.
+    let repo = setup_repository(&state.db)?;
+    if let Some(active) = state
+        .db
+        .active_import_operation(&repo.id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
     {
-        let is_active = {
-            let p = state.import_progress.read().await;
-            matches!(
-                p.phase,
-                ImportPhase::Importing
-                    | ImportPhase::Connecting
-                    | ImportPhase::Verifying
-                    | ImportPhase::FinalPush
-            )
-        };
-
-        if is_active {
-            info!("cancelling running import before reset");
-            {
-                let mut p = state.import_progress.write().await;
-                p.cancel_requested = true;
-            }
-
-            // Poll until the import stops (max 30 seconds)
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let phase = state.import_progress.read().await.phase.clone();
-                if matches!(
-                    phase,
-                    ImportPhase::Idle
-                        | ImportPhase::Completed
-                        | ImportPhase::Failed
-                        | ImportPhase::Cancelled
-                ) {
-                    info!(?phase, "previous import stopped");
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Ok(Json(ImportActionResponse {
-                        ok: false,
-                        message: "Timed out waiting for running import to cancel".into(),
-                    }));
-                }
-            }
+        return Ok(action_response(
+            false,
+            "import is active or held; inspect or cancel before reset",
+            Some(&active),
+        ));
+    }
+    {
+        let p = state.import_progress.read().await;
+        if setup_import_phase_busy(&p.phase) || reposync_core::busy::is_busy(&repo.id) {
+            return Ok(action_response(false, "An import is already running", None));
         }
     }
+
+    let busy_guard = match reposync_core::busy::try_acquire(&repo.id) {
+        Some(guard) => guard,
+        None => {
+            return Ok(action_response(
+                false,
+                "A sync cycle is currently running for this repository. Please retry in a moment.",
+                None,
+            ));
+        }
+    };
 
     // Set phase to Connecting immediately — this pauses the scheduler
     {
@@ -1082,10 +1465,7 @@ async fn reset_and_reimport(
                 let mut p = state.import_progress.write().await;
                 p.phase = ImportPhase::Failed;
                 p.push_log(format!("[error] {}", msg));
-                return Ok(Json(ImportActionResponse {
-                    ok: false,
-                    message: msg,
-                }));
+                return Ok(action_response(false, msg, None));
             }
         }
     }
@@ -1105,17 +1485,26 @@ async fn reset_and_reimport(
     //    (it expects either .git to exist or not — we need a clean state)
     std::fs::remove_dir_all(&git_repo_path).ok();
 
-    // 5. Reset progress for import phase and spawn import
+    // 5. Enroll a durable operation after destructive prep, then spawn.
+    let request_id = format!("setup-reset-{}", Uuid::new_v4());
+    let fingerprint = import_target_fingerprint(&repo, &git_repo_path);
+    let operation = state
+        .db
+        .create_import_operation(&repo.id, &user_id, &request_id, &fingerprint)
+        .map_err(import_write_error)?;
+    let operation_id = operation.id.clone();
     {
         let mut p = state.import_progress.write().await;
         p.phase = ImportPhase::Importing;
         p.push_log("[info] Starting full SVN import from revision 0...".into());
     }
 
-    spawn_import_task(&state).await?;
+    spawn_import_task(&state, repo.id.clone(), operation_id.clone(), busy_guard).await?;
 
     Ok(Json(ImportActionResponse {
         ok: true,
         message: "Reset and reimport started".into(),
+        operation_id: Some(operation_id),
+        lifecycle: Some(ImportOperationState::Queued),
     }))
 }

@@ -405,7 +405,12 @@ export const api = {
     }),
 
   startImport: () =>
-    fetchJson<{ ok: boolean; message: string }>('/setup/import', {
+    fetchJson<{
+      ok: boolean;
+      message: string;
+      operation_id?: string;
+      lifecycle?: ImportStatus['lifecycle'];
+    }>('/setup/import', {
       method: 'POST',
     }),
 
@@ -415,7 +420,12 @@ export const api = {
     fetchJson<ImportStatus>('/setup/import/status'),
 
   cancelImport: () =>
-    fetchJson<{ ok: boolean; message: string }>('/setup/import/cancel', {
+    fetchJson<{
+      ok: boolean;
+      message: string;
+      operation_id?: string;
+      lifecycle?: ImportStatus['lifecycle'];
+    }>('/setup/import/cancel', {
       method: 'POST',
     }),
 
@@ -722,6 +732,8 @@ export interface ImportStatus {
   completed_at: string | null;
   operation_id?: string;
   lifecycle?: 'queued' | 'running' | 'cancel_requested' | 'cancelling' | 'completed' | 'cancelled' | 'failed' | 'reconciliation_required';
+  busy?: boolean;
+  cancelling?: boolean;
   can_start?: boolean;
   last_local_svn_rev?: number | null;
   last_local_git_sha?: string | null;
