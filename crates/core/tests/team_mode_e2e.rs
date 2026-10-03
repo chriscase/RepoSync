@@ -6803,3 +6803,187 @@ async fn candidate_64d_concurrent_cycle_blocked_while_held_without_resume() {
         })
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64e_absent_unchanged_svn_to_git_resumes_one_recorded_push() {
+    let fixture = QualifiedPair::new_with_repo_id("64e-resume-git-push").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "resume recorded push\n",
+        "RS-64E resume recorded git push",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let watermark_before = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_CRASH_BEFORE", repo_id);
+    let crashed = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &crashed,
+            Err(SyncError::GitPushHeld { reason, .. })
+                if reason == "intent_recorded_push_not_issued"
+        ),
+        "{crashed:?}"
+    );
+    drop(_fault);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_before,
+        "crash-before-push must not have published"
+    );
+    let intended = git_output(&fixture.bridge, &["rev-parse", "HEAD"]);
+    assert_ne!(intended, remote_before);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.intended_local_git_sha, intended);
+    assert!(!op.resume_authorized);
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush)
+        .expect("svn-to-git auto-reconcile attempt");
+    assert!(!attempt.finalized, "{attempt:?}");
+    assert!(attempt.resume_authorized, "{attempt:?}");
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_before,
+        "observe-first authorize must not issue the push"
+    );
+    let resumed = fixture.engine.run_sync_cycle().await;
+    assert!(
+        resumed.is_ok(),
+        "authorized resume must issue the recorded push instead of unpublished_local_history: {resumed:?}"
+    );
+    let resumed = resumed.unwrap();
+    assert_eq!(resumed.svn_to_git_count, 1);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        intended,
+        "the one recorded intended commit must be the published tip"
+    );
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    assert_ne!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark_before
+    );
+    assert!(fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .is_none());
+    assert!(
+        fixture
+            .engine
+            .db()
+            .get_state(&reposync_core::history_inspect::history_block_key(Some(
+                repo_id
+            )))
+            .unwrap()
+            .is_none(),
+        "resume must not persist a history block"
+    );
+    let quiet = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(quiet.svn_to_git_count, 0);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        intended
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64E_RESUME_RECORDED_GIT_PUSH",
+            "operation_id":op.id,
+            "intended":intended,
+            "remote_before":remote_before,
+            "issued_recorded_push":true,
+            "quiet_second_cycle":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64e_authorized_svn_to_git_resume_stays_held_on_conflict() {
+    let fixture = QualifiedPair::new_with_repo_id("64e-resume-conflict").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "resume then conflict\n",
+        "RS-64E resume conflict",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    let watermark_before = fixture.engine.db().get_repo_watermark(repo_id).unwrap();
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_CRASH_BEFORE", repo_id);
+    let _ = fixture.engine.run_sync_cycle().await;
+    drop(_fault);
+    let intended = git_output(&fixture.bridge, &["rev-parse", "HEAD"]);
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush)
+        .expect("svn-to-git auto-reconcile attempt");
+    assert!(attempt.resume_authorized, "{attempt:?}");
+    git_cli(&fixture.developer, &["fetch", "origin"]);
+    git_cli(&fixture.developer, &["reset", "--hard", "origin/main"]);
+    std::fs::write(fixture.developer.join("interference.txt"), "other\n").unwrap();
+    git_cli(&fixture.developer, &["add", "interference.txt"]);
+    git_cli(
+        &fixture.developer,
+        &["commit", "-m", "Interfering Git advance"],
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let remote_after_interference = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    assert_ne!(remote_after_interference, remote_before);
+    assert_ne!(remote_after_interference, intended);
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::GitPushHeld { .. })),
+        "conflict after authorize must stay held without a push: {blocked:?}"
+    );
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_after_interference
+    );
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark(repo_id).unwrap(),
+        watermark_before
+    );
+    let held = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    assert!(!held.resume_authorized);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64E_RESUME_CONFLICT_HELD",
+            "operation_id":held.id,
+            "finalized":false,
+            "resume_authorized":false,
+            "watermark_unchanged":true
+        })
+    );
+}

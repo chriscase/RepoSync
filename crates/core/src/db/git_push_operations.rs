@@ -632,6 +632,28 @@ pub struct GitPushIntent<'a> {
     pub intended_local_git_tree: &'a str,
 }
 
+impl GitPushOperation {
+    /// Reconstruct the recorded intent so a resume re-uses the same operation.
+    pub fn intent(&self) -> GitPushIntent<'_> {
+        GitPushIntent {
+            repo_id: &self.repo_id,
+            initiator_id: &self.initiator_id,
+            request_id: &self.request_id,
+            target_fingerprint: &self.target_fingerprint,
+            source_svn_rev: self.source_svn_rev,
+            source_svn_author: &self.source_svn_author,
+            source_svn_message: &self.source_svn_message,
+            pre_push_git_remote: &self.pre_push_git_remote,
+            pre_push_git_branch: &self.pre_push_git_branch,
+            pre_push_git_sha: &self.pre_push_git_sha,
+            pre_push_git_tree: self.pre_push_git_tree.as_deref(),
+            intended_local_git_sha: &self.intended_local_git_sha,
+            intended_local_git_parent: self.intended_local_git_parent.as_deref(),
+            intended_local_git_tree: &self.intended_local_git_tree,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

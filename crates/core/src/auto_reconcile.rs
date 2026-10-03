@@ -3,6 +3,11 @@
 //! Reuses the same inspect+finalize paths as the admin reconcile endpoints
 //! (`apply_svn_commit_reconciliation`, `apply_git_push_reconciliation`).
 //! Callers must hold the per-repository busy slot before invoking.
+//!
+//! Absent/unchanged Git→SVN and SVN→Git journals set `resume_authorized`.
+//! The team worker then issues that one recorded write. For SVN→Git this
+//! must happen before history inspect so the unpushed intended commit is
+//! not classified as `unpublished_local_history`.
 
 use std::path::Path;
 
