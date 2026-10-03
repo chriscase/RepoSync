@@ -2948,3 +2948,117 @@ fn git_sha_at(repo: &Path, rev: &str) -> String {
     assert!(output.status.success());
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
+
+struct GitPushFaultGuard {
+    scoped_key: String,
+}
+
+impl GitPushFaultGuard {
+    fn lost_reply(repo: &str) -> Self {
+        let key = "REPOSYNC_GIT_PUSH_LOST_REPLY";
+        let scoped_key = format!("{}__{}", key, repo);
+        std::env::set_var(&scoped_key, "1");
+        Self { scoped_key }
+    }
+}
+
+impl Drop for GitPushFaultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(&self.scoped_key);
+    }
+}
+
+#[tokio::test]
+async fn test_personal_svn_to_git_lost_reply_holds_without_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(
+        &wc_path,
+        "feature.txt",
+        "lost reply\n",
+        "Personal lost reply",
+    );
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+    let remote_before = git_sha_at(&bare_dir, "refs/heads/main");
+
+    let db_path = tmp.path().join("test.db");
+    let db = setup_db(&db_path);
+    let config = make_test_config(&svn_url, tmp.path());
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let git_arc = Arc::new(Mutex::new(git_client));
+    let db_arc = Arc::new(db);
+
+    let syncer = SvnToGitSync::new(svn_client, git_arc.clone(), db_arc.clone(), config);
+    let _fault = GitPushFaultGuard::lost_reply("personal");
+    let err = syncer
+        .sync()
+        .await
+        .expect_err("lost reply must hold, not succeed");
+    let err_text = format!("{err:#}");
+    assert!(
+        err_text.contains("reconciliation_required"),
+        "expected reconciliation hold: {err_text}"
+    );
+    drop(_fault);
+
+    let remote_after = git_sha_at(&bare_dir, "refs/heads/main");
+    assert_ne!(
+        remote_before, remote_after,
+        "remote push must have landed before the hold"
+    );
+    assert_eq!(
+        db_arc.get_watermark("svn_rev").unwrap().as_deref(),
+        None,
+        "watermark must not advance on uncertain outcome"
+    );
+    assert_eq!(
+        db_arc.list_commit_map(10).unwrap().len(),
+        0,
+        "commit_map must not advance on uncertain outcome"
+    );
+    let op = db_arc
+        .active_git_push_operation("personal")
+        .unwrap()
+        .expect("active personal svn-to-git push journal");
+    assert_eq!(
+        op.state,
+        reposync_core::db::git_push_operations::GitPushOperationState::ReconciliationRequired
+    );
+    assert!(!op.resume_authorized);
+
+    let syncer2 = SvnToGitSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        git_arc.clone(),
+        db_arc.clone(),
+        make_test_config(&svn_url, tmp.path()),
+    );
+    let again = syncer2
+        .sync()
+        .await
+        .expect_err("held push must block retry");
+    assert!(
+        format!("{again:#}").contains("reconciliation_required"),
+        "{again:#}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "PERSONAL_LOST_REPLY",
+            "operation_id": op.id,
+            "remote_before": remote_before,
+            "remote_after": remote_after,
+            "lifecycle": "reconciliation_required",
+            "mode": "personal"
+        })
+    );
+}

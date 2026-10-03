@@ -11,9 +11,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, info};
 
+use reposync_core::db::git_push_operations::{
+    git_push_target_fingerprint, GitPushIntent, GitPushOperation, GitPushOperationState,
+};
 use reposync_core::db::Database;
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
+use reposync_core::git_push::{observed_git_ref, observed_git_tree};
 use reposync_core::import::{
     copy_tree_with_policy as copy_tree_with_policy_shared,
     remove_stale_files as remove_stale_files_shared,
@@ -25,6 +29,11 @@ use crate::commit_format::CommitFormatter;
 
 /// Watermark key used to track the last SVN revision synced to Git.
 const WATERMARK_KEY: &str = "svn_rev";
+
+/// Personal-mode repository scope for the shared SVN→Git push journal.
+const PERSONAL_REPO_ID: &str = "personal";
+
+const GIT_REMOTE: &str = "origin";
 
 /// The SVN-to-Git sync engine for personal branch mode.
 ///
@@ -79,6 +88,16 @@ impl SvnToGitSync {
     /// - The commit message contains the `[reposync]` echo marker.
     /// - The revision is already recorded in the `commit_map` table.
     pub async fn sync(&self) -> Result<usize> {
+        if let Some(op) = self
+            .db
+            .active_git_push_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal svn-to-git push")?
+        {
+            if let Some(reason) = blocking_git_push_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+
         // 1. Read the current watermark.
         let watermark = self
             .db
@@ -170,10 +189,33 @@ impl SvnToGitSync {
                 self.formatter
                     .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date);
 
-            // 8. Stage all changes and commit using the developer's identity.
-            //
-            // The GitClient uses git2 (synchronous). We wrap the call in
-            // spawn_blocking so we don't block the async runtime.
+            // 8. Read the remote tip, then stage and commit locally.
+            let branch = self.config.github.default_branch.clone();
+            let (pre_push_sha, pre_push_tree) = {
+                let git_client = self.git_client.lock().unwrap();
+                let pre_push_sha = git_client
+                    .ls_remote_ref(GIT_REMOTE, &branch)
+                    .with_context(|| format!("failed to read remote {GIT_REMOTE}/{branch}"))?
+                    .unwrap_or_default();
+                let pre_push_tree = if pre_push_sha.is_empty() {
+                    None
+                } else {
+                    Some(
+                        git_client
+                            .commit_parent_and_tree(&pre_push_sha)
+                            .with_context(|| {
+                                format!("failed to read remote tree for {}", pre_push_sha)
+                            })?
+                            .1,
+                    )
+                };
+                (pre_push_sha, pre_push_tree)
+            };
+
+            let git_author = format!(
+                "{} <{}>",
+                self.config.developer.name, self.config.developer.email
+            );
             let git_sha = {
                 let author_name = self.config.developer.name.clone();
                 let author_email = self.config.developer.email.clone();
@@ -200,36 +242,154 @@ impl SvnToGitSync {
             let sha_str = git_sha.to_string();
             info!(rev, sha = %sha_str, "committed SVN revision as Git commit");
 
-            // 9. Push to origin. Credentials come from the remote URL
-            // (set up at clone time / by ensure_remote_credentials).
-            let branch = self.config.github.default_branch.clone();
-            let gc = self.git_client.clone();
+            let (intended_parent, intended_tree) = {
+                let git_client = self.git_client.lock().unwrap();
+                git_client
+                    .commit_parent_and_tree(&sha_str)
+                    .with_context(|| format!("failed to read local tree for {}", sha_str))?
+            };
+            let target_fingerprint =
+                git_push_target_fingerprint(PERSONAL_REPO_ID, GIT_REMOTE, &branch);
+            let request_id = format!("svn-r{}", rev);
+            let push_op = self
+                .db
+                .begin_svn_to_git_push(GitPushIntent {
+                    repo_id: PERSONAL_REPO_ID,
+                    initiator_id: "personal_worker",
+                    request_id: &request_id,
+                    target_fingerprint: &target_fingerprint,
+                    source_svn_rev: rev,
+                    source_svn_author: &entry.author,
+                    source_svn_message: &entry.message,
+                    pre_push_git_remote: GIT_REMOTE,
+                    pre_push_git_branch: &branch,
+                    pre_push_git_sha: &pre_push_sha,
+                    pre_push_git_tree: pre_push_tree.as_deref(),
+                    intended_local_git_sha: &sha_str,
+                    intended_local_git_parent: intended_parent.as_deref(),
+                    intended_local_git_tree: &intended_tree,
+                })
+                .with_context(|| format!("failed to record svn-to-git push intent for r{}", rev))?;
 
-            tokio::task::spawn_blocking(move || {
+            #[cfg(debug_assertions)]
+            if git_push_fixture_flag("REPOSYNC_GIT_PUSH_CRASH_BEFORE", PERSONAL_REPO_ID) {
+                let _ = self.db.hold_svn_to_git_reconciliation(
+                    PERSONAL_REPO_ID,
+                    &push_op.id,
+                    "intent recorded; planned Git push was not issued",
+                );
+                anyhow::bail!(
+                    "reconciliation_required: intent recorded before personal git push for r{}",
+                    rev
+                );
+            }
+
+            // 9. Push to origin after durable intent is recorded.
+            let gc = self.git_client.clone();
+            let branch_for_push = branch.clone();
+            let push_result = tokio::task::spawn_blocking(move || {
                 let git_client = gc.lock().unwrap();
-                git_client.push("origin", &branch)
+                git_client.push(GIT_REMOTE, &branch_for_push)
             })
             .await
-            .context("push task panicked")?
-            .with_context(|| format!("failed to push Git commit for SVN r{}", rev))?;
+            .context("push task panicked")?;
+            if let Err(push_err) = push_result {
+                let _ = self.db.hold_svn_to_git_reconciliation(
+                    PERSONAL_REPO_ID,
+                    &push_op.id,
+                    &format!("git push failed after intent was recorded: {push_err}"),
+                );
+                return Err(push_err).context(format!(
+                    "failed to push Git commit for SVN r{}; held for reconcile",
+                    rev
+                ));
+            }
 
             info!(rev, sha = %sha_str, "pushed to origin");
 
-            // 10. Record the mapping and advance the watermark.
-            self.db
-                .insert_commit_map(
-                    rev,
-                    &sha_str,
-                    "svn_to_git",
-                    &entry.author,
-                    &format!(
-                        "{} <{}>",
-                        self.config.developer.name, self.config.developer.email
-                    ),
-                )
-                .with_context(|| format!("failed to insert commit_map for SVN r{}", rev))?;
+            #[cfg(debug_assertions)]
+            if git_push_fixture_flag("REPOSYNC_GIT_PUSH_LOST_REPLY", PERSONAL_REPO_ID) {
+                let _ = self.db.hold_svn_to_git_reconciliation(
+                    PERSONAL_REPO_ID,
+                    &push_op.id,
+                    "Git accepted the push but the reply was lost before local checkpoint",
+                );
+                anyhow::bail!(
+                    "reconciliation_required: lost push reply for personal svn-to-git r{}",
+                    rev
+                );
+            }
 
-            self.advance_watermark(rev)?;
+            let (observed_sha, observed_tree) = {
+                let git_client = self.git_client.lock().unwrap();
+                let observed_sha = observed_git_ref(&git_client, GIT_REMOTE, &branch)
+                    .with_context(|| format!("failed to observe remote {GIT_REMOTE}/{branch}"))?;
+                let observed_tree =
+                    observed_git_tree(&git_client, &observed_sha).with_context(|| {
+                        format!("failed to read observed tree for {}", observed_sha)
+                    })?;
+                (observed_sha, observed_tree)
+            };
+            #[cfg(debug_assertions)]
+            let observed_tree = if git_push_fixture_flag(
+                "REPOSYNC_GIT_PUSH_OBSERVED_TREE_MISMATCH",
+                PERSONAL_REPO_ID,
+            ) {
+                "ffffffffffffffffffffffffffffffffffffffff".to_string()
+            } else {
+                observed_tree
+            };
+            if observed_sha != sha_str {
+                let detail = format!(
+                    "remote ref {branch} is {observed_sha} but intended local commit was {sha_str}"
+                );
+                let _ =
+                    self.db
+                        .hold_svn_to_git_reconciliation(PERSONAL_REPO_ID, &push_op.id, &detail);
+                anyhow::bail!("reconciliation_required: {detail}");
+            }
+            if observed_tree != intended_tree {
+                let detail = format!(
+                    "remote commit tree {observed_tree} does not match intended local tree {intended_tree}"
+                );
+                let _ =
+                    self.db
+                        .hold_svn_to_git_reconciliation(PERSONAL_REPO_ID, &push_op.id, &detail);
+                anyhow::bail!("reconciliation_required: {detail}");
+            }
+
+            match self.db.confirm_personal_svn_to_git_push(
+                PERSONAL_REPO_ID,
+                &push_op.id,
+                &observed_sha,
+                &observed_tree,
+                WATERMARK_KEY,
+                &git_author,
+            ) {
+                Ok(confirmed) => {
+                    info!(
+                        rev,
+                        operation_id = %confirmed.id,
+                        sha = %observed_sha,
+                        "personal svn-to-git push verified and checkpointed"
+                    );
+                }
+                Err(error) => {
+                    let _ = self.db.hold_svn_to_git_reconciliation(
+                        PERSONAL_REPO_ID,
+                        &push_op.id,
+                        &format!(
+                            "Git push verified but the local checkpoint write failed: {error}"
+                        ),
+                    );
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to checkpoint personal svn-to-git push for r{}; held for reconcile",
+                            rev
+                        )
+                    });
+                }
+            }
 
             // 11. Audit log entry.
             let _ = self.db.insert_audit_log(
@@ -291,6 +451,33 @@ impl SvnToGitSync {
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
         remove_stale_files_shared(src, dst)
     }
+}
+
+fn blocking_git_push_hold(op: &GitPushOperation) -> Option<String> {
+    if op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized {
+        return Some(format!(
+            "reconciliation_required: personal svn-to-git push held ({})",
+            op.outcome_detail
+                .as_deref()
+                .unwrap_or("inspect the exact Git ref before retrying")
+        ));
+    }
+    if !op.state.is_terminal() {
+        return Some(
+            "repository has an active personal svn-to-git push; wait for the current operation"
+                .into(),
+        );
+    }
+    None
+}
+
+#[cfg(debug_assertions)]
+fn git_push_fixture_flag(var: &str, repo_id: &str) -> bool {
+    let scoped = format!("{}__{}", var, repo_id);
+    if std::env::var(&scoped).is_ok() {
+        return true;
+    }
+    std::env::var(var).ok().as_deref() == Some(repo_id)
 }
 
 #[cfg(test)]
