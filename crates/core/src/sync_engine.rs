@@ -32,6 +32,10 @@ use crate::db::queries::AuditLogInput;
 use crate::db::svn_commit_operations::{
     svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
 };
+use crate::db::team_cycle_mapping_operations::{
+    team_cycle_mapping_fingerprint, TeamCycleMappingDirection, TeamCycleMappingIntent,
+    TeamCycleMappingOperation, TeamCycleMappingOutcome, TeamCycleMappingState,
+};
 use crate::db::Database;
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
@@ -274,7 +278,8 @@ impl SyncEngine {
             ),
             Err(e @ SyncError::HistoryBlocked { .. })
             | Err(e @ SyncError::SvnCommitHeld { .. })
-            | Err(e @ SyncError::GitPushHeld { .. }) => {
+            | Err(e @ SyncError::GitPushHeld { .. })
+            | Err(e @ SyncError::CycleMappingHeld { .. }) => {
                 ("reconciliation_required", format!("sync blocked: {}", e))
             }
             Err(e) => ("error", format!("sync failed: {}", e)),
@@ -1050,6 +1055,15 @@ impl SyncEngine {
         if let Some(rid) = self.effective_repo_id() {
             if let Some(op) = self
                 .db
+                .active_team_cycle_mapping_operation(rid)
+                .map_err(SyncError::DatabaseError)?
+            {
+                if let Some(error) = self.blocking_cycle_mapping_hold(&op) {
+                    return Err(error);
+                }
+            }
+            if let Some(op) = self
+                .db
                 .active_svn_commit_operation(rid)
                 .map_err(SyncError::DatabaseError)?
             {
@@ -1345,19 +1359,42 @@ impl SyncEngine {
                     rev = change.revision,
                     "recording SVN revision with no Git target content (metadata-only)"
                 );
-                // Advance the watermark so we don't re-process this revision.
-                let per_repo_key = self
-                    .effective_repo_id()
-                    .map(|rid| format!("last_svn_rev_{}", rid));
-                if let Some(ref key) = per_repo_key {
-                    self.db
-                        .set_state(key, &change.revision.to_string())
-                        .map_err(SyncError::DatabaseError)?;
-                }
-                if let Some(ref rid) = self.repo_id {
-                    self.db
-                        .advance_svn_watermark(rid, change.revision)
-                        .map_err(SyncError::DatabaseError)?;
+                if let Some(rid) = self.effective_repo_id() {
+                    let (pre_svn_rev, pre_git_sha) =
+                        self.cycle_mapping_pre_write_watermarks(rid)?;
+                    let projection = self.no_target_projection();
+                    let fingerprint = team_cycle_mapping_fingerprint(rid, &projection);
+                    self.record_team_cycle_mapping(
+                        TeamCycleMappingIntent {
+                            repo_id: rid,
+                            initiator_id: "team_worker",
+                            request_id: &format!("svn-r{}", change.revision),
+                            target_fingerprint: &fingerprint,
+                            direction: TeamCycleMappingDirection::SvnToGit,
+                            outcome: TeamCycleMappingOutcome::SvnNoTargetContent,
+                            source_svn_rev: Some(change.revision),
+                            source_git_sha: None,
+                            pre_write_svn_rev: pre_svn_rev,
+                            pre_write_git_sha: &pre_git_sha,
+                            projection: &projection,
+                            intended_target_proof: None,
+                        },
+                        None,
+                    )?;
+                } else {
+                    let per_repo_key = self
+                        .effective_repo_id()
+                        .map(|rid| format!("last_svn_rev_{}", rid));
+                    if let Some(ref key) = per_repo_key {
+                        self.db
+                            .set_state(key, &change.revision.to_string())
+                            .map_err(SyncError::DatabaseError)?;
+                    }
+                    if let Some(ref rid) = self.repo_id {
+                        self.db
+                            .advance_svn_watermark(rid, change.revision)
+                            .map_err(SyncError::DatabaseError)?;
+                    }
                 }
                 self.db
                     .insert_audit_log_with_repo(AuditLogInput {
@@ -2002,6 +2039,82 @@ impl SyncEngine {
         None
     }
 
+    fn blocking_cycle_mapping_hold(&self, op: &TeamCycleMappingOperation) -> Option<SyncError> {
+        if op.state == TeamCycleMappingState::ReconciliationRequired && !op.resume_authorized {
+            return Some(SyncError::CycleMappingHeld {
+                reason: "reconciliation_required".into(),
+                detail: op.outcome_detail.clone().unwrap_or_else(|| {
+                    "held team cycle mapping requires explicit reconcile".into()
+                }),
+            });
+        }
+        if !op.state.is_terminal() && op.state != TeamCycleMappingState::Running {
+            return Some(SyncError::CycleMappingHeld {
+                reason: "unfinished_mapping".into(),
+                detail: "an unfinished team cycle mapping is still active".into(),
+            });
+        }
+        None
+    }
+
+    fn cycle_mapping_pre_write_watermarks(&self, rid: &str) -> Result<(i64, String), SyncError> {
+        let (svn_rev, git_sha) = self
+            .db
+            .get_repo_watermark(rid)
+            .map_err(SyncError::DatabaseError)?;
+        Ok((svn_rev, git_sha))
+    }
+
+    fn record_team_cycle_mapping(
+        &self,
+        intent: TeamCycleMappingIntent<'_>,
+        observed_proof: Option<serde_json::Value>,
+    ) -> Result<(), SyncError> {
+        let rid = intent.repo_id;
+        let op = self
+            .db
+            .begin_team_cycle_mapping(intent)
+            .map_err(SyncError::DatabaseError)?;
+        #[cfg(debug_assertions)]
+        if self.cycle_mapping_fixture_flag("REPOSYNC_CYCLE_MAPPING_CHECKPOINT_FAIL", rid) {
+            let _ = self.db.hold_team_cycle_mapping_reconciliation(
+                rid,
+                &op.id,
+                "mapping intent recorded but the local checkpoint write failed",
+            );
+            return Err(SyncError::CycleMappingHeld {
+                reason: "checkpoint_write_failed".into(),
+                detail: "fixture: mapping intent could not be checkpointed".into(),
+            });
+        }
+        match self
+            .db
+            .confirm_team_cycle_mapping(rid, &op.id, observed_proof)
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let _ = self.db.hold_team_cycle_mapping_reconciliation(
+                    rid,
+                    &op.id,
+                    &format!("mapping verified but the local checkpoint write failed: {error}"),
+                );
+                Err(SyncError::CycleMappingHeld {
+                    reason: "checkpoint_write_failed".into(),
+                    detail: error.to_string(),
+                })
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn cycle_mapping_fixture_flag(&self, var: &str, repo_id: &str) -> bool {
+        let scoped = format!("{}__{}", var, repo_id);
+        if std::env::var(&scoped).is_ok() {
+            return true;
+        }
+        std::env::var(var).ok().as_deref() == Some(repo_id)
+    }
+
     #[cfg(debug_assertions)]
     fn svn_commit_fixture_flag(&self, var: &str, repo_id: &str) -> bool {
         let scoped = format!("{}__{}", var, repo_id);
@@ -2274,21 +2387,34 @@ impl SyncEngine {
             }
 
             if file_contents.is_empty() {
-                // All files were filtered out — advance watermark and skip
+                // All files were filtered out — record a durable no-target mapping.
                 if let Some(rid) = self.effective_repo_id() {
-                    let outcome = if change.changed_files.is_empty() {
-                        "empty_commit"
+                    let (pre_svn_rev, pre_git_sha) =
+                        self.cycle_mapping_pre_write_watermarks(rid)?;
+                    let projection = self.no_target_projection();
+                    let fingerprint = team_cycle_mapping_fingerprint(rid, &projection);
+                    let mapping_outcome = if change.changed_files.is_empty() {
+                        TeamCycleMappingOutcome::GitEmptyCommit
                     } else {
-                        "filtered"
+                        TeamCycleMappingOutcome::GitFiltered
                     };
-                    self.db
-                        .advance_no_target_watermarks(
-                            rid,
-                            &change.sha,
-                            outcome,
-                            &self.no_target_projection(),
-                        )
-                        .map_err(SyncError::DatabaseError)?;
+                    self.record_team_cycle_mapping(
+                        TeamCycleMappingIntent {
+                            repo_id: rid,
+                            initiator_id: "team_worker",
+                            request_id: &change.sha,
+                            target_fingerprint: &fingerprint,
+                            direction: TeamCycleMappingDirection::GitToSvn,
+                            outcome: mapping_outcome,
+                            source_svn_rev: None,
+                            source_git_sha: Some(&change.sha),
+                            pre_write_svn_rev: pre_svn_rev,
+                            pre_write_git_sha: &pre_git_sha,
+                            projection: &projection,
+                            intended_target_proof: None,
+                        },
+                        None,
+                    )?;
                 } else {
                     self.db
                         .set_state("last_git_hash", &change.sha)
@@ -2518,14 +2644,27 @@ impl SyncEngine {
                     .verify_no_svn_delta(&svn, &file_contents, &change.sha)
                     .await?;
                 if let Some(rid) = self.effective_repo_id() {
-                    self.db
-                        .advance_verified_no_delta_watermarks(
-                            rid,
-                            &change.sha,
-                            &self.no_target_projection(),
-                            &proof,
-                        )
-                        .map_err(SyncError::DatabaseError)?;
+                    let (pre_svn_rev, pre_git_sha) =
+                        self.cycle_mapping_pre_write_watermarks(rid)?;
+                    let projection = self.no_target_projection();
+                    let fingerprint = team_cycle_mapping_fingerprint(rid, &projection);
+                    self.record_team_cycle_mapping(
+                        TeamCycleMappingIntent {
+                            repo_id: rid,
+                            initiator_id: "team_worker",
+                            request_id: &change.sha,
+                            target_fingerprint: &fingerprint,
+                            direction: TeamCycleMappingDirection::GitToSvn,
+                            outcome: TeamCycleMappingOutcome::GitNoSvnDelta,
+                            source_svn_rev: None,
+                            source_git_sha: Some(&change.sha),
+                            pre_write_svn_rev: pre_svn_rev,
+                            pre_write_git_sha: &pre_git_sha,
+                            projection: &projection,
+                            intended_target_proof: Some(&proof),
+                        },
+                        Some(proof.clone()),
+                    )?;
                 } else {
                     self.db
                         .set_state("last_git_hash", &change.sha)
@@ -2625,14 +2764,27 @@ impl SyncEngine {
                         .verify_no_svn_delta(&svn, &file_contents, &change.sha)
                         .await?;
                     if let Some(rid) = self.effective_repo_id() {
-                        self.db
-                            .advance_verified_no_delta_watermarks(
-                                rid,
-                                &change.sha,
-                                &self.no_target_projection(),
-                                &proof,
-                            )
-                            .map_err(SyncError::DatabaseError)?;
+                        let (pre_svn_rev, pre_git_sha) =
+                            self.cycle_mapping_pre_write_watermarks(rid)?;
+                        let projection = self.no_target_projection();
+                        let fingerprint = team_cycle_mapping_fingerprint(rid, &projection);
+                        self.record_team_cycle_mapping(
+                            TeamCycleMappingIntent {
+                                repo_id: rid,
+                                initiator_id: "team_worker",
+                                request_id: &change.sha,
+                                target_fingerprint: &fingerprint,
+                                direction: TeamCycleMappingDirection::GitToSvn,
+                                outcome: TeamCycleMappingOutcome::GitNoSvnDelta,
+                                source_svn_rev: None,
+                                source_git_sha: Some(&change.sha),
+                                pre_write_svn_rev: pre_svn_rev,
+                                pre_write_git_sha: &pre_git_sha,
+                                projection: &projection,
+                                intended_target_proof: Some(&proof),
+                            },
+                            Some(proof.clone()),
+                        )?;
                     } else {
                         self.db
                             .set_state("last_git_hash", &change.sha)
