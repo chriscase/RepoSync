@@ -16,29 +16,6 @@ use crate::errors::GitError;
 /// Reviewed pending-commit batch size for replay continuation.
 pub const DEFAULT_PENDING_COMMIT_CAP: usize = 1000;
 
-/// Replay batch cap, overridable in debug builds for fixture tests.
-pub fn effective_pending_commit_cap() -> usize {
-    #[cfg(debug_assertions)]
-    if let Some(cap) = test_pending_commit_cap_override() {
-        return cap;
-    }
-    DEFAULT_PENDING_COMMIT_CAP
-}
-
-#[cfg(debug_assertions)]
-static TEST_PENDING_COMMIT_CAP: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
-
-/// Install a process-wide replay cap for fixture tests (serialized by callers).
-#[cfg(debug_assertions)]
-pub fn set_test_pending_commit_cap(cap: Option<usize>) {
-    *TEST_PENDING_COMMIT_CAP.lock().unwrap() = cap;
-}
-
-#[cfg(debug_assertions)]
-fn test_pending_commit_cap_override() -> Option<usize> {
-    *TEST_PENDING_COMMIT_CAP.lock().unwrap()
-}
-
 pub const REASON_MERGE_DAG: &str = "unsupported_merge_dag";
 pub const REASON_BACKLOG: &str = "unsupported_backlog";
 pub const REASON_UNPROVEN_RANGE: &str = "unproven_pending_range";

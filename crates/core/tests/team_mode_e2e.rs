@@ -3662,23 +3662,25 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
     );
 }
 
-struct PendingCapGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+struct PendingCapGuard<'a> {
+    engine: &'a SyncEngine,
+    cap: usize,
 }
 
-static PENDING_CAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+impl<'a> PendingCapGuard<'a> {
+    fn new(engine: &'a SyncEngine, cap: usize) -> Self {
+        engine.set_pending_commit_cap_override(Some(cap));
+        Self { engine, cap }
+    }
 
-impl PendingCapGuard {
-    fn new(cap: usize) -> Self {
-        let _lock = PENDING_CAP_LOCK.lock().unwrap();
-        reposync_core::pending_frontier::set_test_pending_commit_cap(Some(cap));
-        Self { _lock }
+    fn apply_to(&self, engine: &SyncEngine) {
+        engine.set_pending_commit_cap_override(Some(self.cap));
     }
 }
 
-impl Drop for PendingCapGuard {
+impl Drop for PendingCapGuard<'_> {
     fn drop(&mut self) {
-        reposync_core::pending_frontier::set_test_pending_commit_cap(None);
+        self.engine.set_pending_commit_cap_override(None);
     }
 }
 
@@ -3701,8 +3703,8 @@ fn build_linear_commit_chain(fixture: &QualifiedPair, count: usize) -> (String, 
 /// oldest-first batches instead of failing with unsupported_backlog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_over_1000_pending_commits_batched() {
-    let _cap = PendingCapGuard::new(3);
     let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -3773,8 +3775,8 @@ async fn candidate_r10_over_1000_pending_commits_batched() {
 /// whole cycle with no bridge reset and no opposite-direction writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r66_continuation_mixed_pending_fail_closed() {
-    let _cap = PendingCapGuard::new(3);
     let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -3838,8 +3840,8 @@ async fn candidate_r66_continuation_mixed_pending_fail_closed() {
 /// Continuation state is durable across restart via the handled Git checkpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r66_team_history_continuation_survives_restart() {
-    let _cap = PendingCapGuard::new(3);
     let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -3860,6 +3862,7 @@ async fn candidate_r66_team_history_continuation_survives_restart() {
     assert_eq!(mid.watermark.1, chain[2]);
 
     let restarted = reopen_pair(&fixture);
+    _cap.apply_to(&restarted);
     let second = restarted.run_sync_cycle().await.unwrap();
     assert_eq!(second.git_to_svn_count, 3);
     let after_restart = fixture.snapshot().await;

@@ -586,7 +586,7 @@ impl GitClient {
                 detail: crate::pending_frontier::DETAIL_MERGE_DAG.into(),
             });
         }
-        let cap = max_commits.unwrap_or_else(crate::pending_frontier::effective_pending_commit_cap);
+        let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
         let batch =
             crate::pending_frontier::select_pending_batch(&self.repo, since_sha, tip_sha, cap)?;
         if batch.has_more {
@@ -629,8 +629,9 @@ impl GitClient {
         &self,
         since_sha: &str,
         tip_sha: &str,
+        max_commits: Option<usize>,
     ) -> Result<Vec<GitCommitInfo>, GitError> {
-        let replay = self.pending_commits_between(since_sha, tip_sha, None)?;
+        let replay = self.pending_commits_between(since_sha, tip_sha, max_commits)?;
         if !replay.has_more {
             return Ok(replay.commits);
         }
