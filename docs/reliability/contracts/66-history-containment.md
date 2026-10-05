@@ -3,10 +3,10 @@
 **Status:** smallest remaining product slice after the merged team
 pre-reset gate and hide/push pending selection (#109). Team
 `inspect_team_history` classifications are unchanged; durable
-`reconciliation_required` blocks now cover rewrite (`non_fast_forward`) and
-UnsupportedHistory (`unsupported_merge_dag`, `unsupported_backlog`,
-`unproven_pending_range`), including fetch-time second-line hits. Personal-mode
-Git→SVN inspect, webhook-only force-push recovery, merge-DAG replay, and >1000
+`reconciliation_required` blocks now cover rewrite (`non_fast_forward`,
+`observed_remote_rewrite`) and UnsupportedHistory (`unsupported_merge_dag`,
+`unsupported_backlog`, `unproven_pending_range`), including fetch-time
+second-line hits. Personal-mode Git→SVN inspect, merge-DAG replay, and >1000
 continuation remain later.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
@@ -49,7 +49,8 @@ Current classifications (exact reason strings in
 | `remote_changed_during_inspection` | advertised SHA ≠ fetched SHA |
 | `ambiguous_checkpoint` / `missing_checkpoint` / `missing_checkpoint_object` | P unusable |
 | `incomplete_history` | shallow clone |
-| `non_fast_forward` | `merge-base --is-ancestor` exit 1 |
+| `non_fast_forward` | handled Git cursor P is not an ancestor of R |
+| `observed_remote_rewrite` | prior observed remote tip O is not an ancestor of R |
 | `ancestry_command_failed` | exit not in {0,1} — not a rewrite claim |
 | `unpublished_local_history` | L outside the P→R path |
 | `unsupported_backlog` | more than 1000 pending commits |
@@ -64,8 +65,9 @@ omit older pending commits; the proof lives in `pending_frontier` unit tests
 `candidate_r10_merge_dag_older_side_not_silently_skipped` (that case only
 asserts merge-DAG fail-closed before writes).
 
-Durable `reconciliation_required` blocks persist for `non_fast_forward` and
-UnsupportedHistory reasons via `record_history_block` / `enforce_durable_history_block`.
+Durable `reconciliation_required` blocks persist for `non_fast_forward`,
+`observed_remote_rewrite`, and UnsupportedHistory reasons via
+`record_history_block` / `enforce_durable_history_block`.
 They survive process restart and refuse fetch, replay, reset, remote write, SVN
 commit, and watermark or mapping change until an explicit operator action clears
 them. `fetch_git_changes` records the same durable block when its second-line
@@ -103,13 +105,12 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 
 Durable rewrite block, personal inspect, webhook `forced` hint, exact skip
 disposition, hide/push pending selection, durable UnsupportedHistory blocks
-(including fetch-time persistence), and restart enforcement have landed. Remaining
-#66 work is explicit recovery algorithms, not more pre-reset classification:
+(including fetch-time persistence), polling O→R force-push detection, and
+restart enforcement have landed. Remaining #66 work is explicit recovery
+algorithms, not more pre-reset classification:
 
-1. Polling-only force-push detection beyond the current named reject cases.
-2. Personal-mode rewrite containment as a first-class inspect path.
-3. Continuation past 1000 pending commits.
-4. Merge-DAG replay.
+1. Continuation past 1000 pending commits.
+2. Merge-DAG replay.
 
 Automatic rewrite reconciliation stays a later slice with its own proofs.
 
@@ -120,12 +121,14 @@ L=R lagging P; rewrite of already-synced work; metadata amend; missing
 branch/object/shallow; ancestry-command error; merge DAG reject (including
 older-side hide/push frontier vs visited-order skip in unit tests); >1000 reject;
 ignored-path preservation; repo scoping; durable block survives restart for
-rewrite and UnsupportedHistory; fetch-time UnsupportedHistory persistence.
+rewrite, observed-remote rewrite, UnsupportedHistory (merge DAG and backlog);
+fetch-time UnsupportedHistory persistence.
 
 Still required before claiming #66:
 
-- polling-only force-push detection (beyond current named reject cases)
-- personal-mode rewrite containment or an explicit NOT RUN row
+- `unproven_pending_range` engine-level durable restart (deferred: inspect
+  P→R ancestry gate rejects the same shapes first; unit coverage lives in
+  `pending_frontier::non_ancestor_tip_fails_closed`)
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
 - merge-DAG replay and >1000 continuation algorithms

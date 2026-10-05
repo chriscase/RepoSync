@@ -1,8 +1,11 @@
 //! Shared Git P/O/R/L inspection and repository-scoped history blocks.
 //!
-//! Team and personal engines use the same classifications. A rewrite
-//! (`non_fast_forward`) persists `reconciliation_required` and stays blocked
-//! across restart and later polls even if a subsequent fetch looks identical.
+//! Team and personal engines use the same classifications. Durable
+//! `reconciliation_required` blocks persist for rewrites (`non_fast_forward`,
+//! `observed_remote_rewrite`) and UnsupportedHistory reasons
+//! (`unsupported_merge_dag`, `unsupported_backlog`, `unproven_pending_range`).
+//! They survive restart and later polls even when a subsequent fetch looks
+//! admissible.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -13,9 +16,11 @@ use serde_json::Value;
 use crate::db::Database;
 use crate::errors::{DatabaseError, SyncError};
 
-/// Rewrite of already-handled history. Other inspection reasons re-check live
-/// Git on the next poll (auth, dirty worktree, missing branch, …).
+/// Rewrite of already-handled Git cursor (P→R ancestry failure).
 pub const DURABLE_HISTORY_REASON: &str = "non_fast_forward";
+
+/// Prior observed remote tip (O) is no longer an ancestor of fresh R.
+pub const REASON_OBSERVED_REMOTE_REWRITE: &str = "observed_remote_rewrite";
 
 pub fn history_block_key(repo_id: Option<&str>) -> String {
     match repo_id {
@@ -30,6 +35,7 @@ pub fn is_full_git_oid(value: &str) -> bool {
 
 pub fn is_durable_history_reason(reason: &str) -> bool {
     reason == DURABLE_HISTORY_REASON
+        || reason == REASON_OBSERVED_REMOTE_REWRITE
         || reason == crate::pending_frontier::REASON_MERGE_DAG
         || reason == crate::pending_frontier::REASON_BACKLOG
         || reason == crate::pending_frontier::REASON_UNPROVEN_RANGE
@@ -398,6 +404,21 @@ pub fn inspect_fetched_history(
             "ancestry_command_failed",
             "Git ancestry could not be established"
         ),
+    }
+    if let Some(ref prior) = o {
+        if prior != &fetched {
+            match run(&["merge-base", "--is-ancestor", prior, &fetched]) {
+                Ok(output) if output.status.code() == Some(0) => {}
+                Ok(output) if output.status.code() == Some(1) => blocked!(
+                    REASON_OBSERVED_REMOTE_REWRITE,
+                    "prior observed remote tip is not an ancestor of the fresh remote tip"
+                ),
+                _ => blocked!(
+                    "ancestry_command_failed",
+                    "prior observed remote ancestry could not be established"
+                ),
+            }
+        }
     }
     for (ancestor, descendant) in [
         (checkpoint, local.as_str()),
