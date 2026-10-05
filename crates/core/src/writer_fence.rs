@@ -46,7 +46,10 @@ fn set_process_identity(host: &str, pid: u32, epoch: u64) {
 fn clear_process_identity() {
     process_epoch().store(0, Ordering::Release);
     process_pid().store(0, Ordering::Release);
-    process_host().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    process_host()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 fn current_holder_identity() -> Option<(String, u32)> {
@@ -54,7 +57,10 @@ fn current_holder_identity() -> Option<(String, u32)> {
     if epoch == 0 {
         return None;
     }
-    let host = process_host().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let host = process_host()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let pid = process_pid().load(Ordering::Acquire);
     if host.is_empty() || pid == 0 {
         return None;
@@ -137,7 +143,11 @@ fn write_lease(conn: &Connection, lease: &WriterLease) -> Result<(), DatabaseErr
     conn.execute(
         "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
-        rusqlite::params![LEASE_KEY, serde_json::to_string(lease).unwrap(), Utc::now().to_rfc3339()],
+        rusqlite::params![
+            LEASE_KEY,
+            serde_json::to_string(lease).unwrap(),
+            Utc::now().to_rfc3339()
+        ],
     )?;
     Ok(())
 }
@@ -196,12 +206,7 @@ pub fn claim_with_identity(
 ) -> Result<WriterFenceGuard, DatabaseError> {
     let epoch = db.transaction(|tx| claim_lease_tx(tx, host, pid))?;
     set_process_identity(host, pid, epoch);
-    info!(
-        host,
-        pid,
-        epoch,
-        "acquired durable writer fence lease"
-    );
+    info!(host, pid, epoch, "acquired durable writer fence lease");
     Ok(WriterFenceGuard {
         epoch,
         host: host.into(),
@@ -260,7 +265,10 @@ fn release_lease_if_current(
 ) -> Result<(), DatabaseError> {
     db.transaction(|tx| {
         let lease = read_lease(tx)?;
-        if lease.as_ref().is_some_and(|l| l.epoch == epoch && l.holder_host == host && l.holder_pid == pid) {
+        if lease
+            .as_ref()
+            .is_some_and(|l| l.epoch == epoch && l.holder_host == host && l.holder_pid == pid)
+        {
             delete_lease(tx, epoch)?;
         }
         Ok(())
@@ -330,8 +338,10 @@ mod tests {
     #[test]
     fn live_holder_refuses_second_host_claim() {
         let ctx = test_ctx();
-        let _a = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
-        let err = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap_err();
+        let _a =
+            claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
+        let err =
+            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap_err();
         assert!(matches!(err, DatabaseError::DataDirInUse(_)));
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
@@ -344,7 +354,8 @@ mod tests {
         let ctx = test_ctx();
         let first = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", dead_pid()).unwrap();
         assert_eq!(first.epoch(), 1);
-        let second = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
+        let second =
+            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
         assert_eq!(second.epoch(), 2);
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
@@ -356,7 +367,8 @@ mod tests {
     fn superseded_epoch_is_refused_at_finalize() {
         let ctx = test_ctx();
         let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", dead_pid()).unwrap();
-        let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
+        let _current =
+            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
         set_process_identity("host-a", dead_pid(), stale.epoch());
         let err = ctx
             .db
@@ -373,7 +385,7 @@ mod tests {
 
     #[test]
     fn fenced_import_finalize_refuses_superseded_host() {
-        use crate::db::import_operations::{ImportOperationState, import_target_fingerprint};
+        use crate::db::import_operations::{import_target_fingerprint, ImportOperationState};
 
         let ctx = test_ctx();
         ctx.db.conn().execute(
@@ -390,7 +402,8 @@ mod tests {
             .create_import_operation("repo-f", "admin", "req-fence", &fp)
             .unwrap();
         ctx.db.start_import_operation("repo-f", &op.id).unwrap();
-        let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
+        let _current =
+            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
         set_process_identity("host-a", dead_pid(), stale.epoch());
         let err = ctx
             .db
@@ -402,7 +415,10 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("epoch mismatch") || err.contains("WriterFenced"), "{err}");
+        assert!(
+            err.contains("epoch mismatch") || err.contains("WriterFenced"),
+            "{err}"
+        );
         clear_process_identity();
         assert_eq!(
             ctx.db
@@ -422,10 +438,12 @@ mod tests {
     fn clean_release_allows_immediate_reclaim() {
         let ctx = test_ctx();
         {
-            let guard = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
+            let guard =
+                claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
             assert_eq!(guard.epoch(), 1);
         }
-        let again = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
+        let again =
+            claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
         assert_eq!(again.epoch(), 1);
         eprintln!(
             "RELIABILITY_EVIDENCE {}",

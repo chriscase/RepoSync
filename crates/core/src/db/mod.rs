@@ -121,13 +121,7 @@ impl Database {
         let db = Self::new(data_dir.join("reposync.db"))?;
         db.initialize()?;
         let fence = crate::writer_fence::claim(&db, data_dir)?;
-        Ok((
-            db,
-            crate::data_dir::DataDirOwner {
-                lock,
-                fence,
-            },
-        ))
+        Ok((db, crate::data_dir::DataDirOwner { lock, fence }))
     }
 
     /// Obtain a lock on the underlying connection.
