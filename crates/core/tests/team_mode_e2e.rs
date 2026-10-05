@@ -3602,7 +3602,6 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
 }
 
 struct PendingCapGuard {
-    key: String,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -3611,15 +3610,14 @@ static PENDING_CAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl PendingCapGuard {
     fn new(cap: usize) -> Self {
         let _lock = PENDING_CAP_LOCK.lock().unwrap();
-        let key = "REPOSYNC_TEST_PENDING_COMMIT_CAP".to_string();
-        std::env::set_var(&key, cap.to_string());
-        Self { key, _lock }
+        reposync_core::pending_frontier::set_test_pending_commit_cap(Some(cap));
+        Self { _lock }
     }
 }
 
 impl Drop for PendingCapGuard {
     fn drop(&mut self) {
-        std::env::remove_var(&self.key);
+        reposync_core::pending_frontier::set_test_pending_commit_cap(None);
     }
 }
 

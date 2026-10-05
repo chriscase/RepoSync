@@ -17,14 +17,27 @@ pub const DEFAULT_PENDING_COMMIT_CAP: usize = 1000;
 /// Replay batch cap, overridable in debug builds for fixture tests.
 pub fn effective_pending_commit_cap() -> usize {
     #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var("REPOSYNC_TEST_PENDING_COMMIT_CAP") {
-        if let Ok(parsed) = value.parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
+    if let Some(cap) = test_pending_commit_cap_override() {
+        return cap;
     }
     DEFAULT_PENDING_COMMIT_CAP
+}
+
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static TEST_PENDING_COMMIT_CAP: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install a per-thread replay cap for fixture tests.
+#[cfg(debug_assertions)]
+pub fn set_test_pending_commit_cap(cap: Option<usize>) {
+    TEST_PENDING_COMMIT_CAP.set(cap);
+}
+
+#[cfg(debug_assertions)]
+fn test_pending_commit_cap_override() -> Option<usize> {
+    TEST_PENDING_COMMIT_CAP.get()
 }
 
 pub const REASON_MERGE_DAG: &str = "unsupported_merge_dag";
