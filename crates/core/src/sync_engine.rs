@@ -129,6 +129,16 @@ struct TeamHistoryAdmission {
     remote_tip: String,
 }
 
+/// Git changes selected for one sync cycle, including continuation metadata.
+struct GitFetchResult {
+    replay_batch: Vec<GitChangeSet>,
+    conflict_coverage: Vec<GitChangeSet>,
+    has_more: bool,
+    reset_target: String,
+    pending_total: usize,
+    deferred_mixed_pending: bool,
+}
+
 /// The bidirectional sync engine.
 pub struct SyncEngine {
     config: AppConfig,
@@ -1109,10 +1119,20 @@ impl SyncEngine {
 
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
-        let git_changes = self.fetch_git_changes(&admission).await?;
+        let git_fetch = self.fetch_git_changes(&admission, &svn_changes).await?;
 
-        // 2. Detect conflicts.
-        let conflicts = self.detect_conflicts_internal(&svn_changes, &git_changes);
+        if git_fetch.deferred_mixed_pending {
+            info!(
+                pending_git_total = git_fetch.pending_total,
+                svn_pending = svn_changes.len(),
+                reset_target = %git_fetch.reset_target,
+                "Git replay continuation incomplete with pending SVN work; deferring cycle with no mutation"
+            );
+            return Ok(());
+        }
+
+        // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
+        let conflicts = self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage);
         stats.conflicts_detected = conflicts.len();
 
         if !conflicts.is_empty() {
@@ -1143,7 +1163,8 @@ impl SyncEngine {
 
         // The exact remote Git tip had no pending commits before this SVN
         // publication, so its newly mapped tip is a handled frontier.
-        if git_changes.is_empty()
+        if git_fetch.replay_batch.is_empty()
+            && !git_fetch.has_more
             && admission.checkpoint == admission.remote_tip
             && stats.svn_to_git_count > 0
         {
@@ -1157,7 +1178,7 @@ impl SyncEngine {
         }
 
         // 4. Apply Git -> SVN.
-        stats.git_to_svn_count = self.sync_git_to_svn(&git_changes).await?;
+        stats.git_to_svn_count = self.sync_git_to_svn(&git_fetch.replay_batch).await?;
 
         // Collect commit details for notifications (max 10 commits)
         for change in &svn_changes {
@@ -1175,7 +1196,7 @@ impl SyncEngine {
                 });
             }
         }
-        for change in &git_changes {
+        for change in &git_fetch.replay_batch {
             let first_line = change.message.lines().next().unwrap_or("").to_string();
             if !first_line.is_empty() && stats.recent_messages.len() < 5 {
                 stats.recent_messages.push(first_line);
@@ -3066,15 +3087,16 @@ impl SyncEngine {
     async fn fetch_git_changes(
         &self,
         admission: &TeamHistoryAdmission,
-    ) -> Result<Vec<GitChangeSet>, SyncError> {
+        svn_changes: &[SvnChangeSet],
+    ) -> Result<GitFetchResult, SyncError> {
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
 
         info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
 
         // Select P..R from the pinned inspection objects before reset so a
         // visited-order HEAD walk cannot skip older pending work, and so an
-        // unqualified merge/backlog still fails closed with no mutation.
-        let commits = git
+        // unqualified merge still fails closed with no mutation.
+        let selection = git
             .pending_commits_between(&admission.checkpoint, &admission.remote_tip, None)
             .map_err(|error| match error {
                 crate::errors::GitError::UnsupportedHistory { reason, detail } => self
@@ -3089,11 +3111,33 @@ impl SyncEngine {
                 other => SyncError::GitError(other),
             })?;
 
-        // Reset only to the commit fetched and inspected above. A second pull
-        // of a mutable branch would invalidate the admission decision.
+        if selection.has_more && !svn_changes.is_empty() {
+            return Ok(GitFetchResult {
+                replay_batch: Vec::new(),
+                conflict_coverage: Vec::new(),
+                has_more: true,
+                reset_target: admission.checkpoint.clone(),
+                pending_total: selection.total,
+                deferred_mixed_pending: true,
+            });
+        }
+
+        let conflict_commits = git
+            .pending_commits_for_conflict_coverage(&admission.checkpoint, &admission.remote_tip)
+            .map_err(SyncError::GitError)?;
+
+        let reset_target = if selection.has_more {
+            selection.batch_tip.clone()
+        } else {
+            admission.remote_tip.clone()
+        };
+
+        // Reset only through the replay batch tip while continuation is
+        // incomplete. A hard reset to the full admitted R would leave unreplayed
+        // Git history on the bridge and invite unsafe opposite-direction writes.
         let reset = tokio::task::block_in_place(|| {
             Command::new("git")
-                .args(["reset", "--hard", &admission.remote_tip])
+                .args(["reset", "--hard", &reset_target])
                 .current_dir(git.repo_path())
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .output()
@@ -3101,16 +3145,41 @@ impl SyncEngine {
         .map_err(crate::errors::GitError::IoError)?;
         if !reset.status.success() {
             return Err(SyncError::GitError(crate::errors::GitError::Git2Error(
-                git2::Error::from_str("git reset to inspected remote commit failed"),
+                git2::Error::from_str("git reset to replay target failed"),
             )));
         }
-        if git.head_sha().map_err(SyncError::GitError)? != admission.remote_tip {
+        if git.head_sha().map_err(SyncError::GitError)? != reset_target {
             return Err(SyncError::HistoryBlocked {
                 reason: "post_reset_tip_mismatch".into(),
-                detail: "bridge did not reach the admitted Git commit".into(),
+                detail: "bridge did not reach the replay checkout target".into(),
             });
         }
 
+        let replay_batch = self.git_change_sets_from_commits(&git, &selection.commits)?;
+        let conflict_coverage = self.git_change_sets_from_commits(&git, &conflict_commits)?;
+
+        debug!(
+            replay = replay_batch.len(),
+            conflict_coverage = conflict_coverage.len(),
+            has_more = selection.has_more,
+            reset_target = %reset_target,
+            "fetched Git change sets"
+        );
+        Ok(GitFetchResult {
+            replay_batch,
+            conflict_coverage,
+            has_more: selection.has_more,
+            reset_target,
+            pending_total: selection.total,
+            deferred_mixed_pending: false,
+        })
+    }
+
+    fn git_change_sets_from_commits(
+        &self,
+        git: &GitClient,
+        commits: &[crate::git::client::GitCommitInfo],
+    ) -> Result<Vec<GitChangeSet>, SyncError> {
         let mut change_sets: Vec<GitChangeSet> = Vec::new();
         for c in commits {
             if self.is_echo_commit(&c.message) {
@@ -3124,7 +3193,6 @@ impl SyncEngine {
                     continue;
                 }
             }
-            // Populate changed_files from the commit's diff.
             let files = git.get_changed_files(&c.sha).map_err(SyncError::GitError)?;
             let changed_files: Vec<ChangedFile> = files
                 .into_iter()
@@ -3136,18 +3204,13 @@ impl SyncEngine {
                 })
                 .collect();
             change_sets.push(GitChangeSet {
-                sha: c.sha,
-                author_name: c.author_name,
-                author_email: c.author_email,
-                message: c.message,
+                sha: c.sha.clone(),
+                author_name: c.author_name.clone(),
+                author_email: c.author_email.clone(),
+                message: c.message.clone(),
                 changed_files,
             });
         }
-
-        // pending_commits_between already returns oldest-first (parents before
-        // children) so Git→SVN replay matches intermediate mapping order.
-
-        debug!(count = change_sets.len(), "fetched Git change sets");
         Ok(change_sets)
     }
 

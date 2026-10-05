@@ -256,6 +256,30 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "R66_TEAM_CONTINUATION_RESTART",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r66_team_history_continuation_survives_restart",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_CONTINUATION_MIXED_PENDING",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r66_continuation_mixed_pending_fail_closed",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_PERSONAL_LINEAR_OVER_1000",
+      "binary": "integration",
+      "test": "candidate_r66_personal_linear_over_1000_admitted",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_PERSONAL_BACKLOG_RESTART",
+      "binary": "integration",
+      "test": "candidate_r66_personal_backlog_block_survives_restart",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R09_WEBHOOK_FORCED_HINT",
       "binary": "github_webhook_forced",
       "test": "candidate_r09_webhook_forced_is_hint_not_reset",

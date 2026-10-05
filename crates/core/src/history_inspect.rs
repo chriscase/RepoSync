@@ -443,12 +443,8 @@ pub fn inspect_fetched_history(
             "pending Git repository could not be opened"
         ),
     };
-    match crate::pending_frontier::select_pending_oids(
-        &inspect_repo,
-        checkpoint,
-        &fetched,
-        crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP,
-    ) {
+    match crate::pending_frontier::verify_linear_pending_range(&inspect_repo, checkpoint, &fetched)
+    {
         Ok(_) => {}
         Err(crate::errors::GitError::UnsupportedHistory { reason, detail }) => {
             blocked!(reason, detail);
