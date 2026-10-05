@@ -26,6 +26,19 @@ pub struct GitCommitInfo {
     pub committer_email: String,
 }
 
+/// Result of capped pending-commit selection on the P→R frontier.
+#[derive(Debug, Clone)]
+pub struct PendingCommitSelection {
+    /// Oldest-first replay batch, at most the requested cap.
+    pub commits: Vec<GitCommitInfo>,
+    /// Total pending commits on the frontier (may exceed `commits.len()`).
+    pub total: usize,
+    /// True when another replay batch is required after this one.
+    pub has_more: bool,
+    /// Checkout target for this batch: last replay commit, or `tip_sha` when empty/done.
+    pub batch_tip: String,
+}
+
 impl GitClient {
     /// Open an existing Git repository at `repo_path`.
     pub fn new<P: AsRef<Path>>(repo_path: P) -> Result<Self, GitError> {
@@ -553,13 +566,14 @@ impl GitClient {
     /// Pending commits on the ancestry frontier from `since_sha` to `tip_sha`.
     ///
     /// Uses hide/push (`since..tip`), not a visited-order stop at `since_sha`.
-    /// Merge DAGs and overflow fail closed rather than returning a truncated list.
+    /// Merge DAGs fail closed. Linear overflow returns the oldest-first replay
+    /// batch with `has_more` set instead of silently truncating.
     pub fn pending_commits_between(
         &self,
         since_sha: &str,
         tip_sha: &str,
         max_commits: Option<usize>,
-    ) -> Result<Vec<GitCommitInfo>, GitError> {
+    ) -> Result<PendingCommitSelection, GitError> {
         #[cfg(debug_assertions)]
         if std::env::var("REPOSYNC_TEST_FETCH_PENDING_FAULT")
             .ok()
@@ -587,7 +601,49 @@ impl GitClient {
             let commit = self.repo.find_commit(oid)?;
             commits.push(git_commit_info(&commit));
         }
-        debug!(count = commits.len(), "collected pending commits");
+        let batch_tip = commits
+            .last()
+            .map(|commit| commit.sha.clone())
+            .unwrap_or_else(|| tip_sha.to_string());
+        debug!(
+            count = commits.len(),
+            total = batch.total,
+            has_more = batch.has_more,
+            batch_tip = %batch_tip,
+            "collected pending commits"
+        );
+        Ok(PendingCommitSelection {
+            commits,
+            total: batch.total,
+            has_more: batch.has_more,
+            batch_tip,
+        })
+    }
+
+    /// All pending commits on the P→R frontier for conflict coverage.
+    ///
+    /// Callers that replay in batches use this to detect overlapping paths
+    /// across the full admitted range, not only the current batch.
+    pub fn pending_commits_for_conflict_coverage(
+        &self,
+        since_sha: &str,
+        tip_sha: &str,
+    ) -> Result<Vec<GitCommitInfo>, GitError> {
+        let replay = self.pending_commits_between(since_sha, tip_sha, None)?;
+        if !replay.has_more {
+            return Ok(replay.commits);
+        }
+        let full = crate::pending_frontier::select_pending_batch(
+            &self.repo,
+            since_sha,
+            tip_sha,
+            replay.total,
+        )?;
+        let mut commits = Vec::with_capacity(full.commits.len());
+        for oid in full.commits {
+            let commit = self.repo.find_commit(oid)?;
+            commits.push(git_commit_info(&commit));
+        }
         Ok(commits)
     }
 
@@ -610,7 +666,9 @@ impl GitClient {
             });
         };
         let tip = self.head_sha()?;
-        self.pending_commits_between(since_sha, &tip, max_commits)
+        Ok(self
+            .pending_commits_between(since_sha, &tip, max_commits)?
+            .commits)
     }
 
     /// Create a new branch pointing at `from_sha`.
@@ -993,14 +1051,18 @@ mod tests {
         let pending = client.pending_commits_between(&a, &c, None).unwrap();
         assert_eq!(
             pending
+                .commits
                 .iter()
                 .map(|info| info.sha.as_str())
                 .collect::<Vec<_>>(),
             vec![b.as_str(), c.as_str()]
         );
+        assert!(!pending.has_more);
+        assert_eq!(pending.batch_tip, c);
         assert!(client
             .pending_commits_between(&c, &c, None)
             .unwrap()
+            .commits
             .is_empty());
     }
 

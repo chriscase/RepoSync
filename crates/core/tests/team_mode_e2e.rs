@@ -3661,6 +3661,8 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
     );
     let after_first = fixture.snapshot().await;
     assert_eq!(after_first.watermark.1, chain[2]);
+    assert_eq!(after_first.bridge_sha, chain[2]);
+    assert_ne!(after_first.bridge_sha, tip);
     assert_eq!(after_first.svn_rev, before.svn_rev + 3);
 
     let second = fixture.engine.run_sync_cycle().await.unwrap();
@@ -3694,6 +3696,69 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
             "mapping_before":before.mapping_count,
             "mapping_after":after_third.mapping_count,
             "continuation":true
+        })
+    );
+}
+
+/// While Git replay continuation is incomplete, pending SVN work must defer the
+/// whole cycle with no bridge reset and no opposite-direction writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_continuation_mixed_pending_fail_closed() {
+    let _cap = PendingCapGuard::new(3);
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let baseline = fixture.snapshot().await;
+    let (_tip, chain) = build_linear_commit_chain(&fixture, 7);
+    let pending_svn = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "pending SVN during continuation\n",
+        "Pending SVN during Git continuation",
+    );
+    let before = fixture.snapshot().await;
+
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (stats.svn_to_git_count, stats.git_to_svn_count),
+        (0, 0),
+        "mixed pending must defer the cycle with no mutation"
+    );
+    let after = fixture.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev);
+    assert_eq!(after.watermark, before.watermark);
+    assert_eq!(after.bridge_sha, before.bridge_sha);
+    assert_eq!(after.mapping_count, before.mapping_count);
+    assert!(
+        pending_svn > baseline.svn_rev,
+        "fixture must have pending SVN work"
+    );
+    assert!(
+        chain.len() > 3,
+        "fixture must leave Git continuation pending after the first batch"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_CONTINUATION_MIXED_PENDING",
+            "p":synced,
+            "pending_git_total":7,
+            "batch_cap":3,
+            "pending_svn":pending_svn,
+            "bridge_before_after":before.bridge_sha,
+            "watermark_before_after":before.watermark.1,
+            "svn_revision_before_after":before.svn_rev,
+            "mapping_before_after":before.mapping_count,
+            "deferred_mixed_pending":true
         })
     );
 }

@@ -67,6 +67,12 @@ omit older pending commits; the proof lives in `pending_frontier` unit tests
 `candidate_r10_merge_dag_older_side_not_silently_skipped` (that case only
 asserts merge-DAG fail-closed before writes).
 
+While Git replay continuation is incomplete (`has_more`), the team engine
+resets the bridge only through the current batch tip (not the full admitted
+`R`), replays that batch Git→SVN, and defers the whole cycle with no bridge
+reset or writes when pending SVN work would overlap the not-yet-replayed Git
+prefix. Conflict detection uses the full admitted P→R path set before any write.
+
 Durable `reconciliation_required` blocks persist for `non_fast_forward`,
 `observed_remote_rewrite`, and UnsupportedHistory reasons via
 `record_history_block` / `enforce_durable_history_block`.
@@ -87,6 +93,7 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | >1000 linear inspect admission | **proven** — `candidate_r66_personal_linear_over_1000_admitted` |
 | >1000 legacy backlog durable restart | **proven** — team `candidate_r10_durable_backlog_block_survives_restart` (seeded block), personal `candidate_r66_personal_backlog_block_survives_restart` |
 | >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_rejected` (batched replay), `candidate_r66_team_history_continuation_survives_restart` |
+| >1000 continuation with pending SVN work | **proven** — `candidate_r66_continuation_mixed_pending_fail_closed` (cycle deferred with no bridge reset or writes) |
 | Merge-DAG replay | **remaining** |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
@@ -110,7 +117,9 @@ metadata-only amend with zero remote writes, including repeat/reopen.
    Until proved, unqualified merge DAGs **reject before writes**. Linear
    backlogs over 1000 replay in explicit oldest-first batches of at most 1000
    commits per cycle; the handled Git checkpoint is the durable continuation
-   cursor. Do not silently drop older work.
+   cursor. While continuation is incomplete, opposite-direction SVN work with
+   pending Git backlog defers the cycle with no mutation; conflict detection
+   sees the full P→R path. Do not silently drop older work.
 6. Normal SVN merges append revisions. A revision-number jump is not a Git
    rewrite. Path delete/recreate and UUID/copy-origin change are identity
    events for #63/#15, not this gate’s `non_fast_forward`.
@@ -125,8 +134,9 @@ Durable rewrite block, personal inspect (with containment proofs), webhook
 `forced` hint, exact skip disposition, hide/push pending selection, durable
 UnsupportedHistory blocks (including fetch-time persistence), polling O→R
 force-push detection, restart enforcement, and linear >1000 continuation have
-landed. Remaining #66 work is explicit recovery algorithms, not more
-pre-reset classification:
+landed with fail-closed mixed-pending deferral and full-path conflict coverage.
+Remaining #66 work is explicit recovery algorithms, not more pre-reset
+classification:
 
 1. Merge-DAG replay.
 
@@ -138,7 +148,7 @@ Already present: ordinary fast-forward; unchanged tip with new SVN work;
 L=R lagging P; rewrite of already-synced work; metadata amend; missing
 branch/object/shallow; ancestry-command error; merge DAG reject (including
 older-side hide/push frontier vs visited-order skip in unit tests); >1000 linear
-continuation with restart; ignored-path preservation; repo scoping; durable
+continuation with restart and mixed-pending deferral; ignored-path preservation; repo scoping; durable
 block survives restart for rewrite, observed-remote rewrite, UnsupportedHistory
 (merge DAG and legacy backlog); fetch-time UnsupportedHistory persistence;
 personal-mode rewrite and merge-DAG containment with durable restart
