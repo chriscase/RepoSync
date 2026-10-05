@@ -571,11 +571,19 @@ impl GitClient {
                 detail: crate::pending_frontier::DETAIL_MERGE_DAG.into(),
             });
         }
-        let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
-        let oids =
-            crate::pending_frontier::select_pending_oids(&self.repo, since_sha, tip_sha, cap)?;
-        let mut commits = Vec::with_capacity(oids.len());
-        for oid in oids {
+        let cap = max_commits.unwrap_or_else(crate::pending_frontier::effective_pending_commit_cap);
+        let batch =
+            crate::pending_frontier::select_pending_batch(&self.repo, since_sha, tip_sha, cap)?;
+        if batch.has_more {
+            debug!(
+                total = batch.total,
+                batch = batch.commits.len(),
+                cap,
+                "pending Git history continues in later sync cycles"
+            );
+        }
+        let mut commits = Vec::with_capacity(batch.commits.len());
+        for oid in batch.commits {
             let commit = self.repo.find_commit(oid)?;
             commits.push(git_commit_info(&commit));
         }

@@ -7,8 +7,9 @@ pre-reset gate and hide/push pending selection (#109). Team
 `observed_remote_rewrite`) and UnsupportedHistory (`unsupported_merge_dag`,
 `unsupported_backlog`, `unproven_pending_range`), including fetch-time
 second-line hits. Personal-mode Git→SVN inspect now shares the same
-`inspect_fetched_history` gate with proven containment tests; merge-DAG
-replay and >1000 continuation remain later.
+`inspect_fetched_history` gate with proven containment tests. Linear
+backlogs over 1000 continue in explicit oldest-first replay batches; merge-DAG
+replay remains later.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
@@ -54,7 +55,7 @@ Current classifications (exact reason strings in
 | `observed_remote_rewrite` | prior observed remote tip O is not an ancestor of R |
 | `ancestry_command_failed` | exit not in {0,1} — not a rewrite claim |
 | `unpublished_local_history` | L outside the P→R path |
-| `unsupported_backlog` | more than 1000 pending commits |
+| `unsupported_backlog` | legacy durable block reason; linear replay now continues in batches |
 | `unsupported_merge_dag` | pending history has a merge commit |
 | `unproven_pending_range` | P is not an ancestor of R |
 
@@ -83,8 +84,10 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | Qualified linear admission | **proven** — `candidate_r66_personal_linear_history_admitted` |
 | UnsupportedHistory (`unsupported_merge_dag`) + durable restart | **proven** — `candidate_r66_personal_merge_dag_contained` |
 | Observed-remote rewrite (`observed_remote_rewrite`) | **NOT RUN** — team polling cases cover O→R; personal inherits inspect |
-| >1000 backlog durable restart | **NOT RUN** — team `candidate_r10_durable_backlog_block_survives_restart` |
-| Merge-DAG replay / >1000 continuation | **remaining** |
+| >1000 linear inspect admission | **proven** — `candidate_r66_personal_linear_over_1000_admitted` |
+| >1000 legacy backlog durable restart | **proven** — team `candidate_r10_durable_backlog_block_survives_restart` (seeded block), personal `candidate_r66_personal_backlog_block_survives_restart` |
+| >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_rejected` (batched replay), `candidate_r66_team_history_continuation_survives_restart` |
+| Merge-DAG replay | **remaining** |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
 duplicates rewritten history. Candidate R09 cases reject replacement and
@@ -104,8 +107,10 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 4. Do not declare work already in SVN from messages, timestamps, short SHAs,
    or patch-id equality. Future auto-reconciliation needs its own review.
 5. Pending-commit selection must be a correct ancestry/frontier algorithm.
-   Until proved, unqualified merge DAGs and >1000-commit backlogs **reject
-   before writes**. Do not silently drop older work.
+   Until proved, unqualified merge DAGs **reject before writes**. Linear
+   backlogs over 1000 replay in explicit oldest-first batches of at most 1000
+   commits per cycle; the handled Git checkpoint is the durable continuation
+   cursor. Do not silently drop older work.
 6. Normal SVN merges append revisions. A revision-number jump is not a Git
    rewrite. Path delete/recreate and UUID/copy-origin change are identity
    events for #63/#15, not this gate’s `non_fast_forward`.
@@ -119,11 +124,11 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 Durable rewrite block, personal inspect (with containment proofs), webhook
 `forced` hint, exact skip disposition, hide/push pending selection, durable
 UnsupportedHistory blocks (including fetch-time persistence), polling O→R
-force-push detection, and restart enforcement have landed. Remaining #66 work is
-explicit recovery algorithms, not more pre-reset classification:
+force-push detection, restart enforcement, and linear >1000 continuation have
+landed. Remaining #66 work is explicit recovery algorithms, not more
+pre-reset classification:
 
-1. Continuation past 1000 pending commits.
-2. Merge-DAG replay.
+1. Merge-DAG replay.
 
 Automatic rewrite reconciliation stays a later slice with its own proofs.
 
@@ -132,12 +137,12 @@ Automatic rewrite reconciliation stays a later slice with its own proofs.
 Already present: ordinary fast-forward; unchanged tip with new SVN work;
 L=R lagging P; rewrite of already-synced work; metadata amend; missing
 branch/object/shallow; ancestry-command error; merge DAG reject (including
-older-side hide/push frontier vs visited-order skip in unit tests); >1000 reject;
-ignored-path preservation; repo scoping; durable block survives restart for
-rewrite, observed-remote rewrite, UnsupportedHistory (merge DAG and backlog);
-fetch-time UnsupportedHistory persistence; personal-mode rewrite and merge-DAG
-containment with durable restart (inspection/tracking refs retargeted to restored
-tip before reopen).
+older-side hide/push frontier vs visited-order skip in unit tests); >1000 linear
+continuation with restart; ignored-path preservation; repo scoping; durable
+block survives restart for rewrite, observed-remote rewrite, UnsupportedHistory
+(merge DAG and legacy backlog); fetch-time UnsupportedHistory persistence;
+personal-mode rewrite and merge-DAG containment with durable restart
+(inspection/tracking refs retargeted to restored tip before reopen).
 
 Still required before claiming #66:
 
@@ -146,7 +151,9 @@ Still required before claiming #66:
   `pending_frontier::non_ancestor_tip_fails_closed`)
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
-- merge-DAG replay and >1000 continuation algorithms
+- merge-DAG replay algorithm
+- personal Git→SVN engine-cycle proof for qualified linear admission (inspect
+  admission is proven; PR-based replay is a separate surface)
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and
 no duplicates on accepted ordinary replay. The coworker’s exact production

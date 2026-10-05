@@ -3,15 +3,29 @@
 //! The pending set from handled checkpoint `P` to tip `R` is commits reachable
 //! from `R` and not from `P` (`P..R`). A revwalk that stops when `P` is first
 //! visited can omit older pending commits on other merge parents. Unqualified
-//! merge DAGs and backlogs over the reviewed cap fail closed instead of
-//! returning a truncated list.
+//! merge DAGs fail closed. Linear backlogs over the reviewed cap are admitted
+//! at inspect time and replayed in explicit oldest-first batches of at most
+//! [`DEFAULT_PENDING_COMMIT_CAP`] commits per cycle.
 
 use git2::{Oid, Repository, Sort};
 
 use crate::errors::GitError;
 
-/// Reviewed pending-commit cap. Continuation past this bound is a later slice.
+/// Reviewed pending-commit batch size for replay continuation.
 pub const DEFAULT_PENDING_COMMIT_CAP: usize = 1000;
+
+/// Replay batch cap, overridable in debug builds for fixture tests.
+pub fn effective_pending_commit_cap() -> usize {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("REPOSYNC_TEST_PENDING_COMMIT_CAP") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            if parsed > 0 {
+                return parsed;
+            }
+        }
+    }
+    DEFAULT_PENDING_COMMIT_CAP
+}
 
 pub const REASON_MERGE_DAG: &str = "unsupported_merge_dag";
 pub const REASON_BACKLOG: &str = "unsupported_backlog";
@@ -20,6 +34,17 @@ pub const REASON_UNPROVEN_RANGE: &str = "unproven_pending_range";
 pub const DETAIL_MERGE_DAG: &str = "pending Git history contains a merge commit";
 pub const DETAIL_BACKLOG: &str =
     "more than 1000 pending Git commits require a reviewed continuation algorithm";
+
+/// Result of a capped pending-commit batch selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBatch {
+    /// Oldest-first pending commits, at most `cap` entries.
+    pub commits: Vec<Oid>,
+    /// Total pending commits on the P→R frontier (may exceed `commits.len()`).
+    pub total: usize,
+    /// True when `total > commits.len()` and another batch is required.
+    pub has_more: bool,
+}
 
 fn unsupported(reason: &str, detail: impl Into<String>) -> GitError {
     GitError::UnsupportedHistory {
@@ -34,35 +59,43 @@ fn parse_commit(repo: &Repository, sha: &str) -> Result<Oid, GitError> {
     Ok(oid)
 }
 
-/// Commits reachable from `tip_sha` and not from `since_sha`, oldest first.
+fn ensure_descendant(
+    repo: &Repository,
+    since: Oid,
+    tip: Oid,
+    since_sha: &str,
+    tip_sha: &str,
+) -> Result<(), GitError> {
+    if since == tip {
+        return Ok(());
+    }
+    match repo.graph_descendant_of(tip, since) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(unsupported(
+            REASON_UNPROVEN_RANGE,
+            format!("{since_sha} is not an ancestor of {tip_sha}"),
+        )),
+        Err(error) => Err(unsupported(
+            REASON_UNPROVEN_RANGE,
+            format!("pending range ancestry could not be established: {error}"),
+        )),
+    }
+}
+
+/// Walk the full P→R frontier and verify it is a linear pending range.
 ///
-/// `since_sha` is hidden (the commit and its ancestors), not used as a
-/// visited-order stop. Merge commits and overflow fail closed.
-pub fn select_pending_oids(
+/// Merge commits fail closed. The total pending count may exceed the replay cap;
+/// inspect uses this to admit qualified linear histories before batch replay.
+pub fn verify_linear_pending_range(
     repo: &Repository,
     since_sha: &str,
     tip_sha: &str,
-    cap: usize,
-) -> Result<Vec<Oid>, GitError> {
+) -> Result<usize, GitError> {
     let since = parse_commit(repo, since_sha)?;
     let tip = parse_commit(repo, tip_sha)?;
+    ensure_descendant(repo, since, tip, since_sha, tip_sha)?;
     if since == tip {
-        return Ok(Vec::new());
-    }
-    match repo.graph_descendant_of(tip, since) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(unsupported(
-                REASON_UNPROVEN_RANGE,
-                format!("{since_sha} is not an ancestor of {tip_sha}"),
-            ));
-        }
-        Err(error) => {
-            return Err(unsupported(
-                REASON_UNPROVEN_RANGE,
-                format!("pending range ancestry could not be established: {error}"),
-            ));
-        }
+        return Ok(0);
     }
 
     let mut revwalk = repo.revwalk().map_err(GitError::from)?;
@@ -72,7 +105,7 @@ pub fn select_pending_oids(
     revwalk.push(tip).map_err(GitError::from)?;
     revwalk.hide(since).map_err(GitError::from)?;
 
-    let mut oids = Vec::new();
+    let mut total = 0usize;
     let mut merge_sha = None;
     for oid in revwalk {
         let oid = oid.map_err(GitError::from)?;
@@ -80,10 +113,7 @@ pub fn select_pending_oids(
         if commit.parent_count() >= 2 && merge_sha.is_none() {
             merge_sha = Some(oid);
         }
-        oids.push(oid);
-        if oids.len() > cap {
-            return Err(unsupported(REASON_BACKLOG, DETAIL_BACKLOG));
-        }
+        total += 1;
     }
     if let Some(merge) = merge_sha {
         return Err(unsupported(
@@ -91,8 +121,82 @@ pub fn select_pending_oids(
             format!("{DETAIL_MERGE_DAG}: {merge}"),
         ));
     }
-    oids.reverse();
-    Ok(oids)
+    Ok(total)
+}
+
+/// Select the oldest-first pending batch from P→R, at most `cap` commits.
+///
+/// `since_sha` is hidden (the commit and its ancestors), not used as a
+/// visited-order stop. Merge commits fail closed. When the frontier exceeds
+/// `cap`, the first batch is returned with `has_more = true` instead of
+/// silently truncating without signaling continuation.
+pub fn select_pending_batch(
+    repo: &Repository,
+    since_sha: &str,
+    tip_sha: &str,
+    cap: usize,
+) -> Result<PendingBatch, GitError> {
+    let since = parse_commit(repo, since_sha)?;
+    let tip = parse_commit(repo, tip_sha)?;
+    ensure_descendant(repo, since, tip, since_sha, tip_sha)?;
+    if since == tip {
+        return Ok(PendingBatch {
+            commits: Vec::new(),
+            total: 0,
+            has_more: false,
+        });
+    }
+
+    let mut revwalk = repo.revwalk().map_err(GitError::from)?;
+    revwalk
+        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+        .map_err(GitError::from)?;
+    revwalk.push(tip).map_err(GitError::from)?;
+    revwalk.hide(since).map_err(GitError::from)?;
+
+    let mut frontier = Vec::new();
+    let mut merge_sha = None;
+    for oid in revwalk {
+        let oid = oid.map_err(GitError::from)?;
+        let commit = repo.find_commit(oid).map_err(GitError::from)?;
+        if commit.parent_count() >= 2 && merge_sha.is_none() {
+            merge_sha = Some(oid);
+        }
+        frontier.push(oid);
+    }
+    if let Some(merge) = merge_sha {
+        return Err(unsupported(
+            REASON_MERGE_DAG,
+            format!("{DETAIL_MERGE_DAG}: {merge}"),
+        ));
+    }
+    let total = frontier.len();
+    frontier.reverse();
+    let batch_len = total.min(cap);
+    let commits = frontier[..batch_len].to_vec();
+    Ok(PendingBatch {
+        commits,
+        total,
+        has_more: total > cap,
+    })
+}
+
+/// Commits reachable from `tip_sha` and not from `since_sha`, oldest first.
+///
+/// `since_sha` is hidden (the commit and its ancestors), not used as a
+/// visited-order stop. Merge commits fail closed. Overflow beyond `cap`
+/// fails closed for callers that require a complete pending set in one pass.
+pub fn select_pending_oids(
+    repo: &Repository,
+    since_sha: &str,
+    tip_sha: &str,
+    cap: usize,
+) -> Result<Vec<Oid>, GitError> {
+    let batch = select_pending_batch(repo, since_sha, tip_sha, cap)?;
+    if batch.has_more {
+        return Err(unsupported(REASON_BACKLOG, DETAIL_BACKLOG));
+    }
+    Ok(batch.commits)
 }
 
 #[cfg(test)]
@@ -323,6 +427,33 @@ mod tests {
             }
             other => panic!("expected backlog reject, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn batch_selection_signals_continuation_instead_of_silent_truncation() {
+        let linear = linear_repo(4);
+        let batch = select_pending_batch(
+            &linear.repo,
+            &linear.oids[0].to_string(),
+            &linear.oids[3].to_string(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(batch.total, 3);
+        assert!(batch.has_more);
+        assert_eq!(batch.commits, vec![linear.oids[1], linear.oids[2]]);
+    }
+
+    #[test]
+    fn verify_linear_pending_range_counts_full_frontier() {
+        let linear = linear_repo(4);
+        let total = verify_linear_pending_range(
+            &linear.repo,
+            &linear.oids[0].to_string(),
+            &linear.oids[3].to_string(),
+        )
+        .unwrap();
+        assert_eq!(total, 3);
     }
 
     #[test]

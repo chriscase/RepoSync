@@ -3601,46 +3601,158 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
     assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_over_1000_pending_commits_rejected() {
-    let fixture = QualifiedPair::new().await;
-    let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
-    let mut parent = fixture.imported_base.clone();
-    for index in 0..1001 {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&fixture.developer)
-            .args([
-                "commit-tree",
-                &tree,
-                "-p",
-                &parent,
-                "-m",
-                &format!("pending {index}"),
-            ])
-            .env("GIT_AUTHOR_NAME", "Fixture Developer")
-            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-            .env("GIT_COMMITTER_NAME", "Fixture Developer")
-            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "commit-tree: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        parent = String::from_utf8(output.stdout).unwrap().trim().to_string();
-    }
-    git_cli(
-        &fixture.developer,
-        &["update-ref", "refs/heads/main", &parent],
-    );
-    git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_pair_blocked_without_damage(&fixture, "unsupported_backlog").await;
+struct PendingCapGuard {
+    key: String,
 }
 
-/// Backlog durable blocks must survive restart and refuse even when the live
-/// remote later looks linear and admissible.
+impl PendingCapGuard {
+    fn new(cap: usize) -> Self {
+        let key = "REPOSYNC_TEST_PENDING_COMMIT_CAP".to_string();
+        std::env::set_var(&key, cap.to_string());
+        Self { key }
+    }
+}
+
+impl Drop for PendingCapGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(&self.key);
+    }
+}
+
+fn build_linear_commit_chain(fixture: &QualifiedPair, count: usize) -> (String, Vec<String>) {
+    let mut chain = Vec::new();
+    for index in 0..count {
+        let sha = fixture.developer_commit(
+            "backlog.txt",
+            &format!("pending line {index}\n"),
+            &format!("pending {index}"),
+        );
+        chain.push(sha);
+    }
+    let tip = chain.last().cloned().unwrap();
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    (tip, chain)
+}
+
+/// Linear histories beyond the reviewed replay cap continue in explicit
+/// oldest-first batches instead of failing with unsupported_backlog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_over_1000_pending_commits_rejected() {
+    let _cap = PendingCapGuard::new(3);
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let before = fixture.snapshot().await;
+    let (tip, chain) = build_linear_commit_chain(&fixture, 7);
+
+    let first = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        first.git_to_svn_count, 3,
+        "first batch must replay exactly cap commits"
+    );
+    let after_first = fixture.snapshot().await;
+    assert_eq!(after_first.watermark.1, chain[2]);
+    assert_eq!(after_first.svn_rev, before.svn_rev + 3);
+
+    let second = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        second.git_to_svn_count, 3,
+        "second batch continues the frontier"
+    );
+    let after_second = fixture.snapshot().await;
+    assert_eq!(after_second.watermark.1, chain[5]);
+
+    let third = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(third.git_to_svn_count, 1, "final batch drains the backlog");
+    let after_third = fixture.snapshot().await;
+    assert_eq!(after_third.watermark.1, tip);
+    assert_eq!(after_third.bridge_sha, tip);
+    assert_eq!(after_third.svn_rev, before.svn_rev + 7);
+
+    let idle = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((idle.git_to_svn_count, idle.svn_to_git_count), (0, 0));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_OVERFLOW",
+            "p":synced,
+            "r":tip,
+            "batch_cap":3,
+            "pending_total":7,
+            "batches":[3,3,1],
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":after_third.svn_rev,
+            "mapping_before":before.mapping_count,
+            "mapping_after":after_third.mapping_count,
+            "continuation":true
+        })
+    );
+}
+
+/// Continuation state is durable across restart via the handled Git checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_team_history_continuation_survives_restart() {
+    let _cap = PendingCapGuard::new(3);
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let before = fixture.snapshot().await;
+    let (tip, chain) = build_linear_commit_chain(&fixture, 7);
+
+    let first = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(first.git_to_svn_count, 3);
+    let mid = fixture.snapshot().await;
+    assert_eq!(mid.watermark.1, chain[2]);
+
+    let restarted = reopen_pair(&fixture);
+    let second = restarted.run_sync_cycle().await.unwrap();
+    assert_eq!(second.git_to_svn_count, 3);
+    let after_restart = fixture.snapshot().await;
+    assert_eq!(after_restart.watermark.1, chain[5]);
+
+    let third = restarted.run_sync_cycle().await.unwrap();
+    assert_eq!(third.git_to_svn_count, 1);
+    let done = fixture.snapshot().await;
+    assert_eq!(done.watermark.1, tip);
+    assert_eq!(done.svn_rev, before.svn_rev + 7);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_TEAM_CONTINUATION_RESTART",
+            "p":synced,
+            "r":tip,
+            "batch_cap":3,
+            "pending_total":7,
+            "checkpoint_after_first_batch":chain[2],
+            "checkpoint_after_restart_batch":chain[5],
+            "checkpoint_final":tip,
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":done.svn_rev,
+            "restart_mid_continuation":true
+        })
+    );
+}
+
+/// Legacy unsupported_backlog durable blocks must survive restart and refuse
+/// even when the live remote later looks linear and admissible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_durable_backlog_block_survives_restart() {
     let fixture = QualifiedPair::new().await;
@@ -3655,39 +3767,24 @@ async fn candidate_r10_durable_backlog_block_survives_restart() {
             .git_to_svn_count,
         1
     );
-    let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
-    let mut parent = synced.clone();
-    for index in 0..1001 {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&fixture.developer)
-            .args([
-                "commit-tree",
-                &tree,
-                "-p",
-                &parent,
-                "-m",
-                &format!("pending {index}"),
-            ])
-            .env("GIT_AUTHOR_NAME", "Fixture Developer")
-            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-            .env("GIT_COMMITTER_NAME", "Fixture Developer")
-            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        parent = String::from_utf8(output.stdout).unwrap().trim().to_string();
-    }
-    git_cli(
-        &fixture.developer,
-        &["update-ref", "refs/heads/main", &parent],
-    );
-    git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_pair_blocked_without_damage(&fixture, "unsupported_backlog").await;
-    let blocked_record = history_block_json(&fixture);
-    assert_eq!(blocked_record["durable"], true);
-    assert_eq!(blocked_record["p_handled"], synced);
-    assert_eq!(blocked_record["r_fresh_remote"], parent);
+    let (blocked_tip, _) = build_linear_commit_chain(&fixture, 7);
+    let block = serde_json::json!({
+        "state": "reconciliation_required",
+        "reason": "unsupported_backlog",
+        "detail": reposync_core::pending_frontier::DETAIL_BACKLOG,
+        "repo_id": fixture.repo_id,
+        "p_handled": synced,
+        "r_fresh_remote": blocked_tip,
+        "durable": true,
+    });
+    fixture
+        .engine
+        .db()
+        .set_state(
+            &format!("team_history_block_{}", fixture.repo_id),
+            &block.to_string(),
+        )
+        .unwrap();
     let quarantined = fixture.snapshot().await;
 
     git_cli(&fixture.developer, &["reset", "--hard", &synced]);
@@ -3711,6 +3808,8 @@ async fn candidate_r10_durable_backlog_block_survives_restart() {
         ),
         "restored linear remote must still be refused from the durable block: {result:?}"
     );
+    let still = history_block_json(&fixture);
+    assert_eq!(still["r_fresh_remote"], blocked_tip);
     assert_eq!(fixture.snapshot().await.svn_rev, quarantined.svn_rev);
     assert_eq!(fixture.snapshot().await.watermark, quarantined.watermark);
     eprintln!(
@@ -3718,11 +3817,12 @@ async fn candidate_r10_durable_backlog_block_survives_restart() {
         serde_json::json!({
             "case":"R10_DURABLE_BACKLOG_BLOCK",
             "p":synced,
-            "blocked_r":parent,
+            "blocked_r":blocked_tip,
             "restored_remote":synced,
             "reason":"unsupported_backlog",
             "durable":true,
             "restart_without_live_backlog":true,
+            "seeded_legacy_block":true,
             "svn_revision_before_after":quarantined.svn_rev,
             "watermark_before_after":quarantined.watermark
         })

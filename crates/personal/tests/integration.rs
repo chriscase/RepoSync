@@ -2954,6 +2954,22 @@ async fn candidate_r09_personal_rewrite_contained() {
         format!("{again:#}").contains("non_fast_forward"),
         "{again:#}"
     );
+    let still = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .unwrap();
+    let still_block: serde_json::Value = serde_json::from_str(&still).unwrap();
+    assert_eq!(still_block["r_fresh_remote"], rewritten);
+    let commit_map_len = Database::new(&db_path)
+        .unwrap()
+        .list_commit_map(10_000)
+        .unwrap()
+        .len();
+    assert_eq!(
+        commit_map_len, 1,
+        "rewrite must not add git_to_svn mappings"
+    );
     let svn_after = {
         let repo = svn_url.strip_prefix("file://").unwrap();
         String::from_utf8_lossy(
@@ -3180,6 +3196,22 @@ async fn candidate_r66_personal_merge_dag_contained() {
         format!("{again:#}").contains("unsupported_merge_dag"),
         "{again:#}"
     );
+    let still = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .unwrap();
+    let still_block: serde_json::Value = serde_json::from_str(&still).unwrap();
+    assert_eq!(still_block["r_fresh_remote"], merge_tip);
+    let commit_map_len = Database::new(&db_path)
+        .unwrap()
+        .list_commit_map(10_000)
+        .unwrap()
+        .len();
+    assert_eq!(
+        commit_map_len, 1,
+        "merge DAG must not add git_to_svn mappings"
+    );
     assert_eq!(svn_youngest(&svn_url), svn_before);
     assert_eq!(git_sha(&git_work), handled);
     eprintln!(
@@ -3191,6 +3223,226 @@ async fn candidate_r66_personal_merge_dag_contained() {
             "restored_remote":handled,
             "reason":"unsupported_merge_dag",
             "durable":true,
+            "svn_revision_before_after":svn_before,
+            "mode":"personal",
+            "inspection_refs_retargeted":true
+        })
+    );
+}
+
+fn build_personal_linear_chain(
+    git_work: &Path,
+    parent: &str,
+    count: usize,
+) -> (String, Vec<String>) {
+    let tree = {
+        let output = Command::new("git")
+            .args(["-C", git_work.to_str().unwrap(), "rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let mut tip = parent.to_string();
+    let mut chain = Vec::new();
+    for index in 0..count {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(git_work)
+            .args([
+                "commit-tree",
+                &tree,
+                "-p",
+                &tip,
+                "-m",
+                &format!("pending {index}"),
+            ])
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        tip = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        chain.push(tip.clone());
+    }
+    (tip, chain)
+}
+
+/// Qualified linear histories beyond the replay cap are admitted at inspect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_personal_linear_over_1000_admitted() {
+    use reposync_core::history_inspect::inspect_personal_history;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+
+    let git_work = tmp.path().join("git_work");
+    let _bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &_bare);
+    std::fs::write(git_work.join("feature.txt"), "first version\n").unwrap();
+    git_client
+        .commit(
+            "First Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let handled = git_sha(&git_work);
+    let (remote_tip, _) = build_personal_linear_chain(&git_work, &handled, 1001);
+    git_cmd(&git_work, &["update-ref", "refs/heads/main", &remote_tip]);
+    git_client.push("origin", "main").unwrap();
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    drop(git_client);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+
+    let admission = inspect_personal_history(&db, &git_work, "main", "personal")
+        .expect("qualified linear backlog must be admitted");
+    let admission = admission.expect("origin remote and handled checkpoint require inspection");
+    assert_eq!(admission.checkpoint, handled);
+    assert_eq!(admission.remote_tip, remote_tip);
+    assert!(
+        db.get_state(&reposync_core::history_inspect::history_block_key(Some(
+            "personal"
+        )))
+        .unwrap()
+        .is_none(),
+        "admitted backlog must not record a durable block"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_PERSONAL_LINEAR_OVER_1000",
+            "p":handled,
+            "r":remote_tip,
+            "pending_total":1001,
+            "mode":"personal"
+        })
+    );
+}
+
+/// Legacy unsupported_backlog durable blocks survive personal restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_personal_backlog_block_survives_restart() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::history_block_key;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("feature.txt"), "first version\n").unwrap();
+    git_client
+        .commit(
+            "First Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let handled = git_sha(&git_work);
+    let (blocked_tip, _) = build_personal_linear_chain(&git_work, &handled, 7);
+    git_cmd(&git_work, &["update-ref", "refs/heads/main", &blocked_tip]);
+    git_client.push("origin", "main").unwrap();
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    drop(git_client);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+    db.set_state(
+        &history_block_key(Some("personal")),
+        &serde_json::json!({
+            "state": "reconciliation_required",
+            "reason": "unsupported_backlog",
+            "detail": reposync_core::pending_frontier::DETAIL_BACKLOG,
+            "repo_id": "personal",
+            "p_handled": handled,
+            "r_fresh_remote": blocked_tip,
+            "durable": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drop(db);
+
+    let config = make_test_config(&svn_url, tmp.path());
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    let restore_ref = format!("{handled}:refs/heads/main");
+    git_cmd(&git_work, &["push", "--force", "origin", &restore_ref]);
+    assert_eq!(git_sha_at(&bare, "refs/heads/main"), handled);
+    retarget_personal_remote_observation(&git_work, &handled, "main");
+
+    let restarted = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let again = restarted
+        .run_cycle()
+        .await
+        .expect_err("legacy backlog durable block must survive restored remote");
+    assert!(
+        format!("{again:#}").contains("unsupported_backlog"),
+        "{again:#}"
+    );
+    let still = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .unwrap();
+    let still_block: serde_json::Value = serde_json::from_str(&still).unwrap();
+    assert_eq!(still_block["r_fresh_remote"], blocked_tip);
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    assert_eq!(git_sha(&git_work), handled);
+    let commit_map_len = Database::new(&db_path)
+        .unwrap()
+        .list_commit_map(10_000)
+        .unwrap()
+        .len();
+    assert_eq!(commit_map_len, 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_PERSONAL_BACKLOG_RESTART",
+            "p":handled,
+            "blocked_r":blocked_tip,
+            "restored_remote":handled,
+            "reason":"unsupported_backlog",
+            "durable":true,
+            "seeded_legacy_block":true,
             "svn_revision_before_after":svn_before,
             "mode":"personal",
             "inspection_refs_retargeted":true
