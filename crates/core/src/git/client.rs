@@ -566,8 +566,10 @@ impl GitClient {
     /// Pending commits on the ancestry frontier from `since_sha` to `tip_sha`.
     ///
     /// Uses hide/push (`since..tip`), not a visited-order stop at `since_sha`.
-    /// Merge DAGs fail closed. Linear overflow returns the oldest-first replay
-    /// batch with `has_more` set instead of silently truncating.
+    /// Qualified merge DAGs replay in deterministic oldest-first topological
+    /// order when the full frontier fits in one batch. Linear overflow returns
+    /// the oldest-first replay batch with `has_more` set. Merge-DAG overflow
+    /// fails closed because a single Git SHA cannot checkpoint a DAG cut.
     pub fn pending_commits_between(
         &self,
         since_sha: &str,
@@ -585,7 +587,7 @@ impl GitClient {
                 detail: crate::pending_frontier::DETAIL_MERGE_DAG.into(),
             });
         }
-        let cap = max_commits.unwrap_or_else(crate::pending_frontier::effective_pending_commit_cap);
+        let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
         let batch =
             crate::pending_frontier::select_pending_batch(&self.repo, since_sha, tip_sha, cap)?;
         if batch.has_more {
@@ -601,10 +603,23 @@ impl GitClient {
             let commit = self.repo.find_commit(oid)?;
             commits.push(git_commit_info(&commit));
         }
-        let batch_tip = commits
-            .last()
-            .map(|commit| commit.sha.clone())
-            .unwrap_or_else(|| tip_sha.to_string());
+        let batch_tip = if batch.has_more {
+            let Some(last) = commits.last() else {
+                return Err(GitError::UnsupportedHistory {
+                    reason: crate::pending_frontier::REASON_BACKLOG.into(),
+                    detail: format!(
+                        "{}: empty continuation batch",
+                        crate::pending_frontier::DETAIL_BACKLOG
+                    ),
+                });
+            };
+            last.sha.clone()
+        } else {
+            commits
+                .last()
+                .map(|commit| commit.sha.clone())
+                .unwrap_or_else(|| tip_sha.to_string())
+        };
         debug!(
             count = commits.len(),
             total = batch.total,
@@ -628,8 +643,9 @@ impl GitClient {
         &self,
         since_sha: &str,
         tip_sha: &str,
+        max_commits: Option<usize>,
     ) -> Result<Vec<GitCommitInfo>, GitError> {
-        let replay = self.pending_commits_between(since_sha, tip_sha, None)?;
+        let replay = self.pending_commits_between(since_sha, tip_sha, max_commits)?;
         if !replay.has_more {
             return Ok(replay.commits);
         }

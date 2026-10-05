@@ -113,9 +113,9 @@
     {
       "id": "R10_MERGE",
       "binary": "team_mode_e2e",
-      "test": "candidate_r10_merge_dag_rejected_before_replay",
+      "test": "candidate_r10_merge_dag_replayed",
       "tier": "candidate_regression",
-      "supporting_note": "hide/push frontier proof is pending_frontier::hide_push_frontier_includes_older_pending_side, not candidate_r10_merge_dag_older_side_not_silently_skipped"
+      "supporting_note": "older-side engine replay proof is candidate_r10_merge_dag_older_side_replayed_with_delta; merge-DAG continuation fail-closed proof is candidate_r10_merge_dag_continuation_fail_closed_before_writes and cap=1/2 siblings; visited-order skip proof is pending_frontier::visited_order_truncation_skips_older_pending_side"
     },
     {
       "id": "R10_DURABLE_UNSUPPORTED_BLOCK",
@@ -138,7 +138,7 @@
     {
       "id": "R10_OVERFLOW",
       "binary": "team_mode_e2e",
-      "test": "candidate_r10_over_1000_pending_commits_rejected",
+      "test": "candidate_r10_over_1000_pending_commits_batched",
       "tier": "candidate_regression"
     },
     {

@@ -443,8 +443,7 @@ pub fn inspect_fetched_history(
             "pending Git repository could not be opened"
         ),
     };
-    match crate::pending_frontier::verify_linear_pending_range(&inspect_repo, checkpoint, &fetched)
-    {
+    match crate::pending_frontier::verify_pending_range(&inspect_repo, checkpoint, &fetched) {
         Ok(_) => {}
         Err(crate::errors::GitError::UnsupportedHistory { reason, detail }) => {
             blocked!(reason, detail);

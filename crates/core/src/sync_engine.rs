@@ -114,6 +114,12 @@ pub struct SyncStats {
     pub recent_messages: Vec<String>,
     /// Rich commit details for Teams notifications (max 10).
     pub synced_commits: Vec<SyncedCommit>,
+    /// True when Git replay continuation is incomplete after this cycle.
+    pub git_replay_has_more: bool,
+    /// Total pending Git commits on the admitted P→R frontier.
+    pub git_pending_total: usize,
+    /// True when the cycle deferred because Git continuation overlapped SVN work.
+    pub deferred_mixed_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +164,9 @@ pub struct SyncEngine {
     allowed_paths: Vec<String>,
     /// Blocked path patterns for Git-to-SVN sync. Empty means no blocked patterns.
     blocked_patterns: Vec<String>,
+    /// Fixture-only replay batch cap override (debug builds).
+    #[cfg(debug_assertions)]
+    pending_commit_cap_override: std::sync::Mutex<Option<usize>>,
 }
 
 impl SyncEngine {
@@ -182,6 +191,25 @@ impl SyncEngine {
             lfs_threshold_bytes: 0,
             allowed_paths: Vec::new(),
             blocked_patterns: Vec::new(),
+            #[cfg(debug_assertions)]
+            pending_commit_cap_override: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Install a per-engine replay batch cap for fixture tests.
+    #[cfg(debug_assertions)]
+    pub fn set_pending_commit_cap_override(&self, cap: Option<usize>) {
+        *self.pending_commit_cap_override.lock().unwrap() = cap;
+    }
+
+    fn replay_batch_cap(&self) -> Option<usize> {
+        #[cfg(debug_assertions)]
+        {
+            return *self.pending_commit_cap_override.lock().unwrap();
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
         }
     }
 
@@ -1120,6 +1148,10 @@ impl SyncEngine {
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
         let git_fetch = self.fetch_git_changes(&admission, &svn_changes).await?;
+
+        stats.git_replay_has_more = git_fetch.has_more;
+        stats.git_pending_total = git_fetch.pending_total;
+        stats.deferred_mixed_pending = git_fetch.deferred_mixed_pending;
 
         if git_fetch.deferred_mixed_pending {
             info!(
@@ -3094,10 +3126,11 @@ impl SyncEngine {
         info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
 
         // Select P..R from the pinned inspection objects before reset so a
-        // visited-order HEAD walk cannot skip older pending work, and so an
-        // unqualified merge still fails closed with no mutation.
+        // visited-order HEAD walk cannot skip older pending work. Unsupported
+        // merge-DAG continuation batches fail closed with no mutation.
+        let batch_cap = self.replay_batch_cap();
         let selection = git
-            .pending_commits_between(&admission.checkpoint, &admission.remote_tip, None)
+            .pending_commits_between(&admission.checkpoint, &admission.remote_tip, batch_cap)
             .map_err(|error| match error {
                 crate::errors::GitError::UnsupportedHistory { reason, detail } => self
                     .record_history_block(
@@ -3123,7 +3156,11 @@ impl SyncEngine {
         }
 
         let conflict_commits = git
-            .pending_commits_for_conflict_coverage(&admission.checkpoint, &admission.remote_tip)
+            .pending_commits_for_conflict_coverage(
+                &admission.checkpoint,
+                &admission.remote_tip,
+                batch_cap,
+            )
             .map_err(SyncError::GitError)?;
 
         let reset_target = if selection.has_more {

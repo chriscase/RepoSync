@@ -2,10 +2,14 @@
 //!
 //! The pending set from handled checkpoint `P` to tip `R` is commits reachable
 //! from `R` and not from `P` (`P..R`). A revwalk that stops when `P` is first
-//! visited can omit older pending commits on other merge parents. Unqualified
-//! merge DAGs fail closed. Linear backlogs over the reviewed cap are admitted
-//! at inspect time and replayed in explicit oldest-first batches of at most
-//! [`DEFAULT_PENDING_COMMIT_CAP`] commits per cycle.
+//! visited can omit older pending commits on other merge parents. Qualified
+//! merge DAGs replay in deterministic oldest-first topological order when the
+//! full frontier fits in one batch. Linear backlogs over the reviewed cap
+//! continue in explicit batches of at most [`DEFAULT_PENDING_COMMIT_CAP`]
+//! commits per cycle; merge-DAG backlogs that exceed the cap fail closed
+//! because a single Git SHA cannot checkpoint a cut through the DAG.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use git2::{Oid, Repository, Sort};
 
@@ -14,39 +18,14 @@ use crate::errors::GitError;
 /// Reviewed pending-commit batch size for replay continuation.
 pub const DEFAULT_PENDING_COMMIT_CAP: usize = 1000;
 
-/// Replay batch cap, overridable in debug builds for fixture tests.
-pub fn effective_pending_commit_cap() -> usize {
-    #[cfg(debug_assertions)]
-    if let Some(cap) = test_pending_commit_cap_override() {
-        return cap;
-    }
-    DEFAULT_PENDING_COMMIT_CAP
-}
-
-#[cfg(debug_assertions)]
-std::thread_local! {
-    static TEST_PENDING_COMMIT_CAP: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Install a per-thread replay cap for fixture tests.
-#[cfg(debug_assertions)]
-pub fn set_test_pending_commit_cap(cap: Option<usize>) {
-    TEST_PENDING_COMMIT_CAP.set(cap);
-}
-
-#[cfg(debug_assertions)]
-fn test_pending_commit_cap_override() -> Option<usize> {
-    TEST_PENDING_COMMIT_CAP.get()
-}
-
 pub const REASON_MERGE_DAG: &str = "unsupported_merge_dag";
 pub const REASON_BACKLOG: &str = "unsupported_backlog";
 pub const REASON_UNPROVEN_RANGE: &str = "unproven_pending_range";
 
-pub const DETAIL_MERGE_DAG: &str = "pending Git history contains a merge commit";
+pub const DETAIL_MERGE_DAG: &str =
+    "merge-DAG history blocked: seeded operator block, fetch-time fault, unordered frontier, or overflow exceeding the replay cap";
 pub const DETAIL_BACKLOG: &str =
-    "more than 1000 pending Git commits require a reviewed continuation algorithm";
+    "legacy durable block; linear continuation replays in oldest-first batches";
 
 /// Result of a capped pending-commit batch selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +74,116 @@ fn ensure_descendant(
     }
 }
 
+/// Collect every commit on the P→R frontier via hide/push.
+fn collect_frontier_oids(repo: &Repository, since: Oid, tip: Oid) -> Result<Vec<Oid>, GitError> {
+    let mut revwalk = repo.revwalk().map_err(GitError::from)?;
+    revwalk
+        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+        .map_err(GitError::from)?;
+    revwalk.push(tip).map_err(GitError::from)?;
+    revwalk.hide(since).map_err(GitError::from)?;
+
+    let mut frontier = Vec::new();
+    for oid in revwalk {
+        frontier.push(oid.map_err(GitError::from)?);
+    }
+    Ok(frontier)
+}
+
+fn topo_sort_from_relations(
+    frontier: &[Oid],
+    mut in_degree: HashMap<Oid, usize>,
+    parents_in_frontier: HashMap<Oid, Vec<Oid>>,
+    mut sort_key: impl FnMut(&Oid) -> Result<(i64, Oid), GitError>,
+) -> Result<Vec<Oid>, GitError> {
+    let mut ready: BTreeSet<(i64, Oid)> = frontier
+        .iter()
+        .filter(|oid| in_degree.get(oid).copied() == Some(0))
+        .map(&mut sort_key)
+        .collect::<Result<_, _>>()?;
+
+    let mut ordered = Vec::with_capacity(frontier.len());
+    while let Some((_, oid)) = ready.pop_first() {
+        ordered.push(oid);
+        if let Some(children) = parents_in_frontier.get(&oid) {
+            for child in children {
+                let degree = in_degree.get_mut(child).ok_or_else(|| {
+                    unsupported(
+                        REASON_MERGE_DAG,
+                        format!("{DETAIL_MERGE_DAG}: missing frontier child {child}"),
+                    )
+                })?;
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.insert(sort_key(child)?);
+                }
+            }
+        }
+    }
+
+    if ordered.len() != frontier.len() {
+        return Err(unsupported(
+            REASON_MERGE_DAG,
+            format!("{DETAIL_MERGE_DAG}: pending frontier could not be topologically ordered"),
+        ));
+    }
+    Ok(ordered)
+}
+
+/// Deterministic oldest-first topological order for a pending frontier.
+///
+/// Parents precede children. Among ready commits, sort by committer time then
+/// OID so restart and batch boundaries are stable.
+fn topo_sort_oldest_first(repo: &Repository, frontier: &[Oid]) -> Result<Vec<Oid>, GitError> {
+    if frontier.is_empty() {
+        return Ok(Vec::new());
+    }
+    let set: HashSet<Oid> = frontier.iter().copied().collect();
+    let mut in_degree: HashMap<Oid, usize> = HashMap::new();
+    let mut parents_in_frontier: HashMap<Oid, Vec<Oid>> = HashMap::new();
+
+    for oid in frontier {
+        let commit = repo.find_commit(*oid).map_err(GitError::from)?;
+        let mut pending_parents = 0usize;
+        for index in 0..commit.parent_count() {
+            let parent = commit.parent_id(index).map_err(GitError::from)?;
+            if set.contains(&parent) {
+                pending_parents += 1;
+                parents_in_frontier.entry(parent).or_default().push(*oid);
+            }
+        }
+        in_degree.insert(*oid, pending_parents);
+    }
+
+    topo_sort_from_relations(frontier, in_degree, parents_in_frontier, |oid| {
+        let commit = repo.find_commit(*oid).map_err(GitError::from)?;
+        Ok((commit.time().seconds(), *oid))
+    })
+}
+
+/// Walk the full P→R frontier and return the pending commit count.
+///
+/// Qualified linear and merge-DAG histories are admitted at inspect time.
+pub fn verify_pending_range(
+    repo: &Repository,
+    since_sha: &str,
+    tip_sha: &str,
+) -> Result<usize, GitError> {
+    let since = parse_commit(repo, since_sha)?;
+    let tip = parse_commit(repo, tip_sha)?;
+    ensure_descendant(repo, since, tip, since_sha, tip_sha)?;
+    if since == tip {
+        return Ok(0);
+    }
+    let frontier = collect_frontier_oids(repo, since, tip)?;
+    topo_sort_oldest_first(repo, &frontier)?;
+    Ok(frontier.len())
+}
+
 /// Walk the full P→R frontier and verify it is a linear pending range.
 ///
-/// Merge commits fail closed. The total pending count may exceed the replay cap;
-/// inspect uses this to admit qualified linear histories before batch replay.
+/// Merge commits fail closed. Prefer [`verify_pending_range`] for inspect
+/// admission that includes merge-DAG replay.
 pub fn verify_linear_pending_range(
     repo: &Repository,
     since_sha: &str,
@@ -111,38 +196,37 @@ pub fn verify_linear_pending_range(
         return Ok(0);
     }
 
-    let mut revwalk = repo.revwalk().map_err(GitError::from)?;
-    revwalk
-        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
-        .map_err(GitError::from)?;
-    revwalk.push(tip).map_err(GitError::from)?;
-    revwalk.hide(since).map_err(GitError::from)?;
-
-    let mut total = 0usize;
-    let mut merge_sha = None;
-    for oid in revwalk {
-        let oid = oid.map_err(GitError::from)?;
-        let commit = repo.find_commit(oid).map_err(GitError::from)?;
-        if commit.parent_count() >= 2 && merge_sha.is_none() {
-            merge_sha = Some(oid);
+    let frontier = collect_frontier_oids(repo, since, tip)?;
+    for oid in &frontier {
+        let commit = repo.find_commit(*oid).map_err(GitError::from)?;
+        if commit.parent_count() >= 2 {
+            return Err(unsupported(
+                REASON_MERGE_DAG,
+                format!("{DETAIL_MERGE_DAG}: {oid}"),
+            ));
         }
-        total += 1;
     }
-    if let Some(merge) = merge_sha {
-        return Err(unsupported(
-            REASON_MERGE_DAG,
-            format!("{DETAIL_MERGE_DAG}: {merge}"),
-        ));
+    Ok(frontier.len())
+}
+
+/// Returns `true` when the pending frontier contains a merge commit.
+fn frontier_is_merge_dag(repo: &Repository, frontier: &[Oid]) -> Result<bool, GitError> {
+    for oid in frontier {
+        let commit = repo.find_commit(*oid).map_err(GitError::from)?;
+        if commit.parent_count() >= 2 {
+            return Ok(true);
+        }
     }
-    Ok(total)
+    Ok(false)
 }
 
 /// Select the oldest-first pending batch from P→R, at most `cap` commits.
 ///
 /// `since_sha` is hidden (the commit and its ancestors), not used as a
-/// visited-order stop. Merge commits fail closed. When the frontier exceeds
-/// `cap`, the first batch is returned with `has_more = true` instead of
-/// silently truncating without signaling continuation.
+/// visited-order stop. Qualified merge DAGs replay in deterministic
+/// topological order when the full frontier fits in one batch. Linear
+/// overflow returns the oldest-first prefix with `has_more = true`. Merge-DAG
+/// overflow fails closed because a single Git SHA cannot checkpoint a DAG cut.
 pub fn select_pending_batch(
     repo: &Repository,
     since_sha: &str,
@@ -160,45 +244,40 @@ pub fn select_pending_batch(
         });
     }
 
-    let mut revwalk = repo.revwalk().map_err(GitError::from)?;
-    revwalk
-        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
-        .map_err(GitError::from)?;
-    revwalk.push(tip).map_err(GitError::from)?;
-    revwalk.hide(since).map_err(GitError::from)?;
-
-    let mut frontier = Vec::new();
-    let mut merge_sha = None;
-    for oid in revwalk {
-        let oid = oid.map_err(GitError::from)?;
-        let commit = repo.find_commit(oid).map_err(GitError::from)?;
-        if commit.parent_count() >= 2 && merge_sha.is_none() {
-            merge_sha = Some(oid);
-        }
-        frontier.push(oid);
-    }
-    if let Some(merge) = merge_sha {
-        return Err(unsupported(
-            REASON_MERGE_DAG,
-            format!("{DETAIL_MERGE_DAG}: {merge}"),
-        ));
-    }
-    let total = frontier.len();
-    frontier.reverse();
+    let frontier = collect_frontier_oids(repo, since, tip)?;
+    let ordered = topo_sort_oldest_first(repo, &frontier)?;
+    let total = ordered.len();
     let batch_len = total.min(cap);
-    let commits = frontier[..batch_len].to_vec();
+    let commits = ordered[..batch_len].to_vec();
+    let has_more = total > cap;
+    if has_more {
+        if commits.is_empty() {
+            return Err(unsupported(
+                REASON_BACKLOG,
+                format!("{DETAIL_BACKLOG}: empty continuation batch"),
+            ));
+        }
+        if frontier_is_merge_dag(repo, &frontier)? {
+            return Err(unsupported(
+                REASON_MERGE_DAG,
+                format!(
+                    "{DETAIL_MERGE_DAG}: merge-DAG frontier of {total} commits exceeds cap {cap}"
+                ),
+            ));
+        }
+    }
     Ok(PendingBatch {
         commits,
         total,
-        has_more: total > cap,
+        has_more,
     })
 }
 
 /// Commits reachable from `tip_sha` and not from `since_sha`, oldest first.
 ///
 /// `since_sha` is hidden (the commit and its ancestors), not used as a
-/// visited-order stop. Merge commits fail closed. Overflow beyond `cap`
-/// fails closed for callers that require a complete pending set in one pass.
+/// visited-order stop. Overflow beyond `cap` fails closed for callers that
+/// require a complete pending set in one pass.
 pub fn select_pending_oids(
     repo: &Repository,
     since_sha: &str,
@@ -365,34 +444,43 @@ mod tests {
     #[test]
     fn hide_push_frontier_includes_older_pending_side() {
         let dag = older_side_merge_dag();
-        let error = select_pending_oids(
+        let batch = select_pending_batch(
             &dag.repo,
             &dag.p.to_string(),
             &dag.m.to_string(),
             DEFAULT_PENDING_COMMIT_CAP,
         )
-        .unwrap_err();
-        match error {
-            GitError::UnsupportedHistory { reason, detail } => {
-                assert_eq!(reason, REASON_MERGE_DAG);
-                assert!(detail.contains(&dag.m.to_string()), "{detail}");
-            }
-            other => panic!("expected merge-dag reject, got {other:?}"),
-        }
-        // The hide/push set (without the merge fail-closed) must include Z.
-        let mut revwalk = dag.repo.revwalk().unwrap();
-        revwalk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).unwrap();
-        revwalk.push(dag.m).unwrap();
-        revwalk.hide(dag.p).unwrap();
-        let mut frontier = Vec::new();
-        for oid in revwalk {
-            frontier.push(oid.unwrap());
-        }
-        assert!(frontier.contains(&dag.z), "frontier missing older side Z");
-        assert!(frontier.contains(&dag.y));
-        assert!(frontier.contains(&dag.b));
-        assert!(frontier.contains(&dag.m));
-        assert!(!frontier.contains(&dag.p));
+        .unwrap();
+        assert!(
+            batch.commits.contains(&dag.z),
+            "replay must include older side Z"
+        );
+        assert!(batch.commits.contains(&dag.y));
+        assert!(batch.commits.contains(&dag.b));
+        assert!(batch.commits.contains(&dag.m));
+        assert!(!batch.commits.contains(&dag.p));
+        assert_eq!(batch.commits.first(), Some(&dag.z), "Z is oldest pending");
+        assert_eq!(batch.commits.last(), Some(&dag.m), "merge tip is last");
+    }
+
+    #[test]
+    fn merge_dag_replay_order_is_deterministic() {
+        let dag = older_side_merge_dag();
+        let first = select_pending_batch(
+            &dag.repo,
+            &dag.p.to_string(),
+            &dag.m.to_string(),
+            DEFAULT_PENDING_COMMIT_CAP,
+        )
+        .unwrap();
+        let second = select_pending_batch(
+            &dag.repo,
+            &dag.p.to_string(),
+            &dag.m.to_string(),
+            DEFAULT_PENDING_COMMIT_CAP,
+        )
+        .unwrap();
+        assert_eq!(first.commits, second.commits);
     }
 
     #[test]
@@ -458,15 +546,88 @@ mod tests {
     }
 
     #[test]
-    fn verify_linear_pending_range_counts_full_frontier() {
+    fn verify_pending_range_counts_full_frontier() {
         let linear = linear_repo(4);
-        let total = verify_linear_pending_range(
+        let total = verify_pending_range(
             &linear.repo,
             &linear.oids[0].to_string(),
             &linear.oids[3].to_string(),
         )
         .unwrap();
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn verify_pending_range_admits_merge_dag() {
+        let dag = older_side_merge_dag();
+        let total =
+            verify_pending_range(&dag.repo, &dag.p.to_string(), &dag.m.to_string()).unwrap();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn merge_dag_continuation_batch_fails_closed_when_exceeds_cap() {
+        let dag = older_side_merge_dag();
+        for cap in [1, 2, 3] {
+            let error =
+                select_pending_batch(&dag.repo, &dag.p.to_string(), &dag.m.to_string(), cap)
+                    .unwrap_err();
+            match error {
+                GitError::UnsupportedHistory { reason, detail } => {
+                    assert_eq!(reason, REASON_MERGE_DAG);
+                    assert!(
+                        detail.contains("exceeds cap"),
+                        "cap={cap} unexpected detail: {detail}"
+                    );
+                }
+                other => panic!("cap={cap} expected merge-DAG reject, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn empty_continuation_batch_fails_closed() {
+        let linear = linear_repo(4);
+        let error = select_pending_batch(
+            &linear.repo,
+            &linear.oids[0].to_string(),
+            &linear.oids[3].to_string(),
+            0,
+        )
+        .unwrap_err();
+        match error {
+            GitError::UnsupportedHistory { reason, .. } => {
+                assert_eq!(reason, REASON_BACKLOG);
+            }
+            other => panic!("expected backlog reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_topo_order_fails_closed() {
+        let left = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let right = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let frontier = vec![left, right];
+        let mut in_degree = HashMap::new();
+        in_degree.insert(left, 1);
+        in_degree.insert(right, 1);
+        let mut parents_in_frontier = HashMap::new();
+        parents_in_frontier.insert(left, vec![right]);
+        parents_in_frontier.insert(right, vec![left]);
+        let error = topo_sort_from_relations(&frontier, in_degree, parents_in_frontier, |oid| {
+            Ok((oid.as_bytes()[0] as i64, *oid))
+        })
+        .unwrap_err();
+        match error {
+            GitError::UnsupportedHistory { reason, detail } => {
+                assert_eq!(reason, REASON_MERGE_DAG);
+                assert!(
+                    detail.contains("could not be topologically ordered"),
+                    "unexpected detail: {detail}"
+                );
+            }
+            other => panic!("expected merge-DAG reject, got {other:?}"),
+        }
     }
 
     #[test]

@@ -3531,8 +3531,9 @@ async fn candidate_r09_local_dirty_index_and_unpublished_commit_preserved() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_rejected_before_replay() {
+async fn candidate_r10_merge_dag_replayed() {
     let fixture = QualifiedPair::new().await;
+    let before = fixture.snapshot().await;
     git_cli(&fixture.developer, &["checkout", "-b", "side"]);
     fixture.developer_commit("side.txt", "side\n", "Side change");
     git_cli(&fixture.developer, &["checkout", "main"]);
@@ -3541,13 +3542,147 @@ async fn candidate_r10_merge_dag_rejected_before_replay() {
         &fixture.developer,
         &["merge", "--no-ff", "side", "-m", "Merge side"],
     );
+    let merge_tip = get_head_sha(&fixture.developer);
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    let after = fixture.snapshot().await;
+    assert_eq!(
+        stats.git_to_svn_count, 2,
+        "side and main carry file deltas; the no-ff merge commit is an empty checkpoint"
+    );
+    assert_eq!(after.watermark.1, merge_tip);
+    assert_eq!(after.bridge_sha, merge_tip);
+    assert_eq!(after.svn_rev, before.svn_rev + 2);
+    assert!(
+        after.mapping_count >= before.mapping_count + 2,
+        "each replayed commit must checkpoint, including the empty merge"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_MERGE",
+            "p":before.watermark.1,
+            "r":merge_tip,
+            "git_to_svn_count":2,
+            "svn_deltas":2,
+            "checkpoint_final":merge_tip,
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":after.svn_rev,
+            "mapping_before":before.mapping_count,
+            "mapping_after":after.mapping_count,
+            "merge_dag_replayed":true
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
+async fn candidate_r10_merge_dag_older_side_replayed_with_delta() {
     let fixture = QualifiedPair::new().await;
+    let checkpoint = fixture.imported_base.clone();
+    let commit_tree = |tree: &str, parents: &[&str], message: &str, unix: i64| -> String {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&fixture.developer)
+            .args(["commit-tree", tree, "-m", message]);
+        for parent in parents {
+            command.args(["-p", parent]);
+        }
+        let output = command
+            .env("GIT_AUTHOR_NAME", "Fixture Developer")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture Developer")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .env("GIT_AUTHOR_DATE", unix.to_string())
+            .env("GIT_COMMITTER_DATE", unix.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "commit-tree {message}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    // Unrelated older root Z is reachable from merge M but not from P, so a
+    // visited-order stop at P can omit it. Hide/push still lists Z.
+    std::fs::write(fixture.developer.join("z-side.txt"), "older side delta\n").unwrap();
+    git_cli(&fixture.developer, &["add", "z-side.txt"]);
+    let z_tree = git_output(&fixture.developer, &["write-tree"]);
+    git_cli(&fixture.developer, &["reset", "--hard", &checkpoint]);
+    let z = commit_tree(&z_tree, &[], "Z old side", 1_000_000_000);
+    let y = commit_tree(&z_tree, &[&z], "Y old side", 1_000_000_001);
+    std::fs::write(fixture.developer.join("b-side.txt"), "mainline delta\n").unwrap();
+    git_cli(&fixture.developer, &["add", "b-side.txt"]);
+    let b_tree = git_output(&fixture.developer, &["write-tree"]);
+    git_cli(&fixture.developer, &["reset", "--hard", &checkpoint]);
+    let b = commit_tree(&b_tree, &[&checkpoint], "B mainline", 2_000_000_000);
+    git_cli(&fixture.developer, &["reset", "--hard", &checkpoint]);
+    std::fs::write(fixture.developer.join("z-side.txt"), "older side delta\n").unwrap();
+    std::fs::write(fixture.developer.join("b-side.txt"), "mainline delta\n").unwrap();
+    git_cli(&fixture.developer, &["add", "z-side.txt", "b-side.txt"]);
+    let merge_tree = git_output(&fixture.developer, &["write-tree"]);
+    let merge = commit_tree(&merge_tree, &[&b, &y], "Merge older side", 2_000_000_001);
+    git_cli(
+        &fixture.developer,
+        &["update-ref", "refs/heads/main", &merge],
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let pending = git_output(
+        &fixture.developer,
+        &[
+            "rev-list",
+            "--topo-order",
+            &format!("{checkpoint}..{merge}"),
+        ],
+    );
+    assert!(
+        pending.lines().any(|line| line == z),
+        "ancestry frontier must include older pending {z}; pending={pending}"
+    );
+    let before = fixture.snapshot().await;
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    let after = fixture.snapshot().await;
+    assert!(
+        stats.git_to_svn_count >= 1,
+        "older side Z must produce a Git→SVN write, not just checkpoint ordering"
+    );
+    assert_eq!(
+        after.watermark.1, merge,
+        "older side Z, Y, mainline B, and merge must all checkpoint without skipping Z"
+    );
+    assert_eq!(after.bridge_sha, merge);
+    assert!(
+        after.mapping_count > before.mapping_count,
+        "Z-side delta must advance mappings when replayed"
+    );
+    let svn_tree = svn_tree(&fixture, after.svn_rev).await;
+    assert_eq!(
+        svn_tree.get("z-side.txt").map(|content| content.as_slice()),
+        Some(b"older side delta\n".as_ref()),
+        "Z-side tree delta must be present in SVN, not only mainline B"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_MERGE_OLDER_SIDE",
+            "p":checkpoint,
+            "r":merge,
+            "older_side":z,
+            "git_to_svn_count":stats.git_to_svn_count,
+            "checkpoint_final":merge,
+            "pending_commits":4,
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":after.svn_rev,
+            "mapping_before":before.mapping_count,
+            "mapping_after":after.mapping_count,
+            "z_side_in_svn":true,
+            "older_side_replayed":true
+        })
+    );
+}
+
+async fn push_older_side_merge_dag_fixture(fixture: &QualifiedPair) -> (String, String, String) {
     let checkpoint = fixture.imported_base.clone();
     let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
     let commit_tree = |parents: &[&str], message: &str, unix: i64| -> String {
@@ -3575,8 +3710,6 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     };
-    // Unrelated older root Z is reachable from merge M but not from P, so a
-    // visited-order stop at P can omit it. Hide/push still lists Z.
     let z = commit_tree(&[], "Z old side", 1_000_000_000);
     let y = commit_tree(&[&z], "Y old side", 1_000_000_001);
     let b = commit_tree(&[&checkpoint], "B mainline", 2_000_000_000);
@@ -3586,38 +3719,72 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
         &["update-ref", "refs/heads/main", &merge],
     );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    let pending = git_output(
-        &fixture.developer,
-        &[
-            "rev-list",
-            "--topo-order",
-            &format!("{checkpoint}..{merge}"),
-        ],
-    );
-    assert!(
-        pending.lines().any(|line| line == z),
-        "ancestry frontier must include older pending {z}; pending={pending}"
-    );
+    (checkpoint, z, merge)
+}
+
+async fn assert_merge_dag_continuation_fail_closed_before_writes(cap: usize) {
+    let fixture = QualifiedPair::new().await;
+    let _cap_guard = PendingCapGuard::new(&fixture.engine, cap);
+    let (checkpoint, z, merge) = push_older_side_merge_dag_fixture(&fixture).await;
     assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
+    let block = history_block_json(&fixture);
+    assert!(
+        block["detail"].as_str().unwrap().contains("exceeds cap"),
+        "block detail must explain merge-DAG overflow: {block}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_MERGE_DAG_CONTINUATION_FAIL_CLOSED",
+            "p":checkpoint,
+            "r":merge,
+            "older_side":z,
+            "reason":"unsupported_merge_dag",
+            "pending_cap":cap,
+            "pending_commits":4,
+            "durable":true,
+            "before_writes":true,
+            "merge_dag_overflow_fail_closed":true
+        })
+    );
 }
 
-struct PendingCapGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+/// Merge-DAG backlogs that exceed the replay cap fail closed before writes
+/// because a single Git SHA cannot checkpoint a cut through the DAG.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
+    assert_merge_dag_continuation_fail_closed_before_writes(3).await;
 }
 
-static PENDING_CAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_cap1_before_writes() {
+    assert_merge_dag_continuation_fail_closed_before_writes(1).await;
+}
 
-impl PendingCapGuard {
-    fn new(cap: usize) -> Self {
-        let _lock = PENDING_CAP_LOCK.lock().unwrap();
-        reposync_core::pending_frontier::set_test_pending_commit_cap(Some(cap));
-        Self { _lock }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_cap2_before_writes() {
+    assert_merge_dag_continuation_fail_closed_before_writes(2).await;
+}
+
+struct PendingCapGuard<'a> {
+    engine: &'a SyncEngine,
+    cap: usize,
+}
+
+impl<'a> PendingCapGuard<'a> {
+    fn new(engine: &'a SyncEngine, cap: usize) -> Self {
+        engine.set_pending_commit_cap_override(Some(cap));
+        Self { engine, cap }
+    }
+
+    fn apply_to(&self, engine: &SyncEngine) {
+        engine.set_pending_commit_cap_override(Some(self.cap));
     }
 }
 
-impl Drop for PendingCapGuard {
+impl Drop for PendingCapGuard<'_> {
     fn drop(&mut self) {
-        reposync_core::pending_frontier::set_test_pending_commit_cap(None);
+        self.engine.set_pending_commit_cap_override(None);
     }
 }
 
@@ -3639,9 +3806,9 @@ fn build_linear_commit_chain(fixture: &QualifiedPair, count: usize) -> (String, 
 /// Linear histories beyond the reviewed replay cap continue in explicit
 /// oldest-first batches instead of failing with unsupported_backlog.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_over_1000_pending_commits_rejected() {
-    let _cap = PendingCapGuard::new(3);
+async fn candidate_r10_over_1000_pending_commits_batched() {
     let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -3681,6 +3848,11 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
     assert_eq!(after_third.watermark.1, tip);
     assert_eq!(after_third.bridge_sha, tip);
     assert_eq!(after_third.svn_rev, before.svn_rev + 7);
+    assert_eq!(
+        after_third.mapping_count,
+        before.mapping_count + 7,
+        "each replayed Git commit must add a mapping"
+    );
 
     let idle = fixture.engine.run_sync_cycle().await.unwrap();
     assert_eq!((idle.git_to_svn_count, idle.svn_to_git_count), (0, 0));
@@ -3697,6 +3869,7 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
             "svn_revision_final":after_third.svn_rev,
             "mapping_before":before.mapping_count,
             "mapping_after":after_third.mapping_count,
+            "mapping_delta":7,
             "continuation":true
         })
     );
@@ -3706,8 +3879,8 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
 /// whole cycle with no bridge reset and no opposite-direction writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r66_continuation_mixed_pending_fail_closed() {
-    let _cap = PendingCapGuard::new(3);
     let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -3735,6 +3908,9 @@ async fn candidate_r66_continuation_mixed_pending_fail_closed() {
         (0, 0),
         "mixed pending must defer the cycle with no mutation"
     );
+    assert!(stats.git_replay_has_more, "continuation must be visible");
+    assert!(stats.deferred_mixed_pending, "deferral must be visible");
+    assert_eq!(stats.git_pending_total, 7);
     let after = fixture.snapshot().await;
     assert_eq!(after.svn_rev, before.svn_rev);
     assert_eq!(after.watermark, before.watermark);
@@ -3768,8 +3944,8 @@ async fn candidate_r66_continuation_mixed_pending_fail_closed() {
 /// Continuation state is durable across restart via the handled Git checkpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r66_team_history_continuation_survives_restart() {
-    let _cap = PendingCapGuard::new(3);
     let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     assert_eq!(
@@ -3790,6 +3966,7 @@ async fn candidate_r66_team_history_continuation_survives_restart() {
     assert_eq!(mid.watermark.1, chain[2]);
 
     let restarted = reopen_pair(&fixture);
+    _cap.apply_to(&restarted);
     let second = restarted.run_sync_cycle().await.unwrap();
     assert_eq!(second.git_to_svn_count, 3);
     let after_restart = fixture.snapshot().await;
@@ -3896,8 +4073,8 @@ async fn candidate_r10_durable_backlog_block_survives_restart() {
     );
 }
 
-/// Unsupported-history blocks must survive restart and refuse even when the
-/// live remote later looks linear and admissible.
+/// Legacy unsupported_merge_dag durable blocks must survive restart and refuse
+/// even when the live remote later looks linear and admissible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_durable_unsupported_history_block_survives_restart() {
     let fixture = QualifiedPair::new().await;
@@ -3922,12 +4099,23 @@ async fn candidate_r10_durable_unsupported_history_block_survives_restart() {
     );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
     let merge_tip = get_head_sha(&fixture.developer);
-    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
-    let blocked_record = history_block_json(&fixture);
-    assert_eq!(blocked_record["state"], "reconciliation_required");
-    assert_eq!(blocked_record["durable"], true);
-    assert_eq!(blocked_record["p_handled"], synced);
-    assert_eq!(blocked_record["r_fresh_remote"], merge_tip);
+    let block = serde_json::json!({
+        "state": "reconciliation_required",
+        "reason": "unsupported_merge_dag",
+        "detail": reposync_core::pending_frontier::DETAIL_MERGE_DAG,
+        "repo_id": fixture.repo_id,
+        "p_handled": synced,
+        "r_fresh_remote": merge_tip,
+        "durable": true,
+    });
+    fixture
+        .engine
+        .db()
+        .set_state(
+            &format!("team_history_block_{}", fixture.repo_id),
+            &block.to_string(),
+        )
+        .unwrap();
     let quarantined = fixture.snapshot().await;
 
     git_cli(&fixture.developer, &["reset", "--hard", &synced]);
@@ -3975,6 +4163,7 @@ async fn candidate_r10_durable_unsupported_history_block_survives_restart() {
             "reason":"unsupported_merge_dag",
             "durable":true,
             "restart_without_live_merge_dag":true,
+            "seeded_legacy_block":true,
             "svn_revision_before_after":quarantined.svn_rev,
             "watermark_before_after":quarantined.watermark,
             "mapping_count_before_after":quarantined.mapping_count
