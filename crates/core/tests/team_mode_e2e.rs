@@ -3341,6 +3341,62 @@ async fn candidate_r10_merge_dag_rejected_before_replay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
+    let fixture = QualifiedPair::new().await;
+    let checkpoint = fixture.imported_base.clone();
+    let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
+    let commit_tree = |parents: &[&str], message: &str, unix: i64| -> String {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&fixture.developer)
+            .args(["commit-tree", &tree, "-m", message]);
+        for parent in parents {
+            command.args(["-p", parent]);
+        }
+        let output = command
+            .env("GIT_AUTHOR_NAME", "Fixture Developer")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture Developer")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .env("GIT_AUTHOR_DATE", unix.to_string())
+            .env("GIT_COMMITTER_DATE", unix.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "commit-tree {message}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    // Unrelated older root Z is reachable from merge M but not from P, so a
+    // visited-order stop at P can omit it. Hide/push still lists Z.
+    let z = commit_tree(&[], "Z old side", 1_000_000_000);
+    let y = commit_tree(&[&z], "Y old side", 1_000_000_001);
+    let b = commit_tree(&[&checkpoint], "B mainline", 2_000_000_000);
+    let merge = commit_tree(&[&b, &y], "Merge older side", 2_000_000_001);
+    git_cli(
+        &fixture.developer,
+        &["update-ref", "refs/heads/main", &merge],
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let pending = git_output(
+        &fixture.developer,
+        &[
+            "rev-list",
+            "--topo-order",
+            &format!("{checkpoint}..{merge}"),
+        ],
+    );
+    assert!(
+        pending.lines().any(|line| line == z),
+        "ancestry frontier must include older pending {z}; pending={pending}"
+    );
+    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r10_over_1000_pending_commits_rejected() {
     let fixture = QualifiedPair::new().await;
     let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
