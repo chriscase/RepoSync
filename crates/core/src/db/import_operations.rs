@@ -89,6 +89,9 @@ pub struct ImportOperation {
     pub intended_ref: Option<String>,
     pub intended_git_sha: Option<String>,
     pub outcome_detail: Option<String>,
+    /// When true, an admin may resume a held partial import from the confirmed checkpoint.
+    #[serde(default)]
+    pub resume_authorized: bool,
     /// Present for snapshot imports. Absent on pre-#68 full-import documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_pin: Option<SnapshotPin>,
@@ -172,6 +175,28 @@ pub struct ReconciledImport {
     pub operation: ImportOperation,
     pub publication_recorded: bool,
     pub completed: bool,
+    pub resume_authorized: bool,
+}
+
+/// A partial import may resume only when the confirmed SVN/Git prefix matches
+/// the durable local tip and no publication intent remains outstanding.
+pub fn import_resume_checkpoint(op: &ImportOperation) -> Option<(i64, u64, u64)> {
+    if op.operation_type != "full_import"
+        || op.intended_git_sha.is_some()
+        || op.intended_ref.is_some()
+    {
+        return None;
+    }
+    let total = op.total_revisions.unwrap_or(0);
+    if op.processed_revisions == 0 || op.processed_revisions >= total {
+        return None;
+    }
+    let confirmed = op.last_confirmed_svn_rev?;
+    let local = op.last_local_svn_rev?;
+    if confirmed != local || confirmed <= 0 {
+        return None;
+    }
+    Some((confirmed, op.local_commits, op.confirmed_batches))
 }
 
 fn key(kind: &str, id: &str) -> String {
@@ -324,6 +349,7 @@ impl Database {
                 intended_ref: None,
                 intended_git_sha: None,
                 outcome_detail: None,
+                resume_authorized: false,
                 snapshot_pin: None,
             };
             write_value(
@@ -746,12 +772,25 @@ impl Database {
             if complete {
                 op.outcome_detail = Some("Import completed after remote verification".into());
                 let operation = complete_import_tx(tx, repo_id, op_id, op, svn_rev, observed_sha)?;
-                return Ok(ReconciledImport { operation, publication_recorded, completed: true });
+                return Ok(ReconciledImport {
+                    operation,
+                    publication_recorded,
+                    completed: true,
+                    resume_authorized: false,
+                });
             }
-            op.outcome_detail = Some("Publication verified. Import is still partial and remains held; safe resume is not yet implemented.".into());
+            op.resume_authorized = true;
+            op.outcome_detail = Some(
+                "Publication verified. Partial import remains held; resume from the confirmed checkpoint when ready.".into(),
+            );
             op.updated_at = Utc::now().to_rfc3339();
             write_value(tx, &document, &serde_json::to_string(&op).unwrap())?;
-            Ok(ReconciledImport { operation: op, publication_recorded, completed: false })
+            Ok(ReconciledImport {
+                operation: op,
+                publication_recorded,
+                completed: false,
+                resume_authorized: true,
+            })
         })
     }
 
@@ -768,6 +807,36 @@ impl Database {
                 ));
             }
             op.outcome_detail = Some(reason.into());
+            Ok(())
+        })
+    }
+
+    /// Transition a held partial import back to `running` from the confirmed checkpoint.
+    pub fn resume_import_operation(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+    ) -> Result<ImportOperation, DatabaseError> {
+        self.update_import_operation(repo_id, op_id, |op| {
+            let authorized = match op.state {
+                ImportOperationState::ReconciliationRequired => op.resume_authorized,
+                ImportOperationState::Cancelled => import_resume_checkpoint(op).is_some(),
+                _ => false,
+            };
+            if !authorized {
+                return Err(DatabaseError::Other(
+                    "import resume is not authorized for this operation".into(),
+                ));
+            }
+            if import_resume_checkpoint(op).is_none() {
+                return Err(DatabaseError::Other(
+                    "import lacks a confirmed partial checkpoint".into(),
+                ));
+            }
+            op.state = ImportOperationState::Running;
+            op.resume_authorized = false;
+            op.cancel_requested = false;
+            op.outcome_detail = Some("Resuming import from durable checkpoint".into());
             Ok(())
         })
     }
@@ -1184,5 +1253,113 @@ mod tests {
             "{err}"
         );
         assert_eq!(other.get_repo_watermark("other").unwrap().0, 0);
+    }
+
+    #[test]
+    fn partial_reconcile_authorizes_resume_without_completing_checkpoint() {
+        let (_dir, db, workdir) = open_repo("partial-resume");
+        let fp = fingerprint(&db, "partial-resume", &workdir);
+        let op = db
+            .create_import_operation("partial-resume", "admin", "req-partial", &fp)
+            .unwrap();
+        db.start_import_operation("partial-resume", &op.id).unwrap();
+        db.note_import_total("partial-resume", &op.id, 52).unwrap();
+        let tip = "3333333333333333333333333333333333333333";
+        for rev in 1..50 {
+            let sha = format!("{:040x}", rev);
+            db.note_import_local("partial-resume", &op.id, rev, &sha, rev as u64, rev as u64)
+                .unwrap();
+        }
+        db.note_import_local("partial-resume", &op.id, 50, tip, 50, 50)
+            .unwrap();
+        db.begin_import_publication("partial-resume", &op.id, "refs/heads/main", tip)
+            .unwrap();
+        db.finish_import_operation(
+            "partial-resume",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let reconciled = db
+            .reconcile_verified_import("partial-resume", &op.id, &workdir, "refs/heads/main", tip)
+            .unwrap();
+        assert!(!reconciled.completed);
+        assert!(reconciled.resume_authorized);
+        assert!(reconciled.operation.resume_authorized);
+        assert_eq!(db.get_repo_watermark("partial-resume").unwrap().0, 0);
+        assert_eq!(
+            import_resume_checkpoint(&reconciled.operation),
+            Some((50, 50, 1))
+        );
+    }
+
+    #[test]
+    fn resume_transitions_authorized_hold_back_to_running() {
+        let (_dir, db, workdir) = open_repo("resume-run");
+        let fp = fingerprint(&db, "resume-run", &workdir);
+        let op = db
+            .create_import_operation("resume-run", "admin", "req-resume", &fp)
+            .unwrap();
+        db.start_import_operation("resume-run", &op.id).unwrap();
+        db.note_import_total("resume-run", &op.id, 3).unwrap();
+        db.note_import_local("resume-run", &op.id, 1, BASELINE_SHA, 1, 1)
+            .unwrap();
+        db.begin_import_publication("resume-run", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        db.confirm_import_publication("resume-run", &op.id, BASELINE_SHA)
+            .unwrap();
+        db.finish_import_operation(
+            "resume-run",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "worker stopped",
+        )
+        .unwrap();
+        let mut held = db
+            .get_import_operation("resume-run", &op.id)
+            .unwrap()
+            .unwrap();
+        held.resume_authorized = true;
+        held.last_confirmed_svn_rev = Some(1);
+        held.last_confirmed_git_sha = Some(BASELINE_SHA.into());
+        db.conn()
+            .execute(
+                "UPDATE kv_state SET value=?1 WHERE key=?2",
+                params![
+                    serde_json::to_string(&held).unwrap(),
+                    format!("import_operation_v1:document:{}", op.id)
+                ],
+            )
+            .unwrap();
+        let resumed = db.resume_import_operation("resume-run", &op.id).unwrap();
+        assert_eq!(resumed.state, ImportOperationState::Running);
+        assert!(!resumed.resume_authorized);
+        assert_eq!(import_resume_checkpoint(&resumed), Some((1, 1, 1)));
+    }
+
+    #[test]
+    fn resume_refuses_without_authorization() {
+        let (_dir, db, workdir) = open_repo("resume-deny");
+        let fp = fingerprint(&db, "resume-deny", &workdir);
+        let op = db
+            .create_import_operation("resume-deny", "admin", "req-deny", &fp)
+            .unwrap();
+        db.start_import_operation("resume-deny", &op.id).unwrap();
+        db.note_import_total("resume-deny", &op.id, 3).unwrap();
+        db.note_import_local("resume-deny", &op.id, 1, BASELINE_SHA, 1, 1)
+            .unwrap();
+        db.finish_import_operation(
+            "resume-deny",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "held",
+        )
+        .unwrap();
+        let err = db
+            .resume_import_operation("resume-deny", &op.id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not authorized"), "{err}");
     }
 }

@@ -266,6 +266,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(reconcile_repo_import),
         )
         .route(
+            "/api/repos/:id/import/:operation_id/resume",
+            post(resume_repo_import),
+        )
+        .route(
             "/api/repos/:id/svn-commit/:operation_id",
             get(svn_commit_status),
         )
@@ -1630,6 +1634,17 @@ async fn repo_import_status(
             "outcome_detail".into(),
             serde_json::json!(op.outcome_detail),
         );
+        object.insert(
+            "resume_authorized".into(),
+            serde_json::json!(op.resume_authorized),
+        );
+        object.insert(
+            "can_resume".into(),
+            serde_json::json!(
+                reposync_core::db::import_operations::import_resume_checkpoint(&op).is_some()
+                    && (op.resume_authorized || op.state == ImportOperationState::Cancelled)
+            ),
+        );
         let import_mode = if op.snapshot_pin.is_some() || op.operation_type == "snapshot_import" {
             "snapshot"
         } else {
@@ -1727,6 +1742,8 @@ fn reconciliation_result(
         "publication_proved": publication_proved,
         "publication_receipt_recorded": publication_receipt_recorded,
         "checkpoint_completed": checkpoint_completed,
+        "may_resume": after.resume_authorized,
+        "resume_authorized": after.resume_authorized,
         "remaining_reason": after.outcome_detail,
     }))
 }
@@ -1818,6 +1835,293 @@ async fn reconcile_repo_import(
         reconciled.publication_recorded,
         reconciled.finalized,
     ))
+}
+
+async fn resume_repo_import(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, operation_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (_user_id, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Unauthorized("admin access required".into()));
+    }
+    let db = &state.db;
+    let repo = db
+        .get_repository(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    let requested = db
+        .get_import_operation(&id, &operation_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("import operation not found for repository".into()))?;
+    let active = db
+        .active_import_operation(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if active.as_ref().is_none_or(|op| op.id != operation_id) {
+        return Err(AppError::BadRequest(
+            "operation is not this repository's active import hold".into(),
+        ));
+    }
+    if requested.operation_type != "full_import" {
+        return Err(AppError::BadRequest(
+            "only full-history imports may resume from a checkpoint".into(),
+        ));
+    }
+
+    let progress = state.get_repo_import_progress(&id).await;
+    {
+        let p = progress.read().await;
+        if p.phase == ImportPhase::Importing {
+            return Ok(Json(serde_json::json!({
+                "ok": false,
+                "message": "An import is already running for this repository",
+            })));
+        }
+    }
+
+    let busy_guard = {
+        let mut guard = None;
+        for attempt in 0..30 {
+            if let Some(g) = reposync_core::busy::try_acquire(&id) {
+                guard = Some(g);
+                break;
+            }
+            if attempt == 0 {
+                info!(repo_id = %id, "waiting for in-flight sync cycle to finish before import resume");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        guard.ok_or_else(|| {
+            AppError::BadRequest(
+                "A sync cycle is currently running for this repository. Please retry in a moment."
+                    .into(),
+            )
+        })?
+    };
+
+    let resumed = db
+        .resume_import_operation(&id, &operation_id)
+        .map_err(import_write_error)?;
+
+    let data_dir = state.config.daemon.data_dir.clone();
+    let git_repo_path = data_dir.join("repos").join(&id).join("git-repo");
+    if !git_repo_path.join(".git").exists() {
+        return Err(AppError::BadRequest(
+            "managed Git workdir is unavailable for import resume".into(),
+        ));
+    }
+
+    {
+        let mut p = progress.write().await;
+        p.phase = ImportPhase::Importing;
+        p.started_at = Some(chrono::Utc::now().to_rfc3339());
+        p.completed_at = None;
+        p.cancel_requested = false;
+        p.cancel_signal
+            .store(false, std::sync::atomic::Ordering::Release);
+        p.total_revs = resumed.total_revisions.unwrap_or(0) as i64;
+        p.commits_created = resumed.local_commits;
+        p.batches_pushed = resumed.confirmed_batches;
+        p.current_rev = resumed.processed_revisions as i64;
+    }
+
+    let svn_password_repo = db
+        .get_state(&format!("secret_svn_password_{}", id))
+        .unwrap_or(None);
+    let svn_password_global = db.get_state("secret_svn_password").unwrap_or(None);
+    let svn_password = svn_password_repo
+        .clone()
+        .or(svn_password_global.clone())
+        .unwrap_or_default();
+    let git_token_repo = db
+        .get_state(&format!("secret_git_token_{}", id))
+        .unwrap_or(None);
+    let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
+    let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
+
+    let svn_import_url = {
+        let base = repo.svn_url.trim_end_matches('/');
+        let branch = if repo.svn_branch.is_empty() {
+            "trunk"
+        } else {
+            &repo.svn_branch
+        };
+        if branch.is_empty() || branch == "/" {
+            base.to_string()
+        } else {
+            format!("{}/{}", base, branch.trim_start_matches('/'))
+        }
+    };
+    let svn_client = SvnClient::new(&svn_import_url, &repo.svn_username, &svn_password)
+        .with_cancel_signal(progress.read().await.cancel_signal.clone());
+    let git_client = Arc::new(std::sync::Mutex::new(
+        GitClient::new(&git_repo_path)
+            .map_err(|e| AppError::Internal(format!("failed to open git repo: {e}")))?,
+    ));
+    git_client
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ensure_remote_credentials("origin", git_token.as_deref())
+        .map_err(|e| AppError::Internal(format!("failed to set git credentials: {e}")))?;
+
+    let identity_config = reposync_core::config::IdentityConfig::default();
+    let identity_mapper = IdentityMapper::new(&identity_config)
+        .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {e}")))?;
+    let lfs_threshold_bytes = if repo.lfs_threshold_mb > 0 {
+        (repo.lfs_threshold_mb as u64) * 1024 * 1024
+    } else {
+        0
+    };
+    let file_policy = FilePolicy::with_lfs(0, vec![], lfs_threshold_bytes, &[]);
+    let import_config = ImportConfig {
+        committer_name: "RepoSync".into(),
+        committer_email: "reposync@localhost".into(),
+        remote_name: "origin".into(),
+        branch: repo.git_branch.clone(),
+        push_token: git_token,
+        message_prefix: None,
+        trunk_path: repo.svn_branch.clone(),
+    };
+
+    let db_path = data_dir.join("reposync.db");
+    let import_db = Database::new(&db_path)
+        .map_err(|e| AppError::Internal(format!("failed to open db: {e}")))?;
+    let ws_broadcast = Some(state.ws_broadcast.clone());
+    let repo_id_clone = id.clone();
+    let worker_operation_id = operation_id.clone();
+    let cancel_signal = progress.read().await.cancel_signal.clone();
+    let state_for_handle = state.clone();
+
+    let handle = tokio::spawn(async move {
+        let _busy_guard = busy_guard;
+        let result = {
+            let run_state = ImportRunState {
+                progress: progress.clone(),
+                ws_broadcast: ws_broadcast.clone(),
+                repo_id: Some(repo_id_clone.clone()),
+                operation_id: Some(worker_operation_id.clone()),
+                cancel_signal: Some(cancel_signal),
+            };
+            import::run_full_import(
+                &svn_client,
+                &git_client,
+                &identity_mapper,
+                &import_db,
+                &file_policy,
+                &import_config,
+                run_state,
+            )
+            .await
+        };
+        let terminal = match result {
+            Ok(import::ImportOutcome::Completed {
+                commits,
+                svn_rev,
+                git_sha,
+            }) => {
+                match import_db.complete_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    svn_rev,
+                    &git_sha,
+                ) {
+                    Ok(_) => {
+                        info!(repo_id = %repo_id_clone, commits, "per-repo import resumed and completed");
+                        ImportPhase::Completed
+                    }
+                    Err(e) => {
+                        error!(repo_id = %repo_id_clone, error = %e, "import resume finalization failed");
+                        let _ = import_db.finish_import_operation(
+                            &repo_id_clone,
+                            &worker_operation_id,
+                            ImportOperationState::ReconciliationRequired,
+                            &format!("finalization failed: {e}"),
+                        );
+                        ImportPhase::Failed
+                    }
+                }
+            }
+            Ok(import::ImportOutcome::Cancelled { commits }) => {
+                let op = import_db
+                    .get_import_operation(&repo_id_clone, &worker_operation_id)
+                    .ok()
+                    .flatten();
+                let uncertain = op.as_ref().is_some_and(|o| o.intended_git_sha.is_some());
+                let state = if uncertain {
+                    ImportOperationState::ReconciliationRequired
+                } else {
+                    ImportOperationState::Cancelled
+                };
+                let detail = format!(
+                    "stopped after {commits} local commits; published history is not undone"
+                );
+                if import_db
+                    .finish_import_operation(&repo_id_clone, &worker_operation_id, state, &detail)
+                    .is_err()
+                    || uncertain
+                {
+                    ImportPhase::Failed
+                } else {
+                    ImportPhase::Cancelled
+                }
+            }
+            Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
+                let _ = import_db.finish_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    ImportOperationState::ReconciliationRequired,
+                    &reason,
+                );
+                ImportPhase::Failed
+            }
+            Err(e) => {
+                let detail = format!("import resume stopped with error: {e:#}");
+                let _ = import_db.finish_import_operation(
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    ImportOperationState::Failed,
+                    &detail,
+                );
+                ImportPhase::Failed
+            }
+        };
+        let mut p = progress.write().await;
+        p.phase = terminal;
+        p.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        let _ = import_db.persist_import_progress(&p);
+        if let Some(ref sender) = ws_broadcast {
+            let json = serde_json::json!({
+                "type": "repo_import_progress",
+                "repo_id": repo_id_clone,
+                "phase": format!("{:?}", p.phase).to_lowercase(),
+                "current_rev": p.current_rev,
+                "total_revs": p.total_revs,
+                "commits_created": p.commits_created,
+            });
+            let _ = sender.send(json.to_string());
+        }
+    });
+
+    {
+        let mut handles = state_for_handle.import_handles.lock().await;
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
+    }
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "message": "Import resume started",
+        "operation_id": operation_id,
+        "lifecycle": resumed.state,
+        "resume_from_svn_rev": resumed.last_confirmed_svn_rev,
+        "processed_revisions": resumed.processed_revisions,
+        "total_revisions": resumed.total_revisions,
+    })))
 }
 
 fn svn_commit_status_json(

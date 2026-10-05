@@ -1237,8 +1237,8 @@ fn import_reconcile_held_reasons() -> [&'static str; 10] {
 /// Observe-first reconciliation for held `import_operation_v1` journals.
 ///
 /// Reuses the same inspect+finalize path as the admin reconcile endpoint.
-/// Finalizes only on a unique verified remote match. Import resume is not
-/// implemented in this slice, so `resume_authorized` is always false.
+/// Finalizes only on a unique verified remote match. A verified partial import
+/// authorizes resume from the confirmed checkpoint but does not auto-resume.
 pub async fn apply_import_reconciliation(
     db: &Database,
     repo: &Repository,
@@ -1435,7 +1435,7 @@ pub async fn apply_import_reconciliation(
                 git_tree: local_tree,
             },
             finalized: reconciled.completed,
-            resume_authorized: false,
+            resume_authorized: reconciled.resume_authorized,
             publication_recorded: reconciled.publication_recorded,
             observed_ref: Some(reference),
             observed_sha: Some(observed),
@@ -2051,32 +2051,99 @@ pub async fn run_full_import(
         Err(e) => return Err(e).context("failed to get SVN log"),
     };
 
+    let resume_checkpoint = if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+        db.get_import_operation(repo, op)
+            .ok()
+            .flatten()
+            .and_then(|operation| {
+                crate::db::import_operations::import_resume_checkpoint(&operation)
+            })
+    } else {
+        None
+    };
+
     if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
-        db.note_import_total(repo, op, log_entries.len() as u64)?;
+        if resume_checkpoint.is_none() {
+            db.note_import_total(repo, op, log_entries.len() as u64)?;
+        }
     }
 
+    let total_revisions = log_entries.len();
     {
         let mut p = progress.write().await;
-        p.total_revs = log_entries.len() as i64;
+        p.total_revs = total_revisions as i64;
     }
 
-    log(
-        &progress,
-        &ws_broadcast,
-        format!("[info] Found {} revisions to import", log_entries.len()),
-    )
-    .await;
+    let pending_entries: Vec<_> = if let Some((from_svn_rev, _, _)) = resume_checkpoint {
+        log_entries
+            .iter()
+            .filter(|entry| entry.revision > from_svn_rev)
+            .collect()
+    } else {
+        log_entries.iter().collect()
+    };
+
+    if let Some((from_svn_rev, local_commits, confirmed_batches)) = resume_checkpoint {
+        log(
+            &progress,
+            &ws_broadcast,
+            format!(
+                "[info] Resuming import after confirmed SVN r{} ({}/{} revisions already durable)",
+                from_svn_rev, local_commits, total_revisions
+            ),
+        )
+        .await;
+        {
+            let mut p = progress.write().await;
+            p.commits_created = local_commits;
+            p.batches_pushed = confirmed_batches;
+            p.current_rev = local_commits as i64;
+        }
+    } else {
+        log(
+            &progress,
+            &ws_broadcast,
+            format!("[info] Found {} revisions to import", total_revisions),
+        )
+        .await;
+    }
 
     let repo_path = {
         let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
         git_guard.repo_path().to_path_buf()
     };
 
-    let mut count = 0u64;
-    let mut commits_since_push = 0u64;
-    const PUSH_BATCH_SIZE: u64 = 50;
+    if let Some((_, local_commits, _)) = resume_checkpoint {
+        let git_guard = git_client.lock().unwrap_or_else(|p| p.into_inner());
+        let head = git_guard
+            .get_head_sha()
+            .context("missing local import tip during resume")?;
+        let expected = db
+            .get_import_operation(
+                repo_id.as_deref().unwrap(),
+                operation_id.as_deref().unwrap(),
+            )?
+            .and_then(|op| op.last_local_git_sha)
+            .ok_or_else(|| anyhow::anyhow!("missing recorded local Git tip during resume"))?;
+        if head != expected {
+            return Err(anyhow::anyhow!(
+                "local Git tip {head} does not match the durable checkpoint {expected}"
+            ));
+        }
+        if local_commits == 0 {
+            return Err(anyhow::anyhow!(
+                "resume checkpoint recorded zero local commits"
+            ));
+        }
+    }
 
-    for (idx, entry) in log_entries.iter().enumerate() {
+    const PUSH_BATCH_SIZE: u64 = 50;
+    let mut count = resume_checkpoint.map(|(_, local, _)| local).unwrap_or(0);
+    let mut commits_since_push = resume_checkpoint
+        .map(|(_, local, batches)| local.saturating_sub(batches * PUSH_BATCH_SIZE))
+        .unwrap_or(0);
+
+    for (idx, entry) in pending_entries.iter().enumerate() {
         // Check for cancellation
         if stop_requested(&progress, cancel_signal.as_ref()).await {
             {
@@ -2096,7 +2163,7 @@ pub async fn run_full_import(
         let rev = entry.revision;
         {
             let mut p = progress.write().await;
-            p.current_rev = idx as i64 + 1;
+            p.current_rev = (count + idx as u64 + 1) as i64;
         }
 
         // Export this revision
@@ -2329,7 +2396,7 @@ pub async fn run_full_import(
             Ok(oid) => {
                 let sha = oid.to_string();
                 if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
-                    db.note_import_local(repo, op, rev, &sha, idx as u64 + 1, count + 1)
+                    db.note_import_local(repo, op, rev, &sha, count + 1, count + 1)
                         .context("failed to persist local import progress")?;
                 }
                 let short_sha = &sha[..8.min(sha.len())];

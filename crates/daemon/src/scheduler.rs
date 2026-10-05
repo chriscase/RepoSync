@@ -1255,6 +1255,101 @@ mod cancellation_tests {
     }
 
     #[tokio::test]
+    async fn candidate_64f_partial_import_with_resume_authorized_still_blocks_scheduler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) =
+            scheduler_fixture(&tmp, "held-import-resume-auth", "2000-01-01T00:00:00Z");
+        let operation = scheduler
+            .db
+            .create_import_operation("held-import-resume-auth", "legacy", "request", "fp")
+            .unwrap();
+        scheduler
+            .db
+            .start_import_operation("held-import-resume-auth", &operation.id)
+            .unwrap();
+        scheduler
+            .db
+            .note_import_total("held-import-resume-auth", &operation.id, 52)
+            .unwrap();
+        scheduler
+            .db
+            .note_import_local(
+                "held-import-resume-auth",
+                &operation.id,
+                50,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                50,
+                50,
+            )
+            .unwrap();
+        scheduler
+            .db
+            .begin_import_publication(
+                "held-import-resume-auth",
+                &operation.id,
+                "refs/heads/main",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+        scheduler
+            .db
+            .confirm_import_publication(
+                "held-import-resume-auth",
+                &operation.id,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap();
+        scheduler
+            .db
+            .finish_import_operation(
+                "held-import-resume-auth",
+                &operation.id,
+                reposync_core::db::import_operations::ImportOperationState::ReconciliationRequired,
+                "partial import held",
+            )
+            .unwrap();
+        let mut held = scheduler
+            .db
+            .get_import_operation("held-import-resume-auth", &operation.id)
+            .unwrap()
+            .unwrap();
+        held.resume_authorized = true;
+        held.last_confirmed_svn_rev = Some(50);
+        held.last_confirmed_git_sha = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        scheduler
+            .db
+            .conn()
+            .execute(
+                "UPDATE kv_state SET value=?1 WHERE key=?2",
+                rusqlite::params![
+                    serde_json::to_string(&held).unwrap(),
+                    format!("import_operation_v1:document:{}", operation.id)
+                ],
+            )
+            .unwrap();
+
+        scheduler.maybe_run_repo_cycles().await;
+
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+        assert_eq!(
+            scheduler
+                .db
+                .get_repo_watermark("held-import-resume-auth")
+                .unwrap(),
+            (2, "verified-old".into())
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({
+                "case":"64F_PARTIAL_RESUME_AUTH_STILL_BLOCKED",
+                "operation_id":operation.id,
+                "resume_authorized":true,
+                "checkpoint":2,
+                "worker_spawned":false
+            })
+        );
+    }
+
     async fn candidate_64e_held_import_blocks_scheduler_sync_without_resume() {
         let tmp = tempfile::tempdir().unwrap();
         let (scheduler, _) = scheduler_fixture(&tmp, "held-import-block", "2000-01-01T00:00:00Z");
