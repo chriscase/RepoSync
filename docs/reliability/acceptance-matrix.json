@@ -261,6 +261,8 @@
         "R09_OBSERVED_REMOTE_REWRITE_DURABLE",
         "R09_DURABLE_BLOCK",
         "R09_PERSONAL",
+        "R66_PERSONAL_LINEAR_ADMIT",
+        "R66_PERSONAL_MERGE_DAG",
         "R09_WEBHOOK_FORCED_HINT"
       ],
       "supporting_case_ids": [],
@@ -268,7 +270,7 @@
         "Automatic rebase/reconciliation of rewritten history is not implemented",
         "Issue #66 remains open until remaining rewrite/unproven-history cases (merge DAG replay, >1000 continuation, live acceptance) are reviewed"
       ],
-      "evidence": "Baseline replacement of an already-handled SHA writes another SVN revision. Candidate independent developer/bridge/bare-remote replacement and metadata-only amend reject with non_fast_forward before reset, with repeat/reopen and remote/SVN/checkpoint/mapping preservation. Polling-only force-push covers handled-checkpoint rewrite (non_fast_forward) and pending-history rewrite (observed_remote_rewrite when O is no longer an ancestor of R). Durable reconciliation_required blocks survive restart after the live remote is restored to equal-looking original history. Personal-mode Git→SVN uses the same P/O/R/L inspect. Webhook forced is parsed as a hint and triggers the same polling inspection; it does not reset. Local dirty index, unpublished commits, and ignored-path collisions are retained.",
+      "evidence": "Baseline replacement of an already-handled SHA writes another SVN revision. Candidate independent developer/bridge/bare-remote replacement and metadata-only amend reject with non_fast_forward before reset, with repeat/reopen and remote/SVN/checkpoint/mapping preservation. Polling-only force-push covers handled-checkpoint rewrite (non_fast_forward) and pending-history rewrite (observed_remote_rewrite when O is no longer an ancestor of R). Durable reconciliation_required blocks survive restart after the live remote is restored to equal-looking original history; durable-restart fixtures retarget inspection/tracking refs to the restored tip before reopen so the kv block is what holds. Personal-mode Git→SVN uses the same P/O/R/L inspect with proven rewrite/merge-DAG containment and linear admission. Webhook forced is parsed as a hint and triggers the same polling inspection; it does not reset. Local dirty index, unpublished commits, and ignored-path collisions are retained.",
       "diagnostic_expected_baseline_failure": true
     },
     {

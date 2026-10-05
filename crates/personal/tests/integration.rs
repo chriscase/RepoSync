@@ -2798,6 +2798,39 @@ fn git_cmd(repo: &Path, args: &[&str]) {
     );
 }
 
+/// Point inspection and tracking refs at `tip` so a fresh inspect would admit
+/// live Git; durable kv blocks must still refuse after restart.
+fn retarget_personal_remote_observation(git_work: &Path, tip: &str, branch: &str) {
+    git_cmd(
+        git_work,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            &format!("+{tip}:refs/reposync/inspection/incoming"),
+        ],
+    );
+    git_cmd(
+        git_work,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            &format!("+{tip}:refs/remotes/origin/{branch}"),
+        ],
+    );
+    assert_eq!(
+        git_sha_at(git_work, "refs/reposync/inspection/incoming"),
+        tip,
+        "inspection ref must match restored tip"
+    );
+    assert_eq!(
+        git_sha_at(git_work, &format!("refs/remotes/origin/{branch}")),
+        tip,
+        "tracking ref must match restored tip"
+    );
+}
+
 /// Personal-mode Git→SVN uses the same P/O/R/L inspection before replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r09_personal_rewrite_contained() {
@@ -2902,8 +2935,9 @@ async fn candidate_r09_personal_rewrite_contained() {
     assert_eq!(
         git_sha_at(&bare, "refs/heads/main"),
         handled,
-        "live remote restored; admission would pass without the durable block"
+        "live remote restored to the handled checkpoint"
     );
+    retarget_personal_remote_observation(&git_work, &handled, "main");
 
     let restarted = PersonalSyncEngine::new(
         config,
@@ -2945,7 +2979,221 @@ async fn candidate_r09_personal_rewrite_contained() {
             "case":"R09_PERSONAL", "p":handled, "blocked_r":rewritten,
             "restored_remote":handled, "reason":"non_fast_forward",
             "durable":true, "svn_revision_before_after":svn_before,
+            "mode":"personal", "inspection_refs_retargeted":true
+        })
+    );
+}
+
+/// Qualified linear P→R history is admitted through personal inspect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_personal_linear_history_admitted() {
+    use reposync_core::history_inspect::inspect_personal_history;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("feature.txt"), "first version\n").unwrap();
+    git_client
+        .commit(
+            "First Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let handled = git_sha(&git_work);
+
+    std::fs::write(git_work.join("feature.txt"), "second version\n").unwrap();
+    git_client
+        .commit(
+            "Second Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let remote_tip = git_sha(&git_work);
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    drop(git_client);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+
+    let admission = inspect_personal_history(&db, &git_work, "main", "personal")
+        .expect("qualified linear history must be admitted");
+    let admission = admission.expect("origin remote and handled checkpoint require inspection");
+    assert_eq!(admission.checkpoint, handled);
+    assert_eq!(admission.remote_tip, remote_tip);
+    assert!(
+        db.get_state(&reposync_core::history_inspect::history_block_key(Some(
+            "personal"
+        )))
+        .unwrap()
+        .is_none(),
+        "admitted history must not record a durable block"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_PERSONAL_LINEAR_ADMIT",
+            "p":handled,
+            "r":remote_tip,
             "mode":"personal"
+        })
+    );
+}
+
+/// Personal-mode inspect fail-closes on merge-DAG pending history and the
+/// durable block survives restart when live Git would admit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_personal_merge_dag_contained() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::history_block_key;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("feature.txt"), "first version\n").unwrap();
+    git_client
+        .commit(
+            "First Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let handled = git_sha(&git_work);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+    drop(db);
+
+    git_cmd(&git_work, &["checkout", "-b", "side"]);
+    std::fs::write(git_work.join("side.txt"), "side\n").unwrap();
+    git_client
+        .commit(
+            "Side change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_cmd(&git_work, &["checkout", "main"]);
+    std::fs::write(git_work.join("main.txt"), "main\n").unwrap();
+    git_client
+        .commit(
+            "Main change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_cmd(&git_work, &["merge", "--no-ff", "side", "-m", "Merge side"]);
+    git_client.push("origin", "main").unwrap();
+    let merge_tip = git_sha(&git_work);
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    drop(git_client);
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let engine = PersonalSyncEngine::new(
+        config.clone(),
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let err = engine
+        .run_cycle()
+        .await
+        .expect_err("personal merge DAG must be refused before replay");
+    let err_text = format!("{err:#}");
+    assert!(
+        err_text.contains("unsupported_merge_dag"),
+        "personal inspection must use the team classification: {err_text}"
+    );
+    drop(engine);
+    let block_raw = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .unwrap();
+    let block: serde_json::Value = serde_json::from_str(&block_raw).unwrap();
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(block["reason"], "unsupported_merge_dag");
+    assert_eq!(block["durable"], true);
+    assert_eq!(block["p_handled"], handled);
+    assert_eq!(block["r_fresh_remote"], merge_tip);
+
+    git_cmd(&git_work, &["reset", "--hard", &handled]);
+    let restore_ref = format!("{handled}:refs/heads/main");
+    git_cmd(&git_work, &["push", "--force", "origin", &restore_ref]);
+    assert_eq!(git_sha_at(&bare, "refs/heads/main"), handled);
+    retarget_personal_remote_observation(&git_work, &handled, "main");
+
+    let restarted = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let again = restarted
+        .run_cycle()
+        .await
+        .expect_err("durable personal merge-DAG block must survive restored remote");
+    assert!(
+        format!("{again:#}").contains("unsupported_merge_dag"),
+        "{again:#}"
+    );
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    assert_eq!(git_sha(&git_work), handled);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_PERSONAL_MERGE_DAG",
+            "p":handled,
+            "blocked_r":merge_tip,
+            "restored_remote":handled,
+            "reason":"unsupported_merge_dag",
+            "durable":true,
+            "svn_revision_before_after":svn_before,
+            "mode":"personal",
+            "inspection_refs_retargeted":true
         })
     );
 }
