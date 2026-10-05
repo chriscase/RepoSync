@@ -124,6 +124,12 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "R10_DURABLE_BACKLOG_BLOCK",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_durable_backlog_block_survives_restart",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R10_FETCH_HISTORY_BLOCK",
       "binary": "team_mode_e2e",
       "test": "candidate_r10_fetch_time_history_block_persists",
@@ -211,6 +217,18 @@
       "id": "R09_POLLING_ONLY",
       "binary": "team_mode_e2e",
       "test": "candidate_r09_polling_only_force_push",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_OBSERVED_REMOTE_REWRITE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_observed_remote_rewrite_polling",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R09_OBSERVED_REMOTE_REWRITE_DURABLE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r09_observed_remote_rewrite_durable_restart",
       "tier": "candidate_regression"
     },
     {

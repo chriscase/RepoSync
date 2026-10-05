@@ -1302,6 +1302,172 @@ async fn candidate_r09_polling_only_force_push() {
     );
 }
 
+/// Polling detects a rewrite of pending remote history: P→R still fast-forwards
+/// from the handled checkpoint, but the prior observed tip O is no longer an
+/// ancestor of fresh R.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_observed_remote_rewrite_polling() {
+    let repo_id = unique_pair_id("r09-o-rewrite");
+    let fixture = QualifiedPair::new_with_repo_id(&repo_id).await;
+    let old_synced = fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let pending =
+        fixture.developer_commit("feature.txt", "pending version\n", "Pending remote commit");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    git_cli(
+        &fixture.bridge,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            "+refs/heads/main:refs/reposync/inspection/incoming",
+        ],
+    );
+    assert_eq!(
+        git_output(
+            &fixture.bridge,
+            &["rev-parse", "refs/reposync/inspection/incoming"],
+        ),
+        pending,
+        "prior observed remote tip must be seeded before rewrite"
+    );
+    git_cli(&fixture.developer, &["reset", "--hard", &old_synced]);
+    fixture.developer_commit(
+        "feature.txt",
+        "rewritten pending\n",
+        "Force-pushed pending rewrite",
+    );
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    let replacement = get_head_sha(&fixture.developer);
+    assert_ne!(replacement, pending);
+    let before = fixture.snapshot().await;
+    assert_pair_blocked_without_damage(&fixture, "observed_remote_rewrite").await;
+    let block = history_block_json(&fixture);
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(block["durable"], true);
+    assert_eq!(block["p_handled"], old_synced);
+    assert_eq!(block["o_prior_observed"], pending);
+    assert_eq!(block["r_fresh_remote"], replacement);
+    assert_eq!(fixture.snapshot().await, before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_OBSERVED_REMOTE_REWRITE",
+            "webhook":false,
+            "p":old_synced,
+            "o":pending,
+            "r":replacement,
+            "reason":"observed_remote_rewrite",
+            "durable":true,
+            "p_to_r_fast_forward":true,
+            "svn_revision_before_after":before.svn_rev,
+            "watermark_before_after":before.watermark,
+            "mapping_count_before_after":before.mapping_count
+        })
+    );
+}
+
+/// Durable observed-remote rewrite blocks survive restart after the live remote
+/// is restored to a linear fast-forward from the handled checkpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r09_observed_remote_rewrite_durable_restart() {
+    let repo_id = unique_pair_id("r09-o-durable");
+    let fixture = QualifiedPair::new_with_repo_id(&repo_id).await;
+    let old_synced = fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let pending =
+        fixture.developer_commit("feature.txt", "pending version\n", "Pending remote commit");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    git_cli(
+        &fixture.bridge,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            "+refs/heads/main:refs/reposync/inspection/incoming",
+        ],
+    );
+    git_cli(&fixture.developer, &["reset", "--hard", &old_synced]);
+    fixture.developer_commit(
+        "feature.txt",
+        "rewritten pending\n",
+        "Force-pushed pending rewrite",
+    );
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    let rewritten = get_head_sha(&fixture.developer);
+    assert_pair_blocked_without_damage(&fixture, "observed_remote_rewrite").await;
+    let blocked_record = history_block_json(&fixture);
+    assert_eq!(blocked_record["p_handled"], old_synced);
+    assert_eq!(blocked_record["o_prior_observed"], pending);
+    assert_eq!(blocked_record["r_fresh_remote"], rewritten);
+    assert_eq!(blocked_record["durable"], true);
+    let quarantined = fixture.snapshot().await;
+
+    git_cli(&fixture.developer, &["reset", "--hard", &old_synced]);
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        old_synced,
+        "live remote restored to the handled checkpoint"
+    );
+
+    let restarted = reopen_pair(&fixture);
+    let result = restarted.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "observed_remote_rewrite"
+        ),
+        "restored linear remote must still be refused from the durable block: {result:?}"
+    );
+    assert_eq!(fixture.snapshot().await.svn_rev, quarantined.svn_rev);
+    assert_eq!(fixture.snapshot().await.watermark, quarantined.watermark);
+    assert_eq!(
+        fixture.snapshot().await.mapping_count,
+        quarantined.mapping_count
+    );
+    let still = history_block_json(&fixture);
+    assert_eq!(still["state"], "reconciliation_required");
+    assert_eq!(still["r_fresh_remote"], rewritten);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R09_OBSERVED_REMOTE_REWRITE_DURABLE",
+            "p":old_synced,
+            "blocked_o":pending,
+            "blocked_r":rewritten,
+            "restored_remote":old_synced,
+            "reason":"observed_remote_rewrite",
+            "durable":true,
+            "restart_without_live_rewrite":true,
+            "svn_revision_before_after":quarantined.svn_rev,
+            "watermark_before_after":quarantined.watermark,
+            "mapping_count_before_after":quarantined.mapping_count
+        })
+    );
+}
+
 /// Durable quarantine must survive restart after the live remote is restored
 /// to the original handled SHA. Re-inspection would admit; the block must not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3434,6 +3600,95 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
     assert_pair_blocked_without_damage(&fixture, "unsupported_backlog").await;
 }
 
+/// Backlog durable blocks must survive restart and refuse even when the live
+/// remote later looks linear and admissible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_durable_backlog_block_survives_restart() {
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
+    let mut parent = synced.clone();
+    for index in 0..1001 {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&fixture.developer)
+            .args([
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                &format!("pending {index}"),
+            ])
+            .env("GIT_AUTHOR_NAME", "Fixture Developer")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture Developer")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        parent = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    }
+    git_cli(
+        &fixture.developer,
+        &["update-ref", "refs/heads/main", &parent],
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_pair_blocked_without_damage(&fixture, "unsupported_backlog").await;
+    let blocked_record = history_block_json(&fixture);
+    assert_eq!(blocked_record["durable"], true);
+    assert_eq!(blocked_record["p_handled"], synced);
+    assert_eq!(blocked_record["r_fresh_remote"], parent);
+    let quarantined = fixture.snapshot().await;
+
+    git_cli(&fixture.developer, &["reset", "--hard", &synced]);
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        synced,
+        "live remote restored to the handled checkpoint"
+    );
+
+    let restarted = reopen_pair(&fixture);
+    let result = restarted.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "unsupported_backlog"
+        ),
+        "restored linear remote must still be refused from the durable block: {result:?}"
+    );
+    assert_eq!(fixture.snapshot().await.svn_rev, quarantined.svn_rev);
+    assert_eq!(fixture.snapshot().await.watermark, quarantined.watermark);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_DURABLE_BACKLOG_BLOCK",
+            "p":synced,
+            "blocked_r":parent,
+            "restored_remote":synced,
+            "reason":"unsupported_backlog",
+            "durable":true,
+            "restart_without_live_backlog":true,
+            "svn_revision_before_after":quarantined.svn_rev,
+            "watermark_before_after":quarantined.watermark
+        })
+    );
+}
+
 /// Unsupported-history blocks must survive restart and refuse even when the
 /// live remote later looks linear and admissible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3559,6 +3814,7 @@ async fn candidate_r10_fetch_time_history_block_persists() {
     assert_eq!(block["durable"], true);
     assert_eq!(block["reason"], "unsupported_merge_dag");
     let quarantined = fixture.snapshot().await;
+    drop(_fault);
 
     let restarted = reopen_pair(&fixture);
     let result = restarted.run_sync_cycle().await;
