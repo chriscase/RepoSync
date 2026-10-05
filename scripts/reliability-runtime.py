@@ -69,7 +69,9 @@ MANDATORY["candidate"].update({"64B_LOST_REPLY_COMPLETE", "64B_FINALIZER_RECOVER
                                "64B_PARTIAL_CONFIRMED", "64B_STALE_ID", "64B_AUTH", "64B_RACE"})
 MANDATORY["candidate"].update({"64FENC_REFUSE_SECOND_HOST", "64FENC_STALE_TAKEOVER",
                                "64FENC_SUPERSEDED_FINALIZE", "64FENC_IMPORT_FINALIZE",
-                               "64FENC_SYNC_CONFIRM", "64FENC_CLEAN_RELEASE"})
+                               "64FENC_SYNC_CONFIRM", "64FENC_NO_IDENTITY_REFUSE",
+                               "64FENC_FOREIGN_TTL_INERT", "64FENC_BEGIN_REFUSE",
+                               "64FENC_CLEAN_RELEASE"})
 MANDATORY["candidate"].update({"64B_LOCAL_MISSING", "64B_MALFORMED", "64B_ATOMIC_FAILURE",
                                "64B_CURSOR_CONFLICT"})
 SCANNER_CASES = {

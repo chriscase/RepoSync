@@ -366,6 +366,7 @@ impl Database {
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", intent.repo_id);
             let active_existing = read_value(tx, &active)?;
             if active_existing.is_none()

@@ -8,17 +8,17 @@
 //! ## Cross-host liveness
 //!
 //! `kill(pid, 0)` is meaningful only when `holder_host` matches this machine.
-//! For a remote holder we cannot observe its PID, so liveness is the durable
-//! `renewed_at` timestamp: a holder must refresh within [`LEASE_TTL_SECS`]
-//! (renewed on claim and on each successful fenced write). Takeover is allowed
-//! when the remote lease is past TTL, or when the holder is on this host and
-//! its PID is no longer alive.
+//! A **local** holder is live while that PID exists; `renewed_at` does not
+//! affect local liveness. A **foreign** holder is treated as live until a future
+//! heartbeat loop (or explicit break-glass) exists — [`LEASE_TTL_SECS`] is
+//! reserved and inert for takeover today. Stale takeover is therefore a dead
+//! local PID (or break-glass), never idle TTL expiry of a remote holder.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -27,7 +27,8 @@ use crate::db::Database;
 use crate::errors::DatabaseError;
 
 const LEASE_KEY: &str = "writer_fence_v1:lease";
-/// Holders must renew within this window or another host may take over.
+/// Reserved for a future heartbeat loop. Not consulted for takeover yet.
+#[allow(dead_code)]
 const LEASE_TTL_SECS: i64 = 300;
 
 static PROCESS_EPOCH: OnceLock<AtomicU64> = OnceLock::new();
@@ -188,20 +189,12 @@ fn holder_is_local(lease: &WriterLease) -> bool {
     lease.holder_host == local_host_id()
 }
 
-fn lease_renewed_within_ttl(lease: &WriterLease, now: DateTime<Utc>) -> bool {
-    let renewed = DateTime::parse_from_rfc3339(&lease.renewed_at)
-        .map(|ts| ts.with_timezone(&Utc))
-        .unwrap_or_else(|_| now);
-    (now - renewed).num_seconds() <= LEASE_TTL_SECS
-}
-
 /// Whether another claimant must refuse because this holder still owns the lease.
-fn lease_is_live(lease: &WriterLease, now: DateTime<Utc>) -> bool {
-    let ttl_ok = lease_renewed_within_ttl(lease, now);
+fn lease_is_live(lease: &WriterLease) -> bool {
     if holder_is_local(lease) {
-        is_process_alive(lease.holder_pid) && ttl_ok
+        is_process_alive(lease.holder_pid)
     } else {
-        ttl_ok
+        true
     }
 }
 
@@ -266,7 +259,7 @@ fn claim_lease_tx(tx: &Connection, host: &str, pid: u32) -> Result<u64, Database
             write_lease(tx, &renewed)?;
             return Ok(lease.epoch);
         }
-        if lease_is_live(&lease, Utc::now()) {
+        if lease_is_live(&lease) {
             return Err(DatabaseError::DataDirInUse(in_use_message(&lease)));
         }
         warn!(
@@ -316,13 +309,10 @@ pub fn require_current(tx: &Connection) -> Result<(), DatabaseError> {
         return Ok(());
     };
     let Some((holder_host, holder_pid)) = current_holder_identity() else {
-        if lease_is_live(&lease, Utc::now()) {
-            return Err(DatabaseError::WriterFenced(format!(
-                "writer fence epoch not held locally; active holder is host {} PID {} epoch {}",
-                lease.holder_host, lease.holder_pid, lease.epoch
-            )));
-        }
-        return Ok(());
+        return Err(DatabaseError::WriterFenced(format!(
+            "writer fence epoch not held locally; active holder is host {} PID {} epoch {}",
+            lease.holder_host, lease.holder_pid, lease.epoch
+        )));
     };
     let expected = process_epoch().load(Ordering::Acquire);
     if lease.epoch != expected {
@@ -370,7 +360,7 @@ mod tests {
         4_194_304_u32
     }
 
-    fn expire_lease(db: &Database) {
+    fn backdate_lease_renewed_at(db: &Database) {
         let raw = db.get_state(LEASE_KEY).unwrap().unwrap();
         let lease = parse_lease(&raw).unwrap();
         let expired = (Utc::now() - chrono::Duration::seconds(LEASE_TTL_SECS + 60)).to_rfc3339();
@@ -401,37 +391,55 @@ mod tests {
     #[test]
     fn stale_holder_takeover_bumps_epoch() {
         let ctx = test_ctx();
-        let first = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_001).unwrap();
+        let local = local_host_id();
+        let first = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
         assert_eq!(first.epoch(), 1);
-        expire_lease(&ctx.db);
         let second = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_002).unwrap();
         assert_eq!(second.epoch(), 2);
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
-            serde_json::json!({"case":"64FENC_STALE_TAKEOVER","cross_host_ttl_expired":true,"epoch":2})
+            serde_json::json!({"case":"64FENC_STALE_TAKEOVER","dead_local_pid_takeover":true,"epoch":2})
         );
     }
 
     #[test]
-    fn same_host_dead_pid_allows_takeover() {
+    fn foreign_holder_survives_backdated_renewal_without_takeover() {
         let ctx = test_ctx();
-        let local = local_host_id();
-        let _first = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
-        let second = claim_with_identity(&ctx.db, ctx.dir.path(), "standby-host", 10_003).unwrap();
-        assert_eq!(second.epoch(), 2);
+        let _a = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_001).unwrap();
+        backdate_lease_renewed_at(&ctx.db);
+        let err = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_002).unwrap_err();
+        assert!(matches!(err, DatabaseError::DataDirInUse(_)));
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
-            serde_json::json!({"case":"64FENC_SAME_HOST_DEAD_PID","takeover":true})
+            serde_json::json!({"case":"64FENC_FOREIGN_TTL_INERT","ttl_backdated":true,"refused":true})
+        );
+    }
+
+    #[test]
+    fn unenrolled_writer_refused_when_lease_present() {
+        let ctx = test_ctx();
+        let _guard = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_003).unwrap();
+        backdate_lease_renewed_at(&ctx.db);
+        clear_process_identity();
+        let err = ctx
+            .db
+            .transaction(|tx| require_current(tx))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not held locally"), "{err}");
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64FENC_NO_IDENTITY_REFUSE","refused":true})
         );
     }
 
     #[test]
     fn superseded_epoch_is_refused_at_finalize() {
         let ctx = test_ctx();
-        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_005).unwrap();
-        expire_lease(&ctx.db);
+        let local = local_host_id();
+        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
         let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_006).unwrap();
-        set_process_identity("host-a", 10_005, stale.epoch());
+        set_process_identity(&local, dead_pid(), stale.epoch());
         let err = ctx
             .db
             .transaction(|tx| require_current(tx))
@@ -471,11 +479,11 @@ mod tests {
             intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         };
-        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_007).unwrap();
+        let local = local_host_id();
+        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
         let op = ctx.db.begin_svn_to_git_push(intent).unwrap();
-        expire_lease(&ctx.db);
         let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_008).unwrap();
-        set_process_identity("host-a", 10_007, stale.epoch());
+        set_process_identity(&local, dead_pid(), stale.epoch());
         let err = ctx
             .db
             .confirm_svn_to_git_push(
@@ -520,15 +528,15 @@ mod tests {
         let workdir = ctx.dir.path().join("git-repo");
         let repo = ctx.db.get_repository("repo-f").unwrap().unwrap();
         let fp = import_target_fingerprint(&repo, &workdir);
-        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_009).unwrap();
+        let local = local_host_id();
+        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
         let op = ctx
             .db
             .create_import_operation("repo-f", "admin", "req-fence", &fp)
             .unwrap();
         ctx.db.start_import_operation("repo-f", &op.id).unwrap();
-        expire_lease(&ctx.db);
         let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_010).unwrap();
-        set_process_identity("host-a", 10_009, stale.epoch());
+        set_process_identity(&local, dead_pid(), stale.epoch());
         let err = ctx
             .db
             .finish_import_operation(
@@ -555,6 +563,49 @@ mod tests {
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64FENC_IMPORT_FINALIZE","journal_unchanged":true})
+        );
+    }
+
+    #[test]
+    fn begin_svn_to_git_push_refused_without_fence() {
+        use crate::db::git_push_operations::GitPushIntent;
+
+        let ctx = test_ctx();
+        ctx.db.conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+             VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'old','idle',0,0)",
+            [],
+        ).unwrap();
+        let _holder = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_011).unwrap();
+        clear_process_identity();
+        let intent = GitPushIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-begin",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "msg",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let err = ctx
+            .db
+            .begin_svn_to_git_push(intent)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not held locally") || err.contains("WriterFenced"),
+            "{err}"
+        );
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64FENC_BEGIN_REFUSE","refused":true})
         );
     }
 
