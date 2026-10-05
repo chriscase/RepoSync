@@ -888,6 +888,9 @@ async fn admit_setup_import(
     })
 }
 
+const SETUP_PREPARATION_HOLD_DETAIL: &str =
+    "preparation stopped before worker start; inspect local work and target";
+
 struct SetupPreparationGuard<'a> {
     db: &'a Database,
     repo_id: String,
@@ -895,17 +898,34 @@ struct SetupPreparationGuard<'a> {
     armed: bool,
 }
 
-impl Drop for SetupPreparationGuard<'_> {
-    fn drop(&mut self) {
+impl SetupPreparationGuard<'_> {
+    fn try_finalize_preparation_hold(&mut self) -> Result<(), DatabaseError> {
         if !self.armed {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.db.finish_import_operation(
+        self.db.finish_import_operation(
             &self.repo_id,
             &self.operation_id,
             ImportOperationState::ReconciliationRequired,
-            "preparation stopped before worker start; inspect local work and target",
-        ) {
+            SETUP_PREPARATION_HOLD_DETAIL,
+        )?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn finalize_preparation_hold(&mut self) -> Result<(), AppError> {
+        self.try_finalize_preparation_hold()
+            .map_err(import_write_error)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SetupPreparationGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.try_finalize_preparation_hold() {
             error!(repo_id = %self.repo_id, error = %e, "failed to persist setup import preparation outcome");
         }
     }
@@ -955,9 +975,10 @@ async fn start_import(
                     p.completed_at = Some(chrono::Utc::now().to_rfc3339());
                     p.push_log("[error] setup import preparation failed".into());
                 }
+                preparation_guard.finalize_preparation_hold()?;
                 return Err(e);
             }
-            preparation_guard.armed = false;
+            preparation_guard.disarm();
 
             Ok(Json(ImportActionResponse {
                 ok: true,
@@ -1499,9 +1520,10 @@ async fn reset_and_reimport(
             p.completed_at = Some(chrono::Utc::now().to_rfc3339());
             p.push_log("[error] setup import preparation failed".into());
         }
+        preparation_guard.finalize_preparation_hold()?;
         return Err(e);
     }
-    preparation_guard.armed = false;
+    preparation_guard.disarm();
 
     Ok(Json(ImportActionResponse {
         ok: true,
