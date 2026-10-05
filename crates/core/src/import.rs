@@ -2063,9 +2063,9 @@ pub async fn run_full_import(
     };
 
     if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
-        if resume_checkpoint.is_none() {
-            db.note_import_total(repo, op, log_entries.len() as u64)?;
-        }
+        // Always persist the live SVN log length. On resume the journal total must
+        // grow with the repository so processed_revisions cannot outrun total_revisions.
+        db.note_import_total(repo, op, log_entries.len() as u64)?;
     }
 
     let total_revisions = log_entries.len();

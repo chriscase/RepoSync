@@ -1641,8 +1641,9 @@ async fn repo_import_status(
         object.insert(
             "can_resume".into(),
             serde_json::json!(
-                reposync_core::db::import_operations::import_resume_checkpoint(&op).is_some()
-                    && (op.resume_authorized || op.state == ImportOperationState::Cancelled)
+                op.resume_authorized
+                    && reposync_core::db::import_operations::import_resume_checkpoint(&op)
+                        .is_some()
             ),
         );
         let import_mode = if op.snapshot_pin.is_some() || op.operation_type == "snapshot_import" {

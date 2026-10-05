@@ -818,11 +818,10 @@ impl Database {
         op_id: &str,
     ) -> Result<ImportOperation, DatabaseError> {
         self.update_import_operation(repo_id, op_id, |op| {
-            let authorized = match op.state {
-                ImportOperationState::ReconciliationRequired => op.resume_authorized,
-                ImportOperationState::Cancelled => import_resume_checkpoint(op).is_some(),
-                _ => false,
-            };
+            let authorized = matches!(
+                op.state,
+                ImportOperationState::ReconciliationRequired | ImportOperationState::Cancelled
+            ) && op.resume_authorized;
             if !authorized {
                 return Err(DatabaseError::Other(
                     "import resume is not authorized for this operation".into(),
@@ -1361,5 +1360,155 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not authorized"), "{err}");
+    }
+
+    #[test]
+    fn cancelled_without_resume_authorized_cannot_resume() {
+        let (_dir, db, workdir) = open_repo("cancel-no-auth");
+        let fp = fingerprint(&db, "cancel-no-auth", &workdir);
+        let op = db
+            .create_import_operation("cancel-no-auth", "admin", "req-cancel", &fp)
+            .unwrap();
+        db.start_import_operation("cancel-no-auth", &op.id).unwrap();
+        db.note_import_total("cancel-no-auth", &op.id, 3).unwrap();
+        db.note_import_local("cancel-no-auth", &op.id, 1, BASELINE_SHA, 1, 1)
+            .unwrap();
+        db.begin_import_publication("cancel-no-auth", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        db.confirm_import_publication("cancel-no-auth", &op.id, BASELINE_SHA)
+            .unwrap();
+        db.finish_import_operation(
+            "cancel-no-auth",
+            &op.id,
+            ImportOperationState::Cancelled,
+            "stopped after confirmed prefix",
+        )
+        .unwrap();
+        assert!(import_resume_checkpoint(
+            &db.get_import_operation("cancel-no-auth", &op.id)
+                .unwrap()
+                .unwrap()
+        )
+        .is_some());
+        let err = db
+            .resume_import_operation("cancel-no-auth", &op.id)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not authorized"), "{err}");
+        assert_eq!(
+            db.get_import_operation("cancel-no-auth", &op.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            ImportOperationState::Cancelled
+        );
+    }
+
+    #[test]
+    fn reconcile_rejects_processed_beyond_frozen_total() {
+        let (_dir, db, workdir) = open_repo("stale-total");
+        let fp = fingerprint(&db, "stale-total", &workdir);
+        let op = db
+            .create_import_operation("stale-total", "admin", "req-stale", &fp)
+            .unwrap();
+        db.start_import_operation("stale-total", &op.id).unwrap();
+        db.note_import_total("stale-total", &op.id, 52).unwrap();
+        let tip = "6666666666666666666666666666666666666666";
+        for rev in 1..=52 {
+            let sha = format!("{:040x}", rev);
+            db.note_import_local("stale-total", &op.id, rev, &sha, rev as u64, rev as u64)
+                .unwrap();
+        }
+        db.note_import_local("stale-total", &op.id, 53, tip, 53, 53)
+            .unwrap();
+        db.begin_import_publication("stale-total", &op.id, "refs/heads/main", tip)
+            .unwrap();
+        db.finish_import_operation(
+            "stale-total",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let err = db
+            .reconcile_verified_import("stale-total", &op.id, &workdir, "refs/heads/main", tip)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("remote SHA is not the recorded local import tip"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn resume_refreshes_total_when_svn_log_grows_and_allows_re_reconcile() {
+        let (_dir, db, workdir) = open_repo("grow-log");
+        let fp = fingerprint(&db, "grow-log", &workdir);
+        let op = db
+            .create_import_operation("grow-log", "admin", "req-grow", &fp)
+            .unwrap();
+        db.start_import_operation("grow-log", &op.id).unwrap();
+        db.note_import_total("grow-log", &op.id, 52).unwrap();
+        let batch_tip = "4444444444444444444444444444444444444444";
+        for rev in 1..50 {
+            let sha = format!("{:040x}", rev);
+            db.note_import_local("grow-log", &op.id, rev, &sha, rev as u64, rev as u64)
+                .unwrap();
+        }
+        db.note_import_local("grow-log", &op.id, 50, batch_tip, 50, 50)
+            .unwrap();
+        db.begin_import_publication("grow-log", &op.id, "refs/heads/main", batch_tip)
+            .unwrap();
+        db.finish_import_operation(
+            "grow-log",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let first = db
+            .reconcile_verified_import("grow-log", &op.id, &workdir, "refs/heads/main", batch_tip)
+            .unwrap();
+        assert!(first.resume_authorized);
+        assert_eq!(first.operation.total_revisions, Some(52));
+
+        db.resume_import_operation("grow-log", &op.id).unwrap();
+        db.note_import_total("grow-log", &op.id, 54).unwrap();
+        let mid_tip = "5555555555555555555555555555555555555555";
+        db.note_import_local("grow-log", &op.id, 51, mid_tip, 51, 51)
+            .unwrap();
+        db.note_import_local("grow-log", &op.id, 52, mid_tip, 52, 52)
+            .unwrap();
+        db.begin_import_publication("grow-log", &op.id, "refs/heads/main", mid_tip)
+            .unwrap();
+        db.finish_import_operation(
+            "grow-log",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply after resume",
+        )
+        .unwrap();
+
+        let held = db
+            .get_import_operation("grow-log", &op.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.processed_revisions, 52);
+        assert_eq!(held.total_revisions, Some(54));
+        assert!(
+            import_resume_checkpoint(&held).is_none(),
+            "checkpoint requires confirmed prefix before another 64B reconcile"
+        );
+
+        let second = db
+            .reconcile_verified_import("grow-log", &op.id, &workdir, "refs/heads/main", mid_tip)
+            .unwrap();
+        assert!(!second.completed);
+        assert!(second.resume_authorized);
+        assert_eq!(second.operation.total_revisions, Some(54));
+        assert_eq!(
+            import_resume_checkpoint(&second.operation),
+            Some((52, 52, 2))
+        );
     }
 }
