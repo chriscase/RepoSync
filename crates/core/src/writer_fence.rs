@@ -1,9 +1,18 @@
 //! Cross-host writer fencing via a durable epoch lease in `kv_state`.
 //!
 //! A local `flock` on `reposync.lock` blocks a second daemon on the same host,
-//! but shared storage can admit two hosts at once. The lease records an
-//! monotonic epoch plus holder identity; operation journals refuse finalize
+//! but shared storage can admit two hosts at once. The lease records a
+//! monotonic epoch plus holder host/PID; operation journals refuse finalize
 //! unless the current process still owns that epoch.
+//!
+//! ## Cross-host liveness
+//!
+//! `kill(pid, 0)` is meaningful only when `holder_host` matches this machine.
+//! For a remote holder we cannot observe its PID, so liveness is the durable
+//! `renewed_at` timestamp: a holder must refresh within [`LEASE_TTL_SECS`]
+//! (renewed on claim and on each successful fenced write). Takeover is allowed
+//! when the remote lease is past TTL, or when the holder is on this host and
+//! its PID is no longer alive.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -175,14 +184,39 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-fn lease_is_live(lease: &WriterLease, now: DateTime<Utc>) -> bool {
-    if !is_process_alive(lease.holder_pid) {
-        return false;
-    }
+fn holder_is_local(lease: &WriterLease) -> bool {
+    lease.holder_host == local_host_id()
+}
+
+fn lease_renewed_within_ttl(lease: &WriterLease, now: DateTime<Utc>) -> bool {
     let renewed = DateTime::parse_from_rfc3339(&lease.renewed_at)
         .map(|ts| ts.with_timezone(&Utc))
         .unwrap_or_else(|_| now);
     (now - renewed).num_seconds() <= LEASE_TTL_SECS
+}
+
+/// Whether another claimant must refuse because this holder still owns the lease.
+fn lease_is_live(lease: &WriterLease, now: DateTime<Utc>) -> bool {
+    let ttl_ok = lease_renewed_within_ttl(lease, now);
+    if holder_is_local(lease) {
+        is_process_alive(lease.holder_pid) && ttl_ok
+    } else {
+        ttl_ok
+    }
+}
+
+fn renew_lease_tx(tx: &Connection, lease: &WriterLease) -> Result<(), DatabaseError> {
+    write_lease(
+        tx,
+        &WriterLease {
+            version: 1,
+            epoch: lease.epoch,
+            holder_pid: lease.holder_pid,
+            holder_host: lease.holder_host.clone(),
+            acquired_at: lease.acquired_at.clone(),
+            renewed_at: Utc::now().to_rfc3339(),
+        },
+    )
 }
 
 fn in_use_message(lease: &WriterLease) -> String {
@@ -302,6 +336,7 @@ pub fn require_current(tx: &Connection) -> Result<(), DatabaseError> {
             "writer fence holder identity mismatch".into(),
         ));
     }
+    renew_lease_tx(tx, &lease)?;
     Ok(())
 }
 
@@ -335,41 +370,68 @@ mod tests {
         4_194_304_u32
     }
 
+    fn expire_lease(db: &Database) {
+        let raw = db.get_state(LEASE_KEY).unwrap().unwrap();
+        let lease = parse_lease(&raw).unwrap();
+        let expired = (Utc::now() - chrono::Duration::seconds(LEASE_TTL_SECS + 60)).to_rfc3339();
+        let stale = WriterLease {
+            version: 1,
+            epoch: lease.epoch,
+            holder_pid: lease.holder_pid,
+            holder_host: lease.holder_host,
+            acquired_at: lease.acquired_at,
+            renewed_at: expired,
+        };
+        db.set_state(LEASE_KEY, &serde_json::to_string(&stale).unwrap())
+            .unwrap();
+    }
+
     #[test]
     fn live_holder_refuses_second_host_claim() {
         let ctx = test_ctx();
-        let _a =
-            claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", std::process::id()).unwrap();
-        let err =
-            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap_err();
+        let _a = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_001).unwrap();
+        let err = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_002).unwrap_err();
         assert!(matches!(err, DatabaseError::DataDirInUse(_)));
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
-            serde_json::json!({"case":"64FENC_REFUSE_SECOND_HOST","refused":true})
+            serde_json::json!({"case":"64FENC_REFUSE_SECOND_HOST","host_a_pid":10001,"host_b_pid":10002,"refused":true})
         );
     }
 
     #[test]
     fn stale_holder_takeover_bumps_epoch() {
         let ctx = test_ctx();
-        let first = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", dead_pid()).unwrap();
+        let first = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_001).unwrap();
         assert_eq!(first.epoch(), 1);
-        let second =
-            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
+        expire_lease(&ctx.db);
+        let second = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_002).unwrap();
         assert_eq!(second.epoch(), 2);
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
-            serde_json::json!({"case":"64FENC_STALE_TAKEOVER","epoch":2})
+            serde_json::json!({"case":"64FENC_STALE_TAKEOVER","cross_host_ttl_expired":true,"epoch":2})
+        );
+    }
+
+    #[test]
+    fn same_host_dead_pid_allows_takeover() {
+        let ctx = test_ctx();
+        let local = local_host_id();
+        let _first = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
+        let second = claim_with_identity(&ctx.db, ctx.dir.path(), "standby-host", 10_003).unwrap();
+        assert_eq!(second.epoch(), 2);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64FENC_SAME_HOST_DEAD_PID","takeover":true})
         );
     }
 
     #[test]
     fn superseded_epoch_is_refused_at_finalize() {
         let ctx = test_ctx();
-        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", dead_pid()).unwrap();
-        let _current =
-            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
-        set_process_identity("host-a", dead_pid(), stale.epoch());
+        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_005).unwrap();
+        expire_lease(&ctx.db);
+        let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_006).unwrap();
+        set_process_identity("host-a", 10_005, stale.epoch());
         let err = ctx
             .db
             .transaction(|tx| require_current(tx))
@@ -380,6 +442,68 @@ mod tests {
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64FENC_SUPERSEDED_FINALIZE","refused":true})
+        );
+    }
+
+    #[test]
+    fn fenced_confirm_svn_to_git_push_refuses_superseded_host() {
+        use crate::db::git_push_operations::GitPushIntent;
+
+        let ctx = test_ctx();
+        ctx.db.conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+             VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'old','idle',0,0)",
+            [],
+        ).unwrap();
+        let intent = GitPushIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-fence",
+            target_fingerprint: "fp",
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "msg",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: "dddddddddddddddddddddddddddddddddddddddd",
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        };
+        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_007).unwrap();
+        let op = ctx.db.begin_svn_to_git_push(intent).unwrap();
+        expire_lease(&ctx.db);
+        let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_008).unwrap();
+        set_process_identity("host-a", 10_007, stale.epoch());
+        let err = ctx
+            .db
+            .confirm_svn_to_git_push(
+                "pair",
+                &op.id,
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("epoch mismatch") || err.contains("WriterFenced"),
+            "{err}"
+        );
+        clear_process_identity();
+        let mapped: i64 = ctx
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id='pair'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapped, 0);
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"64FENC_SYNC_CONFIRM","sync_records_unchanged":true})
         );
     }
 
@@ -396,15 +520,15 @@ mod tests {
         let workdir = ctx.dir.path().join("git-repo");
         let repo = ctx.db.get_repository("repo-f").unwrap().unwrap();
         let fp = import_target_fingerprint(&repo, &workdir);
-        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", dead_pid()).unwrap();
+        let stale = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_009).unwrap();
         let op = ctx
             .db
             .create_import_operation("repo-f", "admin", "req-fence", &fp)
             .unwrap();
         ctx.db.start_import_operation("repo-f", &op.id).unwrap();
-        let _current =
-            claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", std::process::id()).unwrap();
-        set_process_identity("host-a", dead_pid(), stale.epoch());
+        expire_lease(&ctx.db);
+        let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_010).unwrap();
+        set_process_identity("host-a", 10_009, stale.epoch());
         let err = ctx
             .db
             .finish_import_operation(

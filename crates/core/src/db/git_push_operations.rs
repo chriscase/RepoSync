@@ -518,6 +518,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ReconciledGitPush, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -570,6 +571,7 @@ impl Database {
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -600,6 +602,7 @@ impl Database {
         git_author: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),

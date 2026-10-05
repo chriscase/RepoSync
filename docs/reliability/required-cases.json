@@ -585,6 +585,7 @@
     {"id":"64FENC_STALE_TAKEOVER", "binary":"reposync_core", "test":"writer_fence::tests::stale_holder_takeover_bumps_epoch", "tier":"candidate_regression"},
     {"id":"64FENC_SUPERSEDED_FINALIZE", "binary":"reposync_core", "test":"writer_fence::tests::superseded_epoch_is_refused_at_finalize", "tier":"candidate_regression"},
     {"id":"64FENC_IMPORT_FINALIZE", "binary":"reposync_core", "test":"writer_fence::tests::fenced_import_finalize_refuses_superseded_host", "tier":"candidate_regression"},
+    {"id":"64FENC_SYNC_CONFIRM", "binary":"reposync_core", "test":"writer_fence::tests::fenced_confirm_svn_to_git_push_refuses_superseded_host", "tier":"candidate_regression"},
     {"id":"64FENC_CLEAN_RELEASE", "binary":"reposync_core", "test":"writer_fence::tests::clean_release_allows_immediate_reclaim", "tier":"candidate_regression"},
     {"id":"64C_JOURNAL", "binary":"reposync_core", "test":"db::svn_commit_operations::tests::persist_hold_and_unique_finalize", "tier":"candidate_regression"},
     {"id":"64C_RESUME_INTENT", "binary":"reposync_core", "test":"db::svn_commit_operations::tests::absent_effect_may_resume_same_intent_only", "tier":"candidate_regression"},
