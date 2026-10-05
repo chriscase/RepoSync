@@ -688,6 +688,72 @@ async fn candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64_setup_wizard_preparation_hold_persist_failure_is_not_acknowledged() {
+    if !svn_available() {
+        eprintln!("SKIP: svnadmin not available");
+        return;
+    }
+    let (addr, state, server, _tmp, repo_id, bare) = setup_wizard_fixture().await;
+    assert!(std::fs::remove_dir_all(&bare).is_ok());
+    state
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_setup_preparation_finish
+        BEFORE UPDATE OF value ON kv_state
+        WHEN NEW.key LIKE 'import_operation_v1:document:%'
+          AND json_extract(NEW.value, '$.state') = 'reconciliation_required'
+        BEGIN SELECT RAISE(FAIL, 'fixture preparation finish failure'); END;",
+        )
+        .unwrap();
+
+    let client = authed_client();
+    let started = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "setup-prep-hold-persist-fail")
+        .send()
+        .await
+        .unwrap();
+    let status = started.status();
+    let body: serde_json::Value = started.json().await.unwrap();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "{status} {body}"
+    );
+    assert_eq!(
+        body["error"].as_str().unwrap_or(""),
+        "internal server error",
+        "persistence failure must surface as operator-visible 500, not a held clone error: {body}"
+    );
+
+    let held = state
+        .db
+        .active_import_operation(&repo_id)
+        .unwrap()
+        .expect("active import pointer must remain while hold is unconfirmed");
+    assert_eq!(held.state, ImportOperationState::Queued);
+    assert_eq!(held.request_id, "setup-prep-hold-persist-fail");
+    assert!(!reposync_core::busy::is_busy(&repo_id));
+
+    let progress = state.import_progress.read().await.clone();
+    assert_eq!(progress.phase, ImportPhase::Failed);
+
+    let retry: serde_json::Value = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "setup-prep-hold-persist-fail-retry")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retry["ok"], false, "{retry}");
+    assert_eq!(retry["operation_id"], held.id);
+    server.abort();
+}
+
 #[cfg(feature = "reliability-fixture")]
 async fn wait_for_file(path: &Path) {
     tokio::time::timeout(Duration::from_secs(30), async {
