@@ -96,7 +96,7 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_batched`, `candidate_r66_team_history_continuation_survives_restart` |
 | >1000 continuation with pending SVN work | **proven** — `candidate_r66_continuation_mixed_pending_fail_closed` (cycle deferred with no bridge reset or writes) |
 | Merge-DAG team replay (engine cycle) | **proven** — `candidate_r10_merge_dag_replayed`, `candidate_r10_merge_dag_older_side_replayed_with_delta` |
-| Merge-DAG continuation over cap | **proven fail-closed** — `candidate_r10_merge_dag_continuation_fail_closed_before_writes`, `pending_frontier::merge_dag_continuation_batch_fails_closed_when_not_ancestor_closed` |
+| Merge-DAG continuation over cap | **proven fail-closed** — `candidate_r10_merge_dag_continuation_fail_closed_before_writes` (cap=1/2/3), `pending_frontier::merge_dag_continuation_batch_fails_closed_when_exceeds_cap` |
 | Personal Git→SVN engine-cycle merge-DAG replay | **NOT RUN** — inspect admission is proven; PR-based replay is a separate surface |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
@@ -139,10 +139,10 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 
 **Supported:** any qualified P→R frontier where `P` is an ancestor of `R`.
 Pending commits are collected via hide/push (`P..R`), topologically sorted
-oldest-first with deterministic tie-breaking, and replayed in batches of at
-most 1000 per cycle when the batch is ancestor-closed (always true for linear
-histories). Merge-DAG frontiers that fit entirely in one batch replay in one
-cycle. The handled Git checkpoint advances per confirmed Git→SVN commit and
+oldest-first with deterministic tie-breaking. Merge-DAG frontiers replay in
+one cycle when `total ≤ cap` (`has_more = false`). Linear backlogs over the
+reviewed cap continue in explicit oldest-first batches of at most 1000 commits
+per cycle. The handled Git checkpoint advances per confirmed Git→SVN commit and
 survives restart. `SyncStats` exposes `git_replay_has_more`,
 `git_pending_total`, and `deferred_mixed_pending`.
 
@@ -154,8 +154,8 @@ survives restart. `SyncStats` exposes `git_replay_has_more`,
 - Fetch-time `UnsupportedHistory` injection (test fault path)
 - A frontier that cannot be fully topologically ordered (should not arise for
   valid Git objects)
-- Merge-DAG continuation when the capped batch is not ancestor-closed (a single
-  Git SHA cannot represent a cut through the DAG)
+- Merge-DAG overflow when `total > cap` (`has_more = true`; a single Git SHA
+  cannot checkpoint a cut through the DAG)
 
 Automatic rewrite reconciliation stays a later slice with its own proofs.
 

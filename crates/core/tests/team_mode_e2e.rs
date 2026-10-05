@@ -3656,6 +3656,12 @@ async fn candidate_r10_merge_dag_older_side_replayed_with_delta() {
         after.mapping_count > before.mapping_count,
         "Z-side delta must advance mappings when replayed"
     );
+    let svn_tree = svn_tree(&fixture, after.svn_rev).await;
+    assert_eq!(
+        svn_tree.get("z-side.txt").map(|content| content.as_slice()),
+        Some(b"older side delta\n".as_ref()),
+        "Z-side tree delta must be present in SVN, not only mainline B"
+    );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
@@ -3670,17 +3676,13 @@ async fn candidate_r10_merge_dag_older_side_replayed_with_delta() {
             "svn_revision_final":after.svn_rev,
             "mapping_before":before.mapping_count,
             "mapping_after":after.mapping_count,
+            "z_side_in_svn":true,
             "older_side_replayed":true
         })
     );
 }
 
-/// Merge-DAG backlogs that exceed the replay cap fail closed before writes
-/// because a single Git SHA cannot checkpoint a cut through the DAG.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
-    let fixture = QualifiedPair::new().await;
-    let _cap = PendingCapGuard::new(&fixture.engine, 3);
+async fn push_older_side_merge_dag_fixture(fixture: &QualifiedPair) -> (String, String, String) {
     let checkpoint = fixture.imported_base.clone();
     let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
     let commit_tree = |parents: &[&str], message: &str, unix: i64| -> String {
@@ -3717,14 +3719,18 @@ async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
         &["update-ref", "refs/heads/main", &merge],
     );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
+    (checkpoint, z, merge)
+}
+
+async fn assert_merge_dag_continuation_fail_closed_before_writes(cap: usize) {
+    let fixture = QualifiedPair::new().await;
+    let _cap_guard = PendingCapGuard::new(&fixture.engine, cap);
+    let (checkpoint, z, merge) = push_older_side_merge_dag_fixture(&fixture).await;
     assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
     let block = history_block_json(&fixture);
     assert!(
-        block["detail"]
-            .as_str()
-            .unwrap()
-            .contains("ancestor-closed"),
-        "block detail must explain non-ancestor-closed batch: {block}"
+        block["detail"].as_str().unwrap().contains("exceeds cap"),
+        "block detail must explain merge-DAG overflow: {block}"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -3734,13 +3740,30 @@ async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
             "r":merge,
             "older_side":z,
             "reason":"unsupported_merge_dag",
-            "pending_cap":3,
+            "pending_cap":cap,
             "pending_commits":4,
             "durable":true,
             "before_writes":true,
-            "ancestor_closed_required":true
+            "merge_dag_overflow_fail_closed":true
         })
     );
+}
+
+/// Merge-DAG backlogs that exceed the replay cap fail closed before writes
+/// because a single Git SHA cannot checkpoint a cut through the DAG.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
+    assert_merge_dag_continuation_fail_closed_before_writes(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_cap1_before_writes() {
+    assert_merge_dag_continuation_fail_closed_before_writes(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_cap2_before_writes() {
+    assert_merge_dag_continuation_fail_closed_before_writes(2).await;
 }
 
 struct PendingCapGuard<'a> {

@@ -569,7 +569,7 @@ impl GitClient {
     /// Qualified merge DAGs replay in deterministic oldest-first topological
     /// order when the full frontier fits in one batch. Linear overflow returns
     /// the oldest-first replay batch with `has_more` set. Merge-DAG overflow
-    /// fails closed when the batch is not ancestor-closed.
+    /// fails closed because a single Git SHA cannot checkpoint a DAG cut.
     pub fn pending_commits_between(
         &self,
         since_sha: &str,
@@ -606,10 +606,10 @@ impl GitClient {
         let batch_tip = if batch.has_more {
             let Some(last) = commits.last() else {
                 return Err(GitError::UnsupportedHistory {
-                    reason: crate::pending_frontier::REASON_MERGE_DAG.into(),
+                    reason: crate::pending_frontier::REASON_BACKLOG.into(),
                     detail: format!(
                         "{}: empty continuation batch",
-                        crate::pending_frontier::DETAIL_MERGE_DAG
+                        crate::pending_frontier::DETAIL_BACKLOG
                     ),
                 });
             };

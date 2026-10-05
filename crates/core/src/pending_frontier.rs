@@ -23,7 +23,7 @@ pub const REASON_BACKLOG: &str = "unsupported_backlog";
 pub const REASON_UNPROVEN_RANGE: &str = "unproven_pending_range";
 
 pub const DETAIL_MERGE_DAG: &str =
-    "merge-DAG history blocked: seeded operator block, fetch-time fault, unordered frontier, or non-ancestor-closed continuation batch";
+    "merge-DAG history blocked: seeded operator block, fetch-time fault, unordered frontier, or overflow exceeding the replay cap";
 pub const DETAIL_BACKLOG: &str =
     "legacy durable block; linear continuation replays in oldest-first batches";
 
@@ -209,32 +209,15 @@ pub fn verify_linear_pending_range(
     Ok(frontier.len())
 }
 
-/// Returns `true` when every commit in `batch` is an ancestor of (or equal to)
-/// `batch_tip`, so a single Git SHA can represent the replayed prefix.
-fn batch_is_ancestor_closed(
-    repo: &Repository,
-    batch: &[Oid],
-    batch_tip: Oid,
-) -> Result<bool, GitError> {
-    for oid in batch {
-        if *oid == batch_tip {
-            continue;
-        }
-        match repo.graph_descendant_of(batch_tip, *oid) {
-            Ok(is_ancestor) => {
-                if !is_ancestor {
-                    return Ok(false);
-                }
-            }
-            Err(error) => {
-                return Err(unsupported(
-                    REASON_UNPROVEN_RANGE,
-                    format!("batch ancestry could not be established: {error}"),
-                ));
-            }
+/// Returns `true` when the pending frontier contains a merge commit.
+fn frontier_is_merge_dag(repo: &Repository, frontier: &[Oid]) -> Result<bool, GitError> {
+    for oid in frontier {
+        let commit = repo.find_commit(*oid).map_err(GitError::from)?;
+        if commit.parent_count() >= 2 {
+            return Ok(true);
         }
     }
-    Ok(true)
+    Ok(false)
 }
 
 /// Select the oldest-first pending batch from P→R, at most `cap` commits.
@@ -243,7 +226,7 @@ fn batch_is_ancestor_closed(
 /// visited-order stop. Qualified merge DAGs replay in deterministic
 /// topological order when the full frontier fits in one batch. Linear
 /// overflow returns the oldest-first prefix with `has_more = true`. Merge-DAG
-/// overflow fails closed when the prefix is not ancestor-closed.
+/// overflow fails closed because a single Git SHA cannot checkpoint a DAG cut.
 pub fn select_pending_batch(
     repo: &Repository,
     since_sha: &str,
@@ -270,16 +253,15 @@ pub fn select_pending_batch(
     if has_more {
         if commits.is_empty() {
             return Err(unsupported(
-                REASON_MERGE_DAG,
-                format!("{DETAIL_MERGE_DAG}: empty continuation batch"),
+                REASON_BACKLOG,
+                format!("{DETAIL_BACKLOG}: empty continuation batch"),
             ));
         }
-        let batch_tip = *commits.last().expect("non-empty batch");
-        if !batch_is_ancestor_closed(repo, &commits, batch_tip)? {
+        if frontier_is_merge_dag(repo, &frontier)? {
             return Err(unsupported(
                 REASON_MERGE_DAG,
                 format!(
-                    "{DETAIL_MERGE_DAG}: continuation batch ending at {batch_tip} is not ancestor-closed"
+                    "{DETAIL_MERGE_DAG}: merge-DAG frontier of {total} commits exceeds cap {cap}"
                 ),
             ));
         }
@@ -584,19 +566,22 @@ mod tests {
     }
 
     #[test]
-    fn merge_dag_continuation_batch_fails_closed_when_not_ancestor_closed() {
+    fn merge_dag_continuation_batch_fails_closed_when_exceeds_cap() {
         let dag = older_side_merge_dag();
-        let error =
-            select_pending_batch(&dag.repo, &dag.p.to_string(), &dag.m.to_string(), 3).unwrap_err();
-        match error {
-            GitError::UnsupportedHistory { reason, detail } => {
-                assert_eq!(reason, REASON_MERGE_DAG);
-                assert!(
-                    detail.contains("not ancestor-closed"),
-                    "unexpected detail: {detail}"
-                );
+        for cap in [1, 2, 3] {
+            let error =
+                select_pending_batch(&dag.repo, &dag.p.to_string(), &dag.m.to_string(), cap)
+                    .unwrap_err();
+            match error {
+                GitError::UnsupportedHistory { reason, detail } => {
+                    assert_eq!(reason, REASON_MERGE_DAG);
+                    assert!(
+                        detail.contains("exceeds cap"),
+                        "cap={cap} unexpected detail: {detail}"
+                    );
+                }
+                other => panic!("cap={cap} expected merge-DAG reject, got {other:?}"),
             }
-            other => panic!("expected merge-DAG reject, got {other:?}"),
         }
     }
 
@@ -612,9 +597,9 @@ mod tests {
         .unwrap_err();
         match error {
             GitError::UnsupportedHistory { reason, .. } => {
-                assert_eq!(reason, REASON_MERGE_DAG);
+                assert_eq!(reason, REASON_BACKLOG);
             }
-            other => panic!("expected merge-DAG reject, got {other:?}"),
+            other => panic!("expected backlog reject, got {other:?}"),
         }
     }
 
