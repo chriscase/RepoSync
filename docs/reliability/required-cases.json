@@ -244,6 +244,18 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "R66_PERSONAL_LINEAR_ADMIT",
+      "binary": "integration",
+      "test": "candidate_r66_personal_linear_history_admitted",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_PERSONAL_MERGE_DAG",
+      "binary": "integration",
+      "test": "candidate_r66_personal_merge_dag_contained",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R09_WEBHOOK_FORCED_HINT",
       "binary": "github_webhook_forced",
       "test": "candidate_r09_webhook_forced_is_hint_not_reset",

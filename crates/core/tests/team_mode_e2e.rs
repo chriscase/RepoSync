@@ -587,6 +587,42 @@ fn git_output(repo_path: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+/// Point inspection and tracking refs at `tip` so a fresh inspect would admit
+/// live Git; durable kv blocks must still refuse after restart.
+fn retarget_bridge_remote_observation(bridge: &Path, tip: &str, branch: &str) {
+    git_cli(
+        bridge,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            &format!("+{tip}:refs/reposync/inspection/incoming"),
+        ],
+    );
+    git_cli(
+        bridge,
+        &[
+            "fetch",
+            "--no-tags",
+            "origin",
+            &format!("+{tip}:refs/remotes/origin/{branch}"),
+        ],
+    );
+    assert_eq!(
+        git_output(bridge, &["rev-parse", "refs/reposync/inspection/incoming"]),
+        tip,
+        "inspection ref must match restored tip"
+    );
+    assert_eq!(
+        git_output(
+            bridge,
+            &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+        ),
+        tip,
+        "tracking ref must match restored tip"
+    );
+}
+
 struct QualifiedPair {
     repo_id: String,
     tmp: TempDir,
@@ -1428,6 +1464,7 @@ async fn candidate_r09_observed_remote_rewrite_durable_restart() {
         old_synced,
         "live remote restored to the handled checkpoint"
     );
+    retarget_bridge_remote_observation(&fixture.bridge, &old_synced, "main");
 
     let restarted = reopen_pair(&fixture);
     let result = restarted.run_sync_cycle().await;
@@ -1469,7 +1506,8 @@ async fn candidate_r09_observed_remote_rewrite_durable_restart() {
 }
 
 /// Durable quarantine must survive restart after the live remote is restored
-/// to the original handled SHA. Re-inspection would admit; the block must not.
+/// to the original handled SHA. Inspection/tracking refs are retargeted to the
+/// restored tip so live Git would admit; the durable block must still refuse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r09_durable_block_survives_restored_remote() {
     let repo_id = unique_pair_id("r09-durable");
@@ -1511,6 +1549,7 @@ async fn candidate_r09_durable_block_survives_restored_remote() {
         old_synced,
         "live remote restored to the original handled SHA"
     );
+    retarget_bridge_remote_observation(&fixture.bridge, &old_synced, "main");
 
     let restarted = reopen_pair(&fixture);
     let result = restarted.run_sync_cycle().await;
@@ -3658,6 +3697,7 @@ async fn candidate_r10_durable_backlog_block_survives_restart() {
         synced,
         "live remote restored to the handled checkpoint"
     );
+    retarget_bridge_remote_observation(&fixture.bridge, &synced, "main");
 
     let restarted = reopen_pair(&fixture);
     let result = restarted.run_sync_cycle().await;
@@ -3730,6 +3770,7 @@ async fn candidate_r10_durable_unsupported_history_block_survives_restart() {
         synced,
         "live remote restored to the handled checkpoint"
     );
+    retarget_bridge_remote_observation(&fixture.bridge, &synced, "main");
 
     let restarted = reopen_pair(&fixture);
     let result = restarted.run_sync_cycle().await;

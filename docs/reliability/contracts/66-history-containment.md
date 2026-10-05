@@ -6,8 +6,9 @@ pre-reset gate and hide/push pending selection (#109). Team
 `reconciliation_required` blocks now cover rewrite (`non_fast_forward`,
 `observed_remote_rewrite`) and UnsupportedHistory (`unsupported_merge_dag`,
 `unsupported_backlog`, `unproven_pending_range`), including fetch-time
-second-line hits. Personal-mode Git→SVN inspect, merge-DAG replay, and >1000
-continuation remain later.
+second-line hits. Personal-mode Git→SVN inspect now shares the same
+`inspect_fetched_history` gate with proven containment tests; merge-DAG
+replay and >1000 continuation remain later.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
@@ -73,6 +74,18 @@ commit, and watermark or mapping change until an explicit operator action clears
 them. `fetch_git_changes` records the same durable block when its second-line
 `pending_commits_between` check hits UnsupportedHistory.
 
+### Personal-mode Git→SVN inspect
+
+| Area | Status |
+| --- | --- |
+| P/O/R/L inspect before replay (`inspect_personal_history`) | **shipped** — same classifications as team |
+| Rewrite containment (`non_fast_forward`) + durable restart | **proven** — `candidate_r09_personal_rewrite_contained` |
+| Qualified linear admission | **proven** — `candidate_r66_personal_linear_history_admitted` |
+| UnsupportedHistory (`unsupported_merge_dag`) + durable restart | **proven** — `candidate_r66_personal_merge_dag_contained` |
+| Observed-remote rewrite (`observed_remote_rewrite`) | **NOT RUN** — team polling cases cover O→R; personal inherits inspect |
+| >1000 backlog durable restart | **NOT RUN** — team `candidate_r10_durable_backlog_block_survives_restart` |
+| Merge-DAG replay / >1000 continuation | **remaining** |
+
 Baseline R09 still demonstrates that the original pull-then-walk path
 duplicates rewritten history. Candidate R09 cases reject replacement and
 metadata-only amend with zero remote writes, including repeat/reopen.
@@ -103,11 +116,11 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 
 ## Smallest next implementation slice (after this review)
 
-Durable rewrite block, personal inspect, webhook `forced` hint, exact skip
-disposition, hide/push pending selection, durable UnsupportedHistory blocks
-(including fetch-time persistence), polling O→R force-push detection, and
-restart enforcement have landed. Remaining #66 work is explicit recovery
-algorithms, not more pre-reset classification:
+Durable rewrite block, personal inspect (with containment proofs), webhook
+`forced` hint, exact skip disposition, hide/push pending selection, durable
+UnsupportedHistory blocks (including fetch-time persistence), polling O→R
+force-push detection, and restart enforcement have landed. Remaining #66 work is
+explicit recovery algorithms, not more pre-reset classification:
 
 1. Continuation past 1000 pending commits.
 2. Merge-DAG replay.
@@ -122,7 +135,9 @@ branch/object/shallow; ancestry-command error; merge DAG reject (including
 older-side hide/push frontier vs visited-order skip in unit tests); >1000 reject;
 ignored-path preservation; repo scoping; durable block survives restart for
 rewrite, observed-remote rewrite, UnsupportedHistory (merge DAG and backlog);
-fetch-time UnsupportedHistory persistence.
+fetch-time UnsupportedHistory persistence; personal-mode rewrite and merge-DAG
+containment with durable restart (inspection/tracking refs retargeted to restored
+tip before reopen).
 
 Still required before claiming #66:
 
