@@ -567,8 +567,9 @@ impl GitClient {
     ///
     /// Uses hide/push (`since..tip`), not a visited-order stop at `since_sha`.
     /// Qualified merge DAGs replay in deterministic oldest-first topological
-    /// order. Linear overflow returns the oldest-first replay batch with
-    /// `has_more` set instead of silently truncating.
+    /// order when the full frontier fits in one batch. Linear overflow returns
+    /// the oldest-first replay batch with `has_more` set. Merge-DAG overflow
+    /// fails closed when the batch is not ancestor-closed.
     pub fn pending_commits_between(
         &self,
         since_sha: &str,
@@ -602,10 +603,23 @@ impl GitClient {
             let commit = self.repo.find_commit(oid)?;
             commits.push(git_commit_info(&commit));
         }
-        let batch_tip = commits
-            .last()
-            .map(|commit| commit.sha.clone())
-            .unwrap_or_else(|| tip_sha.to_string());
+        let batch_tip = if batch.has_more {
+            let Some(last) = commits.last() else {
+                return Err(GitError::UnsupportedHistory {
+                    reason: crate::pending_frontier::REASON_MERGE_DAG.into(),
+                    detail: format!(
+                        "{}: empty continuation batch",
+                        crate::pending_frontier::DETAIL_MERGE_DAG
+                    ),
+                });
+            };
+            last.sha.clone()
+        } else {
+            commits
+                .last()
+                .map(|commit| commit.sha.clone())
+                .unwrap_or_else(|| tip_sha.to_string())
+        };
         debug!(
             count = commits.len(),
             total = batch.total,

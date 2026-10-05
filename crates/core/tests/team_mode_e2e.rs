@@ -3576,8 +3576,111 @@ async fn candidate_r10_merge_dag_replayed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
+async fn candidate_r10_merge_dag_older_side_replayed_with_delta() {
     let fixture = QualifiedPair::new().await;
+    let checkpoint = fixture.imported_base.clone();
+    let commit_tree = |tree: &str, parents: &[&str], message: &str, unix: i64| -> String {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&fixture.developer)
+            .args(["commit-tree", tree, "-m", message]);
+        for parent in parents {
+            command.args(["-p", parent]);
+        }
+        let output = command
+            .env("GIT_AUTHOR_NAME", "Fixture Developer")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture Developer")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .env("GIT_AUTHOR_DATE", unix.to_string())
+            .env("GIT_COMMITTER_DATE", unix.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "commit-tree {message}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    // Unrelated older root Z is reachable from merge M but not from P, so a
+    // visited-order stop at P can omit it. Hide/push still lists Z.
+    std::fs::write(fixture.developer.join("z-side.txt"), "older side delta\n").unwrap();
+    git_cli(&fixture.developer, &["add", "z-side.txt"]);
+    let z_tree = git_output(&fixture.developer, &["write-tree"]);
+    git_cli(&fixture.developer, &["reset", "--hard", &checkpoint]);
+    let z = commit_tree(&z_tree, &[], "Z old side", 1_000_000_000);
+    let y = commit_tree(&z_tree, &[&z], "Y old side", 1_000_000_001);
+    std::fs::write(fixture.developer.join("b-side.txt"), "mainline delta\n").unwrap();
+    git_cli(&fixture.developer, &["add", "b-side.txt"]);
+    let b_tree = git_output(&fixture.developer, &["write-tree"]);
+    git_cli(&fixture.developer, &["reset", "--hard", &checkpoint]);
+    let b = commit_tree(&b_tree, &[&checkpoint], "B mainline", 2_000_000_000);
+    git_cli(&fixture.developer, &["reset", "--hard", &checkpoint]);
+    std::fs::write(fixture.developer.join("z-side.txt"), "older side delta\n").unwrap();
+    std::fs::write(fixture.developer.join("b-side.txt"), "mainline delta\n").unwrap();
+    git_cli(&fixture.developer, &["add", "z-side.txt", "b-side.txt"]);
+    let merge_tree = git_output(&fixture.developer, &["write-tree"]);
+    let merge = commit_tree(&merge_tree, &[&b, &y], "Merge older side", 2_000_000_001);
+    git_cli(
+        &fixture.developer,
+        &["update-ref", "refs/heads/main", &merge],
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let pending = git_output(
+        &fixture.developer,
+        &[
+            "rev-list",
+            "--topo-order",
+            &format!("{checkpoint}..{merge}"),
+        ],
+    );
+    assert!(
+        pending.lines().any(|line| line == z),
+        "ancestry frontier must include older pending {z}; pending={pending}"
+    );
+    let before = fixture.snapshot().await;
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    let after = fixture.snapshot().await;
+    assert!(
+        stats.git_to_svn_count >= 1,
+        "older side Z must produce a Git→SVN write, not just checkpoint ordering"
+    );
+    assert_eq!(
+        after.watermark.1, merge,
+        "older side Z, Y, mainline B, and merge must all checkpoint without skipping Z"
+    );
+    assert_eq!(after.bridge_sha, merge);
+    assert!(
+        after.mapping_count > before.mapping_count,
+        "Z-side delta must advance mappings when replayed"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_MERGE_OLDER_SIDE",
+            "p":checkpoint,
+            "r":merge,
+            "older_side":z,
+            "git_to_svn_count":stats.git_to_svn_count,
+            "checkpoint_final":merge,
+            "pending_commits":4,
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":after.svn_rev,
+            "mapping_before":before.mapping_count,
+            "mapping_after":after.mapping_count,
+            "older_side_replayed":true
+        })
+    );
+}
+
+/// Merge-DAG backlogs that exceed the replay cap fail closed before writes
+/// because a single Git SHA cannot checkpoint a cut through the DAG.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
+    let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
     let checkpoint = fixture.imported_base.clone();
     let tree = git_output(&fixture.developer, &["rev-parse", "HEAD^{tree}"]);
     let commit_tree = |parents: &[&str], message: &str, unix: i64| -> String {
@@ -3605,8 +3708,6 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     };
-    // Unrelated older root Z is reachable from merge M but not from P, so a
-    // visited-order stop at P can omit it. Hide/push still lists Z.
     let z = commit_tree(&[], "Z old side", 1_000_000_000);
     let y = commit_tree(&[&z], "Y old side", 1_000_000_001);
     let b = commit_tree(&[&checkpoint], "B mainline", 2_000_000_000);
@@ -3616,48 +3717,28 @@ async fn candidate_r10_merge_dag_older_side_not_silently_skipped() {
         &["update-ref", "refs/heads/main", &merge],
     );
     git_cli(&fixture.developer, &["push", "origin", "main"]);
-    let pending = git_output(
-        &fixture.developer,
-        &[
-            "rev-list",
-            "--topo-order",
-            &format!("{checkpoint}..{merge}"),
-        ],
-    );
+    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
+    let block = history_block_json(&fixture);
     assert!(
-        pending.lines().any(|line| line == z),
-        "ancestry frontier must include older pending {z}; pending={pending}"
+        block["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ancestor-closed"),
+        "block detail must explain non-ancestor-closed batch: {block}"
     );
-    let before = fixture.snapshot().await;
-    let stats = fixture.engine.run_sync_cycle().await.unwrap();
-    let after = fixture.snapshot().await;
-    assert_eq!(
-        stats.git_to_svn_count,
-        0,
-        "commit-tree fixture shares one tree; replay proves ordering via checkpoints, not SVN deltas"
-    );
-    assert_eq!(
-        after.watermark.1, merge,
-        "older side Z, Y, mainline B, and merge must all checkpoint without skipping Z"
-    );
-    assert_eq!(after.bridge_sha, merge);
-    assert_eq!(after.svn_rev, before.svn_rev);
-    assert_eq!(after.mapping_count, before.mapping_count);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
-            "case":"R10_MERGE_OLDER_SIDE",
+            "case":"R10_MERGE_DAG_CONTINUATION_FAIL_CLOSED",
             "p":checkpoint,
             "r":merge,
             "older_side":z,
-            "git_to_svn_count":0,
-            "checkpoint_final":merge,
+            "reason":"unsupported_merge_dag",
+            "pending_cap":3,
             "pending_commits":4,
-            "svn_revision_before_after":before.svn_rev,
-            "svn_revision_final":after.svn_rev,
-            "mapping_before":before.mapping_count,
-            "mapping_after":after.mapping_count,
-            "older_side_replayed":true
+            "durable":true,
+            "before_writes":true,
+            "ancestor_closed_required":true
         })
     );
 }

@@ -3126,8 +3126,8 @@ impl SyncEngine {
         info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
 
         // Select P..R from the pinned inspection objects before reset so a
-        // visited-order HEAD walk cannot skip older pending work, and so an
-        // unqualified merge still fails closed with no mutation.
+        // visited-order HEAD walk cannot skip older pending work. Unsupported
+        // merge-DAG continuation batches fail closed with no mutation.
         let batch_cap = self.replay_batch_cap();
         let selection = git
             .pending_commits_between(&admission.checkpoint, &admission.remote_tip, batch_cap)

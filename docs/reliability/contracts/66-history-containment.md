@@ -7,8 +7,9 @@ continuation, and qualified merge-DAG replay are shipped. Team
 `observed_remote_rewrite`) and UnsupportedHistory (`unsupported_merge_dag`,
 `unsupported_backlog`, `unproven_pending_range`), including fetch-time
 second-line hits. Personal-mode Git→SVN inspect shares the same
-`inspect_fetched_history` gate with proven containment tests. Linear and
-merge-DAG backlogs continue in explicit oldest-first replay batches.
+`inspect_fetched_history` gate with proven containment tests. Linear and merge-DAG backlogs continue in explicit oldest-first replay
+batches when the full frontier fits in one batch. Merge-DAG backlogs that
+exceed the cap fail closed before writes.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
@@ -63,8 +64,8 @@ checkout/reset must use the same object. Pending-commit selection uses a
 hide/push ancestry frontier (`P..R`) so a visited-order stop at `P` cannot
 omit older pending commits; the proof lives in `pending_frontier` unit tests
 (`hide_push_frontier_includes_older_pending_side`), not in
-`candidate_r10_merge_dag_older_side_not_silently_skipped` (replays the older
-side instead of silently skipping it).
+`candidate_r10_merge_dag_older_side_replayed_with_delta` (engine replay with a
+Z-side tree delta).
 
 While Git replay continuation is incomplete (`has_more`), the team engine
 resets the bridge only through the current batch tip (not the full admitted
@@ -94,7 +95,8 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | >1000 legacy backlog durable restart | **proven** — team `candidate_r10_durable_backlog_block_survives_restart` (seeded block), personal `candidate_r66_personal_backlog_block_survives_restart` |
 | >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_batched`, `candidate_r66_team_history_continuation_survives_restart` |
 | >1000 continuation with pending SVN work | **proven** — `candidate_r66_continuation_mixed_pending_fail_closed` (cycle deferred with no bridge reset or writes) |
-| Merge-DAG team replay (engine cycle) | **proven** — `candidate_r10_merge_dag_replayed`, `candidate_r10_merge_dag_older_side_not_silently_skipped` |
+| Merge-DAG team replay (engine cycle) | **proven** — `candidate_r10_merge_dag_replayed`, `candidate_r10_merge_dag_older_side_replayed_with_delta` |
+| Merge-DAG continuation over cap | **proven fail-closed** — `candidate_r10_merge_dag_continuation_fail_closed_before_writes`, `pending_frontier::merge_dag_continuation_batch_fails_closed_when_not_ancestor_closed` |
 | Personal Git→SVN engine-cycle merge-DAG replay | **NOT RUN** — inspect admission is proven; PR-based replay is a separate surface |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
@@ -116,10 +118,12 @@ metadata-only amend with zero remote writes, including repeat/reopen.
    or patch-id equality. Future auto-reconciliation needs its own review.
 5. Pending-commit selection must be a correct ancestry/frontier algorithm.
    Qualified merge DAGs replay in deterministic oldest-first topological
-   order (parents before children; tie-break by committer time then OID).
-   Linear and merge-DAG backlogs over 1000 replay in explicit oldest-first
-   batches of at most 1000 commits per cycle; the handled Git checkpoint is
-   the durable continuation cursor. While continuation is incomplete,
+   order (parents before children; tie-break by committer time then OID) when
+   the full frontier fits in one batch. Linear backlogs over 1000 replay in
+   explicit oldest-first batches of at most 1000 commits per cycle; merge-DAG
+   backlogs that exceed the cap fail closed before writes because a single Git
+   SHA cannot checkpoint a cut through the DAG. The handled Git checkpoint is
+   the durable continuation cursor for linear batches only. While continuation is incomplete,
    opposite-direction SVN work with pending Git backlog defers the cycle with
    no mutation and surfaces `deferred_mixed_pending` on `SyncStats`; conflict
    detection sees the full P→R path. Do not silently drop older work.
@@ -136,8 +140,10 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 **Supported:** any qualified P→R frontier where `P` is an ancestor of `R`.
 Pending commits are collected via hide/push (`P..R`), topologically sorted
 oldest-first with deterministic tie-breaking, and replayed in batches of at
-most 1000 per cycle. The handled Git checkpoint advances per confirmed
-Git→SVN commit and survives restart. `SyncStats` exposes `git_replay_has_more`,
+most 1000 per cycle when the batch is ancestor-closed (always true for linear
+histories). Merge-DAG frontiers that fit entirely in one batch replay in one
+cycle. The handled Git checkpoint advances per confirmed Git→SVN commit and
+survives restart. `SyncStats` exposes `git_replay_has_more`,
 `git_pending_total`, and `deferred_mixed_pending`.
 
 **Still fail-closed:**
@@ -148,6 +154,8 @@ Git→SVN commit and survives restart. `SyncStats` exposes `git_replay_has_more`
 - Fetch-time `UnsupportedHistory` injection (test fault path)
 - A frontier that cannot be fully topologically ordered (should not arise for
   valid Git objects)
+- Merge-DAG continuation when the capped batch is not ancestor-closed (a single
+  Git SHA cannot represent a cut through the DAG)
 
 Automatic rewrite reconciliation stays a later slice with its own proofs.
 
@@ -155,8 +163,9 @@ Automatic rewrite reconciliation stays a later slice with its own proofs.
 
 Already present: ordinary fast-forward; unchanged tip with new SVN work;
 L=R lagging P; rewrite of already-synced work; metadata amend; missing
-branch/object/shallow; ancestry-command error; merge DAG reject (including
-older-side hide/push frontier vs visited-order skip in unit tests); >1000 linear
+branch/object/shallow; ancestry-command error; merge-DAG replay when the full
+frontier fits in one batch (older-side hide/push frontier vs visited-order skip
+in unit tests); merge-DAG continuation over cap fail-closed; >1000 linear
 continuation with restart and mixed-pending deferral; ignored-path preservation; repo scoping; durable
 block survives restart for rewrite, observed-remote rewrite, UnsupportedHistory
 (merge DAG and legacy backlog); fetch-time UnsupportedHistory persistence;
