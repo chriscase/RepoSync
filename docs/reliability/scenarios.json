@@ -32,7 +32,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "A held partial import is skipped by the real scheduler tick. An existing Git target is refused before replay. reset=true is refused before enrollment. A stale operation ID cannot act on a newer active operation. Reconcile serializes against the per-repo busy slot. Two independent repos remain independent in 64A_CONNECTING.",
+      "evidence": "A held partial import is skipped by the real scheduler tick. An existing Git target is refused before replay. reset=true is refused before enrollment. A stale operation ID cannot act on a newer active operation. Reconcile serializes against the per-repo busy slot. Two independent repos remain independent in 64A_CONNECTING. Cross-host writer fencing treats foreign holders as live until heartbeat exists, probes local PIDs only for stale takeover, refuses unenrolled writers when any lease row is present, enrolls begin/confirm/finalize paths, and blocks superseded epochs on import finalize and SVN-to-Git confirm without writing sync_records.",
       "diagnostic_expected_baseline_failure": false
     },
     {

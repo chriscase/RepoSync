@@ -235,6 +235,61 @@ fn finalize_tx(
     Ok(op)
 }
 
+fn personal_finalize_tx(
+    tx: &Connection,
+    mut op: GitPushOperation,
+    git_sha: &str,
+    git_tree: &str,
+    watermark_source: &str,
+    git_author: &str,
+) -> Result<GitPushOperation, DatabaseError> {
+    if git_sha.len() != 40 || !git_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DatabaseError::Other(
+            "svn-to-git push lacks a full observed Git SHA".into(),
+        ));
+    }
+    if git_tree.len() != 40 || !git_tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DatabaseError::Other(
+            "svn-to-git push lacks a full observed Git tree".into(),
+        ));
+    }
+    if git_sha != op.intended_local_git_sha {
+        return Err(DatabaseError::Other(
+            "observed Git SHA differs from the recorded local intent".into(),
+        ));
+    }
+    let svn_rev = op.source_svn_rev;
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commit_map WHERE svn_rev = ?1)",
+        params![svn_rev],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author)
+             VALUES (?1, ?2, 'svn_to_git', ?3, ?4, ?5)",
+            params![svn_rev, git_sha, now, op.source_svn_author, git_author],
+        )?;
+    }
+    let watermark_now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![watermark_source, svn_rev.to_string(), watermark_now],
+    )?;
+    let now = Utc::now().to_rfc3339();
+    op.state = GitPushOperationState::Completed;
+    op.last_confirmed_git_sha = Some(git_sha.into());
+    op.last_confirmed_git_tree = Some(git_tree.into());
+    op.resume_authorized = false;
+    op.updated_at = now;
+    op.outcome_detail = Some("personal SVN-to-Git push verified and recorded".into());
+    write_op(tx, &op)?;
+    clear_active(tx, &op.repo_id, &op.id)?;
+    Ok(op)
+}
+
 impl Database {
     pub fn get_git_push_operation(
         &self,
@@ -311,6 +366,7 @@ impl Database {
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", intent.repo_id);
             let active_existing = read_value(tx, &active)?;
             if active_existing.is_none()
@@ -463,6 +519,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ReconciledGitPush, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -515,6 +572,7 @@ impl Database {
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -534,6 +592,43 @@ impl Database {
         })
     }
 
+    /// Personal-mode checkpoint: journal completion plus `commit_map` and watermark.
+    pub fn confirm_personal_svn_to_git_push(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        observed_git_sha: &str,
+        observed_git_tree: &str,
+        watermark_source: &str,
+        git_author: &str,
+    ) -> Result<GitPushOperation, DatabaseError> {
+        self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
+                return Err(DatabaseError::Other(
+                    "stale or inactive svn-to-git push operation".into(),
+                ));
+            }
+            let op =
+                parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
+                    DatabaseError::Other("missing svn-to-git push document".into())
+                })?)?;
+            if op.repo_id != repo_id || op.state != GitPushOperationState::Running {
+                return Err(DatabaseError::Other(
+                    "svn-to-git push is not running".into(),
+                ));
+            }
+            personal_finalize_tx(
+                tx,
+                op,
+                observed_git_sha,
+                observed_git_tree,
+                watermark_source,
+                git_author,
+            )
+        })
+    }
+
     fn update_git_push_operation<F>(
         &self,
         repo_id: &str,
@@ -544,6 +639,7 @@ impl Database {
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -743,5 +839,34 @@ mod tests {
         let held = db.get_git_push_operation("pair", &op.id).unwrap().unwrap();
         assert_eq!(held.state, GitPushOperationState::ReconciliationRequired);
         assert!(!held.resume_authorized);
+    }
+
+    #[test]
+    fn personal_confirm_records_commit_map_and_watermark() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
+        let done = db
+            .confirm_personal_svn_to_git_push(
+                "pair",
+                &op.id,
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "svn_rev",
+                "Dev <dev@example.com>",
+            )
+            .unwrap();
+        assert_eq!(done.state, GitPushOperationState::Completed);
+        assert!(db.active_git_push_operation("pair").unwrap().is_none());
+        let mapped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE svn_rev=3 AND git_sha=?1",
+                ["dddddddddddddddddddddddddddddddddddddddd"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mapped, 1);
+        assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("3"));
     }
 }

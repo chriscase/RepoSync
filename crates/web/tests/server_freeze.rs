@@ -4761,6 +4761,8 @@ mod import_reconciliation_tests {
             .as_str()
             .unwrap()
             .contains("partial"));
+        assert_eq!(result["may_resume"], true);
+        assert_eq!(result["resume_authorized"], true);
         assert_eq!(fixture.operation().confirmed_batches, 1);
         assert!(fixture.operation().intended_git_sha.is_none());
         assert_eq!(

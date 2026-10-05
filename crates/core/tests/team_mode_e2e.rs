@@ -7041,3 +7041,65 @@ async fn candidate_64e_authorized_svn_to_git_resume_stays_held_on_conflict() {
         })
     );
 }
+
+struct CycleMappingFaultGuard {
+    var: String,
+}
+
+impl CycleMappingFaultGuard {
+    fn set(var: &str, repo_id: &str) -> Self {
+        let scoped = format!("{}__{}", var, repo_id);
+        std::env::set_var(&scoped, "1");
+        Self { var: scoped }
+    }
+}
+
+impl Drop for CycleMappingFaultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(&self.var);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_64f_cycle_mapping_checkpoint_fail_holds_without_advance() {
+    let fixture = QualifiedPair::new_with_repo_id("64f-cycle-mapping-hold").await;
+    let repo_id = fixture.repo_id.as_str();
+    let before = fixture.snapshot().await;
+    let revision = svn_property_only_revision(&fixture.wc);
+    assert_eq!(revision, before.svn_rev + 1);
+    let _fault = CycleMappingFaultGuard::set("REPOSYNC_CYCLE_MAPPING_CHECKPOINT_FAIL", repo_id);
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::CycleMappingHeld { .. })),
+        "{result:?}"
+    );
+    drop(_fault);
+    let after = fixture.snapshot().await;
+    assert_eq!(after.watermark, before.watermark);
+    let held = fixture
+        .engine
+        .db()
+        .active_team_cycle_mapping_operation(repo_id)
+        .unwrap()
+        .expect("held cycle mapping");
+    assert_eq!(
+        held.state,
+        reposync_core::db::team_cycle_mapping_operations::TeamCycleMappingState::ReconciliationRequired
+    );
+    assert!(!held.resume_authorized);
+    let blocked = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(blocked, Err(SyncError::CycleMappingHeld { .. })),
+        "{blocked:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"64F_CYCLE_MAPPING_HOLD",
+            "operation_id":held.id,
+            "revision":revision,
+            "watermark_unchanged":true,
+            "second_cycle_blocked":true
+        })
+    );
+}

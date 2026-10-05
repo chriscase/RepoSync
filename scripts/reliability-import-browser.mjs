@@ -113,12 +113,12 @@ try {
     } else if (mode === 'reconcile-partial') {
       if (receipt.payload?.lifecycle !== 'reconciliation_required' || receipt.payload?.publication_proved !== true ||
           receipt.payload?.checkpoint_completed !== false) throw new Error(`Partial proof was not held: ${JSON.stringify(receipt)}`);
-      await until(async () => (await body()).includes('safe resume is not yet implemented'), 'partial hold reason');
+      await until(async () => (await body()).includes('resume from the confirmed checkpoint'), 'partial hold reason');
     } else throw new Error(`Unknown reconciliation mode ${mode}`);
     await screenshot(`${mode}-after.png`);
     await send('Page.reload', { ignoreCache: true });
     const durable = mode === 'reconcile-complete' ? 'Import completed after remote verification' :
-      mode === 'reconcile-mismatch' ? 'Remote ref differs' : 'safe resume is not yet implemented';
+      mode === 'reconcile-mismatch' ? 'Remote ref differs' : 'resume from the confirmed checkpoint';
     await until(async () => (await body()).includes(durable), 'durable reconciliation status after reload');
     if (await button('Start full import') || await button('Stop import')) {
       throw new Error('Unsafe import action available after verification');
