@@ -1,9 +1,9 @@
-//! Exclusive data-directory owner via the daemon lockfile.
+//! Exclusive data-directory owner via the daemon lockfile and durable lease.
 //!
 //! Mixed-version writer policy: one process owns `{data_dir}/reposync.lock`
-//! with an exclusive `flock`. A second daemon — including an older or newer
-//! executable — cannot take that owner while the lock is held. This is a
-//! local file lock, not a distributed lock.
+//! with an exclusive `flock` and a durable writer-fence epoch in `kv_state`.
+//! A second daemon on the same host is blocked by `flock`; a second host on
+//! shared storage is refused or fenced by the epoch lease checked at finalize.
 //!
 //! Ordinary daemon startup acquires this owner. CLI/personal
 //! `Database::new`/`initialize` paths do not; wiring those writers is a later
@@ -23,6 +23,12 @@ use crate::errors::DatabaseError;
 pub struct LockGuard {
     _file: File,
     path: PathBuf,
+}
+
+/// Combined local flock and durable cross-host writer fence.
+pub struct DataDirOwner {
+    pub lock: LockGuard,
+    pub fence: crate::writer_fence::WriterFenceGuard,
 }
 
 impl Drop for LockGuard {

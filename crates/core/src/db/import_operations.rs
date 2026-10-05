@@ -314,6 +314,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ImportOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if super::managed_remove::new_work_blocked(tx, repo_id)? {
                 return Err(DatabaseError::Other(
                     "repository removal blocks a new import".into(),
@@ -416,6 +417,7 @@ impl Database {
         F: FnOnce(&mut ImportOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -671,6 +673,7 @@ impl Database {
         sha: &str,
     ) -> Result<ImportOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
@@ -708,6 +711,7 @@ impl Database {
         observed_sha: &str,
     ) -> Result<ReconciledImport, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other("stale or inactive import operation".into()));
             }

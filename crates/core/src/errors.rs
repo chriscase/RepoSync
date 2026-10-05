@@ -383,6 +383,10 @@ pub enum DatabaseError {
     #[error("{0}")]
     DataDirInUse(String),
 
+    /// A durable writer-fence lease is held by another host or epoch.
+    #[error("{0}")]
+    WriterFenced(String),
+
     /// A record was not found.
     #[error("{entity} not found: {id}")]
     NotFound { entity: String, id: String },

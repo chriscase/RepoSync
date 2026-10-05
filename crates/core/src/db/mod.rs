@@ -103,24 +103,31 @@ impl Database {
         Ok(())
     }
 
-    /// Ordinary daemon writer startup: exclusive `reposync.lock` owner, then
-    /// v12 init.
+    /// Ordinary daemon writer startup: exclusive `reposync.lock` owner, durable
+    /// writer-fence lease, then v12 init.
     ///
-    /// The returned [`crate::data_dir::LockGuard`] must be held for the process
-    /// lifetime. Additional SQLite connections to the same file are allowed
-    /// in-process; a second process cannot take the owner.
+    /// The returned [`crate::data_dir::DataDirOwner`] must be held for the
+    /// process lifetime. Additional SQLite connections to the same file are
+    /// allowed in-process; a second process cannot take the owner.
     ///
     /// CLI and personal `Database::new`/`initialize` paths do not take this
     /// lock. Non-daemon writers stay out of scope until a later slice.
     pub fn open_with_exclusive_owner(
         data_dir: impl AsRef<Path>,
-    ) -> Result<(Self, crate::data_dir::LockGuard), DatabaseError> {
+    ) -> Result<(Self, crate::data_dir::DataDirOwner), DatabaseError> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
-        let owner = crate::data_dir::acquire(data_dir)?;
+        let lock = crate::data_dir::acquire(data_dir)?;
         let db = Self::new(data_dir.join("reposync.db"))?;
         db.initialize()?;
-        Ok((db, owner))
+        let fence = crate::writer_fence::claim(&db, data_dir)?;
+        Ok((
+            db,
+            crate::data_dir::DataDirOwner {
+                lock,
+                fence,
+            },
+        ))
     }
 
     /// Obtain a lock on the underlying connection.

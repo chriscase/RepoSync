@@ -101,6 +101,8 @@ fn exclusive_data_dir_owner_blocks_second_startup() {
         matches!(err, DatabaseError::DataDirInUse(_)),
         "expected DataDirInUse, got {err:?}"
     );
+    let fence_epoch = owner.fence.epoch();
+    assert!(fence_epoch >= 1);
     drop(owner);
     let (reopen, _owner2) = Database::open_with_exclusive_owner(t.path()).unwrap();
     assert_eq!(
@@ -112,6 +114,6 @@ fn exclusive_data_dir_owner_blocks_second_startup() {
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"STARTUP_EXCLUSIVE_OWNER","second_startup_refused":true,"reacquire_after_drop":true})
+        serde_json::json!({"case":"STARTUP_EXCLUSIVE_OWNER","second_startup_refused":true,"reacquire_after_drop":true,"writer_fence_epoch":fence_epoch})
     );
 }

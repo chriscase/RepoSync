@@ -635,6 +635,7 @@ impl Database {
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
