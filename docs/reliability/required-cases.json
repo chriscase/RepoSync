@@ -114,6 +114,19 @@
       "id": "R10_MERGE",
       "binary": "team_mode_e2e",
       "test": "candidate_r10_merge_dag_rejected_before_replay",
+      "tier": "candidate_regression",
+      "supporting_note": "hide/push frontier proof is pending_frontier::hide_push_frontier_includes_older_pending_side, not candidate_r10_merge_dag_older_side_not_silently_skipped"
+    },
+    {
+      "id": "R10_DURABLE_UNSUPPORTED_BLOCK",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_durable_unsupported_history_block_survives_restart",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R10_FETCH_HISTORY_BLOCK",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_fetch_time_history_block_persists",
       "tier": "candidate_regression"
     },
     {

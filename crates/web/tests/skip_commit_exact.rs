@@ -63,7 +63,12 @@ fn pending_after(repo: &Path, cursor: &str) -> Vec<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["rev-list", "--reverse", &format!("{cursor}..HEAD")])
+        .args([
+            "rev-list",
+            "--topo-order",
+            "--reverse",
+            &format!("{cursor}..HEAD"),
+        ])
         .output()
         .unwrap();
     assert!(output.status.success());

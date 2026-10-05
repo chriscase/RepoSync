@@ -80,7 +80,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "L=R with lagging P replays. Missing/ambiguous cursors do not borrow another repo. Missing objects, shallow history, and ancestry-command errors are distinct from rewrite. Merge DAGs and >1000 pending commits reject before writes. Pending selection is hide/push P..R so a visited-order stop at P cannot omit older merge-side commits. Policy/receipt supporting cases belong to the #63 compatibility reader.",
+      "evidence": "L=R with lagging P replays. Missing/ambiguous cursors do not borrow another repo. Missing objects, shallow history, and ancestry-command errors are distinct from rewrite. Merge DAGs and >1000 pending commits reject before writes. Pending selection is hide/push P..R; the older-side frontier proof is pending_frontier::hide_push_frontier_includes_older_pending_side, not candidate_r10_merge_dag_older_side_not_silently_skipped. Durable UnsupportedHistory blocks survive restart; fetch_git_changes persists the same record on second-line UnsupportedHistory. Policy/receipt supporting cases belong to the #63 compatibility reader.",
       "diagnostic_expected_baseline_failure": false
     },
     {

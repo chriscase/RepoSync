@@ -560,6 +560,17 @@ impl GitClient {
         tip_sha: &str,
         max_commits: Option<usize>,
     ) -> Result<Vec<GitCommitInfo>, GitError> {
+        #[cfg(debug_assertions)]
+        if std::env::var("REPOSYNC_TEST_FETCH_PENDING_FAULT")
+            .ok()
+            .as_deref()
+            == self.repo_path.to_str()
+        {
+            return Err(GitError::UnsupportedHistory {
+                reason: crate::pending_frontier::REASON_MERGE_DAG.into(),
+                detail: crate::pending_frontier::DETAIL_MERGE_DAG.into(),
+            });
+        }
         let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
         let oids =
             crate::pending_frontier::select_pending_oids(&self.repo, since_sha, tip_sha, cap)?;
