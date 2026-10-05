@@ -1350,6 +1350,7 @@ mod cancellation_tests {
         );
     }
 
+    #[tokio::test]
     async fn candidate_64e_held_import_blocks_scheduler_sync_without_resume() {
         let tmp = tempfile::tempdir().unwrap();
         let (scheduler, _) = scheduler_fixture(&tmp, "held-import-block", "2000-01-01T00:00:00Z");
