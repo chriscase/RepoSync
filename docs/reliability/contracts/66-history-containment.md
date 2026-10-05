@@ -1,15 +1,14 @@
 # #66 contract: rewritten or unproven history before reset/replay
 
-**Status:** smallest remaining product slice after the merged team
-pre-reset gate and hide/push pending selection (#109). Team
+**Status:** team pre-reset gate, hide/push pending selection, linear >1000
+continuation, and qualified merge-DAG replay are shipped. Team
 `inspect_team_history` classifications are unchanged; durable
 `reconciliation_required` blocks now cover rewrite (`non_fast_forward`,
 `observed_remote_rewrite`) and UnsupportedHistory (`unsupported_merge_dag`,
 `unsupported_backlog`, `unproven_pending_range`), including fetch-time
-second-line hits. Personal-mode Git→SVN inspect now shares the same
-`inspect_fetched_history` gate with proven containment tests. Linear
-backlogs over 1000 continue in explicit oldest-first replay batches; merge-DAG
-replay remains later.
+second-line hits. Personal-mode Git→SVN inspect shares the same
+`inspect_fetched_history` gate with proven containment tests. Linear and
+merge-DAG backlogs continue in explicit oldest-first replay batches.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
@@ -56,7 +55,7 @@ Current classifications (exact reason strings in
 | `ancestry_command_failed` | exit not in {0,1} — not a rewrite claim |
 | `unpublished_local_history` | L outside the P→R path |
 | `unsupported_backlog` | legacy durable block reason; linear replay now continues in batches |
-| `unsupported_merge_dag` | pending history has a merge commit |
+| `unsupported_merge_dag` | legacy durable block or frontier that cannot be topologically ordered |
 | `unproven_pending_range` | P is not an ancestor of R |
 
 Ordinary qualified linear P→R is admitted and pinned to that R. Later
@@ -64,8 +63,8 @@ checkout/reset must use the same object. Pending-commit selection uses a
 hide/push ancestry frontier (`P..R`) so a visited-order stop at `P` cannot
 omit older pending commits; the proof lives in `pending_frontier` unit tests
 (`hide_push_frontier_includes_older_pending_side`), not in
-`candidate_r10_merge_dag_older_side_not_silently_skipped` (that case only
-asserts merge-DAG fail-closed before writes).
+`candidate_r10_merge_dag_older_side_not_silently_skipped` (replays the older
+side instead of silently skipping it).
 
 While Git replay continuation is incomplete (`has_more`), the team engine
 resets the bridge only through the current batch tip (not the full admitted
@@ -88,13 +87,15 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | P/O/R/L inspect before replay (`inspect_personal_history`) | **shipped** — same classifications as team |
 | Rewrite containment (`non_fast_forward`) + durable restart | **proven** — `candidate_r09_personal_rewrite_contained` |
 | Qualified linear admission | **proven** — `candidate_r66_personal_linear_history_admitted` |
-| UnsupportedHistory (`unsupported_merge_dag`) + durable restart | **proven** — `candidate_r66_personal_merge_dag_contained` |
+| Merge-DAG inspect admission | **proven** — `candidate_r66_personal_merge_dag_admitted`, team `candidate_r10_merge_dag_replayed` |
+| Legacy UnsupportedHistory (`unsupported_merge_dag`) + durable restart | **proven** — seeded-block `candidate_r66_personal_merge_dag_contained`, `candidate_r10_durable_unsupported_history_block_survives_restart` |
 | Observed-remote rewrite (`observed_remote_rewrite`) | **NOT RUN** — team polling cases cover O→R; personal inherits inspect |
 | >1000 linear inspect admission | **proven** — `candidate_r66_personal_linear_over_1000_admitted` |
 | >1000 legacy backlog durable restart | **proven** — team `candidate_r10_durable_backlog_block_survives_restart` (seeded block), personal `candidate_r66_personal_backlog_block_survives_restart` |
-| >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_rejected` (batched replay), `candidate_r66_team_history_continuation_survives_restart` |
+| >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_batched`, `candidate_r66_team_history_continuation_survives_restart` |
 | >1000 continuation with pending SVN work | **proven** — `candidate_r66_continuation_mixed_pending_fail_closed` (cycle deferred with no bridge reset or writes) |
-| Merge-DAG replay | **remaining** |
+| Merge-DAG team replay (engine cycle) | **proven** — `candidate_r10_merge_dag_replayed`, `candidate_r10_merge_dag_older_side_not_silently_skipped` |
+| Personal Git→SVN engine-cycle merge-DAG replay | **NOT RUN** — inspect admission is proven; PR-based replay is a separate surface |
 
 Baseline R09 still demonstrates that the original pull-then-walk path
 duplicates rewritten history. Candidate R09 cases reject replacement and
@@ -114,12 +115,14 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 4. Do not declare work already in SVN from messages, timestamps, short SHAs,
    or patch-id equality. Future auto-reconciliation needs its own review.
 5. Pending-commit selection must be a correct ancestry/frontier algorithm.
-   Until proved, unqualified merge DAGs **reject before writes**. Linear
-   backlogs over 1000 replay in explicit oldest-first batches of at most 1000
-   commits per cycle; the handled Git checkpoint is the durable continuation
-   cursor. While continuation is incomplete, opposite-direction SVN work with
-   pending Git backlog defers the cycle with no mutation; conflict detection
-   sees the full P→R path. Do not silently drop older work.
+   Qualified merge DAGs replay in deterministic oldest-first topological
+   order (parents before children; tie-break by committer time then OID).
+   Linear and merge-DAG backlogs over 1000 replay in explicit oldest-first
+   batches of at most 1000 commits per cycle; the handled Git checkpoint is
+   the durable continuation cursor. While continuation is incomplete,
+   opposite-direction SVN work with pending Git backlog defers the cycle with
+   no mutation and surfaces `deferred_mixed_pending` on `SyncStats`; conflict
+   detection sees the full P→R path. Do not silently drop older work.
 6. Normal SVN merges append revisions. A revision-number jump is not a Git
    rewrite. Path delete/recreate and UUID/copy-origin change are identity
    events for #63/#15, not this gate’s `non_fast_forward`.
@@ -128,17 +131,23 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 8. Old healthy linear histories continue after migration. Unsupported history
    is reported, not “fixed” by resetting or clearing maps.
 
-## Smallest next implementation slice (after this review)
+## Merge-DAG replay (shipped slice)
 
-Durable rewrite block, personal inspect (with containment proofs), webhook
-`forced` hint, exact skip disposition, hide/push pending selection, durable
-UnsupportedHistory blocks (including fetch-time persistence), polling O→R
-force-push detection, restart enforcement, and linear >1000 continuation have
-landed with fail-closed mixed-pending deferral and full-path conflict coverage.
-Remaining #66 work is explicit recovery algorithms, not more pre-reset
-classification:
+**Supported:** any qualified P→R frontier where `P` is an ancestor of `R`.
+Pending commits are collected via hide/push (`P..R`), topologically sorted
+oldest-first with deterministic tie-breaking, and replayed in batches of at
+most 1000 per cycle. The handled Git checkpoint advances per confirmed
+Git→SVN commit and survives restart. `SyncStats` exposes `git_replay_has_more`,
+`git_pending_total`, and `deferred_mixed_pending`.
 
-1. Merge-DAG replay.
+**Still fail-closed:**
+
+- `unproven_pending_range` when `P` is not an ancestor of `R`
+- Legacy seeded durable `unsupported_merge_dag` / `unsupported_backlog` blocks
+  (operator must clear before replay resumes)
+- Fetch-time `UnsupportedHistory` injection (test fault path)
+- A frontier that cannot be fully topologically ordered (should not arise for
+  valid Git objects)
 
 Automatic rewrite reconciliation stays a later slice with its own proofs.
 
@@ -161,8 +170,7 @@ Still required before claiming #66:
   `pending_frontier::non_ancestor_tip_fails_closed`)
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
-- merge-DAG replay algorithm
-- personal Git→SVN engine-cycle proof for qualified linear admission (inspect
+- personal Git→SVN engine-cycle proof for qualified merge-DAG admission (inspect
   admission is proven; PR-based replay is a separate surface)
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and

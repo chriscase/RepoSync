@@ -566,8 +566,9 @@ impl GitClient {
     /// Pending commits on the ancestry frontier from `since_sha` to `tip_sha`.
     ///
     /// Uses hide/push (`since..tip`), not a visited-order stop at `since_sha`.
-    /// Merge DAGs fail closed. Linear overflow returns the oldest-first replay
-    /// batch with `has_more` set instead of silently truncating.
+    /// Qualified merge DAGs replay in deterministic oldest-first topological
+    /// order. Linear overflow returns the oldest-first replay batch with
+    /// `has_more` set instead of silently truncating.
     pub fn pending_commits_between(
         &self,
         since_sha: &str,

@@ -114,6 +114,12 @@ pub struct SyncStats {
     pub recent_messages: Vec<String>,
     /// Rich commit details for Teams notifications (max 10).
     pub synced_commits: Vec<SyncedCommit>,
+    /// True when Git replay continuation is incomplete after this cycle.
+    pub git_replay_has_more: bool,
+    /// Total pending Git commits on the admitted P→R frontier.
+    pub git_pending_total: usize,
+    /// True when the cycle deferred because Git continuation overlapped SVN work.
+    pub deferred_mixed_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,6 +1126,10 @@ impl SyncEngine {
         // 1. Fetch changes from both sides.
         let svn_changes = self.fetch_svn_changes().await?;
         let git_fetch = self.fetch_git_changes(&admission, &svn_changes).await?;
+
+        stats.git_replay_has_more = git_fetch.has_more;
+        stats.git_pending_total = git_fetch.pending_total;
+        stats.deferred_mixed_pending = git_fetch.deferred_mixed_pending;
 
         if git_fetch.deferred_mixed_pending {
             info!(
