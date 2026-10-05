@@ -251,6 +251,10 @@ pub enum SyncError {
     #[error("svn-to-git push reconciliation required ({reason}): {detail}")]
     GitPushHeld { reason: String, detail: String },
 
+    /// An ordinary team-cycle mapping is held until explicit inspection.
+    #[error("team cycle mapping reconciliation required ({reason}): {detail}")]
+    CycleMappingHeld { reason: String, detail: String },
+
     /// The sync detected an unresolvable conflict.
     #[error("unresolvable conflict on '{file_path}': {detail}")]
     UnresolvableConflict { file_path: String, detail: String },
@@ -290,7 +294,9 @@ impl SyncError {
         match self {
             SyncError::SvnError(e) => e.is_permanent(),
             SyncError::GitError(e) => e.is_permanent(),
-            SyncError::SvnCommitHeld { .. } | SyncError::HistoryBlocked { .. } => true,
+            SyncError::SvnCommitHeld { .. }
+            | SyncError::CycleMappingHeld { .. }
+            | SyncError::HistoryBlocked { .. } => true,
             _ => false,
         }
     }

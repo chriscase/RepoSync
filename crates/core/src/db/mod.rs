@@ -9,6 +9,7 @@ pub mod managed_remove;
 pub mod queries;
 pub mod schema;
 pub mod svn_commit_operations;
+pub mod team_cycle_mapping_operations;
 
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;
