@@ -366,6 +366,7 @@ impl Database {
         intent: GitPushIntent<'_>,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", intent.repo_id);
             let active_existing = read_value(tx, &active)?;
             if active_existing.is_none()
@@ -518,6 +519,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ReconciledGitPush, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -570,6 +572,7 @@ impl Database {
         observed_git_tree: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -600,6 +603,7 @@ impl Database {
         git_author: &str,
     ) -> Result<GitPushOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive svn-to-git push operation".into(),
@@ -635,6 +639,7 @@ impl Database {
         F: FnOnce(&mut GitPushOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(

@@ -371,6 +371,7 @@ impl Database {
         intent: SvnCommitIntent<'_>,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", intent.repo_id);
             let active_existing = read_value(tx, &active)?;
             if active_existing.is_none()
@@ -529,6 +530,7 @@ impl Database {
         fingerprint: &str,
     ) -> Result<ReconciledSvnCommit, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive git-to-svn commit operation".into(),
@@ -582,6 +584,7 @@ impl Database {
         svn_tree: &str,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive git-to-svn commit operation".into(),
@@ -609,6 +612,7 @@ impl Database {
         git_author: &str,
     ) -> Result<SvnCommitOperation, DatabaseError> {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive git-to-svn commit operation".into(),
@@ -636,6 +640,7 @@ impl Database {
         F: FnOnce(&mut SvnCommitOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
             let active = key("active", repo_id);
             if read_value(tx, &active)?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
