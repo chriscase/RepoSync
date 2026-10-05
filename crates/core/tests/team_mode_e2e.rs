@@ -3434,6 +3434,165 @@ async fn candidate_r10_over_1000_pending_commits_rejected() {
     assert_pair_blocked_without_damage(&fixture, "unsupported_backlog").await;
 }
 
+/// Unsupported-history blocks must survive restart and refuse even when the
+/// live remote later looks linear and admissible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_durable_unsupported_history_block_survives_restart() {
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    git_cli(&fixture.developer, &["checkout", "-b", "side"]);
+    fixture.developer_commit("side.txt", "side\n", "Side change");
+    git_cli(&fixture.developer, &["checkout", "main"]);
+    fixture.developer_commit("main.txt", "main\n", "Main change");
+    git_cli(
+        &fixture.developer,
+        &["merge", "--no-ff", "side", "-m", "Merge side"],
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let merge_tip = get_head_sha(&fixture.developer);
+    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
+    let blocked_record = history_block_json(&fixture);
+    assert_eq!(blocked_record["state"], "reconciliation_required");
+    assert_eq!(blocked_record["durable"], true);
+    assert_eq!(blocked_record["p_handled"], synced);
+    assert_eq!(blocked_record["r_fresh_remote"], merge_tip);
+    let quarantined = fixture.snapshot().await;
+
+    git_cli(&fixture.developer, &["reset", "--hard", &synced]);
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        synced,
+        "live remote restored to the handled checkpoint"
+    );
+
+    let restarted = reopen_pair(&fixture);
+    let result = restarted.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "unsupported_merge_dag"
+        ),
+        "restored linear remote must still be refused from the durable block: {result:?}"
+    );
+    assert_eq!(fixture.snapshot().await.svn_rev, quarantined.svn_rev);
+    assert_eq!(fixture.snapshot().await.watermark, quarantined.watermark);
+    assert_eq!(
+        fixture.snapshot().await.mapping_count,
+        quarantined.mapping_count
+    );
+    assert_eq!(
+        git_output(&fixture.bridge, &["rev-parse", "HEAD"]),
+        quarantined.bridge_sha,
+        "bridge must not reset after restored remote"
+    );
+    let still = history_block_json(&fixture);
+    assert_eq!(still["state"], "reconciliation_required");
+    assert_eq!(still["r_fresh_remote"], merge_tip);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_DURABLE_UNSUPPORTED_BLOCK",
+            "p":synced,
+            "blocked_r":merge_tip,
+            "restored_remote":synced,
+            "reason":"unsupported_merge_dag",
+            "durable":true,
+            "restart_without_live_merge_dag":true,
+            "svn_revision_before_after":quarantined.svn_rev,
+            "watermark_before_after":quarantined.watermark,
+            "mapping_count_before_after":quarantined.mapping_count
+        })
+    );
+}
+
+struct TestFetchPendingFault {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl TestFetchPendingFault {
+    async fn new(bridge: &Path) -> Self {
+        static FAULT_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let guard = FAULT_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let repo_path = GitClient::new(bridge)
+            .expect("bridge git client")
+            .repo_path()
+            .to_string_lossy()
+            .to_string();
+        std::env::set_var("REPOSYNC_TEST_FETCH_PENDING_FAULT", repo_path);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for TestFetchPendingFault {
+    fn drop(&mut self) {
+        std::env::remove_var("REPOSYNC_TEST_FETCH_PENDING_FAULT");
+    }
+}
+
+/// fetch_git_changes must persist UnsupportedHistory the same way inspect does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_fetch_time_history_block_persists() {
+    let fixture = QualifiedPair::new().await;
+    fixture.developer_commit("feature.txt", "pending\n", "Linear pending commit");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let _fault = TestFetchPendingFault::new(&fixture.bridge).await;
+    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
+    let block = history_block_json(&fixture);
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(block["durable"], true);
+    assert_eq!(block["reason"], "unsupported_merge_dag");
+    let quarantined = fixture.snapshot().await;
+
+    let restarted = reopen_pair(&fixture);
+    let result = restarted.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "unsupported_merge_dag"
+        ),
+        "fetch-time durable block must survive restart: {result:?}"
+    );
+    assert_eq!(fixture.snapshot().await.svn_rev, quarantined.svn_rev);
+    assert_eq!(fixture.snapshot().await.watermark, quarantined.watermark);
+    assert_eq!(
+        fixture.snapshot().await.mapping_count,
+        quarantined.mapping_count
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_FETCH_HISTORY_BLOCK",
+            "reason":"unsupported_merge_dag",
+            "durable":true,
+            "fetch_time_path":true,
+            "restart_held":true,
+            "svn_revision_before_after":quarantined.svn_rev,
+            "watermark_before_after":quarantined.watermark,
+            "mapping_count_before_after":quarantined.mapping_count
+        })
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r17_repository_cursors_remain_scoped() {
     let fixture = QualifiedPair::new().await;

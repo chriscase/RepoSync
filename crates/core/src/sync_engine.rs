@@ -3077,9 +3077,15 @@ impl SyncEngine {
         let commits = git
             .pending_commits_between(&admission.checkpoint, &admission.remote_tip, None)
             .map_err(|error| match error {
-                crate::errors::GitError::UnsupportedHistory { reason, detail } => {
-                    SyncError::HistoryBlocked { reason, detail }
-                }
+                crate::errors::GitError::UnsupportedHistory { reason, detail } => self
+                    .record_history_block(
+                        &reason,
+                        &detail,
+                        Some(&admission.checkpoint),
+                        None,
+                        Some(&admission.remote_tip),
+                        None,
+                    ),
                 other => SyncError::GitError(other),
             })?;
 

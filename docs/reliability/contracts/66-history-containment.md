@@ -1,13 +1,13 @@
 # #66 contract: rewritten or unproven history before reset/replay
 
 **Status:** smallest remaining product slice after the merged team
-pre-reset gate. Team `inspect_team_history` classifications are unchanged;
-this slice persists a durable `reconciliation_required` rewrite block, applies
-the same P/O/R/L inspect to personal-mode Git→SVN, and treats webhook `forced`
-as a hint. Automatic rewrite reconciliation and merge-DAG *replay* remain later.
-Pending-commit selection uses a hide/push ancestry frontier (`P..R`) so a
-visited-order stop at `P` cannot omit older pending commits. Unqualified merge
-DAGs still reject before mutation.
+pre-reset gate and hide/push pending selection (#109). Team
+`inspect_team_history` classifications are unchanged; durable
+`reconciliation_required` blocks now cover rewrite (`non_fast_forward`) and
+UnsupportedHistory (`unsupported_merge_dag`, `unsupported_backlog`,
+`unproven_pending_range`), including fetch-time second-line hits. Personal-mode
+Git→SVN inspect, webhook-only force-push recovery, merge-DAG replay, and >1000
+continuation remain later.
 
 **Depends on:** #62 reproductions and the #63 checkpoint meanings.
 **Coordinates recovery persistence with:** #64. An ancestry check is not
@@ -54,9 +54,22 @@ Current classifications (exact reason strings in
 | `unpublished_local_history` | L outside the P→R path |
 | `unsupported_backlog` | more than 1000 pending commits |
 | `unsupported_merge_dag` | pending history has a merge commit |
+| `unproven_pending_range` | P is not an ancestor of R |
 
 Ordinary qualified linear P→R is admitted and pinned to that R. Later
-checkout/reset must use the same object.
+checkout/reset must use the same object. Pending-commit selection uses a
+hide/push ancestry frontier (`P..R`) so a visited-order stop at `P` cannot
+omit older pending commits; the proof lives in `pending_frontier` unit tests
+(`hide_push_frontier_includes_older_pending_side`), not in
+`candidate_r10_merge_dag_older_side_not_silently_skipped` (that case only
+asserts merge-DAG fail-closed before writes).
+
+Durable `reconciliation_required` blocks persist for `non_fast_forward` and
+UnsupportedHistory reasons via `record_history_block` / `enforce_durable_history_block`.
+They survive process restart and refuse fetch, replay, reset, remote write, SVN
+commit, and watermark or mapping change until an explicit operator action clears
+them. `fetch_git_changes` records the same durable block when its second-line
+`pending_commits_between` check hits UnsupportedHistory.
 
 Baseline R09 still demonstrates that the original pull-then-walk path
 duplicates rewritten history. Candidate R09 cases reject replacement and
@@ -88,33 +101,34 @@ metadata-only amend with zero remote writes, including repeat/reopen.
 
 ## Smallest next implementation slice (after this review)
 
-Durable rewrite block, personal inspect, webhook `forced` hint, and exact skip
-disposition have landed. This slice is pending-commit **selection** only:
+Durable rewrite block, personal inspect, webhook `forced` hint, exact skip
+disposition, hide/push pending selection, durable UnsupportedHistory blocks
+(including fetch-time persistence), and restart enforcement have landed. Remaining
+#66 work is explicit recovery algorithms, not more pre-reset classification:
 
-1. Select `P..R` by hiding `P` and pushing `R` (ancestry frontier), not by
-   walking until `P` happens to be visited.
-2. Unqualified merge DAGs and >1000-commit backlogs still **reject before
-   writes**. Do not implement merge-DAG replay or overflow continuation here.
+1. Polling-only force-push detection beyond the current named reject cases.
+2. Personal-mode rewrite containment as a first-class inspect path.
+3. Continuation past 1000 pending commits.
+4. Merge-DAG replay.
 
-Automatic rewrite reconciliation, merge-DAG support, and >1000 continuation
-algorithms stay later slices with their own proofs.
+Automatic rewrite reconciliation stays a later slice with its own proofs.
 
 ## Required tests
 
 Already present: ordinary fast-forward; unchanged tip with new SVN work;
 L=R lagging P; rewrite of already-synced work; metadata amend; missing
 branch/object/shallow; ancestry-command error; merge DAG reject (including
-older-side hide/push frontier vs visited-order skip); >1000 reject;
-ignored-path preservation; repo scoping.
+older-side hide/push frontier vs visited-order skip in unit tests); >1000 reject;
+ignored-path preservation; repo scoping; durable block survives restart for
+rewrite and UnsupportedHistory; fetch-time UnsupportedHistory persistence.
 
 Still required before claiming #66:
 
-- force-push without webhook (polling-only) as a named case
+- polling-only force-push detection (beyond current named reject cases)
 - personal-mode rewrite containment or an explicit NOT RUN row
-- durable block survives restart without relying only on the live remote
-  still being rewritten
 - equal-looking content with different provenance (already partly R09 amend)
 - SVN mergeinfo-only versus UUID/path incarnation (R15 remains PARTIAL)
+- merge-DAG replay and >1000 continuation algorithms
 
 Assert zero unwanted remote changes and stable checkpoints on rejection, and
 no duplicates on accepted ordinary replay. The coworker’s exact production
