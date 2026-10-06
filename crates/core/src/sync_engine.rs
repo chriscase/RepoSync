@@ -29,6 +29,7 @@ use crate::conflict::Conflict;
 use crate::db::git_push_operations::{
     git_push_target_fingerprint, GitPushIntent, GitPushOperation, GitPushOperationState,
 };
+use crate::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
 use crate::db::queries::AuditLogInput;
 use crate::db::svn_commit_operations::{
     svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
@@ -315,6 +316,11 @@ impl SyncEngine {
                     stats.svn_to_git_count, stats.git_to_svn_count, stats.conflicts_detected
                 ),
             ),
+            Err(SyncError::HistoryBlocked { reason, detail, .. })
+                if reason == "import_baseline_pending" =>
+            {
+                ("initializing", format!("awaiting import: {}", detail))
+            }
             Err(e @ SyncError::HistoryBlocked { .. })
             | Err(e @ SyncError::SvnCommitHeld { .. })
             | Err(e @ SyncError::GitPushHeld { .. })
@@ -331,7 +337,12 @@ impl SyncEngine {
         // Update per-repo sync status and error count
         if let Some(rid) = self.effective_repo_id() {
             let _ = self.db.update_repo_sync_status(rid, final_state);
-            if result.is_err() {
+            let skip_error_count = matches!(
+                &result,
+                Err(SyncError::HistoryBlocked { reason, .. })
+                    if reason == "import_baseline_pending"
+            );
+            if result.is_err() && !skip_error_count {
                 let _ = self.db.increment_repo_error_count(rid);
             }
         }
@@ -3004,22 +3015,53 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
 
     async fn fetch_svn_changes(&self) -> Result<Vec<SvnChangeSet>, SyncError> {
-        // Try the repo table watermark first (authoritative), then fall back
-        // to kv_state, then to commit_map / sync_records for legacy databases.
-        let mut last_rev = 0i64;
-
-        if let Some(rid) = self.effective_repo_id() {
-            let (repo_rev, _repo_sha) = self
+        let last_rev = if let Some(rid) = self.effective_repo_id() {
+            // Team mode: scoped import baseline is the only SVN checkpoint
+            // authority. Global `last_svn_rev`, git-log auto-detect, and
+            // revision zero are never adopted (#63).
+            if self
                 .db
-                .get_repo_watermark(rid)
-                .map_err(SyncError::DatabaseError)?;
-            if repo_rev > 0 {
-                last_rev = repo_rev;
+                .get_repository(rid)
+                .map_err(SyncError::DatabaseError)?
+                .is_some()
+            {
+                match resolve_repo_import_baseline(&self.db, rid)
+                    .map_err(SyncError::DatabaseError)?
+                {
+                    RepoImportBaseline::Verified { svn_rev, .. } => svn_rev,
+                    RepoImportBaseline::Pending => {
+                        return Err(SyncError::HistoryBlocked {
+                            reason: "import_baseline_pending".into(),
+                            detail: "repository has no verified scoped SVN checkpoint; complete import before syncing"
+                                .into(),
+                        });
+                    }
+                    RepoImportBaseline::ReconciliationRequired { reason, detail } => {
+                        return Err(SyncError::HistoryBlocked { reason, detail });
+                    }
+                }
+            } else {
+                // Legacy pair-creation transition before a repository row
+                // exists: honor scoped KV only; never borrow global state.
+                match self
+                    .db
+                    .get_state(&self.svn_rev_key())
+                    .map_err(SyncError::DatabaseError)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                {
+                    Some(rev) if rev > 0 => rev,
+                    _ => {
+                        return Err(SyncError::HistoryBlocked {
+                            reason: "import_baseline_pending".into(),
+                            detail: "repository has no verified scoped SVN checkpoint; complete import before syncing"
+                                .into(),
+                        });
+                    }
+                }
             }
-        }
-
-        if last_rev == 0 {
-            last_rev = match self
+        } else {
+            // Personal/single-repo callers keep the legacy fallback chain.
+            let mut last_rev = match self
                 .db
                 .get_state(&self.svn_rev_key())
                 .map_err(SyncError::DatabaseError)?
@@ -3031,26 +3073,27 @@ impl SyncEngine {
                     .map_err(SyncError::DatabaseError)?
                     .unwrap_or(0),
             };
-        }
 
-        // On a fresh DB connecting to a repo with existing commits, auto-detect
-        // the highest SVN revision already synced by scanning git log for
-        // sync markers like "[reposync] synced from SVN rNNN".
-        if last_rev == 0 {
-            let detected = self.detect_last_svn_rev_from_git();
-            if detected > 0 {
-                info!(
-                    detected_rev = detected,
-                    "Auto-detected last synced revision from existing git history"
-                );
-                let _ = crate::db::watermark_recovery::persist_git_log_auto_detect_watermark(
-                    &self.db,
-                    self.effective_repo_id(),
-                    detected,
-                );
-                last_rev = detected;
+            // On a fresh DB connecting to a repo with existing commits, auto-detect
+            // the highest SVN revision already synced by scanning git log for
+            // sync markers like "[reposync] synced from SVN rNNN".
+            if last_rev == 0 {
+                let detected = self.detect_last_svn_rev_from_git();
+                if detected > 0 {
+                    info!(
+                        detected_rev = detected,
+                        "Auto-detected last synced revision from existing git history"
+                    );
+                    let _ = crate::db::watermark_recovery::persist_git_log_auto_detect_watermark(
+                        &self.db,
+                        self.effective_repo_id(),
+                        detected,
+                    );
+                    last_rev = detected;
+                }
             }
-        }
+            last_rev
+        };
 
         info!(since_rev = last_rev, "fetching SVN changes");
 
