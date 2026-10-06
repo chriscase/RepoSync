@@ -697,6 +697,7 @@
     {"id":"RS_C02_RENAME_BLOCKED_TO_ALLOWED", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_blocked_old_to_allowed_new_projects_add_only", "tier":"candidate_regression"},
     {"id":"RS_C02_RENAME_BOTH_ALLOWED", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_both_endpoints_allowed_moves_in_svn", "tier":"candidate_regression"},
     {"id":"RS_C02_RENAME_BOTH_BLOCKED", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_both_endpoints_blocked_leaves_pristine_wc", "tier":"candidate_regression"},
-    {"id":"RS_C02_RENAME_NO_PATH_RULES", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_no_path_rules_removes_source", "tier":"candidate_regression"}
+    {"id":"RS_C02_RENAME_NO_PATH_RULES", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_no_path_rules_removes_source", "tier":"candidate_regression"},
+    {"id":"RS_C02_RENAME_SOURCE_PATH_CONFLICT", "binary":"team_mode_e2e", "test":"candidate_rsc02_git_rename_svn_edit_source_path_conflict", "tier":"candidate_regression"}
   ]
 }

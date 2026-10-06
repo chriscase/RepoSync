@@ -7100,6 +7100,59 @@ async fn candidate_rsc02_rename_both_endpoints_blocked_leaves_pristine_wc() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_git_rename_svn_edit_source_path_conflict() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("old.txt", "shared seed\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(
+        update.success(),
+        "svn update before conflicting edit failed"
+    );
+    svn_commit_file(
+        &pair.wc,
+        "old.txt",
+        "SVN edited old path\n",
+        "SVN edits rename source",
+    );
+    let sha = pair.developer_git_mv("old.txt", "new.txt", "Git renames old path");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let sync_result = pair.engine.run_sync_cycle().await;
+    // Conflict detection runs before SVN→Git apply; apply may fail once the rename
+    // removed the Git path SVN still edited.
+    assert!(
+        sync_result.is_err(),
+        "expected SVN→Git apply to fail after rename/source-path conflict, got {sync_result:?}"
+    );
+    let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+    assert!(
+        conflicts.iter().any(|c| c.file_path == "old.txt"),
+        "expected conflict on rename source path old.txt, got {:?}",
+        conflicts
+            .iter()
+            .map(|c| c.file_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_SOURCE_PATH_CONFLICT",
+            "sha":sha,
+            "conflicts_detected":conflicts.len(),
+            "conflict_paths":conflicts.iter().map(|c| c.file_path.clone()).collect::<Vec<_>>(),
+            "sync_apply_failed":true
+        })
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RS-C14 / #64: branch-relative path identity for lost-reply reconciliation
 // ---------------------------------------------------------------------------

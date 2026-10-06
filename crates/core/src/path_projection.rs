@@ -6,6 +6,15 @@
 //! personal-mode rules (#59), and the full monorepo rewrite product (#52/#57)
 //! stay out of scope.
 
+use thiserror::Error;
+
+/// A Git rename (`R`) arrived without its source path.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("git rename for '{path}' is missing rename_from")]
+pub struct IncompleteGitRenameError {
+    pub path: String,
+}
+
 /// One Git path after allow/block projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedGitToSvnChange {
@@ -249,23 +258,24 @@ pub fn project_git_to_svn_changeset(
     files: Vec<GitToSvnInputChange>,
     allowed: &[String],
     blocked: &[String],
-) -> ProjectedGitToSvnChangeset {
+) -> Result<ProjectedGitToSvnChangeset, IncompleteGitRenameError> {
     let mut included = Vec::new();
     let mut excluded = Vec::new();
     for change in files {
         if change.action == "R" {
-            if let Some(rename_from) = change.rename_from {
-                let (rename_included, rename_excluded) = project_rename_endpoints(
-                    &rename_from,
-                    &change.path,
-                    change.content,
-                    allowed,
-                    blocked,
-                );
-                included.extend(rename_included);
-                excluded.extend(rename_excluded);
-                continue;
-            }
+            let rename_from = change.rename_from.ok_or_else(|| IncompleteGitRenameError {
+                path: change.path.clone(),
+            })?;
+            let (rename_included, rename_excluded) = project_rename_endpoints(
+                &rename_from,
+                &change.path,
+                change.content,
+                allowed,
+                blocked,
+            );
+            included.extend(rename_included);
+            excluded.extend(rename_excluded);
+            continue;
         }
         if path_is_projected(&change.path, allowed, blocked) {
             included.push(ProjectedGitToSvnChange {
@@ -277,7 +287,7 @@ pub fn project_git_to_svn_changeset(
             excluded.push((change.action, change.path));
         }
     }
-    ProjectedGitToSvnChangeset { included, excluded }
+    Ok(ProjectedGitToSvnChangeset { included, excluded })
 }
 
 #[cfg(test)]
@@ -344,7 +354,8 @@ mod tests {
             file("A", "skip.exe"),
         ];
         let projected =
-            project_git_to_svn_changeset(files, &["team".to_string()], &["*.exe".to_string()]);
+            project_git_to_svn_changeset(files, &["team".to_string()], &["*.exe".to_string()])
+                .unwrap();
         let included: Vec<_> = projected
             .included
             .iter()
@@ -372,7 +383,7 @@ mod tests {
     #[test]
     fn empty_rules_include_everything() {
         let files = vec![file("A", "anywhere.txt"), file("D", "gone.txt")];
-        let projected = project_git_to_svn_changeset(files, &[], &[]);
+        let projected = project_git_to_svn_changeset(files, &[], &[]).unwrap();
         assert_eq!(projected.included.len(), 2);
         assert!(projected.excluded.is_empty());
     }
@@ -380,7 +391,7 @@ mod tests {
     #[test]
     fn empty_rules_split_rename_to_delete_and_add() {
         let files = vec![rename("old.txt", "new.txt")];
-        let projected = project_git_to_svn_changeset(files, &[], &[]);
+        let projected = project_git_to_svn_changeset(files, &[], &[]).unwrap();
         let included: Vec<_> = projected
             .included
             .iter()
@@ -517,7 +528,7 @@ mod tests {
             rename("team/keep.txt", "team-other/leak.txt"),
             file("A", "team/ok.txt"),
         ];
-        let projected = project_git_to_svn_changeset(files, &["team".to_string()], &[]);
+        let projected = project_git_to_svn_changeset(files, &["team".to_string()], &[]).unwrap();
         let included: Vec<_> = projected
             .included
             .iter()
@@ -535,5 +546,17 @@ mod tests {
             svn_log_path_to_branch_relative("/allow/x.txt", &allow),
             Some("x.txt".into())
         );
+    }
+
+    #[test]
+    fn rename_without_source_path_fails_closed() {
+        let files = vec![GitToSvnInputChange {
+            action: "R".into(),
+            path: "new.txt".into(),
+            content: Some(b"moved".to_vec()),
+            rename_from: None,
+        }];
+        let err = project_git_to_svn_changeset(files, &[], &[]).unwrap_err();
+        assert_eq!(err.path, "new.txt");
     }
 }
