@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, SvnLayout};
+use crate::conflict::detector::git_action_to_change_kind;
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
@@ -1164,7 +1165,8 @@ impl SyncEngine {
         }
 
         // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
-        let conflicts = self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage);
+        let conflicts =
+            self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage)?;
         stats.conflicts_detected = conflicts.len();
 
         if !conflicts.is_empty() {
@@ -1177,6 +1179,7 @@ impl SyncEngine {
                 } else {
                     // Persist unresolved conflict
                     let mut db_conflict = crate::models::Conflict::new(conflict.file_path.clone());
+                    db_conflict.conflict_type = conflict.conflict_type.to_string();
                     db_conflict.svn_content = conflict.svn_content.clone();
                     db_conflict.git_content = conflict.git_content.clone();
                     db_conflict.base_content = conflict.base_content.clone();
@@ -2343,7 +2346,10 @@ impl SyncEngine {
                 file_contents,
                 &self.allowed_paths,
                 &self.blocked_patterns,
-            );
+            )
+            .map_err(|err| {
+                SyncError::GitError(crate::errors::GitError::ApplyFailed(err.to_string()))
+            })?;
             if !projected.excluded.is_empty() {
                 let violations =
                     projected.exclusion_messages(&self.allowed_paths, &self.blocked_patterns);
@@ -3265,7 +3271,7 @@ impl SyncEngine {
         &self,
         svn_changes: &[SvnChangeSet],
         git_changes: &[GitChangeSet],
-    ) -> Vec<Conflict> {
+    ) -> Result<Vec<Conflict>, SyncError> {
         // SVN paths from the changeset include the branch prefix
         // (e.g. `trunk/README.md`), but Git paths are relative to the repo
         // root (e.g. `README.md`). Strip the SVN branch prefix so the
@@ -3305,22 +3311,28 @@ impl SyncEngine {
 
         let git_file_changes: Vec<FileChange> = git_changes
             .iter()
-            .flat_map(|cs| {
-                cs.changed_files.iter().map(|f| FileChange {
+            .flat_map(|cs| cs.changed_files.iter())
+            .map(|f| {
+                let change_kind =
+                    git_action_to_change_kind(&f.action, &f.path, f.rename_from.as_deref())
+                        .map_err(|err| {
+                            SyncError::GitError(crate::errors::GitError::ApplyFailed(
+                                err.to_string(),
+                            ))
+                        })?;
+                Ok(FileChange {
                     path: f.path.trim_start_matches('/').to_string(),
-                    change_kind: match f.action.as_str() {
-                        "A" => ChangeKind::Added,
-                        "D" => ChangeKind::Deleted,
-                        "M" => ChangeKind::Modified,
-                        _ => ChangeKind::Modified,
-                    },
+                    change_kind,
                     content: f.content.clone(),
                     is_binary: f.is_binary,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, SyncError>>()?;
 
-        ConflictDetector::detect(&svn_file_changes, &git_file_changes)
+        Ok(ConflictDetector::detect(
+            &svn_file_changes,
+            &git_file_changes,
+        ))
     }
 
     // -----------------------------------------------------------------------

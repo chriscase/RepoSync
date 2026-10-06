@@ -900,7 +900,7 @@ impl GitToSvnSync {
             });
         }
         const NO_RULES: &[String] = &[];
-        Ok(project_git_to_svn_changeset(inputs, NO_RULES, NO_RULES))
+        project_git_to_svn_changeset(inputs, NO_RULES, NO_RULES).map_err(|err| anyhow::anyhow!(err))
     }
 
     /// Detect the merge strategy used for a PR by inspecting the merge commit.

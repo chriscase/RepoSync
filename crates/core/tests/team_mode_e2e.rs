@@ -7100,6 +7100,111 @@ async fn candidate_rsc02_rename_both_endpoints_blocked_leaves_pristine_wc() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_git_rename_svn_edit_source_path_conflict() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("old.txt", "shared seed\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(
+        update.success(),
+        "svn update before conflicting edit failed"
+    );
+    svn_commit_file(
+        &pair.wc,
+        "old.txt",
+        "SVN edited old path\n",
+        "SVN edits rename source",
+    );
+    let sha = pair.developer_git_mv("old.txt", "new.txt", "Git renames old path");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    let svn_tree_before = svn_tree(&pair, before.svn_rev).await;
+    assert!(
+        svn_tree_before.contains_key("old.txt"),
+        "SVN fixture must contain old.txt before conflicting cycle"
+    );
+    assert!(
+        !svn_tree_before.contains_key("new.txt"),
+        "SVN fixture must not contain new.txt before conflicting cycle"
+    );
+    let sync_result = pair.engine.run_sync_cycle().await;
+    assert!(
+        sync_result.is_err(),
+        "expected sync cycle to fail once rename/source-path conflict is detected, got {sync_result:?}"
+    );
+    assert_eq!(
+        pair.engine.db().get_state("sync_state").unwrap().as_deref(),
+        Some("error"),
+        "failed conflict cycle should leave sync_state=error"
+    );
+    let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+    let source_conflict = conflicts
+        .iter()
+        .find(|c| c.file_path == "old.txt")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected persisted conflict row for rename source path old.txt, got {:?}",
+                conflicts
+                    .iter()
+                    .map(|c| (&c.file_path, c.conflict_type.as_str()))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        source_conflict.conflict_type, "edit_delete",
+        "rename source conflict should persist as edit_delete"
+    );
+    assert_eq!(source_conflict.status, "detected");
+    let after = pair.snapshot().await;
+    assert_eq!(
+        after.watermark, before.watermark,
+        "conflict cycle must not advance repo watermark"
+    );
+    assert_eq!(
+        after.mapping_count, before.mapping_count,
+        "conflict cycle must not create sync mappings"
+    );
+    assert_eq!(
+        after.repo_sync_count, before.repo_sync_count,
+        "conflict cycle must not increment repo sync count"
+    );
+    assert_eq!(
+        after.svn_rev, before.svn_rev,
+        "conflict cycle must not publish SVN changes"
+    );
+    let svn_tree_after = svn_tree(&pair, after.svn_rev).await;
+    assert_eq!(
+        svn_tree_after.get("old.txt").map(|bytes| bytes.as_slice()),
+        Some(b"SVN edited old path\n" as &[u8]),
+        "SVN rename source edit must survive a failed conflict cycle"
+    );
+    assert!(
+        !svn_tree_after.contains_key("new.txt"),
+        "Git rename destination must not be half-applied to SVN"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_SOURCE_PATH_CONFLICT",
+            "sha":sha,
+            "conflicts_detected":conflicts.len(),
+            "conflict_paths":conflicts.iter().map(|c| c.file_path.clone()).collect::<Vec<_>>(),
+            "conflict_types":conflicts.iter().map(|c| c.conflict_type.clone()).collect::<Vec<_>>(),
+            "sync_apply_failed":true,
+            "watermark_unchanged":before.watermark == after.watermark,
+            "svn_tree_unchanged":svn_tree_before == svn_tree_after
+        })
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RS-C14 / #64: branch-relative path identity for lost-reply reconciliation
 // ---------------------------------------------------------------------------
