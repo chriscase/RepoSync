@@ -4538,8 +4538,8 @@ async fn candidate_rs05_global_svn_watermark_not_adopted_without_scoped_state() 
         teams_webhook_url: None,
     })
     .unwrap();
-    db.set_state("last_svn_rev", "2").unwrap();
-    db.set_watermark("svn_rev", "2").unwrap();
+    db.set_state("last_svn_rev", "9").unwrap();
+    db.set_watermark("svn_rev", "9").unwrap();
 
     assert_eq!(
         resolve_repo_import_baseline(&db, "pending").unwrap(),
@@ -4676,8 +4676,8 @@ async fn candidate_rs05_columns_only_watermark_backfill_becomes_verified() {
         teams_webhook_url: None,
     })
     .unwrap();
-    db.set_state("last_svn_rev", "2").unwrap();
-    db.set_watermark("svn_rev", "2").unwrap();
+    db.set_state("last_svn_rev", "9").unwrap();
+    db.set_watermark("svn_rev", "9").unwrap();
     db.conn()
         .execute(
             "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='legacy'",
@@ -4701,6 +4701,63 @@ async fn candidate_rs05_columns_only_watermark_backfill_becomes_verified() {
             "case":"RS05_TEAM_COLUMNS_ONLY_BACKFILL",
             "scoped_svn_rev":2,
             "verified_baseline":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_global_recovery_columns_only_does_not_mint_scoped_state() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("global-recovery.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: "recovery".into(),
+        name: "recovery".into(),
+        svn_url: "file:///svn".into(),
+        svn_branch: "trunk".into(),
+        svn_username: String::new(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: "repo.git".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.set_watermark("svn_rev", "9").unwrap();
+    db.set_watermark("git_sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .unwrap();
+    db.update_repo_watermark_columns_only("recovery", 9, "")
+        .unwrap();
+    assert_eq!(db.get_state("last_svn_rev_recovery").unwrap(), None);
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "recovery").unwrap(),
+        RepoImportBaseline::Pending
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_GLOBAL_RECOVERY_COLUMNS_ONLY",
+            "scoped_svn_rev":null,
+            "baseline":"pending"
         })
     );
 }

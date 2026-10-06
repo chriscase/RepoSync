@@ -3048,7 +3048,9 @@ impl SyncEngine {
                     .set_state(&self.svn_rev_key(), &detected.to_string());
                 // Also persist to the repo table if available
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.update_repo_watermark(rid, detected, "");
+                    let _ = self
+                        .db
+                        .update_repo_watermark_columns_only(rid, detected, "");
                 }
                 last_rev = detected;
             }

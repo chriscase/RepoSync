@@ -448,7 +448,10 @@ async fn main() -> Result<()> {
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default();
-                            match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
+                            match engine
+                                .db()
+                                .update_repo_watermark_columns_only(&repo.id, rev, &sha)
+                            {
                                 Ok(()) => {
                                     info!(repo_name = %repo.name, rev, "Recovered watermark from global watermarks table (single-repo migration)");
                                     continue;
@@ -474,7 +477,10 @@ async fn main() -> Result<()> {
                             .ok()
                             .flatten()
                             .unwrap_or_default();
-                        match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
+                        match engine
+                            .db()
+                            .update_repo_watermark_columns_only(&repo.id, rev, &sha)
+                        {
                             Ok(()) => {
                                 info!(repo_name = %repo.name, rev, "Recovered watermark from per-repo kv_state");
                                 continue;
@@ -540,7 +546,7 @@ async fn main() -> Result<()> {
                             } else {
                                 head_sha
                             };
-                            match engine.db().update_repo_watermark(
+                            match engine.db().update_repo_watermark_columns_only(
                                 &repo.id,
                                 max_rev,
                                 &sha_for_watermark,
