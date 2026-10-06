@@ -20,6 +20,10 @@ use tempfile::TempDir;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
+use reposync_core::db::watermark_recovery::{
+    persist_git_log_auto_detect_watermark, recover_repo_watermark_from_git_log_scan,
+    recover_repo_watermark_from_global_migration,
+};
 use reposync_core::db::Database;
 use reposync_core::errors::SyncError;
 use reposync_core::git::GitClient;
@@ -4745,13 +4749,49 @@ async fn candidate_rs05_global_recovery_columns_only_does_not_mint_scoped_state(
     db.set_watermark("svn_rev", "9").unwrap();
     db.set_watermark("git_sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
         .unwrap();
-    db.update_repo_watermark_columns_only("recovery", 9, "")
-        .unwrap();
+    assert!(recover_repo_watermark_from_global_migration(&db, "recovery").unwrap());
     assert_eq!(db.get_state("last_svn_rev_recovery").unwrap(), None);
     assert_eq!(
         resolve_repo_import_baseline(&db, "recovery").unwrap(),
         RepoImportBaseline::Pending
     );
+
+    let git_dir = tmp.path().join("git-repo");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    git_cli(&git_dir, &["init", "-b", "main"]);
+    git_cli(
+        &git_dir,
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "[reposync] synced from SVN r12",
+        ],
+    );
+    assert!(recover_repo_watermark_from_git_log_scan(&db, "recovery", &git_dir).unwrap());
+    assert_eq!(db.get_state("last_svn_rev_recovery").unwrap(), None);
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "recovery").unwrap(),
+        RepoImportBaseline::Pending
+    );
+    assert_eq!(
+        db.get_repository("recovery").unwrap().unwrap().last_svn_rev,
+        12
+    );
+    assert!(db
+        .get_repository("recovery")
+        .unwrap()
+        .unwrap()
+        .last_git_sha
+        .is_empty());
+
+    persist_git_log_auto_detect_watermark(&db, Some("recovery"), 15).unwrap();
+    assert_eq!(db.get_state("last_svn_rev_recovery").unwrap(), None);
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "recovery").unwrap(),
+        RepoImportBaseline::Pending
+    );
+
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({

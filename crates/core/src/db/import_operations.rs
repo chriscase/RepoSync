@@ -1038,6 +1038,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::watermark_recovery::recover_repo_watermark_from_global_migration;
     use rusqlite::params;
 
     #[test]
@@ -1793,10 +1794,10 @@ mod tests {
     #[test]
     fn resolve_repo_import_baseline_global_recovery_columns_only_stays_pending() {
         let (_dir, db, _workdir) = open_repo("recovery");
-        db.set_state("last_svn_rev", "9").unwrap();
         db.set_watermark("svn_rev", "9").unwrap();
-        db.update_repo_watermark_columns_only("recovery", 9, "")
+        db.set_watermark("git_sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .unwrap();
+        assert!(recover_repo_watermark_from_global_migration(&db, "recovery").unwrap());
         assert_eq!(db.get_state("last_svn_rev_recovery").unwrap(), None);
         assert_eq!(
             resolve_repo_import_baseline(&db, "recovery").unwrap(),
