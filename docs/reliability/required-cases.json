@@ -388,9 +388,21 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_TEAM_GET_STATUS_SCOPED_GIT_CURSOR",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_get_status_scoped_git_cursor_ignores_global",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_TEAM_ADVANCE_GIT_SCOPED",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_advance_git_team_scoped_not_global",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_DIRECT_FINALIZE_ADVANCES_GLOBAL",
+      "binary": "reposync_core",
+      "test": "db::svn_commit_operations::tests::direct_mode_finalize_advances_global_last_git_hash",
       "tier": "candidate_regression"
     },
     {

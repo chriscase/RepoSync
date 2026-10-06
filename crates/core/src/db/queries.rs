@@ -1106,8 +1106,10 @@ impl Database {
         Ok(())
     }
 
-    /// Advance ALL watermark locations atomically for a given repo.
-    /// Updates repositories table, per-repo kv_state, and global kv_state.
+    /// Advance the Git handled frontier for a managed repository.
+    /// Updates `repositories.last_git_sha` and the per-repo `last_git_sha_<repo_id>`
+    /// kv_state key. Global `last_git_hash` is written only when the repository is
+    /// not in team mode (`sync_mode != "team"`).
     /// Admin `POST .../skip-commit` no longer calls this (live HEAD adoption is refused).
     pub fn advance_all_watermarks(
         &self,
@@ -1154,7 +1156,7 @@ impl Database {
     }
 
     /// Team-mode managed repos keep Git cursors scoped per pair (#63).
-    fn repo_writes_global_git_watermark(
+    pub(crate) fn repo_writes_global_git_watermark(
         conn: &rusqlite::Connection,
         repo_id: &str,
     ) -> Result<bool, DatabaseError> {

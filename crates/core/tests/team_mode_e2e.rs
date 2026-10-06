@@ -5584,6 +5584,120 @@ async fn candidate_rs05_fetch_git_two_incremental_cycles_no_replay_skip() {
     );
 }
 
+/// RS-05 / #63: `get_status` for managed team repos reports scoped Git cursors
+/// and does not borrow a stale global `last_git_hash`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_get_status_scoped_git_cursor_ignores_global() {
+    let fixture = QualifiedPair::new().await;
+    let pair_sha = fixture.imported_base.clone();
+    let other_sha = "cccccccccccccccccccccccccccccccccccccccc";
+    let stale_global = "dddddddddddddddddddddddddddddddddddddddd";
+
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_hash", stale_global)
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_sha_pair", &pair_sha)
+        .unwrap();
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "other".into(),
+            name: "other pair".into(),
+            svn_url: fixture.svn_repo_root.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: fixture.bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 1,
+            last_git_sha: other_sha.into(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+    shared_db
+        .set_state("last_git_sha_other", other_sha)
+        .unwrap();
+
+    let status_pair = fixture.engine.get_status().unwrap();
+    assert_eq!(
+        status_pair.last_git_hash.as_deref(),
+        Some(pair_sha.as_str()),
+        "pair get_status must report scoped cursor, not stale global"
+    );
+
+    let mut other_engine = SyncEngine::new(
+        make_app_config(&fixture.svn_repo_root, fixture.tmp.path()),
+        shared_db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).expect("git client"),
+        Arc::new(make_identity_mapper()),
+    );
+    other_engine.set_repo_id("other".into());
+    let status_other = other_engine.get_status().unwrap();
+    assert_eq!(
+        status_other.last_git_hash.as_deref(),
+        Some(other_sha),
+        "other get_status must report its own scoped cursor"
+    );
+
+    other_engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_other'", [])
+        .unwrap();
+    other_engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = '' WHERE id = 'other'",
+            [],
+        )
+        .unwrap();
+    let status_missing = other_engine.get_status().unwrap();
+    assert_eq!(
+        status_missing.last_git_hash, None,
+        "missing scoped cursor must report absent git position, not global fallback"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_GET_STATUS_SCOPED_GIT_CURSOR",
+            "stale_global":stale_global,
+            "pair_scoped":pair_sha,
+            "other_scoped":other_sha,
+            "pair_status_git":status_pair.last_git_hash,
+            "other_status_git":status_other.last_git_hash,
+            "missing_scoped_status_git":status_missing.last_git_hash
+        })
+    );
+}
+
 /// RS-05 / #63: team-mode git-to-svn advancement updates only the managed
 /// repo checkpoint and must not advance the global `last_git_hash`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

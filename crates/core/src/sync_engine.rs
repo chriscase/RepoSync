@@ -241,6 +241,15 @@ impl SyncEngine {
         }
     }
 
+    /// Return the kv_state key for the last Git SHA watermark.
+    /// Uses per-repo key if repo_id is set, otherwise global key.
+    fn git_sha_key(&self) -> String {
+        match &self.repo_id {
+            Some(rid) if !rid.is_empty() => format!("last_git_sha_{}", rid),
+            _ => "last_git_hash".to_string(),
+        }
+    }
+
     /// Return the effective repo_id if set and non-empty, for repo-table watermark operations.
     fn effective_repo_id(&self) -> Option<&str> {
         self.repo_id.as_deref().filter(|id| !id.is_empty())
@@ -405,16 +414,38 @@ impl SyncEngine {
                 .get_last_svn_revision()
                 .map_err(SyncError::DatabaseError)?,
         };
-        let last_git_hash = match self
-            .db
-            .get_state("last_git_hash")
-            .map_err(SyncError::DatabaseError)?
-        {
-            Some(s) if !s.is_empty() => Some(s),
-            _ => self
+        let last_git_hash = if let Some(rid) = self.effective_repo_id() {
+            let scoped = self
                 .db
-                .get_last_git_hash()
-                .map_err(SyncError::DatabaseError)?,
+                .get_state(&self.git_sha_key())
+                .map_err(SyncError::DatabaseError)?
+                .filter(|s| !s.is_empty());
+            if scoped.is_some() {
+                scoped
+            } else {
+                self.db
+                    .get_repository(rid)
+                    .map_err(SyncError::DatabaseError)?
+                    .and_then(|repo| {
+                        if repo.last_git_sha.is_empty() {
+                            None
+                        } else {
+                            Some(repo.last_git_sha)
+                        }
+                    })
+            }
+        } else {
+            match self
+                .db
+                .get_state("last_git_hash")
+                .map_err(SyncError::DatabaseError)?
+            {
+                Some(s) if !s.is_empty() => Some(s),
+                _ => self
+                    .db
+                    .get_last_git_hash()
+                    .map_err(SyncError::DatabaseError)?,
+            }
         };
         let last_error_at = self.db.last_error_at().map_err(SyncError::DatabaseError)?;
 
