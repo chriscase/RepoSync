@@ -250,19 +250,6 @@ pub fn project_git_to_svn_changeset(
     allowed: &[String],
     blocked: &[String],
 ) -> ProjectedGitToSvnChangeset {
-    if allowed.is_empty() && blocked.is_empty() {
-        return ProjectedGitToSvnChangeset {
-            included: files
-                .into_iter()
-                .map(|change| ProjectedGitToSvnChange {
-                    action: change.action,
-                    path: change.path,
-                    content: change.content,
-                })
-                .collect(),
-            excluded: Vec::new(),
-        };
-    }
     let mut included = Vec::new();
     let mut excluded = Vec::new();
     for change in files {
@@ -387,6 +374,19 @@ mod tests {
         let files = vec![file("A", "anywhere.txt"), file("D", "gone.txt")];
         let projected = project_git_to_svn_changeset(files, &[], &[]);
         assert_eq!(projected.included.len(), 2);
+        assert!(projected.excluded.is_empty());
+    }
+
+    #[test]
+    fn empty_rules_split_rename_to_delete_and_add() {
+        let files = vec![rename("old.txt", "new.txt")];
+        let projected = project_git_to_svn_changeset(files, &[], &[]);
+        let included: Vec<_> = projected
+            .included
+            .iter()
+            .map(|c| (c.action.as_str(), c.path.as_str()))
+            .collect();
+        assert_eq!(included, vec![("D", "old.txt"), ("A", "new.txt")]);
         assert!(projected.excluded.is_empty());
     }
 

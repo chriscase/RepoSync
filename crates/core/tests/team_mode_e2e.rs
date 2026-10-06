@@ -7014,6 +7014,48 @@ async fn candidate_rsc02_rename_both_endpoints_allowed_moves_in_svn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_no_path_rules_removes_source() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("old.txt", "rename me\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let sha = pair.developer_git_mv("old.txt", "new.txt", "Default-policy rename");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert!(!tree.contains_key("old.txt"));
+    assert_eq!(tree.get("new.txt"), Some(&b"rename me\n".to_vec()));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, sha);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| (p.path.as_str(), p.action.as_str()))
+        .collect();
+    assert_eq!(journal_paths, vec![("new.txt", "A"), ("old.txt", "D")]);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_NO_PATH_RULES",
+            "sha":sha,
+            "journal_paths":journal_paths,
+            "old_path_removed":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_rename_both_endpoints_blocked_leaves_pristine_wc() {
     let mut pair = QualifiedPair::new().await;
     pair.developer_commit(
