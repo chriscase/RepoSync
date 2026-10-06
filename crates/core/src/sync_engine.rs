@@ -402,17 +402,41 @@ impl SyncEngine {
                 .map(|dt| dt.with_timezone(&Utc))
         });
 
-        // SVN rev and git hash need per-repo key lookups not in the summary
-        let last_svn_rev = match self
-            .db
-            .get_state(&self.svn_rev_key())
-            .map_err(SyncError::DatabaseError)?
-        {
-            Some(s) => s.parse::<i64>().ok(),
-            None => self
+        // SVN rev and git hash need per-repo key lookups not in the summary.
+        // Managed engines scope both cursors to the repo; legacy callers keep
+        // the global fallback chain.
+        let last_svn_rev = if let Some(rid) = self.effective_repo_id() {
+            let scoped = self
                 .db
-                .get_last_svn_revision()
-                .map_err(SyncError::DatabaseError)?,
+                .get_state(&self.svn_rev_key())
+                .map_err(SyncError::DatabaseError)?
+                .and_then(|s| s.parse::<i64>().ok());
+            if scoped.is_some() {
+                scoped
+            } else {
+                self.db
+                    .get_repository(rid)
+                    .map_err(SyncError::DatabaseError)?
+                    .and_then(|repo| {
+                        if repo.last_svn_rev > 0 {
+                            Some(repo.last_svn_rev)
+                        } else {
+                            None
+                        }
+                    })
+            }
+        } else {
+            match self
+                .db
+                .get_state(&self.svn_rev_key())
+                .map_err(SyncError::DatabaseError)?
+            {
+                Some(s) => s.parse::<i64>().ok(),
+                None => self
+                    .db
+                    .get_last_svn_revision()
+                    .map_err(SyncError::DatabaseError)?,
+            }
         };
         let last_git_hash = if let Some(rid) = self.effective_repo_id() {
             let scoped = self
@@ -437,7 +461,7 @@ impl SyncEngine {
         } else {
             match self
                 .db
-                .get_state("last_git_hash")
+                .get_state(&self.git_sha_key())
                 .map_err(SyncError::DatabaseError)?
             {
                 Some(s) if !s.is_empty() => Some(s),
