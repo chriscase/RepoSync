@@ -192,7 +192,6 @@ fn advance_git_with_receipt_tx(
         ));
     }
     write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
-    write_value(tx, "last_git_hash", git_sha)?;
     let receipt_key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
     write_value(tx, &receipt_key, &receipt.to_string())?;
     Ok(())
@@ -591,6 +590,15 @@ mod tests {
         db.confirm_team_cycle_mapping("pair", &op.id, None).unwrap();
         let (_, emitted) = db.get_repo_watermark("pair").unwrap();
         assert_eq!(emitted, git_sha);
+        assert_eq!(
+            db.get_state("last_git_hash").unwrap(),
+            None,
+            "managed team git no-target must not write global last_git_hash"
+        );
+        assert_eq!(
+            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            Some(git_sha.as_str())
+        );
         let receipt = db
             .get_state(&format!("handled_git_no_target_pair_{}", git_sha))
             .unwrap()
