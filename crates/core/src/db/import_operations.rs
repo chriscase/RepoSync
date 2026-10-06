@@ -204,8 +204,8 @@ impl RepoImportBaseline {
 /// Global `last_svn_rev`, `watermarks.svn_rev`, and commit-map maxima are never
 /// adopted as completion proof. Repository columns plus a matching scoped
 /// `last_svn_rev_<repo>` copy authorize import completion. A scoped
-/// `last_git_sha_<repo>` copy is validated when present but is not required
-/// because sync cycles persist the SVN cursor without always mirroring Git.
+/// A scoped `last_git_sha_<repo>` copy is not required because sync cycles
+/// persist the SVN cursor without always mirroring Git.
 pub fn resolve_repo_import_baseline(
     db: &Database,
     repo_id: &str,
@@ -265,11 +265,11 @@ pub fn resolve_repo_import_baseline(
     let scoped_svn = db
         .get_state(&format!("last_svn_rev_{repo_id}"))?
         .and_then(|value| value.parse::<i64>().ok());
-    let scoped_git = db
+    let has_scoped_git = db
         .get_state(&format!("last_git_sha_{repo_id}"))?
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .is_some();
     let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
-    let has_scoped_git = scoped_git.is_some();
 
     // Team sync checkpoints columns plus scoped `last_svn_rev_<repo>` without always
     // setting `last_sync_at` or `last_git_sha_<repo>`.
@@ -277,22 +277,14 @@ pub fn resolve_repo_import_baseline(
 
     if column_imported {
         if !has_scoped_svn {
-            return Ok(RepoImportBaseline::ReconciliationRequired {
-                reason: "missing_scoped_import_checkpoint".into(),
-                detail: "repository checkpoint lacks matching per-repo svn_rev kv_state copy"
-                    .into(),
-            });
-        }
-        if scoped_svn != Some(repo.last_svn_rev) {
+            db.set_state(
+                &format!("last_svn_rev_{repo_id}"),
+                &repo.last_svn_rev.to_string(),
+            )?;
+        } else if scoped_svn != Some(repo.last_svn_rev) {
             return Ok(RepoImportBaseline::ReconciliationRequired {
                 reason: "conflicting_import_checkpoint".into(),
                 detail: "repository column and scoped svn_rev cursor disagree".into(),
-            });
-        }
-        if has_scoped_git && scoped_git.as_deref() != Some(&repo.last_git_sha) {
-            return Ok(RepoImportBaseline::ReconciliationRequired {
-                reason: "conflicting_import_checkpoint".into(),
-                detail: "repository column and scoped git_sha cursor disagree".into(),
             });
         }
         return Ok(RepoImportBaseline::Verified {
@@ -1742,5 +1734,30 @@ mod tests {
                 ..
             } if reason == "conflicting_import_checkpoint"
         ));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_ignores_stale_scoped_git_kv() {
+        let (_dir, db, _workdir) = open_repo("stale-git");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='stale-git'",
+                [BASELINE_SHA],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_stale-git", "2").unwrap();
+        db.set_state(
+            "last_git_sha_stale-git",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )
+        .unwrap();
+        let baseline = resolve_repo_import_baseline(&db, "stale-git").unwrap();
+        assert_eq!(
+            baseline,
+            RepoImportBaseline::Verified {
+                svn_rev: 2,
+                git_sha: BASELINE_SHA.to_string(),
+            }
+        );
     }
 }

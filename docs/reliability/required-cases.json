@@ -298,6 +298,30 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_TEAM_POST_IMPORT_SVN_TO_GIT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_post_import_svn_to_git_stays_verified",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_COLUMNS_ONLY_BACKFILL",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_columns_only_watermark_backfill_becomes_verified",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_SCOPED_SVN_DISAGREEMENT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_scoped_svn_checkpoint_disagreement_stays_blocked",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_WEB_RECONCILIATION_REFUSES_IMPORT",
+      "binary": "server_freeze",
+      "test": "candidate_rs05_reconciliation_required_refuses_import_start",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R66_PERSONAL_LINEAR_ADMIT",
       "binary": "integration",
       "test": "candidate_r66_personal_linear_history_admitted",

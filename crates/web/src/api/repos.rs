@@ -1049,12 +1049,12 @@ async fn start_repo_import(
             "repository import is active or held for reconciliation".into(),
         ));
     }
-    if resolve_repo_import_baseline(db, &id)
+    if !resolve_repo_import_baseline(db, &id)
         .map_err(|e| AppError::Internal(e.to_string()))?
-        .is_verified()
+        .is_pending()
     {
         return Err(AppError::BadRequest(
-            "repository already has a completed baseline; refusing implicit full replay".into(),
+            "repository import baseline is not pending; refusing implicit full replay".into(),
         ));
     }
     let registrations = db

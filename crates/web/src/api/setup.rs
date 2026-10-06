@@ -820,12 +820,12 @@ async fn admit_setup_import(
             operation: Some(Box::new(active)),
         });
     }
-    if resolve_repo_import_baseline(db, &repo.id)
+    if !resolve_repo_import_baseline(db, &repo.id)
         .map_err(|e| AppError::Internal(e.to_string()))?
-        .is_verified()
+        .is_pending()
     {
         return Ok(SetupAdmission::Busy {
-            message: "repository already has a completed baseline; refusing implicit full replay"
+            message: "repository import baseline is not pending; refusing implicit full replay"
                 .into(),
             operation: db
                 .latest_import_operation(&repo.id)

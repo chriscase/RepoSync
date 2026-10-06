@@ -7382,6 +7382,57 @@ async fn candidate_70_delete_viewed_pair_redirects_without_detail_polling() {
     drop(tmp);
 }
 
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_reconciliation_required_refuses_import_start() {
+    let (addr, state, server, _tmp, id, _bare) = import_fixture().await;
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev=5, last_git_sha=?1, last_sync_at=datetime('now') WHERE id=?2",
+            rusqlite::params![
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                id,
+            ],
+        )
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("last_svn_rev_{id}"), "3")
+        .unwrap();
+    let client = authed_client();
+    let status = client
+        .get(format!("http://{addr}/api/repos/{id}/import/status"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    assert_eq!(status["can_start"], false);
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/import"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("not pending"),
+        "expected import refusal for reconciliation_required repo: {body}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_WEB_RECONCILIATION_REFUSES_IMPORT",
+            "can_start":false,
+            "status":400
+        })
+    );
+    server.abort();
+}
+
 fn fixture_branch_repo(
     id: &str,
     name: &str,

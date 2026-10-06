@@ -4552,21 +4552,25 @@ async fn candidate_rs05_global_svn_watermark_not_adopted_without_scoped_state() 
             ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
         )
         .unwrap();
-    let held = resolve_repo_import_baseline(&db, "pending").unwrap();
-    assert!(matches!(
-        held,
-        RepoImportBaseline::ReconciliationRequired {
-            reason,
-            ..
-        } if reason == "missing_scoped_import_checkpoint"
-    ));
+    let upgraded = resolve_repo_import_baseline(&db, "pending").unwrap();
+    assert_eq!(
+        upgraded,
+        RepoImportBaseline::Verified {
+            svn_rev: 2,
+            git_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        }
+    );
+    assert_eq!(
+        db.get_state("last_svn_rev_pending").unwrap(),
+        Some("2".into())
+    );
 
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"RS05_TEAM_GLOBAL_NOT_ADOPTED",
             "pending_with_global_only":"pending",
-            "column_without_scoped_kv":"missing_scoped_import_checkpoint"
+            "column_without_scoped_kv":"verified_after_backfill"
         })
     );
 }
@@ -4586,6 +4590,178 @@ async fn candidate_rs05_single_repo_import_then_noop_sync() {
             "case":"RS05_TEAM_SINGLE_IMPORT_NOOP",
             "second_svn_to_git":noop.svn_to_git_count,
             "verified_baseline":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_post_import_svn_to_git_stays_verified() {
+    let fixture = QualifiedPair::new().await;
+    assert!(resolve_repo_import_baseline(fixture.engine.db(), "pair")
+        .unwrap()
+        .is_verified());
+    let svn_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "Post-import SVN change\n",
+        "Post-import SVN change",
+    );
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    let emitted = get_head_sha(&fixture.bridge);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap(),
+        (svn_rev, emitted.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_svn_rev_pair").unwrap(),
+        Some(svn_rev.to_string())
+    );
+    let baseline = resolve_repo_import_baseline(fixture.engine.db(), "pair").unwrap();
+    assert!(
+        baseline.is_verified(),
+        "post-import svn-to-git must stay verified, not reconciliation_required: {baseline:?}"
+    );
+    let mapped: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND svn_rev = ?1 AND git_sha = ?2 AND status = 'applied'",
+        rusqlite::params![svn_rev, emitted],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(mapped, 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_POST_IMPORT_SVN_TO_GIT",
+            "svn_rev":svn_rev,
+            "git_sha":emitted,
+            "verified_baseline":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_columns_only_watermark_backfill_becomes_verified() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("columns-only.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: "legacy".into(),
+        name: "legacy".into(),
+        svn_url: "file:///svn".into(),
+        svn_branch: "trunk".into(),
+        svn_username: String::new(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: "repo.git".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.set_state("last_svn_rev", "2").unwrap();
+    db.set_watermark("svn_rev", "2").unwrap();
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='legacy'",
+            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .unwrap();
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "legacy").unwrap(),
+        RepoImportBaseline::Verified {
+            svn_rev: 2,
+            git_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        }
+    );
+    assert_eq!(
+        db.get_state("last_svn_rev_legacy").unwrap(),
+        Some("2".into())
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_COLUMNS_ONLY_BACKFILL",
+            "scoped_svn_rev":2,
+            "verified_baseline":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_scoped_svn_checkpoint_disagreement_stays_blocked() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("scoped-disagree.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: "split".into(),
+        name: "split".into(),
+        svn_url: "file:///svn".into(),
+        svn_branch: "trunk".into(),
+        svn_username: String::new(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: "repo.git".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='split'",
+            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .unwrap();
+    db.set_state("last_svn_rev_split", "3").unwrap();
+    let held = resolve_repo_import_baseline(&db, "split").unwrap();
+    assert!(matches!(
+        held,
+        RepoImportBaseline::ReconciliationRequired {
+            reason,
+            ..
+        } if reason == "conflicting_import_checkpoint"
+    ));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_SCOPED_SVN_DISAGREEMENT",
+            "reason":"conflicting_import_checkpoint"
         })
     );
 }

@@ -4618,6 +4618,8 @@ async fn candidate_rs05_personal_ambiguous_checkpoint_blocks_before_svn_write() 
 /// Git ancestry command failures are distinct from rewrite claims and block replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write() {
+    use reposync_core::history_inspect::history_block_key;
+
     if !svn_available() {
         panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
     }
@@ -4654,10 +4656,17 @@ async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write
     db.set_watermark("git_sha", &watermark).unwrap();
     let db_arc = Arc::new(db);
 
-    std::env::set_var(
-        "REPOSYNC_TEST_INSPECTION_FAULT",
-        format!("ancestry_exit_128|{}", git_work.display()),
+    let watermark_object = git_work.join(format!(
+        ".git/objects/{}/{}",
+        &watermark[..2],
+        &watermark[2..]
+    ));
+    assert!(
+        watermark_object.exists(),
+        "watermark object must exist before corruption"
     );
+    std::fs::remove_file(&watermark_object).unwrap();
+
     let sync = personal_git_to_svn(
         &svn_url,
         db_arc.clone(),
@@ -4670,12 +4679,19 @@ async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write
         .replay_commit(&commit, 1, "main")
         .await
         .expect_err("ancestry command failure must block before SVN writes");
-    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
     assert!(
         format!("{err:#}").contains("ancestry_command_failed"),
         "{err:#}"
     );
     assert_eq!(svn_youngest(&svn_url), svn_before);
+    let block = db_arc
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .expect("ancestry command failure must persist a history block");
+    let block: serde_json::Value = serde_json::from_str(&block).unwrap();
+    assert_eq!(block["reason"], "ancestry_command_failed");
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(block["durable"], true);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
