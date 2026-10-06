@@ -20,6 +20,7 @@ use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
 use reposync_core::path_projection::{
     project_git_to_svn_changeset, svn_path_identity, GitToSvnInputChange,
+    ProjectedGitToSvnChangeset,
 };
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
@@ -472,9 +473,10 @@ impl GitToSvnSync {
         let (parent, tree) = git_client
             .commit_parent_and_tree(&commit.sha)
             .context("failed to read source Git parent and tree")?;
-        let file_contents = self
+        let projected = self
             .projected_changes_for_commit(&git_client, &commit.sha)
             .context("failed to project Git changes for commit journal")?;
+        let file_contents = projected.into_file_contents();
         let intended_changed_paths = intended_paths_from_contents(&file_contents);
         let intended_svn_tree = hash_regular_file_tree(&self.svn_wc_path)
             .context("failed to hash intended SVN working copy")?;
@@ -670,7 +672,8 @@ impl GitToSvnSync {
             return Ok(());
         }
 
-        for (action, file_path, content) in &projected {
+        let file_changes = projected.into_file_contents();
+        for (action, file_path, content) in &file_changes {
             let dst = self.svn_wc_path.join(file_path);
 
             match action.as_str() {
@@ -691,14 +694,14 @@ impl GitToSvnSync {
                         match &decision {
                             FilePolicyDecision::Allow => {
                                 // Check if this is an LFS pointer that needs resolution.
-                                let write_content = if reposync_core::lfs::is_lfs_pointer(&content)
+                                let write_content = if reposync_core::lfs::is_lfs_pointer(content)
                                 {
                                     // The file in Git is an LFS pointer — resolve
                                     // it to the actual blob content before writing
                                     // to SVN (SVN doesn't understand LFS pointers).
                                     match reposync_core::lfs::resolve_lfs_pointer(
                                         &self.git_repo_path,
-                                        &content,
+                                        content,
                                     ) {
                                         Ok(resolved) => {
                                             info!(
@@ -754,11 +757,11 @@ impl GitToSvnSync {
                             FilePolicyDecision::LfsTrack { .. } => {
                                 // File exceeds LFS threshold — same LFS pointer
                                 // resolution logic applies.
-                                let write_content = if reposync_core::lfs::is_lfs_pointer(&content)
+                                let write_content = if reposync_core::lfs::is_lfs_pointer(content)
                                 {
                                     match reposync_core::lfs::resolve_lfs_pointer(
                                         &self.git_repo_path,
-                                        &content,
+                                        content,
                                     ) {
                                         Ok(resolved) => {
                                             info!(
@@ -861,7 +864,7 @@ impl GitToSvnSync {
 
         debug!(
             git_sha = %commit.sha,
-            file_count = projected.len(),
+            file_count = file_changes.len(),
             "applied commit-specific changes to SVN working copy"
         );
 
@@ -876,7 +879,7 @@ impl GitToSvnSync {
         &self,
         git_client: &GitClient,
         commit_sha: &str,
-    ) -> Result<Vec<(String, String, Option<Vec<u8>>)>> {
+    ) -> Result<ProjectedGitToSvnChangeset> {
         let changed_files = git_client
             .get_changed_files(commit_sha)
             .context("failed to get changed files for commit")?;
@@ -899,8 +902,7 @@ impl GitToSvnSync {
             });
         }
         const NO_RULES: &[String] = &[];
-        let projected = project_git_to_svn_changeset(inputs, NO_RULES, NO_RULES);
-        Ok(projected.into_file_contents())
+        Ok(project_git_to_svn_changeset(inputs, NO_RULES, NO_RULES))
     }
 
     /// Detect the merge strategy used for a PR by inspecting the merge commit.
