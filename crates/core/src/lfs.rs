@@ -135,7 +135,7 @@ fn is_single_line_pattern(pattern: &str) -> bool {
     !pattern.is_empty() && !pattern.contains(['\n', '\r', '\0'])
 }
 
-fn unlink_gitattributes_symlink(path: &Path) -> std::io::Result<()> {
+pub(crate) fn unlink_gitattributes_symlink(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(path),
         Ok(_) => Ok(()),
@@ -196,6 +196,70 @@ fn record_engine_lfs_pattern(repo_root: &Path, pattern: &str) -> std::io::Result
         std::fs::remove_file(&path)?;
     }
     std::fs::write(path, body)
+}
+
+fn gitattributes_line_is_planted_filter(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("filter=") && !trimmed.contains("filter=lfs")
+}
+
+fn push_gitattributes_line(lines: &mut Vec<String>, line: &str) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if !lines.iter().any(|existing| existing == trimmed) {
+        lines.push(trimmed.to_string());
+    }
+}
+
+/// Merge export-shipped `.gitattributes` with engine LFS lines already on the
+/// destination and, when `strip_planted` is set, lines recorded in
+/// [`engine_gitattributes_body`].
+pub(crate) fn merge_export_present_gitattributes(
+    export_body: &str,
+    dest_body: Option<&str>,
+    engine_body: Option<&str>,
+    strip_planted: bool,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in export_body.lines() {
+        push_gitattributes_line(&mut lines, line);
+    }
+
+    if let Some(body) = dest_body {
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("filter=lfs") {
+                push_gitattributes_line(&mut lines, trimmed);
+            }
+        }
+    }
+
+    if strip_planted {
+        if let Some(engine) = engine_body {
+            for line in engine.lines() {
+                push_gitattributes_line(&mut lines, line);
+            }
+        }
+    }
+
+    let mut body = String::new();
+    for line in lines {
+        body.push_str(&line);
+        body.push('\n');
+    }
+    body
+}
+
+pub(crate) fn export_present_gitattributes_needs_strip(
+    dest_was_symlink: bool,
+    dest_body: Option<&str>,
+) -> bool {
+    dest_was_symlink
+        || dest_body
+            .map(|body| body.lines().any(gitattributes_line_is_planted_filter))
+            .unwrap_or(false)
 }
 
 /// `.gitattributes` body for LFS patterns recorded by [`ensure_lfs_tracked`].
@@ -561,6 +625,47 @@ mod tests {
             "* filter=evil\n",
             "must not append through the planted symlink"
         );
+    }
+
+    #[test]
+    fn test_merge_export_present_gitattributes_keeps_export_and_dest_engine_lfs() {
+        let merged = merge_export_present_gitattributes(
+            "* text=auto\n",
+            Some("* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            None,
+            false,
+        );
+        assert_eq!(
+            merged,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+    }
+
+    #[test]
+    fn test_merge_export_present_gitattributes_adds_marker_when_stripping_planted_filters(
+    ) {
+        let merged = merge_export_present_gitattributes(
+            "* text=auto\n",
+            Some("* filter=evil\n*.c filter=evil\n"),
+            Some("*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            true,
+        );
+        assert_eq!(
+            merged,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+    }
+
+    #[test]
+    fn test_merge_export_present_gitattributes_ignores_marker_without_planted_filters(
+    ) {
+        let merged = merge_export_present_gitattributes(
+            "* text=auto\n",
+            Some("* text=auto\n"),
+            Some("*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            false,
+        );
+        assert_eq!(merged, "* text=auto\n");
     }
 
     #[test]
