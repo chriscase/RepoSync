@@ -203,8 +203,55 @@ pub fn copy_tree_with_policy(
         visited: &mut visited,
     };
     copy_tree_policy_inner(src, dst, &mut ctx)?;
+    if stats.lfs_tracked > 0 {
+        refresh_export_present_engine_lfs(dst, src)?;
+    }
     record_copy_exclusions(db, &stats);
     Ok(stats)
+}
+
+/// After copy, re-merge export `.gitattributes` with engine LFS lines when this
+/// pass tracked large files. `ensure_lfs_tracked` may have run before the
+/// export file was copied, so refresh once the export body is in place.
+fn refresh_export_present_engine_lfs(dst_root: &Path, export_root: &Path) -> Result<()> {
+    let export_gitattr = export_root.join(".gitattributes");
+    let export_meta = match std::fs::symlink_metadata(&export_gitattr) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to stat exported .gitattributes without following: {}",
+                    export_gitattr.display()
+                )
+            });
+        }
+        Ok(meta) => meta,
+    };
+    if export_meta.file_type().is_symlink() {
+        bail!(
+            "unsupported symlink at exported .gitattributes: refusing to follow outside the export root"
+        );
+    }
+    if !export_meta.file_type().is_file() {
+        return Ok(());
+    }
+    let export_body = read_regular_file_no_follow(&export_gitattr).with_context(|| {
+        format!(
+            "failed to read exported .gitattributes: {}",
+            export_gitattr.display()
+        )
+    })?;
+    let dst_gitattr = dst_root.join(".gitattributes");
+    let engine_body = crate::lfs::engine_gitattributes_body(dst_root)
+        .with_context(|| format!("failed to read engine LFS marker in {}", dst_root.display()))?;
+    let merged = crate::lfs::merge_export_present_gitattributes(
+        &export_body,
+        None,
+        engine_body.as_deref(),
+        true,
+    );
+    write_root_gitattributes_regular_file(&dst_gitattr, &merged)?;
+    Ok(())
 }
 
 /// Shared no-follow copy context. Kept off the recursive signature so
@@ -355,6 +402,15 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
         }
         if is_hardlink_alias(&meta) {
             reject_hardlink_alias(ctx.db, ctx.stats, &rel)?;
+        }
+
+        if file_name == ".gitattributes" && dst == ctx.dst_root {
+            crate::lfs::unlink_gitattributes_symlink(&dst_path).with_context(|| {
+                format!(
+                    "failed to unlink planted .gitattributes symlink before copy: {}",
+                    dst_path.display()
+                )
+            })?;
         }
 
         // Size comes from no-follow metadata; never call evaluate_path (it follows).
@@ -926,16 +982,75 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
         return Ok(false);
     }
 
-    // The current export ships this path. Leave it for the copier; do not
-    // blanket-rewrite exported attribute rules.
-    if std::fs::symlink_metadata(src_path).is_ok() {
-        return Ok(true);
+    let src_meta = match std::fs::symlink_metadata(src_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to stat exported .gitattributes without following: {}",
+                    src_path.display()
+                )
+            });
+        }
+        Ok(meta) => Some(meta),
+    };
+
+    // The current export ships this path. Merge export lines with engine LFS
+    // patterns and drop any destination-only planted `filter=` rules.
+    if let Some(src_meta) = src_meta {
+        if src_meta.file_type().is_symlink() {
+            bail!(
+                "unsupported symlink at exported .gitattributes: refusing to follow outside the export root"
+            );
+        }
+        if src_meta.file_type().is_file() {
+            let dest_was_symlink = dst_meta.file_type().is_symlink();
+            let dest_body = if dst_meta.file_type().is_file() {
+                Some(std::fs::read_to_string(dst_path).with_context(|| {
+                    format!(
+                        "failed to read destination .gitattributes: {}",
+                        dst_path.display()
+                    )
+                })?)
+            } else {
+                None
+            };
+            let strip_planted = crate::lfs::export_present_gitattributes_needs_strip(
+                dest_was_symlink,
+                dest_body.as_deref(),
+            );
+            let export_body = read_regular_file_no_follow(src_path).with_context(|| {
+                format!(
+                    "failed to read exported .gitattributes: {}",
+                    src_path.display()
+                )
+            })?;
+            let engine_body = if strip_planted {
+                crate::lfs::engine_gitattributes_body(dst_root).with_context(|| {
+                    format!("failed to read engine LFS marker in {}", dst_root.display())
+                })?
+            } else {
+                None
+            };
+            let merged = crate::lfs::merge_export_present_gitattributes(
+                &export_body,
+                dest_body.as_deref(),
+                engine_body.as_deref(),
+                strip_planted,
+            );
+            write_root_gitattributes_regular_file(dst_path, &merged)?;
+            debug!(
+                path = %dst_path.display(),
+                "reconciled export-present .gitattributes"
+            );
+            return Ok(true);
+        }
     }
 
     if let Some(body) = crate::lfs::engine_gitattributes_body(dst_root)
         .with_context(|| format!("failed to read engine LFS marker in {}", dst_root.display()))?
     {
-        replace_with_regular_file(dst_path, &dst_meta, &body)?;
+        write_root_gitattributes_regular_file(dst_path, &body)?;
         debug!(
             path = %dst_path.display(),
             "rewrote .gitattributes to engine-recorded LFS patterns"
@@ -953,17 +1068,65 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
     Ok(true)
 }
 
-fn replace_with_regular_file(path: &Path, meta: &std::fs::Metadata, body: &str) -> Result<()> {
-    if !meta.file_type().is_file() {
-        std::fs::remove_file(path).with_context(|| {
-            format!(
-                "failed to remove non-regular .gitattributes: {}",
-                path.display()
-            )
-        })?;
+fn read_regular_file_no_follow(path: &Path) -> Result<String> {
+    let mut file = open_no_follow_read(path)?;
+    let mut body = String::new();
+    file.read_to_string(&mut body)
+        .with_context(|| format!("failed to read {} without following", path.display()))?;
+    Ok(body)
+}
+
+fn write_root_gitattributes_regular_file(path: &Path, body: &str) -> Result<()> {
+    crate::lfs::unlink_gitattributes_symlink(path).with_context(|| {
+        format!(
+            "failed to unlink planted .gitattributes symlink before write: {}",
+            path.display()
+        )
+    })?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to remove non-regular .gitattributes: {}",
+                        path.display()
+                    )
+                });
+            }
+            Ok(()) => {}
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to stat .gitattributes without following: {}",
+                    path.display()
+                )
+            });
+        }
     }
-    std::fs::write(path, body)
+    write_regular_file_no_follow(path, body)
         .with_context(|| format!("failed to write engine .gitattributes: {}", path.display()))?;
+    Ok(())
+}
+
+fn write_regular_file_no_follow(path: &Path, body: &str) -> Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("failed to open {} without following", path.display()))?;
+    file.write_all(body.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
     Ok(())
 }
 
@@ -3746,6 +3909,157 @@ mod tests {
 
         let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
         assert_eq!(after, "* text=auto\n");
+    }
+
+    #[test]
+    fn import_copy_export_present_gitattributes_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-attrs");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        std::fs::write(src.join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.join(".git")).unwrap();
+        symlink(&outside, dst.join(".gitattributes")).unwrap();
+
+        copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap();
+        remove_stale_files(&src, &dst).unwrap();
+
+        let meta = std::fs::symlink_metadata(dst.join(".gitattributes")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "export-present copy must replace a planted .gitattributes symlink with a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join(".gitattributes")).unwrap(),
+            "* text=auto\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "must not write through the planted .gitattributes symlink"
+        );
+    }
+
+    #[test]
+    fn import_export_present_strips_planted_filter_keeps_export_and_engine_lfs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.path().join("model.bin"), vec![0u8; 200]).unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(
+            dst.path().join(".gitattributes"),
+            "* filter=evil\n*.c filter=evil\n",
+        )
+        .unwrap();
+
+        let policy = FilePolicy::with_lfs(0, vec![], 100, &[]);
+        copy_tree_with_policy(src.path(), dst.path(), &policy, &test_db()).unwrap();
+        remove_stale_files(src.path(), dst.path()).unwrap();
+
+        let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(
+            after,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+        assert!(
+            !after.contains("evil"),
+            "planted destination-only filter rules must not survive: {after}"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_export_present_dest_symlink_replaced_without_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-attrs");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        std::fs::write(src.join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.join(".git")).unwrap();
+        symlink(&outside, dst.join(".gitattributes")).unwrap();
+
+        remove_stale_files(&src, &dst).unwrap();
+
+        let meta = std::fs::symlink_metadata(dst.join(".gitattributes")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "stale-remove must replace a planted .gitattributes symlink with a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join(".gitattributes")).unwrap(),
+            "* text=auto\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "must not write through the planted .gitattributes symlink"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_export_present_export_symlink_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-export-canary");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(&outside, "OUTSIDE-EXPORT-CANARY filter=evil\n").unwrap();
+        symlink(&outside, src.join(".gitattributes")).unwrap();
+        std::fs::write(src.join("readme.txt"), "hello").unwrap();
+        std::fs::write(dst.join(".gitattributes"), "dest-owned\n").unwrap();
+        std::fs::create_dir(dst.join(".git")).unwrap();
+
+        let err = remove_stale_files(&src, &dst).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported symlink at exported .gitattributes"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join(".gitattributes")).unwrap(),
+            "dest-owned\n",
+            "must not publish export-side symlink target into destination"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "OUTSIDE-EXPORT-CANARY filter=evil\n"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_export_present_strips_planted_filter_without_copy() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        crate::lfs::ensure_lfs_tracked(dst.path(), "*.bin").unwrap();
+        std::fs::write(
+            dst.path().join(".gitattributes"),
+            "* filter=evil\n*.c filter=evil\n",
+        )
+        .unwrap();
+
+        remove_stale_files(src.path(), dst.path()).unwrap();
+
+        let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(
+            after,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+        assert!(
+            !after.contains("evil"),
+            "export-present reconcile must drop planted filter rules: {after}"
+        );
     }
 
     #[test]
