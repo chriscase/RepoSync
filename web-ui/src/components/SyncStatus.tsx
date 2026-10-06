@@ -1,16 +1,22 @@
 import { type SyncStatus as SyncStatusType } from '../api';
+import { syncStateVisual } from '../utils/syncStateColor';
 
 interface Props {
   status: SyncStatusType;
 }
 
 export default function SyncStatus({ status }: Props) {
+  const visual = syncStateVisual(status.state);
   const stateColor =
-    status.state === 'idle'
+    visual === 'healthy'
       ? 'bg-green-400'
-      : status.state === 'error'
+      : visual === 'error'
         ? 'bg-red-400'
-        : 'bg-yellow-400';
+        : visual === 'attention'
+          ? 'bg-yellow-400'
+          : visual === 'active'
+            ? 'bg-blue-400'
+            : 'bg-gray-500';
 
   const stateLabel =
     status.state.charAt(0).toUpperCase() + status.state.slice(1);

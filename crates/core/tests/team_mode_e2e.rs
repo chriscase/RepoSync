@@ -5588,6 +5588,83 @@ async fn candidate_rs05_single_repo_sync_state_uses_global_key() {
     );
 }
 
+/// RS-05 / #63: unscoped status readers aggregate managed-repo sync_status with
+/// worst-state-wins instead of reading stale global `kv_state.sync_state`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_unscoped_status_aggregates_worst_repo_state() {
+    let fixture = QualifiedPair::new().await;
+    fixture.engine.db().set_state("sync_state", "idle").unwrap();
+    fixture
+        .engine
+        .db()
+        .update_repo_sync_status("pair", "reconciliation_required")
+        .unwrap();
+
+    let sibling_root = fixture.tmp.path().join("sibling-status");
+    std::fs::create_dir_all(&sibling_root).unwrap();
+    let sibling_svn = create_svn_repo(&sibling_root);
+    let sibling_wc = sibling_root.join("wc");
+    svn_checkout(&sibling_svn, &sibling_wc);
+    svn_commit_file(&sibling_wc, ".gitkeep", "", "Initial sibling anchor");
+    let sibling_bridge = sibling_root.join("bridge");
+    let sibling_bare = sibling_root.join("origin.git");
+    let _sibling_git = init_git_from_svn_export(&sibling_wc, &sibling_bridge, &sibling_bare);
+    let sibling_head = get_head_sha(&sibling_bridge);
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "sibling".into(),
+            name: "sibling".into(),
+            svn_url: sibling_svn,
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "local".into(),
+            git_api_url: "".into(),
+            git_repo: sibling_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 1,
+            last_git_sha: sibling_head,
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        reposync_core::sync_status::resolve_unscoped_sync_state(&shared_db).unwrap(),
+        "reconciliation_required",
+        "unscoped readers must report worst managed-repo state, not stale global idle"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_UNSCOPED_STATUS_WORST_WINS",
+            "aggregated_state":"reconciliation_required",
+            "global_sync_state":"idle",
+            "pair_status":"reconciliation_required",
+            "sibling_status":"idle"
+        })
+    );
+}
+
 /// RS-05 / #63: team-mode svn no-target advancement updates only the managed
 /// repo checkpoint and must not advance the global `last_svn_rev`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

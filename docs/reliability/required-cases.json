@@ -382,6 +382,24 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_UNSCOPED_STATUS_WORST_WINS",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_unscoped_status_aggregates_worst_repo_state",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_WEB_UNSCOPED_STATUS_AGGREGATION",
+      "binary": "unscoped_status",
+      "test": "candidate_rs05_web_unscoped_status_aggregates_worst_repo_state",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_ERROR_PAUSED_STATUS_ROUNDTRIP",
+      "binary": "unscoped_status",
+      "test": "candidate_rs05_web_unscoped_status_reports_error_paused",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R66_PERSONAL_LINEAR_ADMIT",
       "binary": "integration",
       "test": "candidate_r66_personal_linear_history_admitted",

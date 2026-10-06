@@ -136,11 +136,10 @@ async fn get_status(
         }));
     }
 
-    // Global status (no repo_id) — read from the sync engine's kv_state.
-    let state_str = db
-        .get_state("sync_state")
-        .unwrap_or(None)
-        .unwrap_or_else(|| "idle".into());
+    // Global status (no repo_id) — aggregate per-repo sync_status when managed
+    // repos exist; otherwise read the legacy global kv_state key.
+    let state_str = reposync_core::sync_status::resolve_unscoped_sync_state(db)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
     let last_sync_str = db.get_state("last_sync_at").unwrap_or(None);
     let last_sync_at = last_sync_str.and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(&s)

@@ -34,6 +34,7 @@ pub mod snapshot;
 pub mod svn;
 pub mod svn_commit;
 pub mod sync_engine;
+pub mod sync_status;
 pub mod writer_fence;
 
 // Re-exports for convenience.

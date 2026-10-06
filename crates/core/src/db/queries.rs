@@ -2636,29 +2636,36 @@ impl Database {
         &self,
         _repo_id: Option<&str>,
     ) -> Result<StatusSummary, DatabaseError> {
-        let conn = self.conn();
-        let summary = conn.query_row(
-            "SELECT
-                (SELECT value FROM kv_state WHERE key = 'sync_state') as sync_state,
-                (SELECT value FROM kv_state WHERE key = 'last_sync_at') as last_sync_at,
-                (SELECT COUNT(*) FROM sync_records) as total_syncs,
-                (SELECT COUNT(*) FROM conflicts) as total_conflicts,
-                (SELECT COUNT(*) FROM conflicts WHERE status = 'active') as active_conflicts,
-                (SELECT COUNT(*) FROM audit_log WHERE success = 0 AND created_at > datetime('now', '-24 hours')) as recent_errors
-            ",
-            [],
-            |row| {
-                Ok(StatusSummary {
-                    sync_state: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    last_sync_at: row.get::<_, Option<String>>(1)?,
-                    total_syncs: row.get(2)?,
-                    total_conflicts: row.get(3)?,
-                    active_conflicts: row.get(4)?,
-                    recent_errors: row.get(5)?,
-                })
-            },
-        )?;
-        Ok(summary)
+        // Drop the connection guard before resolve_unscoped_sync_state: that helper
+        // acquires the DB mutex again via list_repositories/get_state.
+        let summary = {
+            let conn = self.conn();
+            conn.query_row(
+                "SELECT
+                    (SELECT value FROM kv_state WHERE key = 'last_sync_at') as last_sync_at,
+                    (SELECT COUNT(*) FROM sync_records) as total_syncs,
+                    (SELECT COUNT(*) FROM conflicts) as total_conflicts,
+                    (SELECT COUNT(*) FROM conflicts WHERE status = 'active') as active_conflicts,
+                    (SELECT COUNT(*) FROM audit_log WHERE success = 0 AND created_at > datetime('now', '-24 hours')) as recent_errors
+                ",
+                [],
+                |row| {
+                    Ok(StatusSummary {
+                        sync_state: String::new(),
+                        last_sync_at: row.get::<_, Option<String>>(0)?,
+                        total_syncs: row.get(1)?,
+                        total_conflicts: row.get(2)?,
+                        active_conflicts: row.get(3)?,
+                        recent_errors: row.get(4)?,
+                    })
+                },
+            )?
+        };
+        let sync_state = crate::sync_status::resolve_unscoped_sync_state(self)?;
+        Ok(StatusSummary {
+            sync_state,
+            ..summary
+        })
     }
 }
 
@@ -2713,6 +2720,47 @@ mod tests {
         db.complete_sync_state(id, "completed", Some("ok")).unwrap();
         let latest = db.get_latest_sync_state().unwrap().unwrap();
         assert_eq!(latest.state, "completed");
+    }
+
+    #[test]
+    fn get_status_summary_does_not_deadlock_with_repositories() {
+        use crate::models::Repository;
+
+        let db = setup_db();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: "repo1".into(),
+            name: "repo1".into(),
+            svn_url: "file:///tmp/svn".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "github".into(),
+            git_api_url: "http://127.0.0.1:1".into(),
+            git_repo: "org/repo".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 60,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "reconciliation_required".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        let summary = db.get_status_summary(None).unwrap();
+        assert_eq!(summary.sync_state, "reconciliation_required");
     }
 
     #[test]
