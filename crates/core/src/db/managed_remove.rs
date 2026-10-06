@@ -949,7 +949,7 @@ mod tests {
             }
             other => panic!("expected git-push wait, got {other:?}"),
         }
-        assert!(db.get_repository("push-repo").unwrap().unwrap().enabled == false);
+        assert!(!db.get_repository("push-repo").unwrap().unwrap().enabled);
     }
 
     #[test]

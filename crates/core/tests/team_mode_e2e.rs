@@ -2442,13 +2442,14 @@ async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
         None
     );
-    let conn = fixture.engine.db().conn();
-    let old_time = "2000-01-01 00:00:00";
-    assert_eq!(conn.execute(
-        "UPDATE sync_records SET synced_at = ?1 WHERE repo_id = 'pair' AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
-        rusqlite::params![old_time, baseline],).unwrap(), 1);
-    conn.execute("INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status) VALUES ('old-diagnostic', 'pair', NULL, NULL, 'svn_to_git', '', '', ?1, ?1, 'pending')", [old_time]).unwrap();
-    drop(conn);
+    {
+        let conn = fixture.engine.db().conn();
+        let old_time = "2000-01-01 00:00:00";
+        assert_eq!(conn.execute(
+            "UPDATE sync_records SET synced_at = ?1 WHERE repo_id = 'pair' AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+            rusqlite::params![old_time, baseline],).unwrap(), 1);
+        conn.execute("INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status) VALUES ('old-diagnostic', 'pair', NULL, NULL, 'svn_to_git', '', '', ?1, ?1, 'pending')", [old_time]).unwrap();
+    }
     fixture.engine.db().run_maintenance(90).unwrap();
     let retained_baseline: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
@@ -2534,14 +2535,15 @@ async fn candidate_r10_prior_pruned_baseline_blocks_without_guessing() {
     );
     // Model an installation already pruned by the original maintenance code.
     // Candidate retention cannot recreate a lost authority from the next row.
-    let conn = fixture.engine.db().conn();
-    conn.execute(
-        "DELETE FROM kv_state WHERE key = 'handled_git_baseline_pair'",
-        [],
-    )
-    .unwrap();
-    conn.execute("DELETE FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git'", [&baseline]).unwrap();
-    drop(conn);
+    {
+        let conn = fixture.engine.db().conn();
+        conn.execute(
+            "DELETE FROM kv_state WHERE key = 'handled_git_baseline_pair'",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git'", [&baseline]).unwrap();
+    }
     let before_remote = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
     let before_tree = tracked_tree(&fixture.bridge);
     let before_svn = SvnClient::new(&fixture.svn_url, "", "")
@@ -2629,11 +2631,12 @@ async fn candidate_r10_retention_preserves_present_kv_applied_mapping() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (revision, emitted.clone())
     );
-    let conn = fixture.engine.db().conn();
-    assert_eq!(conn.execute(
-        "UPDATE sync_records SET synced_at = '2000-01-01 00:00:00' WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
-        [&handled]).unwrap(), 1);
-    drop(conn);
+    {
+        let conn = fixture.engine.db().conn();
+        assert_eq!(conn.execute(
+            "UPDATE sync_records SET synced_at = '2000-01-01 00:00:00' WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+            [&handled]).unwrap(), 1);
+    }
     fixture.engine.db().run_maintenance(90).unwrap();
     let applied: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
@@ -5312,7 +5315,12 @@ async fn candidate_rs05_import_baseline_pending_isolated_per_repo_status() {
         "verified pair sync_status must stay idle"
     );
     assert_eq!(
-        fixture.engine.db().get_state("sync_state").unwrap().as_deref(),
+        fixture
+            .engine
+            .db()
+            .get_state("sync_state")
+            .unwrap()
+            .as_deref(),
         Some("idle"),
         "shared global sync_state must stay idle"
     );
@@ -7293,7 +7301,7 @@ async fn candidate_64c_lost_reply_holds_without_pretending_success() {
         .get_svn_commit_operation(repo_id, &op.id)
         .unwrap()
         .unwrap();
-    assert_eq!(status.lifecycle_is_held(), true);
+    assert!(status.lifecycle_is_held());
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({

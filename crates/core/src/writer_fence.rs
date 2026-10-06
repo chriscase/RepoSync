@@ -421,11 +421,7 @@ mod tests {
         let _guard = claim_with_identity(&ctx.db, ctx.dir.path(), "host-a", 10_003).unwrap();
         backdate_lease_renewed_at(&ctx.db);
         clear_process_identity();
-        let err = ctx
-            .db
-            .transaction(|tx| require_current(tx))
-            .unwrap_err()
-            .to_string();
+        let err = ctx.db.transaction(require_current).unwrap_err().to_string();
         assert!(err.contains("not held locally"), "{err}");
         eprintln!(
             "RELIABILITY_EVIDENCE {}",
@@ -440,11 +436,7 @@ mod tests {
         let stale = claim_with_identity(&ctx.db, ctx.dir.path(), &local, dead_pid()).unwrap();
         let _current = claim_with_identity(&ctx.db, ctx.dir.path(), "host-b", 10_006).unwrap();
         set_process_identity(&local, dead_pid(), stale.epoch());
-        let err = ctx
-            .db
-            .transaction(|tx| require_current(tx))
-            .unwrap_err()
-            .to_string();
+        let err = ctx.db.transaction(require_current).unwrap_err().to_string();
         assert!(err.contains("epoch mismatch"), "{err}");
         clear_process_identity();
         eprintln!(
