@@ -274,6 +274,30 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_PERSONAL_ANCESTRY_COMMAND_FAILED",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_EQUAL_REVISION_SCOPED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_two_repos_equal_revision_import_completion_scoped",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_GLOBAL_NOT_ADOPTED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_global_svn_watermark_not_adopted_without_scoped_state",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_SINGLE_IMPORT_NOOP",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_single_repo_import_then_noop_sync",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R66_PERSONAL_LINEAR_ADMIT",
       "binary": "integration",
       "test": "candidate_r66_personal_linear_history_admitted",

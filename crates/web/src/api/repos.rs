@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use reposync_core::db::git_push_operations::GitPushOperationState;
 use reposync_core::db::import_operations::{
-    import_target_fingerprint, ImportOperation, ImportOperationState, SnapshotPin,
+    import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
+    RepoImportBaseline, SnapshotPin,
 };
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
@@ -200,6 +201,24 @@ impl From<reposync_core::models::Repository> for RepoDetail {
 }
 
 fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetail, AppError> {
+    match resolve_repo_import_baseline(db, &detail.id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        RepoImportBaseline::Verified { .. } => {
+            detail.initializing = false;
+        }
+        RepoImportBaseline::Pending => {
+            detail.initializing = true;
+            if detail.status == "unknown" || detail.status == "idle" {
+                detail.status = "initializing".into();
+            }
+        }
+        RepoImportBaseline::ReconciliationRequired { reason, .. } => {
+            detail.initializing = true;
+            detail.status = reason;
+        }
+    }
+
     if let Some(op) = db
         .latest_import_operation(&detail.id)
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -1030,7 +1049,10 @@ async fn start_repo_import(
             "repository import is active or held for reconciliation".into(),
         ));
     }
-    if repo.last_svn_rev > 0 {
+    if resolve_repo_import_baseline(db, &id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_verified()
+    {
         return Err(AppError::BadRequest(
             "repository already has a completed baseline; refusing implicit full replay".into(),
         ));
@@ -1555,8 +1577,7 @@ async fn repo_import_status(
 
     // Verify the repository exists
     let db = &state.db;
-    let repo = db
-        .get_repository(&id)
+    db.get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
         .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
 
@@ -1571,10 +1592,14 @@ async fn repo_import_status(
     let progress = state.get_repo_import_progress(&id).await;
     let p = progress.read().await;
     let mut value = serde_json::to_value(&*p).map_err(|e| AppError::Internal(e.to_string()))?;
-    value.as_object_mut().unwrap().insert(
-        "can_start".into(),
-        serde_json::json!(op.is_none() && repo.last_svn_rev == 0 && repo.last_sync_at.is_none()),
-    );
+    let can_start = op.is_none()
+        && resolve_repo_import_baseline(db, &id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .is_pending();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("can_start".into(), serde_json::json!(can_start));
     if let Some(op) = op {
         let terminal_phase = match op.state {
             ImportOperationState::Queued

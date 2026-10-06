@@ -2779,6 +2779,18 @@ fn git_sha(repo: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn seed_personal_svn_import_checkpoint(db: &Database, imported_git_sha: &str, svn_rev: i64) {
+    db.insert_commit_map(
+        svn_rev,
+        imported_git_sha,
+        "svn_to_git",
+        "testuser",
+        "Test User",
+    )
+    .unwrap();
+    db.set_watermark("git_sha", imported_git_sha).unwrap();
+}
+
 fn git_cmd(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -3727,6 +3739,8 @@ async fn test_personal_git_to_svn_confirm_writes_commit_map() {
     let git_work = tmp.path().join("git_work");
     let bare = tmp.path().join("origin.git");
     let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
     std::fs::write(git_work.join("feature.txt"), "from git\n").unwrap();
     let oid = git_client
         .commit(
@@ -3738,10 +3752,12 @@ async fn test_personal_git_to_svn_confirm_writes_commit_map() {
         )
         .unwrap();
     let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
     drop(git_client);
 
     let db_path = tmp.path().join("test.db");
     let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
     let syncer = personal_git_to_svn(
         &svn_url,
         db_arc.clone(),
@@ -3770,11 +3786,15 @@ async fn test_personal_git_to_svn_confirm_writes_commit_map() {
             .is_none(),
         "confirmed journal must clear the active hold"
     );
-    let mapped = db_arc.list_commit_map(10).unwrap();
+    let mapped = db_arc
+        .list_commit_map(10)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.direction == "git_to_svn")
+        .collect::<Vec<_>>();
     assert_eq!(mapped.len(), 1);
     assert_eq!(mapped[0].git_sha, git_sha);
     assert_eq!(mapped[0].svn_rev, svn_rev);
-    assert_eq!(mapped[0].direction, "git_to_svn");
 }
 
 #[tokio::test]
@@ -3794,6 +3814,8 @@ async fn test_personal_git_to_svn_rename_removes_source() {
     let git_work = tmp.path().join("git_work");
     let bare = tmp.path().join("origin.git");
     let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
     std::fs::write(git_work.join("old.txt"), "rename me\n").unwrap();
     let seed_oid = git_client
         .commit(
@@ -3805,10 +3827,12 @@ async fn test_personal_git_to_svn_rename_removes_source() {
         )
         .unwrap();
     let seed_sha = seed_oid.to_string();
+    git_client.push("origin", "main").unwrap();
     drop(git_client);
 
     let db_path = tmp.path().join("test.db");
     let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
     let syncer = personal_git_to_svn(
         &svn_url,
         db_arc.clone(),
@@ -3834,6 +3858,11 @@ async fn test_personal_git_to_svn_rename_removes_source() {
         .expect("git commit failed");
     assert!(status.success(), "git commit rename failed");
     let rename_sha = git_sha_at(&git_work, "HEAD");
+    assert!(Command::new("git")
+        .args(["-C", git_work.to_str().unwrap(), "push", "origin", "main"])
+        .status()
+        .unwrap()
+        .success());
 
     let svn_rev = syncer
         .replay_commit(
@@ -3892,6 +3921,8 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
     let git_work = tmp.path().join("git_work");
     let bare = tmp.path().join("origin.git");
     let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
     std::fs::write(git_work.join("feature.txt"), "lost reply\n").unwrap();
     let oid = git_client
         .commit(
@@ -3903,10 +3934,12 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         )
         .unwrap();
     let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
     drop(git_client);
 
     let db_path = tmp.path().join("test.db");
     let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
     let syncer = personal_git_to_svn(
         &svn_url,
         db_arc.clone(),
@@ -3936,7 +3969,12 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         "SVN commit must have landed before the hold"
     );
     assert_eq!(
-        db_arc.list_commit_map(10).unwrap().len(),
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.direction == "git_to_svn")
+            .count(),
         0,
         "commit_map must not advance on uncertain outcome"
     );
@@ -4571,6 +4609,80 @@ async fn candidate_rs05_personal_ambiguous_checkpoint_blocks_before_svn_write() 
             "reason":"ambiguous_checkpoint",
             "watermark":watermark,
             "mapping":unrelated,
+            "svn_revision_before_after":svn_before,
+            "mode":"personal"
+        })
+    );
+}
+
+/// Git ancestry command failures are distinct from rewrite claims and block replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write() {
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let watermark = git_sha(&git_work);
+    std::fs::write(git_work.join("progress.txt"), "progress\n").unwrap();
+    git_cmd(&git_work, &["add", "progress.txt"]);
+    git_client
+        .commit(
+            "Progress after import",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let mapping = git_sha(&git_work);
+    drop(git_client);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &mapping, "svn_to_git", "testuser", "Test User")
+        .unwrap();
+    db.set_watermark("git_sha", &watermark).unwrap();
+    let db_arc = Arc::new(db);
+
+    std::env::set_var(
+        "REPOSYNC_TEST_INSPECTION_FAULT",
+        format!("ancestry_exit_128|{}", git_work.display()),
+    );
+    let sync = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let commit = github_commit(mapping.clone(), "Progress after import");
+    let err = sync
+        .replay_commit(&commit, 1, "main")
+        .await
+        .expect_err("ancestry command failure must block before SVN writes");
+    std::env::remove_var("REPOSYNC_TEST_INSPECTION_FAULT");
+    assert!(
+        format!("{err:#}").contains("ancestry_command_failed"),
+        "{err:#}"
+    );
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_PERSONAL_ANCESTRY_COMMAND_FAILED",
+            "reason":"ancestry_command_failed",
+            "watermark":watermark,
+            "mapping":mapping,
             "svn_revision_before_after":svn_before,
             "mode":"personal"
         })

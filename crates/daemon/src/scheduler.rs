@@ -16,6 +16,7 @@ use tokio::time;
 use tracing::{debug, error, info, warn};
 
 use reposync_core::config::AppConfig;
+use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
@@ -585,12 +586,32 @@ impl Scheduler {
             // AND last_svn_rev is 0, the user hasn't kicked an import
             // yet — leave it alone, don't clone, don't sync, don't
             // take the busy slot.
-            if repo.last_sync_at.is_none() && repo.last_svn_rev == 0 {
-                debug!(
-                    repo_name = %repo.name,
-                    "skipping: repo has never been initialized (awaiting import)"
-                );
-                continue;
+            match resolve_repo_import_baseline(&self.db, &repo.id) {
+                Ok(RepoImportBaseline::Pending) => {
+                    debug!(
+                        repo_name = %repo.name,
+                        "skipping: repo has never been initialized (awaiting import)"
+                    );
+                    continue;
+                }
+                Ok(RepoImportBaseline::ReconciliationRequired { reason, detail }) => {
+                    debug!(
+                        repo_name = %repo.name,
+                        reason = %reason,
+                        detail = %detail,
+                        "skipping: repo import baseline requires reconciliation"
+                    );
+                    continue;
+                }
+                Ok(RepoImportBaseline::Verified { .. }) => {}
+                Err(error) => {
+                    error!(
+                        repo_name = %repo.name,
+                        error = %error,
+                        "cannot resolve import baseline; refusing repository sync"
+                    );
+                    continue;
+                }
             }
 
             // Check if it's time to sync based on poll_interval_secs and last_sync_at.
@@ -1086,6 +1107,8 @@ mod cancellation_tests {
             teams_webhook_url: None,
         })
         .unwrap();
+        db.set_state(&format!("last_svn_rev_{repo_id}"), "2")
+            .unwrap();
         let dummy_git = tmp.path().join("dummy-git");
         assert!(std::process::Command::new("git")
             .args(["init", dummy_git.to_str().unwrap()])

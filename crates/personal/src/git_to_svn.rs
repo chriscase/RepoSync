@@ -18,6 +18,7 @@ use reposync_core::db::Database;
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
+use reposync_core::history_inspect::inspect_personal_history;
 use reposync_core::path_projection::{
     project_git_to_svn_changeset, svn_path_identity, GitToSvnInputChange,
     ProjectedGitToSvnChangeset,
@@ -159,6 +160,17 @@ impl GitToSvnSync {
     /// 5. Record results in `pr_sync_log` and `commit_map`.
     ///
     /// Returns a summary of what was synced.
+    fn ensure_personal_history_admitted(&self) -> Result<()> {
+        inspect_personal_history(
+            &self.db,
+            &self.git_repo_path,
+            &self.default_branch,
+            PERSONAL_REPO_ID,
+        )
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!(e))
+    }
+
     #[instrument(skip(self), fields(repo = %self.github_repo))]
     pub async fn sync(&self) -> Result<GitToSvnResult> {
         if let Some(op) = self
@@ -170,6 +182,9 @@ impl GitToSvnSync {
                 anyhow::bail!(reason);
             }
         }
+
+        self.ensure_personal_history_admitted()
+            .context("personal Git history inspection blocked git-to-svn sync")?;
 
         info!("starting git-to-svn sync cycle");
         let mut result = GitToSvnResult::default();
@@ -413,6 +428,9 @@ impl GitToSvnSync {
                 anyhow::bail!(reason);
             }
         }
+
+        self.ensure_personal_history_admitted()
+            .context("personal Git history inspection blocked git-to-svn replay")?;
 
         // 1. Update SVN working copy to latest.
         self.svn

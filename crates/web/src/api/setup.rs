@@ -19,7 +19,7 @@ use uuid::Uuid;
 use reposync_core::busy::BusyGuard;
 use reposync_core::config::AppConfig;
 use reposync_core::db::import_operations::{
-    import_target_fingerprint, ImportOperation, ImportOperationState,
+    import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
 };
 use reposync_core::db::Database;
 use reposync_core::errors::DatabaseError;
@@ -820,7 +820,10 @@ async fn admit_setup_import(
             operation: Some(Box::new(active)),
         });
     }
-    if repo.last_svn_rev > 0 {
+    if resolve_repo_import_baseline(db, &repo.id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .is_verified()
+    {
         return Ok(SetupAdmission::Busy {
             message: "repository already has a completed baseline; refusing implicit full replay"
                 .into(),

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
+use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
 use reposync_core::db::Database;
 use reposync_core::errors::SyncError;
 use reposync_core::git::GitClient;
@@ -4400,6 +4401,191 @@ async fn candidate_r17_repository_cursors_remain_scoped() {
             "other_p_before":other_import, "other_r_after":second,
             "other_svn_before":2, "other_svn_after":4,
             "global_cursor_not_borrowed":true, "first_pair_still_blocked":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_two_repos_equal_revision_import_completion_scoped() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("scoped-import.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let a_root = tmp.path().join("a");
+    let b_root = tmp.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    for (id, svn_url, bare) in [
+        ("repo_a", create_svn_repo(&a_root), tmp.path().join("a.git")),
+        ("repo_b", create_svn_repo(&b_root), tmp.path().join("b.git")),
+    ] {
+        let wc = tmp.path().join(format!("{id}_wc"));
+        svn_checkout(&svn_url, &wc);
+        svn_commit_file(&wc, "seed.txt", "seed\n", "Seed");
+        svn_commit_file(&wc, "origin.txt", "origin\n", "Origin");
+        let bridge = tmp.path().join(format!("{id}_bridge"));
+        let git = init_git_from_svn_export(&wc, &bridge, &bare);
+        let imported = get_head_sha(&bridge);
+        drop(git);
+        db.insert_repository(&Repository {
+            id: id.into(),
+            name: id.into(),
+            svn_url,
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        if id == "repo_a" {
+            seed_svn_to_git_baseline(&db, id, 2, &imported);
+            db.conn()
+                .execute(
+                    "UPDATE repositories SET last_sync_at=datetime('now') WHERE id=?1",
+                    [id],
+                )
+                .unwrap();
+        }
+    }
+
+    db.set_state("last_svn_rev", "2").unwrap();
+    db.set_watermark("svn_rev", "2").unwrap();
+
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "repo_a").unwrap(),
+        RepoImportBaseline::Verified {
+            svn_rev: 2,
+            git_sha: db.get_repo_watermark("repo_a").unwrap().1,
+        }
+    );
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "repo_b").unwrap(),
+        RepoImportBaseline::Pending
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_EQUAL_REVISION_SCOPED",
+            "repo_a":"verified",
+            "repo_b":"pending",
+            "global_svn_rev":2,
+            "equal_revision_numbers":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_global_svn_watermark_not_adopted_without_scoped_state() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("global-watermark.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: "pending".into(),
+        name: "pending".into(),
+        svn_url: "file:///svn".into(),
+        svn_branch: "trunk".into(),
+        svn_username: String::new(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: "repo.git".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.set_state("last_svn_rev", "2").unwrap();
+    db.set_watermark("svn_rev", "2").unwrap();
+
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "pending").unwrap(),
+        RepoImportBaseline::Pending
+    );
+
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='pending'",
+            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .unwrap();
+    let held = resolve_repo_import_baseline(&db, "pending").unwrap();
+    assert!(matches!(
+        held,
+        RepoImportBaseline::ReconciliationRequired {
+            reason,
+            ..
+        } if reason == "missing_scoped_import_checkpoint"
+    ));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_GLOBAL_NOT_ADOPTED",
+            "pending_with_global_only":"pending",
+            "column_without_scoped_kv":"missing_scoped_import_checkpoint"
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_single_repo_import_then_noop_sync() {
+    let fixture = QualifiedPair::new().await;
+    assert!(resolve_repo_import_baseline(fixture.engine.db(), "pair")
+        .unwrap()
+        .is_verified());
+    let noop = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(noop.svn_to_git_count, 0);
+    assert_eq!(noop.git_to_svn_count, 0);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_SINGLE_IMPORT_NOOP",
+            "second_svn_to_git":noop.svn_to_git_count,
+            "verified_baseline":true
         })
     );
 }

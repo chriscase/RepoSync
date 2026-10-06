@@ -509,6 +509,24 @@ fn personal_checkpoint_ancestry(
     watermark: &str,
     mapping: &str,
 ) -> Result<bool, HistoryInspectReject> {
+    #[cfg(debug_assertions)]
+    {
+        let fault = std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok();
+        let fixture_fault = fault
+            .as_deref()
+            .and_then(|value| value.split_once('|'))
+            .filter(|(_, fixture_path)| Path::new(fixture_path) == git_path)
+            .map(|(kind, _)| kind);
+        if fixture_fault == Some("ancestry_exit_128") {
+            return Err(HistoryInspectReject {
+                reason: "ancestry_command_failed".into(),
+                detail: "personal checkpoint ancestry could not be established".into(),
+                o: None,
+                r: None,
+                l: None,
+            });
+        }
+    }
     match Command::new("git")
         .args(["merge-base", "--is-ancestor", watermark, mapping])
         .current_dir(git_path)
