@@ -694,8 +694,7 @@ impl GitToSvnSync {
                         match &decision {
                             FilePolicyDecision::Allow => {
                                 // Check if this is an LFS pointer that needs resolution.
-                                let write_content = if reposync_core::lfs::is_lfs_pointer(content)
-                                {
+                                let write_content = if reposync_core::lfs::is_lfs_pointer(content) {
                                     // The file in Git is an LFS pointer — resolve
                                     // it to the actual blob content before writing
                                     // to SVN (SVN doesn't understand LFS pointers).
@@ -757,8 +756,7 @@ impl GitToSvnSync {
                             FilePolicyDecision::LfsTrack { .. } => {
                                 // File exceeds LFS threshold — same LFS pointer
                                 // resolution logic applies.
-                                let write_content = if reposync_core::lfs::is_lfs_pointer(content)
-                                {
+                                let write_content = if reposync_core::lfs::is_lfs_pointer(content) {
                                     match reposync_core::lfs::resolve_lfs_pointer(
                                         &self.git_repo_path,
                                         content,
