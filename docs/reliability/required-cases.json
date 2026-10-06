@@ -358,6 +358,42 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_TEAM_FETCH_GIT_GLOBAL_FAIL_CLOSED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_git_changes_global_watermark_fails_closed",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_FETCH_GIT_SCOPED_IGNORES_GLOBAL",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_git_changes_scoped_checkpoint_ignores_global",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_FETCH_GIT_SCOPED_ISOLATION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_git_changes_missing_scoped_one_repo_other_syncs",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_SINGLE_REPO_FETCH_GIT_GLOBAL_FALLBACK",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_git_changes_personal_mode_keeps_global_fallback",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_FETCH_GIT_INCREMENTAL_NO_REPLAY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_git_two_incremental_cycles_no_replay_skip",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_ADVANCE_GIT_SCOPED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_advance_git_team_scoped_not_global",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_TEAM_RECONCILIATION_STATUS_HONEST",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_reconciliation_required_not_reported_idle",

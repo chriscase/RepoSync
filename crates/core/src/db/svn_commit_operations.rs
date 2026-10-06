@@ -234,7 +234,6 @@ fn finalize_tx(
             &format!("last_git_sha_{}", op.repo_id),
             &op.source_git_sha,
         )?;
-        write_value(tx, "last_git_hash", &op.source_git_sha)?;
     }
     if removed {
         op.outcome_detail =

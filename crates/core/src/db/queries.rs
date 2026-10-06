@@ -1,7 +1,7 @@
 //! Typed query helpers for every table in the RepoSync database.
 
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -1153,6 +1153,21 @@ impl Database {
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
+    /// Team-mode managed repos keep Git cursors scoped per pair (#63).
+    fn repo_writes_global_git_watermark(
+        conn: &rusqlite::Connection,
+        repo_id: &str,
+    ) -> Result<bool, DatabaseError> {
+        let mode: Option<String> = conn
+            .query_row(
+                "SELECT sync_mode FROM repositories WHERE id = ?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(mode.as_deref() != Some("team"))
+    }
+
     /// Advance the Git handled frontier for an exact skip and persist exclusion
     /// receipts for each selected commit. Does not adopt live HEAD.
     pub fn advance_exact_skip_watermarks(
@@ -1177,10 +1192,12 @@ impl Database {
             params![kv_key, frontier_sha, now],
         )?;
 
-        tx.execute(
-            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
-            params![frontier_sha, now],
-        )?;
+        if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
+            tx.execute(
+                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
+                params![frontier_sha, now],
+            )?;
+        }
 
         for sha in excluded_commits {
             let receipt = serde_json::json!({
@@ -1230,11 +1247,12 @@ impl Database {
             params![kv_key, git_sha, now],
         )?;
 
-        // 3. Update global kv_state key
-        tx.execute(
-            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
-            params![git_sha, now],
-        )?;
+        if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
+            tx.execute(
+                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
+                params![git_sha, now],
+            )?;
+        }
 
         if let Some(receipt) = no_target {
             let key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
@@ -3141,6 +3159,28 @@ mod tests {
 
         let global = db.get_state("last_git_hash").unwrap();
         assert_eq!(global.as_deref(), Some("sha789"));
+    }
+
+    #[test]
+    fn test_advance_all_watermarks_team_mode_skips_global_kv() {
+        let db = setup_db();
+        let mut repo = create_test_repo(&db, "pair", "Team Pair");
+        repo.sync_mode = "team".into();
+        db.update_repository(&repo).unwrap();
+        db.set_state("last_git_hash", "stale-global").unwrap();
+
+        db.advance_all_watermarks("pair", "sha7890123456789012345678901234567890")
+            .unwrap();
+
+        assert_eq!(
+            db.get_state("last_git_hash").unwrap().as_deref(),
+            Some("stale-global"),
+            "team-mode managed repo must not clobber global last_git_hash"
+        );
+        assert_eq!(
+            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            Some("sha7890123456789012345678901234567890")
+        );
     }
 
     // ---- consecutive_errors tests ----

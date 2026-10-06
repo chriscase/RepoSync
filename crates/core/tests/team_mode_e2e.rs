@@ -5220,6 +5220,410 @@ async fn candidate_rs05_fetch_svn_changes_personal_mode_keeps_global_fallback() 
     );
 }
 
+/// RS-05 / #63: team-mode `inspect_team_history` / `fetch_git_changes` must
+/// fail closed when scoped Git cursor copies are absent, even if a stale global
+/// `last_git_hash` exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_git_changes_global_watermark_fails_closed() {
+    let fixture = QualifiedPair::new().await;
+    let repo_rev = fixture.engine.db().get_repo_watermark("pair").unwrap().0;
+    fixture
+        .engine
+        .db()
+        .update_repo_watermark("pair", repo_rev, "")
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_hash", &fixture.imported_base)
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .set_watermark("git_sha", &fixture.imported_base)
+        .unwrap();
+
+    let git_sha = fixture.developer_commit("feature.txt", "blocked git\n", "Blocked git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let svn_before = svn_youngest(&fixture.svn_repo_root);
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "missing_checkpoint"
+        ),
+        "fetch_git_changes must fail closed without scoped Git cursor: {result:?}"
+    );
+    assert_eq!(svn_youngest(&fixture.svn_repo_root), svn_before);
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_GIT_GLOBAL_FAIL_CLOSED",
+            "reason":"missing_checkpoint",
+            "global_git_hash":fixture.imported_base,
+            "pending_git":git_sha,
+            "svn_revision_before_after":svn_before
+        })
+    );
+}
+
+/// RS-05 / #63: verified scoped Git checkpoint drives `fetch_git_changes`
+/// even when a stale global watermark claims a later handled SHA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_git_changes_scoped_checkpoint_ignores_global() {
+    let fixture = QualifiedPair::new().await;
+    let first = fixture.developer_commit("feature.txt", "first pending\n", "First pending");
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_hash", &first)
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .set_watermark("git_sha", &first)
+        .unwrap();
+    let second = fixture.developer_commit("feature.txt", "second pending\n", "Second pending");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        stats.git_to_svn_count, 2,
+        "fetch_git_changes must replay from scoped checkpoint, not stale global"
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(second.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_hash").unwrap(),
+        Some(first.clone()),
+        "team-mode git advancement must not clobber global last_git_hash"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_GIT_SCOPED_IGNORES_GLOBAL",
+            "global_git_hash":first,
+            "scoped_git_before":fixture.imported_base,
+            "synced_commits":[first, second],
+            "git_to_svn":stats.git_to_svn_count
+        })
+    );
+}
+
+/// RS-05 / #63: one team repo missing scoped Git proof fails closed while a
+/// separately verified pair keeps syncing through the real engine path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_git_changes_missing_scoped_one_repo_other_syncs() {
+    let fixture = QualifiedPair::new().await;
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_hash", &fixture.imported_base)
+        .unwrap();
+
+    let blocked_root = fixture.tmp.path().join("blocked-git");
+    std::fs::create_dir_all(&blocked_root).unwrap();
+    let blocked_svn = create_svn_repo(&blocked_root);
+    let blocked_wc = blocked_root.join("wc");
+    svn_checkout(&blocked_svn, &blocked_wc);
+    svn_commit_file(&blocked_wc, ".gitkeep", "", "Initial blocked anchor");
+    svn_commit_file(
+        &blocked_wc,
+        "origin.txt",
+        "Blocked SVN origin\n",
+        "Blocked SVN origin",
+    );
+    let blocked_bridge = blocked_root.join("bridge");
+    let blocked_bare = blocked_root.join("origin.git");
+    let blocked_git = init_git_from_svn_export(&blocked_wc, &blocked_bridge, &blocked_bare);
+    let blocked_head = get_head_sha(&blocked_bridge);
+    let blocked_developer = blocked_root.join("developer");
+    let clone = Command::new("git")
+        .args([
+            "clone",
+            "-b",
+            "main",
+            blocked_bare.to_str().unwrap(),
+            blocked_developer.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "blocked developer clone failed");
+    let blocked_pending = {
+        let path = blocked_developer.join("feature.txt");
+        std::fs::write(&path, "blocked pending\n").unwrap();
+        git_cli(&blocked_developer, &["add", "feature.txt"]);
+        git_cli(&blocked_developer, &["commit", "-m", "Blocked pending"]);
+        git_cli(&blocked_developer, &["push", "origin", "main"]);
+        get_head_sha(&blocked_developer)
+    };
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let blocked_svn_rev = svn_youngest(&blocked_svn) - 1;
+    shared_db
+        .insert_repository(&Repository {
+            id: "blocked".into(),
+            name: "blocked git pair".into(),
+            svn_url: blocked_svn.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: blocked_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: blocked_svn_rev,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+    seed_svn_to_git_baseline(&shared_db, "blocked", blocked_svn_rev, &blocked_head);
+    shared_db
+        .conn()
+        .execute(
+            "DELETE FROM kv_state WHERE key = 'last_git_sha_blocked'",
+            [],
+        )
+        .unwrap();
+    shared_db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = '' WHERE id = 'blocked'",
+            [],
+        )
+        .unwrap();
+
+    let mut blocked_config = make_app_config(&blocked_svn, &blocked_root);
+    blocked_config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut blocked_engine = SyncEngine::new(
+        blocked_config,
+        shared_db,
+        SvnClient::new(&blocked_svn, "", ""),
+        blocked_git,
+        Arc::new(make_identity_mapper()),
+    );
+    blocked_engine.set_repo_id("blocked".into());
+
+    let blocked_result = blocked_engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &blocked_result,
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "missing_checkpoint"
+        ),
+        "blocked pair must fail closed in fetch_git_changes: {blocked_result:?}"
+    );
+    assert_eq!(svn_youngest(&blocked_svn), blocked_svn_rev + 1);
+
+    let healthy_git = fixture.developer_commit(
+        "feature.txt",
+        "Healthy pair still syncs\n",
+        "Healthy pair still syncs",
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let healthy_stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(healthy_stats.git_to_svn_count, 1);
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(healthy_git.clone())
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_GIT_SCOPED_ISOLATION",
+            "blocked_pair":"blocked",
+            "healthy_pair":"pair",
+            "blocked_reason":"missing_checkpoint",
+            "blocked_pending":blocked_pending,
+            "healthy_synced_git":healthy_git
+        })
+    );
+}
+
+/// RS-05 / #63: single-repo callers without a repo id keep the legacy global
+/// Git watermark inside `inspect_team_history` / `fetch_git_changes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_git_changes_personal_mode_keeps_global_fallback() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(&wc_path, ".gitkeep", "", "Initial anchor");
+    svn_commit_file(
+        &wc_path,
+        "origin.txt",
+        "SVN origin\n",
+        "Verified SVN origin",
+    );
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+    let developer = tmp.path().join("developer");
+    let clone = Command::new("git")
+        .args([
+            "clone",
+            "-b",
+            "main",
+            bare_dir.to_str().unwrap(),
+            developer.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(clone.status.success(), "developer clone failed");
+    let initial_sha = get_head_sha(&git_work_dir);
+    let pending = {
+        std::fs::write(developer.join("feature.txt"), "from Git\n").unwrap();
+        git_cli(&developer, &["add", "feature.txt"]);
+        git_cli(&developer, &["commit", "-m", "Git change"]);
+        git_cli(&developer, &["push", "origin", "main"]);
+        get_head_sha(&developer)
+    };
+
+    let db = setup_db(&tmp.path().join("sync.db"));
+    db.set_state("last_git_hash", &initial_sha).unwrap();
+    db.set_state("last_svn_rev", "2").unwrap();
+
+    let config = make_app_config(&svn_url, tmp.path());
+    let engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        Arc::new(make_identity_mapper()),
+    );
+
+    let stats = engine.run_sync_cycle().await.expect("sync cycle failed");
+    assert_eq!(
+        stats.git_to_svn_count, 1,
+        "single-repo mode must still fetch via global watermark fallback"
+    );
+    assert_eq!(
+        engine.db().get_state("last_git_hash").unwrap(),
+        Some(pending.clone())
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_SINGLE_REPO_FETCH_GIT_GLOBAL_FALLBACK",
+            "git_to_svn":stats.git_to_svn_count,
+            "global_last_git_hash":engine.db().get_state("last_git_hash").unwrap()
+        })
+    );
+}
+
+/// RS-05 / #63: two consecutive incremental team cycles neither replay nor skip
+/// Git commits when the scoped cursor advances between cycles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_git_two_incremental_cycles_no_replay_skip() {
+    let fixture = QualifiedPair::new().await;
+    let first = fixture.developer_commit("feature.txt", "cycle one\n", "Cycle one");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let first_stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(first_stats.git_to_svn_count, 1);
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(first.clone())
+    );
+
+    let second = fixture.developer_commit("feature.txt", "cycle two\n", "Cycle two");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let second_stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(second_stats.git_to_svn_count, 1);
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(second.clone())
+    );
+
+    let repeat = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.git_to_svn_count, repeat.svn_to_git_count), (0, 0));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_GIT_INCREMENTAL_NO_REPLAY",
+            "first_git":first,
+            "second_git":second,
+            "first_cycle_git_to_svn":first_stats.git_to_svn_count,
+            "second_cycle_git_to_svn":second_stats.git_to_svn_count,
+            "repeat_noop":true
+        })
+    );
+}
+
+/// RS-05 / #63: team-mode git-to-svn advancement updates only the managed
+/// repo checkpoint and must not advance the global `last_git_hash`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_advance_git_team_scoped_not_global() {
+    let fixture = QualifiedPair::new().await;
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_hash", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .unwrap();
+    let before_global = fixture.engine.db().get_state("last_git_hash").unwrap();
+
+    let git_sha = fixture.developer_commit("feature.txt", "scoped advance\n", "Scoped advance");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.git_to_svn_count, 1);
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(git_sha.clone())
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_hash").unwrap(),
+        before_global,
+        "global kv_state last_git_hash must not advance for managed team repo"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_ADVANCE_GIT_SCOPED",
+            "repo_id":"pair",
+            "global_last_git_hash_before_after":[
+                before_global,
+                fixture.engine.db().get_state("last_git_hash").unwrap()
+            ],
+            "scoped_last_git_sha":git_sha
+        })
+    );
+}
+
 /// RS-05 / #63: a pending team repo records initializing per-repo without
 /// clobbering another pair's global or per-repo sync state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
