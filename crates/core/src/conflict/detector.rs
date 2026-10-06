@@ -215,13 +215,20 @@ impl ConflictDetector {
         for git_change in git_changes {
             if let ChangeKind::Renamed { ref from } = git_change.change_kind {
                 if let Some(svn_change) = svn_by_path.get(from.as_str()) {
-                    let git_deleted_source = FileChange {
-                        path: from.clone(),
-                        change_kind: ChangeKind::Deleted,
-                        content: None,
-                        is_binary: git_change.is_binary,
+                    let conflict_type = if matches!(svn_change.change_kind, ChangeKind::Deleted) {
+                        // Git rename keeps bytes under a new name; SVN delete is not
+                        // "both deleted".
+                        Some(ConflictType::EditDelete)
+                    } else {
+                        let git_deleted_source = FileChange {
+                            path: from.clone(),
+                            change_kind: ChangeKind::Deleted,
+                            content: None,
+                            is_binary: git_change.is_binary,
+                        };
+                        classify_conflict(svn_change, &git_deleted_source)
                     };
-                    if let Some(ct) = classify_conflict(svn_change, &git_deleted_source) {
+                    if let Some(ct) = conflict_type {
                         if conflict_paths.insert(from.clone()) {
                             let mut conflict = Conflict::new(from.as_str(), ct);
                             conflict.svn_content = svn_change.content.clone();
@@ -304,6 +311,15 @@ fn classify_conflict(svn: &FileChange, git: &FileChange) -> Option<ConflictType>
         (ChangeKind::Added, ChangeKind::Deleted) | (ChangeKind::Deleted, ChangeKind::Added) => {
             Some(ConflictType::EditDelete)
         }
+
+        // Git rename at destination: classify like Modified so dest-side SVN
+        // add/edit/delete conflicts are not dropped.
+        (ChangeKind::Modified, ChangeKind::Renamed { .. })
+        | (ChangeKind::Renamed { .. }, ChangeKind::Modified) => Some(ConflictType::Content),
+        (ChangeKind::Added, ChangeKind::Renamed { .. })
+        | (ChangeKind::Renamed { .. }, ChangeKind::Added) => Some(ConflictType::Content),
+        (ChangeKind::Deleted, ChangeKind::Renamed { .. })
+        | (ChangeKind::Renamed { .. }, ChangeKind::Deleted) => Some(ConflictType::EditDelete),
 
         // Property changes.
         (ChangeKind::PropertyChanged, _) | (_, ChangeKind::PropertyChanged) => {
@@ -426,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_svn_delete_on_git_rename_source_is_no_conflict() {
+    fn test_svn_delete_on_git_rename_source_is_edit_delete_conflict() {
         let svn = vec![change("old.txt", ChangeKind::Deleted)];
         let git = vec![FileChange {
             path: "new.txt".to_string(),
@@ -437,7 +453,50 @@ mod tests {
             is_binary: false,
         }];
         let conflicts = ConflictDetector::detect(&svn, &git);
-        assert!(conflicts.is_empty());
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_path, "old.txt");
+        assert_eq!(conflicts[0].conflict_type, ConflictType::EditDelete);
+    }
+
+    fn git_rename(from: &str, to: &str) -> FileChange {
+        FileChange {
+            path: to.to_string(),
+            change_kind: ChangeKind::Renamed {
+                from: from.to_string(),
+            },
+            content: None,
+            is_binary: false,
+        }
+    }
+
+    #[test]
+    fn test_svn_add_on_git_rename_destination_is_content_conflict() {
+        let svn = vec![change("new.txt", ChangeKind::Added)];
+        let git = vec![git_rename("old.txt", "new.txt")];
+        let conflicts = ConflictDetector::detect(&svn, &git);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_path, "new.txt");
+        assert_eq!(conflicts[0].conflict_type, ConflictType::Content);
+    }
+
+    #[test]
+    fn test_svn_edit_on_git_rename_destination_is_content_conflict() {
+        let svn = vec![change("new.txt", ChangeKind::Modified)];
+        let git = vec![git_rename("old.txt", "new.txt")];
+        let conflicts = ConflictDetector::detect(&svn, &git);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_path, "new.txt");
+        assert_eq!(conflicts[0].conflict_type, ConflictType::Content);
+    }
+
+    #[test]
+    fn test_svn_delete_on_git_rename_destination_is_edit_delete_conflict() {
+        let svn = vec![change("new.txt", ChangeKind::Deleted)];
+        let git = vec![git_rename("old.txt", "new.txt")];
+        let conflicts = ConflictDetector::detect(&svn, &git);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_path, "new.txt");
+        assert_eq!(conflicts[0].conflict_type, ConflictType::EditDelete);
     }
 
     #[test]

@@ -1179,6 +1179,7 @@ impl SyncEngine {
                 } else {
                     // Persist unresolved conflict
                     let mut db_conflict = crate::models::Conflict::new(conflict.file_path.clone());
+                    db_conflict.conflict_type = conflict.conflict_type.to_string();
                     db_conflict.svn_content = conflict.svn_content.clone();
                     db_conflict.git_content = conflict.git_content.clone();
                     db_conflict.base_content = conflict.base_content.clone();
