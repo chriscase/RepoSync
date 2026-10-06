@@ -474,15 +474,17 @@ impl GitToSvnSync {
             .get_changed_files(&commit.sha)
             .context("failed to read source Git changed files")?;
         let mut file_contents = Vec::new();
-        for (action, path) in &changed_files {
-            let content = if action != "D" {
+        for change in &changed_files {
+            let content = if change.action != "D" {
                 git_client
-                    .get_file_content_at_commit(&commit.sha, path)
-                    .with_context(|| format!("failed to read '{path}' at {}", commit.sha))?
+                    .get_file_content_at_commit(&commit.sha, &change.path)
+                    .with_context(|| {
+                        format!("failed to read '{}' at {}", change.path, commit.sha)
+                    })?
             } else {
                 None
             };
-            file_contents.push((action.clone(), path.clone(), content));
+            file_contents.push((change.action.clone(), change.path.clone(), content));
         }
         let intended_changed_paths = intended_paths_from_contents(&file_contents);
         let intended_svn_tree = hash_regular_file_tree(&self.svn_wc_path)
@@ -680,10 +682,11 @@ impl GitToSvnSync {
             return Ok(());
         }
 
-        for (action, file_path) in &changed_files {
+        for change in &changed_files {
+            let file_path = &change.path;
             let dst = self.svn_wc_path.join(file_path);
 
-            match action.as_str() {
+            match change.action.as_str() {
                 "D" => {
                     // File was deleted in this commit: remove it from SVN WC
                     // so `svn status` picks it up as missing.

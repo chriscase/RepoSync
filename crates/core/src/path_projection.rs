@@ -14,6 +14,15 @@ pub struct ProjectedGitToSvnChange {
     pub content: Option<Vec<u8>>,
 }
 
+/// Raw Git change before allow/block projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitToSvnInputChange {
+    pub action: String,
+    pub path: String,
+    pub content: Option<Vec<u8>>,
+    pub rename_from: Option<String>,
+}
+
 /// Projected Git→SVN changeset: included paths drive the write; excluded
 /// paths must not touch the SVN working copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,12 +188,65 @@ pub fn exclusion_message(path: &str, allowed: &[String], blocked: &[String]) -> 
     }
 }
 
+/// Project one Git rename/move per endpoint.
+///
+/// Allowed-old to blocked/out-of-scope-new keeps only the delete. Blocked/out-
+/// of-scope-old to allowed-new keeps only the add. Both allowed becomes delete
+/// plus add. Both blocked excludes the rename entirely.
+pub fn project_rename_endpoints(
+    rename_from: &str,
+    rename_to: &str,
+    content: Option<Vec<u8>>,
+    allowed: &[String],
+    blocked: &[String],
+) -> (Vec<ProjectedGitToSvnChange>, Vec<(String, String)>) {
+    let old_in = path_is_projected(rename_from, allowed, blocked);
+    let new_in = path_is_projected(rename_to, allowed, blocked);
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+    match (old_in, new_in) {
+        (true, true) => {
+            included.push(ProjectedGitToSvnChange {
+                action: "D".into(),
+                path: rename_from.to_string(),
+                content: None,
+            });
+            included.push(ProjectedGitToSvnChange {
+                action: "A".into(),
+                path: rename_to.to_string(),
+                content,
+            });
+        }
+        (true, false) => {
+            included.push(ProjectedGitToSvnChange {
+                action: "D".into(),
+                path: rename_from.to_string(),
+                content: None,
+            });
+            excluded.push(("R".into(), format!("{rename_from} -> {rename_to}")));
+        }
+        (false, true) => {
+            included.push(ProjectedGitToSvnChange {
+                action: "A".into(),
+                path: rename_to.to_string(),
+                content,
+            });
+            excluded.push(("R".into(), format!("{rename_from} -> {rename_to}")));
+        }
+        (false, false) => {
+            excluded.push(("R".into(), format!("{rename_from} -> {rename_to}")));
+        }
+    }
+    (included, excluded)
+}
+
 /// Compute the typed projected changeset from raw Git file contents.
 ///
 /// This is the single Git→SVN path filter: allow prefixes, blocked patterns,
-/// and deletes. Call it before checkout, write, `svn add`, or `svn rm`.
+/// deletes, and rename endpoint splitting. Call it before checkout, write,
+/// `svn add`, or `svn rm`.
 pub fn project_git_to_svn_changeset(
-    files: Vec<(String, String, Option<Vec<u8>>)>,
+    files: Vec<GitToSvnInputChange>,
     allowed: &[String],
     blocked: &[String],
 ) -> ProjectedGitToSvnChangeset {
@@ -192,10 +254,10 @@ pub fn project_git_to_svn_changeset(
         return ProjectedGitToSvnChangeset {
             included: files
                 .into_iter()
-                .map(|(action, path, content)| ProjectedGitToSvnChange {
-                    action,
-                    path,
-                    content,
+                .map(|change| ProjectedGitToSvnChange {
+                    action: change.action,
+                    path: change.path,
+                    content: change.content,
                 })
                 .collect(),
             excluded: Vec::new(),
@@ -203,15 +265,29 @@ pub fn project_git_to_svn_changeset(
     }
     let mut included = Vec::new();
     let mut excluded = Vec::new();
-    for (action, path, content) in files {
-        if path_is_projected(&path, allowed, blocked) {
+    for change in files {
+        if change.action == "R" {
+            if let Some(rename_from) = change.rename_from {
+                let (rename_included, rename_excluded) = project_rename_endpoints(
+                    &rename_from,
+                    &change.path,
+                    change.content,
+                    allowed,
+                    blocked,
+                );
+                included.extend(rename_included);
+                excluded.extend(rename_excluded);
+                continue;
+            }
+        }
+        if path_is_projected(&change.path, allowed, blocked) {
             included.push(ProjectedGitToSvnChange {
-                action,
-                path,
-                content,
+                action: change.action,
+                path: change.path,
+                content: change.content,
             });
         } else {
-            excluded.push((action, path));
+            excluded.push((change.action, change.path));
         }
     }
     ProjectedGitToSvnChangeset { included, excluded }
@@ -221,8 +297,22 @@ pub fn project_git_to_svn_changeset(
 mod tests {
     use super::*;
 
-    fn file(action: &str, path: &str) -> (String, String, Option<Vec<u8>>) {
-        (action.to_string(), path.to_string(), None)
+    fn file(action: &str, path: &str) -> GitToSvnInputChange {
+        GitToSvnInputChange {
+            action: action.to_string(),
+            path: path.to_string(),
+            content: None,
+            rename_from: None,
+        }
+    }
+
+    fn rename(from: &str, to: &str) -> GitToSvnInputChange {
+        GitToSvnInputChange {
+            action: "R".into(),
+            path: to.to_string(),
+            content: Some(b"renamed payload".to_vec()),
+            rename_from: Some(from.to_string()),
+        }
     }
 
     #[test]
@@ -343,6 +433,98 @@ mod tests {
             svn_log_path_to_branch_relative("/feature.txt", &root),
             Some("feature.txt".into())
         );
+    }
+
+    #[test]
+    fn rename_allowed_to_blocked_projects_delete_only() {
+        let allowed = vec!["team".to_string()];
+        let (included, excluded) = project_rename_endpoints(
+            "team/old.txt",
+            "team-other/new.txt",
+            Some(b"must not publish".to_vec()),
+            &allowed,
+            &[],
+        );
+        assert_eq!(
+            included,
+            vec![ProjectedGitToSvnChange {
+                action: "D".into(),
+                path: "team/old.txt".into(),
+                content: None,
+            }]
+        );
+        assert_eq!(excluded.len(), 1);
+        assert!(excluded[0].1.contains("team-other/new.txt"));
+    }
+
+    #[test]
+    fn rename_blocked_to_allowed_projects_add_only() {
+        let allowed = vec!["team".to_string()];
+        let (included, excluded) = project_rename_endpoints(
+            "team-other/old.txt",
+            "team/new.txt",
+            Some(b"allowed add".to_vec()),
+            &allowed,
+            &[],
+        );
+        assert_eq!(
+            included,
+            vec![ProjectedGitToSvnChange {
+                action: "A".into(),
+                path: "team/new.txt".into(),
+                content: Some(b"allowed add".to_vec()),
+            }]
+        );
+        assert_eq!(excluded.len(), 1);
+        assert!(excluded[0].1.contains("team-other/old.txt"));
+    }
+
+    #[test]
+    fn rename_both_allowed_projects_delete_and_add() {
+        let allowed = vec!["team".to_string()];
+        let (included, excluded) = project_rename_endpoints(
+            "team/a.txt",
+            "team/b.txt",
+            Some(b"moved".to_vec()),
+            &allowed,
+            &[],
+        );
+        assert_eq!(included.len(), 2);
+        assert_eq!(included[0].action, "D");
+        assert_eq!(included[0].path, "team/a.txt");
+        assert_eq!(included[1].action, "A");
+        assert_eq!(included[1].path, "team/b.txt");
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn rename_both_blocked_projects_nothing() {
+        let allowed = vec!["team".to_string()];
+        let (included, excluded) = project_rename_endpoints(
+            "team-other/a.txt",
+            "secret/b.txt",
+            Some(b"blocked".to_vec()),
+            &allowed,
+            &["secret/".to_string()],
+        );
+        assert!(included.is_empty());
+        assert_eq!(excluded.len(), 1);
+    }
+
+    #[test]
+    fn project_changeset_splits_rename_endpoints() {
+        let files = vec![
+            rename("team/keep.txt", "team-other/leak.txt"),
+            file("A", "team/ok.txt"),
+        ];
+        let projected = project_git_to_svn_changeset(files, &["team".to_string()], &[]);
+        let included: Vec<_> = projected
+            .included
+            .iter()
+            .map(|c| (c.action.as_str(), c.path.as_str()))
+            .collect();
+        assert_eq!(included, vec![("D", "team/keep.txt"), ("A", "team/ok.txt")]);
+        assert_eq!(projected.excluded.len(), 1);
     }
 
     #[test]
