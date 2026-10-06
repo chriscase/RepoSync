@@ -7,6 +7,7 @@ import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import { GitBranch, Plus, Database, Clock, X, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
 import { formatTimeAgo } from '../utils/time';
+import { syncStateVisual } from '../utils/syncStateColor';
 
 /** Custom SVG icon: two circular sync arrows, one blue (SVN) and one purple (Git) */
 function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
@@ -36,17 +37,21 @@ function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
 
 /** Status dot with optional pulsing animation for active state */
 function StatusDot({ state, enabled }: { state?: string; enabled: boolean }) {
-  if (!enabled) {
+  const visual = syncStateVisual(state, enabled);
+  if (visual === 'disabled') {
     return <span className="w-2.5 h-2.5 rounded-full bg-gray-500 flex-shrink-0" />;
   }
-  if (state === 'error' || state === 'failed') {
+  if (visual === 'error') {
     return <span className="w-2.5 h-2.5 rounded-full bg-red-400 flex-shrink-0" />;
   }
-  // Active / idle / syncing - green with pulse
+  if (visual === 'attention') {
+    return <span className="w-2.5 h-2.5 rounded-full bg-yellow-400 flex-shrink-0" />;
+  }
+  const color = visual === 'healthy' ? 'bg-green-400' : 'bg-blue-400';
   return (
     <span className="relative flex-shrink-0 w-2.5 h-2.5">
-      <span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-40" />
-      <span className="relative block w-2.5 h-2.5 rounded-full bg-green-400" />
+      <span className={`absolute inset-0 rounded-full ${color} animate-ping opacity-40`} />
+      <span className={`relative block w-2.5 h-2.5 rounded-full ${color}`} />
     </span>
   );
 }

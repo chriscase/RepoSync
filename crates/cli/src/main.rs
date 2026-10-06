@@ -349,10 +349,8 @@ fn cmd_validate(config_path: &PathBuf) -> Result<()> {
 }
 
 fn cmd_status(db: &Database) -> Result<()> {
-    let state = db
-        .get_state("sync_state")
-        .context("failed to read sync state")?
-        .unwrap_or_else(|| "idle".to_string());
+    let state = reposync_core::sync_status::resolve_unscoped_sync_state(db)
+        .context("failed to read sync state")?;
 
     let last_sync = db
         .get_state("last_sync_at")

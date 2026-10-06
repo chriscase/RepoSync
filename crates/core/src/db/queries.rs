@@ -2639,7 +2639,6 @@ impl Database {
         let conn = self.conn();
         let summary = conn.query_row(
             "SELECT
-                (SELECT value FROM kv_state WHERE key = 'sync_state') as sync_state,
                 (SELECT value FROM kv_state WHERE key = 'last_sync_at') as last_sync_at,
                 (SELECT COUNT(*) FROM sync_records) as total_syncs,
                 (SELECT COUNT(*) FROM conflicts) as total_conflicts,
@@ -2649,16 +2648,20 @@ impl Database {
             [],
             |row| {
                 Ok(StatusSummary {
-                    sync_state: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                    last_sync_at: row.get::<_, Option<String>>(1)?,
-                    total_syncs: row.get(2)?,
-                    total_conflicts: row.get(3)?,
-                    active_conflicts: row.get(4)?,
-                    recent_errors: row.get(5)?,
+                    sync_state: String::new(),
+                    last_sync_at: row.get::<_, Option<String>>(0)?,
+                    total_syncs: row.get(1)?,
+                    total_conflicts: row.get(2)?,
+                    active_conflicts: row.get(3)?,
+                    recent_errors: row.get(4)?,
                 })
             },
         )?;
-        Ok(summary)
+        let sync_state = crate::sync_status::resolve_unscoped_sync_state(self)?;
+        Ok(StatusSummary {
+            sync_state,
+            ..summary
+        })
     }
 }
 

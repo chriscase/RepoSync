@@ -32,6 +32,7 @@ pub enum SyncState {
     Initializing,
     Syncing,
     Error,
+    ErrorPaused,
     ConflictFound,
     ReconciliationRequired,
 }
@@ -43,6 +44,7 @@ impl SyncState {
             "initializing" => Self::Initializing,
             "syncing" | "detecting" | "applying" => Self::Syncing,
             "error" => Self::Error,
+            "error_paused" => Self::ErrorPaused,
             "conflict_found" => Self::ConflictFound,
             "reconciliation_required" => Self::ReconciliationRequired,
             _ => Self::Idle,
@@ -57,6 +59,7 @@ impl std::fmt::Display for SyncState {
             Self::Initializing => write!(f, "initializing"),
             Self::Syncing => write!(f, "syncing"),
             Self::Error => write!(f, "error"),
+            Self::ErrorPaused => write!(f, "error_paused"),
             Self::ConflictFound => write!(f, "conflict_found"),
             Self::ReconciliationRequired => write!(f, "reconciliation_required"),
         }
