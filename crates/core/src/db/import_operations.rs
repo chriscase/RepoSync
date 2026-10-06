@@ -178,6 +178,133 @@ pub struct ReconciledImport {
     pub resume_authorized: bool,
 }
 
+/// Repository-owned import baseline authority for team mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoImportBaseline {
+    /// No verified baseline; the repository may start a new import.
+    Pending,
+    /// Verified import baseline from repository columns and scoped kv_state only.
+    Verified { svn_rev: i64, git_sha: String },
+    /// Missing or conflicting scoped provenance; do not adopt global state.
+    ReconciliationRequired { reason: String, detail: String },
+}
+
+impl RepoImportBaseline {
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified { .. })
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+/// Decide whether a repository has a verified import baseline.
+///
+/// Global `last_svn_rev`, `watermarks.svn_rev`, and commit-map maxima are never
+/// adopted as completion proof. Repository columns plus a matching scoped
+/// `last_svn_rev_<repo>` copy authorize import completion. A scoped
+/// A scoped `last_git_sha_<repo>` copy is not required because sync cycles
+/// persist the SVN cursor without always mirroring Git.
+pub fn resolve_repo_import_baseline(
+    db: &Database,
+    repo_id: &str,
+) -> Result<RepoImportBaseline, DatabaseError> {
+    let repo = db
+        .get_repository(repo_id)?
+        .ok_or_else(|| DatabaseError::Other("repository not found".into()))?;
+
+    if let Some(op) = db.active_import_operation(repo_id)? {
+        return Ok(RepoImportBaseline::ReconciliationRequired {
+            reason: "import_operation_held".into(),
+            detail: format!(
+                "import operation {} is active in {:?} state",
+                op.id, op.state
+            ),
+        });
+    }
+
+    if let Some(op) = db.latest_import_operation(repo_id)? {
+        match op.state {
+            ImportOperationState::ReconciliationRequired => {
+                return Ok(RepoImportBaseline::ReconciliationRequired {
+                    reason: "import_reconciliation_required".into(),
+                    detail: op
+                        .outcome_detail
+                        .unwrap_or_else(|| "import held for reconciliation".into()),
+                });
+            }
+            ImportOperationState::Completed => {
+                if repo.last_svn_rev <= 0
+                    || repo.last_sync_at.is_none()
+                    || repo.last_git_sha.is_empty()
+                {
+                    return Ok(RepoImportBaseline::ReconciliationRequired {
+                        reason: "completed_import_missing_checkpoint".into(),
+                        detail: "completed import operation lacks a matching repository checkpoint"
+                            .into(),
+                    });
+                }
+            }
+            ImportOperationState::Queued
+            | ImportOperationState::Running
+            | ImportOperationState::CancelRequested
+            | ImportOperationState::Cancelling => {
+                return Ok(RepoImportBaseline::ReconciliationRequired {
+                    reason: "import_operation_in_progress".into(),
+                    detail: format!(
+                        "import operation {} is unfinished in {:?} state",
+                        op.id, op.state
+                    ),
+                });
+            }
+            ImportOperationState::Cancelled | ImportOperationState::Failed => {}
+        }
+    }
+
+    let scoped_svn = db
+        .get_state(&format!("last_svn_rev_{repo_id}"))?
+        .and_then(|value| value.parse::<i64>().ok());
+    let has_scoped_git = db
+        .get_state(&format!("last_git_sha_{repo_id}"))?
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
+
+    // Team sync checkpoints columns plus scoped `last_svn_rev_<repo>` without always
+    // setting `last_sync_at` or `last_git_sha_<repo>`.
+    let column_imported = repo.last_svn_rev > 0 && !repo.last_git_sha.is_empty();
+
+    if column_imported {
+        if !has_scoped_svn {
+            db.set_state(
+                &format!("last_svn_rev_{repo_id}"),
+                &repo.last_svn_rev.to_string(),
+            )?;
+        } else if scoped_svn != Some(repo.last_svn_rev) {
+            return Ok(RepoImportBaseline::ReconciliationRequired {
+                reason: "conflicting_import_checkpoint".into(),
+                detail: "repository column and scoped svn_rev cursor disagree".into(),
+            });
+        }
+        return Ok(RepoImportBaseline::Verified {
+            svn_rev: repo.last_svn_rev,
+            git_sha: repo.last_git_sha.clone(),
+        });
+    }
+
+    if has_scoped_svn || has_scoped_git {
+        return Ok(RepoImportBaseline::ReconciliationRequired {
+            reason: "orphan_scoped_import_checkpoint".into(),
+            detail: "per-repo import cursors exist without a finalized repository checkpoint"
+                .into(),
+        });
+    }
+
+    // Global watermarks and singleton import progress are display references only.
+    Ok(RepoImportBaseline::Pending)
+}
+
 /// A partial import may resume only when the confirmed SVN/Git prefix matches
 /// the durable local tip and no publication intent remains outstanding.
 pub fn import_resume_checkpoint(op: &ImportOperation) -> Option<(i64, u64, u64)> {
@@ -1513,6 +1640,124 @@ mod tests {
         assert_eq!(
             import_resume_checkpoint(&second.operation),
             Some((52, 52, 2))
+        );
+    }
+
+    fn finalize_import_checkpoint(db: &Database, repo_id: &str, svn_rev: i64, sha: &str) {
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=?1,last_git_sha=?2,last_sync_at=datetime('now') WHERE id=?3",
+                params![svn_rev, sha, repo_id],
+            )
+            .unwrap();
+        db.set_state(&format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())
+            .unwrap();
+        db.set_state(&format!("last_git_sha_{repo_id}"), sha)
+            .unwrap();
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_verified_from_scoped_state_only() {
+        let (_dir, db, _workdir) = open_repo("verified");
+        finalize_import_checkpoint(&db, "verified", 2, BASELINE_SHA);
+        let baseline = resolve_repo_import_baseline(&db, "verified").unwrap();
+        assert_eq!(
+            baseline,
+            RepoImportBaseline::Verified {
+                svn_rev: 2,
+                git_sha: BASELINE_SHA.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_ignores_global_svn_watermark() {
+        let (_dir, db, _workdir) = open_repo("pending");
+        db.set_state("last_svn_rev", "2").unwrap();
+        db.set_watermark("svn_rev", "2").unwrap();
+        assert_eq!(
+            resolve_repo_import_baseline(&db, "pending").unwrap(),
+            RepoImportBaseline::Pending
+        );
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_rejects_orphan_scoped_cursor() {
+        let (_dir, db, _workdir) = open_repo("orphan");
+        db.set_state("last_svn_rev_orphan", "2").unwrap();
+        let baseline = resolve_repo_import_baseline(&db, "orphan").unwrap();
+        assert!(matches!(
+            baseline,
+            RepoImportBaseline::ReconciliationRequired {
+                reason,
+                ..
+            } if reason == "orphan_scoped_import_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_accepts_sync_watermark_without_scoped_git_kv() {
+        let (_dir, db, _workdir) = open_repo("sync-only");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='sync-only'",
+                [BASELINE_SHA],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_sync-only", "2").unwrap();
+        let baseline = resolve_repo_import_baseline(&db, "sync-only").unwrap();
+        assert_eq!(
+            baseline,
+            RepoImportBaseline::Verified {
+                svn_rev: 2,
+                git_sha: BASELINE_SHA.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_rejects_split_checkpoint() {
+        let (_dir, db, _workdir) = open_repo("split");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='split'",
+                [BASELINE_SHA],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_split", "3").unwrap();
+        db.set_state("last_git_sha_split", BASELINE_SHA).unwrap();
+        let baseline = resolve_repo_import_baseline(&db, "split").unwrap();
+        assert!(matches!(
+            baseline,
+            RepoImportBaseline::ReconciliationRequired {
+                reason,
+                ..
+            } if reason == "conflicting_import_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_ignores_stale_scoped_git_kv() {
+        let (_dir, db, _workdir) = open_repo("stale-git");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='stale-git'",
+                [BASELINE_SHA],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_stale-git", "2").unwrap();
+        db.set_state(
+            "last_git_sha_stale-git",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )
+        .unwrap();
+        let baseline = resolve_repo_import_baseline(&db, "stale-git").unwrap();
+        assert_eq!(
+            baseline,
+            RepoImportBaseline::Verified {
+                svn_rev: 2,
+                git_sha: BASELINE_SHA.to_string(),
+            }
         );
     }
 }

@@ -2343,10 +2343,22 @@ impl Database {
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
         )?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![
+                format!("last_svn_rev_{repo_id}"),
+                svn_rev.to_string(),
+                now,
+            ],
+        )?;
+        tx.commit()?;
         debug!(repo_id, svn_rev, git_sha, "updated repo watermark");
         Ok(())
     }

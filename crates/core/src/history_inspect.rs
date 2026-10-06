@@ -36,6 +36,7 @@ pub fn is_full_git_oid(value: &str) -> bool {
 pub fn is_durable_history_reason(reason: &str) -> bool {
     reason == DURABLE_HISTORY_REASON
         || reason == REASON_OBSERVED_REMOTE_REWRITE
+        || reason == "ancestry_command_failed"
         || reason == crate::pending_frontier::REASON_MERGE_DAG
         || reason == crate::pending_frontier::REASON_BACKLOG
         || reason == crate::pending_frontier::REASON_UNPROVEN_RANGE
