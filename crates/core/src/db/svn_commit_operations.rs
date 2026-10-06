@@ -234,6 +234,9 @@ fn finalize_tx(
             &format!("last_git_sha_{}", op.repo_id),
             &op.source_git_sha,
         )?;
+        if Database::repo_writes_global_git_watermark(tx, &op.repo_id)? {
+            write_value(tx, "last_git_hash", &op.source_git_sha)?;
+        }
     }
     if removed {
         op.outcome_detail =
@@ -772,6 +775,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.set_state("last_git_hash", "stale-global").unwrap();
         let paths = vec![IntendedPath {
             action: "A".into(),
             path: "feature.txt".into(),
@@ -802,6 +806,42 @@ mod tests {
         assert_eq!(
             db.get_repo_watermark("pair").unwrap().1,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            db.get_state("last_git_hash").unwrap().as_deref(),
+            Some("stale-global"),
+            "team-mode git-to-svn finalize must not advance global last_git_hash"
+        );
+    }
+
+    #[test]
+    fn direct_mode_finalize_advances_global_last_git_hash() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','direct',5,0,0,1,'t','t',2,'old','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        db.set_state("last_git_hash", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        let paths = vec![IntendedPath {
+            action: "A".into(),
+            path: "feature.txt".into(),
+            content_sha256: Some("d".repeat(64)),
+        }];
+        let (intent, _, _) = sample_intent(paths, "post-tree");
+        let op = db.begin_git_to_svn_commit(intent).unwrap();
+        let done = db
+            .confirm_git_to_svn_commit("pair", &op.id, 3, "post-tree")
+            .unwrap();
+        assert_eq!(done.state, SvnCommitOperationState::Completed);
+        assert_eq!(
+            db.get_state("last_git_hash").unwrap().as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "direct-mode managed git-to-svn finalize must advance global last_git_hash"
         );
     }
 
