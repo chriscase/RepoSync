@@ -1288,10 +1288,7 @@ mod tests {
         git_ok(&work, &["branch", "-D", "feature"]);
         let head = rev_parse(&work, "HEAD").unwrap();
         let obs = observe_branch(&work, "feature", PAIR_INSPECT_REF);
-        assert_eq!(
-            obs.remote_tip.as_deref().map(|tip| is_full_git_oid(tip)),
-            Some(true)
-        );
+        assert_eq!(obs.remote_tip.as_deref().map(is_full_git_oid), Some(true));
         assert!(obs.local_tip.is_none());
         assert_eq!(rev_parse(&work, "HEAD").unwrap(), head);
         let status = git(&work, &["status", "--porcelain"]).unwrap();

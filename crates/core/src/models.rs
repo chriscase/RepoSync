@@ -29,6 +29,7 @@ pub struct SyncStatus {
 #[serde(rename_all = "snake_case")]
 pub enum SyncState {
     Idle,
+    Initializing,
     Syncing,
     Error,
     ConflictFound,
@@ -38,6 +39,7 @@ impl SyncState {
     /// Parse a state string into a `SyncState`.
     pub fn from_str_val(s: &str) -> Self {
         match s {
+            "initializing" => Self::Initializing,
             "syncing" | "detecting" | "applying" => Self::Syncing,
             "error" => Self::Error,
             "conflict_found" => Self::ConflictFound,
@@ -50,6 +52,7 @@ impl std::fmt::Display for SyncState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Idle => write!(f, "idle"),
+            Self::Initializing => write!(f, "initializing"),
             Self::Syncing => write!(f, "syncing"),
             Self::Error => write!(f, "error"),
             Self::ConflictFound => write!(f, "conflict_found"),

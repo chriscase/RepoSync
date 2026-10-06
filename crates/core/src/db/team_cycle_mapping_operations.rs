@@ -168,7 +168,6 @@ fn advance_svn_only_tx(tx: &Connection, repo_id: &str, svn_rev: i64) -> Result<(
         &format!("last_svn_rev_{}", repo_id),
         &svn_rev.to_string(),
     )?;
-    write_value(tx, "last_svn_rev", &svn_rev.to_string())?;
     Ok(())
 }
 
@@ -545,6 +544,15 @@ mod tests {
         db.confirm_team_cycle_mapping("pair", &op.id, None).unwrap();
         let (svn_rev, _) = db.get_repo_watermark("pair").unwrap();
         assert_eq!(svn_rev, 2);
+        assert_eq!(
+            db.get_state("last_svn_rev").unwrap(),
+            None,
+            "managed team svn no-target must not write global last_svn_rev"
+        );
+        assert_eq!(
+            db.get_state("last_svn_rev_pair").unwrap().as_deref(),
+            Some("2")
+        );
         assert!(db
             .active_team_cycle_mapping_operation("pair")
             .unwrap()

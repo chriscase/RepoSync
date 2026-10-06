@@ -447,6 +447,7 @@ async fn test_web_requests_not_blocked_by_sync_engine_db() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
 async fn test_spawn_blocking_exhaustion_does_not_block_async_tasks() {
     let mutex = Arc::new(std::sync::Mutex::new(()));
 
@@ -538,6 +539,7 @@ async fn test_separate_database_instances_no_mutex_contention() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
 async fn test_health_check_responds_under_spawn_blocking_saturation() {
     let (addr, _state, _server, _tmp) = build_test_server().await;
     let base_url = format!("http://{}", addr);
@@ -612,21 +614,18 @@ async fn test_sustained_load_under_sync_cycles() {
 
     // --- Sync simulation: lock the sync engine DB for 2 s every 5 s ----------
     let sync_engine = state.sync_engine.clone();
-    let sync_task = {
-        let start = start;
-        tokio::spawn(async move {
-            while start.elapsed() < test_duration {
-                let se = sync_engine.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _guard = se.db().conn();
-                    std::thread::sleep(Duration::from_secs(2));
-                })
-                .await
-                .ok();
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-        })
-    };
+    let sync_task = tokio::spawn(async move {
+        while start.elapsed() < test_duration {
+            let se = sync_engine.clone();
+            tokio::task::spawn_blocking(move || {
+                let _guard = se.db().conn();
+                std::thread::sleep(Duration::from_secs(2));
+            })
+            .await
+            .ok();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    });
 
     // --- Poller helper -------------------------------------------------------
     let spawn_poller = |url: String,
@@ -645,7 +644,6 @@ async fn test_sustained_load_under_sync_cycles() {
             .default_headers(headers)
             .build()
             .unwrap();
-        let start = start;
         tokio::spawn(async move {
             while start.elapsed() < test_duration {
                 let req_start = Instant::now();
@@ -936,6 +934,7 @@ async fn test_database_wal_contention() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
 async fn test_spawn_blocking_pool_pressure_with_server() {
     let (addr, _state, _server, _tmp) = build_test_server().await;
     let base_url = format!("http://{}", addr);
