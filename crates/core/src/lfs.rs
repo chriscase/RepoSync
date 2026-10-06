@@ -642,8 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_export_present_gitattributes_adds_marker_when_stripping_planted_filters(
-    ) {
+    fn test_merge_export_present_gitattributes_adds_marker_when_stripping_planted_filters() {
         let merged = merge_export_present_gitattributes(
             "* text=auto\n",
             Some("* filter=evil\n*.c filter=evil\n"),
@@ -657,8 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_export_present_gitattributes_ignores_marker_without_planted_filters(
-    ) {
+    fn test_merge_export_present_gitattributes_ignores_marker_without_planted_filters() {
         let merged = merge_export_present_gitattributes(
             "* text=auto\n",
             Some("* text=auto\n"),

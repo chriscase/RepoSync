@@ -990,8 +990,10 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
         } else {
             None
         };
-        let strip_planted =
-            crate::lfs::export_present_gitattributes_needs_strip(dest_was_symlink, dest_body.as_deref());
+        let strip_planted = crate::lfs::export_present_gitattributes_needs_strip(
+            dest_was_symlink,
+            dest_body.as_deref(),
+        );
         crate::lfs::unlink_gitattributes_symlink(dst_path).with_context(|| {
             format!(
                 "failed to unlink planted .gitattributes symlink before reconcile: {}",
@@ -1005,8 +1007,9 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
             )
         })?;
         let engine_body = if strip_planted {
-            crate::lfs::engine_gitattributes_body(dst_root)
-                .with_context(|| format!("failed to read engine LFS marker in {}", dst_root.display()))?
+            crate::lfs::engine_gitattributes_body(dst_root).with_context(|| {
+                format!("failed to read engine LFS marker in {}", dst_root.display())
+            })?
         } else {
             None
         };
