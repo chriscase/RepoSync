@@ -7141,12 +7141,7 @@ async fn candidate_rsc02_git_rename_svn_edit_source_path_conflict() {
         "expected sync cycle to fail once rename/source-path conflict is detected, got {sync_result:?}"
     );
     assert_eq!(
-        pair
-            .engine
-            .db()
-            .get_state("sync_state")
-            .unwrap()
-            .as_deref(),
+        pair.engine.db().get_state("sync_state").unwrap().as_deref(),
         Some("error"),
         "failed conflict cycle should leave sync_state=error"
     );
