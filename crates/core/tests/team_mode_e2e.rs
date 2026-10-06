@@ -935,10 +935,16 @@ async fn assert_pair_blocked_without_damage(fixture: &QualifiedPair, reason: &st
         fixture
             .engine
             .db()
-            .get_state("sync_state")
+            .get_repository(&fixture.repo_id)
             .unwrap()
-            .as_deref(),
-        Some("reconciliation_required")
+            .unwrap()
+            .sync_status,
+        "reconciliation_required"
+    );
+    assert_eq!(
+        fixture.engine.get_status().unwrap().state,
+        SyncState::ReconciliationRequired,
+        "reconciliation_required must not map to idle in get_status"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -1240,13 +1246,17 @@ async fn run_candidate_r09_rewrite(metadata_only_amend: bool) {
     );
     assert_eq!(fixture.snapshot().await, before);
     assert_eq!(
-        fixture
-            .engine
+        restarted
             .db()
-            .get_state("sync_state")
+            .get_repository(&fixture.repo_id)
             .unwrap()
-            .as_deref(),
-        Some("reconciliation_required")
+            .unwrap()
+            .sync_status,
+        "reconciliation_required"
+    );
+    assert_eq!(
+        restarted.get_status().unwrap().state,
+        SyncState::ReconciliationRequired
     );
     let block: serde_json::Value = serde_json::from_str(
         &fixture
@@ -1595,8 +1605,17 @@ async fn candidate_r09_durable_block_survives_restored_remote() {
         "original rewritten R must be retained; a later identical fetch is not new authority"
     );
     assert_eq!(
-        restarted.db().get_state("sync_state").unwrap().as_deref(),
-        Some("reconciliation_required")
+        restarted
+            .db()
+            .get_repository(&fixture.repo_id)
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "reconciliation_required"
+    );
+    assert_eq!(
+        restarted.get_status().unwrap().state,
+        SyncState::ReconciliationRequired
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -5338,6 +5357,237 @@ async fn candidate_rs05_import_baseline_pending_isolated_per_repo_status() {
     );
 }
 
+/// RS-05 / #63: a reconciliation_required managed pair reports an honest
+/// distinct state via `get_status`, not idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_reconciliation_required_not_reported_idle() {
+    let fixture = QualifiedPair::new().await;
+    fixture
+        .engine
+        .db()
+        .update_repo_sync_status("pair", "idle")
+        .unwrap();
+    fixture.engine.db().set_state("sync_state", "idle").unwrap();
+
+    let _old_synced =
+        fixture.developer_commit("feature.txt", "first version\n", "First Git change");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    git_cli(
+        &fixture.developer,
+        &["reset", "--hard", &fixture.imported_base],
+    );
+    fixture.developer_commit(
+        "feature.txt",
+        "rewritten version\n",
+        "Replacement for reconciliation status",
+    );
+    git_cli(&fixture.developer, &["push", "--force", "origin", "main"]);
+
+    assert_pair_blocked_without_damage(&fixture, "non_fast_forward").await;
+
+    assert_ne!(
+        fixture.engine.get_status().unwrap().state,
+        SyncState::Idle,
+        "reconciliation_required must not be reported as idle"
+    );
+    assert_eq!(
+        fixture.engine.get_status().unwrap().state,
+        SyncState::ReconciliationRequired
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_RECONCILIATION_STATUS_HONEST",
+            "repo_id":"pair",
+            "repo_sync_status":"reconciliation_required",
+            "get_status_state":"reconciliation_required"
+        })
+    );
+}
+
+/// RS-05 / #63: one managed repo's detecting/applying/idle cycle must not
+/// clobber another repo's per-repo status or the shared global sync_state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_team_terminal_sync_state_isolated_per_repo() {
+    let fixture = QualifiedPair::new().await;
+    fixture
+        .engine
+        .db()
+        .set_state("sync_state", "reconciliation_required")
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .update_repo_sync_status("pair", "idle")
+        .unwrap();
+
+    let sibling_root = fixture.tmp.path().join("sibling-terminal");
+    std::fs::create_dir_all(&sibling_root).unwrap();
+    let sibling_svn = create_svn_repo(&sibling_root);
+    let sibling_wc = sibling_root.join("wc");
+    svn_checkout(&sibling_svn, &sibling_wc);
+    svn_commit_file(&sibling_wc, ".gitkeep", "", "Initial sibling anchor");
+    svn_commit_file(
+        &sibling_wc,
+        "origin.txt",
+        "Sibling SVN origin\n",
+        "Sibling SVN origin",
+    );
+    let sibling_bridge = sibling_root.join("bridge");
+    let sibling_bare = sibling_root.join("origin.git");
+    let _sibling_git = init_git_from_svn_export(&sibling_wc, &sibling_bridge, &sibling_bare);
+    let sibling_head = get_head_sha(&sibling_bridge);
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "sibling".into(),
+            name: "sibling pair".into(),
+            svn_url: sibling_svn.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: sibling_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: sibling_head,
+            last_sync_at: None,
+            sync_status: "reconciliation_required".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+
+    let svn_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "Healthy pair syncs through applying\n",
+        "Healthy pair syncs through applying",
+    );
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_repository("pair")
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "idle",
+        "healthy pair must record its own terminal idle status"
+    );
+    assert_eq!(
+        shared_db
+            .get_repository("sibling")
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "reconciliation_required",
+        "sibling reconciliation_required status must stay untouched"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_state("sync_state")
+            .unwrap()
+            .as_deref(),
+        Some("reconciliation_required"),
+        "shared global sync_state must not be clobbered by another repo's cycle"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_TERMINAL_STATUS_ISOLATION",
+            "healthy_repo":"pair",
+            "sibling_repo":"sibling",
+            "healthy_repo_status":"idle",
+            "sibling_repo_status":"reconciliation_required",
+            "global_sync_state":"reconciliation_required",
+            "synced_revision":svn_rev
+        })
+    );
+}
+
+/// RS-05 / #63: single-repo callers without a repo id keep writing lifecycle
+/// state to the legacy global `kv_state.sync_state` key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_single_repo_sync_state_uses_global_key() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(&wc_path, "a.txt", "alpha", "Add a");
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db = setup_db(&tmp.path().join("sync.db"));
+    let head_sha = get_head_sha(&git_work_dir);
+    db.set_state("last_git_hash", &head_sha).unwrap();
+
+    let config = make_app_config(&svn_url, tmp.path());
+    let engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        Arc::new(make_identity_mapper()),
+    );
+
+    let stats = engine.run_sync_cycle().await.expect("sync cycle failed");
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(
+        engine.db().get_state("sync_state").unwrap().as_deref(),
+        Some("idle"),
+        "single-repo callers must persist terminal state to global sync_state"
+    );
+    assert_eq!(engine.get_status().unwrap().state, SyncState::Idle);
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_SINGLE_REPO_SYNC_STATE_GLOBAL",
+            "global_sync_state":"idle",
+            "svn_to_git":stats.svn_to_git_count
+        })
+    );
+}
+
 /// RS-05 / #63: team-mode svn no-target advancement updates only the managed
 /// repo checkpoint and must not advance the global `last_svn_rev`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7290,10 +7540,15 @@ async fn candidate_64c_lost_reply_holds_without_pretending_success() {
         fixture
             .engine
             .db()
-            .get_state("sync_state")
+            .get_repository(repo_id)
             .unwrap()
-            .as_deref(),
-        Some("reconciliation_required")
+            .unwrap()
+            .sync_status,
+        "reconciliation_required"
+    );
+    assert_eq!(
+        fixture.engine.get_status().unwrap().state,
+        SyncState::ReconciliationRequired
     );
     let status = fixture
         .engine
@@ -8121,10 +8376,16 @@ async fn candidate_rsc02_git_rename_svn_edit_source_path_conflict() {
         "expected sync cycle to fail once rename/source-path conflict is detected, got {sync_result:?}"
     );
     assert_eq!(
-        pair.engine.db().get_state("sync_state").unwrap().as_deref(),
-        Some("error"),
-        "failed conflict cycle should leave sync_state=error"
+        pair.engine
+            .db()
+            .get_repository(&pair.repo_id)
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "error",
+        "failed conflict cycle should leave per-repo sync_status=error"
     );
+    assert_eq!(pair.engine.get_status().unwrap().state, SyncState::Error);
     let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
     let source_conflict = conflicts
         .iter()
@@ -8439,10 +8700,15 @@ async fn candidate_rsc04_lost_reply_holds_without_pretending_success() {
         fixture
             .engine
             .db()
-            .get_state("sync_state")
+            .get_repository(repo_id)
             .unwrap()
-            .as_deref(),
-        Some("reconciliation_required")
+            .unwrap()
+            .sync_status,
+        "reconciliation_required"
+    );
+    assert_eq!(
+        fixture.engine.get_status().unwrap().state,
+        SyncState::ReconciliationRequired
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",

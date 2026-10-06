@@ -246,20 +246,14 @@ impl SyncEngine {
         self.repo_id.as_deref().filter(|id| !id.is_empty())
     }
 
-    /// Persist sync lifecycle state. Managed repos always update their own
-    /// `repositories.sync_status`; global `sync_state` is updated for legacy
-    /// callers and for managed-repo terminal states, but never for per-repo
-    /// `detecting`/`initializing` so one pending pair cannot clobber others.
+    /// Persist sync lifecycle state. Managed repos update only their own
+    /// `repositories.sync_status`; legacy single-repo callers without a repo id
+    /// continue to use the global `kv_state.sync_state` key.
     fn persist_sync_state(&self, state: &str) -> Result<(), SyncError> {
         if let Some(rid) = self.effective_repo_id() {
             self.db
                 .update_repo_sync_status(rid, state)
                 .map_err(SyncError::DatabaseError)?;
-            if state != "initializing" && state != "detecting" {
-                self.db
-                    .set_state("sync_state", state)
-                    .map_err(SyncError::DatabaseError)?;
-            }
         } else {
             self.db
                 .set_state("sync_state", state)

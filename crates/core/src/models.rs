@@ -33,6 +33,7 @@ pub enum SyncState {
     Syncing,
     Error,
     ConflictFound,
+    ReconciliationRequired,
 }
 
 impl SyncState {
@@ -43,6 +44,7 @@ impl SyncState {
             "syncing" | "detecting" | "applying" => Self::Syncing,
             "error" => Self::Error,
             "conflict_found" => Self::ConflictFound,
+            "reconciliation_required" => Self::ReconciliationRequired,
             _ => Self::Idle,
         }
     }
@@ -56,6 +58,7 @@ impl std::fmt::Display for SyncState {
             Self::Syncing => write!(f, "syncing"),
             Self::Error => write!(f, "error"),
             Self::ConflictFound => write!(f, "conflict_found"),
+            Self::ReconciliationRequired => write!(f, "reconciliation_required"),
         }
     }
 }

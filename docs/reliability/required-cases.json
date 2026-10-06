@@ -346,6 +346,36 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_TEAM_IMPORT_PENDING_STATUS_ISOLATION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_import_baseline_pending_isolated_per_repo_status",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_ADVANCE_SVN_ONLY_SCOPED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_advance_svn_only_tx_scoped_not_global",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_RECONCILIATION_STATUS_HONEST",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_reconciliation_required_not_reported_idle",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_TERMINAL_STATUS_ISOLATION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_team_terminal_sync_state_isolated_per_repo",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_SINGLE_REPO_SYNC_STATE_GLOBAL",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_single_repo_sync_state_uses_global_key",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_WEB_RECONCILIATION_REFUSES_IMPORT",
       "binary": "server_freeze",
       "test": "candidate_rs05_reconciliation_required_refuses_import_start",
