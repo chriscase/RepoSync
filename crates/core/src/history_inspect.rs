@@ -459,11 +459,93 @@ pub fn inspect_fetched_history(
     })
 }
 
+/// Repository-owned Git cursor for personal mode without borrowing global state.
+///
+/// Personal writers advance `commit_map` on each mapping but keep the `git_sha`
+/// watermark at the import baseline. When both are present, the live mapping tip
+/// is authoritative when it descends from the watermark; unrelated copies fail
+/// closed. A missing cursor is not invented.
+pub fn resolve_personal_checkpoint(
+    db: &Database,
+    git_path: &Path,
+) -> Result<Option<String>, SyncError> {
+    let checkpoint = db
+        .get_last_git_hash()
+        .map_err(SyncError::DatabaseError)?
+        .filter(|value| !value.is_empty());
+    let watermark = db
+        .get_watermark("git_sha")
+        .map_err(SyncError::DatabaseError)?
+        .filter(|value| !value.is_empty());
+    match (checkpoint.as_deref(), watermark.as_deref()) {
+        (Some(mapping), Some(watermark)) if mapping == watermark => Ok(Some(mapping.to_string())),
+        (Some(mapping), Some(watermark)) => {
+            if !is_full_git_oid(mapping) || !is_full_git_oid(watermark) {
+                return Err(SyncError::HistoryBlocked {
+                    reason: "ambiguous_checkpoint".into(),
+                    detail: "stored Git cursor copies are not full object IDs".into(),
+                });
+            }
+            match personal_checkpoint_ancestry(git_path, watermark, mapping) {
+                Ok(true) => Ok(Some(mapping.to_string())),
+                Ok(false) => Err(SyncError::HistoryBlocked {
+                    reason: "ambiguous_checkpoint".into(),
+                    detail: "commit_map handled Git cursor and git_sha watermark disagree".into(),
+                }),
+                Err(reject) => Err(SyncError::HistoryBlocked {
+                    reason: reject.reason,
+                    detail: reject.detail,
+                }),
+            }
+        }
+        (Some(mapping), None) => Ok(Some(mapping.to_string())),
+        (None, Some(watermark)) => Ok(Some(watermark.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+fn personal_checkpoint_ancestry(
+    git_path: &Path,
+    watermark: &str,
+    mapping: &str,
+) -> Result<bool, HistoryInspectReject> {
+    match Command::new("git")
+        .args(["merge-base", "--is-ancestor", watermark, mapping])
+        .current_dir(git_path)
+        .output()
+    {
+        Ok(output) if output.status.code() == Some(0) => Ok(true),
+        Ok(output) if output.status.code() == Some(1) => Ok(false),
+        _ => Err(HistoryInspectReject {
+            reason: "ancestry_command_failed".into(),
+            detail: "personal checkpoint ancestry could not be established".into(),
+            o: None,
+            r: None,
+            l: None,
+        }),
+    }
+}
+
+fn block_personal_history(
+    db: &Database,
+    key: &str,
+    scope_id: &str,
+    reject: HistoryInspectReject,
+    checkpoint: Option<&str>,
+) -> Result<Option<HistoryInspectAdmission>, SyncError> {
+    persist_history_block(db, key, Some(scope_id), &reject, checkpoint)?;
+    Err(SyncError::HistoryBlocked {
+        reason: reject.reason,
+        detail: reject.detail,
+    })
+}
+
 /// Personal-mode Git→SVN gate: same P/O/R/L inspect before PR replay.
 ///
-/// A missing origin remote is not inspected (existing clones without `origin`
-/// keep working). A missing handled Git SHA is not invented as a baseline.
-/// A durable rewrite block still refuses writes after restart.
+/// Missing origin, missing checkpoint, or conflicting checkpoint provenance
+/// fail closed before SVN writes. Initial import owns initialization and does
+/// not call this gate. A durable rewrite block still refuses writes after
+/// restart.
 pub fn inspect_personal_history(
     db: &Database,
     git_path: &Path,
@@ -478,23 +560,304 @@ pub fn inspect_personal_history(
         .env("GIT_TERMINAL_PROMPT", "0")
         .output();
     if !origin.is_ok_and(|output| output.status.success()) {
-        return Ok(None);
+        return block_personal_history(
+            db,
+            &key,
+            scope_id,
+            HistoryInspectReject {
+                reason: "missing_origin".into(),
+                detail:
+                    "origin remote is not configured; run initial import to establish provenance"
+                        .into(),
+                o: None,
+                r: None,
+                l: None,
+            },
+            None,
+        );
     }
-    let checkpoint = db
-        .get_last_git_hash()
-        .map_err(SyncError::DatabaseError)?
-        .filter(|value| !value.is_empty());
-    let Some(checkpoint) = checkpoint else {
-        return Ok(None);
+    let checkpoint = match resolve_personal_checkpoint(db, git_path) {
+        Ok(checkpoint) => checkpoint,
+        Err(SyncError::HistoryBlocked { reason, detail }) => {
+            return block_personal_history(
+                db,
+                &key,
+                scope_id,
+                HistoryInspectReject {
+                    reason,
+                    detail,
+                    o: None,
+                    r: None,
+                    l: None,
+                },
+                None,
+            );
+        }
+        Err(err) => return Err(err),
     };
+    let Some(checkpoint) = checkpoint else {
+        return block_personal_history(
+            db,
+            &key,
+            scope_id,
+            HistoryInspectReject {
+                reason: "missing_checkpoint".into(),
+                detail: "no repository-owned handled Git cursor exists; run initial import first"
+                    .into(),
+                o: None,
+                r: None,
+                l: None,
+            },
+            None,
+        );
+    };
+    if !is_full_git_oid(&checkpoint) {
+        return block_personal_history(
+            db,
+            &key,
+            scope_id,
+            HistoryInspectReject {
+                reason: "ambiguous_checkpoint".into(),
+                detail: "stored Git cursor is not a full object ID".into(),
+                o: None,
+                r: None,
+                l: None,
+            },
+            Some(&checkpoint),
+        );
+    }
     match inspect_fetched_history(git_path, branch, Some(checkpoint.clone())) {
         Ok(admission) => Ok(Some(admission)),
-        Err(reject) => {
-            persist_history_block(db, &key, Some(scope_id), &reject, Some(&checkpoint))?;
-            Err(SyncError::HistoryBlocked {
-                reason: reject.reason,
-                detail: reject.detail,
-            })
-        }
+        Err(reject) => block_personal_history(db, &key, scope_id, reject, Some(&checkpoint)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn init_git_with_origin(work_dir: &Path, bare_dir: &Path) {
+        Command::new("git")
+            .args(["init", "--bare", bare_dir.to_str().unwrap()])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["init", work_dir.to_str().unwrap()])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C", work_dir.to_str().unwrap(), "remote", "add", "origin"])
+            .arg(bare_dir)
+            .status()
+            .unwrap();
+        std::fs::write(work_dir.join("seed.txt"), "seed\n").unwrap();
+        Command::new("git")
+            .args(["-C", work_dir.to_str().unwrap(), "add", "seed.txt"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                work_dir.to_str().unwrap(),
+                "commit",
+                "-m",
+                "seed",
+                "--author",
+                "Test <test@example.com>",
+            ])
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["-C", work_dir.to_str().unwrap(), "branch", "-M", "main"])
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                work_dir.to_str().unwrap(),
+                "push",
+                "-u",
+                "origin",
+                "main",
+            ])
+            .status()
+            .unwrap();
+    }
+
+    fn git_head(work_dir: &Path) -> String {
+        String::from_utf8(
+            Command::new("git")
+                .args(["-C", work_dir.to_str().unwrap(), "rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_rejects_unrelated_watermark() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        init_git_with_origin(&git_work, &bare);
+        let watermark = git_head(&git_work);
+        git_cmd(&git_work, &["checkout", "--orphan", "foreign"]);
+        std::fs::write(git_work.join("foreign.txt"), "foreign\n").unwrap();
+        git_cmd(&git_work, &["add", "foreign.txt"]);
+        git_cmd(
+            &git_work,
+            &[
+                "commit",
+                "-m",
+                "foreign",
+                "--author",
+                "Test <test@example.com>",
+            ],
+        );
+        let unrelated = git_head(&git_work);
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        db.insert_commit_map(1, &unrelated, "git_to_svn", "test", "Test")
+            .unwrap();
+        db.set_watermark("git_sha", &watermark).unwrap();
+
+        let err = resolve_personal_checkpoint(&db, &git_work).unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::HistoryBlocked {
+                reason,
+                ..
+            } if reason == "ambiguous_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_admits_mapping_ahead_of_watermark() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        init_git_with_origin(&git_work, &bare);
+        let watermark = git_head(&git_work);
+        std::fs::write(git_work.join("progress.txt"), "progress\n").unwrap();
+        git_cmd(&git_work, &["add", "progress.txt"]);
+        git_cmd(
+            &git_work,
+            &[
+                "commit",
+                "-m",
+                "progress",
+                "--author",
+                "Test <test@example.com>",
+            ],
+        );
+        let mapping = git_head(&git_work);
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        db.insert_commit_map(1, &mapping, "svn_to_git", "test", "Test")
+            .unwrap();
+        db.set_watermark("git_sha", &watermark).unwrap();
+
+        let checkpoint = resolve_personal_checkpoint(&db, &git_work)
+            .expect("mapping ahead of import watermark must be admitted");
+        assert_eq!(checkpoint.as_deref(), Some(mapping.as_str()));
+    }
+
+    fn git_cmd(work_dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(work_dir)
+            .args(args)
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    #[test]
+    fn inspect_personal_history_blocks_missing_origin() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        Command::new("git")
+            .args(["init", git_work.to_str().unwrap()])
+            .status()
+            .unwrap();
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        let handled = "cccccccccccccccccccccccccccccccccccccccc";
+        db.insert_commit_map(1, handled, "git_to_svn", "test", "Test")
+            .unwrap();
+
+        let err = inspect_personal_history(&db, &git_work, "main", "personal").unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::HistoryBlocked {
+                reason,
+                ..
+            } if reason == "missing_origin"
+        ));
+        let block = load_history_block(&db, &history_block_key(Some("personal")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(block["reason"], "missing_origin");
+    }
+
+    #[test]
+    fn inspect_personal_history_blocks_missing_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        init_git_with_origin(&git_work, &bare);
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+
+        let err = inspect_personal_history(&db, &git_work, "main", "personal").unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::HistoryBlocked {
+                reason,
+                ..
+            } if reason == "missing_checkpoint"
+        ));
+        let block = load_history_block(&db, &history_block_key(Some("personal")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(block["reason"], "missing_checkpoint");
+    }
+
+    #[test]
+    fn inspect_personal_history_admits_when_provenance_present() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        init_git_with_origin(&git_work, &bare);
+        let handled = git_head(&git_work);
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        db.insert_commit_map(1, &handled, "git_to_svn", "test", "Test")
+            .unwrap();
+
+        let admission = inspect_personal_history(&db, &git_work, "main", "personal")
+            .expect("qualified personal history must be admitted")
+            .expect("origin and checkpoint require inspection");
+        assert_eq!(admission.checkpoint, handled);
+        assert_eq!(admission.remote_tip, handled);
     }
 }

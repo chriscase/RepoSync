@@ -3990,3 +3990,589 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         })
     );
 }
+
+fn spawn_github_exists_stub() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), handle)
+}
+
+/// Missing handled Git cursor blocks personal sync before any SVN write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_personal_missing_checkpoint_blocks_before_svn_write() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::history_block_key;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let _git_client = setup_git_with_bare_origin(&git_work, &bare);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    drop(db);
+    let config = make_test_config(&svn_url, tmp.path());
+    let engine = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let err = engine
+        .run_cycle()
+        .await
+        .expect_err("missing checkpoint must block before SVN writes");
+    assert!(format!("{err:#}").contains("missing_checkpoint"), "{err:#}");
+    let block = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .expect("missing checkpoint must persist a history block");
+    let block: serde_json::Value = serde_json::from_str(&block).unwrap();
+    assert_eq!(block["reason"], "missing_checkpoint");
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    assert_eq!(
+        Database::new(&db_path)
+            .unwrap()
+            .list_commit_map(10)
+            .unwrap()
+            .len(),
+        0
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_PERSONAL_MISSING_CHECKPOINT",
+            "reason":"missing_checkpoint",
+            "svn_revision_before_after":svn_before,
+            "mode":"personal"
+        })
+    );
+}
+
+/// Missing origin remote blocks personal sync before any SVN write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_personal_missing_origin_blocks_before_svn_write() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::history_block_key;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("feature.txt"), "first version\n").unwrap();
+    git_client
+        .commit(
+            "First Git change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    git_client.push("origin", "main").unwrap();
+    let handled = git_sha(&git_work);
+    drop(git_client);
+    git_cmd(&git_work, &["remote", "remove", "origin"]);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+    drop(db);
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let engine = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let err = engine
+        .run_cycle()
+        .await
+        .expect_err("missing origin must block before SVN writes");
+    assert!(format!("{err:#}").contains("missing_origin"), "{err:#}");
+    let block = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .expect("missing origin must persist a history block");
+    let block: serde_json::Value = serde_json::from_str(&block).unwrap();
+    assert_eq!(block["reason"], "missing_origin");
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    assert_eq!(
+        Database::new(&db_path)
+            .unwrap()
+            .list_commit_map(10)
+            .unwrap()
+            .len(),
+        1
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_PERSONAL_MISSING_ORIGIN",
+            "reason":"missing_origin",
+            "p":handled,
+            "svn_revision_before_after":svn_before,
+            "mode":"personal"
+        })
+    );
+}
+
+/// Initial import still owns initialization without the personal inspect gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_personal_initial_import_still_works() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::initial_import::{ImportMode, InitialImport};
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "seed.txt", "SVN seed\n", "Snapshot seed");
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    git2::Repository::init_bare(&bare).unwrap();
+    let git_client = GitClient::init(&git_work).unwrap();
+    {
+        let repo = git2::Repository::open(&git_work).unwrap();
+        repo.remote("origin", bare.to_str().unwrap()).unwrap();
+    }
+    git_cmd(&git_work, &["checkout", "-b", "main"]);
+    let git_client = Arc::new(Mutex::new(git_client));
+
+    let db_path = tmp.path().join("personal.db");
+    let db = Database::new(&db_path).unwrap();
+    db.initialize().unwrap();
+
+    let (api_url, stub) = spawn_github_exists_stub();
+    let config = PersonalConfig {
+        personal: PersonalSection {
+            poll_interval_secs: 5,
+            log_level: "debug".into(),
+            data_dir: tmp.path().to_path_buf(),
+            status_port: None,
+        },
+        svn: PersonalSvnConfig {
+            url: svn_url.clone(),
+            username: String::new(),
+            password_env: "REPOSYNC_TEST_SVN_PW".into(),
+            password: Some(String::new()),
+        },
+        github: PersonalGitHubConfig {
+            api_url,
+            git_base_url: None,
+            repo: "test/test-repo".into(),
+            token_env: "REPOSYNC_TEST_GH_TOKEN".into(),
+            default_branch: "main".into(),
+            auto_create: false,
+            private: true,
+            token: Some("unused".into()),
+        },
+        developer: DeveloperConfig {
+            name: "Test User".into(),
+            email: "test@example.com".into(),
+            svn_username: "testuser".into(),
+        },
+        commit_format: CommitFormatConfig::default(),
+        options: PersonalOptionsConfig::default(),
+        identity: None,
+    };
+
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let github_client = GitHubClient::new(&config.github.api_url, "unused", GitProvider::GitHub);
+    let formatter = CommitFormatter::new(&config.commit_format);
+    let importer = InitialImport {
+        svn_client: &svn_client,
+        git_client: &git_client,
+        github_client: &github_client,
+        db: &db,
+        config: &config,
+        formatter: &formatter,
+    };
+    let count = importer
+        .import(ImportMode::Snapshot)
+        .await
+        .expect("initial snapshot import must succeed");
+    drop(stub);
+
+    assert_eq!(count, 1);
+    assert_eq!(db.list_commit_map(10).unwrap().len(), 1);
+    assert!(db.get_watermark("svn_rev").unwrap().is_some());
+    assert!(db.get_watermark("git_sha").unwrap().is_some());
+    assert!(
+        git_sha_at(&bare, "refs/heads/main").len() >= 40,
+        "snapshot import must push to origin"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_PERSONAL_INITIAL_IMPORT",
+            "commits":count,
+            "mode":"personal"
+        })
+    );
+}
+
+/// Healthy personal pairs keep syncing after mapping writes advance commit_map
+/// ahead of the import git_sha watermark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_personal_checkpoint_progress_survives_mapping_writes() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::inspect_personal_history;
+    use reposync_personal::engine::PersonalSyncEngine;
+    use reposync_personal::initial_import::{ImportMode, InitialImport};
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "seed.txt", "SVN seed\n", "Snapshot seed");
+    let svn_after_import = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    git2::Repository::init_bare(&bare).unwrap();
+    let git_client = GitClient::init(&git_work).unwrap();
+    {
+        let repo = git2::Repository::open(&git_work).unwrap();
+        repo.remote("origin", bare.to_str().unwrap()).unwrap();
+    }
+    git_cmd(&git_work, &["checkout", "-b", "main"]);
+    let git_client = Arc::new(Mutex::new(git_client));
+
+    let db_path = tmp.path().join("personal.db");
+    let db = Database::new(&db_path).unwrap();
+    db.initialize().unwrap();
+
+    let (api_url, stub) = spawn_github_exists_stub();
+    let config = PersonalConfig {
+        personal: PersonalSection {
+            poll_interval_secs: 5,
+            log_level: "debug".into(),
+            data_dir: tmp.path().to_path_buf(),
+            status_port: None,
+        },
+        svn: PersonalSvnConfig {
+            url: svn_url.clone(),
+            username: String::new(),
+            password_env: "REPOSYNC_TEST_SVN_PW".into(),
+            password: Some(String::new()),
+        },
+        github: PersonalGitHubConfig {
+            api_url,
+            git_base_url: None,
+            repo: "test/test-repo".into(),
+            token_env: "REPOSYNC_TEST_GH_TOKEN".into(),
+            default_branch: "main".into(),
+            auto_create: false,
+            private: true,
+            token: Some("unused".into()),
+        },
+        developer: DeveloperConfig {
+            name: "Test User".into(),
+            email: "test@example.com".into(),
+            svn_username: "testuser".into(),
+        },
+        commit_format: CommitFormatConfig::default(),
+        options: PersonalOptionsConfig::default(),
+        identity: None,
+    };
+
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let github_client = GitHubClient::new(&config.github.api_url, "unused", GitProvider::GitHub);
+    let formatter = CommitFormatter::new(&config.commit_format);
+    let importer = InitialImport {
+        svn_client: &svn_client,
+        git_client: &git_client,
+        github_client: &github_client,
+        db: &db,
+        config: &config,
+        formatter: &formatter,
+    };
+    importer
+        .import(ImportMode::Snapshot)
+        .await
+        .expect("snapshot import must succeed");
+    drop(stub);
+
+    let import_sha = db
+        .get_watermark("git_sha")
+        .unwrap()
+        .expect("import watermark");
+    let import_map = db.get_last_git_hash().unwrap().expect("import mapping");
+    assert_eq!(import_sha, import_map);
+
+    inspect_personal_history(&db, &git_work, "main", "personal")
+        .expect("post-import inspect must admit")
+        .expect("origin and checkpoint require inspection");
+
+    let engine = PersonalSyncEngine::new(
+        config.clone(),
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new(&config.github.api_url, "unused", GitProvider::GitHub),
+    );
+    engine
+        .run_cycle()
+        .await
+        .expect("idle post-import cycle must admit");
+
+    svn_commit_file(&wc, "from_svn.txt", "SVN change\n", "SVN-side change");
+    let stats = engine
+        .run_cycle()
+        .await
+        .expect("SVN→Git cycle must admit after mapping progress");
+    assert_eq!(
+        stats.svn_to_git_count, 1,
+        "expected one SVN revision synced"
+    );
+
+    let svn_to_git_sha = db
+        .get_last_git_hash()
+        .unwrap()
+        .expect("mapping after svn→git");
+    assert_ne!(
+        svn_to_git_sha, import_sha,
+        "commit_map must advance beyond import watermark"
+    );
+    assert_eq!(
+        db.get_watermark("git_sha").unwrap().as_deref(),
+        Some(import_sha.as_str()),
+        "import git_sha watermark stays at snapshot baseline"
+    );
+    inspect_personal_history(&db, &git_work, "main", "personal")
+        .expect("inspect after svn→git must not false-block")
+        .expect("origin and checkpoint require inspection");
+
+    std::fs::write(git_work.join("from_git.txt"), "Git change\n").unwrap();
+    let git_client = GitClient::new(&git_work).unwrap();
+    let git_commit = git_client
+        .commit(
+            "Git-side change",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let svn_wc = tmp.path().join("svn-wc");
+    svn_checkout(&svn_url, &svn_wc);
+    let db_arc = Arc::new(Database::new(&db_path).unwrap());
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let svn_rev = syncer
+        .replay_commit(
+            &github_commit(git_commit.clone(), "Git-side change"),
+            9,
+            "feature/git",
+        )
+        .await
+        .expect("real git→svn mapping must succeed");
+    assert!(svn_rev > svn_after_import);
+    assert_eq!(
+        db_arc.get_last_git_hash().unwrap().as_deref(),
+        Some(git_commit.as_str())
+    );
+    assert_eq!(
+        db_arc.get_watermark("git_sha").unwrap().as_deref(),
+        Some(import_sha.as_str()),
+        "git_sha watermark remains at import baseline after git→svn"
+    );
+
+    engine
+        .run_cycle()
+        .await
+        .expect("cycle after git→svn must not trip ambiguous_checkpoint");
+    inspect_personal_history(&db_arc, &git_work, "main", "personal")
+        .expect("inspect after git→svn must admit")
+        .expect("origin and checkpoint require inspection");
+
+    svn_commit_file(&wc, "from_svn2.txt", "Second SVN\n", "Second SVN change");
+    let stats = engine
+        .run_cycle()
+        .await
+        .expect("further SVN→Git cycle must admit");
+    assert_eq!(stats.svn_to_git_count, 1);
+
+    assert_eq!(
+        std::fs::read_to_string(git_work.join("from_svn.txt")).unwrap(),
+        "SVN change\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(git_work.join("from_svn2.txt")).unwrap(),
+        "Second SVN\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(svn_wc.join("from_git.txt")).unwrap(),
+        "Git change\n"
+    );
+    assert!(svn_rev > svn_after_import);
+    assert_eq!(
+        svn_youngest(&svn_url),
+        4,
+        "SVN must reflect git→svn and later commits"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_PERSONAL_CHECKPOINT_PROGRESS",
+            "import_sha":import_sha,
+            "svn_to_git_sha":svn_to_git_sha,
+            "git_to_svn_sha":git_commit,
+            "svn_revision":svn_rev,
+            "mode":"personal"
+        })
+    );
+}
+
+/// Unrelated commit_map and git_sha watermark copies still fail closed before SVN writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_personal_ambiguous_checkpoint_blocks_before_svn_write() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_core::history_inspect::history_block_key;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let watermark = git_sha(&git_work);
+    git_cmd(&git_work, &["checkout", "--orphan", "foreign"]);
+    std::fs::write(git_work.join("foreign.txt"), "foreign\n").unwrap();
+    git_cmd(&git_work, &["add", "foreign.txt"]);
+    git_client
+        .commit(
+            "Foreign history",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let unrelated = git_sha(&git_work);
+    drop(git_client);
+
+    let db_path = tmp.path().join("personal.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(1, &unrelated, "git_to_svn", "testuser", "Test User")
+        .unwrap();
+    db.set_watermark("git_sha", &watermark).unwrap();
+    drop(db);
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let engine = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new("http://127.0.0.1:1", "unused", GitProvider::GitHub),
+    );
+    let err = engine
+        .run_cycle()
+        .await
+        .expect_err("unrelated checkpoint copies must block before SVN writes");
+    assert!(
+        format!("{err:#}").contains("ambiguous_checkpoint"),
+        "{err:#}"
+    );
+    let block = Database::new(&db_path)
+        .unwrap()
+        .get_state(&history_block_key(Some("personal")))
+        .unwrap()
+        .expect("ambiguous checkpoint must persist a history block");
+    let block: serde_json::Value = serde_json::from_str(&block).unwrap();
+    assert_eq!(block["reason"], "ambiguous_checkpoint");
+    assert_eq!(block["state"], "reconciliation_required");
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    assert_eq!(
+        Database::new(&db_path)
+            .unwrap()
+            .list_commit_map(10)
+            .unwrap()
+            .len(),
+        1
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_PERSONAL_AMBIGUOUS_CHECKPOINT",
+            "reason":"ambiguous_checkpoint",
+            "watermark":watermark,
+            "mapping":unrelated,
+            "svn_revision_before_after":svn_before,
+            "mode":"personal"
+        })
+    );
+}

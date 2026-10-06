@@ -244,6 +244,36 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_PERSONAL_MISSING_CHECKPOINT",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_missing_checkpoint_blocks_before_svn_write",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_PERSONAL_MISSING_ORIGIN",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_missing_origin_blocks_before_svn_write",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_PERSONAL_INITIAL_IMPORT",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_initial_import_still_works",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_PERSONAL_CHECKPOINT_PROGRESS",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_checkpoint_progress_survives_mapping_writes",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_PERSONAL_AMBIGUOUS_CHECKPOINT",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_ambiguous_checkpoint_blocks_before_svn_write",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "R66_PERSONAL_LINEAR_ADMIT",
       "binary": "integration",
       "test": "candidate_r66_personal_linear_history_admitted",
