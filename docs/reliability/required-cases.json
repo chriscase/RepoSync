@@ -322,6 +322,30 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_TEAM_FETCH_SVN_GLOBAL_FAIL_CLOSED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_svn_changes_global_watermark_fails_closed",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_FETCH_SVN_SCOPED_IGNORES_GLOBAL",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_svn_changes_scoped_checkpoint_ignores_global",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_TEAM_FETCH_SVN_SCOPED_ISOLATION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_svn_changes_missing_scoped_one_repo_other_syncs",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_SINGLE_REPO_FETCH_SVN_GLOBAL_FALLBACK",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_fetch_svn_changes_personal_mode_keeps_global_fallback",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_WEB_RECONCILIATION_REFUSES_IMPORT",
       "binary": "server_freeze",
       "test": "candidate_rs05_reconciliation_required_refuses_import_start",

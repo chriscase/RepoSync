@@ -246,6 +246,28 @@ impl SyncEngine {
         self.repo_id.as_deref().filter(|id| !id.is_empty())
     }
 
+    /// Persist sync lifecycle state. Managed repos always update their own
+    /// `repositories.sync_status`; global `sync_state` is updated for legacy
+    /// callers and for managed-repo terminal states, but never for per-repo
+    /// `detecting`/`initializing` so one pending pair cannot clobber others.
+    fn persist_sync_state(&self, state: &str) -> Result<(), SyncError> {
+        if let Some(rid) = self.effective_repo_id() {
+            self.db
+                .update_repo_sync_status(rid, state)
+                .map_err(SyncError::DatabaseError)?;
+            if state != "initializing" && state != "detecting" {
+                self.db
+                    .set_state("sync_state", state)
+                    .map_err(SyncError::DatabaseError)?;
+            }
+        } else {
+            self.db
+                .set_state("sync_state", state)
+                .map_err(SyncError::DatabaseError)?;
+        }
+        Ok(())
+    }
+
     /// Return a reference to the database.
     pub fn db(&self) -> &Database {
         &self.db
@@ -302,8 +324,8 @@ impl SyncEngine {
             ..Default::default()
         };
 
-        // Store the sync state
-        let _ = self.db.set_state("sync_state", "detecting");
+        // Store the sync state (per-repo for managed pairs, global otherwise).
+        let _ = self.persist_sync_state("detecting");
 
         let result = self.do_sync_cycle(&mut stats).await;
 
@@ -330,13 +352,12 @@ impl SyncEngine {
             Err(e) => ("error", format!("sync failed: {}", e)),
         };
 
-        let _ = self.db.set_state("sync_state", final_state);
+        let _ = self.persist_sync_state(final_state);
         let _ = self.db.set_state("last_sync_at", &Utc::now().to_rfc3339());
         stats.completed_at = Some(Utc::now().to_rfc3339());
 
-        // Update per-repo sync status and error count
+        // Update per-repo error count
         if let Some(rid) = self.effective_repo_id() {
-            let _ = self.db.update_repo_sync_status(rid, final_state);
             let skip_error_count = matches!(
                 &result,
                 Err(SyncError::HistoryBlocked { reason, .. })
@@ -405,8 +426,18 @@ impl SyncEngine {
 
         let uptime = (Utc::now() - self.started_at).num_seconds().max(0) as u64;
 
+        let state_str = if let Some(rid) = self.effective_repo_id() {
+            self.db
+                .get_repository(rid)
+                .map_err(SyncError::DatabaseError)?
+                .map(|repo| repo.sync_status)
+                .unwrap_or(summary.sync_state)
+        } else {
+            summary.sync_state
+        };
+
         Ok(crate::models::SyncStatus {
-            state: crate::models::SyncState::from_str_val(&summary.sync_state),
+            state: crate::models::SyncState::from_str_val(&state_str),
             last_sync_at,
             last_svn_revision: last_svn_rev,
             last_git_hash,
@@ -1182,7 +1213,7 @@ impl SyncEngine {
 
         if !conflicts.is_empty() {
             info!(count = conflicts.len(), "conflicts detected");
-            let _ = self.db.set_state("sync_state", "conflict_found");
+            let _ = self.persist_sync_state("conflict_found");
 
             for conflict in &conflicts {
                 if self.config.sync.auto_merge && self.try_auto_merge(conflict) {
@@ -1203,7 +1234,7 @@ impl SyncEngine {
         }
 
         // 3. Apply SVN -> Git.
-        let _ = self.db.set_state("sync_state", "applying");
+        let _ = self.persist_sync_state("applying");
         self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count)
             .await?;
 

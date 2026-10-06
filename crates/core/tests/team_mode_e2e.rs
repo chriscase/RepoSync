@@ -28,7 +28,7 @@ use reposync_core::db::Database;
 use reposync_core::errors::SyncError;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
-use reposync_core::models::Repository;
+use reposync_core::models::{Repository, SyncState};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
@@ -4950,9 +4950,25 @@ async fn candidate_rs05_fetch_svn_changes_global_watermark_fails_closed() {
     );
     assert_eq!(svn_youngest(&svn_url), svn_before);
     assert_eq!(engine.db().count_sync_records().unwrap(), 0);
+    assert_ne!(
+        engine.db().get_state("sync_state").unwrap().as_deref(),
+        Some("initializing"),
+        "pending import must not overwrite shared global sync_state"
+    );
     assert_eq!(
-        engine.db().get_state("sync_state").unwrap(),
-        Some("initializing".into())
+        engine
+            .db()
+            .get_repository("pending")
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "initializing",
+        "pending repo must record per-repo initializing status"
+    );
+    assert_eq!(
+        engine.get_status().unwrap().state,
+        SyncState::Initializing,
+        "get_status must not map initializing to idle"
     );
     assert_eq!(
         engine
@@ -4972,7 +4988,9 @@ async fn candidate_rs05_fetch_svn_changes_global_watermark_fails_closed() {
             "reason":"import_baseline_pending",
             "global_svn_rev":9,
             "svn_revision_before_after":svn_before,
-            "sync_records":0
+            "sync_records":0,
+            "repo_sync_status":"initializing",
+            "global_sync_state":engine.db().get_state("sync_state").unwrap()
         })
     );
 }
@@ -5176,6 +5194,184 @@ async fn candidate_rs05_fetch_svn_changes_personal_mode_keeps_global_fallback() 
             "case":"RS05_SINGLE_REPO_FETCH_SVN_GLOBAL_FALLBACK",
             "svn_to_git":stats.svn_to_git_count,
             "global_last_svn_rev":engine.db().get_last_svn_revision().unwrap()
+        })
+    );
+}
+
+/// RS-05 / #63: a pending team repo records initializing per-repo without
+/// clobbering another pair's global or per-repo sync state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_import_baseline_pending_isolated_per_repo_status() {
+    let fixture = QualifiedPair::new().await;
+    fixture.engine.db().set_state("sync_state", "idle").unwrap();
+    fixture
+        .engine
+        .db()
+        .update_repo_sync_status("pair", "idle")
+        .unwrap();
+
+    let blocked_root = fixture.tmp.path().join("pending-status");
+    std::fs::create_dir_all(&blocked_root).unwrap();
+    let blocked_svn = create_svn_repo(&blocked_root);
+    let blocked_wc = blocked_root.join("wc");
+    svn_checkout(&blocked_svn, &blocked_wc);
+    svn_commit_file(&blocked_wc, ".gitkeep", "", "Initial blocked anchor");
+    svn_commit_file(
+        &blocked_wc,
+        "origin.txt",
+        "Blocked SVN origin\n",
+        "Blocked SVN origin",
+    );
+    let blocked_bridge = blocked_root.join("bridge");
+    let blocked_bare = blocked_root.join("origin.git");
+    let blocked_git = init_git_from_svn_export(&blocked_wc, &blocked_bridge, &blocked_bare);
+    let blocked_head = get_head_sha(&blocked_bridge);
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "pending-status".into(),
+            name: "pending status pair".into(),
+            svn_url: blocked_svn.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: blocked_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: blocked_head,
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+    shared_db.set_state("last_svn_rev", "9").unwrap();
+
+    let mut blocked_config = make_app_config(&blocked_svn, &blocked_root);
+    blocked_config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut blocked_engine = SyncEngine::new(
+        blocked_config,
+        shared_db,
+        SvnClient::new(&blocked_svn, "", ""),
+        blocked_git,
+        Arc::new(make_identity_mapper()),
+    );
+    blocked_engine.set_repo_id("pending-status".into());
+
+    let blocked_result = blocked_engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &blocked_result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "import_baseline_pending"
+        ),
+        "pending pair must fail closed: {blocked_result:?}"
+    );
+
+    assert_eq!(
+        blocked_engine
+            .db()
+            .get_repository("pending-status")
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "initializing"
+    );
+    assert_eq!(
+        blocked_engine.get_status().unwrap().state,
+        SyncState::Initializing
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_repository("pair")
+            .unwrap()
+            .unwrap()
+            .sync_status,
+        "idle",
+        "verified pair sync_status must stay idle"
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("sync_state").unwrap().as_deref(),
+        Some("idle"),
+        "shared global sync_state must stay idle"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_IMPORT_PENDING_STATUS_ISOLATION",
+            "pending_repo":"pending-status",
+            "healthy_repo":"pair",
+            "pending_repo_status":"initializing",
+            "healthy_repo_status":"idle",
+            "global_sync_state":"idle"
+        })
+    );
+}
+
+/// RS-05 / #63: team-mode svn no-target advancement updates only the managed
+/// repo checkpoint and must not advance the global `last_svn_rev`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_advance_svn_only_tx_scoped_not_global() {
+    let fixture = QualifiedPair::new().await;
+    fixture.engine.db().set_state("last_svn_rev", "1").unwrap();
+    let before_global_kv = fixture.engine.db().get_state("last_svn_rev").unwrap();
+    let before_pair = fixture.engine.db().get_repo_watermark("pair").unwrap().0;
+
+    let revision = svn_property_only_revision(&fixture.wc);
+    assert_eq!(revision, before_pair + 1);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 0));
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().0,
+        revision
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_svn_rev").unwrap(),
+        before_global_kv,
+        "global kv_state last_svn_rev must not advance for managed team repo"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .db()
+            .get_state("last_svn_rev_pair")
+            .unwrap()
+            .as_deref(),
+        Some(revision.to_string().as_str())
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_ADVANCE_SVN_ONLY_SCOPED",
+            "repo_id":"pair",
+            "global_last_svn_rev_kv_before_after":[
+                before_global_kv,
+                fixture.engine.db().get_state("last_svn_rev").unwrap()
+            ],
+            "scoped_last_svn_rev":revision
         })
     );
 }
