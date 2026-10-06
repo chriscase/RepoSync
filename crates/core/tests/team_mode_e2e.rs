@@ -4863,6 +4863,323 @@ async fn candidate_rs05_scoped_svn_checkpoint_disagreement_stays_blocked() {
     );
 }
 
+/// RS-05 / #63: `fetch_svn_changes` must not adopt the global SVN watermark
+/// when a team repo lacks verified scoped import proof, even if Git inspect
+/// can proceed from a repository column cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_svn_changes_global_watermark_fails_closed() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let svn_before = svn_youngest(&svn_url);
+
+    let bridge = tmp.path().join("bridge");
+    let bare = tmp.path().join("origin.git");
+    let git = init_git_from_svn_export(&wc, &bridge, &bare);
+    let git_sha = get_head_sha(&bridge);
+
+    let db_path = tmp.path().join("scoped-fetch.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: "pending".into(),
+        name: "pending".into(),
+        svn_url: svn_url.clone(),
+        svn_branch: String::new(),
+        svn_username: String::new(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: git_sha.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.set_state("last_svn_rev", "9").unwrap();
+    db.set_watermark("svn_rev", "9").unwrap();
+
+    assert_eq!(
+        resolve_repo_import_baseline(&db, "pending").unwrap(),
+        RepoImportBaseline::Pending
+    );
+
+    let config = make_app_config(&svn_url, tmp.path());
+    let mut engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git,
+        Arc::new(make_identity_mapper()),
+    );
+    engine.set_repo_id("pending".into());
+
+    let result = engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "import_baseline_pending"
+        ),
+        "global svn_rev must not be adopted via fetch_svn_changes: {result:?}"
+    );
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+    assert_eq!(engine.db().count_sync_records().unwrap(), 0);
+    assert_eq!(
+        engine.db().get_state("sync_state").unwrap(),
+        Some("initializing".into())
+    );
+    assert_eq!(
+        engine
+            .db()
+            .get_repository("pending")
+            .unwrap()
+            .unwrap()
+            .total_errors,
+        0,
+        "pending baseline must not increment error count"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_SVN_GLOBAL_FAIL_CLOSED",
+            "reason":"import_baseline_pending",
+            "global_svn_rev":9,
+            "svn_revision_before_after":svn_before,
+            "sync_records":0
+        })
+    );
+}
+
+/// RS-05 / #63: verified scoped SVN checkpoint drives `fetch_svn_changes`
+/// even when a stale global watermark claims a higher revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_svn_changes_scoped_checkpoint_ignores_global() {
+    let fixture = QualifiedPair::new().await;
+    fixture.engine.db().set_state("last_svn_rev", "9").unwrap();
+    fixture.engine.db().set_watermark("svn_rev", "9").unwrap();
+
+    let svn_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "Scoped fetch change\n",
+        "Scoped fetch change",
+    );
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        stats.svn_to_git_count, 1,
+        "fetch_svn_changes must advance from scoped checkpoint, not global 9"
+    );
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().0,
+        svn_rev
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_SVN_SCOPED_IGNORES_GLOBAL",
+            "global_svn_rev":9,
+            "scoped_svn_rev_before":2,
+            "synced_revision":svn_rev,
+            "svn_to_git":stats.svn_to_git_count
+        })
+    );
+}
+
+/// RS-05 / #63: one team repo missing scoped SVN proof fails closed while a
+/// separately verified pair keeps syncing through the real engine path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_svn_changes_missing_scoped_one_repo_other_syncs() {
+    let fixture = QualifiedPair::new().await;
+    fixture.engine.db().set_state("last_svn_rev", "9").unwrap();
+    fixture.engine.db().set_watermark("svn_rev", "9").unwrap();
+
+    let blocked_root = fixture.tmp.path().join("blocked");
+    std::fs::create_dir_all(&blocked_root).unwrap();
+    let blocked_svn = create_svn_repo(&blocked_root);
+    let blocked_wc = blocked_root.join("wc");
+    svn_checkout(&blocked_svn, &blocked_wc);
+    svn_commit_file(&blocked_wc, ".gitkeep", "", "Initial blocked anchor");
+    svn_commit_file(
+        &blocked_wc,
+        "origin.txt",
+        "Blocked SVN origin\n",
+        "Blocked SVN origin",
+    );
+    let blocked_bridge = blocked_root.join("bridge");
+    let blocked_bare = blocked_root.join("origin.git");
+    let blocked_git = init_git_from_svn_export(&blocked_wc, &blocked_bridge, &blocked_bare);
+    let blocked_head = get_head_sha(&blocked_bridge);
+    let blocked_svn_before = svn_youngest(&blocked_svn);
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "blocked".into(),
+            name: "blocked pair".into(),
+            svn_url: blocked_svn.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: blocked_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: blocked_head,
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+
+    let mut blocked_config = make_app_config(&blocked_svn, &blocked_root);
+    blocked_config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut blocked_engine = SyncEngine::new(
+        blocked_config,
+        shared_db,
+        SvnClient::new(&blocked_svn, "", ""),
+        blocked_git,
+        Arc::new(make_identity_mapper()),
+    );
+    blocked_engine.set_repo_id("blocked".into());
+
+    let blocked_result = blocked_engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &blocked_result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "import_baseline_pending"
+        ),
+        "blocked pair must fail closed in fetch_svn_changes: {blocked_result:?}"
+    );
+    assert_eq!(svn_youngest(&blocked_svn), blocked_svn_before);
+
+    let healthy_svn_rev = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "Healthy pair still syncs\n",
+        "Healthy pair still syncs",
+    );
+    let healthy_stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(healthy_stats.svn_to_git_count, 1);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair").unwrap().0,
+        healthy_svn_rev
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_FETCH_SVN_SCOPED_ISOLATION",
+            "blocked_pair":"blocked",
+            "healthy_pair":"pair",
+            "blocked_reason":"import_baseline_pending",
+            "blocked_svn_before_after":blocked_svn_before,
+            "healthy_synced_revision":healthy_svn_rev
+        })
+    );
+}
+
+/// RS-05 / #63: single-repo callers without a repo id keep the legacy global
+/// watermark and git-log fallback inside `fetch_svn_changes`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_fetch_svn_changes_personal_mode_keeps_global_fallback() {
+    assert!(
+        svn_available(),
+        "svn and svnadmin are required; do not count a skipped diagnostic as evidence"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(&wc_path, "a.txt", "alpha", "Add a");
+    svn_commit_file(&wc_path, "b.txt", "bravo", "Add b");
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db = setup_db(&tmp.path().join("sync.db"));
+    let head_sha = get_head_sha(&git_work_dir);
+    db.set_state("last_git_hash", &head_sha).unwrap();
+
+    let config = make_app_config(&svn_url, tmp.path());
+    let engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        Arc::new(make_identity_mapper()),
+    );
+    // Deliberately no set_repo_id(): legacy single-repo path.
+
+    let stats = engine.run_sync_cycle().await.expect("sync cycle failed");
+    assert_eq!(
+        stats.svn_to_git_count, 2,
+        "single-repo mode must still fetch via global watermark fallback"
+    );
+    assert_eq!(engine.db().count_sync_records().unwrap(), 2);
+    assert!(
+        engine.db().get_last_svn_revision().unwrap().unwrap_or(0) >= 2,
+        "global last_svn_rev must advance for single-repo callers"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_SINGLE_REPO_FETCH_SVN_GLOBAL_FALLBACK",
+            "svn_to_git":stats.svn_to_git_count,
+            "global_last_svn_rev":engine.db().get_last_svn_revision().unwrap()
+        })
+    );
+}
+
 /// R06 baseline diagnostic: the skip-import checkpoint used by late pairing
 /// acknowledges two unprocessed Git commits. The branch is descended from an
 /// actual SVN-import commit, not an unrelated Git-first history.
