@@ -488,7 +488,15 @@
         "74_LFS_POSITIVE"
       ],
       "supporting_case_ids": [
-        "74_LFS_STOP"
+        "74_LFS_STOP",
+        "RS_C02_FILTERED_THEN_ALLOWED",
+        "RS_C02_MIXED_AND_SIBLING",
+        "RS_C02_OUT_OF_SCOPE_DELETE",
+        "RS_C02_RENAME_ALLOWED_TO_BLOCKED",
+        "RS_C02_RENAME_BLOCKED_TO_ALLOWED",
+        "RS_C02_RENAME_BOTH_ALLOWED",
+        "RS_C02_RENAME_BOTH_BLOCKED",
+        "RS_C02_RENAME_NO_PATH_RULES"
       ],
       "open": [
         "Broader path-policy and monorepo projection cases remain #52/#60",

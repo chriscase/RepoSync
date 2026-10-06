@@ -3778,6 +3778,104 @@ async fn test_personal_git_to_svn_confirm_writes_commit_map() {
 }
 
 #[tokio::test]
+async fn test_personal_git_to_svn_rename_removes_source() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    std::fs::write(git_work.join("old.txt"), "rename me\n").unwrap();
+    let seed_oid = git_client
+        .commit(
+            "Add old.txt",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let seed_sha = seed_oid.to_string();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    syncer
+        .replay_commit(&github_commit(seed_sha, "Add old.txt"), 1, "feature/x")
+        .await
+        .expect("seed commit must sync");
+
+    let status = Command::new("git")
+        .args(["mv", "old.txt", "new.txt"])
+        .current_dir(&git_work)
+        .status()
+        .expect("git mv failed");
+    assert!(status.success(), "git mv old.txt new.txt failed");
+    let status = Command::new("git")
+        .args(["commit", "-m", "Rename old.txt to new.txt"])
+        .current_dir(&git_work)
+        .status()
+        .expect("git commit failed");
+    assert!(status.success(), "git commit rename failed");
+    let rename_sha = git_sha_at(&git_work, "HEAD");
+
+    let svn_rev = syncer
+        .replay_commit(
+            &github_commit(rename_sha.clone(), "Rename old.txt to new.txt"),
+            2,
+            "feature/x",
+        )
+        .await
+        .expect("rename commit must sync");
+    assert!(svn_rev > svn_before);
+
+    assert!(
+        !svn_wc.join("old.txt").exists(),
+        "old SVN path must be removed after rename"
+    );
+    let new_content = std::fs::read_to_string(svn_wc.join("new.txt")).unwrap();
+    assert_eq!(new_content, "rename me\n");
+
+    let op = db_arc
+        .latest_svn_commit_operation("personal")
+        .unwrap()
+        .expect("rename journal");
+    assert_eq!(op.source_git_sha, rename_sha);
+    let journal_paths: Vec<_> = op
+        .intended_changed_paths
+        .iter()
+        .map(|p| (p.path.as_str(), p.action.as_str()))
+        .collect();
+    assert_eq!(journal_paths, vec![("new.txt", "A"), ("old.txt", "D")]);
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "PERSONAL_GIT_TO_SVN_RENAME",
+            "sha": rename_sha,
+            "journal_paths": journal_paths,
+            "old_path_removed": true
+        })
+    );
+}
+
+#[tokio::test]
 async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
     if !svn_available() {
         eprintln!("SKIPPED: svn/svnadmin not found in PATH");

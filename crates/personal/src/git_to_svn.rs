@@ -18,7 +18,10 @@ use reposync_core::db::Database;
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
-use reposync_core::path_projection::svn_path_identity;
+use reposync_core::path_projection::{
+    project_git_to_svn_changeset, svn_path_identity, GitToSvnInputChange,
+    ProjectedGitToSvnChangeset,
+};
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
 use reposync_core::svn_commit::{
@@ -470,20 +473,10 @@ impl GitToSvnSync {
         let (parent, tree) = git_client
             .commit_parent_and_tree(&commit.sha)
             .context("failed to read source Git parent and tree")?;
-        let changed_files = git_client
-            .get_changed_files(&commit.sha)
-            .context("failed to read source Git changed files")?;
-        let mut file_contents = Vec::new();
-        for (action, path) in &changed_files {
-            let content = if action != "D" {
-                git_client
-                    .get_file_content_at_commit(&commit.sha, path)
-                    .with_context(|| format!("failed to read '{path}' at {}", commit.sha))?
-            } else {
-                None
-            };
-            file_contents.push((action.clone(), path.clone(), content));
-        }
+        let projected = self
+            .projected_changes_for_commit(&git_client, &commit.sha)
+            .context("failed to project Git changes for commit journal")?;
+        let file_contents = projected.into_file_contents();
         let intended_changed_paths = intended_paths_from_contents(&file_contents);
         let intended_svn_tree = hash_regular_file_tree(&self.svn_wc_path)
             .context("failed to hash intended SVN working copy")?;
@@ -670,17 +663,17 @@ impl GitToSvnSync {
         let git_client = GitClient::new(&self.git_repo_path)
             .context("failed to open local git repo for commit diff")?;
 
-        // Get the list of files changed in this specific commit.
-        let changed_files = git_client
-            .get_changed_files(&commit.sha)
-            .context("failed to get changed files for commit")?;
+        let projected = self
+            .projected_changes_for_commit(&git_client, &commit.sha)
+            .context("failed to project Git changes for SVN apply")?;
 
-        if changed_files.is_empty() {
+        if projected.is_empty() {
             debug!(git_sha = %commit.sha, "commit has no file changes");
             return Ok(());
         }
 
-        for (action, file_path) in &changed_files {
+        let file_changes = projected.into_file_contents();
+        for (action, file_path, content) in &file_changes {
             let dst = self.svn_wc_path.join(file_path);
 
             match action.as_str() {
@@ -694,30 +687,20 @@ impl GitToSvnSync {
                     }
                 }
                 _ => {
-                    // File was added or modified: read its content at this
-                    // specific commit SHA and write to the SVN WC.
-                    if let Some(content) = git_client
-                        .get_file_content_at_commit(&commit.sha, file_path)
-                        .with_context(|| {
-                            format!(
-                                "failed to read file '{}' at commit {}",
-                                file_path, commit.sha
-                            )
-                        })?
-                    {
+                    // File was added or modified: write projected content to the SVN WC.
+                    if let Some(content) = content {
                         // Evaluate file against policy before writing.
                         let decision = self.policy.evaluate(file_path, content.len() as u64);
                         match &decision {
                             FilePolicyDecision::Allow => {
                                 // Check if this is an LFS pointer that needs resolution.
-                                let write_content = if reposync_core::lfs::is_lfs_pointer(&content)
-                                {
+                                let write_content = if reposync_core::lfs::is_lfs_pointer(content) {
                                     // The file in Git is an LFS pointer — resolve
                                     // it to the actual blob content before writing
                                     // to SVN (SVN doesn't understand LFS pointers).
                                     match reposync_core::lfs::resolve_lfs_pointer(
                                         &self.git_repo_path,
-                                        &content,
+                                        content,
                                     ) {
                                         Ok(resolved) => {
                                             info!(
@@ -773,11 +756,10 @@ impl GitToSvnSync {
                             FilePolicyDecision::LfsTrack { .. } => {
                                 // File exceeds LFS threshold — same LFS pointer
                                 // resolution logic applies.
-                                let write_content = if reposync_core::lfs::is_lfs_pointer(&content)
-                                {
+                                let write_content = if reposync_core::lfs::is_lfs_pointer(content) {
                                     match reposync_core::lfs::resolve_lfs_pointer(
                                         &self.git_repo_path,
-                                        &content,
+                                        content,
                                     ) {
                                         Ok(resolved) => {
                                             info!(
@@ -880,11 +862,45 @@ impl GitToSvnSync {
 
         debug!(
             git_sha = %commit.sha,
-            file_count = changed_files.len(),
+            file_count = file_changes.len(),
             "applied commit-specific changes to SVN working copy"
         );
 
         Ok(())
+    }
+
+    /// Build the projected Git→SVN changeset for one commit.
+    ///
+    /// Personal mode has no allow/block path rules (#59); empty rules mean the
+    /// whole tree is in scope. Renames are split to per-endpoint D/A before apply.
+    fn projected_changes_for_commit(
+        &self,
+        git_client: &GitClient,
+        commit_sha: &str,
+    ) -> Result<ProjectedGitToSvnChangeset> {
+        let changed_files = git_client
+            .get_changed_files(commit_sha)
+            .context("failed to get changed files for commit")?;
+        let mut inputs = Vec::new();
+        for change in &changed_files {
+            let content = if change.action != "D" {
+                git_client
+                    .get_file_content_at_commit(commit_sha, &change.path)
+                    .with_context(|| {
+                        format!("failed to read '{}' at {}", change.path, commit_sha)
+                    })?
+            } else {
+                None
+            };
+            inputs.push(GitToSvnInputChange {
+                action: change.action.clone(),
+                path: change.path.clone(),
+                content,
+                rename_from: change.rename_from.clone(),
+            });
+        }
+        const NO_RULES: &[String] = &[];
+        Ok(project_git_to_svn_changeset(inputs, NO_RULES, NO_RULES))
     }
 
     /// Detect the merge strategy used for a PR by inspecting the merge commit.

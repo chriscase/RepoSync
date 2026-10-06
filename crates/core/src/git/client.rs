@@ -26,6 +26,15 @@ pub struct GitCommitInfo {
     pub committer_email: String,
 }
 
+/// One path changed in a Git commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitChangedPath {
+    pub action: String,
+    pub path: String,
+    /// Source path when `action` is `R` (rename/move).
+    pub rename_from: Option<String>,
+}
+
 /// Result of capped pending-commit selection on the P→R frontier.
 #[derive(Debug, Clone)]
 pub struct PendingCommitSelection {
@@ -778,9 +787,9 @@ impl GitClient {
 
     /// Get the list of changed files for a specific commit.
     ///
-    /// Returns a vec of `(action, path)` tuples where action is "A" (added),
-    /// "M" (modified), or "D" (deleted).
-    pub fn get_changed_files(&self, sha: &str) -> Result<Vec<(String, String)>, GitError> {
+    /// Actions are `A` (added), `M` (modified), `D` (deleted), or `R`
+    /// (rename/move). Renames carry the old path in `rename_from`.
+    pub fn get_changed_files(&self, sha: &str) -> Result<Vec<GitChangedPath>, GitError> {
         let oid = Oid::from_str(sha)?;
         let commit = self.repo.find_commit(oid)?;
         let tree = commit.tree()?;
@@ -791,29 +800,41 @@ impl GitClient {
             None
         };
 
-        let diff = self
+        let mut diff = self
             .repo
             .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut find_opts = git2::DiffFindOptions::new();
+        find_opts.renames(true);
+        diff.find_similar(Some(&mut find_opts))?;
 
         let mut changes = Vec::new();
         diff.foreach(
             &mut |delta, _progress| {
-                let action = match delta.status() {
-                    git2::Delta::Added | git2::Delta::Untracked => "A",
-                    git2::Delta::Deleted => "D",
-                    git2::Delta::Modified => "M",
-                    git2::Delta::Renamed => "M",
-                    _ => "M",
+                let (action, path, rename_from) = match delta.status() {
+                    git2::Delta::Added | git2::Delta::Untracked => {
+                        ("A", delta.new_file().path(), None)
+                    }
+                    git2::Delta::Deleted => ("D", delta.old_file().path(), None),
+                    git2::Delta::Modified => ("M", delta.new_file().path(), None),
+                    git2::Delta::Renamed => ("R", delta.new_file().path(), delta.old_file().path()),
+                    _ => (
+                        "M",
+                        delta.new_file().path().or_else(|| delta.old_file().path()),
+                        None,
+                    ),
                 };
-                let path = delta
-                    .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
+                let path = path
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if !path.is_empty() {
-                    changes.push((action.to_string(), path));
+                if path.is_empty() {
+                    return true;
                 }
+                let rename_from = rename_from.map(|p| p.to_string_lossy().to_string());
+                changes.push(GitChangedPath {
+                    action: action.to_string(),
+                    path,
+                    rename_from,
+                });
                 true
             },
             None,
@@ -1096,8 +1117,9 @@ mod tests {
 
         let files1 = client.get_changed_files(&oid1.to_string()).unwrap();
         assert_eq!(files1.len(), 1);
-        assert_eq!(files1[0].0, "A"); // Added
-        assert_eq!(files1[0].1, "a.txt");
+        assert_eq!(files1[0].action, "A");
+        assert_eq!(files1[0].path, "a.txt");
+        assert!(files1[0].rename_from.is_none());
 
         // Second commit: modify a.txt, add b.txt
         std::fs::write(dir.path().join("a.txt"), "modified").unwrap();
@@ -1108,9 +1130,45 @@ mod tests {
 
         let files2 = client.get_changed_files(&oid2.to_string()).unwrap();
         assert_eq!(files2.len(), 2);
-        let paths: Vec<&str> = files2.iter().map(|(_, p)| p.as_str()).collect();
+        let paths: Vec<&str> = files2.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"a.txt"));
         assert!(paths.contains(&"b.txt"));
+    }
+
+    #[test]
+    fn test_get_changed_files_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        let client = GitClient::new(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("old.txt"), "payload").unwrap();
+        client
+            .commit("add old", "T", "t@t.com", "T", "t@t.com")
+            .unwrap();
+        for args in [
+            ["config", "user.email", "t@t.com"],
+            ["config", "user.name", "T"],
+            ["mv", "old.txt", "new.txt"],
+            ["commit", "-m", "rename old to new"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap();
+        }
+        let oid2 = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(oid2.stdout).unwrap().trim().to_string();
+
+        let files = client.get_changed_files(&sha).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].action, "R");
+        assert_eq!(files[0].path, "new.txt");
+        assert_eq!(files[0].rename_from.as_deref(), Some("old.txt"));
     }
 
     #[test]

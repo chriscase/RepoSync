@@ -48,7 +48,7 @@ use crate::history_inspect::{
 };
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
-use crate::path_projection::project_git_to_svn_changeset;
+use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
     hash_regular_file_tree, intended_paths_from_contents, observed_svn_tree_at_revision,
@@ -2301,8 +2301,7 @@ impl SyncEngine {
                     .changed_files
                     .iter()
                     .map(|f| -> Result<_, SyncError> {
-                        let (action, path) = (&f.action, &f.path);
-                        let content = if action != "D" {
+                        let content = if f.action != "D" {
                             #[cfg(debug_assertions)]
                             let fault = std::env::var("REPOSYNC_TEST_GIT_CONTENT_FAULT")
                                 .ok()
@@ -2311,21 +2310,26 @@ impl SyncEngine {
                                 });
                             #[cfg(debug_assertions)]
                             let read = if fault {
-                                Err(crate::errors::GitError::RefNotFound(path.clone()))
+                                Err(crate::errors::GitError::RefNotFound(f.path.clone()))
                             } else {
-                                git.get_file_content_at_commit(&change.sha, path)
+                                git.get_file_content_at_commit(&change.sha, &f.path)
                             };
                             #[cfg(not(debug_assertions))]
-                            let read = git.get_file_content_at_commit(&change.sha, path);
+                            let read = git.get_file_content_at_commit(&change.sha, &f.path);
                             Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
                                 SyncError::GitError(crate::errors::GitError::RefNotFound(
-                                    path.clone(),
+                                    f.path.clone(),
                                 ))
                             })?)
                         } else {
                             None
                         };
-                        Ok((action.clone(), path.clone(), content))
+                        Ok(GitToSvnInputChange {
+                            action: f.action.clone(),
+                            path: f.path.clone(),
+                            content,
+                            rename_from: f.rename_from.clone(),
+                        })
                     })
                     .collect();
                 contents?
@@ -3105,6 +3109,7 @@ impl SyncEngine {
                             action: p.action.clone(),
                             content: None,
                             is_binary: false,
+                            rename_from: None,
                         })
                     })
                     .collect(),
@@ -3233,11 +3238,12 @@ impl SyncEngine {
             let files = git.get_changed_files(&c.sha).map_err(SyncError::GitError)?;
             let changed_files: Vec<ChangedFile> = files
                 .into_iter()
-                .map(|(action, path)| ChangedFile {
-                    path,
-                    action,
+                .map(|change| ChangedFile {
+                    path: change.path,
+                    action: change.action,
                     content: None,
                     is_binary: false,
+                    rename_from: change.rename_from,
                 })
                 .collect();
             change_sets.push(GitChangeSet {
@@ -3643,6 +3649,7 @@ pub struct ChangedFile {
     pub action: String,
     pub content: Option<String>,
     pub is_binary: bool,
+    pub rename_from: Option<String>,
 }
 
 /// Validate file paths against allowed/blocked rules.

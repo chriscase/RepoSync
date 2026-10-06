@@ -805,6 +805,16 @@ impl QualifiedPair {
         self.developer_commit_tree(&[(name, Some(content))], message)
     }
 
+    fn developer_git_mv(&self, from: &str, to: &str, message: &str) -> String {
+        let to_path = self.developer.join(to);
+        if let Some(parent) = to_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        git_cli(&self.developer, &["mv", from, to]);
+        git_cli(&self.developer, &["commit", "-m", message]);
+        get_head_sha(&self.developer)
+    }
+
     /// Commit several paths at once. `None` content means `git rm`.
     fn developer_commit_tree(&self, files: &[(&str, Option<&str>)], message: &str) -> String {
         for (name, content) in files {
@@ -6843,6 +6853,249 @@ async fn candidate_rsc02_out_of_scope_delete_leaves_svn_file() {
         serde_json::json!({
             "case":"RS_C02_OUT_OF_SCOPE_DELETE",
             "sha":sha, "origin_preserved":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_allowed_old_to_blocked_new_projects_delete_only() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "team/seed.txt",
+        "seed payload\n",
+        "Seed allowed path in SVN",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let svn_before = svn_youngest(&pair.svn_url);
+    let sha = pair.developer_git_mv(
+        "team/seed.txt",
+        "team-other/new.txt",
+        "Allowed-old to sibling-blocked-new rename",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    assert_eq!(svn_youngest(&pair.svn_url), svn_before + 1);
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert!(!tree.contains_key("team/seed.txt"));
+    assert!(!tree.contains_key("team-other/new.txt"));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, sha);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| (p.path.as_str(), p.action.as_str()))
+        .collect();
+    assert_eq!(journal_paths, vec![("team/seed.txt", "D")]);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_ALLOWED_TO_BLOCKED",
+            "sha":sha,
+            "journal_paths":journal_paths,
+            "blocked_new_absent":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_blocked_old_to_allowed_new_projects_add_only() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "team-other/keep.txt",
+        "out-of-scope original\n",
+        "Seed excluded path in SVN",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let before_tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    let sha = pair.developer_git_mv(
+        "team-other/keep.txt",
+        "team/new.txt",
+        "Blocked-old to allowed-new rename",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert_eq!(
+        tree.get("team-other/keep.txt"),
+        before_tree.get("team-other/keep.txt")
+    );
+    assert_eq!(
+        tree.get("team/new.txt"),
+        Some(&b"out-of-scope original\n".to_vec())
+    );
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, sha);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| (p.path.as_str(), p.action.as_str()))
+        .collect();
+    assert_eq!(journal_paths, vec![("team/new.txt", "A")]);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_BLOCKED_TO_ALLOWED",
+            "sha":sha,
+            "journal_paths":journal_paths,
+            "blocked_old_preserved":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_both_endpoints_allowed_moves_in_svn() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("team/a.txt", "rename me\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let sha = pair.developer_git_mv("team/a.txt", "team/b.txt", "Both endpoints allowed rename");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert!(!tree.contains_key("team/a.txt"));
+    assert_eq!(tree.get("team/b.txt"), Some(&b"rename me\n".to_vec()));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, sha);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| (p.path.as_str(), p.action.as_str()))
+        .collect();
+    assert_eq!(
+        journal_paths,
+        vec![("team/a.txt", "D"), ("team/b.txt", "A")]
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_BOTH_ALLOWED",
+            "sha":sha,
+            "journal_paths":journal_paths
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_no_path_rules_removes_source() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("old.txt", "rename me\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let sha = pair.developer_git_mv("old.txt", "new.txt", "Default-policy rename");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert!(!tree.contains_key("old.txt"));
+    assert_eq!(tree.get("new.txt"), Some(&b"rename me\n".to_vec()));
+    let journal = pair
+        .engine
+        .db()
+        .latest_svn_commit_operation("pair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.source_git_sha, sha);
+    let journal_paths: Vec<_> = journal
+        .intended_changed_paths
+        .iter()
+        .map(|p| (p.path.as_str(), p.action.as_str()))
+        .collect();
+    assert_eq!(journal_paths, vec![("new.txt", "A"), ("old.txt", "D")]);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_NO_PATH_RULES",
+            "sha":sha,
+            "journal_paths":journal_paths,
+            "old_path_removed":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_both_endpoints_blocked_leaves_pristine_wc() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "team-other/a.txt",
+        "stay put\n",
+        "Seed out-of-scope rename source",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine
+        .set_path_rules(vec!["team".into()], vec!["secret/".into()]);
+    let svn_before = svn_youngest(&pair.svn_url);
+    let before_tree = svn_tree(&pair, svn_before).await;
+    let filtered = pair.developer_git_mv(
+        "team-other/a.txt",
+        "secret/b.txt",
+        "Both endpoints blocked rename",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(svn_youngest(&pair.svn_url), svn_before);
+    let after_tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert_eq!(after_tree, before_tree);
+    let receipt_key = format!("handled_git_no_target_pair_{filtered}");
+    let receipt: serde_json::Value =
+        serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
+    assert_eq!(receipt["outcome"], "filtered");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_BOTH_BLOCKED",
+            "filtered":filtered,
+            "svn_unchanged":true,
+            "pristine_wc":true
         })
     );
 }
