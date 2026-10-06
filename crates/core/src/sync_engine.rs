@@ -3043,13 +3043,11 @@ impl SyncEngine {
                     detected_rev = detected,
                     "Auto-detected last synced revision from existing git history"
                 );
-                let _ = self
-                    .db
-                    .set_state(&self.svn_rev_key(), &detected.to_string());
-                // Also persist to the repo table if available
-                if let Some(rid) = self.effective_repo_id() {
-                    let _ = self.db.update_repo_watermark(rid, detected, "");
-                }
+                let _ = crate::db::watermark_recovery::persist_git_log_auto_detect_watermark(
+                    &self.db,
+                    self.effective_repo_id(),
+                    detected,
+                );
                 last_rev = detected;
             }
         }

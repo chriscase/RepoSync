@@ -2335,6 +2335,28 @@ impl Database {
         }
     }
 
+    /// Update repository watermark columns without minting scoped import KV.
+    ///
+    /// Used by migration and auto-detect recovery paths that must not write
+    /// `last_svn_rev_<repo>` import-completion proof from global state.
+    pub fn update_repo_watermark_columns_only(
+        &self,
+        repo_id: &str,
+        svn_rev: i64,
+        git_sha: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
+            params![svn_rev, git_sha, repo_id],
+        )?;
+        debug!(
+            repo_id,
+            svn_rev, git_sha, "updated repo watermark (columns only)"
+        );
+        Ok(())
+    }
+
     /// Update the watermark for a repository after a successful sync.
     pub fn update_repo_watermark(
         &self,

@@ -16,6 +16,9 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use reposync_core::config::AppConfig;
+use reposync_core::db::watermark_recovery::{
+    recover_repo_watermark_from_git_log_scan, recover_repo_watermark_from_global_migration,
+};
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -439,26 +442,21 @@ async fn main() -> Result<()> {
             // is a single-repo migration scenario (the daemon was previously
             // running as a single-repo deployment and we're upgrading).
             if single_repo_migration {
-                if let Ok(Some(rev_str)) = engine.db().get_watermark("svn_rev") {
-                    if let Ok(rev) = rev_str.parse::<i64>() {
-                        if rev > 0 {
-                            let sha = engine
-                                .db()
-                                .get_watermark("git_sha")
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
-                                Ok(()) => {
-                                    info!(repo_name = %repo.name, rev, "Recovered watermark from global watermarks table (single-repo migration)");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to write watermark for {}: {}", repo.name, e)
-                                }
+                match recover_repo_watermark_from_global_migration(engine.db(), &repo.id) {
+                    Ok(true) => {
+                        if let Ok(Some(rev_str)) = engine.db().get_watermark("svn_rev") {
+                            if let Ok(rev) = rev_str.parse::<i64>() {
+                                info!(
+                                    repo_name = %repo.name,
+                                    rev,
+                                    "Recovered watermark from global watermarks table (single-repo migration)"
+                                );
                             }
                         }
+                        continue;
                     }
+                    Ok(false) => {}
+                    Err(e) => warn!("Failed to write watermark for {}: {}", repo.name, e),
                 }
             }
 
@@ -474,7 +472,10 @@ async fn main() -> Result<()> {
                             .ok()
                             .flatten()
                             .unwrap_or_default();
-                        match engine.db().update_repo_watermark(&repo.id, rev, &sha) {
+                        match engine
+                            .db()
+                            .update_repo_watermark_columns_only(&repo.id, rev, &sha)
+                        {
                             Ok(()) => {
                                 info!(repo_name = %repo.name, rev, "Recovered watermark from per-repo kv_state");
                                 continue;
@@ -501,64 +502,25 @@ async fn main() -> Result<()> {
             };
 
             if let Some(git_dir) = git_dir {
-                // Read git log and scan for sync markers
-                let output = tokio::process::Command::new("git")
-                    .args(["log", "--oneline", "-200", "--format=%H %s"])
-                    .current_dir(git_dir)
-                    .output()
-                    .await;
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let log_text = String::from_utf8_lossy(&output.stdout);
-                        let re = regex_lite::Regex::new(
-                            r"(?i)(?:\[(?:gitsvnsync|reposync)\].*SVN r(\d+)|imported from SVN r(\d+))",
-                        )
-                        .unwrap();
-                        let mut max_rev: i64 = 0;
-                        let mut head_sha = String::new();
-                        for line in log_text.lines() {
-                            // First line is HEAD
-                            if head_sha.is_empty() {
-                                if let Some(sha) = line.split_whitespace().next() {
-                                    head_sha = sha.to_string();
-                                }
-                            }
-                            if let Some(caps) = re.captures(line) {
-                                let rev_str = caps
-                                    .get(1)
-                                    .or_else(|| caps.get(2))
-                                    .map(|m| m.as_str())
-                                    .unwrap_or("0");
-                                if let Ok(rev) = rev_str.parse::<i64>() {
-                                    max_rev = max_rev.max(rev);
-                                }
-                            }
-                        }
-                        if max_rev > 0 {
-                            let sha_for_watermark = if head_sha.is_empty() {
-                                String::new()
-                            } else {
-                                head_sha
-                            };
-                            match engine.db().update_repo_watermark(
-                                &repo.id,
-                                max_rev,
-                                &sha_for_watermark,
-                            ) {
-                                Ok(()) => info!(
-                                    repo_name = %repo.name,
-                                    rev = max_rev,
-                                    "Auto-detected watermark r{} for repo {}",
-                                    max_rev,
-                                    repo.name
-                                ),
-                                Err(e) => warn!(
-                                    "Failed to write auto-detected watermark for {}: {}",
-                                    repo.name, e
-                                ),
-                            }
-                        }
+                match recover_repo_watermark_from_git_log_scan(engine.db(), &repo.id, git_dir) {
+                    Ok(true) => {
+                        let (max_rev, _) =
+                            reposync_core::db::watermark_recovery::scan_git_log_for_svn_watermark(
+                                git_dir,
+                            );
+                        info!(
+                            repo_name = %repo.name,
+                            rev = max_rev,
+                            "Auto-detected watermark r{} for repo {}",
+                            max_rev,
+                            repo.name
+                        );
                     }
+                    Ok(false) => {}
+                    Err(e) => warn!(
+                        "Failed to write auto-detected watermark for {}: {}",
+                        repo.name, e
+                    ),
                 }
             }
         }

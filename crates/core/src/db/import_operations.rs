@@ -199,13 +199,23 @@ impl RepoImportBaseline {
     }
 }
 
+fn kv_state_value_tx(tx: &Connection, key: &str) -> Result<Option<String>, DatabaseError> {
+    tx.query_row(
+        "SELECT value FROM kv_state WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(DatabaseError::from)
+}
+
 /// Decide whether a repository has a verified import baseline.
 ///
 /// Global `last_svn_rev`, `watermarks.svn_rev`, and commit-map maxima are never
 /// adopted as completion proof. Repository columns plus a matching scoped
 /// `last_svn_rev_<repo>` copy authorize import completion. A scoped
-/// A scoped `last_git_sha_<repo>` copy is not required because sync cycles
-/// persist the SVN cursor without always mirroring Git.
+/// `last_git_sha_<repo>` copy is not required because sync cycles persist the
+/// SVN cursor without always mirroring Git.
 pub fn resolve_repo_import_baseline(
     db: &Database,
     repo_id: &str,
@@ -262,11 +272,13 @@ pub fn resolve_repo_import_baseline(
         }
     }
 
+    let scoped_svn_key = format!("last_svn_rev_{repo_id}");
+    let scoped_git_key = format!("last_git_sha_{repo_id}");
     let scoped_svn = db
-        .get_state(&format!("last_svn_rev_{repo_id}"))?
+        .get_state(&scoped_svn_key)?
         .and_then(|value| value.parse::<i64>().ok());
     let has_scoped_git = db
-        .get_state(&format!("last_git_sha_{repo_id}"))?
+        .get_state(&scoped_git_key)?
         .filter(|value| !value.is_empty())
         .is_some();
     let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
@@ -276,20 +288,41 @@ pub fn resolve_repo_import_baseline(
     let column_imported = repo.last_svn_rev > 0 && !repo.last_git_sha.is_empty();
 
     if column_imported {
-        if !has_scoped_svn {
-            db.set_state(
-                &format!("last_svn_rev_{repo_id}"),
-                &repo.last_svn_rev.to_string(),
+        return db.transaction(|tx| {
+            let (column_svn_rev, column_git_sha): (i64, String) = tx.query_row(
+                "SELECT last_svn_rev, last_git_sha FROM repositories WHERE id = ?1",
+                params![repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-        } else if scoped_svn != Some(repo.last_svn_rev) {
-            return Ok(RepoImportBaseline::ReconciliationRequired {
-                reason: "conflicting_import_checkpoint".into(),
-                detail: "repository column and scoped svn_rev cursor disagree".into(),
-            });
-        }
-        return Ok(RepoImportBaseline::Verified {
-            svn_rev: repo.last_svn_rev,
-            git_sha: repo.last_git_sha.clone(),
+            if column_svn_rev <= 0 || column_git_sha.is_empty() {
+                return Ok(RepoImportBaseline::Pending);
+            }
+
+            let mut scoped_svn_rev =
+                kv_state_value_tx(tx, &scoped_svn_key)?.and_then(|value| value.parse::<i64>().ok());
+            let has_scoped_svn = scoped_svn_rev.is_some_and(|rev| rev > 0);
+            if !has_scoped_svn {
+                let now = Utc::now().to_rfc3339();
+                tx.execute(
+                    "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(key) DO NOTHING",
+                    params![scoped_svn_key, column_svn_rev.to_string(), now],
+                )?;
+                scoped_svn_rev = kv_state_value_tx(tx, &scoped_svn_key)?
+                    .and_then(|value| value.parse::<i64>().ok());
+            }
+
+            if scoped_svn_rev != Some(column_svn_rev) {
+                return Ok(RepoImportBaseline::ReconciliationRequired {
+                    reason: "conflicting_import_checkpoint".into(),
+                    detail: "repository column and scoped svn_rev cursor disagree".into(),
+                });
+            }
+
+            Ok(RepoImportBaseline::Verified {
+                svn_rev: column_svn_rev,
+                git_sha: column_git_sha,
+            })
         });
     }
 
@@ -1005,6 +1038,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::watermark_recovery::recover_repo_watermark_from_global_migration;
     use rusqlite::params;
 
     #[test]
@@ -1734,6 +1768,41 @@ mod tests {
                 ..
             } if reason == "conflicting_import_checkpoint"
         ));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_backfill_does_not_clobber_existing_scoped_key() {
+        let (_dir, db, _workdir) = open_repo("race");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=2,last_git_sha=?1,last_sync_at=datetime('now') WHERE id='race'",
+                [BASELINE_SHA],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_race", "5").unwrap();
+        let baseline = resolve_repo_import_baseline(&db, "race").unwrap();
+        assert!(matches!(
+            baseline,
+            RepoImportBaseline::ReconciliationRequired {
+                reason,
+                ..
+            } if reason == "conflicting_import_checkpoint"
+        ));
+        assert_eq!(db.get_state("last_svn_rev_race").unwrap(), Some("5".into()));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_global_recovery_columns_only_stays_pending() {
+        let (_dir, db, _workdir) = open_repo("recovery");
+        db.set_watermark("svn_rev", "9").unwrap();
+        db.set_watermark("git_sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        assert!(recover_repo_watermark_from_global_migration(&db, "recovery").unwrap());
+        assert_eq!(db.get_state("last_svn_rev_recovery").unwrap(), None);
+        assert_eq!(
+            resolve_repo_import_baseline(&db, "recovery").unwrap(),
+            RepoImportBaseline::Pending
+        );
     }
 
     #[test]
