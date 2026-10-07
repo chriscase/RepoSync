@@ -899,8 +899,8 @@ async fn candidate_rs11_setup_import_config_remote_ignores_managed_chain() {
         .unwrap();
 
     let workdir = tmp.path().join("git-repo");
-    let config_origin = format!("file://{}", bare.display());
-    prepare_config_git_repo(&workdir, &bare, &config_origin);
+    let config_origin = "http://git.test.invalid/local/history.git";
+    prepare_config_git_repo(&workdir, &bare, config_origin);
 
     let client = authed_client();
     let started = client
@@ -917,6 +917,10 @@ async fn candidate_rs11_setup_import_config_remote_ignores_managed_chain() {
 
     let url = git_origin_url(&workdir);
     assert_eq!(url, config_origin);
+    assert!(
+        !url.contains("x-access-token:"),
+        "setup import must not embed credentials on config remote: {url}"
+    );
     assert!(
         !url.contains(managed_token),
         "setup import must not embed managed repo token on config remote: {url}"
@@ -948,8 +952,8 @@ async fn candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation() 
         .unwrap();
 
     let workdir = tmp.path().join("git-repo");
-    let config_origin = format!("file://{}", bare.display());
-    prepare_config_git_repo(&workdir, &bare, &config_origin);
+    let config_origin = "http://git.test.invalid/local/history.git";
+    prepare_config_git_repo(&workdir, &bare, config_origin);
 
     let client = authed_client();
     let started = client

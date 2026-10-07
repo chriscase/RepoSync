@@ -223,6 +223,38 @@ fn gitattributes_line_is_planted_filter(line: &str) -> bool {
     })
 }
 
+/// Engine-owned LFS lines always carry the full tracking attribute set.
+fn gitattributes_line_is_full_engine_lfs(line: &str) -> bool {
+    let trimmed = line.trim();
+    gitattributes_line_has_exact_attribute(trimmed, "filter=lfs")
+        && gitattributes_line_has_exact_attribute(trimmed, "diff=lfs")
+        && gitattributes_line_has_exact_attribute(trimmed, "merge=lfs")
+        && trimmed.contains("-text")
+}
+
+fn export_body_contains_line(export_body: &str, line: &str) -> bool {
+    let trimmed = line.trim();
+    export_body
+        .lines()
+        .any(|candidate| candidate.trim() == trimmed)
+}
+
+/// Destination-only bare `filter=lfs` rules (for example `* filter=lfs` without
+/// the engine's `diff=lfs merge=lfs -text` bundle) are planted filter rules.
+fn gitattributes_line_is_planted_dest_lfs(line: &str, export_body: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    if !gitattributes_line_has_exact_attribute(trimmed, "filter=lfs") {
+        return false;
+    }
+    if gitattributes_line_is_full_engine_lfs(trimmed) {
+        return false;
+    }
+    !export_body_contains_line(export_body, trimmed)
+}
+
 fn push_gitattributes_line(lines: &mut Vec<String>, line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -236,6 +268,15 @@ fn push_gitattributes_line(lines: &mut Vec<String>, line: &str) {
 /// Merge export-shipped `.gitattributes` with engine LFS lines already on the
 /// destination and, when `strip_planted` is set, lines recorded in
 /// [`engine_gitattributes_body`].
+///
+/// Fail-closed rules when `strip_planted` is true:
+/// - export lines always survive;
+/// - destination-only planted `filter=` rules (including bare `* filter=lfs`)
+///   are dropped;
+/// - engine-recorded LFS lines from [`engine_gitattributes_body`] are merged in.
+///
+/// When `strip_planted` is false, legitimate destination engine LFS lines with
+/// the full tracking attribute bundle may be kept alongside export lines.
 pub(crate) fn merge_export_present_gitattributes(
     export_body: &str,
     dest_body: Option<&str>,
@@ -247,14 +288,16 @@ pub(crate) fn merge_export_present_gitattributes(
         push_gitattributes_line(&mut lines, line);
     }
 
-    if let Some(body) = dest_body {
-        for line in body.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            if gitattributes_line_has_exact_attribute(trimmed, "filter=lfs") {
-                push_gitattributes_line(&mut lines, trimmed);
+    if !strip_planted {
+        if let Some(body) = dest_body {
+            for line in body.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if gitattributes_line_has_exact_attribute(trimmed, "filter=lfs") {
+                    push_gitattributes_line(&mut lines, trimmed);
+                }
             }
         }
     }
@@ -278,10 +321,16 @@ pub(crate) fn merge_export_present_gitattributes(
 pub(crate) fn export_present_gitattributes_needs_strip(
     dest_was_symlink: bool,
     dest_body: Option<&str>,
+    export_body: &str,
 ) -> bool {
     dest_was_symlink
         || dest_body
-            .map(|body| body.lines().any(gitattributes_line_is_planted_filter))
+            .map(|body| {
+                body.lines().any(|line| {
+                    gitattributes_line_is_planted_filter(line)
+                        || gitattributes_line_is_planted_dest_lfs(line, export_body)
+                })
+            })
             .unwrap_or(false)
 }
 
@@ -699,20 +748,53 @@ mod tests {
         );
         assert_eq!(
             merged,
-            "* text=auto\n* filter=lfs\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
         );
         assert!(
             !merged.contains("lfsevil"),
             "filter=lfsevil must not be treated as engine LFS: {merged}"
         );
         assert!(!merged.contains("filter=evil"), "{merged}");
+        assert!(
+            !merged.contains("* filter=lfs\n"),
+            "destination-only bare filter=lfs must not survive: {merged}"
+        );
+    }
+
+    #[test]
+    fn test_merge_export_present_gitattributes_strips_dest_only_bare_filter_lfs() {
+        let merged = merge_export_present_gitattributes(
+            "* text=auto\n",
+            Some("* filter=lfs\n"),
+            Some("*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            true,
+        );
+        assert_eq!(
+            merged,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
     }
 
     #[test]
     fn test_export_present_gitattributes_needs_strip_ignores_commented_filter() {
         assert!(!export_present_gitattributes_needs_strip(
             false,
-            Some("# don't use filter=ident here\n* text=auto\n")
+            Some("# don't use filter=ident here\n* text=auto\n"),
+            "* text=auto\n"
+        ));
+    }
+
+    #[test]
+    fn test_export_present_gitattributes_needs_strip_detects_dest_only_bare_filter_lfs() {
+        assert!(export_present_gitattributes_needs_strip(
+            false,
+            Some("* filter=lfs\n"),
+            "* text=auto\n"
+        ));
+        assert!(!export_present_gitattributes_needs_strip(
+            false,
+            Some("*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            "* text=auto\n"
         ));
     }
 

@@ -404,15 +404,6 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
             reject_hardlink_alias(ctx.db, ctx.stats, &rel)?;
         }
 
-        if file_name == ".gitattributes" && dst == ctx.dst_root {
-            crate::lfs::unlink_gitattributes_symlink(&dst_path).with_context(|| {
-                format!(
-                    "failed to unlink planted .gitattributes symlink before copy: {}",
-                    dst_path.display()
-                )
-            })?;
-        }
-
         // Size comes from no-follow metadata; never call evaluate_path (it follows).
         let decision = ctx.policy.evaluate(&rel, meta.len());
         match &decision {
@@ -466,13 +457,9 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
 }
 
 fn copy_regular_file_no_follow(src: &Path, dst: &Path, src_meta: &std::fs::Metadata) -> Result<()> {
+    unlink_dest_symlink_before_copy(dst)?;
     let mut reader = open_no_follow_read(src)?;
-    let mut writer = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(dst)
-        .with_context(|| format!("failed to create {}", dst.display()))?;
+    let mut writer = open_no_follow_write(dst)?;
     std::io::copy(&mut reader, &mut writer)
         .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))?;
     writer
@@ -480,6 +467,69 @@ fn copy_regular_file_no_follow(src: &Path, dst: &Path, src_meta: &std::fs::Metad
         .with_context(|| format!("failed to flush {}", dst.display()))?;
     apply_source_permissions(dst, src_meta)?;
     Ok(())
+}
+
+/// Remove a planted destination symlink before publish. Applies to every copied
+/// path, not only root `.gitattributes`.
+fn unlink_dest_symlink_before_copy(dst: &Path) -> Result<()> {
+    crate::lfs::unlink_gitattributes_symlink(dst).with_context(|| {
+        format!(
+            "failed to unlink planted destination symlink before copy: {}",
+            dst.display()
+        )
+    })
+}
+
+/// Open a destination for write without following symlinks. Uses `O_NOFOLLOW`
+/// and create-exclusive for new paths so a symlink raced in after unlink is
+/// refused instead of written through.
+fn open_no_follow_write(dst: &Path) -> Result<std::fs::File> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to write through symlink at {}: destination must be a regular file",
+                dst.display()
+            );
+        }
+        Ok(meta) if meta.file_type().is_file() => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            opts.open(dst).with_context(|| {
+                format!(
+                    "failed to open {} for write without following",
+                    dst.display()
+                )
+            })
+        }
+        Ok(_) => {
+            bail!(
+                "refusing to overwrite non-regular file at {}",
+                dst.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_NOFOLLOW);
+            }
+            opts.open(dst)
+                .with_context(|| format!("failed to create {} without following", dst.display()))
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to stat {} without following before write",
+                dst.display()
+            )
+        }),
+    }
 }
 
 fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
@@ -1015,16 +1065,17 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
             } else {
                 None
             };
-            let strip_planted = crate::lfs::export_present_gitattributes_needs_strip(
-                dest_was_symlink,
-                dest_body.as_deref(),
-            );
             let export_body = read_regular_file_no_follow(src_path).with_context(|| {
                 format!(
                     "failed to read exported .gitattributes: {}",
                     src_path.display()
                 )
             })?;
+            let strip_planted = crate::lfs::export_present_gitattributes_needs_strip(
+                dest_was_symlink,
+                dest_body.as_deref(),
+                &export_body,
+            );
             let engine_body = if strip_planted {
                 crate::lfs::engine_gitattributes_body(dst_root).with_context(|| {
                     format!("failed to read engine LFS marker in {}", dst_root.display())
@@ -4042,6 +4093,106 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
             "OUTSIDE-EXPORT-CANARY filter=evil\n"
+        );
+    }
+
+    #[test]
+    fn import_copy_nested_gitattributes_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-nested-attrs");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(dst.join("sub")).unwrap();
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        std::fs::write(src.join("sub/.gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.join("sub/readme.txt"), "hello").unwrap();
+        symlink(&outside, dst.join("sub/.gitattributes")).unwrap();
+
+        copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap();
+
+        let meta = std::fs::symlink_metadata(dst.join("sub/.gitattributes")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "nested copy must replace a planted .gitattributes symlink with a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/.gitattributes")).unwrap(),
+            "* text=auto\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "must not write through the planted nested .gitattributes symlink"
+        );
+    }
+
+    #[test]
+    fn import_copy_dest_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-secret");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(&outside, "SECRET").unwrap();
+        std::fs::write(src.join("payload.txt"), "copied").unwrap();
+        symlink(&outside, dst.join("payload.txt")).unwrap();
+
+        copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap();
+
+        let meta = std::fs::symlink_metadata(dst.join("payload.txt")).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(
+            std::fs::read_to_string(dst.join("payload.txt")).unwrap(),
+            "copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "SECRET",
+            "must not write through a planted destination symlink"
+        );
+    }
+
+    #[test]
+    fn import_copy_open_no_follow_write_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let dst = tmp.path().join("dst.txt");
+        std::fs::write(&outside, "SECRET").unwrap();
+        symlink(&outside, &dst).unwrap();
+
+        let err = open_no_follow_write(&dst).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "SECRET");
+    }
+
+    #[test]
+    fn import_export_present_strips_dest_only_bare_filter_lfs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.path().join("model.bin"), vec![0u8; 200]).unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(dst.path().join(".gitattributes"), "* filter=lfs\n").unwrap();
+
+        let policy = FilePolicy::with_lfs(0, vec![], 100, &[]);
+        copy_tree_with_policy(src.path(), dst.path(), &policy, &test_db()).unwrap();
+        remove_stale_files(src.path(), dst.path()).unwrap();
+
+        let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(
+            after,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+        assert!(
+            !after.lines().any(|line| line.trim() == "* filter=lfs"),
+            "destination-only bare filter=lfs must not survive: {after}"
         );
     }
 
