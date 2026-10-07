@@ -518,6 +518,7 @@ impl GitToSvnSync {
             .await
             .context("svn update failed")?;
 
+        let mut apply_touched = Vec::new();
         let replay_result: Result<i64> = async {
             let info = self
                 .svn
@@ -528,7 +529,7 @@ impl GitToSvnSync {
                 .context("failed to hash pre-write SVN working copy")?;
 
             // 2. Copy files from Git repo to SVN working copy.
-            self.apply_git_changes_to_svn(commit)
+            self.apply_git_changes_to_svn_inner(commit, &mut apply_touched)
                 .await
                 .context("failed to apply git changes to SVN working copy")?;
 
@@ -758,13 +759,14 @@ impl GitToSvnSync {
             Err(error) => {
                 let err_text = format!("{:#}", error);
                 if !err_text.contains("reconciliation_required") {
-                    if let Err(restore_err) = self.restore_svn_working_copy_after_abort().await {
-                        error!(
-                            error = %restore_err,
-                            git_sha = %commit.sha,
-                            "failed to restore SVN working copy after git-to-svn apply abort"
-                        );
-                    }
+                    self.restore_svn_working_copy_after_abort(&apply_touched)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to restore SVN working copy after git-to-svn apply abort for {}",
+                                commit.sha
+                            )
+                        })?;
                 }
                 Err(error)
             }
@@ -778,23 +780,33 @@ impl GitToSvnSync {
     ///
     /// Public for integration testing (drives the real LFS-pointer-skip and
     /// policy-evaluation code paths without needing GitHub API calls).
+    #[allow(dead_code)]
     pub async fn apply_git_changes_to_svn(&self, commit: &GitHubCommit) -> Result<()> {
-        match self.apply_git_changes_to_svn_inner(commit).await {
+        let mut touched = Vec::new();
+        match self
+            .apply_git_changes_to_svn_inner(commit, &mut touched)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) => {
-                if let Err(restore_err) = self.restore_svn_working_copy_after_abort().await {
-                    error!(
-                        error = %restore_err,
-                        git_sha = %commit.sha,
-                        "failed to restore SVN working copy after git-to-svn apply abort"
-                    );
-                }
+                self.restore_svn_working_copy_after_abort(&touched)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to restore SVN working copy after git-to-svn apply abort for {}",
+                            commit.sha
+                        )
+                    })?;
                 Err(error)
             }
         }
     }
 
-    async fn apply_git_changes_to_svn_inner(&self, commit: &GitHubCommit) -> Result<()> {
+    async fn apply_git_changes_to_svn_inner(
+        &self,
+        commit: &GitHubCommit,
+        touched_paths: &mut Vec<String>,
+    ) -> Result<()> {
         let git_client = GitClient::new(&self.git_repo_path)
             .context("failed to open local git repo for commit diff")?;
 
@@ -810,6 +822,7 @@ impl GitToSvnSync {
         let file_changes = projected.into_file_contents();
         for (action, file_path, content) in &file_changes {
             let dst = self.svn_wc_path.join(file_path);
+            touched_paths.push(file_path.clone());
 
             match action.as_str() {
                 "D" => {
@@ -1007,19 +1020,24 @@ impl GitToSvnSync {
         Ok(())
     }
 
-    /// Restore the SVN working copy to its pre-apply state after a mid-apply abort.
-    async fn restore_svn_working_copy_after_abort(&self) -> Result<()> {
+    /// Restore only the paths touched by this apply after a mid-apply abort.
+    async fn restore_svn_working_copy_after_abort(&self, touched_paths: &[String]) -> Result<()> {
+        if touched_paths.is_empty() {
+            return Ok(());
+        }
+
+        let refs: Vec<&str> = touched_paths.iter().map(|path| path.as_str()).collect();
         self.svn
-            .revert_recursive(&self.svn_wc_path)
+            .revert_files(&self.svn_wc_path, &refs)
             .await
-            .context("svn revert -R failed while restoring working copy")?;
+            .context("svn revert failed while restoring touched apply paths")?;
 
         let status_output = self
             .svn
             .status(&self.svn_wc_path)
             .await
             .context("svn status failed while restoring working copy")?;
-        remove_abort_leftover_paths(&self.svn_wc_path, &status_output)
+        remove_abort_leftover_paths(&self.svn_wc_path, &status_output, touched_paths)
             .context("failed to remove unversioned apply leftovers")?;
 
         let final_status = self
@@ -1027,15 +1045,16 @@ impl GitToSvnSync {
             .status(&self.svn_wc_path)
             .await
             .context("svn status failed while verifying restored working copy")?;
-        if !is_svn_working_copy_clean(&final_status) {
+        if !are_apply_paths_clean(&final_status, touched_paths) {
             anyhow::bail!(
-                "SVN working copy is not clean after apply abort restore: {}",
+                "SVN working copy still dirty on touched apply paths after abort restore: {}",
                 final_status.trim()
             );
         }
 
         debug!(
             wc = %self.svn_wc_path.display(),
+            touched = touched_paths.len(),
             "restored SVN working copy after git-to-svn apply abort"
         );
         Ok(())
@@ -1267,9 +1286,25 @@ fn remove_stale_files(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-/// True when `svn status` reports no pending working-copy changes.
-fn is_svn_working_copy_clean(output: &str) -> bool {
-    output.lines().all(|line| line.trim().is_empty())
+/// True when none of the touched apply paths appear in `svn status` output.
+fn are_apply_paths_clean(status_output: &str, touched_paths: &[String]) -> bool {
+    if touched_paths.is_empty() {
+        return true;
+    }
+    for line in status_output.lines() {
+        let line = line.trim_end();
+        if line.len() < 2 {
+            continue;
+        }
+        let path = line[1..].trim_start();
+        if path.is_empty() {
+            continue;
+        }
+        if touched_paths.iter().any(|touched| touched == path) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Paths created by a partial apply that must be removed after `svn revert -R`.
@@ -1294,8 +1329,16 @@ fn collect_abort_leftover_paths(output: &str) -> Vec<String> {
 }
 
 /// Remove unversioned or newly-added paths left behind by a partial apply.
-fn remove_abort_leftover_paths(wc_root: &Path, status_output: &str) -> Result<()> {
+fn remove_abort_leftover_paths(
+    wc_root: &Path,
+    status_output: &str,
+    scope: &[String],
+) -> Result<()> {
+    let scope: std::collections::HashSet<&str> = scope.iter().map(|path| path.as_str()).collect();
     for rel_path in collect_abort_leftover_paths(status_output) {
+        if !scope.contains(rel_path.as_str()) {
+            continue;
+        }
         let full_path = wc_root.join(&rel_path);
         if full_path.is_dir() {
             std::fs::remove_dir_all(&full_path).with_context(|| {
@@ -1378,13 +1421,6 @@ A       src/already_added.rs
     }
 
     #[test]
-    fn test_is_svn_working_copy_clean() {
-        assert!(is_svn_working_copy_clean(""));
-        assert!(is_svn_working_copy_clean("\n\n"));
-        assert!(!is_svn_working_copy_clean("M       src/lib.rs\n"));
-    }
-
-    #[test]
     fn test_collect_abort_leftover_paths() {
         let output = "\
 ?       src/new_file.rs
@@ -1409,17 +1445,35 @@ A       src/added.rs
     fn test_remove_abort_leftover_paths() {
         let wc = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(wc.path().join("src")).unwrap();
+        std::fs::create_dir_all(wc.path().join("docs")).unwrap();
         std::fs::write(wc.path().join("src/new_file.rs"), "new").unwrap();
         std::fs::write(wc.path().join("src/modified.rs"), "old").unwrap();
+        std::fs::write(wc.path().join("docs/unrelated.md"), "keep").unwrap();
 
         let output = "\
 ?       src/new_file.rs
 M       src/modified.rs
+?       docs/unrelated.md
 ";
-        remove_abort_leftover_paths(wc.path(), output).unwrap();
+        let scope = vec!["src/new_file.rs".to_string()];
+        remove_abort_leftover_paths(wc.path(), output, &scope).unwrap();
 
         assert!(!wc.path().join("src/new_file.rs").exists());
         assert!(wc.path().join("src/modified.rs").exists());
+        assert!(wc.path().join("docs/unrelated.md").exists());
+    }
+
+    #[test]
+    fn test_are_apply_paths_clean() {
+        let status = "\
+M       src/modified.rs
+?       docs/unrelated.md
+";
+        assert!(are_apply_paths_clean(status, &["other.txt".to_string()]));
+        assert!(!are_apply_paths_clean(
+            status,
+            &["src/modified.rs".to_string()]
+        ));
     }
 
     #[test]

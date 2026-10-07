@@ -2704,9 +2704,7 @@ fn test_resolve_lfs_pointer_reads_local_object_with_skip_smudge() {
     std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
     std::fs::write(&object_path, payload).unwrap();
 
-    std::env::set_var("GIT_LFS_SKIP_SMUDGE", "1");
     let resolved = reposync_core::lfs::resolve_lfs_pointer(tmp.path(), pointer.as_bytes()).unwrap();
-    std::env::remove_var("GIT_LFS_SKIP_SMUDGE");
 
     assert_eq!(resolved, payload);
 }
@@ -2714,8 +2712,7 @@ fn test_resolve_lfs_pointer_reads_local_object_with_skip_smudge() {
 #[tokio::test]
 async fn test_personal_git_to_svn_unresolved_lfs_holds_without_checkpoint() {
     if !svn_available() {
-        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
-        return;
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
     }
 
     let tmp = TempDir::new().unwrap();
@@ -2796,8 +2793,7 @@ async fn candidate_rs05_personal_lfs_abort_cleans_sibling_and_stops_batch() {
     use reposync_core::git::github::GitHubClient;
 
     if !svn_available() {
-        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
-        return;
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
     }
 
     let tmp = TempDir::new().unwrap();
@@ -2805,6 +2801,7 @@ async fn candidate_rs05_personal_lfs_abort_cleans_sibling_and_stops_batch() {
     let svn_wc = tmp.path().join("svn_wc");
     svn_checkout(&svn_url, &svn_wc);
     svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+    std::fs::write(svn_wc.join("unrelated-unversioned.txt"), "leave me").unwrap();
     let svn_before = svn_youngest(&svn_url);
 
     let git_work = tmp.path().join("git_work");
@@ -2916,11 +2913,25 @@ async fn candidate_rs05_personal_lfs_abort_cleans_sibling_and_stops_batch() {
         wc_status.status.success(),
         "svn status must succeed after abort restore"
     );
+    let status_text = String::from_utf8_lossy(&wc_status.stdout);
+    let status_lines: Vec<&str> = status_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        status_lines.len(),
+        1,
+        "unexpected svn status after abort restore"
+    );
     assert!(
-        String::from_utf8_lossy(&wc_status.stdout)
-            .lines()
-            .all(|line| line.trim().is_empty()),
-        "SVN working copy must be clean after abort restore"
+        status_lines[0].starts_with('?') && status_lines[0].ends_with("unrelated-unversioned.txt"),
+        "abort restore must clean only apply-touched paths, leaving unrelated unversioned files: {:?}",
+        status_lines
+    );
+    assert!(
+        svn_wc.join("unrelated-unversioned.txt").is_file(),
+        "narrow abort restore must not delete unrelated unversioned files"
     );
 
     eprintln!(
@@ -2944,8 +2955,7 @@ async fn candidate_rs05_personal_lfs_abort_retries_in_order() {
     use reposync_core::git::github::GitHubClient;
 
     if !svn_available() {
-        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
-        return;
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
     }
 
     let tmp = TempDir::new().unwrap();
@@ -5066,6 +5076,13 @@ async fn candidate_rs05_personal_initial_import_still_works() {
 
     assert_eq!(count, 1);
     assert_eq!(db.list_commit_map(10).unwrap().len(), 1);
+    assert!(
+        db.list_commit_map(10)
+            .unwrap()
+            .iter()
+            .all(|entry| entry.repo_id.as_deref() == Some(PERSONAL_SCOPE_KEY)),
+        "initial import must tag commit_map rows with the personal scope key"
+    );
     assert!(db.get_watermark("svn_rev").unwrap().is_some());
     assert!(db.get_watermark("git_sha").unwrap().is_some());
     assert!(
@@ -5767,14 +5784,138 @@ async fn test_personal_svn_to_git_imports_after_managed_snapshot_null_commit_map
         .await
         .expect("personal svn-to-git must import managed snapshot collision at r1");
     assert_eq!(synced, 1, "revision 1 must be imported, not skipped");
-    assert!(
-        db_arc
-            .list_commit_map(10)
-            .unwrap()
-            .iter()
-            .any(|entry| entry.svn_rev == 1 && entry.direction == "svn_to_git"),
-        "personal import must record commit_map for r1"
+    let head_after = git_sha(&git_work_dir);
+    assert_ne!(
+        head_after, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "personal import must create a new Git commit, not pass on the seeded NULL row"
     );
+    assert!(
+        db_arc.list_commit_map(10).unwrap().iter().any(|entry| {
+            entry.svn_rev == 1
+                && entry.direction == "svn_to_git"
+                && entry.repo_id.as_deref() == Some(PERSONAL_SCOPE_KEY)
+                && entry.git_sha == head_after
+        }),
+        "personal import must record a scoped commit_map row for the emitted Git SHA"
+    );
+    assert_eq!(
+        db_arc.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("1"),
+        "personal svn_rev watermark must advance after import"
+    );
+}
+
+/// A crash after scoped `commit_map` but before the watermark must not create a
+/// second Git commit when `SvnToGitSync::sync` resumes.
+#[tokio::test]
+async fn test_personal_initial_import_crash_resume_no_duplicate_commit() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::initial_import::{ImportMode, InitialImport};
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "resume.txt", "resume seed\n", "resume seed");
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    git2::Repository::init_bare(&bare).unwrap();
+    let git_client = GitClient::init(&git_work).unwrap();
+    {
+        let repo = git2::Repository::open(&git_work).unwrap();
+        repo.remote("origin", bare.to_str().unwrap()).unwrap();
+    }
+    git_cmd(&git_work, &["checkout", "-b", "main"]);
+    let git_arc = Arc::new(Mutex::new(git_client));
+
+    let db_path = tmp.path().join("personal.db");
+    let db = Database::new(&db_path).unwrap();
+    db.initialize().unwrap();
+
+    let (api_url, stub) = spawn_github_exists_stub();
+    let config = PersonalConfig {
+        personal: PersonalSection {
+            poll_interval_secs: 5,
+            log_level: "debug".into(),
+            data_dir: tmp.path().to_path_buf(),
+            status_port: None,
+        },
+        svn: PersonalSvnConfig {
+            url: svn_url.clone(),
+            username: String::new(),
+            password_env: "REPOSYNC_TEST_SVN_PW".into(),
+            password: Some(String::new()),
+        },
+        github: PersonalGitHubConfig {
+            api_url,
+            git_base_url: None,
+            repo: "test/test-repo".into(),
+            token_env: "REPOSYNC_TEST_GH_TOKEN".into(),
+            default_branch: "main".into(),
+            auto_create: false,
+            private: true,
+            token: Some("unused".into()),
+        },
+        developer: DeveloperConfig {
+            name: "Test User".into(),
+            email: "test@example.com".into(),
+            svn_username: "testuser".into(),
+        },
+        commit_format: CommitFormatConfig::default(),
+        options: PersonalOptionsConfig::default(),
+        identity: None,
+    };
+
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let github_client = GitHubClient::new(&config.github.api_url, "unused", GitProvider::GitHub);
+    let formatter = CommitFormatter::new(&config.commit_format);
+    let importer = InitialImport {
+        svn_client: &svn_client,
+        git_client: &git_arc,
+        github_client: &github_client,
+        db: &db,
+        config: &config,
+        formatter: &formatter,
+    };
+    importer
+        .import(ImportMode::Snapshot)
+        .await
+        .expect("initial snapshot import must succeed");
+    drop(stub);
+
+    let head_before = git_sha(&git_work);
+    db.conn()
+        .execute("DELETE FROM watermarks WHERE source = 'svn_rev'", [])
+        .unwrap();
+    db.conn().execute("DELETE FROM sync_records", []).unwrap();
+    assert!(
+        db.is_personal_svn_rev_synced(1).unwrap(),
+        "scoped commit_map alone must count as synced after crash before watermark"
+    );
+    assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), None);
+
+    let db_arc = Arc::new(db);
+    let syncer = SvnToGitSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        git_arc,
+        db_arc.clone(),
+        config,
+    );
+    let synced = syncer
+        .sync()
+        .await
+        .expect("resume sync must succeed without duplicate commit");
+    assert_eq!(
+        synced, 0,
+        "already-mapped revision must not be re-exported after crash"
+    );
+    assert_eq!(git_sha(&git_work), head_before);
     assert_eq!(
         db_arc.get_watermark("svn_rev").unwrap().as_deref(),
         Some("1")

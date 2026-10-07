@@ -251,27 +251,19 @@ impl<'a> InitialImport<'a> {
                 .context("failed to push to GitHub")?;
         }
 
-        // Record in database
+        // Record checkpoint atomically: scoped commit_map, receipt, and watermarks.
         self.db
-            .insert_commit_map(
+            .checkpoint_personal_snapshot_import(
                 head_rev,
                 &sha,
-                "svn_to_git",
                 &self.config.developer.svn_username,
                 &format!(
                     "{} <{}>",
                     self.config.developer.name, self.config.developer.email
                 ),
+                "svn_rev",
             )
-            .context("failed to record in commit_map")?;
-
-        self.db
-            .set_watermark("svn_rev", &head_rev.to_string())
-            .context("failed to set SVN watermark")?;
-
-        self.db
-            .set_legacy_import_git_sha_watermark(&sha)
-            .context("failed to set Git watermark")?;
+            .context("failed to checkpoint personal snapshot import")?;
 
         self.db
             .insert_audit_log(
@@ -428,15 +420,14 @@ impl<'a> InitialImport<'a> {
                     let sha = oid.to_string();
                     debug!(rev, sha = %sha, author = %author_name, "committed revision");
 
-                    self.db
-                        .insert_commit_map(
-                            rev,
-                            &sha,
-                            "svn_to_git",
-                            &entry.author,
-                            &format!("{} <{}>", author_name, author_email),
-                        )
-                        .ok();
+                    if let Err(e) = self.db.record_personal_import_revision(
+                        rev,
+                        &sha,
+                        &entry.author,
+                        &format!("{} <{}>", author_name, author_email),
+                    ) {
+                        warn!(rev, error = %e, "failed to record personal import revision mapping");
+                    }
 
                     count += 1;
                 }
@@ -459,18 +450,15 @@ impl<'a> InitialImport<'a> {
 
         // Set watermarks (both must succeed or the import fails closed).
         if let Some(last) = log_entries.last() {
+            let git_client = self.git_client.lock().unwrap();
+            let head_sha = git_client
+                .get_head_sha()
+                .context("failed to read Git HEAD")?;
+            drop(git_client);
             self.db
-                .set_watermark("svn_rev", &last.revision.to_string())
-                .context("failed to set SVN watermark")?;
+                .finalize_personal_full_import_watermarks(last.revision, &head_sha)
+                .context("failed to finalize personal full-import watermarks")?;
         }
-
-        let git_client = self.git_client.lock().unwrap();
-        if let Ok(sha) = git_client.get_head_sha() {
-            self.db
-                .set_legacy_import_git_sha_watermark(&sha)
-                .context("failed to set Git watermark")?;
-        }
-        drop(git_client);
 
         self.db
             .insert_audit_log(
