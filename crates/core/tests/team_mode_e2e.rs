@@ -20,7 +20,6 @@ use tempfile::TempDir;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
-use reposync_core::db::queries::CredentialChainState;
 use reposync_core::db::watermark_recovery::{
     persist_git_log_auto_detect_watermark, recover_repo_watermark_from_git_log_scan,
     recover_repo_watermark_from_global_migration,
@@ -6867,7 +6866,7 @@ async fn test_team_mode_marker_without_receipt_applies_once() {
     let fixture = QualifiedPair::new_with_repo_id("marker-once").await;
     let repo_id = fixture.repo_id.as_str();
     let svn_before = svn_youngest(&fixture.svn_url);
-    let marker_message = format!("User work\n\n[reposync] forged marker without receipt");
+    let marker_message = "User work\n\n[reposync] forged marker without receipt".to_string();
     let sha =
         fixture.developer_commit_tree(&[("marker.txt", Some("marker body\n"))], &marker_message);
     git_cli(&fixture.developer, &["push", "origin", "main"]);
@@ -11023,16 +11022,27 @@ async fn candidate_rs11_import_chain_miss_preserves_embedded_git_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rs11_chain_db_error_preserves_embedded_git_token() {
     let embedded = "embedded-db-error-token";
-    let (_tmp, bridge, _db_path, _repo_id) = rs11_embedded_git_fixture(embedded);
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
     let before = git_origin_url(&bridge);
 
+    let db = setup_db(&db_path);
+    // Force a genuine kv_state lookup failure (not a plain miss).
+    db.conn().execute("DROP TABLE kv_state", []).unwrap();
+
     let git = GitClient::new(&bridge).unwrap();
-    apply_git_credential_chain_state(&git, "origin", &CredentialChainState::not_found()).unwrap();
+    let state = db.resolve_credential_chain_state(&repo_id, "secret_git_token");
+    assert!(
+        !state.explicitly_revoked,
+        "DB lookup error must not be treated as revocation"
+    );
+    assert!(state.value.is_none());
+
+    apply_managed_git_credentials(&git, &db, &repo_id, "origin").unwrap();
 
     assert_eq!(
         git_origin_url(&bridge),
         before,
-        "chain DB error / not-found must not strip embedded git token"
+        "chain DB error must not strip embedded git token"
     );
     assert!(before.contains(embedded));
 
@@ -11040,7 +11050,8 @@ async fn candidate_rs11_chain_db_error_preserves_embedded_git_token() {
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT",
-            "embedded_preserved":true
+            "embedded_preserved":true,
+            "db_lookup_error":true
         })
     );
 }

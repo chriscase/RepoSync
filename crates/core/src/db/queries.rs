@@ -3521,4 +3521,14 @@ mod tests {
         assert_eq!(state.value, None);
         assert!(!state.explicitly_revoked);
     }
+
+    #[test]
+    fn resolve_credential_chain_db_error_is_not_revocation() {
+        let db = setup_db();
+        create_test_repo(&db, "repo_a", "Repo A");
+        db.conn().execute("DROP TABLE kv_state", []).unwrap();
+
+        let state = db.resolve_credential_chain_state("repo_a", "secret_git_token");
+        assert_eq!(state, CredentialChainState::not_found());
+    }
 }
