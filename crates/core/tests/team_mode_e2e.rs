@@ -10389,7 +10389,7 @@ fn assert_git_origin_has_only_canary(bridge: &Path, repo_id: &str, forbidden: &[
 }
 
 struct ScopedCredentialRepo {
-    repo_id: String,
+    _repo_id: String,
     bridge: PathBuf,
     engine: SyncEngine,
 }
@@ -10492,7 +10492,7 @@ impl TwoRepoCredentialFixture {
             repos.insert(
                 repo_id.into(),
                 ScopedCredentialRepo {
-                    repo_id: repo_id.into(),
+                    _repo_id: repo_id.into(),
                     bridge,
                     engine,
                 },

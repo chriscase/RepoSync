@@ -152,13 +152,10 @@ impl GitClient {
     }
 
     fn strip_http_credentials(url: &str) -> Option<String> {
-        let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
-            ("https://", r)
-        } else if let Some(r) = url.strip_prefix("http://") {
-            ("http://", r)
-        } else {
-            return None;
-        };
+        let (scheme, rest) = url
+            .strip_prefix("https://")
+            .map(|r| ("https://", r))
+            .or_else(|| url.strip_prefix("http://").map(|r| ("http://", r)))?;
 
         let hostpath = if let Some(at_pos) = rest.find('@') {
             let slash_pos = rest.find('/').unwrap_or(rest.len());
