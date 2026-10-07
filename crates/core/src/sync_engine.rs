@@ -3431,59 +3431,68 @@ impl SyncEngine {
     // Credential hot-reload
     // -----------------------------------------------------------------------
 
+    /// Fixture-only accessor for credential isolation proofs.
+    #[doc(hidden)]
+    pub fn fixture_svn_password_marker(&self) -> String {
+        self.svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .fixture_password_marker()
+            .to_string()
+    }
+
     /// Re-read SVN password and Git token from the DB so that credentials
     /// saved via the repo detail page take effect without a daemon restart.
-    /// Tries per-repo keys first (secret_svn_password_{repo_id}), then falls
-    /// back to global keys for backward compatibility.
+    /// Uses the same scoped resolver as the scheduler: repo → parent chain →
+    /// global, with explicit per-repo revocation blocking broader fallback.
     fn reload_credentials(&self) {
-        // SVN password — per-repo key first, then global
         let svn_pw = self
             .repo_id
             .as_ref()
-            .and_then(|rid| {
-                self.db
-                    .get_state(&format!("secret_svn_password_{}", rid))
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            })
+            .and_then(|rid| self.db.resolve_credential_chain(rid, "secret_svn_password"))
             .or_else(|| {
-                self.db
-                    .get_state("secret_svn_password")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
+                if self.repo_id.is_some() {
+                    None
+                } else {
+                    self.db
+                        .get_state("secret_svn_password")
+                        .ok()
+                        .flatten()
+                        .filter(|v| !v.is_empty())
+                }
             });
-
-        if let Some(pw) = svn_pw {
+        {
             let mut svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner());
-            svn.set_password(pw);
-            debug!("reloaded SVN password from database");
+            if let Some(pw) = svn_pw {
+                svn.set_password(pw);
+                debug!("reloaded SVN password from database");
+            } else {
+                svn.set_password("");
+            }
         }
 
-        // Git token — per-repo key first, then global
         let git_tok = self
             .repo_id
             .as_ref()
-            .and_then(|rid| {
-                self.db
-                    .get_state(&format!("secret_git_token_{}", rid))
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            })
+            .and_then(|rid| self.db.resolve_credential_chain(rid, "secret_git_token"))
             .or_else(|| {
-                self.db
-                    .get_state("secret_git_token")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
+                if self.repo_id.is_some() {
+                    None
+                } else {
+                    self.db
+                        .get_state("secret_git_token")
+                        .ok()
+                        .flatten()
+                        .filter(|v| !v.is_empty())
+                }
             });
-
-        if let Some(token) = git_tok {
+        {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = git.ensure_remote_credentials("origin", Some(&token));
-            debug!("reloaded Git token from database");
+            let token_ref = git_tok.as_deref();
+            let _ = git.ensure_remote_credentials("origin", token_ref);
+            if token_ref.is_some() {
+                debug!("reloaded Git token from database");
+            }
         }
     }
 

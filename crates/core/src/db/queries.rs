@@ -2539,15 +2539,16 @@ impl Database {
 
     /// Resolve a credential (e.g. `secret_svn_password`) by walking the
     /// parent chain: repo → parent → grandparent → … → global.
+    ///
+    /// An explicit per-repo key with an empty value is treated as revocation:
+    /// the chain stops and no broader key is consulted.
     pub fn resolve_credential_chain(&self, repo_id: &str, key_prefix: &str) -> Option<String> {
-        // 1. Repo-specific key
-        if let Some(val) = self
-            .get_state(&format!("{}_{}", key_prefix, repo_id))
-            .ok()
-            .flatten()
-            .filter(|v| !v.is_empty())
-        {
-            return Some(val);
+        let repo_key = format!("{}_{}", key_prefix, repo_id);
+        match self.get_state(&repo_key) {
+            Ok(Some(val)) if val.is_empty() => return None,
+            Ok(Some(val)) => return Some(val),
+            Ok(None) => {}
+            Err(_) => return None,
         }
         // 2. Walk parent chain
         let mut pid = self
@@ -3408,5 +3409,39 @@ mod tests {
 
         assert!(db.get_repository("repo1").unwrap().is_none());
         assert!(db.get_repository("repo2").unwrap().is_some());
+    }
+
+    #[test]
+    fn resolve_credential_chain_scoped_keys_do_not_borrow_sibling_or_global() {
+        let db = setup_db();
+        create_test_repo(&db, "repo_a", "Repo A");
+        create_test_repo(&db, "repo_b", "Repo B");
+        db.set_state("secret_git_token_repo_a", "canary-a").unwrap();
+        db.set_state("secret_git_token_repo_b", "canary-b").unwrap();
+        db.set_state("secret_git_token", "canary-global").unwrap();
+
+        assert_eq!(
+            db.resolve_credential_chain("repo_a", "secret_git_token")
+                .as_deref(),
+            Some("canary-a")
+        );
+        assert_eq!(
+            db.resolve_credential_chain("repo_b", "secret_git_token")
+                .as_deref(),
+            Some("canary-b")
+        );
+    }
+
+    #[test]
+    fn resolve_credential_chain_explicit_revocation_blocks_global_fallback() {
+        let db = setup_db();
+        create_test_repo(&db, "repo_a", "Repo A");
+        db.set_state("secret_git_token_repo_a", "").unwrap();
+        db.set_state("secret_git_token", "canary-global").unwrap();
+
+        assert_eq!(
+            db.resolve_credential_chain("repo_a", "secret_git_token"),
+            None
+        );
     }
 }

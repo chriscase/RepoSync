@@ -487,13 +487,17 @@
       ],
       "supporting_case_ids": [
         "R10_PINNED_OLD_TOPOLOGY_INVENTORY",
-        "R10_INVENTORY_AUTHORITY_CONFINEMENT"
+        "R10_INVENTORY_AUTHORITY_CONFINEMENT",
+        "RS11_TEAM_CREDENTIAL_ISOLATION",
+        "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD",
+        "RS11_TEAM_CREDENTIAL_REVOCATION"
       ],
       "open": [
         "Two concurrent in-flight full imports with overlapping branch names are not a required exact case",
-        "Notification/credential crossover beyond cursor scope remains open"
+        "Notification crossover beyond cursor scope remains open",
+        "Nested parent/child credential inheritance and concurrent reload races remain open"
       ],
-      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct.",
+      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct. RS-11 team cases prove per-repo git/svn canary reload across two independent repos with a contaminating global key: rotation on one repo does not change the sibling, reopen reloads the scoped value, and explicit revocation clears embedded git credentials without global fallback.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -506,13 +510,15 @@
         "R10_PINNED_OLD_TOPOLOGY_INVENTORY"
       ],
       "supporting_case_ids": [
-        "64A_SCHEDULER"
+        "64A_SCHEDULER",
+        "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD",
+        "RS11_TEAM_CREDENTIAL_REVOCATION"
       ],
       "open": [
         "Shared-target locking across parent/descendant operations is not a general service",
-        "Credential rotation behavior is not a required exact case"
+        "Parent/child explicit override preservation during parent rotation is not a required exact case"
       ],
-      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. This is not a complete lifecycle lock proof.",
+      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. RS-11 proves team reload/rotation/revocation stay scoped per repo with dummy canaries in .git/config and fixture SVN markers; descendant inheritance remains later work.",
       "diagnostic_expected_baseline_failure": false
     },
     {

@@ -151,42 +151,16 @@ impl GitClient {
         &self.repo
     }
 
-    /// Ensure the origin remote URL contains embedded credentials for HTTP(S) remotes.
-    ///
-    /// libgit2's credential callback doesn't work reliably with all Git servers
-    /// (e.g. Gitea). Embedding `x-access-token:<token>` in the URL is the most
-    /// portable approach and mirrors what CI/CD systems do.
-    pub fn ensure_remote_credentials(
-        &self,
-        remote_name: &str,
-        token: Option<&str>,
-    ) -> Result<(), GitError> {
-        let Some(tok) = token else { return Ok(()) };
-        let remote = self.repo.find_remote(remote_name)?;
-        let Some(url) = remote.url() else {
-            return Ok(());
-        };
-        // Only modify http(s) URLs.
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Ok(());
-        }
-
-        // Strip any existing credentials (old/stale token) from the URL,
-        // then re-embed with the current token. This ensures that when the
-        // token is rotated in the dashboard, the remote URL picks up the
-        // new value on the next sync cycle — no manual intervention needed.
+    fn strip_http_credentials(url: &str) -> Option<String> {
         let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
             ("https://", r)
         } else if let Some(r) = url.strip_prefix("http://") {
             ("http://", r)
         } else {
-            return Ok(());
+            return None;
         };
 
-        // Strip existing "user:pass@" prefix if present
         let hostpath = if let Some(at_pos) = rest.find('@') {
-            // But only if the @ is before the first '/' (i.e., part of userinfo,
-            // not part of the path)
             let slash_pos = rest.find('/').unwrap_or(rest.len());
             if at_pos < slash_pos {
                 &rest[at_pos + 1..]
@@ -197,12 +171,57 @@ impl GitClient {
             rest
         };
 
-        let new_url = format!("{}x-access-token:{}@{}", scheme, tok, hostpath);
+        Some(format!("{scheme}{hostpath}"))
+    }
 
-        // Only update if the URL actually changed (avoid spurious writes).
+    /// Ensure the origin remote URL contains embedded credentials for HTTP(S) remotes.
+    ///
+    /// libgit2's credential callback doesn't work reliably with all Git servers
+    /// (e.g. Gitea). Embedding `x-access-token:<token>` in the URL is the most
+    /// portable approach and mirrors what CI/CD systems do.
+    pub fn ensure_remote_credentials(
+        &self,
+        remote_name: &str,
+        token: Option<&str>,
+    ) -> Result<(), GitError> {
+        let Some(tok) = token else {
+            return self.clear_remote_credentials(remote_name);
+        };
+        let remote = self.repo.find_remote(remote_name)?;
+        let Some(url) = remote.url() else {
+            return Ok(());
+        };
+        let Some(clean_url) = Self::strip_http_credentials(url) else {
+            return Ok(());
+        };
+
+        let new_url = if let Some(hostpath) = clean_url.strip_prefix("https://") {
+            format!("https://x-access-token:{tok}@{hostpath}")
+        } else if let Some(hostpath) = clean_url.strip_prefix("http://") {
+            format!("http://x-access-token:{tok}@{hostpath}")
+        } else {
+            return Ok(());
+        };
+
         if url != new_url {
             info!("updating remote URL to embed fresh credentials");
             self.repo.remote_set_url(remote_name, &new_url)?;
+        }
+        Ok(())
+    }
+
+    /// Remove embedded HTTP(S) credentials from a remote URL.
+    pub fn clear_remote_credentials(&self, remote_name: &str) -> Result<(), GitError> {
+        let remote = self.repo.find_remote(remote_name)?;
+        let Some(url) = remote.url() else {
+            return Ok(());
+        };
+        let Some(clean_url) = Self::strip_http_credentials(url) else {
+            return Ok(());
+        };
+        if url != clean_url {
+            info!("clearing embedded remote credentials");
+            self.repo.remote_set_url(remote_name, &clean_url)?;
         }
         Ok(())
     }
