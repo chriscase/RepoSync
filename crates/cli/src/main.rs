@@ -7,6 +7,7 @@
 //! Also provides the `personal` subcommand group for Personal Branch Mode.
 
 mod personal;
+mod status;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -360,9 +361,7 @@ fn cmd_status(db: &Database) -> Result<()> {
         .get_last_svn_revision()
         .context("failed to read last SVN revision")?;
 
-    let last_git_hash = db
-        .get_last_git_hash()
-        .context("failed to read last Git hash")?;
+    let last_git_hash = status::last_git_hash_display(db)?;
 
     let total_syncs = db
         .count_sync_records()
@@ -392,10 +391,7 @@ fn cmd_status(db: &Database) -> Result<()> {
             .map(|r: i64| r.to_string())
             .unwrap_or_else(|| "none".to_string())
     );
-    println!(
-        "  Last Git hash    : {}",
-        last_git_hash.as_deref().unwrap_or("none")
-    );
+    println!("  Last Git hash    : {}", last_git_hash);
     println!("  Total sync ops   : {}", total_syncs);
     println!("  Active conflicts : {}", active_conflicts);
     println!("  Total conflicts  : {}", total_conflicts);
