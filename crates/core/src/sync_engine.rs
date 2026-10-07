@@ -3544,7 +3544,7 @@ impl SyncEngine {
                 EchoDisposition::DeferPendingJournal => Err(SyncError::SvnCommitHeld {
                     reason: "pending_journal_finalize".into(),
                     detail: format!(
-                        "SVN revision {svn_rev} carries a [reposync] marker without a receipt while a Running git-to-SVN journal is still open for repository {repo_id}; finalize or reconcile the journal before applying"
+                        "SVN revision {svn_rev} matches a Running git-to-SVN journal without a receipt for repository {repo_id}; wait for the in-flight emit to finish, or restart the worker to hold the journal for reconciliation"
                     ),
                 }),
                 EchoDisposition::ApplyGenuineWithMarkerHint | EchoDisposition::ApplyGenuine => {
@@ -3567,18 +3567,19 @@ impl SyncEngine {
                 repo_id,
                 no_target_projection: &projection,
             };
-            return match classify_incoming_git_commit(&ctx, git_sha, message)? {
-                Ok(EchoDisposition::SkipEcho) => Ok(true),
-                Ok(EchoDisposition::DeferPendingJournal) => Err(SyncError::GitPushHeld {
+            return match classify_incoming_git_commit(&ctx, git_sha, message)
+                .map_err(SyncError::DatabaseError)??
+            {
+                EchoDisposition::SkipEcho => Ok(true),
+                EchoDisposition::DeferPendingJournal => Err(SyncError::GitPushHeld {
                     reason: "pending_journal_finalize".into(),
                     detail: format!(
-                        "Git commit {git_sha} carries a [reposync] marker without a receipt while a Running svn-to-Git journal is still open for repository {repo_id}; finalize or reconcile the journal before applying"
+                        "Git commit {git_sha} matches a Running svn-to-Git journal without a receipt for repository {repo_id}; wait for the in-flight emit to finish, or restart the worker to hold the journal for reconciliation"
                     ),
                 }),
-                Ok(EchoDisposition::ApplyGenuineWithMarkerHint | EchoDisposition::ApplyGenuine) => {
+                EchoDisposition::ApplyGenuineWithMarkerHint | EchoDisposition::ApplyGenuine => {
                     Ok(false)
                 }
-                Err(error) => Err(error),
             };
         }
         Ok(personal_mode_marker_echo(message))
@@ -3839,7 +3840,179 @@ pub(crate) fn validate_file_paths_impl(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::config::IdentityConfig;
+    use crate::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
+    use crate::db::svn_commit_operations::{svn_commit_target_fingerprint, SvnCommitIntent};
+    use crate::identity::IdentityMapper;
+
+    fn team_echo_engine(repo_id: &str) -> SyncEngine {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES (?1,'p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','idle',0,0)",
+                [repo_id],
+            )
+            .unwrap();
+        let config: AppConfig = toml::from_str(
+            r#"
+[daemon]
+[svn]
+url = "file:///svn"
+username = ""
+[github]
+repo = "test/test-repo"
+"#,
+        )
+        .unwrap();
+        let git_dir = tempfile::tempdir().unwrap();
+        let git_client = GitClient::init(git_dir.path()).unwrap();
+        let mapper = IdentityMapper::new(&IdentityConfig {
+            email_domain: Some("example.com".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut engine = SyncEngine::new(
+            config,
+            db,
+            SvnClient::new("file:///svn", "", ""),
+            git_client,
+            Arc::new(mapper),
+        );
+        engine.set_repo_id(repo_id.into());
+        engine
+    }
+
+    fn begin_running_svn_to_git_push(db: &Database, repo_id: &str, git_sha: &str) {
+        let fingerprint = git_push_target_fingerprint(repo_id, "origin", "main");
+        db.begin_svn_to_git_push(GitPushIntent {
+            repo_id,
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: git_sha,
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        })
+        .unwrap();
+    }
+
+    fn begin_running_git_to_svn_commit(db: &Database, repo_id: &str, pre_write_svn_rev: i64) {
+        let git_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fingerprint = svn_commit_target_fingerprint(repo_id, "uuid", "/repo", "/repo", "{}");
+        db.begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id,
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_git_sha: git_sha,
+            source_git_parent: Some("0000000000000000000000000000000000000000"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "/repo",
+            target_svn_root_url: "/repo",
+            target_svn_branch_path: "",
+            pre_write_svn_rev,
+            pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            author: "dev",
+            source_message: "feature",
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn pending_journal_finalize_surfaces_for_git_echo() {
+        let git_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let engine = team_echo_engine("pair");
+        begin_running_svn_to_git_push(engine.db(), "pair", git_sha);
+        let marker = format!("synced\n\n{SYNC_MARKER} synced from SVN r3");
+        let err = engine
+            .should_skip_incoming_git_commit(git_sha, &marker)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::GitPushHeld {
+                reason,
+                ..
+            } if reason == "pending_journal_finalize"
+        ));
+    }
+
+    #[test]
+    fn pending_journal_finalize_surfaces_for_svn_echo() {
+        let engine = team_echo_engine("pair");
+        begin_running_git_to_svn_commit(engine.db(), "pair", 4);
+        let marker = format!(
+            "synced\n\n{SYNC_MARKER} synced from Git {}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        let err = engine
+            .should_skip_incoming_svn_revision(5, &marker)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::SvnCommitHeld {
+                reason,
+                ..
+            } if reason == "pending_journal_finalize"
+        ));
+    }
+
+    #[test]
+    fn running_git_journal_with_different_sha_applies_as_genuine() {
+        let journal_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let other_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let engine = team_echo_engine("pair");
+        begin_running_svn_to_git_push(engine.db(), "pair", journal_sha);
+        let marker = format!("user work\n\n{SYNC_MARKER} synced from SVN r3");
+        assert!(!engine
+            .should_skip_incoming_git_commit(other_sha, &marker)
+            .unwrap());
+        assert!(!engine
+            .should_skip_incoming_git_commit(other_sha, "no marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn running_git_journal_without_marker_defers_only_matching_sha() {
+        let git_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let other_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let engine = team_echo_engine("pair");
+        begin_running_svn_to_git_push(engine.db(), "pair", git_sha);
+        assert!(matches!(
+            engine.should_skip_incoming_git_commit(git_sha, "edited away marker"),
+            Err(SyncError::GitPushHeld {
+                reason,
+                ..
+            }) if reason == "pending_journal_finalize"
+        ));
+        assert!(!engine
+            .should_skip_incoming_git_commit(other_sha, "no marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn running_svn_journal_without_marker_applies_as_genuine() {
+        let engine = team_echo_engine("pair");
+        begin_running_git_to_svn_commit(engine.db(), "pair", 4);
+        assert!(!engine
+            .should_skip_incoming_svn_revision(5, "no marker")
+            .unwrap());
+    }
 
     #[test]
     fn test_personal_mode_marker_echo() {

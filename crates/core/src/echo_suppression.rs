@@ -142,15 +142,15 @@ pub fn classify_incoming_git_commit(
         );
         return Ok(Ok(EchoDisposition::SkipEcho));
     }
+    if running_journal_claims_pending_git_echo(ctx, git_sha)? {
+        warn!(
+            repo_id = ctx.repo_id,
+            sha = %git_sha,
+            "Git commit matches a Running svn-to-Git journal without receipt; deferring"
+        );
+        return Ok(Ok(EchoDisposition::DeferPendingJournal));
+    }
     if has_marker {
-        if running_journal_claims_pending_git_echo(ctx, git_sha)? {
-            warn!(
-                repo_id = ctx.repo_id,
-                sha = %git_sha,
-                "Git commit carries [reposync] marker without receipt while a Running svn-to-Git journal is active; deferring"
-            );
-            return Ok(Ok(EchoDisposition::DeferPendingJournal));
-        }
         warn!(
             repo_id = ctx.repo_id,
             sha = %git_sha,
@@ -197,13 +197,7 @@ fn running_journal_claims_pending_svn_echo(
     let Some(op) = ctx.db.active_svn_commit_operation(ctx.repo_id)? else {
         return Ok(false);
     };
-    if op.state != SvnCommitOperationState::Running {
-        return Ok(false);
-    }
-    if op.last_confirmed_svn_rev == Some(svn_rev) {
-        return Ok(true);
-    }
-    Ok(op.pre_write_svn_rev + 1 == svn_rev)
+    Ok(op.state == SvnCommitOperationState::Running && op.pre_write_svn_rev + 1 == svn_rev)
 }
 
 /// Legacy personal-mode echo detection: marker text only.
@@ -348,11 +342,17 @@ mod tests {
             "projection": projection,
         });
         write_no_target_receipt(&db, "repo-b", &sha, &other_repo.to_string());
+        db.conn()
+            .execute(
+                "DELETE FROM kv_state WHERE key = ?1",
+                [format!("handled_git_no_target_repo-a_{sha}")],
+            )
+            .unwrap();
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "repo-a"), &sha, "no marker")
                 .unwrap()
                 .unwrap(),
-            EchoDisposition::SkipEcho
+            EchoDisposition::ApplyGenuine
         );
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "repo-b"), &sha, "no marker")
@@ -446,6 +446,88 @@ mod tests {
     }
 
     #[test]
+    fn running_git_push_journal_defers_matching_sha_without_marker() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let fingerprint = git_push_target_fingerprint("pair", "origin", "main");
+        db.begin_svn_to_git_push(GitPushIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: git_sha,
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        })
+        .unwrap();
+        assert_eq!(
+            classify_incoming_git_commit(&ctx(&db, "pair"), git_sha, "edited away marker")
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::DeferPendingJournal
+        );
+    }
+
+    #[test]
+    fn running_git_push_journal_with_different_sha_applies_as_genuine() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let journal_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        let other_sha = "ffffffffffffffffffffffffffffffffffffffff";
+        let fingerprint = git_push_target_fingerprint("pair", "origin", "main");
+        db.begin_svn_to_git_push(GitPushIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_svn_rev: 3,
+            source_svn_author: "dev",
+            source_svn_message: "add feature",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+            intended_local_git_sha: journal_sha,
+            intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        })
+        .unwrap();
+        let marker = format!("user work\n\n{SYNC_MARKER} synced from SVN r3");
+        assert_eq!(
+            classify_incoming_git_commit(&ctx(&db, "pair"), other_sha, &marker)
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::ApplyGenuineWithMarkerHint
+        );
+        assert_eq!(
+            classify_incoming_git_commit(&ctx(&db, "pair"), other_sha, "no marker")
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
     fn running_svn_commit_journal_defers_marker_without_receipt() {
         let db = setup_db();
         db.conn()
@@ -482,6 +564,85 @@ mod tests {
         assert_eq!(
             classify_incoming_svn_revision(&ctx(&db, "pair"), 5, &marker).unwrap(),
             EchoDisposition::DeferPendingJournal
+        );
+    }
+
+    #[test]
+    fn running_svn_commit_journal_with_different_rev_applies_as_genuine() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let fingerprint = svn_commit_target_fingerprint("pair", "uuid", "/repo", "/repo", "{}");
+        db.begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_git_sha: git_sha,
+            source_git_parent: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "/repo",
+            target_svn_root_url: "/repo",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 4,
+            pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            author: "dev",
+            source_message: "feature",
+        })
+        .unwrap();
+        let marker = format!("synced\n\n{SYNC_MARKER} synced from Git {git_sha}");
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "pair"), 6, &marker).unwrap(),
+            EchoDisposition::ApplyGenuineWithMarkerHint
+        );
+    }
+
+    #[test]
+    fn running_svn_commit_journal_without_marker_applies_as_genuine() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let fingerprint = svn_commit_target_fingerprint("pair", "uuid", "/repo", "/repo", "{}");
+        db.begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_git_sha: git_sha,
+            source_git_parent: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "/repo",
+            target_svn_root_url: "/repo",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 4,
+            pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            author: "dev",
+            source_message: "feature",
+        })
+        .unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "pair"), 5, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
         );
     }
 }
