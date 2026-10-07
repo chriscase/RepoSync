@@ -800,13 +800,10 @@ impl GitToSvnSync {
                                             resolved
                                         }
                                         Err(e) => {
-                                            // DO NOT write raw pointer text to SVN —
-                                            // that would corrupt the SVN copy. Skip
-                                            // this file safely and audit the skip.
                                             error!(
                                                 path = file_path,
                                                 error = %e,
-                                                "Git→SVN: LFS pointer resolution failed — skipping file to prevent pointer text in SVN"
+                                                "Git→SVN: LFS pointer resolution failed — holding apply"
                                             );
                                             let _ = self.db.insert_audit_log(
                                                 "lfs_resolution_failed",
@@ -815,12 +812,16 @@ impl GitToSvnSync {
                                                 Some(&commit.sha),
                                                 None,
                                                 Some(&format!(
-                                                    "Skipped '{}': LFS pointer could not be resolved ({})",
+                                                    "Held '{}': LFS pointer could not be resolved ({})",
                                                     file_path, e
                                                 )),
                                                 false,
                                             );
-                                            continue;
+                                            anyhow::bail!(
+                                                "LFS pointer for '{}' could not be resolved: {}",
+                                                file_path,
+                                                e
+                                            );
                                         }
                                     }
                                 } else {
@@ -859,12 +860,10 @@ impl GitToSvnSync {
                                             resolved
                                         }
                                         Err(e) => {
-                                            // DO NOT write raw pointer text to SVN —
-                                            // skip safely and audit.
                                             error!(
                                                 path = file_path,
                                                 error = %e,
-                                                "Git→SVN: LFS pointer resolution failed (LfsTrack) — skipping file"
+                                                "Git→SVN: LFS pointer resolution failed (LfsTrack) — holding apply"
                                             );
                                             let _ = self.db.insert_audit_log(
                                                 "lfs_resolution_failed",
@@ -873,12 +872,16 @@ impl GitToSvnSync {
                                                 Some(&commit.sha),
                                                 None,
                                                 Some(&format!(
-                                                    "Skipped '{}': LFS pointer could not be resolved [LfsTrack] ({})",
+                                                    "Held '{}': LFS pointer could not be resolved [LfsTrack] ({})",
                                                     file_path, e
                                                 )),
                                                 false,
                                             );
-                                            continue;
+                                            anyhow::bail!(
+                                                "LFS pointer for '{}' could not be resolved [LfsTrack]: {}",
+                                                file_path,
+                                                e
+                                            );
                                         }
                                     }
                                 } else {

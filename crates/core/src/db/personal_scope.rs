@@ -96,20 +96,12 @@ fn null_commit_map_svn_to_git_has_personal_evidence(
             WHERE cm.svn_rev = ?1
               AND cm.direction = 'svn_to_git'
               AND cm.repo_id IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM commit_map foreign_cm
-                  WHERE foreign_cm.svn_rev = cm.svn_rev
-                    AND foreign_cm.direction = cm.direction
-                    AND foreign_cm.repo_id IS NOT NULL
-                    AND foreign_cm.repo_id NOT IN (?2, ?3)
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM sync_records foreign_sr
-                  WHERE foreign_sr.svn_rev = cm.svn_rev
-                    AND foreign_sr.direction = cm.direction
-                    AND foreign_sr.status = 'applied'
-                    AND foreign_sr.repo_id IS NOT NULL
-                    AND foreign_sr.repo_id NOT IN (?2, ?3)
+              AND EXISTS (
+                  SELECT 1 FROM sync_records sr
+                  WHERE sr.svn_rev = cm.svn_rev
+                    AND sr.direction = cm.direction
+                    AND sr.status = 'applied'
+                    AND sr.repo_id IN (?2, ?3)
               )
         )",
         params![svn_rev, PERSONAL_SCOPE_KEY, LEGACY_PERSONAL_REPO_ID],
@@ -159,20 +151,12 @@ fn null_commit_map_git_to_svn_has_personal_evidence(
             WHERE cm.git_sha = ?1
               AND cm.direction = 'git_to_svn'
               AND cm.repo_id IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM commit_map foreign_cm
-                  WHERE foreign_cm.git_sha = cm.git_sha
-                    AND foreign_cm.direction = cm.direction
-                    AND foreign_cm.repo_id IS NOT NULL
-                    AND foreign_cm.repo_id NOT IN (?2, ?3)
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM sync_records foreign_sr
-                  WHERE foreign_sr.git_sha = cm.git_sha
-                    AND foreign_sr.direction = cm.direction
-                    AND foreign_sr.status = 'applied'
-                    AND foreign_sr.repo_id IS NOT NULL
-                    AND foreign_sr.repo_id NOT IN (?2, ?3)
+              AND EXISTS (
+                  SELECT 1 FROM sync_records sr
+                  WHERE sr.git_sha = cm.git_sha
+                    AND sr.direction = cm.direction
+                    AND sr.status = 'applied'
+                    AND sr.repo_id IN (?2, ?3)
               )
         )",
         params![git_sha, PERSONAL_SCOPE_KEY, LEGACY_PERSONAL_REPO_ID],
@@ -329,17 +313,40 @@ mod tests {
     }
 
     #[test]
-    fn legacy_null_commit_map_counts_when_no_foreign_attribution() {
+    fn legacy_null_commit_map_counts_with_personal_sync_record() {
+        let db = setup_db();
+        let git_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        db.insert_commit_map(1, git_sha, "svn_to_git", "dev", "Dev")
+            .unwrap();
+        let now = chrono::Utc::now();
+        db.insert_sync_record(&SyncRecord {
+            id: "legacy-null-svn-to-git".into(),
+            repo_id: Some(LEGACY_PERSONAL_REPO_ID.to_string()),
+            svn_revision: Some(1),
+            git_hash: Some(git_sha.into()),
+            direction: SyncDirection::SvnToGit,
+            author: "dev".into(),
+            message: "legacy".into(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        })
+        .unwrap();
+        assert!(db.is_personal_svn_rev_synced(1).unwrap());
+    }
+
+    #[test]
+    fn bare_null_commit_map_without_personal_evidence_does_not_count() {
         let db = setup_db();
         db.insert_commit_map(
             1,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "svn_to_git",
-            "dev",
-            "Dev",
+            "managed",
+            "Managed",
         )
         .unwrap();
-        assert!(db.is_personal_svn_rev_synced(1).unwrap());
+        assert!(!db.is_personal_svn_rev_synced(1).unwrap());
     }
 
     #[test]

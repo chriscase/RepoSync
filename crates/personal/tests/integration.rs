@@ -2538,7 +2538,7 @@ fn test_lfs_pointer_detection_precision() {
 /// Asserts from real execution:
 ///   - Pointer text is NOT written to the SVN working copy.
 ///   - `lfs_resolution_failed` audit row is emitted by the production path.
-///   - The method returns Ok (skip, not error) reflecting safe-skip behavior.
+///   - The method returns Err (fail-closed) so the SHA is not checkpointed.
 #[tokio::test]
 async fn test_replay_path_lfs_pointer_skipped_not_committed() {
     use reposync_core::db::queries::AuditLogEntry;
@@ -2655,11 +2655,10 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
     // --- Call the PRODUCTION apply_git_changes_to_svn ---
     let result = sync.apply_git_changes_to_svn(&gh_commit).await;
 
-    // The method should succeed (skip is not an error — safe-skip behavior).
     assert!(
-        result.is_ok(),
-        "apply_git_changes_to_svn must return Ok on LFS pointer skip, got: {:?}",
-        result.err()
+        result.is_err(),
+        "apply_git_changes_to_svn must fail closed on unresolved LFS pointer, got: {:?}",
+        result
     );
 
     // --- Verify: SVN working copy must NOT contain the pointer text ---
@@ -2691,8 +2690,119 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
             .as_deref()
             .unwrap_or("")
             .contains("large-asset.bin"),
-        "audit details must mention the skipped file path"
+        "audit details must mention the held file path"
     );
+}
+
+#[test]
+fn test_resolve_lfs_pointer_reads_local_object_with_skip_smudge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = b"local lfs payload with skip smudge";
+    let pointer = reposync_core::lfs::create_lfs_pointer(payload);
+    let parsed = reposync_core::lfs::parse_lfs_pointer(pointer.as_bytes()).unwrap();
+    let object_path = reposync_core::lfs::local_lfs_object_path(tmp.path(), &parsed.oid);
+    std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+    std::fs::write(&object_path, payload).unwrap();
+
+    std::env::set_var("GIT_LFS_SKIP_SMUDGE", "1");
+    let resolved = reposync_core::lfs::resolve_lfs_pointer(tmp.path(), pointer.as_bytes()).unwrap();
+    std::env::remove_var("GIT_LFS_SKIP_SMUDGE");
+
+    assert_eq!(resolved, payload);
+}
+
+#[tokio::test]
+async fn test_personal_git_to_svn_unresolved_lfs_holds_without_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+
+    let pointer_text = "version https://git-lfs.github.com/spec/v1\n\
+                        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                        size 99999\n";
+    std::fs::write(git_work.join("large-asset.bin"), pointer_text).unwrap();
+    let oid = git_client
+        .commit(
+            "add LFS-tracked asset",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let err = syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "add LFS-tracked asset"),
+            9,
+            "feature/lfs",
+        )
+        .await
+        .expect_err("unresolved LFS pointer must fail closed before checkpoint");
+    assert!(
+        format!("{err:#}").contains("LFS pointer"),
+        "expected LFS hold error, got: {err:#}"
+    );
+
+    assert_eq!(
+        svn_youngest(&svn_url),
+        svn_before,
+        "SVN must not advance when LFS resolution fails"
+    );
+    assert_eq!(
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.direction == "git_to_svn")
+            .count(),
+        0,
+        "commit_map must not advance on unresolved LFS pointer"
+    );
+}
+
+#[test]
+fn test_resolve_lfs_pointer_accepts_pointer_shaped_payload() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(tmp.path())
+        .status()
+        .expect("git init");
+    let pointer_shaped_payload =
+        b"version https://git-lfs.github.com/spec/v1\noid sha256:deadbeef\nsize 12\n";
+    let pointer = reposync_core::lfs::store_lfs_object(tmp.path(), pointer_shaped_payload)
+        .expect("store pointer-shaped payload as LFS object");
+    let resolved = reposync_core::lfs::resolve_lfs_pointer(tmp.path(), &pointer)
+        .expect("pointer-shaped payload must resolve when real bytes are available");
+    assert_eq!(resolved, pointer_shaped_payload);
 }
 
 /// Production-path companion test: drives `apply_git_changes_to_svn` with
@@ -5184,6 +5294,70 @@ fn spawn_github_pr_sync_stub(
         }
     });
     (format!("http://127.0.0.1:{}", port), handle)
+}
+
+/// Managed snapshot import leaves an untagged commit_map row with no sync_record.
+/// Personal mode at watermark 0 must still import SVN r1 instead of treating it
+/// as already synced.
+#[tokio::test]
+async fn test_personal_svn_to_git_imports_after_managed_snapshot_null_commit_map() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(
+        &wc_path,
+        "shared.txt",
+        "managed snapshot baseline\n",
+        "Managed snapshot r1",
+    );
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db_path = tmp.path().join("test.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map_with_repo(
+        1,
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "svn_to_git",
+        "snapshot",
+        "Snapshot <snap@example.com>",
+        None,
+    )
+    .unwrap();
+    assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), None);
+    assert!(!db.is_personal_svn_rev_synced(1).unwrap());
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let git_arc = Arc::new(Mutex::new(git_client));
+    let db_arc = Arc::new(db);
+
+    let syncer = SvnToGitSync::new(svn_client, git_arc, db_arc.clone(), config);
+    let synced = syncer
+        .sync()
+        .await
+        .expect("personal svn-to-git must import managed snapshot collision at r1");
+    assert_eq!(synced, 1, "revision 1 must be imported, not skipped");
+    assert!(
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.svn_rev == 1 && entry.direction == "svn_to_git"),
+        "personal import must record commit_map for r1"
+    );
+    assert_eq!(
+        db_arc.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("1")
+    );
 }
 
 /// NULL-repo_id commit_map rows from a non-personal source must not advance the

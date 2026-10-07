@@ -106,15 +106,31 @@ impl Database {
         svn_author: &str,
         git_author: &str,
     ) -> Result<i64, DatabaseError> {
+        self.insert_commit_map_with_repo(svn_rev, git_sha, direction, svn_author, git_author, None)
+    }
+
+    /// Insert a commit-map entry optionally scoped to a managed repository.
+    pub fn insert_commit_map_with_repo(
+        &self,
+        svn_rev: i64,
+        git_sha: &str,
+        direction: &str,
+        svn_author: &str,
+        git_author: &str,
+        repo_id: Option<&str>,
+    ) -> Result<i64, DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
         conn.execute(
-            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![svn_rev, git_sha, direction, now, svn_author, git_author],
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![svn_rev, git_sha, direction, now, svn_author, git_author, repo_id],
         )?;
         let id = conn.last_insert_rowid();
-        debug!(id, svn_rev, git_sha, direction, "inserted commit_map entry");
+        debug!(
+            id,
+            svn_rev, git_sha, direction, repo_id, "inserted commit_map entry"
+        );
         Ok(id)
     }
 
