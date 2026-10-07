@@ -775,6 +775,8 @@ mod tests {
 
     #[test]
     fn persist_hold_and_confirm_with_observed_evidence() {
+        let inbound_cursor = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let emitted_tip = "dddddddddddddddddddddddddddddddddddddddd";
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
         db.conn()
@@ -784,6 +786,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.set_state("last_git_sha_pair", inbound_cursor).unwrap();
         let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
         assert_eq!(op.state, GitPushOperationState::Running);
         let held = db
@@ -826,12 +829,12 @@ mod tests {
         assert_eq!(mapped, 1);
         assert_eq!(
             db.get_repo_watermark("pair").unwrap(),
-            (3, "dddddddddddddddddddddddddddddddddddddddd".into())
+            (3, emitted_tip.into())
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap(),
-            None,
-            "svn-to-git finalize must not advance scoped inbound git cursor kv"
+            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            Some(inbound_cursor),
+            "svn-to-git finalize must preserve scoped inbound git cursor kv"
         );
         assert_eq!(
             db.get_state("last_git_hash").unwrap(),

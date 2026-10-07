@@ -176,6 +176,98 @@ async fn candidate_rs05_web_unscoped_status_aggregates_worst_repo_state() {
 }
 
 #[tokio::test]
+async fn candidate_rs05_web_unscoped_status_omits_global_git_tip_with_multiple_repos() {
+    let (addr, state, server) = status_fixture(&[("alpha", "idle"), ("beta", "idle")]).await;
+    let stale_global = "dddddddddddddddddddddddddddddddddddddddd";
+    let alpha_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let beta_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    state.db.set_state("last_git_hash", stale_global).unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO commit_map (git_sha, svn_rev, direction, synced_at) VALUES (?1, 9, 'svn_to_git', '2020-01-01T00:00:00Z')",
+            ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
+        )
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'alpha'",
+            [alpha_sha],
+        )
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'beta'",
+            [beta_sha],
+        )
+        .unwrap();
+
+    let client = authed_client();
+    let response = client
+        .get(format!("http://{addr}/api/status"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{body}");
+    assert!(
+        body["last_git_hash"].is_null(),
+        "unscoped /api/status must not report a misleading global git tip across managed repos: {body}"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_WEB_UNSCOPED_STATUS_NO_GLOBAL_GIT_TIP",
+            "last_git_hash":body["last_git_hash"],
+            "stale_global":stale_global,
+            "alpha_sha":alpha_sha,
+            "beta_sha":beta_sha
+        })
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn candidate_rs05_web_unscoped_status_reports_legacy_git_tip() {
+    let (addr, state, server) = status_fixture(&[]).await;
+    let legacy_tip = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    state.db.set_state("last_git_hash", legacy_tip).unwrap();
+
+    let client = authed_client();
+    let response = client
+        .get(format!("http://{addr}/api/status"))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{body}");
+    assert_eq!(
+        body["last_git_hash"].as_str(),
+        Some(legacy_tip),
+        "legacy single-repo installs must keep reporting the global git tip"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_LEGACY_UNSCOPED_STATUS_GIT_TIP",
+            "last_git_hash":body["last_git_hash"]
+        })
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn candidate_rs05_web_unscoped_status_reports_error_paused() {
     let (addr, _state, server) =
         status_fixture(&[("paused", "error_paused"), ("healthy", "idle")]).await;
