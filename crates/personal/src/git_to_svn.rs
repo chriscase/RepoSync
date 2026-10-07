@@ -1029,10 +1029,16 @@ impl GitToSvnSync {
         }
 
         let refs: Vec<&str> = touched_paths.iter().map(|path| path.as_str()).collect();
-        self.svn
-            .revert_files(&self.svn_wc_path, &refs)
-            .await
-            .context("svn revert failed while restoring touched apply paths")?;
+        if let Err(error) = self.svn.revert_files(&self.svn_wc_path, &refs).await {
+            // Unversioned adds under new directories make intermediate parents
+            // invisible to SVN (E155010); filesystem cleanup below still restores
+            // the pre-apply tree for those paths.
+            debug!(
+                error = %error,
+                touched = touched_paths.len(),
+                "svn revert on touched apply paths failed; continuing with scoped cleanup"
+            );
+        }
 
         let status_output = self
             .svn
@@ -1041,6 +1047,8 @@ impl GitToSvnSync {
             .context("svn status failed while restoring working copy")?;
         remove_abort_leftover_paths(&self.svn_wc_path, &status_output, touched_paths)
             .context("failed to remove unversioned apply leftovers")?;
+        remove_abort_empty_ancestor_dirs(&self.svn_wc_path, touched_paths)
+            .context("failed to remove empty apply-created ancestor directories")?;
 
         let final_status = self
             .svn
@@ -1389,6 +1397,34 @@ fn remove_abort_leftover_paths(
     Ok(())
 }
 
+/// Remove empty ancestor directories left behind after reverting touched apply paths.
+///
+/// `svn status` does not list empty unversioned directories, so a partial apply that
+/// created `src/newdir/file.txt` can leave `src/newdir` on disk even after the file
+/// is reverted and removed.
+fn remove_abort_empty_ancestor_dirs(wc_root: &Path, scope: &[String]) -> Result<()> {
+    for touched in scope {
+        let touched_path = wc_root.join(touched);
+        let mut current = touched_path.parent();
+        while let Some(dir) = current {
+            if dir == wc_root {
+                break;
+            }
+            if !dir.exists() {
+                break;
+            }
+            match std::fs::remove_dir(dir) {
+                Ok(()) => {
+                    current = dir.parent();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse `svn status` output to identify unversioned (?) and missing (!) files.
 ///
 /// Returns `(added, deleted)` where:
@@ -1526,6 +1562,23 @@ M       src/modified.rs
         assert!(
             !wc.path().join("src/newdir").exists(),
             "ancestor unversioned directory must be removed when scoped to a touched file"
+        );
+    }
+
+    #[test]
+    fn test_remove_abort_empty_ancestor_dirs_after_file_removal() {
+        let wc = tempfile::tempdir().unwrap();
+        let file_path = wc.path().join("src/newdir/file.txt");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        std::fs::write(&file_path, "new").unwrap();
+        std::fs::remove_file(&file_path).unwrap();
+
+        let scope = vec!["src/newdir/file.txt".to_string()];
+        remove_abort_empty_ancestor_dirs(wc.path(), &scope).unwrap();
+
+        assert!(
+            !wc.path().join("src/newdir").exists(),
+            "empty ancestor directories must be removed even when absent from svn status"
         );
     }
 
