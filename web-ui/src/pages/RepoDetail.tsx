@@ -12,6 +12,13 @@ import {
 } from '../branchPairRemoval';
 import ImportProgressCard from '../components/ImportProgressCard';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
+import ManagedRemovalPanel from '../components/ManagedRemovalPanel';
+import {
+  type ManagedRemovalStatus,
+  managedRemovalNeedsPoll,
+  persistManagedRemovalReceipt,
+  readManagedRemovalReceipt,
+} from '../managedRemoval';
 import ServerMonitor from '../components/ServerMonitor';
 import {
   ArrowLeft, RefreshCw, Settings, Database, GitBranch, Clock,
@@ -82,7 +89,9 @@ export default function RepoDetail() {
   const [syncTriggered, setSyncTriggered] = useState(false);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState<EditForm | null>(null);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [showDisableConfirm, setShowDisableConfirm] = useState(false);
+  const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
+  const [removalReceipt, setRemovalReceipt] = useState(readManagedRemovalReceipt());
   const [expandedAuditGroups, setExpandedAuditGroups] = useState<Set<number>>(new Set());
   const [expandedDetails, setExpandedDetails] = useState<Set<number>>(new Set());
   const [svnTestResult, setSvnTestResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -92,7 +101,7 @@ export default function RepoDetail() {
   const [showBranchModal, setShowBranchModal] = useState(false);
   const [deleteBranchTarget, setDeleteBranchTarget] = useState<Repository | null>(null);
   const [deleteBranchConfirmText, setDeleteBranchConfirmText] = useState('');
-  const [deleteBranchOpts, setDeleteBranchOpts] = useState({ delete_git: true, delete_svn: true });
+  const [deleteBranchOpts, setDeleteBranchOpts] = useState({ delete_git: false, delete_svn: false });
   const [branchForm, setBranchForm] = useState({
     svn_branch: '',
     git_branch: '',
@@ -176,6 +185,17 @@ export default function RepoDetail() {
     enabled: detailLive,
     refetchInterval: detailLive ? 5000 : false,
     retry: detailRetry,
+  });
+
+  const removalStatusQuery = useQuery<ManagedRemovalStatus>({
+    queryKey: ['managed-removal', id],
+    queryFn: () => api.getManagedRemoval(id!),
+    enabled: !!id && isAdmin && (detailLive || removalReceipt?.repoId === id),
+    retry: false,
+    refetchInterval: (query) => {
+      const state = query.state.data?.state;
+      return managedRemovalNeedsPoll(state) ? 2000 : false;
+    },
   });
 
   const skipContextEnabled = detailLive && isAdmin && status?.state === 'error_paused';
@@ -345,13 +365,57 @@ export default function RepoDetail() {
     },
   });
 
-  const deleteMutation = useMutation({
-    mutationFn: () => api.deleteRepo(id!),
+  const disableMutation = useMutation({
+    mutationFn: () => api.disableRepo(id!),
     onSuccess: () => {
+      setShowDisableConfirm(false);
+      queryClient.invalidateQueries({ queryKey: ['repo', id] });
       queryClient.invalidateQueries({ queryKey: ['repos'] });
-      navigate('/repos');
     },
   });
+
+  const removeMutation = useMutation({
+    mutationFn: () => api.removeManagedRepo(id!),
+    onSuccess: async (result) => {
+      setShowRemoveConfirm(false);
+      const receipt = {
+        repoId: id!,
+        operationId: result.operation_id,
+        state: result.state,
+        message: result.message,
+        recovery: result.recovery,
+      };
+      persistManagedRemovalReceipt(receipt);
+      setRemovalReceipt(receipt);
+      queryClient.setQueryData(['managed-removal', id], result);
+      queryClient.invalidateQueries({ queryKey: ['managed-removal', id] });
+      queryClient.invalidateQueries({ queryKey: ['repos'] });
+      if (result.state === 'completed' && result.registration_listed === false) {
+        for (const queryKey of repoDetailQueryKeys(id!)) {
+          await queryClient.cancelQueries({ queryKey });
+        }
+        setRetiredId(id!);
+        navigate('/repos', { replace: true });
+      }
+    },
+  });
+
+  const removalPanelStatus: ManagedRemovalStatus | undefined = removalStatusQuery.data
+    ?? (removalReceipt && removalReceipt.repoId === id
+      ? {
+          ok: removalReceipt.state === 'completed',
+          action: 'managed_remove',
+          state: removalReceipt.state,
+          operation_id: removalReceipt.operationId,
+          message: removalReceipt.message,
+          remote_git: 'untouched',
+          remote_svn: 'untouched',
+          restore_supported: false,
+          retryable: removalReceipt.state !== 'completed',
+          registration_listed: removalReceipt.state !== 'completed',
+          recovery: removalReceipt.recovery,
+        }
+      : undefined);
 
   const auditEntries = auditLog?.entries ?? [];
 
@@ -474,7 +538,10 @@ export default function RepoDetail() {
 
   useEffect(() => {
     setLocalNotice(null);
-  }, [id]);
+    if (removalReceipt && removalReceipt.repoId !== id) {
+      setRemovalReceipt(null);
+    }
+  }, [id, removalReceipt]);
 
   useEffect(() => {
     if (!retiredId || retiredId === id) return;
@@ -528,6 +595,17 @@ export default function RepoDetail() {
   return (
     <div className="space-y-6" data-testid="repo-detail" data-repo-id={id}>
       {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
+      {isAdmin && removalPanelStatus && !repo?.parent_id && (
+        <ManagedRemovalPanel
+          status={removalPanelStatus}
+          onRetry={
+            removalPanelStatus.retryable
+              ? () => removeMutation.mutate()
+              : undefined
+          }
+          retryPending={removeMutation.isPending}
+        />
+      )}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
@@ -1525,8 +1603,13 @@ export default function RepoDetail() {
                 </div>
               )}
               <p className="text-sm text-gray-300">
-                This will permanently delete <span className="font-semibold text-gray-100">{deleteBranchTarget.name}</span> and all associated sync records.
+                Remove branch pair <span className="font-semibold text-gray-100">{deleteBranchTarget.name}</span>{' '}
+                from RepoSync. Remote ref/path deletion is opt-in below and is separate from managed root removal.
               </p>
+              <div className="text-xs text-gray-400 border border-gray-600 rounded p-2 space-y-1" data-testid="branch-remote-deletion-preview">
+                <p>Git ref: <span className="font-mono text-gray-200">{deleteBranchTarget.git_branch}</span> — {deleteBranchOpts.delete_git ? 'will be deleted on remote when authorized' : 'left on remote'}</p>
+                <p>SVN path: <span className="font-mono text-gray-200">{deleteBranchTarget.svn_branch}</span> — {deleteBranchOpts.delete_svn ? 'will be deleted on remote when authorized (history retained)' : 'left on remote'}</p>
+              </div>
               <div className="space-y-2">
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={deleteBranchOpts.delete_git}
@@ -1591,15 +1674,33 @@ export default function RepoDetail() {
                 <p className="text-sm text-gray-500 mt-0.5">Unavailable during safe import cancellation. Request a reviewed recovery plan for an existing repository.</p>
               </div>
             </div>
+            {!repo?.parent_id && (
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm text-gray-300 font-medium">Pause / disable sync</p>
+                  <p className="text-sm text-gray-500 mt-0.5">
+                    Stops scheduling. Registration, mappings, secrets, local files, and remotes stay.
+                  </p>
+                </div>
+                <button
+                  data-testid="pause-disable-repo"
+                  onClick={() => setShowDisableConfirm(true)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-700 text-amber-300 hover:bg-amber-900/30 text-sm font-medium transition-colors"
+                >
+                  <Power className="w-4 h-4" />
+                  Pause / disable
+                </button>
+              </div>
+            )}
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-gray-300 font-medium">
-                  {repo?.parent_id ? 'Delete Branch Pair' : 'Delete Repository'}
+                  {repo?.parent_id ? 'Remove branch pair' : 'Remove from RepoSync'}
                 </p>
                 <p className="text-sm text-gray-500 mt-0.5">
                   {repo?.parent_id
-                    ? 'Delete this branch pair and remove the Git and SVN branches.'
-                    : 'Permanently remove this repository configuration.'}
+                    ? 'Remove this pair from RepoSync. Remote Git/SVN deletion is opt-in in the dialog.'
+                    : 'Stop work, clean only owned local data, and drop the registration from active views. Remotes and history stay unless you separately authorize branch deletion.'}
                 </p>
               </div>
               {repo?.parent_id ? (
@@ -1608,20 +1709,22 @@ export default function RepoDetail() {
                   onClick={() => {
                     setDeleteBranchTarget(repo);
                     setDeleteBranchConfirmText('');
+                    setDeleteBranchOpts({ delete_git: false, delete_svn: false });
                     deleteBranchMutation.reset();
                   }}
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
                 >
                   <Trash2 className="w-4 h-4" />
-                  Delete Branch Pair
+                  Remove branch pair
                 </button>
               ) : (
                 <button
-                  onClick={() => setShowDeleteConfirm(true)}
+                  data-testid="remove-from-reposync"
+                  onClick={() => setShowRemoveConfirm(true)}
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
                 >
                   <Trash2 className="w-4 h-4" />
-                  Delete Repository
+                  Remove from RepoSync
                 </button>
               )}
             </div>
@@ -1629,32 +1732,71 @@ export default function RepoDetail() {
         </div>
       )}
 
-      {/* Delete confirmation modal */}
-      {showDeleteConfirm && (
+      {showDisableConfirm && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">Delete Repository</h3>
+            <h3 className="text-lg font-semibold text-gray-100 mb-2">Pause / disable sync</h3>
             <p className="text-sm text-gray-400 mb-6">
-              Are you sure you want to delete <span className="font-semibold text-gray-200">{repo.name}</span>? This cannot be undone.
+              Disable <span className="font-semibold text-gray-200">{repo.name}</span>? This does not remove
+              data or touch remotes. You can re-enable later.
             </p>
-            {deleteMutation.isError && (
+            {disableMutation.isError && (
               <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4">
-                Failed to delete: {deleteMutation.error?.message}
+                Failed to disable: {disableMutation.error?.message}
               </div>
             )}
             <div className="flex items-center justify-end gap-3">
               <button
-                onClick={() => setShowDeleteConfirm(false)}
+                onClick={() => setShowDisableConfirm(false)}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
               >
                 Cancel
               </button>
               <button
-                onClick={() => deleteMutation.mutate()}
-                disabled={deleteMutation.isPending}
+                data-testid="confirm-pause-disable"
+                onClick={() => disableMutation.mutate()}
+                disabled={disableMutation.isPending}
+                className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+              >
+                {disableMutation.isPending ? 'Disabling…' : 'Pause / disable'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRemoveConfirm && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
+            <h3 className="text-lg font-semibold text-gray-100 mb-2">Remove from RepoSync</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              Remove <span className="font-semibold text-gray-200">{repo.name}</span> from active listings and
+              clean only RepoSync-owned local data. Remote Git and SVN history are not deleted. Restore is not supported.
+            </p>
+            {(branchPairs?.length ?? 0) > 0 && (
+              <p className="text-sm text-amber-300 mb-4" data-testid="child-dependency-refusal-preview">
+                {branchPairs!.length} child branch pair(s) must be removed first; parent removal does not cascade.
+              </p>
+            )}
+            {removeMutation.isError && (
+              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4">
+                {removeMutation.error?.message}
+              </div>
+            )}
+            <div className="flex items-center justify-end gap-3">
+              <button
+                onClick={() => setShowRemoveConfirm(false)}
+                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                data-testid="confirm-remove-from-reposync"
+                onClick={() => removeMutation.mutate()}
+                disabled={removeMutation.isPending || (branchPairs?.length ?? 0) > 0}
                 className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
-                {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
+                {removeMutation.isPending ? 'Removing…' : 'Remove from RepoSync'}
               </button>
             </div>
           </div>

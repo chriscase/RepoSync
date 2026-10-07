@@ -1,4 +1,5 @@
 import type { BranchPairRemovalResult } from './branchPairRemoval';
+import type { ManagedRemovalStatus } from './managedRemoval';
 
 const API_BASE = '/api';
 
@@ -441,8 +442,75 @@ export const api = {
   getRepo: (id: string) => fetchJson<Repository>(`/repos/${id}`),
   updateRepo: (id: string, data: Partial<Repository>) =>
     fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  /** Legacy root DELETE — disable only (non-destructive). Prefer `disableRepo`. */
   deleteRepo: (id: string) =>
-    fetchJson<void>(`/repos/${id}`, { method: 'DELETE' }),
+    fetchJson<{
+      ok: boolean;
+      action: string;
+      message: string;
+      enabled: boolean;
+    }>(`/repos/${id}`, { method: 'DELETE' }),
+
+  disableRepo: (id: string) =>
+    fetchJson<{
+      ok: boolean;
+      action: string;
+      message: string;
+      preservation?: string;
+      enabled: boolean;
+      remote_git: string;
+      remote_svn: string;
+      managed_removal: boolean;
+    }>(`/repos/${id}/disable`, { method: 'POST' }),
+
+  removeManagedRepo: async (id: string): Promise<ManagedRemovalStatus> => {
+    const token = localStorage.getItem('session_token');
+    const res = await fetch(`${API_BASE}/repos/${id}/remove`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        'Idempotency-Key': `ui-remove-${id}-${Date.now()}`,
+      },
+    });
+    const text = await res.text();
+    let body = {} as ManagedRemovalStatus & { error?: string };
+    if (text) {
+      try {
+        body = JSON.parse(text) as ManagedRemovalStatus & { error?: string };
+      } catch {
+        throw new Error(text || `API error ${res.status}`);
+      }
+    }
+    const message = body.error || body.message || text || `API error ${res.status}`;
+    if (!res.ok && res.status !== 409 && res.status !== 202) {
+      throw new Error(message);
+    }
+    if (!body.operation_id) {
+      throw new Error(message);
+    }
+    return body;
+  },
+
+  getManagedRemoval: async (id: string): Promise<ManagedRemovalStatus> => {
+    const token = localStorage.getItem('session_token');
+    const res = await fetch(`${API_BASE}/repos/${id}/removal`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (res.status === 404) {
+      throw new Error('managed removal not found');
+    }
+    const text = await res.text();
+    let body = {} as ManagedRemovalStatus & { error?: string };
+    if (text) {
+      body = JSON.parse(text) as ManagedRemovalStatus & { error?: string };
+    }
+    const message = body.error || body.message || text || `API error ${res.status}`;
+    if (!res.ok && res.status !== 409 && res.status !== 202) {
+      throw new Error(message);
+    }
+    return body;
+  },
   createBranchPair: (repoId: string, data: {
     svn_branch: string;
     git_branch: string;
@@ -475,6 +543,7 @@ export const api = {
     const params = new URLSearchParams();
     // Always send the caller's explicit choices. Omitted query params are
     // destructive server defaults and are not used by this UI.
+    params.set('explicit_remote_deletion_opts', 'true');
     params.set('delete_git', String(opts?.delete_git ?? false));
     params.set('delete_svn', String(opts?.delete_svn ?? false));
     const token = localStorage.getItem('session_token');

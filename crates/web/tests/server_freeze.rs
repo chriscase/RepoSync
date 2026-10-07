@@ -7484,3 +7484,197 @@ fn fixture_branch_repo(
         teams_webhook_url: None,
     }
 }
+
+/// RS-16 / #65: import reconciliation_required blocks managed removal with HTTP 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_reconciliation_required_is_409() {
+    use reposync_core::db::import_operations::ImportOperationState;
+
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let id = "r65-recon-root";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            id,
+            "Recon root",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .create_import_operation(id, "admin", "held-import", "fp")
+        .unwrap();
+    let active = state.db.active_import_operation(id).unwrap().unwrap();
+    state
+        .db
+        .finish_import_operation(
+            id,
+            &active.id,
+            ImportOperationState::ReconciliationRequired,
+            "fixture held import for removal block",
+        )
+        .unwrap();
+
+    let remove = client
+        .post(format!("{base}/api/repos/{id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    let status = remove.status();
+    let body: serde_json::Value = remove.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["state"], "reconciliation_required");
+    assert_eq!(body["action"], "managed_remove");
+    assert_eq!(body["ok"], false);
+    assert!(body["partial_cleanup"].is_object());
+    assert_eq!(body["partial_cleanup"]["retry_is_local_cleanup_only"], true);
+    let op_id = body["operation_id"].as_str().unwrap();
+
+    let get = client
+        .get(format!("{base}/api/repos/{id}/removal"))
+        .send()
+        .await
+        .unwrap();
+    let get_body: serde_json::Value = get.json().await.unwrap();
+    assert_eq!(get_body["operation_id"], op_id);
+    assert_eq!(get_body["state"], "reconciliation_required");
+    assert!(state.db.get_repository(id).unwrap().is_some());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "R65_REMOVE_RECONCILIATION",
+            "http": 409,
+            "operation_id_stable": true,
+            "registration_kept": true
+        })
+    );
+    server.abort();
+}
+
+/// RS-16: explicit branch-pair remote deletion opts default false; legacy omitted params stay destructive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_branch_pair_remote_deletion_explicit_false_defaults() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "bp-parent";
+    let pair_id = "bp-pair";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id, "Parent", None, "main", "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            pair_id,
+            "Pair",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+
+    let legacy = client
+        .delete(format!("{base}/api/repos/{pair_id}/branch-pair"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), reqwest::StatusCode::OK);
+    let legacy_body: serde_json::Value = legacy.json().await.unwrap();
+    assert_eq!(legacy_body["remote_deletion"]["delete_git_requested"], true);
+    assert_eq!(legacy_body["remote_deletion"]["delete_svn_requested"], true);
+    assert_eq!(legacy_body["remote_deletion"]["explicit_opts"], false);
+    assert!(state.db.get_repository(pair_id).unwrap().is_none());
+
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            pair_id,
+            "Pair",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+    let explicit = client
+        .delete(format!(
+            "{base}/api/repos/{pair_id}/branch-pair?explicit_remote_deletion_opts=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(explicit.status(), reqwest::StatusCode::OK);
+    let explicit_body: serde_json::Value = explicit.json().await.unwrap();
+    assert_eq!(explicit_body["remote_deletion"]["explicit_opts"], true);
+    assert_eq!(
+        explicit_body["remote_deletion"]["delete_git_requested"],
+        false
+    );
+    assert_eq!(
+        explicit_body["remote_deletion"]["delete_svn_requested"],
+        false
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "R65_BRANCH_REMOTE_OPTS",
+            "legacy_defaults_destructive": true,
+            "explicit_ui_defaults_safe": true
+        })
+    );
+    server.abort();
+}
+
+/// RS-16: explicit POST disable matches legacy DELETE disable-only semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_explicit_disable_matches_legacy_delete() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let id = "r65-disable-root";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            id,
+            "Disable root",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{id}"), "secret")
+        .unwrap();
+
+    let disable = client
+        .post(format!("{base}/api/repos/{id}/disable"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disable.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = disable.json().await.unwrap();
+    assert_eq!(body["action"], "disable");
+    assert_eq!(body["managed_removal"], false);
+    assert_eq!(body["remote_git"], "untouched");
+    assert!(state.db.managed_removal(id).unwrap().is_none());
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("secret_svn_password_{id}"))
+            .unwrap()
+            .as_deref(),
+        Some("secret")
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_EXPLICIT_DISABLE", "managed_journal": false})
+    );
+    server.abort();
+}
