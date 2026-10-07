@@ -462,6 +462,10 @@ pub fn inspect_fetched_history(
 
 /// Repository-owned Git cursor for personal mode without borrowing global state.
 ///
+/// Personal inspect is intentionally unscoped: [`Database::list_repositories`] counts
+/// every row (disabled repos and child rows included), so a leftover row turns a
+/// personal-shaped DB into multi-repo fail-closed.
+///
 /// Personal writers advance `commit_map` on each mapping but keep the `git_sha`
 /// watermark at the import baseline. When both are present, the live mapping tip
 /// is authoritative when it descends from the watermark; unrelated copies fail
@@ -470,6 +474,7 @@ pub fn resolve_personal_checkpoint(
     db: &Database,
     git_path: &Path,
 ) -> Result<Option<String>, SyncError> {
+    let repos = db.list_repositories().map_err(SyncError::DatabaseError)?;
     let checkpoint = crate::sync_status::resolve_scoped_checkpoint_tip(db)
         .map_err(SyncError::DatabaseError)?
         .filter(|value| !value.is_empty());
@@ -499,8 +504,10 @@ pub fn resolve_personal_checkpoint(
             }
         }
         (Some(mapping), None) => Ok(Some(mapping.to_string())),
-        (None, Some(watermark)) => Ok(Some(watermark.to_string())),
-        (None, None) => Ok(None),
+        // Import watermark is a legacy personal fallback only when the repositories
+        // table is empty; managed-repo installs must not borrow a global import SHA.
+        (None, Some(watermark)) if repos.is_empty() => Ok(Some(watermark.to_string())),
+        (None, Some(_)) | (None, None) => Ok(None),
     }
 }
 
@@ -596,14 +603,19 @@ pub fn inspect_personal_history(
         Err(err) => return Err(err),
     };
     let Some(checkpoint) = checkpoint else {
+        let repos = db.list_repositories().map_err(SyncError::DatabaseError)?;
+        let detail = if repos.len() > 1 {
+            "multiple managed repositories; cannot infer a single handled Git cursor"
+        } else {
+            "no repository-owned handled Git cursor exists; run initial import first"
+        };
         return block_personal_history(
             db,
             &key,
             scope_id,
             HistoryInspectReject {
                 reason: "missing_checkpoint".into(),
-                detail: "no repository-owned handled Git cursor exists; run initial import first"
-                    .into(),
+                detail: detail.into(),
                 o: None,
                 r: None,
                 l: None,
@@ -761,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_personal_checkpoint_multi_repo_fails_closed_not_commit_map_max() {
+    fn resolve_personal_checkpoint_multi_repo_fails_closed_not_foreign_tip() {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
         db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
@@ -774,17 +786,19 @@ mod tests {
             "Test",
         )
         .unwrap();
+        db.set_watermark("git_sha", "ffffffffffffffffffffffffffffffffffffffff")
+            .unwrap();
         insert_managed_repo(&db, "alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         insert_managed_repo(&db, "beta", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         assert_eq!(
             resolve_personal_checkpoint(&db, Path::new("/tmp/unused")).unwrap(),
             None,
-            "multi-repo installs must not adopt a foreign commit-map maximum"
+            "multi-repo installs must not adopt a foreign commit-map tip or import watermark"
         );
     }
 
     #[test]
-    fn resolve_personal_checkpoint_single_repo_uses_column_not_foreign_max() {
+    fn resolve_personal_checkpoint_single_repo_uses_column_not_foreign_tip() {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
         db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
@@ -803,7 +817,38 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("cccccccccccccccccccccccccccccccccccccccc"),
-            "single managed repo must use its column tip, not foreign global max"
+            "single managed repo must use its column tip, not foreign global kv or commit-map tip"
+        );
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_single_repo_empty_column_ignores_watermark() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_watermark("git_sha", "ffffffffffffffffffffffffffffffffffffffff")
+            .unwrap();
+        insert_managed_repo(&db, "only", "");
+        assert_eq!(
+            resolve_personal_checkpoint(&db, Path::new("/tmp/unused")).unwrap(),
+            None,
+            "empty managed-repo column must not fall back to import watermark"
+        );
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_legacy_watermark_fallback_without_mapping() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("last_git_hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        db.set_watermark("git_sha", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        assert_eq!(
+            resolve_personal_checkpoint(&db, Path::new("/tmp/unused"))
+                .unwrap()
+                .as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "legacy personal installs without mapping rows may still use import watermark"
         );
     }
 
@@ -937,13 +982,50 @@ mod tests {
             err,
             SyncError::HistoryBlocked {
                 reason,
+                detail,
                 ..
             } if reason == "missing_checkpoint"
+                && detail.contains("run initial import first")
         ));
         let block = load_history_block(&db, &history_block_key(Some("personal")))
             .unwrap()
             .unwrap();
         assert_eq!(block["reason"], "missing_checkpoint");
+    }
+
+    #[test]
+    fn inspect_personal_history_blocks_multi_repo_with_watermark() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        init_git_with_origin(&git_work, &bare);
+        let watermark = git_head(&git_work);
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        db.set_watermark("git_sha", &watermark).unwrap();
+        insert_managed_repo(&db, "alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        insert_managed_repo(&db, "beta", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let err = inspect_personal_history(&db, &git_work, "main", "personal").unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::HistoryBlocked {
+                reason,
+                detail,
+                ..
+            } if reason == "missing_checkpoint"
+                && detail.contains("multiple managed repositories")
+        ));
+        let block = load_history_block(&db, &history_block_key(Some("personal")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(block["reason"], "missing_checkpoint");
+        assert!(block["detail"]
+            .as_str()
+            .unwrap()
+            .contains("multiple managed repositories"));
     }
 
     #[test]
