@@ -62,7 +62,7 @@ pub fn resolve_unscoped_sync_state(db: &Database) -> Result<String, DatabaseErro
 /// - Empty `repositories` table: commit-map fallback via `get_last_git_hash()`.
 /// - Exactly one managed repo: that repo's `last_git_sha` column when non-empty.
 /// - Multiple managed repos: `None` (fail closed; never infer from global kv or
-///   commit-map MAX).
+///   the last `commit_map` row).
 pub fn resolve_scoped_checkpoint_tip(db: &Database) -> Result<Option<String>, DatabaseError> {
     let repos = db.list_repositories()?;
     if repos.is_empty() {
@@ -85,7 +85,7 @@ pub fn resolve_scoped_checkpoint_tip(db: &Database) -> Result<Option<String>, Da
 ///   fallback via `get_last_git_hash()`.
 /// - Exactly one managed repo: that repo's `last_git_sha` column when non-empty.
 /// - Multiple managed repos: `None` (no honest single global tip; never infer from
-///   global kv or commit-map MAX).
+///   global kv or the last `commit_map` row).
 pub fn resolve_unscoped_last_git_hash(db: &Database) -> Result<Option<String>, DatabaseError> {
     let repos = db.list_repositories()?;
     if repos.is_empty() {
@@ -409,7 +409,32 @@ mod tests {
         assert_eq!(
             resolve_scoped_checkpoint_tip(&db).unwrap().as_deref(),
             Some("cccccccccccccccccccccccccccccccccccccccc"),
-            "history inspect must use the managed-repo column, not foreign global max"
+            "history inspect must use the managed-repo column, not foreign global kv or commit-map tip"
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = '' WHERE id = 'only'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            resolve_scoped_checkpoint_tip(&db).unwrap(),
+            None,
+            "empty managed-repo column must not fall back to global kv or commit-map tip"
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_checkpoint_tip_omits_global_kv_without_commit_map() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("last_git_hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        assert_eq!(
+            resolve_scoped_checkpoint_tip(&db).unwrap(),
+            None,
+            "legacy history inspect must not read global kv when commit_map is empty"
         );
     }
 
@@ -472,7 +497,7 @@ mod tests {
         assert_eq!(
             resolve_unscoped_last_git_hash(&db).unwrap(),
             None,
-            "empty managed-repo column must not fall back to global kv or commit-map max"
+            "empty managed-repo column must not fall back to global kv or commit-map tip"
         );
     }
 }
