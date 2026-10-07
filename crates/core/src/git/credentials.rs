@@ -27,6 +27,20 @@ pub fn apply_git_credential_chain_state(
     }
 }
 
+/// Apply only config/env git credentials to the legacy config git-repo remote.
+///
+/// Managed-repo credential chains must never be applied to `data_dir/git-repo`.
+pub fn apply_config_remote_git_credentials(
+    git: &GitClient,
+    config_token: Option<&str>,
+) -> Result<(), GitError> {
+    if let Some(tok) = config_token {
+        git.ensure_remote_credentials("origin", Some(tok))
+    } else {
+        Ok(())
+    }
+}
+
 /// Resolve the managed git-token chain for `repo_id` and apply it to `remote_name`.
 ///
 /// This is the shared entry point used by the scheduler, daemon startup, and

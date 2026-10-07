@@ -942,6 +942,9 @@
     {"id":"RS11_SCHEDULER_CHAIN_MISS_PRESERVES_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_scheduler_chain_miss_preserves_embedded_git_token", "tier":"candidate_regression"},
     {"id":"RS11_IMPORT_CHAIN_MISS_PRESERVES_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_import_chain_miss_preserves_embedded_git_token", "tier":"candidate_regression"},
     {"id":"RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_chain_db_error_preserves_embedded_git_token", "tier":"candidate_regression"},
-    {"id":"RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_scheduler_revocation_strips_embedded_git_token", "tier":"candidate_regression"}
+    {"id":"RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_scheduler_revocation_strips_embedded_git_token", "tier":"candidate_regression"},
+    {"id":"RS11_STARTUP_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
+    {"id":"RS11_CLI_SYNC_NOW_NO_FOREIGN_CONFIG_TOKEN", "binary":"team_mode_e2e", "test":"candidate_rs11_cli_sync_now_keeps_config_remote_without_foreign_token", "tier":"candidate_regression"},
+    {"id":"RS11_STARTUP_CHILD_REVOCATION_PRESERVED", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_child_revocation_preserved", "tier":"candidate_regression"}
   ]
 }
