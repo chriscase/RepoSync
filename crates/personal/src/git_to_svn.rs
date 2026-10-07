@@ -11,10 +11,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, instrument, warn};
 
+use reposync_core::db::git_push_operations::{GitPushOperation, GitPushOperationState};
 use reposync_core::db::svn_commit_operations::{
     svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
 };
 use reposync_core::db::Database;
+use reposync_core::echo_suppression::{
+    classify_incoming_git_commit, EchoDisposition, TeamEchoContext,
+};
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
@@ -33,6 +37,9 @@ use crate::commit_format::CommitFormatter;
 
 /// Personal-mode repository scope for the shared Git→SVN commit journal.
 const PERSONAL_REPO_ID: &str = "personal";
+
+/// Personal-mode no-target receipt projection (empty ruleset).
+const PERSONAL_NO_TARGET_PROJECTION: &str = "{}";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -182,6 +189,15 @@ impl GitToSvnSync {
                 anyhow::bail!(reason);
             }
         }
+        if let Some(op) = self
+            .db
+            .active_git_push_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal svn-to-git push")?
+        {
+            if let Some(reason) = blocking_git_push_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
 
         self.ensure_personal_history_admitted()
             .context("personal Git history inspection blocked git-to-svn sync")?;
@@ -309,28 +325,49 @@ impl GitToSvnSync {
             )
             .context("failed to insert pr_sync_log entry")?;
 
-        // Filter out echo commits (ones we created during SVN-to-Git sync).
-        let commits_to_replay: Vec<&GitHubCommit> = commits
-            .iter()
-            .filter(|c| !CommitFormatter::is_sync_marker(&c.commit.message))
-            .collect();
-
-        if commits_to_replay.is_empty() {
-            info!(
-                pr_number = pr.number,
-                "all PR commits are echo commits, marking as synced"
-            );
-            self.db
-                .complete_pr_sync(sync_id, 0, 0)
-                .context("failed to complete pr_sync_log entry")?;
-            return Ok(0);
-        }
+        let echo_ctx = TeamEchoContext {
+            db: self.db.as_ref(),
+            repo_id: PERSONAL_REPO_ID,
+            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
+        };
 
         let mut synced_count: u64 = 0;
         let mut first_svn_rev: Option<i64> = None;
         let mut last_svn_rev: Option<i64> = None;
+        let mut replayed_any = false;
 
-        for commit in &commits_to_replay {
+        for commit in &commits {
+            match classify_incoming_git_commit(&echo_ctx, &commit.sha, &commit.commit.message)
+                .map_err(|e| anyhow::anyhow!(e))?
+            {
+                Ok(EchoDisposition::SkipEcho) => {
+                    debug!(
+                        git_sha = %commit.sha,
+                        "skipping echo Git commit (repo-scoped receipt)"
+                    );
+                    continue;
+                }
+                Ok(EchoDisposition::DeferPendingJournal) => {
+                    anyhow::bail!(
+                        "pending personal svn-to-git journal for {}; deferring git-to-svn replay",
+                        commit.sha
+                    );
+                }
+                Ok(EchoDisposition::ApplyGenuine | EchoDisposition::ApplyGenuineWithMarkerHint) => {
+                }
+                Err(sync_err) => return Err(sync_err).context("git commit classification failed"),
+            }
+
+            if self
+                .db
+                .is_git_sha_synced(&commit.sha)
+                .context("failed to check commit_map for Git SHA")?
+            {
+                debug!(git_sha = %commit.sha, "skipping already-synced Git commit");
+                continue;
+            }
+
+            replayed_any = true;
             match self.replay_commit(commit, pr.number, pr_branch).await {
                 Ok(svn_rev) => {
                     if first_svn_rev.is_none() {
@@ -390,6 +427,17 @@ impl GitToSvnSync {
             }
         }
 
+        if !replayed_any && synced_count == 0 {
+            info!(
+                pr_number = pr.number,
+                "all PR commits are echo or already synced, marking as synced"
+            );
+            self.db
+                .complete_pr_sync(sync_id, 0, 0)
+                .context("failed to complete pr_sync_log entry")?;
+            return Ok(0);
+        }
+
         // Mark PR sync as completed.
         let svn_start = first_svn_rev.unwrap_or(0);
         let svn_end = last_svn_rev.unwrap_or(0);
@@ -425,6 +473,15 @@ impl GitToSvnSync {
             .context("failed to read active personal git-to-svn commit")?
         {
             if let Some(reason) = blocking_svn_commit_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+        if let Some(op) = self
+            .db
+            .active_git_push_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal svn-to-git push")?
+        {
+            if let Some(reason) = blocking_git_push_hold(&op) {
                 anyhow::bail!(reason);
             }
         }
@@ -946,6 +1003,24 @@ impl GitToSvnSync {
             }
         }
     }
+}
+
+fn blocking_git_push_hold(op: &GitPushOperation) -> Option<String> {
+    if op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized {
+        return Some(format!(
+            "reconciliation_required: personal svn-to-git push held ({})",
+            op.outcome_detail
+                .as_deref()
+                .unwrap_or("inspect the exact Git ref before retrying")
+        ));
+    }
+    if !op.state.is_terminal() {
+        return Some(
+            "repository has an active personal svn-to-git push; wait for the current operation"
+                .into(),
+        );
+    }
+    None
 }
 
 fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {

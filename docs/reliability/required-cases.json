@@ -936,6 +936,21 @@
     {"id":"R17_SVNSERVE_CONCURRENT_OVERLAP", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_concurrent_overlap", "tier":"candidate_regression"},
     {"id":"R17_SVNSERVE_CHECKPOINT_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_checkpoint_isolation", "tier":"candidate_regression"},
     {"id":"R17_SVNSERVE_CREDENTIAL_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_credential_isolation", "tier":"candidate_regression"},
-    {"id":"R17_SVNSERVE_JOB_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_job_isolation", "tier":"candidate_regression"}
+    {"id":"R17_SVNSERVE_JOB_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_job_isolation", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_ISOLATION", "binary":"team_mode_e2e", "test":"candidate_rs11_two_repos_reload_uses_scoped_credentials", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_ROTATION_RELOAD", "binary":"team_mode_e2e", "test":"candidate_rs11_rotation_and_reopen_reload_scoped_credentials", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_REVOCATION", "binary":"team_mode_e2e", "test":"candidate_rs11_revocation_clears_without_global_fallback", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED", "binary":"team_mode_e2e", "test":"candidate_rs11_missed_lookup_preserves_embedded_credentials", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_CONFIG_SURVIVES_RELOAD", "binary":"team_mode_e2e", "test":"candidate_rs11_config_credentials_survive_reload_without_repo_id", "tier":"candidate_regression"},
+    {"id":"RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL", "binary":"team_mode_e2e", "test":"candidate_rs11_parent_revocation_blocks_global_for_child", "tier":"candidate_regression"},
+    {"id":"RS11_SCHEDULER_CHAIN_MISS_PRESERVES_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_scheduler_chain_miss_preserves_embedded_git_token", "tier":"candidate_regression"},
+    {"id":"RS11_IMPORT_CHAIN_MISS_PRESERVES_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_import_chain_miss_preserves_embedded_git_token", "tier":"candidate_regression"},
+    {"id":"RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_chain_db_error_preserves_embedded_git_token", "tier":"candidate_regression"},
+    {"id":"RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_scheduler_revocation_strips_embedded_git_token", "tier":"candidate_regression"},
+    {"id":"RS11_STARTUP_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
+    {"id":"RS11_CLI_SYNC_NOW_NO_FOREIGN_CONFIG_TOKEN", "binary":"team_mode_e2e", "test":"candidate_rs11_cli_sync_now_keeps_config_remote_without_foreign_token", "tier":"candidate_regression"},
+    {"id":"RS11_STARTUP_CHILD_REVOCATION_PRESERVED", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_child_revocation_preserved", "tier":"candidate_regression"},
+    {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
+    {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation", "tier":"candidate_regression"}
   ]
 }

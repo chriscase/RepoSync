@@ -25,12 +25,12 @@ fn main() {
         .unwrap_or(false);
 
     let sha_display = if git_dirty {
-        format!("{}+dirty", git_sha)
+        format!("{git_sha}+dirty")
     } else {
         git_sha
     };
 
-    println!("cargo:rustc-env=GIT_COMMIT_SHA={}", sha_display);
+    println!("cargo:rustc-env=GIT_COMMIT_SHA={sha_display}");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/heads/");
 }

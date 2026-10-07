@@ -171,6 +171,23 @@ fn advance_svn_only_tx(tx: &Connection, repo_id: &str, svn_rev: i64) -> Result<(
     Ok(())
 }
 
+fn advance_svn_with_receipt_tx(
+    tx: &Connection,
+    repo_id: &str,
+    svn_rev: i64,
+    receipt: serde_json::Value,
+) -> Result<(), DatabaseError> {
+    if svn_rev <= 0 {
+        return Err(DatabaseError::Other(
+            "team cycle mapping lacks a positive SVN revision".into(),
+        ));
+    }
+    advance_svn_only_tx(tx, repo_id, svn_rev)?;
+    let receipt_key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
+    write_value(tx, &receipt_key, &receipt.to_string())?;
+    Ok(())
+}
+
 fn advance_git_with_receipt_tx(
     tx: &Connection,
     repo_id: &str,
@@ -217,7 +234,14 @@ fn finalize_tx(
                     "observed SVN revision is not after the pre-write revision".into(),
                 ));
             }
-            advance_svn_only_tx(tx, &op.repo_id, svn_rev)?;
+            let receipt = serde_json::json!({
+                "version": 1,
+                "repo_id": op.repo_id,
+                "svn_revision": svn_rev,
+                "outcome": "no_git_content",
+                "projection": op.projection,
+            });
+            advance_svn_with_receipt_tx(tx, &op.repo_id, svn_rev, receipt)?;
         }
         (
             TeamCycleMappingDirection::GitToSvn,
@@ -511,6 +535,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::echo_suppression::{
+        classify_incoming_svn_revision, verify_svn_no_target_receipt, EchoDisposition,
+        NoTargetReceiptVerdict, TeamEchoContext,
+    };
 
     #[test]
     fn svn_no_target_confirm_advances_watermark() {
@@ -523,6 +551,7 @@ mod tests {
                 ["a".repeat(40)],
             )
             .unwrap();
+        let inbound_git_before = db.get_state("last_git_sha_pair").unwrap();
         let fingerprint = team_cycle_mapping_fingerprint("pair", "unfiltered");
         let op = db
             .begin_team_cycle_mapping(TeamCycleMappingIntent {
@@ -551,6 +580,38 @@ mod tests {
         assert_eq!(
             db.get_state("last_svn_rev_pair").unwrap().as_deref(),
             Some("2")
+        );
+        let receipt_raw = db
+            .get_state("handled_svn_no_target_pair_2")
+            .unwrap()
+            .unwrap();
+        let receipt = serde_json::from_str::<serde_json::Value>(&receipt_raw).unwrap();
+        assert_eq!(
+            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered"),
+            NoTargetReceiptVerdict::Accepted
+        );
+        let echo_ctx = TeamEchoContext {
+            db: &db,
+            repo_id: "pair",
+            no_target_projection: "unfiltered",
+        };
+        assert_eq!(
+            classify_incoming_svn_revision(&echo_ctx, 2, "no marker").unwrap(),
+            EchoDisposition::SkipEcho
+        );
+        let emitted_tip: String = db
+            .conn()
+            .query_row(
+                "SELECT last_git_sha FROM repositories WHERE id='pair'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emitted_tip, "a".repeat(40));
+        assert_eq!(
+            db.get_state("last_git_sha_pair").unwrap(),
+            inbound_git_before,
+            "svn no-target must not move inbound git cursor"
         );
         assert!(db
             .active_team_cycle_mapping_operation("pair")

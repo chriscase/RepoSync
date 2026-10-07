@@ -3431,59 +3431,64 @@ impl SyncEngine {
     // Credential hot-reload
     // -----------------------------------------------------------------------
 
+    /// Fixture-only accessor for credential isolation proofs.
+    #[doc(hidden)]
+    pub fn fixture_svn_password_marker(&self) -> String {
+        self.svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .fixture_password_marker()
+            .to_string()
+    }
+
     /// Re-read SVN password and Git token from the DB so that credentials
     /// saved via the repo detail page take effect without a daemon restart.
-    /// Tries per-repo keys first (secret_svn_password_{repo_id}), then falls
-    /// back to global keys for backward compatibility.
+    /// Uses the same scoped resolver as the scheduler: repo → parent chain →
+    /// global, with explicit per-repo revocation blocking broader fallback.
     fn reload_credentials(&self) {
-        // SVN password — per-repo key first, then global
-        let svn_pw = self
-            .repo_id
-            .as_ref()
-            .and_then(|rid| {
-                self.db
-                    .get_state(&format!("secret_svn_password_{}", rid))
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            })
-            .or_else(|| {
-                self.db
-                    .get_state("secret_svn_password")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            });
+        use crate::db::queries::CredentialChainState;
 
-        if let Some(pw) = svn_pw {
+        let svn_state = match self.repo_id.as_deref() {
+            Some(rid) => self
+                .db
+                .resolve_credential_chain_state(rid, "secret_svn_password"),
+            None => match self.db.get_state("secret_svn_password") {
+                Ok(Some(pw)) if !pw.is_empty() => CredentialChainState::resolved(pw),
+                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+            },
+        };
+        {
             let mut svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner());
-            svn.set_password(pw);
-            debug!("reloaded SVN password from database");
+            if let Some(pw) = svn_state.value {
+                svn.set_password(pw);
+                debug!("reloaded SVN password from database");
+            } else if svn_state.explicitly_revoked {
+                svn.set_password("");
+                debug!("cleared SVN password after explicit revocation");
+            }
         }
 
-        // Git token — per-repo key first, then global
-        let git_tok = self
-            .repo_id
-            .as_ref()
-            .and_then(|rid| {
-                self.db
-                    .get_state(&format!("secret_git_token_{}", rid))
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            })
-            .or_else(|| {
-                self.db
-                    .get_state("secret_git_token")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            });
-
-        if let Some(token) = git_tok {
+        let git_state = match self.repo_id.as_deref() {
+            Some(rid) => self
+                .db
+                .resolve_credential_chain_state(rid, "secret_git_token"),
+            None => match self.db.get_state("secret_git_token") {
+                Ok(Some(tok)) if !tok.is_empty() => CredentialChainState::resolved(tok),
+                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+            },
+        };
+        {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = git.ensure_remote_credentials("origin", Some(&token));
-            debug!("reloaded Git token from database");
+            match crate::git::apply_git_credential_chain_state(&git, "origin", &git_state) {
+                Ok(()) if git_state.value.is_some() => {
+                    debug!("reloaded Git token from database");
+                }
+                Ok(()) if git_state.explicitly_revoked => {
+                    debug!("cleared embedded git credentials after explicit revocation");
+                }
+                Ok(()) => {}
+                Err(e) => warn!("failed to apply git credential chain state: {e}"),
+            }
         }
     }
 
@@ -3534,10 +3539,11 @@ impl SyncEngine {
         message: &str,
     ) -> Result<bool, SyncError> {
         if let Some(repo_id) = self.effective_repo_id() {
+            let projection = self.no_target_projection();
             let ctx = TeamEchoContext {
                 db: &self.db,
                 repo_id,
-                no_target_projection: "",
+                no_target_projection: &projection,
             };
             return match classify_incoming_svn_revision(&ctx, svn_rev, message)? {
                 EchoDisposition::SkipEcho => Ok(true),
@@ -3947,8 +3953,10 @@ repo = "test/test-repo"
             err,
             SyncError::GitPushHeld {
                 reason,
-                ..
+                detail,
             } if reason == "pending_journal_finalize"
+                && detail.contains("matches a Running svn-to-Git journal")
+                && detail.contains("wait for the in-flight emit")
         ));
     }
 
@@ -3967,8 +3975,10 @@ repo = "test/test-repo"
             err,
             SyncError::SvnCommitHeld {
                 reason,
-                ..
+                detail,
             } if reason == "pending_journal_finalize"
+                && detail.contains("matches a Running git-to-SVN journal")
+                && detail.contains("wait for the in-flight emit")
         ));
     }
 
@@ -4006,11 +4016,110 @@ repo = "test/test-repo"
     }
 
     #[test]
-    fn running_svn_journal_without_marker_applies_as_genuine() {
+    fn running_svn_journal_without_marker_defers_only_matching_rev() {
         let engine = team_echo_engine("pair");
         begin_running_git_to_svn_commit(engine.db(), "pair", 4);
+        assert!(matches!(
+            engine.should_skip_incoming_svn_revision(5, "edited away marker"),
+            Err(SyncError::SvnCommitHeld {
+                reason,
+                detail,
+            }) if reason == "pending_journal_finalize"
+                && detail.contains("matches a Running git-to-SVN journal")
+                && detail.contains("wait for the in-flight emit")
+        ));
         assert!(!engine
-            .should_skip_incoming_svn_revision(5, "no marker")
+            .should_skip_incoming_svn_revision(6, "no marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn running_svn_journal_with_different_rev_applies_as_genuine() {
+        let engine = team_echo_engine("pair");
+        begin_running_git_to_svn_commit(engine.db(), "pair", 4);
+        let marker = format!(
+            "synced\n\n{SYNC_MARKER} synced from Git {}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(!engine
+            .should_skip_incoming_svn_revision(6, &marker)
+            .unwrap());
+        assert!(!engine
+            .should_skip_incoming_svn_revision(6, "no marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn svn_no_target_receipt_skips_only_when_admission_scoped() {
+        let engine = team_echo_engine("pair");
+        let svn_rev = 9_i64;
+        let projection = engine.no_target_projection();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_pair_{svn_rev}"),
+                &receipt.to_string(),
+            )
+            .unwrap();
+        assert!(engine
+            .should_skip_incoming_svn_revision(svn_rev, "no marker")
+            .unwrap());
+
+        let other_rev = 10_i64;
+        let cross_repo = serde_json::json!({
+            "version": 1,
+            "repo_id": "other",
+            "svn_revision": other_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_other_{other_rev}"),
+                &cross_repo.to_string(),
+            )
+            .unwrap();
+        assert!(!engine
+            .should_skip_incoming_svn_revision(other_rev, "no marker")
+            .unwrap());
+
+        let malformed_rev = 11_i64;
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_pair_{malformed_rev}"),
+                "not-json",
+            )
+            .unwrap();
+        assert!(!engine
+            .should_skip_incoming_svn_revision(malformed_rev, "no marker")
+            .unwrap());
+
+        let weak_rev = 12_i64;
+        let weak = serde_json::json!({
+            "version": 3,
+            "repo_id": "pair",
+            "svn_revision": weak_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_pair_{weak_rev}"),
+                &weak.to_string(),
+            )
+            .unwrap();
+        assert!(!engine
+            .should_skip_incoming_svn_revision(weak_rev, "no marker")
             .unwrap());
     }
 

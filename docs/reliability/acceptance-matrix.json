@@ -491,12 +491,29 @@
         "R17_SVNSERVE_CONCURRENT_OVERLAP",
         "R17_SVNSERVE_CHECKPOINT_ISOLATION",
         "R17_SVNSERVE_CREDENTIAL_ISOLATION",
-        "R17_SVNSERVE_JOB_ISOLATION"
+        "R17_SVNSERVE_JOB_ISOLATION",
+        "RS11_TEAM_CREDENTIAL_ISOLATION",
+        "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD",
+        "RS11_TEAM_CREDENTIAL_REVOCATION",
+        "RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED",
+        "RS11_TEAM_CREDENTIAL_CONFIG_SURVIVES_RELOAD",
+        "RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL",
+        "RS11_SCHEDULER_CHAIN_MISS_PRESERVES_EMBEDDED_GIT",
+        "RS11_IMPORT_CHAIN_MISS_PRESERVES_EMBEDDED_GIT",
+        "RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT",
+        "RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT",
+        "RS11_STARTUP_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN",
+        "RS11_CLI_SYNC_NOW_NO_FOREIGN_CONFIG_TOKEN",
+        "RS11_STARTUP_CHILD_REVOCATION_PRESERVED",
+        "RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN",
+        "RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION"
       ],
       "open": [
-        "Notification crossover beyond cursor/job/credential scope remains open"
+        "Two concurrent in-flight full imports with overlapping branch names are not a required exact case",
+        "Notification crossover beyond cursor/job/credential scope remains open",
+        "Concurrent reload races for parent/child credential inheritance remain open"
       ],
-      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct. The svnserve real-engine suite imports two repos concurrently at the same numeric SVN revision and branch name without checkpoint, job, or credential crossover.",
+      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct. The svnserve real-engine suite imports two repos concurrently at the same numeric SVN revision and branch name without checkpoint, job, or credential crossover. RS-11 team cases prove per-repo git/svn canary reload across two independent repos with a contaminating global key: rotation on one repo does not change the sibling, reopen reloads the scoped value, explicit revocation clears embedded git credentials without global fallback, missed lookups preserve in-memory and URL-embedded secrets, legacy CLI config passwords survive reload without kv_state keys, and a revoked parent blocks global fallback for a keyless child. Scheduler and import credential prep preserve URL-embedded git tokens on chain miss or kv_state lookup failure; explicit per-repo revocation strips embedded git tokens on the scheduler path. Daemon startup and setup import/reset-reimport apply only config/env credentials to the legacy config remote, CLI sync now without a repo id does not keep a managed-repo token there, and explicit child revocations survive startup seeding plus a scheduler cycle.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -509,13 +526,16 @@
         "R10_PINNED_OLD_TOPOLOGY_INVENTORY"
       ],
       "supporting_case_ids": [
-        "64A_SCHEDULER"
+        "64A_SCHEDULER",
+        "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD",
+        "RS11_TEAM_CREDENTIAL_REVOCATION",
+        "RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL"
       ],
       "open": [
         "Shared-target locking across parent/descendant operations is not a general service",
-        "Credential rotation behavior is not a required exact case"
+        "Parent/child explicit override preservation during parent rotation is not a required exact case"
       ],
-      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. This is not a complete lifecycle lock proof.",
+      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. RS-11 proves team reload/rotation/revocation stay scoped per repo with dummy canaries in .git/config and fixture SVN markers, and parent revocation blocks global fallback for keyless children.",
       "diagnostic_expected_baseline_failure": false
     },
     {

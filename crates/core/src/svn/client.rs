@@ -94,6 +94,12 @@ impl SvnClient {
         self.password = password.into();
     }
 
+    /// Test-only marker for fixture credential isolation proofs.
+    #[doc(hidden)]
+    pub fn fixture_password_marker(&self) -> &str {
+        &self.password
+    }
+
     /// Update the username at runtime (credential hot-reload from DB).
     pub fn set_username(&mut self, username: impl Into<String>) {
         self.username = username.into();

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
+use reposync_core::db::credential_seeding::seed_per_repo_credentials;
 use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
 use reposync_core::db::watermark_recovery::{
     persist_git_log_auto_detect_watermark, recover_repo_watermark_from_git_log_scan,
@@ -26,7 +27,10 @@ use reposync_core::db::watermark_recovery::{
 };
 use reposync_core::db::Database;
 use reposync_core::errors::SyncError;
-use reposync_core::git::GitClient;
+use reposync_core::git::{
+    apply_config_remote_git_credentials, apply_git_credential_chain_state,
+    apply_managed_git_credentials, GitClient,
+};
 use reposync_core::identity::IdentityMapper;
 use reposync_core::models::{Repository, SyncState};
 use reposync_core::svn::SvnClient;
@@ -6864,7 +6868,7 @@ async fn test_team_mode_marker_without_receipt_applies_once() {
     let fixture = QualifiedPair::new_with_repo_id("marker-once").await;
     let repo_id = fixture.repo_id.as_str();
     let svn_before = svn_youngest(&fixture.svn_url);
-    let marker_message = format!("User work\n\n[reposync] forged marker without receipt");
+    let marker_message = "User work\n\n[reposync] forged marker without receipt".to_string();
     let sha =
         fixture.developer_commit_tree(&[("marker.txt", Some("marker body\n"))], &marker_message);
     git_cli(&fixture.developer, &["push", "origin", "main"]);
@@ -10357,6 +10361,1043 @@ async fn candidate_64f_cycle_mapping_checkpoint_fail_holds_without_advance() {
             "revision":revision,
             "watermark_unchanged":true,
             "second_cycle_blocked":true
+        })
+    );
+}
+
+fn git_canary_token(repo_id: &str) -> String {
+    format!("canary-git-token-{repo_id}")
+}
+
+fn svn_canary_password(repo_id: &str) -> String {
+    format!("canary-svn-password-{repo_id}")
+}
+
+fn git_origin_url(bridge: &Path) -> String {
+    git_output(bridge, &["remote", "get-url", "origin"])
+}
+
+fn assert_git_origin_has_only_canary(bridge: &Path, repo_id: &str, forbidden: &[&str]) {
+    let url = git_origin_url(bridge);
+    let canary = git_canary_token(repo_id);
+    assert!(
+        url.contains(&canary),
+        "origin for {repo_id} must embed scoped canary, got {url}"
+    );
+    for other in forbidden {
+        assert!(
+            !url.contains(other),
+            "origin for {repo_id} leaked forbidden canary {other}: {url}"
+        );
+    }
+}
+
+struct ScopedCredentialRepo {
+    _repo_id: String,
+    bridge: PathBuf,
+    engine: SyncEngine,
+}
+
+struct TwoRepoCredentialFixture {
+    _tmp: TempDir,
+    db_path: PathBuf,
+    repos: BTreeMap<String, ScopedCredentialRepo>,
+}
+
+impl TwoRepoCredentialFixture {
+    async fn new() -> Self {
+        assert!(
+            svn_available(),
+            "SVN tools are required for candidate evidence"
+        );
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("team-credentials.db");
+        let db = setup_db(&db_path);
+        let now = chrono::Utc::now().to_rfc3339();
+        db.set_state("secret_git_token", "canary-git-token-global")
+            .unwrap();
+        db.set_state("secret_svn_password", "canary-svn-password-global")
+            .unwrap();
+
+        let mut repos = BTreeMap::new();
+        for repo_id in ["repo_a", "repo_b"] {
+            let root = tmp.path().join(repo_id);
+            std::fs::create_dir_all(&root).unwrap();
+            let svn_repo_root = create_svn_repo(&root);
+            let wc = root.join("wc");
+            svn_checkout(&svn_repo_root, &wc);
+            svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+            svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+            let baseline_svn_rev = svn_youngest(&svn_repo_root);
+            let bridge = root.join("bridge");
+            let bare = root.join("origin.git");
+            let git = setup_git_with_bare_origin(&bridge, &bare);
+            let initial = get_head_sha(&bridge);
+            drop(git);
+
+            db.insert_repository(&Repository {
+                id: repo_id.into(),
+                name: repo_id.into(),
+                svn_url: svn_repo_root.clone(),
+                svn_branch: String::new(),
+                svn_username: "fixture".into(),
+                git_provider: "local".into(),
+                git_api_url: String::new(),
+                git_repo: bare.to_string_lossy().to_string(),
+                git_branch: "main".into(),
+                sync_mode: "team".into(),
+                poll_interval_secs: 5,
+                lfs_threshold_mb: 0,
+                auto_merge: false,
+                enabled: true,
+                created_by: None,
+                parent_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                last_svn_rev: baseline_svn_rev - 1,
+                last_git_sha: initial.clone(),
+                last_sync_at: None,
+                sync_status: "idle".into(),
+                total_syncs: 0,
+                total_errors: 0,
+                allowed_paths: None,
+                blocked_patterns: None,
+                consecutive_errors: 0,
+                teams_webhook_url: None,
+            })
+            .unwrap();
+            seed_svn_to_git_baseline(&db, repo_id, baseline_svn_rev, &initial);
+
+            db.set_state(
+                &format!("secret_git_token_{repo_id}"),
+                &git_canary_token(repo_id),
+            )
+            .unwrap();
+            db.set_state(
+                &format!("secret_svn_password_{repo_id}"),
+                &svn_canary_password(repo_id),
+            )
+            .unwrap();
+
+            let http_origin = format!("https://git.invalid/{repo_id}/repo.git");
+            git_cli(&bridge, &["remote", "set-url", "origin", &http_origin]);
+
+            let mut config = make_app_config(&svn_repo_root, tmp.path());
+            config.svn.layout = reposync_core::config::SvnLayout::Custom;
+            let engine_db = setup_db(&db_path);
+            let mut engine = SyncEngine::new(
+                config,
+                engine_db,
+                SvnClient::new(&svn_repo_root, "fixture", ""),
+                GitClient::new(&bridge).unwrap(),
+                Arc::new(make_identity_mapper()),
+            );
+            engine.set_repo_id(repo_id.into());
+            repos.insert(
+                repo_id.into(),
+                ScopedCredentialRepo {
+                    _repo_id: repo_id.into(),
+                    bridge,
+                    engine,
+                },
+            );
+        }
+
+        Self {
+            _tmp: tmp,
+            db_path,
+            repos,
+        }
+    }
+
+    fn repo(&self, repo_id: &str) -> &ScopedCredentialRepo {
+        self.repos.get(repo_id).expect("missing scoped repo")
+    }
+
+    async fn reload_all(&mut self) {
+        for repo in self.repos.values_mut() {
+            // Credential hot-reload runs at cycle start even when remote
+            // inspection later blocks on the synthetic HTTP origin.
+            let _ = repo.engine.run_sync_cycle().await;
+        }
+    }
+
+    fn reopen_engine(&self, repo_id: &str) -> SyncEngine {
+        let scoped = self.repo(repo_id);
+        let repo_row = setup_db(&self.db_path)
+            .get_repository(repo_id)
+            .unwrap()
+            .unwrap();
+        let mut config = make_app_config(&repo_row.svn_url, self._tmp.path());
+        config.svn.layout = reposync_core::config::SvnLayout::Custom;
+        let mut engine = SyncEngine::new(
+            config,
+            setup_db(&self.db_path),
+            SvnClient::new(&repo_row.svn_url, "fixture", ""),
+            GitClient::new(&scoped.bridge).unwrap(),
+            Arc::new(make_identity_mapper()),
+        );
+        engine.set_repo_id(repo_id.into());
+        engine
+    }
+}
+
+/// RS-11 / #63: team-mode sync reload must resolve only the managed repo's
+/// credentials, never a sibling repo's or a stale global canary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_two_repos_reload_uses_scoped_credentials() {
+    let mut fixture = TwoRepoCredentialFixture::new().await;
+    fixture.reload_all().await;
+
+    let all_canaries = [
+        "canary-git-token-global".to_string(),
+        git_canary_token("repo_a"),
+        git_canary_token("repo_b"),
+        "canary-svn-password-global".to_string(),
+        svn_canary_password("repo_a"),
+        svn_canary_password("repo_b"),
+    ];
+    for repo_id in ["repo_a", "repo_b"] {
+        let scoped = fixture.repo(repo_id);
+        let own_git = git_canary_token(repo_id);
+        let own_svn = svn_canary_password(repo_id);
+        let forbidden_for_repo: Vec<&str> = all_canaries
+            .iter()
+            .filter(|token| **token != own_git && **token != own_svn)
+            .map(String::as_str)
+            .collect();
+        assert_git_origin_has_only_canary(&scoped.bridge, repo_id, &forbidden_for_repo);
+        assert_eq!(scoped.engine.fixture_svn_password_marker(), own_svn);
+    }
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_ISOLATION",
+            "repo_a_git":git_origin_url(&fixture.repo("repo_a").bridge),
+            "repo_b_git":git_origin_url(&fixture.repo("repo_b").bridge),
+            "global_canary_present":true,
+            "sibling_leak":false
+        })
+    );
+}
+
+/// RS-11 / #63: rotating one repo's credentials must not change the sibling,
+/// and reopening the engine after DB rotation still reloads the scoped value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_rotation_and_reopen_reload_scoped_credentials() {
+    let mut fixture = TwoRepoCredentialFixture::new().await;
+    fixture.reload_all().await;
+    let repo_b_before = git_origin_url(&fixture.repo("repo_b").bridge);
+
+    let rotated_git = "canary-git-token-repo_a-rotated";
+    let rotated_svn = "canary-svn-password-repo_a-rotated";
+    setup_db(&fixture.db_path)
+        .set_state("secret_git_token_repo_a", rotated_git)
+        .unwrap();
+    setup_db(&fixture.db_path)
+        .set_state("secret_svn_password_repo_a", rotated_svn)
+        .unwrap();
+
+    let reopened = fixture.reopen_engine("repo_a");
+    let _ = reopened.run_sync_cycle().await;
+    assert!(
+        git_origin_url(&fixture.repo("repo_a").bridge).contains(rotated_git),
+        "rotated git canary must be embedded after reopen"
+    );
+    assert_eq!(reopened.fixture_svn_password_marker(), rotated_svn);
+    assert_eq!(
+        git_origin_url(&fixture.repo("repo_b").bridge),
+        repo_b_before,
+        "sibling origin must stay on its own canary after repo_a rotation"
+    );
+    assert!(!repo_b_before.contains(rotated_git));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_ROTATION_RELOAD",
+            "repo_a_rotated_git":rotated_git,
+            "repo_b_unchanged":true,
+            "reopened_engine":true
+        })
+    );
+}
+
+/// RS-11 / #63: explicit per-repo revocation must clear embedded credentials
+/// and must not fall back to the global canary while the sibling keeps its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_revocation_clears_without_global_fallback() {
+    let mut fixture = TwoRepoCredentialFixture::new().await;
+    fixture.reload_all().await;
+    let repo_b_before = git_origin_url(&fixture.repo("repo_b").bridge);
+
+    setup_db(&fixture.db_path)
+        .set_state("secret_git_token_repo_a", "")
+        .unwrap();
+    setup_db(&fixture.db_path)
+        .set_state("secret_svn_password_repo_a", "")
+        .unwrap();
+
+    let reopened = fixture.reopen_engine("repo_a");
+    let _ = reopened.run_sync_cycle().await;
+    let repo_a_url = git_origin_url(&fixture.repo("repo_a").bridge);
+    assert!(
+        !repo_a_url.contains("x-access-token:"),
+        "revoked repo must not keep embedded git credentials: {repo_a_url}"
+    );
+    assert!(
+        !repo_a_url.contains("canary-git-token-global"),
+        "revoked repo must not borrow global git canary: {repo_a_url}"
+    );
+    assert_eq!(reopened.fixture_svn_password_marker(), "");
+    assert_eq!(
+        git_origin_url(&fixture.repo("repo_b").bridge),
+        repo_b_before,
+        "sibling credentials must survive repo_a revocation"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_REVOCATION",
+            "repo_a_cleared":true,
+            "global_fallback":false,
+            "repo_b_unchanged":true
+        })
+    );
+}
+
+/// RS-11 / #63: a credential-chain miss must not wipe in-memory SVN secrets or
+/// HTTP origin userinfo that were already loaded from scoped keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_missed_lookup_preserves_embedded_credentials() {
+    let mut fixture = TwoRepoCredentialFixture::new().await;
+    fixture.reload_all().await;
+
+    let scoped = fixture.repo("repo_a");
+    let svn_before = scoped.engine.fixture_svn_password_marker().to_string();
+    let git_before = git_origin_url(&scoped.bridge);
+    assert!(git_before.contains(&git_canary_token("repo_a")));
+
+    let db = setup_db(&fixture.db_path);
+    for key in [
+        "secret_git_token_repo_a",
+        "secret_svn_password_repo_a",
+        "secret_git_token",
+        "secret_svn_password",
+    ] {
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let _ = scoped.engine.run_sync_cycle().await;
+    assert_eq!(
+        scoped.engine.fixture_svn_password_marker(),
+        svn_before,
+        "missed SVN lookup must keep the in-memory password"
+    );
+    assert_eq!(
+        git_origin_url(&scoped.bridge),
+        git_before,
+        "missed git lookup must keep URL-embedded credentials"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED",
+            "svn_preserved":true,
+            "url_token_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: legacy CLI `sync now` without a repo id must keep config/env
+/// SVN secrets when plaintext kv_state keys are absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_config_credentials_survive_reload_without_repo_id() {
+    assert!(
+        svn_available(),
+        "SVN tools are required for candidate evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+
+    let bridge = tmp.path().join("bridge");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&bridge, &bare);
+    let db = setup_db(&tmp.path().join("cli-credentials.db"));
+    db.set_state("last_svn_rev", "1").unwrap();
+    db.set_state("last_git_hash", &get_head_sha(&bridge))
+        .unwrap();
+
+    let config_svn_password = "cli-config-svn-password";
+    let mut config = make_app_config(&svn_url, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    config.svn.password = Some(config_svn_password.into());
+
+    let engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "fixture", config_svn_password),
+        git_client,
+        Arc::new(make_identity_mapper()),
+    );
+
+    let _ = engine.run_sync_cycle().await;
+    assert_eq!(
+        engine.fixture_svn_password_marker(),
+        config_svn_password,
+        "config/env SVN password must survive reload without kv_state secrets"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_CONFIG_SURVIVES_RELOAD",
+            "repo_id":null,
+            "svn_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: an explicit empty key on a parent must block global fallback
+/// for a keyless child during credential reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_parent_revocation_blocks_global_for_child() {
+    assert!(
+        svn_available(),
+        "SVN tools are required for candidate evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("parent-child-credentials.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.set_state("secret_git_token", "canary-git-token-global")
+        .unwrap();
+    db.set_state("secret_svn_password", "canary-svn-password-global")
+        .unwrap();
+
+    let root = tmp.path().join("child");
+    std::fs::create_dir_all(&root).unwrap();
+    let svn_repo_root = create_svn_repo(&root);
+    let wc = root.join("wc");
+    svn_checkout(&svn_repo_root, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let baseline_svn_rev = svn_youngest(&svn_repo_root);
+    let bridge = root.join("bridge");
+    let bare = root.join("origin.git");
+    let git = setup_git_with_bare_origin(&bridge, &bare);
+    let initial = get_head_sha(&bridge);
+    drop(git);
+
+    db.insert_repository(&Repository {
+        id: "parent".into(),
+        name: "parent".into(),
+        svn_url: svn_repo_root.clone(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: baseline_svn_rev - 1,
+        last_git_sha: initial.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.insert_repository(&Repository {
+        id: "child".into(),
+        name: "child".into(),
+        svn_url: svn_repo_root.clone(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: Some("parent".into()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: baseline_svn_rev - 1,
+        last_git_sha: initial.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    seed_svn_to_git_baseline(&db, "child", baseline_svn_rev, &initial);
+    db.set_state("secret_git_token_parent", "").unwrap();
+    db.set_state("secret_svn_password_parent", "").unwrap();
+
+    let http_origin = "https://git.invalid/child/repo.git";
+    git_cli(&bridge, &["remote", "set-url", "origin", http_origin]);
+
+    let mut config = make_app_config(&svn_repo_root, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut engine = SyncEngine::new(
+        config,
+        setup_db(&db_path),
+        SvnClient::new(&svn_repo_root, "fixture", ""),
+        GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+    engine.set_repo_id("child".into());
+
+    let _ = engine.run_sync_cycle().await;
+    let child_url = git_origin_url(&bridge);
+    assert!(
+        !child_url.contains("canary-git-token-global"),
+        "revoked parent must block global git fallback: {child_url}"
+    );
+    assert!(
+        !child_url.contains("x-access-token:"),
+        "child must not embed credentials after parent revocation: {child_url}"
+    );
+    assert_eq!(
+        engine.fixture_svn_password_marker(),
+        "",
+        "child must not inherit global SVN password after parent revocation"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL",
+            "parent_revoked":true,
+            "global_fallback":false
+        })
+    );
+}
+
+fn rs11_embedded_git_fixture(embedded_token: &str) -> (TempDir, PathBuf, PathBuf, String) {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("embedded-git.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    let repo_id = "embedded_fixture".to_string();
+    let bridge = tmp.path().join("bridge");
+    let bare = tmp.path().join("origin.git");
+    let _git = setup_git_with_bare_origin(&bridge, &bare);
+    db.insert_repository(&Repository {
+        id: repo_id.clone(),
+        name: "embedded fixture".into(),
+        svn_url: "file:///dev/null".into(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    let url = format!("https://x-access-token:{embedded_token}@git.invalid/repo.git");
+    git_cli(&bridge, &["remote", "set-url", "origin", &url]);
+    (tmp, bridge, db_path, repo_id)
+}
+
+/// RS-11 / #63: scheduler credential prep must preserve URL-embedded git tokens
+/// when the credential chain misses (post-encrypt install).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_scheduler_chain_miss_preserves_embedded_git_token() {
+    let embedded = "embedded-scheduler-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    let before = git_origin_url(&bridge);
+
+    let db = setup_db(&db_path);
+    for key in ["secret_git_token", &format!("secret_git_token_{}", repo_id)] {
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let git = GitClient::new(&bridge).unwrap();
+    apply_managed_git_credentials(&git, &db, &repo_id, "origin").unwrap();
+
+    assert_eq!(
+        git_origin_url(&bridge),
+        before,
+        "scheduler chain miss must not strip embedded git token"
+    );
+    assert!(before.contains(embedded));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_SCHEDULER_CHAIN_MISS_PRESERVES_EMBEDDED_GIT",
+            "embedded_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: import credential prep must preserve URL-embedded git tokens
+/// when the credential chain misses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_import_chain_miss_preserves_embedded_git_token() {
+    let embedded = "embedded-import-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    let before = git_origin_url(&bridge);
+
+    let db = setup_db(&db_path);
+    for key in ["secret_git_token", &format!("secret_git_token_{}", repo_id)] {
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let git = GitClient::new(&bridge).unwrap();
+    let state = db.resolve_credential_chain_state(&repo_id, "secret_git_token");
+    assert!(!state.explicitly_revoked);
+    apply_git_credential_chain_state(&git, "origin", &state).unwrap();
+
+    assert_eq!(
+        git_origin_url(&bridge),
+        before,
+        "import chain miss must not strip embedded git token"
+    );
+    assert!(before.contains(embedded));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_IMPORT_CHAIN_MISS_PRESERVES_EMBEDDED_GIT",
+            "embedded_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: a credential-chain DB error must not strip URL-embedded git
+/// tokens (fail-safe `NotFound` handling).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_chain_db_error_preserves_embedded_git_token() {
+    let embedded = "embedded-db-error-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    let before = git_origin_url(&bridge);
+
+    let db = setup_db(&db_path);
+    // Force a genuine kv_state lookup failure (not a plain miss).
+    db.conn().execute("DROP TABLE kv_state", []).unwrap();
+
+    let git = GitClient::new(&bridge).unwrap();
+    let state = db.resolve_credential_chain_state(&repo_id, "secret_git_token");
+    assert!(
+        !state.explicitly_revoked,
+        "DB lookup error must not be treated as revocation"
+    );
+    assert!(state.value.is_none());
+
+    apply_managed_git_credentials(&git, &db, &repo_id, "origin").unwrap();
+
+    assert_eq!(
+        git_origin_url(&bridge),
+        before,
+        "chain DB error must not strip embedded git token"
+    );
+    assert!(before.contains(embedded));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT",
+            "embedded_preserved":true,
+            "db_lookup_error":true
+        })
+    );
+}
+
+/// RS-11 / #63: scheduler credential prep must strip URL-embedded git tokens
+/// on explicit per-repo revocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_scheduler_revocation_strips_embedded_git_token() {
+    let embedded = "embedded-scheduler-revoke-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    assert!(git_origin_url(&bridge).contains(embedded));
+
+    let db = setup_db(&db_path);
+    db.set_state(&format!("secret_git_token_{}", repo_id), "")
+        .unwrap();
+
+    let git = GitClient::new(&bridge).unwrap();
+    apply_managed_git_credentials(&git, &db, &repo_id, "origin").unwrap();
+
+    let after = git_origin_url(&bridge);
+    assert!(
+        !after.contains("x-access-token:"),
+        "scheduler revocation must strip embedded git token: {after}"
+    );
+    assert_eq!(after, "https://git.invalid/repo.git");
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT",
+            "embedded_cleared":true
+        })
+    );
+}
+
+/// RS-11 / #63: daemon startup must not apply the first managed repo's git
+/// credential chain to the legacy config remote at `data_dir/git-repo`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_startup_config_remote_ignores_managed_chain() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("config-remote.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    for repo_id in ["repo_a", "repo_b"] {
+        db.insert_repository(&Repository {
+            id: repo_id.into(),
+            name: repo_id.into(),
+            svn_url: "file:///dev/null".into(),
+            svn_branch: String::new(),
+            svn_username: "fixture".into(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: "origin.git".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        db.set_state(
+            &format!("secret_git_token_{repo_id}"),
+            &git_canary_token(repo_id),
+        )
+        .unwrap();
+    }
+
+    let config_git_repo = tmp.path().join("git-repo");
+    std::fs::create_dir_all(&config_git_repo).unwrap();
+    let bare = tmp.path().join("config-origin.git");
+    std::process::Command::new("git")
+        .args(["init", "--bare", bare.to_str().unwrap()])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            bare.to_str().unwrap(),
+            config_git_repo.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    let config_origin = "https://git.invalid/config/repo.git";
+    git_cli(
+        &config_git_repo,
+        &["remote", "set-url", "origin", config_origin],
+    );
+
+    let git = GitClient::new(&config_git_repo).unwrap();
+    apply_config_remote_git_credentials(&git, None).unwrap();
+
+    let url = git_origin_url(&config_git_repo);
+    assert_eq!(url, config_origin);
+    assert!(
+        !url.contains(&git_canary_token("repo_a")),
+        "config remote must not embed first managed repo token: {url}"
+    );
+    assert!(
+        !url.contains(&git_canary_token("repo_b")),
+        "config remote must not embed sibling managed repo token: {url}"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_STARTUP_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN",
+            "config_remote_unchanged":true,
+            "foreign_token_embedded":false
+        })
+    );
+}
+
+/// RS-11 / #63: legacy CLI `sync now` without a repo id must not keep a managed
+/// repo's token on the config remote after reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_cli_sync_now_keeps_config_remote_without_foreign_token() {
+    assert!(
+        svn_available(),
+        "SVN tools are required for candidate evidence"
+    );
+    let fixture = TwoRepoCredentialFixture::new().await;
+    let config_git_repo = fixture._tmp.path().join("git-repo");
+    std::fs::create_dir_all(&config_git_repo).unwrap();
+    let bare = fixture._tmp.path().join("config-origin.git");
+    std::process::Command::new("git")
+        .args(["init", "--bare", bare.to_str().unwrap()])
+        .status()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "clone",
+            bare.to_str().unwrap(),
+            config_git_repo.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    let config_origin = "https://git.invalid/config/repo.git";
+    git_cli(
+        &config_git_repo,
+        &["remote", "set-url", "origin", config_origin],
+    );
+    apply_config_remote_git_credentials(&GitClient::new(&config_git_repo).unwrap(), None).unwrap();
+
+    let repo_a = fixture.repo("repo_a");
+    let engine_db = setup_db(&fixture.db_path);
+    for key in ["secret_git_token", "secret_svn_password"] {
+        engine_db
+            .conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let mut config = make_app_config(&repo_a.engine.config().svn.url, fixture._tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    config.github.token = None;
+    let engine = SyncEngine::new(
+        config,
+        engine_db,
+        SvnClient::new(&repo_a.engine.config().svn.url, "fixture", ""),
+        GitClient::new(&config_git_repo).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+
+    let _ = engine.run_sync_cycle().await;
+    let url = git_origin_url(&config_git_repo);
+    assert_eq!(url, config_origin);
+    assert!(
+        !url.contains(&git_canary_token("repo_a")),
+        "sync now must not keep first managed repo token on config remote: {url}"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_CLI_SYNC_NOW_NO_FOREIGN_CONFIG_TOKEN",
+            "repo_id":null,
+            "foreign_token_preserved":false
+        })
+    );
+}
+
+/// RS-11 / #63: daemon startup seeding and scheduler prep must keep an explicit
+/// child revocation after a parent still holds credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_startup_child_revocation_preserved() {
+    assert!(
+        svn_available(),
+        "SVN tools are required for candidate evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("child-revocation.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    let root = tmp.path().join("child");
+    std::fs::create_dir_all(&root).unwrap();
+    let svn_repo_root = create_svn_repo(&root);
+    let wc = root.join("wc");
+    svn_checkout(&svn_repo_root, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let baseline_svn_rev = svn_youngest(&svn_repo_root);
+    let bridge = root.join("bridge");
+    let bare = root.join("origin.git");
+    let git = setup_git_with_bare_origin(&bridge, &bare);
+    let initial = get_head_sha(&bridge);
+    drop(git);
+
+    db.insert_repository(&Repository {
+        id: "parent".into(),
+        name: "parent".into(),
+        svn_url: svn_repo_root.clone(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: baseline_svn_rev - 1,
+        last_git_sha: initial.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.insert_repository(&Repository {
+        id: "child".into(),
+        name: "child".into(),
+        svn_url: svn_repo_root.clone(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: Some("parent".into()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: baseline_svn_rev - 1,
+        last_git_sha: initial.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    seed_svn_to_git_baseline(&db, "child", baseline_svn_rev, &initial);
+    db.set_state("secret_git_token_parent", "parent-git-token")
+        .unwrap();
+    db.set_state("secret_svn_password_parent", "parent-svn-password")
+        .unwrap();
+    db.set_state("secret_git_token_child", "").unwrap();
+    db.set_state("secret_svn_password_child", "").unwrap();
+
+    seed_per_repo_credentials(&db).unwrap();
+    assert_eq!(
+        db.get_state("secret_git_token_child").unwrap().as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        db.get_state("secret_svn_password_child")
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+
+    let http_origin = "https://git.invalid/child/repo.git";
+    git_cli(&bridge, &["remote", "set-url", "origin", http_origin]);
+    let git = GitClient::new(&bridge).unwrap();
+    apply_managed_git_credentials(&git, &db, "child", "origin").unwrap();
+
+    let child_url = git_origin_url(&bridge);
+    assert!(
+        !child_url.contains("parent-git-token"),
+        "scheduler prep must not embed parent token over child revocation: {child_url}"
+    );
+    assert!(
+        !child_url.contains("x-access-token:"),
+        "child revocation must leave origin without embedded git credentials: {child_url}"
+    );
+
+    let mut config = make_app_config(&svn_repo_root, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut engine = SyncEngine::new(
+        config,
+        setup_db(&db_path),
+        SvnClient::new(&svn_repo_root, "fixture", ""),
+        GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+    engine.set_repo_id("child".into());
+    let _ = engine.run_sync_cycle().await;
+
+    assert_eq!(engine.fixture_svn_password_marker(), "");
+    let after_cycle = git_origin_url(&bridge);
+    assert!(
+        !after_cycle.contains("parent-git-token"),
+        "scheduler cycle must not resurrect parent git token: {after_cycle}"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_STARTUP_CHILD_REVOCATION_PRESERVED",
+            "child_revoked_after_startup":true,
+            "scheduler_cycle_respected_revocation":true
         })
     );
 }

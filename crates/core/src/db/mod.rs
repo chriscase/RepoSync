@@ -3,6 +3,7 @@
 //! Provides a [`Database`] handle with WAL-mode journaling, automatic schema
 //! migrations, and query helpers for every table used by the sync engine.
 
+pub mod credential_seeding;
 pub mod git_push_operations;
 pub mod import_operations;
 pub mod managed_remove;
