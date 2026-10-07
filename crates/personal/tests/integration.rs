@@ -16,8 +16,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tempfile::TempDir;
 
+use chrono::Utc;
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
+use reposync_core::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 use reposync_core::personal_config::{
     CommitFormatConfig, DeveloperConfig, PersonalConfig, PersonalGitHubConfig,
     PersonalOptionsConfig, PersonalSection, PersonalSvnConfig,
@@ -445,7 +447,7 @@ async fn test_svn_to_git_basic_sync() {
 // ===========================================================================
 
 #[tokio::test]
-async fn test_svn_to_git_echo_suppression() {
+async fn test_svn_to_git_marker_without_receipt_is_applied() {
     if !svn_available() {
         eprintln!("SKIPPED: svn/svnadmin not found in PATH");
         return;
@@ -456,18 +458,13 @@ async fn test_svn_to_git_echo_suppression() {
     let wc_path = tmp.path().join("wc");
     svn_checkout(&svn_url, &wc_path);
 
-    // Rev 1: normal commit.
     svn_commit_file(&wc_path, "normal1.txt", "hello", "Normal commit 1");
-
-    // Rev 2: commit with [reposync] marker (simulating an echo).
     svn_commit_file(
         &wc_path,
         "echo.txt",
         "echoed content",
         "Echoed commit [reposync] synced from Git",
     );
-
-    // Rev 3: another normal commit.
     svn_commit_file(&wc_path, "normal2.txt", "world", "Normal commit 2");
 
     let git_work_dir = tmp.path().join("git_work");
@@ -482,17 +479,74 @@ async fn test_svn_to_git_echo_suppression() {
     let db_arc = Arc::new(db);
 
     let syncer = SvnToGitSync::new(svn_client, git_arc.clone(), db_arc.clone(), config);
-
     let synced = syncer.sync().await.expect("sync failed");
 
-    // Should sync 2 revisions (skipping the echo).
-    assert_eq!(synced, 2, "expected 2 revisions synced (echo skipped)");
-
-    // Watermark should still advance to 3 (the echo commit was acknowledged).
+    assert_eq!(
+        synced, 3,
+        "marker-only SVN revisions must be applied once without a repo-scoped receipt"
+    );
     let watermark = db_arc.get_watermark("svn_rev").unwrap();
     assert_eq!(watermark.as_deref(), Some("3"));
+    let commit_map = db_arc.list_commit_map(10).unwrap();
+    assert_eq!(commit_map.len(), 3);
+}
 
-    // commit_map should have 2 entries (the echo is not in the map).
+#[tokio::test]
+async fn test_svn_to_git_receipt_backed_echo_suppression() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+
+    svn_commit_file(&wc_path, "normal1.txt", "hello", "Normal commit 1");
+    svn_commit_file(
+        &wc_path,
+        "echo.txt",
+        "echoed content",
+        "Echoed commit [reposync] synced from Git",
+    );
+    svn_commit_file(&wc_path, "normal2.txt", "world", "Normal commit 2");
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db_path = tmp.path().join("test.db");
+    let db = setup_db(&db_path);
+    let now = Utc::now();
+    db.insert_sync_record(&SyncRecord {
+        id: "personal-echo-receipt-test".to_string(),
+        repo_id: Some("personal".to_string()),
+        svn_revision: Some(2),
+        git_hash: Some("b".repeat(40)),
+        direction: SyncDirection::GitToSvn,
+        author: "test".into(),
+        message: "personal git-to-svn echo".into(),
+        timestamp: now,
+        synced_at: now,
+        status: SyncRecordStatus::Applied,
+    })
+    .expect("failed to seed git-to-svn echo receipt");
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let git_arc = Arc::new(Mutex::new(git_client));
+    let db_arc = Arc::new(db);
+
+    let syncer = SvnToGitSync::new(svn_client, git_arc.clone(), db_arc.clone(), config);
+    let synced = syncer.sync().await.expect("sync failed");
+
+    assert_eq!(
+        synced, 2,
+        "receipt-backed SVN echo must skip without re-applying"
+    );
+    let watermark = db_arc.get_watermark("svn_rev").unwrap();
+    assert_eq!(watermark.as_deref(), Some("3"));
     let commit_map = db_arc.list_commit_map(10).unwrap();
     assert_eq!(commit_map.len(), 2);
 }

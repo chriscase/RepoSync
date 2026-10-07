@@ -1,9 +1,7 @@
 //! Commit message formatting and echo suppression for personal branch mode.
 
+use reposync_core::echo_suppression::personal_mode_marker_echo;
 use reposync_core::personal_config::CommitFormatConfig;
-
-/// The sync marker embedded in commit messages for echo suppression.
-pub const SYNC_MARKER: &str = "[reposync]";
 
 /// Formats commit messages for both sync directions using configurable templates.
 pub struct CommitFormatter {
@@ -50,9 +48,10 @@ impl CommitFormatter {
             .replace("{pr_branch}", pr_branch)
     }
 
-    /// Check whether a commit message contains the sync marker (echo suppression).
+    /// Check whether a commit message contains the sync marker (diagnostic only).
+    #[allow(dead_code)]
     pub fn is_sync_marker(message: &str) -> bool {
-        message.contains(SYNC_MARKER)
+        personal_mode_marker_echo(message)
     }
 
     /// Extract the SVN revision from a commit message trailer.

@@ -789,6 +789,43 @@ mod tests {
     }
 
     #[test]
+    fn svn_no_target_receipt_wrong_repo_id_under_local_key_does_not_suppress() {
+        let db = setup_db();
+        let svn_rev = 20_i64;
+        let projection = "{}";
+        let wrong_repo = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-b",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        write_svn_no_target_receipt(&db, "repo-a", svn_rev, &wrong_repo.to_string());
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
+    fn svn_no_target_receipt_projection_mismatch_does_not_suppress() {
+        let db = setup_db();
+        let svn_rev = 21_i64;
+        let mismatched = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": "other-projection",
+        });
+        write_svn_no_target_receipt(&db, "repo-a", svn_rev, &mismatched.to_string());
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
     fn running_svn_commit_journal_without_marker_defers_only_matching_rev() {
         let db = setup_db();
         db.conn()

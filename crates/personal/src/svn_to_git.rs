@@ -15,6 +15,9 @@ use reposync_core::db::git_push_operations::{
     git_push_target_fingerprint, GitPushIntent, GitPushOperation, GitPushOperationState,
 };
 use reposync_core::db::Database;
+use reposync_core::echo_suppression::{
+    classify_incoming_svn_revision, EchoDisposition, TeamEchoContext,
+};
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::git_push::{observed_git_ref, observed_git_tree};
@@ -32,6 +35,9 @@ const WATERMARK_KEY: &str = "svn_rev";
 
 /// Personal-mode repository scope for the shared SVN→Git push journal.
 const PERSONAL_REPO_ID: &str = "personal";
+
+/// Personal-mode no-target receipt projection (empty ruleset).
+const PERSONAL_NO_TARGET_PROJECTION: &str = "{}";
 
 const GIT_REMOTE: &str = "origin";
 
@@ -84,9 +90,9 @@ impl SvnToGitSync {
     /// one as a Git commit (with push). Returns the number of revisions
     /// successfully synced.
     ///
-    /// Revisions are skipped if:
-    /// - The commit message contains the `[reposync]` echo marker.
-    /// - The revision is already recorded in the `commit_map` table.
+    /// Revisions are skipped only with repo-scoped receipts (applied sync records
+    /// or verified no-target receipts). Marker text is diagnostic only.
+    /// Already-synced revisions are skipped via `commit_map` / SVN→Git receipts.
     pub async fn sync(&self) -> Result<usize> {
         if let Some(op) = self
             .db
@@ -135,22 +141,40 @@ impl SvnToGitSync {
             .context("failed to fetch SVN log entries")?;
 
         let mut synced_count: usize = 0;
+        let echo_ctx = TeamEchoContext {
+            db: self.db.as_ref(),
+            repo_id: PERSONAL_REPO_ID,
+            no_target_projection: PERSONAL_NO_TARGET_PROJECTION,
+        };
 
         for entry in &log_entries {
             let rev = entry.revision;
 
-            // 4a. Echo suppression: skip commits that contain our sync marker.
-            if CommitFormatter::is_sync_marker(&entry.message) {
-                debug!(rev, "skipping echo SVN revision (sync marker detected)");
-                self.advance_watermark(rev)?;
-                continue;
+            match classify_incoming_svn_revision(&echo_ctx, rev, &entry.message)
+                .map_err(|e| anyhow::anyhow!(e))?
+            {
+                EchoDisposition::SkipEcho => {
+                    debug!(rev, "skipping echo SVN revision (repo-scoped receipt)");
+                    self.advance_watermark(rev)?;
+                    continue;
+                }
+                EchoDisposition::DeferPendingJournal => {
+                    anyhow::bail!(
+                        "pending personal git-to-svn journal at r{}; deferring svn-to-git sync",
+                        rev
+                    );
+                }
+                EchoDisposition::ApplyGenuine | EchoDisposition::ApplyGenuineWithMarkerHint => {}
             }
 
-            // 4b. Idempotency: skip if already recorded in the commit map.
             let already_synced = self
                 .db
                 .is_svn_rev_synced(rev)
-                .context("failed to check commit_map for SVN revision")?;
+                .context("failed to check commit_map for SVN revision")?
+                || self
+                    .db
+                    .has_personal_svn_to_git_receipt(PERSONAL_REPO_ID, rev)
+                    .context("failed to check svn-to-git receipts for SVN revision")?;
             if already_synced {
                 debug!(rev, "skipping already-synced SVN revision");
                 self.advance_watermark(rev)?;
