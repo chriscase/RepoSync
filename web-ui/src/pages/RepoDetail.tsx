@@ -11,7 +11,6 @@ import {
   readBranchPairRemovalNotice,
   persistBranchPairRemovalNotice,
   readPersistedBranchPairRemovalNotice,
-  clearPersistedBranchPairRemovalNotice,
 } from '../branchPairRemoval';
 import ImportProgressCard from '../components/ImportProgressCard';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
