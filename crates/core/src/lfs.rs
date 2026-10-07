@@ -419,6 +419,13 @@ pub fn resolve_lfs_pointer(repo_root: &Path, pointer_content: &[u8]) -> Result<V
         ));
     }
 
+    // git-lfs may exit 0 while echoing the pointer unchanged when the object is
+    // missing locally — treat that as unresolved so callers skip instead of
+    // writing pointer text to SVN.
+    if is_lfs_pointer(&output.stdout) {
+        return Err("git lfs smudge could not resolve LFS object (pointer unchanged)".to_string());
+    }
+
     Ok(output.stdout)
 }
 
@@ -724,6 +731,23 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(engine_gitattributes_body(dir.path()).unwrap().is_none());
         assert!(!dir.path().join(".gitattributes").exists());
+    }
+
+    #[test]
+    fn test_resolve_lfs_pointer_rejects_smudge_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
+        let result = resolve_lfs_pointer(dir.path(), pointer);
+        assert!(
+            result.is_err(),
+            "unresolved smudge passthrough must not count as success: {:?}",
+            result
+        );
     }
 
     #[test]

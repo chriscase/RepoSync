@@ -237,7 +237,7 @@ impl Database {
         if read_ids.len() == 1 {
             return Ok(false);
         }
-        Ok(null_commit_map_svn_to_git_has_personal_evidence(&conn, svn_rev)?)
+        null_commit_map_svn_to_git_has_personal_evidence(&conn, svn_rev)
     }
 
     /// True when personal mode already synced this Git SHA (receipts only).
@@ -265,7 +265,7 @@ impl Database {
         if read_ids.len() == 1 {
             return Ok(false);
         }
-        Ok(null_commit_map_git_to_svn_has_personal_evidence(&conn, git_sha)?)
+        null_commit_map_git_to_svn_has_personal_evidence(&conn, git_sha)
     }
 
     /// True when personal mode has completed syncing this PR merge SHA.
@@ -525,8 +525,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let fingerprint =
-            git_push_target_fingerprint(LEGACY_PERSONAL_REPO_ID, "origin", "main");
+        let fingerprint = git_push_target_fingerprint(LEGACY_PERSONAL_REPO_ID, "origin", "main");
         db.begin_svn_to_git_push(GitPushIntent {
             repo_id: LEGACY_PERSONAL_REPO_ID,
             initiator_id: "worker",
@@ -545,15 +544,12 @@ mod tests {
         })
         .unwrap();
         assert!(
-            db.active_personal_git_push_operation()
-                .unwrap()
-                .is_some(),
+            db.active_personal_git_push_operation().unwrap().is_some(),
             "legacy journal under personal must still hold when managed repo owns that id"
         );
-        assert!(
-            db.active_git_push_operation(PERSONAL_SCOPE_KEY)
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .active_git_push_operation(PERSONAL_SCOPE_KEY)
+            .unwrap()
+            .is_none());
     }
 }

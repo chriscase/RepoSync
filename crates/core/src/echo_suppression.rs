@@ -1126,12 +1126,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            classify_incoming_svn_revision_personal(
-                &ctx(&db, PERSONAL_SCOPE_KEY),
-                5,
-                "no marker",
-            )
-            .unwrap(),
+            classify_incoming_svn_revision_personal(&ctx(&db, PERSONAL_SCOPE_KEY), 5, "no marker",)
+                .unwrap(),
             EchoDisposition::DeferPendingJournal
         );
     }

@@ -6864,7 +6864,7 @@ async fn test_team_mode_marker_without_receipt_applies_once() {
     let fixture = QualifiedPair::new_with_repo_id("marker-once").await;
     let repo_id = fixture.repo_id.as_str();
     let svn_before = svn_youngest(&fixture.svn_url);
-    let marker_message = format!("User work\n\n[reposync] forged marker without receipt");
+    let marker_message = "User work\n\n[reposync] forged marker without receipt".to_string();
     let sha =
         fixture.developer_commit_tree(&[("marker.txt", Some("marker body\n"))], &marker_message);
     git_cli(&fixture.developer, &["push", "origin", "main"]);
