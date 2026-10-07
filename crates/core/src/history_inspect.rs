@@ -561,7 +561,13 @@ pub fn inspect_personal_history(
     scope_id: &str,
 ) -> Result<Option<HistoryInspectAdmission>, SyncError> {
     let key = history_block_key(Some(scope_id));
-    enforce_durable_history_block(db, &key)?;
+    if scope_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
+        for block_key in crate::db::personal_scope::personal_history_block_keys() {
+            enforce_durable_history_block(db, &block_key)?;
+        }
+    } else {
+        enforce_durable_history_block(db, &key)?;
+    }
     let origin = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(git_path)

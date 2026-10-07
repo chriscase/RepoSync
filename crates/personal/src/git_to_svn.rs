@@ -12,12 +12,13 @@ use anyhow::{Context, Result};
 use tracing::{debug, error, info, instrument, warn};
 
 use reposync_core::db::git_push_operations::{GitPushOperation, GitPushOperationState};
+use reposync_core::db::personal_scope::PERSONAL_SCOPE_KEY;
 use reposync_core::db::svn_commit_operations::{
     svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
 };
 use reposync_core::db::Database;
 use reposync_core::echo_suppression::{
-    classify_incoming_git_commit, EchoDisposition, TeamEchoContext,
+    classify_incoming_git_commit_personal, EchoDisposition, TeamEchoContext,
 };
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
@@ -36,7 +37,7 @@ use reposync_core::svn_commit::{
 use crate::commit_format::CommitFormatter;
 
 /// Personal-mode repository scope for the shared Git→SVN commit journal.
-const PERSONAL_REPO_ID: &str = "personal";
+const PERSONAL_REPO_ID: &str = PERSONAL_SCOPE_KEY;
 
 /// Personal-mode no-target receipt projection (empty ruleset).
 const PERSONAL_NO_TARGET_PROJECTION: &str = "{}";
@@ -182,7 +183,7 @@ impl GitToSvnSync {
     pub async fn sync(&self) -> Result<GitToSvnResult> {
         if let Some(op) = self
             .db
-            .active_svn_commit_operation(PERSONAL_REPO_ID)
+            .active_personal_svn_commit_operation()
             .context("failed to read active personal git-to-svn commit")?
         {
             if let Some(reason) = blocking_svn_commit_hold(&op) {
@@ -191,7 +192,7 @@ impl GitToSvnSync {
         }
         if let Some(op) = self
             .db
-            .active_git_push_operation(PERSONAL_REPO_ID)
+            .active_personal_git_push_operation()
             .context("failed to read active personal svn-to-git push")?
         {
             if let Some(reason) = blocking_git_push_hold(&op) {
@@ -254,7 +255,7 @@ impl GitToSvnSync {
             // Check if this PR merge has already been processed.
             let already_synced = self
                 .db
-                .is_pr_synced(&merge_sha)
+                .is_personal_pr_synced(&merge_sha)
                 .context("failed to check pr_sync_log")?;
             if already_synced {
                 debug!(pr_number = pr.number, merge_sha = %merge_sha, "PR already synced, skipping");
@@ -288,6 +289,13 @@ impl GitToSvnSync {
         );
 
         Ok(result)
+    }
+
+    /// Integration-test entry point for [`sync_pr`] without the cycle-wide journal gate.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub async fn sync_pr_for_test(&self, pr: &PullRequest, merge_sha: &str) -> Result<u64> {
+        self.sync_pr(pr, merge_sha).await
     }
 
     /// Sync a single merged PR's commits to SVN.
@@ -337,8 +345,12 @@ impl GitToSvnSync {
         let mut replayed_any = false;
 
         for commit in &commits {
-            match classify_incoming_git_commit(&echo_ctx, &commit.sha, &commit.commit.message)
-                .map_err(|e| anyhow::anyhow!(e))?
+            match classify_incoming_git_commit_personal(
+                &echo_ctx,
+                &commit.sha,
+                &commit.commit.message,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?
             {
                 Ok(EchoDisposition::SkipEcho) => {
                     debug!(
@@ -348,6 +360,7 @@ impl GitToSvnSync {
                     continue;
                 }
                 Ok(EchoDisposition::DeferPendingJournal) => {
+                    let _ = self.db.abandon_pending_pr_sync(sync_id);
                     anyhow::bail!(
                         "pending personal svn-to-git journal for {}; deferring git-to-svn replay",
                         commit.sha
@@ -360,8 +373,8 @@ impl GitToSvnSync {
 
             if self
                 .db
-                .is_git_sha_synced(&commit.sha)
-                .context("failed to check commit_map for Git SHA")?
+                .is_personal_git_sha_synced(&commit.sha)
+                .context("failed to check personal git-to-svn sync evidence for Git SHA")?
             {
                 debug!(git_sha = %commit.sha, "skipping already-synced Git commit");
                 continue;
@@ -469,7 +482,7 @@ impl GitToSvnSync {
     ) -> Result<i64> {
         if let Some(op) = self
             .db
-            .active_svn_commit_operation(PERSONAL_REPO_ID)
+            .active_personal_svn_commit_operation()
             .context("failed to read active personal git-to-svn commit")?
         {
             if let Some(reason) = blocking_svn_commit_hold(&op) {
@@ -478,7 +491,7 @@ impl GitToSvnSync {
         }
         if let Some(op) = self
             .db
-            .active_git_push_operation(PERSONAL_REPO_ID)
+            .active_personal_git_push_operation()
             .context("failed to read active personal svn-to-git push")?
         {
             if let Some(reason) = blocking_git_push_hold(&op) {
@@ -1041,7 +1054,9 @@ fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {
     None
 }
 
-/// Personal mode journals every checkout under `repo_id = "personal"`. Tests
+/// Personal mode journals every checkout under the collision-proof scope key.
+/// Legacy installations used `repo_id = "personal"`; reads still honor that id.
+/// Tests
 /// isolate debug fixtures with the SVN working-copy path so a lost-reply hold
 /// cannot trip parallel personal tests in the same process.
 fn svn_commit_fixture_scope(svn_wc_path: &Path) -> String {
@@ -1311,7 +1326,7 @@ M       Cargo.toml
             Path::new("/tmp/personal-svn-b"),
         );
         assert_ne!(a, b);
-        assert!(a.starts_with("REPOSYNC_SVN_COMMIT_LOST_REPLY__personal__"));
+        assert!(a.starts_with("REPOSYNC_SVN_COMMIT_LOST_REPLY__"));
     }
 
     #[cfg(debug_assertions)]

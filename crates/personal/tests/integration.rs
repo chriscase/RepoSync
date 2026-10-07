@@ -17,6 +17,7 @@ use std::sync::Mutex;
 use tempfile::TempDir;
 
 use chrono::Utc;
+use reposync_core::db::personal_scope::{LEGACY_PERSONAL_REPO_ID, PERSONAL_SCOPE_KEY};
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::models::{SyncDirection, SyncRecord, SyncRecordStatus};
@@ -2364,7 +2365,7 @@ async fn test_lfs_threshold_creates_gitattributes() {
     let count = sync.sync().await.unwrap();
     assert_eq!(count, 2, "two revisions should sync");
     assert!(
-        db.active_git_push_operation("personal").unwrap().is_none(),
+        db.active_personal_git_push_operation().unwrap().is_none(),
         "LFS threshold sync must confirm the journal, not leave a hold"
     );
     assert_eq!(
@@ -2987,7 +2988,7 @@ async fn candidate_r09_personal_rewrite_contained() {
     drop(engine);
     let block_raw = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .unwrap();
     let block: serde_json::Value = serde_json::from_str(&block_raw).unwrap();
@@ -3022,7 +3023,7 @@ async fn candidate_r09_personal_rewrite_contained() {
     );
     let still = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .unwrap();
     let still_block: serde_json::Value = serde_json::from_str(&still).unwrap();
@@ -3302,7 +3303,10 @@ async fn candidate_r66_personal_merge_dag_contained() {
     });
     Database::new(&db_path)
         .unwrap()
-        .set_state(&history_block_key(Some("personal")), &block.to_string())
+        .set_state(
+            &history_block_key(Some(PERSONAL_SCOPE_KEY)),
+            &block.to_string(),
+        )
         .unwrap();
 
     let config = make_test_config(&svn_url, tmp.path());
@@ -3329,7 +3333,7 @@ async fn candidate_r66_personal_merge_dag_contained() {
     );
     let still = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .unwrap();
     let still_block: serde_json::Value = serde_json::from_str(&still).unwrap();
@@ -3513,7 +3517,7 @@ async fn candidate_r66_personal_backlog_block_survives_restart() {
     db.insert_commit_map(1, &handled, "git_to_svn", "testuser", "Test User")
         .unwrap();
     db.set_state(
-        &history_block_key(Some("personal")),
+        &history_block_key(Some(PERSONAL_SCOPE_KEY)),
         &serde_json::json!({
             "state": "reconciliation_required",
             "reason": "unsupported_backlog",
@@ -3552,7 +3556,7 @@ async fn candidate_r66_personal_backlog_block_survives_restart() {
     );
     let still = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .unwrap();
     let still_block: serde_json::Value = serde_json::from_str(&still).unwrap();
@@ -3740,7 +3744,7 @@ async fn test_personal_svn_to_git_lost_reply_holds_without_checkpoint() {
         "commit_map must not advance on uncertain outcome"
     );
     let op = db_arc
-        .active_git_push_operation("personal")
+        .active_personal_git_push_operation()
         .unwrap()
         .expect("active personal svn-to-git push journal");
     assert_eq!(
@@ -3835,7 +3839,7 @@ async fn test_personal_git_to_svn_confirm_writes_commit_map() {
     assert_eq!(svn_youngest(&svn_url), svn_rev);
     assert!(
         db_arc
-            .active_svn_commit_operation("personal")
+            .active_personal_svn_commit_operation()
             .unwrap()
             .is_none(),
         "confirmed journal must clear the active hold"
@@ -3936,7 +3940,7 @@ async fn test_personal_git_to_svn_rename_removes_source() {
     assert_eq!(new_content, "rename me\n");
 
     let op = db_arc
-        .latest_svn_commit_operation("personal")
+        .latest_svn_commit_operation(PERSONAL_SCOPE_KEY)
         .unwrap()
         .expect("rename journal");
     assert_eq!(op.source_git_sha, rename_sha);
@@ -4033,7 +4037,7 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         "commit_map must not advance on uncertain outcome"
     );
     let op = db_arc
-        .active_svn_commit_operation("personal")
+        .active_personal_svn_commit_operation()
         .unwrap()
         .expect("active personal git-to-svn commit journal");
     assert_eq!(
@@ -4157,7 +4161,7 @@ async fn test_personal_svn_to_git_defers_while_git_to_svn_running() {
         .expect("failed to seed Running git-to-svn journal");
 
     let running = db_arc
-        .active_svn_commit_operation("personal")
+        .active_personal_svn_commit_operation()
         .unwrap()
         .expect("Running git-to-svn journal");
     assert_eq!(running.state, SvnCommitOperationState::Running);
@@ -4255,7 +4259,7 @@ async fn test_personal_svn_to_git_defers_while_git_to_svn_reconciliation_require
     drop(_fault);
 
     let held = db_arc
-        .active_svn_commit_operation("personal")
+        .active_personal_svn_commit_operation()
         .unwrap()
         .expect("held git-to-svn journal");
     assert_eq!(
@@ -4370,8 +4374,11 @@ async fn test_personal_git_to_svn_defers_while_svn_to_git_reconciliation_require
     );
     drop(_fault);
 
+    let svn_before = svn_youngest(&svn_url);
+    let commit_map_before = db_arc.list_commit_map(10).unwrap().len();
+
     let held = db_arc
-        .active_git_push_operation("personal")
+        .active_personal_git_push_operation()
         .unwrap()
         .expect("held svn-to-git journal");
     assert_eq!(
@@ -4392,6 +4399,25 @@ async fn test_personal_git_to_svn_defers_while_svn_to_git_reconciliation_require
         format!("{blocked:#}").contains("reconciliation_required")
             || format!("{blocked:#}").contains("svn-to-git"),
         "{blocked:#}"
+    );
+    assert_eq!(
+        svn_youngest(&svn_url),
+        svn_before,
+        "SVN youngest revision must not change while svn-to-git is held"
+    );
+    assert_eq!(
+        db_arc.list_commit_map(10).unwrap().len(),
+        commit_map_before,
+        "commit_map must not change while svn-to-git is held"
+    );
+    let blocked_again = git_to_svn
+        .sync()
+        .await
+        .expect_err("retry must still refuse while hold persists");
+    assert!(
+        format!("{blocked_again:#}").contains("reconciliation_required")
+            || format!("{blocked_again:#}").contains("svn-to-git"),
+        "{blocked_again:#}"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -4462,7 +4488,7 @@ async fn candidate_rs05_personal_missing_checkpoint_blocks_before_svn_write() {
     assert!(format!("{err:#}").contains("missing_checkpoint"), "{err:#}");
     let block = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .expect("missing checkpoint must persist a history block");
     let block: serde_json::Value = serde_json::from_str(&block).unwrap();
@@ -4545,7 +4571,7 @@ async fn candidate_rs05_personal_missing_origin_blocks_before_svn_write() {
     assert!(format!("{err:#}").contains("missing_origin"), "{err:#}");
     let block = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .expect("missing origin must persist a history block");
     let block: serde_json::Value = serde_json::from_str(&block).unwrap();
@@ -4962,7 +4988,7 @@ async fn candidate_rs05_personal_ambiguous_checkpoint_blocks_before_svn_write() 
     );
     let block = Database::new(&db_path)
         .unwrap()
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .expect("ambiguous checkpoint must persist a history block");
     let block: serde_json::Value = serde_json::from_str(&block).unwrap();
@@ -5060,7 +5086,7 @@ async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write
     );
     assert_eq!(svn_youngest(&svn_url), svn_before);
     let block = db_arc
-        .get_state(&history_block_key(Some("personal")))
+        .get_state(&history_block_key(Some(PERSONAL_SCOPE_KEY)))
         .unwrap()
         .expect("ancestry command failure must persist a history block");
     let block: serde_json::Value = serde_json::from_str(&block).unwrap();
@@ -5077,5 +5103,385 @@ async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write
             "svn_revision_before_after":svn_before,
             "mode":"personal"
         })
+    );
+}
+
+fn spawn_github_pr_sync_stub(
+    merge_sha: &str,
+    pr_commit_sha: &str,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let pulls_body = format!(
+        r#"[{{
+            "number": 1,
+            "title": "Feature PR",
+            "html_url": "https://example.invalid/pr/1",
+            "state": "closed",
+            "head": {{"ref": "feature", "sha": "{pr_commit_sha}"}},
+            "base": {{"ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+            "merged": true,
+            "merge_commit_sha": "{merge_sha}",
+            "merged_at": "2025-01-02T00:00:00Z"
+        }}]"#,
+        pr_commit_sha = pr_commit_sha,
+        merge_sha = merge_sha
+    );
+    let commits_body = format!(
+        r#"[{{
+            "sha": "{pr_commit_sha}",
+            "commit": {{
+                "message": "Add feature from PR",
+                "author": {{"name": "Test User", "email": "test@example.com", "date": null}},
+                "committer": {{"name": "Test User", "email": "test@example.com", "date": null}}
+            }},
+            "author": null
+        }}]"#,
+        pr_commit_sha = pr_commit_sha
+    );
+    let merge_detail_body = format!(
+        r#"{{
+            "sha": "{merge_sha}",
+            "commit": {{
+                "message": "Merge PR",
+                "author": {{"name": "Test User", "email": "test@example.com", "date": null}},
+                "committer": {{"name": "Test User", "email": "test@example.com", "date": null}}
+            }},
+            "parents": [
+                {{"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+                {{"sha": "{pr_commit_sha}"}}
+            ]
+        }}"#,
+        merge_sha = merge_sha,
+        pr_commit_sha = pr_commit_sha
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..8 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("/pulls/1/commits") {
+                    commits_body.clone()
+                } else if req.contains("/commits/") {
+                    merge_detail_body.clone()
+                } else if req.contains("/pulls") {
+                    pulls_body.clone()
+                } else {
+                    "[]".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), handle)
+}
+
+/// Foreign team commit_map rows must not cause personal SVN→Git to skip importing.
+#[tokio::test]
+async fn test_personal_svn_to_git_imports_despite_foreign_commit_map_row() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(
+        &wc_path,
+        "team.txt",
+        "foreign collision\n",
+        "Foreign team rev",
+    );
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db_path = tmp.path().join("test.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(
+        1,
+        "ffffffffffffffffffffffffffffffffffffffff",
+        "svn_to_git",
+        "foreign",
+        "Foreign <f@example.com>",
+    )
+    .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE commit_map SET repo_id = 'foreign-team' WHERE svn_rev = 1",
+            [],
+        )
+        .unwrap();
+    assert!(!db.is_personal_svn_rev_synced(1).unwrap());
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let git_arc = Arc::new(Mutex::new(git_client));
+    let db_arc = Arc::new(db);
+
+    let syncer = SvnToGitSync::new(svn_client, git_arc, db_arc.clone(), config);
+    let synced = syncer
+        .sync()
+        .await
+        .expect("personal svn-to-git must import");
+    assert_eq!(synced, 1, "revision 1 must be imported, not skipped");
+    assert!(
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.svn_rev == 1 && entry.direction == "svn_to_git"),
+        "personal import must record commit_map for r1"
+    );
+    assert_eq!(
+        db_arc.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("1")
+    );
+}
+
+/// Deferred PR sync must abandon pending pr_sync_log and retry after the journal finalizes.
+#[tokio::test]
+async fn test_personal_git_to_svn_retries_pr_after_journal_defer() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
+    use reposync_core::git::github::GitHubClient;
+
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    std::fs::write(git_work.join("feature.txt"), "from pr\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let pr_commit_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    let merge_sha = git_sha(&git_work);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, svn_before);
+
+    let fingerprint = git_push_target_fingerprint(PERSONAL_SCOPE_KEY, "origin", "main");
+    db_arc
+        .begin_svn_to_git_push(GitPushIntent {
+            repo_id: PERSONAL_SCOPE_KEY,
+            initiator_id: "test",
+            request_id: "defer-pr",
+            target_fingerprint: &fingerprint,
+            source_svn_rev: svn_before,
+            source_svn_author: "testuser",
+            source_svn_message: "pending journal",
+            pre_push_git_remote: "origin",
+            pre_push_git_branch: "main",
+            pre_push_git_sha: &imported_base,
+            pre_push_git_tree: None,
+            intended_local_git_sha: &pr_commit_sha,
+            intended_local_git_parent: Some(&imported_base),
+            intended_local_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+        })
+        .expect("seed running svn-to-git journal");
+
+    let (api_url, stub) = spawn_github_pr_sync_stub(&merge_sha, &pr_commit_sha);
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url;
+    config.github.token = Some("test-token".into());
+
+    let sync = GitToSvnSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        GitHubClient::new(&config.github.api_url, "test-token", GitProvider::GitHub),
+        db_arc.clone(),
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+
+    use reposync_core::git::github::{PullRequest, PullRequestRef};
+    let pr = PullRequest {
+        number: 1,
+        title: "Feature PR".into(),
+        html_url: "https://example.invalid/pr/1".into(),
+        state: "closed".into(),
+        head: PullRequestRef {
+            ref_name: "feature".into(),
+            sha: pr_commit_sha.clone(),
+        },
+        base: PullRequestRef {
+            ref_name: "main".into(),
+            sha: imported_base.clone(),
+        },
+        merged: Some(true),
+        merge_commit_sha: Some(merge_sha.clone()),
+        merged_at: Some("2025-01-02T00:00:00Z".into()),
+    };
+
+    let defer_err = sync
+        .sync_pr_for_test(&pr, &merge_sha)
+        .await
+        .expect_err("running svn-to-git journal must defer PR replay");
+    assert!(
+        format!("{defer_err:#}").contains("deferring git-to-svn replay"),
+        "{defer_err:#}"
+    );
+    assert!(!db_arc.is_personal_pr_synced(&merge_sha).unwrap());
+    let pending: i64 = db_arc
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM pr_sync_log WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pending, 0, "defer must abandon pending pr_sync_log row");
+
+    db_arc
+        .conn()
+        .execute(
+            "DELETE FROM kv_state WHERE key LIKE 'svn_to_git_push_v1:active:%'",
+            [],
+        )
+        .unwrap();
+
+    let replayed = sync
+        .sync_pr_for_test(&pr, &merge_sha)
+        .await
+        .expect("PR must replay once journal is finalized");
+    assert_eq!(replayed, 1, "one commit must replay to SVN");
+    assert!(db_arc.is_personal_pr_synced(&merge_sha).unwrap());
+    assert!(
+        svn_youngest(&svn_url) > svn_before,
+        "SVN must advance after successful PR replay"
+    );
+    drop(stub);
+}
+
+/// Personal scope key must not collide with a managed repository id `personal`.
+#[tokio::test]
+async fn test_personal_scope_key_isolated_from_managed_personal_repo_id() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(&wc_path, "team.txt", "managed team\n", "Managed team rev");
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db_path = tmp.path().join("test.db");
+    let db = setup_db(&db_path);
+    db.conn()
+        .execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+             VALUES ('personal','Managed Personal','file:///managed','','','local','','managed/repo','main','team',5,0,0,1,'t','t',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+            [],
+        )
+        .unwrap();
+    let now = Utc::now();
+    db.insert_sync_record(&SyncRecord {
+        id: "managed-team-receipt".into(),
+        repo_id: Some(LEGACY_PERSONAL_REPO_ID.to_string()),
+        svn_revision: Some(1),
+        git_hash: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+        direction: SyncDirection::SvnToGit,
+        author: "team".into(),
+        message: "managed team receipt".into(),
+        timestamp: now,
+        synced_at: now,
+        status: SyncRecordStatus::Applied,
+    })
+    .unwrap();
+    assert!(db
+        .has_personal_svn_to_git_receipt(LEGACY_PERSONAL_REPO_ID, 1)
+        .unwrap());
+    assert!(!db
+        .has_personal_svn_to_git_receipt(PERSONAL_SCOPE_KEY, 1)
+        .unwrap());
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let syncer = SvnToGitSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        Arc::new(Mutex::new(git_client)),
+        Arc::new(db),
+        config,
+    );
+    let synced = syncer
+        .sync()
+        .await
+        .expect("personal must not treat team receipt as synced");
+    assert_eq!(
+        synced, 1,
+        "personal must import r1 despite managed repo id collision"
+    );
+}
+
+/// Legacy personal receipts under repo id `personal` remain visible after scope-key upgrade.
+#[tokio::test]
+async fn test_personal_legacy_receipt_upgrade_path() {
+    use reposync_core::echo_suppression::{
+        classify_incoming_svn_revision_personal, EchoDisposition, TeamEchoContext,
+    };
+
+    let db = Database::in_memory().expect("in-memory db");
+    db.initialize().expect("schema");
+    let now = Utc::now();
+    db.insert_sync_record(&SyncRecord {
+        id: "legacy-git-to-svn-receipt".into(),
+        repo_id: Some(LEGACY_PERSONAL_REPO_ID.to_string()),
+        svn_revision: Some(4),
+        git_hash: Some("cccccccccccccccccccccccccccccccccccccccc".into()),
+        direction: SyncDirection::GitToSvn,
+        author: "dev".into(),
+        message: "legacy git-to-svn".into(),
+        timestamp: now,
+        synced_at: now,
+        status: SyncRecordStatus::Applied,
+    })
+    .unwrap();
+
+    let ctx = TeamEchoContext {
+        db: &db,
+        repo_id: PERSONAL_SCOPE_KEY,
+        no_target_projection: "{}",
+    };
+    assert_eq!(
+        classify_incoming_svn_revision_personal(&ctx, 4, "no marker").unwrap(),
+        EchoDisposition::SkipEcho
     );
 }

@@ -11,6 +11,7 @@ use anyhow::Result;
 use std::sync::Mutex;
 use tracing::{error, info, warn};
 
+use reposync_core::db::personal_scope::personal_scope_key;
 use reposync_core::db::Database;
 use reposync_core::git::client::GitClient;
 use reposync_core::git::github::GitHubClient;
@@ -287,7 +288,7 @@ impl PersonalSyncEngine {
             &self.db,
             &git_path,
             &self.config.github.default_branch,
-            "personal",
+            personal_scope_key(),
         )
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
