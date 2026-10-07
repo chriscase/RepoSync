@@ -4824,7 +4824,7 @@ fn spawn_github_exists_stub() -> (String, std::thread::JoinHandle<()>) {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0u8; 1024];
             let _ = stream.read(&mut buf);
-            let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+            let response = github_stub_http_response("{}");
             let _ = stream.write_all(response.as_bytes());
         }
     });
@@ -5501,6 +5501,20 @@ fn svn_path_exists_at_head(svn_url: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Minimal HTTP/1.1 response for raw-TCP GitHub API stubs in this file.
+///
+/// `Connection: close` is required: reqwest pools keep-alive sockets, but these
+/// stubs accept once per request and do not read further bytes on the same TCP
+/// connection. Without close, a later `sync_pr` call can reuse a dead socket and
+/// fail with "connection closed before message completed".
+fn github_stub_http_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
 fn spawn_github_two_pr_sync_stub(
     pr1_merge_sha: &str,
     pr1_commit_sha: &str,
@@ -5617,11 +5631,7 @@ fn spawn_github_two_pr_sync_stub(
                 } else {
                     "[]".to_string()
                 };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let response = github_stub_http_response(&body);
                 let _ = stream.write_all(response.as_bytes());
             }
         }
@@ -5683,7 +5693,9 @@ fn spawn_github_pr_sync_stub(
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = std::thread::spawn(move || {
-        for _ in 0..8 {
+        // Two sync_pr passes × (commits list + merge detail) = 4 requests; keep
+        // headroom for reqwest opening spare connections during pool churn.
+        for _ in 0..16 {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
@@ -5697,11 +5709,7 @@ fn spawn_github_pr_sync_stub(
                 } else {
                     "[]".to_string()
                 };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
+                let response = github_stub_http_response(&body);
                 let _ = stream.write_all(response.as_bytes());
             }
         }
