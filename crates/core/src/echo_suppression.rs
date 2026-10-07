@@ -446,6 +446,7 @@ pub fn personal_mode_marker_echo(message: &str) -> bool {
 mod tests {
     use super::*;
     use crate::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
+    use crate::db::personal_scope::{LEGACY_PERSONAL_REPO_ID, PERSONAL_SCOPE_KEY};
     use crate::db::svn_commit_operations::{svn_commit_target_fingerprint, SvnCommitIntent};
     use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
@@ -1086,6 +1087,51 @@ mod tests {
             classify_incoming_git_commit(&ctx(&db, "pair"), git_sha, &marker)
                 .unwrap()
                 .unwrap(),
+            EchoDisposition::DeferPendingJournal
+        );
+    }
+
+    #[test]
+    fn legacy_unfinalized_personal_journal_holds_when_managed_personal_repo_exists() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('personal','Managed','file:///x','','','local','','r','main','team',5,0,0,1,'t','t',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let fingerprint =
+            svn_commit_target_fingerprint(LEGACY_PERSONAL_REPO_ID, "uuid", "/repo", "/repo", "{}");
+        db.begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: LEGACY_PERSONAL_REPO_ID,
+            initiator_id: "worker",
+            request_id: "legacy-hold",
+            target_fingerprint: &fingerprint,
+            source_git_sha: git_sha,
+            source_git_parent: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "/repo",
+            target_svn_root_url: "/repo",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 4,
+            pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            author: "dev",
+            source_message: "pre-upgrade journal",
+        })
+        .unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision_personal(
+                &ctx(&db, PERSONAL_SCOPE_KEY),
+                5,
+                "no marker",
+            )
+            .unwrap(),
             EchoDisposition::DeferPendingJournal
         );
     }

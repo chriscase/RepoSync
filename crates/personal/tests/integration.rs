@@ -5186,6 +5186,81 @@ fn spawn_github_pr_sync_stub(
     (format!("http://127.0.0.1:{}", port), handle)
 }
 
+/// NULL-repo_id commit_map rows from a non-personal source must not advance the
+/// personal svn_rev watermark or skip importing.
+#[tokio::test]
+async fn test_personal_svn_to_git_imports_despite_null_foreign_commit_map_row() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(
+        &wc_path,
+        "team.txt",
+        "foreign null collision\n",
+        "Foreign null rev",
+    );
+
+    let git_work_dir = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
+
+    let db_path = tmp.path().join("test.db");
+    let db = setup_db(&db_path);
+    db.insert_commit_map(
+        1,
+        "ffffffffffffffffffffffffffffffffffffffff",
+        "svn_to_git",
+        "foreign",
+        "Foreign <f@example.com>",
+    )
+    .unwrap();
+    let now = Utc::now();
+    db.insert_sync_record(&SyncRecord {
+        id: "foreign-null-svn-to-git".into(),
+        repo_id: Some("foreign-team".into()),
+        svn_revision: Some(1),
+        git_hash: Some("ffffffffffffffffffffffffffffffffffffffff".into()),
+        direction: SyncDirection::SvnToGit,
+        author: "foreign".into(),
+        message: "team import".into(),
+        timestamp: now,
+        synced_at: now,
+        status: SyncRecordStatus::Applied,
+    })
+    .unwrap();
+    assert!(!db.is_personal_svn_rev_synced(1).unwrap());
+
+    let config = make_test_config(&svn_url, tmp.path());
+    let svn_client = SvnClient::new(&svn_url, "", "");
+    let git_arc = Arc::new(Mutex::new(git_client));
+    let db_arc = Arc::new(db);
+
+    let syncer = SvnToGitSync::new(svn_client, git_arc, db_arc.clone(), config);
+    let synced = syncer
+        .sync()
+        .await
+        .expect("personal svn-to-git must import despite NULL foreign commit_map");
+    assert_eq!(synced, 1, "revision 1 must be imported, not skipped");
+    assert!(
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.svn_rev == 1 && entry.direction == "svn_to_git"),
+        "personal import must record commit_map for r1"
+    );
+    assert_eq!(
+        db_arc.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("1")
+    );
+}
+
 /// Foreign team commit_map rows must not cause personal SVN→Git to skip importing.
 #[tokio::test]
 async fn test_personal_svn_to_git_imports_despite_foreign_commit_map_row() {
