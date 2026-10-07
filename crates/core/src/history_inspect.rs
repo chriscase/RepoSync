@@ -463,8 +463,9 @@ pub fn inspect_fetched_history(
 /// Repository-owned Git cursor for personal mode without borrowing global state.
 ///
 /// Personal inspect is intentionally unscoped: [`Database::list_repositories`] counts
-/// every row (disabled repos and child rows included), so a leftover row turns a
-/// personal-shaped DB into multi-repo fail-closed.
+/// every row (disabled repos and child rows included). Multiple rows fail closed
+/// (no single P). One managed repo uses its `last_git_sha` column when populated;
+/// an empty column does not fall back to the import watermark.
 ///
 /// Personal writers advance `commit_map` on each mapping but keep the `git_sha`
 /// watermark at the import baseline. When both are present, the live mapping tip
@@ -606,6 +607,8 @@ pub fn inspect_personal_history(
         let repos = db.list_repositories().map_err(SyncError::DatabaseError)?;
         let detail = if repos.len() > 1 {
             "multiple managed repositories; cannot infer a single handled Git cursor"
+        } else if repos.len() == 1 {
+            "managed repository lacks a handled Git cursor in its last_git_sha column"
         } else {
             "no repository-owned handled Git cursor exists; run initial import first"
         };
@@ -825,13 +828,28 @@ mod tests {
     fn resolve_personal_checkpoint_single_repo_empty_column_ignores_watermark() {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
+        db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
+            .unwrap();
+        db.set_state(
+            "last_git_sha_only",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .unwrap();
+        db.insert_commit_map(
+            1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "git_to_svn",
+            "test",
+            "Test",
+        )
+        .unwrap();
         db.set_watermark("git_sha", "ffffffffffffffffffffffffffffffffffffffff")
             .unwrap();
         insert_managed_repo(&db, "only", "");
         assert_eq!(
             resolve_personal_checkpoint(&db, Path::new("/tmp/unused")).unwrap(),
             None,
-            "empty managed-repo column must not fall back to import watermark"
+            "empty managed-repo column must not fall back to import watermark, global kv, or commit-map tip"
         );
     }
 
@@ -991,6 +1009,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(block["reason"], "missing_checkpoint");
+    }
+
+    #[test]
+    fn inspect_personal_history_blocks_single_repo_empty_column_without_import_copy() {
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        init_git_with_origin(&git_work, &bare);
+
+        let db_path = tmp.path().join("personal.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        insert_managed_repo(&db, "only", "");
+
+        let err = inspect_personal_history(&db, &git_work, "main", "personal").unwrap_err();
+        assert!(matches!(
+            err,
+            SyncError::HistoryBlocked {
+                reason,
+                detail,
+                ..
+            } if reason == "missing_checkpoint"
+                && detail.contains("last_git_sha column")
+                && !detail.contains("run initial import first")
+        ));
     }
 
     #[test]
