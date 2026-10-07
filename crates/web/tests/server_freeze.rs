@@ -7604,7 +7604,7 @@ async fn candidate_r65_branch_pair_remote_deletion_explicit_false_defaults() {
         .unwrap();
     let explicit = client
         .delete(format!(
-            "{base}/api/repos/{pair_id}/branch-pair?explicit_remote_deletion_opts=true"
+            "{base}/api/repos/{pair_id}/branch-pair?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=false"
         ))
         .send()
         .await
@@ -7619,6 +7619,10 @@ async fn candidate_r65_branch_pair_remote_deletion_explicit_false_defaults() {
     assert_eq!(
         explicit_body["remote_deletion"]["delete_svn_requested"],
         false
+    );
+    assert!(
+        state.db.get_repository(pair_id).unwrap().is_none(),
+        "explicit safe UI query must remove the local branch-pair row"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",

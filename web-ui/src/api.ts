@@ -1,3 +1,4 @@
+import { buildBranchPairDeleteQuery } from './branchPairDeletion';
 import type { BranchPairRemovalResult } from './branchPairRemoval';
 import type { ManagedRemovalStatus } from './managedRemoval';
 
@@ -540,12 +541,7 @@ export const api = {
     repoId: string,
     opts?: { delete_git?: boolean; delete_svn?: boolean },
   ): Promise<BranchPairRemovalResult> => {
-    const params = new URLSearchParams();
-    // Always send the caller's explicit choices. Omitted query params are
-    // destructive server defaults and are not used by this UI.
-    params.set('explicit_remote_deletion_opts', 'true');
-    params.set('delete_git', String(opts?.delete_git ?? false));
-    params.set('delete_svn', String(opts?.delete_svn ?? false));
+    const params = buildBranchPairDeleteQuery(opts);
     const token = localStorage.getItem('session_token');
     const res = await fetch(`${API_BASE}/repos/${repoId}/branch-pair?${params.toString()}`, {
       method: 'DELETE',

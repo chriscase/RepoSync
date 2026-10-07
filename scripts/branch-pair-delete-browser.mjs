@@ -176,6 +176,8 @@ function startMock() {
     const id = decodeURIComponent(repoMatch[1]);
     const rest = repoMatch[2] || '';
     if (req.method === 'DELETE' && rest === '/branch-pair') {
+      const deleteGit = url.searchParams.get('delete_git') === 'true';
+      const deleteSvn = url.searchParams.get('delete_svn') === 'true';
       if (id === 'child-error') {
         send(500, { error: 'internal server error' });
         return;
@@ -215,7 +217,7 @@ function startMock() {
         return;
       }
       deleted.add(id);
-      const warnings = id === 'child-warn'
+      const warnings = id === 'child-warn' && deleteGit
         ? ["failed to delete Git branch 'warn-branch'"]
         : [];
       send(200, { ok: true, message: `Branch pair '${id}' deleted`, warnings });
@@ -367,27 +369,53 @@ async function runScenarios(uiOrigin, session, mode) {
     })()`);
     await until(async () => (await evaluate(`document.querySelector('[data-testid="confirm-delete-branch-pair"]')?.disabled === false`)), 'confirm enabled');
   };
-  const setRemoteDeletion = async (enabled) => {
-    const ok = await evaluate(`(() => {
-      for (const testId of ['delete-git-opt', 'delete-svn-opt']) {
-        const el = document.querySelector('[data-testid="' + testId + '"]');
-        if (!el) return false;
-        if (el.checked !== ${enabled ? 'true' : 'false'}) {
-          el.checked = ${enabled ? 'true' : 'false'};
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      }
-      return true;
+  const clickCheckboxIfNeeded = async (testId, wantChecked) => {
+    const toggled = await evaluate(`(() => {
+      const el = document.querySelector('[data-testid="${testId}"]');
+      if (!el) return 'missing';
+      if (el.checked === ${wantChecked ? 'true' : 'false'}) return 'ok';
+      el.click();
+      return el.checked === ${wantChecked ? 'true' : 'false'} ? 'ok' : 'still-wrong';
     })()`);
-    if (!ok) throw new Error('Remote deletion checkboxes were not available in the delete modal');
+    if (toggled === 'missing') throw new Error(`Missing checkbox ${testId}`);
+    if (toggled !== 'ok') throw new Error(`Checkbox ${testId} did not reach checked=${wantChecked}`);
+  };
+  const setRemoteDeletion = async (enabled) => {
+    await clickCheckboxIfNeeded('delete-git-opt', enabled);
+    await clickCheckboxIfNeeded('delete-svn-opt', enabled);
+    if (enabled) {
+      const preview = await evaluate(`document.querySelector('[data-testid="branch-remote-deletion-preview"]')?.innerText || ''`);
+      if (!preview.includes('will be deleted')) {
+        throw new Error(`Remote opt-in preview did not show deletion: ${preview.slice(0, 300)}`);
+      }
+    }
+  };
+  const assertDeleteQuery = (path, { deleteGit, deleteSvn }) => {
+    const qs = String(path).split('?')[1] || '';
+    const params = new URLSearchParams(qs);
+    if (params.get('explicit_remote_deletion_opts') !== 'true') {
+      throw new Error(`DELETE missing explicit_remote_deletion_opts=true: ${path}`);
+    }
+    if (params.get('delete_git') !== String(deleteGit)) {
+      throw new Error(`DELETE delete_git expected ${deleteGit}, got ${params.get('delete_git')}: ${path}`);
+    }
+    if (params.get('delete_svn') !== String(deleteSvn)) {
+      throw new Error(`DELETE delete_svn expected ${deleteSvn}, got ${params.get('delete_svn')}: ${path}`);
+    }
   };
   const confirmDelete = async (gitBranch, { remote = false } = {}) => {
-    await setRemoteDeletion(remote);
     await fill(gitBranch);
-    const before = await evaluate('window.__pairFetches.length');
+    await setRemoteDeletion(remote);
+    const deletesBefore = (await deleteCalls()).length;
     await click('confirm-delete-branch-pair');
-    return before;
+    await until(async () => (await deleteCalls()).length > deletesBefore, 'branch-pair DELETE recorded');
+    return deletesBefore;
+  };
+  const latestDeleteFor = async (repoId, sinceDeleteCount = 0) => {
+    const calls = (await deleteCalls()).slice(sinceDeleteCount);
+    const matches = calls.filter((entry) => mentionsId(entry.path, repoId));
+    if (!matches.length) throw new Error(`No DELETE for ${repoId}: ${JSON.stringify(await deleteCalls())}`);
+    return matches[matches.length - 1];
   };
   const deleteCalls = () => evaluate(`window.__pairFetches.filter(entry => entry.method === 'DELETE' && entry.path.includes('/branch-pair'))`);
   const pollsFor = async (id, since) => evaluate(`window.__pairFetches.filter(entry => entry.method === 'GET' && entry.started > ${since} && String(entry.path).split(/[/?=&]/).includes(${JSON.stringify(id)})).map(entry => entry.path)`);
@@ -397,17 +425,11 @@ async function runScenarios(uiOrigin, session, mode) {
   async function expectStay(id, gitBranch, text) {
     await goto(`/repos/${id}`, async () => (await heading()) !== '');
     await click('delete-viewed-branch-pair');
-    await confirmDelete(gitBranch);
+    const deletesBefore = await confirmDelete(gitBranch);
     await until(async () => ((await body()).includes(text)), text);
     if ((await pathOf()) !== `/repos/${id}`) throw new Error(`Left ${id} for ${await pathOf()}`);
-    if ((await deleteCalls()).length < 1) throw new Error(`No DELETE recorded for ${id}`);
-    const explicit = (await deleteCalls()).some(
-      (entry) =>
-        entry.path.includes('explicit_remote_deletion_opts=true')
-        && entry.path.includes('delete_git=')
-        && entry.path.includes('delete_svn='),
-    );
-    if (!explicit) throw new Error(`DELETE did not submit explicit remote options: ${JSON.stringify(await deleteCalls())}`);
+    const lastDelete = await latestDeleteFor(id, deletesBefore);
+    assertDeleteQuery(lastDelete.path, { deleteGit: false, deleteSvn: false });
     if ((await body()).includes('Branch pair removed.')) throw new Error(`Failure was presented as removal: ${await body()}`);
   }
 
@@ -486,7 +508,9 @@ async function runScenarios(uiOrigin, session, mode) {
 
   await goto('/repos/child-warn', async () => (await heading()).includes('Warn Child'));
   await click('delete-viewed-branch-pair');
-  await confirmDelete('warn-branch', { remote: true });
+  const warnDeletesBefore = await confirmDelete('warn-branch', { remote: true });
+  const warnDelete = await latestDeleteFor('child-warn', warnDeletesBefore);
+  assertDeleteQuery(warnDelete.path, { deleteGit: true, deleteSvn: true });
   await until(async () => (await pathOf()) === '/repos/parent-1', 'parent after warnings');
   await until(async () => (await body()).includes('Parent trunk'), 'parent detail loaded', 20000);
   await until(

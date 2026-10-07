@@ -63,7 +63,8 @@
         "R65_REMOVE_RECONCILIATION",
         "R65_BRANCH_REMOTE_OPTS",
         "R65_EXPLICIT_DISABLE",
-        "R65_UI_DISABLE_REMOVE"
+        "R65_UI_DISABLE_REMOVE",
+        "R65_BRANCH_PAIR_QUERY"
       ],
       "open": [
         "Rich parent/child dependency preview beyond child-count refusal is not implemented",
