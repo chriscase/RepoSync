@@ -594,10 +594,8 @@ impl GitClient {
     /// Pending commits on the ancestry frontier from `since_sha` to `tip_sha`.
     ///
     /// Uses hide/push (`since..tip`), not a visited-order stop at `since_sha`.
-    /// Qualified merge DAGs replay in deterministic oldest-first topological
-    /// order when the full frontier fits in one batch. Linear overflow returns
-    /// the oldest-first replay batch with `has_more` set. Merge-DAG overflow
-    /// fails closed because a single Git SHA cannot checkpoint a DAG cut.
+    /// Qualified merge DAGs and linear backlogs both return the oldest-first
+    /// replay batch with `has_more` set when the frontier exceeds the cap.
     pub fn pending_commits_between(
         &self,
         since_sha: &str,
@@ -663,6 +661,52 @@ impl GitClient {
         })
     }
 
+    /// Next merge-DAG continuation batch after prior handled commits.
+    pub fn pending_commits_continuation_batch(
+        &self,
+        since_sha: &str,
+        tip_sha: &str,
+        handled_shas: &[String],
+        max_commits: Option<usize>,
+    ) -> Result<PendingCommitSelection, GitError> {
+        let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
+        let handled: std::collections::HashSet<Oid> = handled_shas
+            .iter()
+            .map(|sha| Oid::from_str(sha).map_err(GitError::Git2Error))
+            .collect::<Result<_, _>>()?;
+        let batch = crate::pending_frontier::select_continuation_batch(
+            &self.repo, since_sha, tip_sha, &handled, cap,
+        )?;
+        let mut commits = Vec::with_capacity(batch.commits.len());
+        for oid in batch.commits {
+            let commit = self.repo.find_commit(oid)?;
+            commits.push(git_commit_info(&commit));
+        }
+        let batch_tip = if batch.has_more {
+            let Some(last) = commits.last() else {
+                return Err(GitError::UnsupportedHistory {
+                    reason: crate::pending_frontier::REASON_BACKLOG.into(),
+                    detail: format!(
+                        "{}: empty continuation batch",
+                        crate::pending_frontier::DETAIL_BACKLOG
+                    ),
+                });
+            };
+            last.sha.clone()
+        } else {
+            commits
+                .last()
+                .map(|commit| commit.sha.clone())
+                .unwrap_or_else(|| tip_sha.to_string())
+        };
+        Ok(PendingCommitSelection {
+            commits,
+            total: batch.total,
+            has_more: batch.has_more,
+            batch_tip,
+        })
+    }
+
     /// All pending commits on the P→R frontier for conflict coverage.
     ///
     /// Callers that replay in batches use this to detect overlapping paths
@@ -673,15 +717,22 @@ impl GitClient {
         tip_sha: &str,
         max_commits: Option<usize>,
     ) -> Result<Vec<GitCommitInfo>, GitError> {
-        let replay = self.pending_commits_between(since_sha, tip_sha, max_commits)?;
-        if !replay.has_more {
-            return Ok(replay.commits);
+        let cap = max_commits.unwrap_or(crate::pending_frontier::DEFAULT_PENDING_COMMIT_CAP);
+        let batch =
+            crate::pending_frontier::select_pending_batch(&self.repo, since_sha, tip_sha, cap)?;
+        if !batch.has_more {
+            let mut commits = Vec::with_capacity(batch.commits.len());
+            for oid in batch.commits {
+                let commit = self.repo.find_commit(oid)?;
+                commits.push(git_commit_info(&commit));
+            }
+            return Ok(commits);
         }
         let full = crate::pending_frontier::select_pending_batch(
             &self.repo,
             since_sha,
             tip_sha,
-            replay.total,
+            batch.total,
         )?;
         let mut commits = Vec::with_capacity(full.commits.len());
         for oid in full.commits {
