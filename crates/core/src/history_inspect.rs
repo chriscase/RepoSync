@@ -470,8 +470,7 @@ pub fn resolve_personal_checkpoint(
     db: &Database,
     git_path: &Path,
 ) -> Result<Option<String>, SyncError> {
-    let checkpoint = db
-        .get_last_git_hash()
+    let checkpoint = crate::sync_status::resolve_scoped_checkpoint_tip(db)
         .map_err(SyncError::DatabaseError)?
         .filter(|value| !value.is_empty());
     let watermark = db
@@ -700,6 +699,112 @@ mod tests {
         .unwrap()
         .trim()
         .to_string()
+    }
+
+    fn insert_managed_repo(db: &Database, id: &str, last_git_sha: &str) {
+        use crate::models::Repository;
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: id.into(),
+            name: id.into(),
+            svn_url: "file:///tmp/svn".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "github".into(),
+            git_api_url: "http://127.0.0.1:1".into(),
+            git_repo: "org/repo".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 60,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 1,
+            last_git_sha: last_git_sha.into(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_legacy_uses_commit_map_not_global_kv() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("last_git_hash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        db.insert_commit_map(
+            1,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "git_to_svn",
+            "test",
+            "Test",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_personal_checkpoint(&db, Path::new("/tmp/unused"))
+                .unwrap()
+                .as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "legacy personal checkpoint must read commit-map tip, not global kv"
+        );
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_multi_repo_fails_closed_not_commit_map_max() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
+            .unwrap();
+        db.insert_commit_map(
+            1,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git_to_svn",
+            "test",
+            "Test",
+        )
+        .unwrap();
+        insert_managed_repo(&db, "alpha", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        insert_managed_repo(&db, "beta", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(
+            resolve_personal_checkpoint(&db, Path::new("/tmp/unused")).unwrap(),
+            None,
+            "multi-repo installs must not adopt a foreign commit-map maximum"
+        );
+    }
+
+    #[test]
+    fn resolve_personal_checkpoint_single_repo_uses_column_not_foreign_max() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
+            .unwrap();
+        db.insert_commit_map(
+            1,
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "git_to_svn",
+            "test",
+            "Test",
+        )
+        .unwrap();
+        insert_managed_repo(&db, "only", "cccccccccccccccccccccccccccccccccccccccc");
+        assert_eq!(
+            resolve_personal_checkpoint(&db, Path::new("/tmp/unused"))
+                .unwrap()
+                .as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccc"),
+            "single managed repo must use its column tip, not foreign global max"
+        );
     }
 
     #[test]
