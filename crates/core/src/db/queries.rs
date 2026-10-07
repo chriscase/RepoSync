@@ -1030,6 +1030,42 @@ impl Database {
         Ok(count)
     }
 
+    /// True when this repository has an applied Git→SVN receipt for the emitted SVN revision.
+    pub fn has_repo_emitted_svn_revision(
+        &self,
+        repo_id: &str,
+        svn_rev: i64,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sync_records
+                WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'git_to_svn' AND status = 'applied'
+            )",
+            params![repo_id, svn_rev],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// True when this repository has an applied SVN→Git receipt for the emitted Git SHA.
+    pub fn has_repo_emitted_git_commit(
+        &self,
+        repo_id: &str,
+        git_sha: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sync_records
+                WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'
+            )",
+            params![repo_id, git_sha],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     /// Delete all sync records for a specific repository (used during reset/reimport).
     pub fn delete_sync_records_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
@@ -2829,6 +2865,51 @@ mod tests {
         assert_eq!(db.get_watermark("svn").unwrap().as_deref(), Some("100"));
         db.set_watermark("svn", "200").unwrap();
         assert_eq!(db.get_watermark("svn").unwrap().as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn repo_emitted_receipt_queries_are_repo_scoped() {
+        let db = setup_db();
+        let git_sha = "a".repeat(40);
+        let now = chrono::Utc::now();
+        db.insert_sync_record(&crate::models::SyncRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: Some("repo-a".to_string()),
+            svn_revision: Some(5),
+            git_hash: Some(git_sha.clone()),
+            direction: crate::models::SyncDirection::GitToSvn,
+            author: "alice".into(),
+            message: "test".into(),
+            timestamp: now,
+            synced_at: now,
+            status: crate::models::SyncRecordStatus::Applied,
+        })
+        .unwrap();
+
+        assert!(db.has_repo_emitted_svn_revision("repo-a", 5).unwrap());
+        assert!(!db.has_repo_emitted_svn_revision("repo-b", 5).unwrap());
+        assert!(!db.has_repo_emitted_git_commit("repo-a", &git_sha).unwrap());
+
+        let emitted_git = "b".repeat(40);
+        db.insert_sync_record(&crate::models::SyncRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: Some("repo-a".to_string()),
+            svn_revision: Some(6),
+            git_hash: Some(emitted_git.clone()),
+            direction: crate::models::SyncDirection::SvnToGit,
+            author: "alice".into(),
+            message: "test".into(),
+            timestamp: now,
+            synced_at: now,
+            status: crate::models::SyncRecordStatus::Applied,
+        })
+        .unwrap();
+        assert!(db
+            .has_repo_emitted_git_commit("repo-a", &emitted_git)
+            .unwrap());
+        assert!(!db
+            .has_repo_emitted_git_commit("repo-b", &emitted_git)
+            .unwrap());
     }
 
     #[test]

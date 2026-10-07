@@ -39,6 +39,10 @@ use crate::db::team_cycle_mapping_operations::{
     TeamCycleMappingOperation, TeamCycleMappingOutcome, TeamCycleMappingState,
 };
 use crate::db::Database;
+use crate::echo_suppression::{
+    classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
+    EchoDisposition, TeamEchoContext, SYNC_MARKER,
+};
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
 use crate::git_push::{
@@ -127,9 +131,6 @@ pub struct SyncStats {
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
-
-/// Marker string embedded in sync-generated commit messages for echo detection.
-const SYNC_MARKER: &str = "[reposync]";
 
 /// Inputs admitted for one team cycle. The Git replay cursor is P, not L or O.
 struct TeamHistoryAdmission {
@@ -1394,8 +1395,7 @@ impl SyncEngine {
                     continue;
                 }
             }
-            if self.is_echo_commit(&change.message) {
-                debug!(rev = change.revision, "skipping echo SVN revision");
+            if self.should_skip_incoming_svn_revision(change.revision, &change.message)? {
                 continue;
             }
 
@@ -2365,8 +2365,7 @@ impl SyncEngine {
                     continue;
                 }
             }
-            if self.is_echo_commit(&change.message) {
-                debug!(sha = %change.sha, "skipping echo Git commit");
+            if self.should_skip_incoming_git_commit(&change.sha, &change.message)? {
                 continue;
             }
 
@@ -3198,10 +3197,12 @@ impl SyncEngine {
             None
         };
 
-        let change_sets: Vec<SvnChangeSet> = entries
-            .into_iter()
-            .filter(|e| !self.is_echo_commit(&e.message))
-            .map(|e| SvnChangeSet {
+        let mut change_sets: Vec<SvnChangeSet> = Vec::new();
+        for e in entries {
+            if self.should_skip_incoming_svn_revision(e.revision, &e.message)? {
+                continue;
+            }
+            change_sets.push(SvnChangeSet {
                 revision: e.revision,
                 author: e.author,
                 date: e.date,
@@ -3232,8 +3233,8 @@ impl SyncEngine {
                     })
                     .collect(),
                 diff_content: None,
-            })
-            .collect();
+            });
+        }
 
         debug!(count = change_sets.len(), "fetched SVN change sets");
         Ok(change_sets)
@@ -3342,7 +3343,7 @@ impl SyncEngine {
     ) -> Result<Vec<GitChangeSet>, SyncError> {
         let mut change_sets: Vec<GitChangeSet> = Vec::new();
         for c in commits {
-            if self.is_echo_commit(&c.message) {
+            if self.should_skip_incoming_git_commit(&c.sha, &c.message)? {
                 continue;
             }
             if let Some(rid) = self.effective_repo_id() {
@@ -3545,11 +3546,42 @@ impl SyncEngine {
     }
 
     // -----------------------------------------------------------------------
-    // Echo detection
+    // Echo detection (team: receipt-backed; personal: marker hint only)
     // -----------------------------------------------------------------------
 
-    fn is_echo_commit(&self, message: &str) -> bool {
-        message.contains(SYNC_MARKER)
+    fn should_skip_incoming_svn_revision(
+        &self,
+        svn_rev: i64,
+        message: &str,
+    ) -> Result<bool, SyncError> {
+        if let Some(repo_id) = self.effective_repo_id() {
+            let ctx = TeamEchoContext {
+                db: &self.db,
+                repo_id,
+                no_target_projection: "",
+            };
+            return Ok(classify_incoming_svn_revision(&ctx, svn_rev, message)?
+                == EchoDisposition::SkipEcho);
+        }
+        Ok(personal_mode_marker_echo(message))
+    }
+
+    fn should_skip_incoming_git_commit(
+        &self,
+        git_sha: &str,
+        message: &str,
+    ) -> Result<bool, SyncError> {
+        if let Some(repo_id) = self.effective_repo_id() {
+            let projection = self.no_target_projection();
+            let ctx = TeamEchoContext {
+                db: &self.db,
+                repo_id,
+                no_target_projection: &projection,
+            };
+            return classify_incoming_git_commit(&ctx, git_sha, message)?
+                .map(|disposition| disposition == EchoDisposition::SkipEcho);
+        }
+        Ok(personal_mode_marker_echo(message))
     }
 
     fn try_auto_merge(&self, conflict: &Conflict) -> bool {
@@ -3810,12 +3842,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_echo_commit() {
-        let message_with_marker = "Fix bug\n\n[reposync] synced from SVN r42";
-        assert!(message_with_marker.contains(SYNC_MARKER));
-
-        let normal_message = "Fix bug in authentication";
-        assert!(!normal_message.contains(SYNC_MARKER));
+    fn test_personal_mode_marker_echo() {
+        assert!(personal_mode_marker_echo(
+            "Fix bug\n\n[reposync] synced from SVN r42"
+        ));
+        assert!(!personal_mode_marker_echo("Fix bug in authentication"));
     }
 
     #[test]

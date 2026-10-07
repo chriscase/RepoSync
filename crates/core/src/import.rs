@@ -1162,7 +1162,7 @@ pub struct ImportRunState {
     pub progress: Arc<RwLock<ImportProgress>>,
     pub ws_broadcast: Option<broadcast::Sender<String>>,
     pub repo_id: Option<String>,
-    /// Present for durable per-repository imports; absent for the setup wizard.
+    /// Durable import operation id when `repo_id` is set (managed repos and setup wizard).
     pub operation_id: Option<String>,
     pub cancel_signal: Option<Arc<AtomicBool>>,
 }
@@ -2047,6 +2047,17 @@ pub async fn run_snapshot_import(
         svn_rev: pin.operative_rev,
         git_sha: sha,
     })
+}
+
+/// Legacy personal-import tail: global watermarks when no durable operation journal exists.
+fn persist_legacy_personal_import_watermarks(
+    db: &Database,
+    last_svn_rev: i64,
+    git_sha: &str,
+) -> Result<(), crate::errors::DatabaseError> {
+    db.set_watermark("svn_rev", &last_svn_rev.to_string())?;
+    db.set_legacy_import_git_sha_watermark(git_sha)?;
+    Ok(())
 }
 
 pub async fn run_full_import(
@@ -3051,8 +3062,7 @@ pub async fn run_full_import(
         }
     }
     if operation_id.is_none() {
-        db.set_watermark("svn_rev", &last_rev.to_string())?;
-        db.set_legacy_import_git_sha_watermark(&sha)?;
+        persist_legacy_personal_import_watermarks(db, last_rev, &sha)?;
     }
 
     // Final audit log
@@ -4059,6 +4069,19 @@ mod tests {
         assert!(
             !after.contains("evil"),
             "export-present reconcile must drop planted filter rules: {after}"
+        );
+    }
+
+    #[test]
+    fn legacy_personal_import_watermarks_use_helper_caller_path() {
+        let db = test_db();
+        assert!(db.list_repositories().unwrap().is_empty());
+        let sha = "f".repeat(40);
+        persist_legacy_personal_import_watermarks(&db, 42, &sha).unwrap();
+        assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("42"));
+        assert_eq!(
+            db.get_watermark("git_sha").unwrap().as_deref(),
+            Some(sha.as_str())
         );
     }
 

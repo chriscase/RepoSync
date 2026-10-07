@@ -457,11 +457,11 @@ impl<'a> InitialImport<'a> {
             drop(git_client);
         }
 
-        // Set watermarks
+        // Set watermarks (both must succeed or the import fails closed).
         if let Some(last) = log_entries.last() {
             self.db
                 .set_watermark("svn_rev", &last.revision.to_string())
-                .ok();
+                .context("failed to set SVN watermark")?;
         }
 
         let git_client = self.git_client.lock().unwrap();
