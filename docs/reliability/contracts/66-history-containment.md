@@ -96,7 +96,10 @@ them. `fetch_git_changes` records the same durable block when its second-line
 | >1000 team replay continuation + restart | **proven** — `candidate_r10_over_1000_pending_commits_batched`, `candidate_r66_team_history_continuation_survives_restart` |
 | >1000 continuation with pending SVN work | **proven** — `candidate_r66_continuation_mixed_pending_fail_closed` (cycle deferred with no bridge reset or writes) |
 | Merge-DAG team replay (engine cycle) | **proven** — `candidate_r10_merge_dag_replayed`, `candidate_r10_merge_dag_older_side_replayed_with_delta` |
-| Merge-DAG continuation over cap | **proven fail-closed** — `candidate_r10_merge_dag_continuation_fail_closed_before_writes` (cap=1/2/3), `pending_frontier::merge_dag_continuation_batch_fails_closed_when_exceeds_cap` |
+| Merge-DAG continuation over cap | **proven** — `candidate_r10_merge_dag_continuation_batched` (cap=1/2/3), `candidate_r10_merge_dag_continuation_batched_distinct_trees_cap1` / `cap3`, `candidate_r66_merge_dag_continuation_survives_restart`, `pending_frontier::merge_dag_continuation_batches_without_reordering_or_skips` |
+| Durable `has_more` across restart | **proven** — linear `candidate_r66_team_history_continuation_survives_restart`; merge-DAG `candidate_r66_merge_dag_continuation_survives_restart` (`git_replay_continuation_{repo}` pins admitted R and handled set); missing-row idempotency `candidate_r66_merge_dag_continuation_missing_row_idempotent` |
+| Drain Git batches past SVN-only commits | **proven** — `candidate_r66_drain_git_batch_past_svn_only` (metadata-only SVN defers only on file-content delta) |
+| Conflict detection gating | **proven** — `candidate_r66_incomplete_conflict_coverage_fail_closed` and `sync_engine::tests::incomplete_conflict_coverage_fails_closed`; outer gate compares post-filter `conflict_coverage.len()` against applicable pending commits |
 | Personal Git→SVN engine-cycle merge-DAG replay | **NOT RUN** — inspect admission is proven; PR-based replay is a separate surface |
 
 Baseline R09 still demonstrates that the original pull-then-walk path

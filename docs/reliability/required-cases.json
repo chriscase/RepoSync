@@ -115,7 +115,7 @@
       "binary": "team_mode_e2e",
       "test": "candidate_r10_merge_dag_replayed",
       "tier": "candidate_regression",
-      "supporting_note": "older-side engine replay proof is candidate_r10_merge_dag_older_side_replayed_with_delta; merge-DAG continuation fail-closed proof is candidate_r10_merge_dag_continuation_fail_closed_before_writes and cap=1/2 siblings; visited-order skip proof is pending_frontier::visited_order_truncation_skips_older_pending_side"
+      "supporting_note": "older-side engine replay proof is candidate_r10_merge_dag_older_side_replayed_with_delta; merge-DAG multi-batch continuation proof is candidate_r10_merge_dag_continuation_batched and cap=1/2 siblings plus candidate_r10_merge_dag_continuation_batched_distinct_trees_cap1/cap3, candidate_r66_merge_dag_continuation_missing_row_idempotent, and pending_frontier::merge_dag_continuation_batches_without_reordering_or_skips; visited-order skip proof is pending_frontier::visited_order_truncation_skips_older_pending_side"
     },
     {
       "id": "R10_DURABLE_UNSUPPORTED_BLOCK",
@@ -511,6 +511,42 @@
       "id": "R66_CONTINUATION_MIXED_PENDING",
       "binary": "team_mode_e2e",
       "test": "candidate_r66_continuation_mixed_pending_fail_closed",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_MERGE_DAG_CONTINUATION_RESTART",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r66_merge_dag_continuation_survives_restart",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_MERGE_DAG_CONTINUATION_MISSING_ROW",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r66_merge_dag_continuation_missing_row_idempotent",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_MERGE_DAG_CONTINUATION_DISTINCT_CAP3",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_merge_dag_continuation_batched_distinct_trees_cap3",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_MERGE_DAG_CONTINUATION_DISTINCT_CAP1",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r10_merge_dag_continuation_batched_distinct_trees_cap1",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_INCOMPLETE_CONFLICT_COVERAGE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r66_incomplete_conflict_coverage_fail_closed",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "R66_DRAIN_PAST_SVN_ONLY",
+      "binary": "team_mode_e2e",
+      "test": "candidate_r66_drain_git_batch_past_svn_only",
       "tier": "candidate_regression"
     },
     {

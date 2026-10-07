@@ -132,6 +132,7 @@ try {
   await until(() => button('Start full import'), 'mounted idle card');
   await click('Start full import');
   const start = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith('/import') && c.status === 200), 'start operation');
+  await writeFile(join(barrier, 'import_started.ready'), 'ready');
   const operation = start.payload?.operation_id;
   if (!operation || !(await body()).includes(`Operation ${operation}`)) {
     await until(async () => (await body()).includes(`Operation ${operation}`), 'operation identity in card');
