@@ -259,6 +259,37 @@ fn personal_finalize_tx(
         ));
     }
     let svn_rev = op.source_svn_rev;
+    if !mapping_exists(tx, &op.repo_id, git_sha, svn_rev)? {
+        let now = Utc::now();
+        let record = SyncRecord {
+            id: Uuid::new_v4().to_string(),
+            repo_id: Some(op.repo_id.clone()),
+            svn_revision: Some(svn_rev),
+            git_hash: Some(git_sha.into()),
+            direction: SyncDirection::SvnToGit,
+            author: op.source_svn_author.clone(),
+            message: op.source_svn_message.clone(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        };
+        tx.execute(
+            "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id,
+                record.repo_id,
+                record.svn_revision,
+                record.git_hash,
+                record.direction.to_string(),
+                record.author,
+                record.message,
+                record.timestamp.to_rfc3339(),
+                record.synced_at.to_rfc3339(),
+                record.status.to_string(),
+            ],
+        )?;
+    }
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM commit_map WHERE svn_rev = ?1)",
         params![svn_rev],
@@ -592,6 +623,24 @@ impl Database {
         })
     }
 
+    /// True when personal mode already has an applied SVN→Git receipt for this revision.
+    pub fn has_personal_svn_to_git_receipt(
+        &self,
+        repo_id: &str,
+        svn_rev: i64,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sync_records
+                WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'
+            )",
+            params![repo_id, svn_rev],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
     /// Personal-mode checkpoint: journal completion plus `commit_map` and watermark.
     pub fn confirm_personal_svn_to_git_push(
         &self,
@@ -880,6 +929,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mapped, 1);
+        let receipt: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id='pair' AND svn_rev=3 AND git_sha=?1 AND direction='svn_to_git'",
+                ["dddddddddddddddddddddddddddddddddddddddd"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt, 1);
         assert_eq!(db.get_watermark("svn_rev").unwrap().as_deref(), Some("3"));
     }
 }

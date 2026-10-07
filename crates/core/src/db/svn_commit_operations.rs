@@ -272,6 +272,37 @@ fn personal_finalize_tx(
             "observed SVN revision is not after the pre-write revision".into(),
         ));
     }
+    if !mapping_exists(tx, &op.repo_id, &op.source_git_sha, svn_rev)? {
+        let now = Utc::now();
+        let record = SyncRecord {
+            id: Uuid::new_v4().to_string(),
+            repo_id: Some(op.repo_id.clone()),
+            svn_revision: Some(svn_rev),
+            git_hash: Some(op.source_git_sha.clone()),
+            direction: SyncDirection::GitToSvn,
+            author: op.author.clone(),
+            message: op.source_message.clone(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        };
+        tx.execute(
+            "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id,
+                record.repo_id,
+                record.svn_revision,
+                record.git_hash,
+                record.direction.to_string(),
+                record.author,
+                record.message,
+                record.timestamp.to_rfc3339(),
+                record.synced_at.to_rfc3339(),
+                record.status.to_string(),
+            ],
+        )?;
+    }
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM commit_map WHERE git_sha = ?1 AND direction = 'git_to_svn')",
         params![op.source_git_sha],
@@ -923,6 +954,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mapped, 1);
+        let receipt: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id='pair' AND svn_rev=3 AND git_sha=?1 AND direction='git_to_svn'",
+                ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt, 1);
         let git_author: String = db
             .conn()
             .query_row(
