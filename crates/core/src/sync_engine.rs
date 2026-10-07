@@ -11,6 +11,7 @@
 //!
 //! A lock mechanism prevents concurrent sync cycles.
 
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -144,13 +145,19 @@ struct TeamHistoryAdmission {
 struct GitFetchResult {
     replay_batch: Vec<GitChangeSet>,
     conflict_coverage: Vec<GitChangeSet>,
-    conflict_coverage_commit_count: usize,
+    conflict_coverage_skipped: usize,
     has_more: bool,
     reset_target: String,
     pending_total: usize,
     deferred_mixed_pending: bool,
     continuation_to_persist: Option<GitReplayContinuation>,
     clear_continuation: bool,
+}
+
+/// Durable merge-DAG continuation state for one replay batch apply.
+struct GitReplayBatchContinuation {
+    target: GitReplayContinuation,
+    batch_shas: Vec<String>,
 }
 
 /// The bidirectional sync engine.
@@ -1230,11 +1237,29 @@ impl SyncEngine {
             return Ok(());
         }
 
+        let batch_continuation =
+            git_fetch
+                .continuation_to_persist
+                .as_ref()
+                .map(|target| GitReplayBatchContinuation {
+                    target: target.clone(),
+                    batch_shas: git_fetch
+                        .replay_batch
+                        .iter()
+                        .map(|change| change.sha.clone())
+                        .collect(),
+                });
+        if let Some(continuation) = batch_continuation.as_ref() {
+            self.persist_pre_batch_git_replay_continuation(continuation)?;
+        }
+
         // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
         self.ensure_conflict_coverage_before_detection(
             git_fetch.has_more,
-            git_fetch.pending_total,
-            git_fetch.conflict_coverage_commit_count,
+            git_fetch
+                .pending_total
+                .saturating_sub(git_fetch.conflict_coverage_skipped),
+            git_fetch.conflict_coverage.len(),
         )?;
         let conflicts =
             self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage)?;
@@ -1284,7 +1309,9 @@ impl SyncEngine {
         }
 
         // 4. Apply Git -> SVN.
-        stats.git_to_svn_count = self.sync_git_to_svn(&git_fetch.replay_batch).await?;
+        stats.git_to_svn_count = self
+            .sync_git_to_svn(&git_fetch.replay_batch, batch_continuation.as_ref())
+            .await?;
 
         // Collect commit details for notifications (max 10 commits)
         for change in &svn_changes {
@@ -1324,8 +1351,6 @@ impl SyncEngine {
 
         if git_fetch.clear_continuation {
             self.clear_git_replay_continuation()?;
-        } else if let Some(continuation) = git_fetch.continuation_to_persist {
-            self.persist_git_replay_continuation(&continuation)?;
         }
 
         info!(
@@ -2315,7 +2340,11 @@ impl SyncEngine {
         Ok(Some(op))
     }
 
-    async fn sync_git_to_svn(&self, git_changes: &[GitChangeSet]) -> Result<usize, SyncError> {
+    async fn sync_git_to_svn(
+        &self,
+        git_changes: &[GitChangeSet],
+        batch_continuation: Option<&GitReplayBatchContinuation>,
+    ) -> Result<usize, SyncError> {
         let mut count = 0;
         let resume_sha = if let Some(rid) = self.effective_repo_id() {
             match self
@@ -2553,6 +2582,7 @@ impl SyncEngine {
                         },
                         None,
                     )?;
+                    self.append_git_replay_handled_commit(batch_continuation, &change.sha)?;
                 } else {
                     self.db
                         .set_state("last_git_hash", &change.sha)
@@ -2803,6 +2833,7 @@ impl SyncEngine {
                         },
                         Some(proof.clone()),
                     )?;
+                    self.append_git_replay_handled_commit(batch_continuation, &change.sha)?;
                 } else {
                     self.db
                         .set_state("last_git_hash", &change.sha)
@@ -2923,6 +2954,7 @@ impl SyncEngine {
                             },
                             Some(proof.clone()),
                         )?;
+                        self.append_git_replay_handled_commit(batch_continuation, &change.sha)?;
                     } else {
                         self.db
                             .set_state("last_git_hash", &change.sha)
@@ -2997,7 +3029,9 @@ impl SyncEngine {
                     .db
                     .confirm_git_to_svn_commit(rid, &op.id, svn_rev, &observed_svn_tree)
                 {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        self.append_git_replay_handled_commit(batch_continuation, &change.sha)?;
+                    }
                     Err(error) => {
                         let _ = self.db.hold_git_to_svn_reconciliation(
                             rid,
@@ -3255,7 +3289,10 @@ impl SyncEngine {
         continuation: &GitReplayContinuation,
     ) -> Result<(), SyncError> {
         let Some(rid) = self.effective_repo_id() else {
-            return Ok(());
+            return Err(SyncError::HistoryBlocked {
+                reason: "missing_repo_identity".into(),
+                detail: "git replay continuation requires a repository identity".into(),
+            });
         };
         let key = GitReplayContinuation::state_key(rid);
         let value =
@@ -3279,6 +3316,52 @@ impl SyncEngine {
                 })?;
         }
         Ok(())
+    }
+
+    fn persist_pre_batch_git_replay_continuation(
+        &self,
+        ctx: &GitReplayBatchContinuation,
+    ) -> Result<(), SyncError> {
+        let batch_set: HashSet<&str> = ctx.batch_shas.iter().map(String::as_str).collect();
+        let pre_batch = GitReplayContinuation {
+            handled_shas: ctx
+                .target
+                .handled_shas
+                .iter()
+                .filter(|sha| !batch_set.contains(sha.as_str()))
+                .cloned()
+                .collect(),
+            ..ctx.target.clone()
+        };
+        self.persist_git_replay_continuation(&pre_batch)
+    }
+
+    fn append_git_replay_handled_commit(
+        &self,
+        ctx: Option<&GitReplayBatchContinuation>,
+        sha: &str,
+    ) -> Result<(), SyncError> {
+        let Some(ctx) = ctx else {
+            return Ok(());
+        };
+        if !ctx.target.merge_dag || !ctx.batch_shas.iter().any(|batch_sha| batch_sha == sha) {
+            return Ok(());
+        }
+        let stored = self
+            .load_git_replay_continuation()?
+            .unwrap_or_else(|| ctx.target.clone());
+        if stored.handled_shas.iter().any(|handled| handled == sha) {
+            return Ok(());
+        }
+        let updated = GitReplayContinuation {
+            handled_shas: stored
+                .handled_shas
+                .into_iter()
+                .chain(std::iter::once(sha.to_string()))
+                .collect(),
+            ..stored
+        };
+        self.persist_git_replay_continuation(&updated)
     }
 
     async fn svn_changes_block_git_continuation(
@@ -3444,7 +3527,7 @@ impl SyncEngine {
             return Ok(GitFetchResult {
                 replay_batch: Vec::new(),
                 conflict_coverage: Vec::new(),
-                conflict_coverage_commit_count: 0,
+                conflict_coverage_skipped: 0,
                 has_more: true,
                 reset_target: admission.checkpoint.clone(),
                 pending_total,
@@ -3462,6 +3545,21 @@ impl SyncEngine {
                 batch_cap,
             )
             .map_err(SyncError::GitError)?;
+        #[cfg(debug_assertions)]
+        let conflict_commits = if let Some(rid) = self.effective_repo_id() {
+            let scoped = format!("REPOSYNC_TEST_INCOMPLETE_CONFLICT_COVERAGE__{}", rid);
+            if selection.has_more
+                && std::env::var(&scoped).is_ok()
+                && conflict_commits.len() == pending_total
+                && conflict_commits.len() > 1
+            {
+                conflict_commits[..conflict_commits.len() - 1].to_vec()
+            } else {
+                conflict_commits
+            }
+        } else {
+            conflict_commits
+        };
         self.ensure_conflict_coverage_before_detection(
             selection.has_more,
             pending_total,
@@ -3499,10 +3597,12 @@ impl SyncEngine {
 
         let replay_batch = self.git_change_sets_from_commits(&git, &selection.commits)?;
         let conflict_coverage = self.git_change_sets_from_commits(&git, &conflict_commits)?;
+        let conflict_coverage_skipped = conflict_commits.len() - conflict_coverage.len();
 
         debug!(
             replay = replay_batch.len(),
             conflict_coverage = conflict_coverage.len(),
+            conflict_coverage_skipped,
             has_more = selection.has_more,
             reset_target = %reset_target,
             "fetched Git change sets"
@@ -3510,7 +3610,7 @@ impl SyncEngine {
         Ok(GitFetchResult {
             replay_batch,
             conflict_coverage,
-            conflict_coverage_commit_count: conflict_commits.len(),
+            conflict_coverage_skipped,
             has_more: selection.has_more,
             reset_target,
             pending_total,
@@ -4461,5 +4561,18 @@ repo = "test/test-repo"
         let blocked = vec!["*.exe".to_string()];
         let files = vec![make_file("A", "source/foo.rs")];
         assert!(validate_file_paths_impl(&[], &blocked, &files).is_ok());
+    }
+
+    #[test]
+    fn incomplete_conflict_coverage_fails_closed() {
+        let engine = team_echo_engine("pair");
+        let err = engine.ensure_conflict_coverage_before_detection(true, 4, 3);
+        assert!(matches!(
+            err,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "incomplete_conflict_coverage"
+        ));
     }
 }
