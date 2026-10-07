@@ -270,7 +270,7 @@ impl<'a> InitialImport<'a> {
             .context("failed to set SVN watermark")?;
 
         self.db
-            .set_watermark("git_sha", &sha)
+            .set_legacy_import_git_sha_watermark(&sha)
             .context("failed to set Git watermark")?;
 
         self.db
@@ -466,7 +466,9 @@ impl<'a> InitialImport<'a> {
 
         let git_client = self.git_client.lock().unwrap();
         if let Ok(sha) = git_client.get_head_sha() {
-            self.db.set_watermark("git_sha", &sha).ok();
+            self.db
+                .set_legacy_import_git_sha_watermark(&sha)
+                .context("failed to set Git watermark")?;
         }
         drop(git_client);
 

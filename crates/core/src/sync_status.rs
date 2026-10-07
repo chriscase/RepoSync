@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_unscoped_git_hash_omits_global_max_with_multiple_managed_repos() {
+    fn resolve_unscoped_git_hash_omits_foreign_tip_with_multiple_managed_repos() {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
         db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scoped_checkpoint_tip_omits_global_max_with_multiple_managed_repos() {
+    fn resolve_scoped_checkpoint_tip_omits_foreign_tip_with_multiple_managed_repos() {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
         db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")

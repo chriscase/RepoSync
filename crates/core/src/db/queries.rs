@@ -692,6 +692,20 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the legacy personal import `git_sha` watermark.
+    ///
+    /// Managed installs keep Git cursors in repository columns and scoped kv; the
+    /// global watermark is only for legacy personal DBs with an empty
+    /// `repositories` table (#63).
+    pub fn set_legacy_import_git_sha_watermark(&self, sha: &str) -> Result<(), DatabaseError> {
+        if !self.list_repositories()?.is_empty() {
+            return Err(DatabaseError::Other(
+                "refusing global git_sha watermark while repositories table is non-empty".into(),
+            ));
+        }
+        self.set_watermark("git_sha", sha)
+    }
+
     /// List all watermarks.
     pub fn list_watermarks(&self) -> Result<Vec<WatermarkEntry>, DatabaseError> {
         let conn = self.conn();
@@ -2815,6 +2829,65 @@ mod tests {
         assert_eq!(db.get_watermark("svn").unwrap().as_deref(), Some("100"));
         db.set_watermark("svn", "200").unwrap();
         assert_eq!(db.get_watermark("svn").unwrap().as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn legacy_import_git_sha_watermark_refuses_managed_repositories() {
+        use crate::models::Repository;
+        use chrono::Utc;
+
+        let db = setup_db();
+        let now = Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: "only".into(),
+            name: "only".into(),
+            svn_url: "file:///svn".into(),
+            svn_branch: "trunk".into(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: "repo.git".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        let err = db
+            .set_legacy_import_git_sha_watermark("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("repositories table is non-empty"),
+            "{err}"
+        );
+        assert!(db.get_watermark("git_sha").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_import_git_sha_watermark_allows_empty_repositories_table() {
+        let db = setup_db();
+        db.set_legacy_import_git_sha_watermark("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+        assert_eq!(
+            db.get_watermark("git_sha").unwrap().as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
     }
 
     #[test]

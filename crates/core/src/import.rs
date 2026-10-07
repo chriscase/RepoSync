@@ -3052,7 +3052,7 @@ pub async fn run_full_import(
     }
     if operation_id.is_none() {
         db.set_watermark("svn_rev", &last_rev.to_string())?;
-        db.set_watermark("git_sha", &sha)?;
+        db.set_legacy_import_git_sha_watermark(&sha)?;
     }
 
     // Final audit log
