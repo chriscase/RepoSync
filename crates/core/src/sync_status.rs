@@ -264,6 +264,14 @@ mod tests {
     fn resolve_unscoped_git_hash_reports_single_managed_repo_column() {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
+        db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (git_sha, svn_rev, direction, synced_at) VALUES (?1, 9, 'svn_to_git', '2020-01-01T00:00:00Z')",
+                ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
+            )
+            .unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         db.insert_repository(&Repository {
             id: "only".into(),
@@ -299,7 +307,19 @@ mod tests {
         assert_eq!(
             resolve_unscoped_last_git_hash(&db).unwrap().as_deref(),
             Some("cccccccccccccccccccccccccccccccccccccccc"),
-            "single managed repo may report its column tip without global fallback"
+            "single managed repo must report its column tip, not foreign global max"
+        );
+
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = '' WHERE id = 'only'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            resolve_unscoped_last_git_hash(&db).unwrap(),
+            None,
+            "empty managed-repo column must not fall back to global kv or commit-map max"
         );
     }
 }
