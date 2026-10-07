@@ -425,7 +425,7 @@ fi
 # ============================================================================
 log ""
 log "──────────────────────────────────────────────────────────────"
-log "Phase 6/6: Secret redaction scan"
+log "Phase 6/7: Secret redaction scan"
 log "──────────────────────────────────────────────────────────────"
 
 REDACT_DIR="$ARTIFACT_DIR/redaction"
@@ -446,6 +446,37 @@ else
     emit_event "redaction" "complete" "pass" 0
     log "  ✅ Secret scan: no token patterns found"
     record_phase "Secret scan" "PASS"
+fi
+
+# ============================================================================
+# Phase 7: Real-engine svnserve scenario suite (#62)
+# ============================================================================
+log ""
+log "──────────────────────────────────────────────────────────────"
+log "Phase 7/7: Real-engine svnserve scenario suite"
+log "──────────────────────────────────────────────────────────────"
+
+REAL_ENGINE_DIR="$ARTIFACT_DIR/real-engine-scenarios"
+mkdir -p "$REAL_ENGINE_DIR"
+emit_event "real-engine-scenarios" "start" "running" 0
+if scripts/real-engine-scenario-suite.sh > "$REAL_ENGINE_DIR/suite.log" 2>&1; then
+    emit_event "real-engine-scenarios" "complete" "pass" 0
+    log "  ✅ Real-engine scenario suite PASS"
+    record_phase "Real-engine scenarios" "PASS"
+else
+    suite_exit=$?
+    if grep -q '"overall": "NOT RUN"' "$REAL_ENGINE_DIR"/*/summary.json 2>/dev/null || grep -q '"overall": "NOT RUN"' artifacts/real-engine-scenarios/*/summary.json 2>/dev/null; then
+        emit_event "real-engine-scenarios" "complete" "not_run" 0
+        log "  ⏭  Real-engine scenario suite NOT RUN (missing tools)"
+        record_phase "Real-engine scenarios" "NOT RUN"
+    else
+        emit_event "real-engine-scenarios" "complete" "fail" 0
+        log "  ❌ Real-engine scenario suite FAIL — see $REAL_ENGINE_DIR/suite.log"
+        record_phase "Real-engine scenarios" "FAIL"
+    fi
+    if [[ $suite_exit -ne 2 ]]; then
+        : # keep overall FAIL when scenarios failed
+    fi
 fi
 
 # ============================================================================
