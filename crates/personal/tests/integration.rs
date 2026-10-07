@@ -2694,6 +2694,126 @@ async fn test_replay_path_lfs_pointer_skipped_not_committed() {
     );
 }
 
+/// Abort restore must remove a newly-created parent directory when a later file in
+/// the same commit fails (e.g. unresolved LFS pointer).
+#[tokio::test]
+async fn test_replay_path_abort_restore_removes_newdir_after_lfs_failure() {
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
+    use reposync_personal::git_to_svn::GitToSvnSync;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+
+    let git_work = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare_dir);
+
+    std::fs::create_dir_all(git_work.join("src/newdir")).unwrap();
+    std::fs::write(git_work.join("src/newdir/file.txt"), "new file\n").unwrap();
+    let pointer_text = "version https://git-lfs.github.com/spec/v1\n\
+                        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                        size 99999\n";
+    std::fs::write(git_work.join("zzz-large.bin"), pointer_text).unwrap();
+    let oid = git_client
+        .commit(
+            "add newdir file then unresolved LFS pointer",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .expect("git commit failed");
+    let commit_sha = oid.to_string();
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+
+    let config = PersonalConfig {
+        personal: PersonalSection {
+            poll_interval_secs: 30,
+            data_dir: tmp.path().to_path_buf(),
+            log_level: "info".into(),
+            status_port: None,
+        },
+        svn: PersonalSvnConfig {
+            url: svn_url.clone(),
+            username: "test".into(),
+            password_env: String::new(),
+            password: Some("test".into()),
+        },
+        github: PersonalGitHubConfig {
+            api_url: "https://localhost:0/unused".into(),
+            git_base_url: None,
+            repo: "test/unused".into(),
+            token_env: String::new(),
+            default_branch: "main".into(),
+            auto_create: false,
+            private: false,
+            token: Some("unused".into()),
+        },
+        developer: DeveloperConfig {
+            name: "Test User".into(),
+            email: "test@example.com".into(),
+            svn_username: "test".into(),
+        },
+        commit_format: CommitFormatConfig::default(),
+        options: PersonalOptionsConfig::default(),
+        identity: None,
+    };
+
+    let svn_client = SvnClient::new(&svn_url, "test", "test");
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        "https://localhost:0/unused",
+        "unused",
+        reposync_core::config::GitProvider::default(),
+    );
+
+    let sync = GitToSvnSync::new(
+        svn_client,
+        github_client,
+        db_arc,
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+
+    let gh_commit = GitHubCommit {
+        sha: commit_sha.clone(),
+        commit: GitHubCommitDetail {
+            message: "add newdir file then unresolved LFS pointer".into(),
+            author: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+            committer: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+        },
+        author: None,
+    };
+
+    let result = sync.apply_git_changes_to_svn(&gh_commit).await;
+    assert!(
+        result.is_err(),
+        "apply_git_changes_to_svn must fail closed on unresolved LFS pointer, got: {:?}",
+        result
+    );
+    assert!(
+        !svn_wc.join("src/newdir").exists(),
+        "abort restore must remove the newly-created parent directory after LFS failure"
+    );
+}
+
 #[test]
 fn test_resolve_lfs_pointer_reads_local_object_with_skip_smudge() {
     let tmp = tempfile::tempdir().unwrap();

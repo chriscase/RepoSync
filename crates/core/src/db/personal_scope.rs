@@ -221,6 +221,9 @@ impl Database {
         if has_explicit_personal_commit_map_svn_to_git(&conn, svn_rev, &read_ids)? {
             return Ok(true);
         }
+        if read_ids.len() == 1 {
+            return Ok(false);
+        }
         null_commit_map_svn_to_git_has_personal_evidence(&conn, svn_rev)
     }
 
@@ -321,7 +324,8 @@ impl Database {
                 svn_watermark_key,
                 true,
             )
-        })
+        })?;
+        self.set_legacy_import_git_sha_watermark(git_sha)
     }
 
     /// Record one personal full-import revision mapping (scoped `commit_map` + receipt).
@@ -352,20 +356,8 @@ impl Database {
         last_svn_rev: i64,
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
-        self.transaction(|tx| {
-            let watermark_now = Utc::now().to_rfc3339();
-            tx.execute(
-                "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                params!["svn_rev", last_svn_rev.to_string(), watermark_now],
-            )?;
-            tx.execute(
-                "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                params!["git_sha", git_sha, watermark_now],
-            )?;
-            Ok(())
-        })
+        self.set_watermark("svn_rev", &last_svn_rev.to_string())?;
+        self.set_legacy_import_git_sha_watermark(git_sha)
     }
 }
 
@@ -450,11 +442,6 @@ fn checkpoint_personal_svn_to_git_import_tx(
              ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![svn_watermark_key, svn_rev.to_string(), watermark_now],
         )?;
-        tx.execute(
-            "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params!["git_sha", git_sha, watermark_now],
-        )?;
     }
     Ok(())
 }
@@ -473,13 +460,6 @@ mod tests {
     #[test]
     fn legacy_null_commit_map_counts_with_personal_sync_record() {
         let db = setup_db();
-        db.conn()
-            .execute(
-                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
-                 VALUES ('personal','Managed','file:///x','','','local','','r','main','team',5,0,0,1,'t','t',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
-                [],
-            )
-            .unwrap();
         let git_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         db.insert_commit_map(1, git_sha, "svn_to_git", "dev", "Dev")
             .unwrap();
@@ -497,8 +477,39 @@ mod tests {
             status: SyncRecordStatus::Applied,
         })
         .unwrap();
-        assert!(!db.has_personal_svn_to_git_receipt_scoped(1).unwrap());
+        assert!(db.has_personal_svn_to_git_receipt_scoped(1).unwrap());
         assert!(db.is_personal_svn_rev_synced(1).unwrap());
+    }
+
+    #[test]
+    fn managed_personal_repo_null_commit_map_ignores_legacy_personal_receipt() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('personal','Managed','file:///x','','','local','','r','main','team',5,0,0,1,'t','t',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        db.insert_commit_map(1, git_sha, "svn_to_git", "dev", "Dev")
+            .unwrap();
+        let now = chrono::Utc::now();
+        db.insert_sync_record(&SyncRecord {
+            id: "managed-legacy-receipt".into(),
+            repo_id: Some(LEGACY_PERSONAL_REPO_ID.to_string()),
+            svn_revision: Some(1),
+            git_hash: Some(git_sha.into()),
+            direction: SyncDirection::SvnToGit,
+            author: "dev".into(),
+            message: "managed receipt".into(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        })
+        .unwrap();
+        assert!(!db.has_personal_svn_to_git_receipt_scoped(1).unwrap());
+        assert!(!db.is_personal_svn_rev_synced(1).unwrap());
     }
 
     #[test]

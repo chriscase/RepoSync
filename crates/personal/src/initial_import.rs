@@ -420,14 +420,19 @@ impl<'a> InitialImport<'a> {
                     let sha = oid.to_string();
                     debug!(rev, sha = %sha, author = %author_name, "committed revision");
 
-                    if let Err(e) = self.db.record_personal_import_revision(
-                        rev,
-                        &sha,
-                        &entry.author,
-                        &format!("{} <{}>", author_name, author_email),
-                    ) {
-                        warn!(rev, error = %e, "failed to record personal import revision mapping");
-                    }
+                    self.db
+                        .record_personal_import_revision(
+                            rev,
+                            &sha,
+                            &entry.author,
+                            &format!("{} <{}>", author_name, author_email),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "failed to record personal import revision mapping for r{}",
+                                rev
+                            )
+                        })?;
 
                     count += 1;
                 }

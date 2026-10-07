@@ -822,7 +822,6 @@ impl GitToSvnSync {
         let file_changes = projected.into_file_contents();
         for (action, file_path, content) in &file_changes {
             let dst = self.svn_wc_path.join(file_path);
-            touched_paths.push(file_path.clone());
 
             match action.as_str() {
                 "D" => {
@@ -833,6 +832,7 @@ impl GitToSvnSync {
                             format!("failed to remove deleted file: {}", dst.display())
                         })?;
                     }
+                    touched_paths.push(file_path.clone());
                 }
                 _ => {
                     // File was added or modified: write projected content to the SVN WC.
@@ -901,6 +901,7 @@ impl GitToSvnSync {
                                 std::fs::write(&dst, &write_content).with_context(|| {
                                     format!("failed to write file: {}", dst.display())
                                 })?;
+                                touched_paths.push(file_path.clone());
                             }
                             FilePolicyDecision::LfsTrack { .. } => {
                                 // File exceeds LFS threshold — same LFS pointer
@@ -961,6 +962,7 @@ impl GitToSvnSync {
                                 std::fs::write(&dst, &write_content).with_context(|| {
                                     format!("failed to write file: {}", dst.display())
                                 })?;
+                                touched_paths.push(file_path.clone());
                             }
                             FilePolicyDecision::Ignored { pattern } => {
                                 warn!(
@@ -1286,21 +1288,54 @@ fn remove_stale_files(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
+/// Column index where `svn status` paths begin (after seven status columns and a separator).
+const SVN_STATUS_PATH_OFFSET: usize = 8;
+
+fn svn_status_path(line: &str) -> Option<&str> {
+    let line = line.trim_end();
+    if line.len() <= SVN_STATUS_PATH_OFFSET {
+        return None;
+    }
+    let path = line[SVN_STATUS_PATH_OFFSET..].trim_start();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn is_path_prefix_ancestor(ancestor: &str, descendant: &str) -> bool {
+    if ancestor.is_empty() {
+        return false;
+    }
+    if descendant == ancestor {
+        return true;
+    }
+    if descendant.len() <= ancestor.len() {
+        return false;
+    }
+    descendant.starts_with(ancestor) && descendant.as_bytes().get(ancestor.len()) == Some(&b'/')
+}
+
+fn svn_paths_overlap(status_path: &str, touched_path: &str) -> bool {
+    status_path == touched_path
+        || is_path_prefix_ancestor(status_path, touched_path)
+        || is_path_prefix_ancestor(touched_path, status_path)
+}
+
 /// True when none of the touched apply paths appear in `svn status` output.
 fn are_apply_paths_clean(status_output: &str, touched_paths: &[String]) -> bool {
     if touched_paths.is_empty() {
         return true;
     }
     for line in status_output.lines() {
-        let line = line.trim_end();
-        if line.len() < 2 {
+        let Some(path) = svn_status_path(line) else {
             continue;
-        }
-        let path = line[1..].trim_start();
-        if path.is_empty() {
-            continue;
-        }
-        if touched_paths.iter().any(|touched| touched == path) {
+        };
+        if touched_paths
+            .iter()
+            .any(|touched| svn_paths_overlap(path, touched))
+        {
             return false;
         }
     }
@@ -1311,14 +1346,10 @@ fn are_apply_paths_clean(status_output: &str, touched_paths: &[String]) -> bool 
 fn collect_abort_leftover_paths(output: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in output.lines() {
-        if line.len() < 2 {
-            continue;
-        }
         let status_char = line.chars().next().unwrap_or(' ');
-        let path = line[1..].trim_start();
-        if path.is_empty() {
+        let Some(path) = svn_status_path(line) else {
             continue;
-        }
+        };
         match status_char {
             '?' | 'A' | 'I' => paths.push(path.to_string()),
             _ => {}
@@ -1334,9 +1365,11 @@ fn remove_abort_leftover_paths(
     status_output: &str,
     scope: &[String],
 ) -> Result<()> {
-    let scope: std::collections::HashSet<&str> = scope.iter().map(|path| path.as_str()).collect();
     for rel_path in collect_abort_leftover_paths(status_output) {
-        if !scope.contains(rel_path.as_str()) {
+        if !scope
+            .iter()
+            .any(|touched| svn_paths_overlap(rel_path.as_str(), touched))
+        {
             continue;
         }
         let full_path = wc_root.join(&rel_path);
@@ -1372,13 +1405,9 @@ fn parse_svn_status(output: &str) -> (Vec<String>, Vec<String>) {
         }
 
         let status_char = line.chars().next().unwrap_or(' ');
-        // The file path starts at column 8 in standard `svn status` output,
-        // but we handle both formats by trimming leading whitespace after the
-        // status character.
-        let path = line[1..].trim_start();
-        if path.is_empty() {
+        let Some(path) = svn_status_path(line) else {
             continue;
-        }
+        };
 
         match status_char {
             '?' => added.push(path.to_string()),
@@ -1474,6 +1503,30 @@ M       src/modified.rs
             status,
             &["src/modified.rs".to_string()]
         ));
+        assert!(!are_apply_paths_clean(
+            "?       src/newdir\n",
+            &["src/newdir/file.txt".to_string()]
+        ));
+        assert!(!are_apply_paths_clean(
+            "MM       src/modified.rs\n",
+            &["src/modified.rs".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_remove_abort_leftover_paths_ancestor_scope() {
+        let wc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wc.path().join("src/newdir")).unwrap();
+        std::fs::write(wc.path().join("src/newdir/file.txt"), "new").unwrap();
+
+        let output = "?       src/newdir\n";
+        let scope = vec!["src/newdir/file.txt".to_string()];
+        remove_abort_leftover_paths(wc.path(), output, &scope).unwrap();
+
+        assert!(
+            !wc.path().join("src/newdir").exists(),
+            "ancestor unversioned directory must be removed when scoped to a touched file"
+        );
     }
 
     #[test]
