@@ -1022,12 +1022,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(block["reason"], "missing_checkpoint");
-        assert!(
-            block["detail"]
-                .as_str()
-                .unwrap()
-                .contains("multiple managed repositories")
-        );
+        assert!(block["detail"]
+            .as_str()
+            .unwrap()
+            .contains("multiple managed repositories"));
     }
 
     #[test]
