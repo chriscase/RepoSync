@@ -280,6 +280,18 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_PERSONAL_LFS_ABORT_STOPS_BATCH",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_lfs_abort_cleans_sibling_and_stops_batch",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_PERSONAL_LFS_ABORT_RETRY_IN_ORDER",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_lfs_abort_retries_in_order",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_TEAM_EQUAL_REVISION_SCOPED",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_two_repos_equal_revision_import_completion_scoped",

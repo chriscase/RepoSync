@@ -2788,6 +2788,280 @@ async fn test_personal_git_to_svn_unresolved_lfs_holds_without_checkpoint() {
     );
 }
 
+/// LFS abort with a sibling file in the same commit must not leak edits into SVN,
+/// must stop the batch before a later PR, and must leave the working copy clean.
+#[tokio::test]
+async fn candidate_rs05_personal_lfs_abort_cleans_sibling_and_stops_batch() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+
+    let pointer_text = "version https://git-lfs.github.com/spec/v1\n\
+                        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                        size 99999\n";
+    std::fs::write(git_work.join("before-lfs.txt"), "sibling edit\n").unwrap();
+    std::fs::write(git_work.join("large-asset.bin"), pointer_text).unwrap();
+    let pr1_commit = git_client
+        .commit(
+            "add sibling and unresolved LFS pointer",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    git_client.push("origin", "main").unwrap();
+    let pr1_merge_sha = git_sha(&git_work);
+
+    std::fs::write(git_work.join("second-pr.txt"), "second pr\n").unwrap();
+    let pr2_commit = git_client
+        .commit(
+            "second merged PR",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    git_client.push("origin", "main").unwrap();
+    let pr2_merge_sha = git_sha(&git_work);
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, svn_before);
+
+    let (api_url, stub) = spawn_github_two_pr_sync_stub(
+        &pr1_merge_sha,
+        &pr1_commit,
+        "2025-01-02T00:00:00Z",
+        &pr2_merge_sha,
+        &pr2_commit,
+        "2025-01-03T00:00:00Z",
+    );
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url;
+    config.github.token = Some("test-token".into());
+
+    let sync = GitToSvnSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        GitHubClient::new(&config.github.api_url, "test-token", GitProvider::GitHub),
+        db_arc.clone(),
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+
+    let result = sync.sync().await.expect("sync must return a summary");
+    assert_eq!(
+        result.prs_synced, 0,
+        "no PR must complete during LFS abort pass"
+    );
+    assert_eq!(result.prs_failed, 1, "first PR must fail closed");
+    assert_eq!(
+        svn_youngest(&svn_url),
+        svn_before,
+        "SVN must not advance when LFS abort stops the batch"
+    );
+    assert!(
+        !svn_path_exists_at_head(&svn_url, "before-lfs.txt"),
+        "sibling edits must not reach SVN"
+    );
+    assert!(
+        !svn_path_exists_at_head(&svn_url, "second-pr.txt"),
+        "later PR must not be committed in the same pass"
+    );
+    assert!(
+        !db_arc.is_personal_pr_synced(&pr1_merge_sha).unwrap(),
+        "first PR must remain unsynced for retry"
+    );
+    assert!(
+        !db_arc.is_personal_pr_synced(&pr2_merge_sha).unwrap(),
+        "second PR must not be processed after batch stop"
+    );
+    assert_eq!(
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.direction == "git_to_svn")
+            .count(),
+        0,
+        "commit_map must not advance on LFS abort"
+    );
+    let wc_status = Command::new("svn")
+        .args(["status", svn_wc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        wc_status.status.success(),
+        "svn status must succeed after abort restore"
+    );
+    assert!(
+        String::from_utf8_lossy(&wc_status.stdout)
+            .lines()
+            .all(|line| line.trim().is_empty()),
+        "SVN working copy must be clean after abort restore"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "RS05_PERSONAL_LFS_ABORT_STOPS_BATCH",
+            "svn_revision_before_after": svn_before,
+            "pr1_merge_sha": pr1_merge_sha,
+            "pr2_merge_sha": pr2_merge_sha,
+            "working_copy_clean": true,
+            "mode": "personal"
+        })
+    );
+    drop(stub);
+}
+
+/// After the LFS object becomes available locally, the next sync pass must replay PRs in order.
+#[tokio::test]
+async fn candidate_rs05_personal_lfs_abort_retries_in_order() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+
+    let lfs_payload = b"resolved lfs payload for retry";
+    let pointer = reposync_core::lfs::create_lfs_pointer(lfs_payload);
+    let parsed = reposync_core::lfs::parse_lfs_pointer(pointer.as_bytes()).unwrap();
+    std::fs::write(git_work.join("before-lfs.txt"), "sibling edit\n").unwrap();
+    std::fs::write(git_work.join("large-asset.bin"), &pointer).unwrap();
+    let pr1_commit = git_client
+        .commit(
+            "add sibling and LFS pointer",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    git_client.push("origin", "main").unwrap();
+    let pr1_merge_sha = git_sha(&git_work);
+
+    std::fs::write(git_work.join("second-pr.txt"), "second pr\n").unwrap();
+    let pr2_commit = git_client
+        .commit(
+            "second merged PR",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    git_client.push("origin", "main").unwrap();
+    let pr2_merge_sha = git_sha(&git_work);
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, svn_before);
+
+    let (api_url, stub) = spawn_github_two_pr_sync_stub(
+        &pr1_merge_sha,
+        &pr1_commit,
+        "2025-01-02T00:00:00Z",
+        &pr2_merge_sha,
+        &pr2_commit,
+        "2025-01-03T00:00:00Z",
+    );
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url.clone();
+    config.github.token = Some("test-token".into());
+
+    let sync = GitToSvnSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        GitHubClient::new(&config.github.api_url, "test-token", GitProvider::GitHub),
+        db_arc.clone(),
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+
+    let blocked = sync.sync().await.expect("first pass must return summary");
+    assert_eq!(blocked.prs_synced, 0);
+    assert_eq!(blocked.prs_failed, 1);
+    assert_eq!(svn_youngest(&svn_url), svn_before);
+
+    let object_path = reposync_core::lfs::local_lfs_object_path(&git_work, &parsed.oid);
+    std::fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+    std::fs::write(&object_path, lfs_payload).unwrap();
+
+    let retry = GitToSvnSync::new(
+        SvnClient::new(&svn_url, "", ""),
+        GitHubClient::new(&api_url, "test-token", GitProvider::GitHub),
+        db_arc.clone(),
+        &config,
+        svn_wc.clone(),
+        git_work.clone(),
+    );
+    let recovered = retry.sync().await.expect("retry pass must succeed");
+    assert_eq!(recovered.prs_synced, 2, "both PRs must replay in order");
+    assert!(
+        svn_youngest(&svn_url) > svn_before,
+        "SVN must advance after successful retry"
+    );
+    assert!(db_arc.is_personal_pr_synced(&pr1_merge_sha).unwrap());
+    assert!(db_arc.is_personal_pr_synced(&pr2_merge_sha).unwrap());
+    assert!(svn_path_exists_at_head(&svn_url, "before-lfs.txt"));
+    assert!(svn_path_exists_at_head(&svn_url, "large-asset.bin"));
+    assert!(svn_path_exists_at_head(&svn_url, "second-pr.txt"));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "RS05_PERSONAL_LFS_ABORT_RETRY_IN_ORDER",
+            "svn_revision_before": svn_before,
+            "svn_revision_after": svn_youngest(&svn_url),
+            "pr1_merge_sha": pr1_merge_sha,
+            "pr2_merge_sha": pr2_merge_sha,
+            "mode": "personal"
+        })
+    );
+    drop(stub);
+}
+
 #[test]
 fn test_resolve_lfs_pointer_accepts_pointer_shaped_payload() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5214,6 +5488,145 @@ async fn candidate_rs05_personal_ancestry_command_failed_blocks_before_svn_write
             "mode":"personal"
         })
     );
+}
+
+fn svn_path_exists_at_head(svn_url: &str, path: &str) -> bool {
+    let target = format!("{}/{}@HEAD", svn_url, path);
+    Command::new("svn")
+        .args(["cat", &target, "--non-interactive"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn spawn_github_two_pr_sync_stub(
+    pr1_merge_sha: &str,
+    pr1_commit_sha: &str,
+    pr1_merged_at: &str,
+    pr2_merge_sha: &str,
+    pr2_commit_sha: &str,
+    pr2_merged_at: &str,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let pulls_body = format!(
+        r#"[{{
+            "number": 1,
+            "title": "LFS PR",
+            "html_url": "https://example.invalid/pr/1",
+            "state": "closed",
+            "head": {{"ref": "feature/lfs", "sha": "{pr1_commit_sha}"}},
+            "base": {{"ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+            "merged": true,
+            "merge_commit_sha": "{pr1_merge_sha}",
+            "merged_at": "{pr1_merged_at}"
+        }}, {{
+            "number": 2,
+            "title": "Second PR",
+            "html_url": "https://example.invalid/pr/2",
+            "state": "closed",
+            "head": {{"ref": "feature/second", "sha": "{pr2_commit_sha}"}},
+            "base": {{"ref": "main", "sha": "cccccccccccccccccccccccccccccccccccccccc"}},
+            "merged": true,
+            "merge_commit_sha": "{pr2_merge_sha}",
+            "merged_at": "{pr2_merged_at}"
+        }}]"#,
+        pr1_commit_sha = pr1_commit_sha,
+        pr1_merge_sha = pr1_merge_sha,
+        pr1_merged_at = pr1_merged_at,
+        pr2_commit_sha = pr2_commit_sha,
+        pr2_merge_sha = pr2_merge_sha,
+        pr2_merged_at = pr2_merged_at,
+    );
+    let pr1_commits_body = format!(
+        r#"[{{
+            "sha": "{pr1_commit_sha}",
+            "commit": {{
+                "message": "Add LFS and sibling",
+                "author": {{"name": "Test User", "email": "test@example.com", "date": null}},
+                "committer": {{"name": "Test User", "email": "test@example.com", "date": null}}
+            }},
+            "author": null
+        }}]"#,
+        pr1_commit_sha = pr1_commit_sha
+    );
+    let pr2_commits_body = format!(
+        r#"[{{
+            "sha": "{pr2_commit_sha}",
+            "commit": {{
+                "message": "Second merged PR",
+                "author": {{"name": "Test User", "email": "test@example.com", "date": null}},
+                "committer": {{"name": "Test User", "email": "test@example.com", "date": null}}
+            }},
+            "author": null
+        }}]"#,
+        pr2_commit_sha = pr2_commit_sha
+    );
+    let merge_detail_body = |merge_sha: &str, parents: &[&str]| {
+        let parent_json = parents
+            .iter()
+            .map(|sha| format!(r#"{{"sha": "{sha}"}}"#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"{{
+            "sha": "{merge_sha}",
+            "commit": {{
+                "message": "Merge PR",
+                "author": {{"name": "Test User", "email": "test@example.com", "date": null}},
+                "committer": {{"name": "Test User", "email": "test@example.com", "date": null}}
+            }},
+            "parents": [{parent_json}]
+        }}"#,
+            merge_sha = merge_sha,
+            parent_json = parent_json
+        )
+    };
+    let pr1_merge_detail = merge_detail_body(
+        pr1_merge_sha,
+        &["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", pr1_commit_sha],
+    );
+    let pr2_merge_detail = merge_detail_body(
+        pr2_merge_sha,
+        &["cccccccccccccccccccccccccccccccccccccccc", pr2_commit_sha],
+    );
+    let pr1_merge_path = format!("/commits/{}", pr1_merge_sha);
+    let pr2_merge_path = format!("/commits/{}", pr2_merge_sha);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..16 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("/pulls/1/commits") {
+                    pr1_commits_body.clone()
+                } else if req.contains("/pulls/2/commits") {
+                    pr2_commits_body.clone()
+                } else if req.contains(&pr1_merge_path) {
+                    pr1_merge_detail.clone()
+                } else if req.contains(&pr2_merge_path) {
+                    pr2_merge_detail.clone()
+                } else if req.contains("/pulls") {
+                    pulls_body.clone()
+                } else {
+                    "[]".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), handle)
 }
 
 fn spawn_github_pr_sync_stub(

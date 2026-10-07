@@ -422,6 +422,14 @@ impl SvnClient {
         Ok(())
     }
 
+    /// Revert every local change under a working-copy root.
+    #[instrument(skip(self), fields(path = %path.display()))]
+    pub async fn revert_recursive(&self, path: &Path) -> Result<(), SvnError> {
+        self.run_svn_in_dir(path, &["revert", "-R", "."]).await?;
+        debug!(path = %path.display(), "svn revert -R completed");
+        Ok(())
+    }
+
     /// Run `svn add` on files in a working copy.
     #[instrument(skip(self, files), fields(path = %path.display()))]
     pub async fn add(&self, path: &Path, files: &[&str]) -> Result<(), SvnError> {
