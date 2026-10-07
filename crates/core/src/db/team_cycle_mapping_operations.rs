@@ -171,6 +171,23 @@ fn advance_svn_only_tx(tx: &Connection, repo_id: &str, svn_rev: i64) -> Result<(
     Ok(())
 }
 
+fn advance_svn_with_receipt_tx(
+    tx: &Connection,
+    repo_id: &str,
+    svn_rev: i64,
+    receipt: serde_json::Value,
+) -> Result<(), DatabaseError> {
+    if svn_rev <= 0 {
+        return Err(DatabaseError::Other(
+            "team cycle mapping lacks a positive SVN revision".into(),
+        ));
+    }
+    advance_svn_only_tx(tx, repo_id, svn_rev)?;
+    let receipt_key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
+    write_value(tx, &receipt_key, &receipt.to_string())?;
+    Ok(())
+}
+
 fn advance_git_with_receipt_tx(
     tx: &Connection,
     repo_id: &str,
@@ -217,7 +234,14 @@ fn finalize_tx(
                     "observed SVN revision is not after the pre-write revision".into(),
                 ));
             }
-            advance_svn_only_tx(tx, &op.repo_id, svn_rev)?;
+            let receipt = serde_json::json!({
+                "version": 1,
+                "repo_id": op.repo_id,
+                "svn_revision": svn_rev,
+                "outcome": "no_git_content",
+                "projection": op.projection,
+            });
+            advance_svn_with_receipt_tx(tx, &op.repo_id, svn_rev, receipt)?;
         }
         (
             TeamCycleMappingDirection::GitToSvn,
@@ -552,6 +576,11 @@ mod tests {
             db.get_state("last_svn_rev_pair").unwrap().as_deref(),
             Some("2")
         );
+        let receipt = db
+            .get_state("handled_svn_no_target_pair_2")
+            .unwrap()
+            .unwrap();
+        assert!(receipt.contains("no_git_content"));
         assert!(db
             .active_team_cycle_mapping_operation("pair")
             .unwrap()

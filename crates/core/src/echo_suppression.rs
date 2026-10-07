@@ -22,7 +22,7 @@ pub enum EchoDisposition {
     ApplyGenuineWithMarkerHint,
     /// Apply once; no marker and no receipt.
     ApplyGenuine,
-    /// Marker without receipt, but a Running journal still owns this emit.
+    /// Incoming change matches a Running journal without a finalized receipt.
     DeferPendingJournal,
 }
 
@@ -41,7 +41,7 @@ pub(crate) enum NoTargetReceiptVerdict {
     UnverifiedOutcome,
 }
 
-/// Validate a no-target receipt with the same scoping the admission writer binds.
+/// Validate a Git no-target receipt with the same scoping the admission writer binds.
 pub(crate) fn verify_no_target_receipt(
     record: &serde_json::Value,
     repo_id: &str,
@@ -54,14 +54,37 @@ pub(crate) fn verify_no_target_receipt(
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
     }
-    if no_target_outcome_is_verified(record) {
+    if git_no_target_outcome_is_verified(record) {
         NoTargetReceiptVerdict::Accepted
     } else {
         NoTargetReceiptVerdict::UnverifiedOutcome
     }
 }
 
-fn no_target_outcome_is_verified(record: &serde_json::Value) -> bool {
+/// Validate an SVN no-target receipt with the same scoping the admission writer binds.
+pub(crate) fn verify_svn_no_target_receipt(
+    record: &serde_json::Value,
+    repo_id: &str,
+    svn_rev: i64,
+    projection: &str,
+) -> NoTargetReceiptVerdict {
+    if record["repo_id"] != repo_id
+        || record["svn_revision"].as_i64() != Some(svn_rev)
+        || svn_rev <= 0
+    {
+        return NoTargetReceiptVerdict::RepoOrShaMismatch;
+    }
+    if record["projection"] != projection {
+        return NoTargetReceiptVerdict::ProjectionMismatch;
+    }
+    if svn_no_target_outcome_is_verified(record) {
+        NoTargetReceiptVerdict::Accepted
+    } else {
+        NoTargetReceiptVerdict::UnverifiedOutcome
+    }
+}
+
+fn git_no_target_outcome_is_verified(record: &serde_json::Value) -> bool {
     match (record["version"].as_u64(), record["outcome"].as_str()) {
         (Some(1), Some("empty_commit" | "filtered")) => true,
         (Some(3), Some("no_svn_delta")) => {
@@ -84,6 +107,13 @@ fn no_target_outcome_is_verified(record: &serde_json::Value) -> bool {
     }
 }
 
+fn svn_no_target_outcome_is_verified(record: &serde_json::Value) -> bool {
+    matches!(
+        (record["version"].as_u64(), record["outcome"].as_str()),
+        (Some(1), Some("no_git_content"))
+    )
+}
+
 /// Classify an incoming SVN revision for team mode.
 pub fn classify_incoming_svn_revision(
     ctx: &TeamEchoContext<'_>,
@@ -99,15 +129,23 @@ pub fn classify_incoming_svn_revision(
         );
         return Ok(EchoDisposition::SkipEcho);
     }
+    if verified_svn_no_target_receipt(ctx, svn_rev)? {
+        debug!(
+            repo_id = ctx.repo_id,
+            rev = svn_rev,
+            "skipping handled SVN revision (repo-scoped no-target receipt)"
+        );
+        return Ok(EchoDisposition::SkipEcho);
+    }
+    if running_journal_claims_pending_svn_echo(ctx, svn_rev)? {
+        warn!(
+            repo_id = ctx.repo_id,
+            rev = svn_rev,
+            "SVN revision matches a Running git-to-SVN journal without receipt; deferring"
+        );
+        return Ok(EchoDisposition::DeferPendingJournal);
+    }
     if has_marker {
-        if running_journal_claims_pending_svn_echo(ctx, svn_rev)? {
-            warn!(
-                repo_id = ctx.repo_id,
-                rev = svn_rev,
-                "SVN revision carries [reposync] marker without receipt while a Running git-to-SVN journal is active; deferring"
-            );
-            return Ok(EchoDisposition::DeferPendingJournal);
-        }
         warn!(
             repo_id = ctx.repo_id,
             rev = svn_rev,
@@ -160,6 +198,24 @@ pub fn classify_incoming_git_commit(
     } else {
         Ok(Ok(EchoDisposition::ApplyGenuine))
     }
+}
+
+fn verified_svn_no_target_receipt(
+    ctx: &TeamEchoContext<'_>,
+    svn_rev: i64,
+) -> Result<bool, DatabaseError> {
+    let key = format!("handled_svn_no_target_{}_{}", ctx.repo_id, svn_rev);
+    let Some(raw) = ctx.db.get_state(&key)? else {
+        return Ok(false);
+    };
+    let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
+    let Some(record) = receipt else {
+        return Ok(false);
+    };
+    Ok(
+        verify_svn_no_target_receipt(&record, ctx.repo_id, svn_rev, ctx.no_target_projection)
+            == NoTargetReceiptVerdict::Accepted,
+    )
 }
 
 fn verified_git_no_target_receipt(
@@ -260,8 +316,13 @@ mod tests {
         }
     }
 
-    fn write_no_target_receipt(db: &Database, repo_id: &str, git_sha: &str, receipt: &str) {
+    fn write_git_no_target_receipt(db: &Database, repo_id: &str, git_sha: &str, receipt: &str) {
         let key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+        db.set_state(&key, receipt).unwrap();
+    }
+
+    fn write_svn_no_target_receipt(db: &Database, repo_id: &str, svn_rev: i64, receipt: &str) {
+        let key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
         db.set_state(&key, receipt).unwrap();
     }
 
@@ -326,7 +387,7 @@ mod tests {
             "outcome": "filtered",
             "projection": projection,
         });
-        write_no_target_receipt(&db, "repo-a", &sha, &valid.to_string());
+        write_git_no_target_receipt(&db, "repo-a", &sha, &valid.to_string());
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "repo-a"), &sha, "no marker")
                 .unwrap()
@@ -341,7 +402,7 @@ mod tests {
             "outcome": "filtered",
             "projection": projection,
         });
-        write_no_target_receipt(&db, "repo-b", &sha, &other_repo.to_string());
+        write_git_no_target_receipt(&db, "repo-b", &sha, &other_repo.to_string());
         db.conn()
             .execute(
                 "DELETE FROM kv_state WHERE key = ?1",
@@ -369,7 +430,7 @@ mod tests {
             "outcome": "filtered",
             "projection": projection,
         });
-        write_no_target_receipt(&db, "repo-a", &forged_sha, &wrong_sha.to_string());
+        write_git_no_target_receipt(&db, "repo-a", &forged_sha, &wrong_sha.to_string());
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "repo-a"), &forged_sha, "no marker")
                 .unwrap()
@@ -385,7 +446,7 @@ mod tests {
             "outcome": "no_svn_delta",
             "projection": projection,
         });
-        write_no_target_receipt(&db, "repo-a", &weak_v3_sha, &weak_v3.to_string());
+        write_git_no_target_receipt(&db, "repo-a", &weak_v3_sha, &weak_v3.to_string());
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "repo-a"), &weak_v3_sha, "no marker")
                 .unwrap()
@@ -398,7 +459,7 @@ mod tests {
     fn malformed_no_target_receipt_does_not_suppress() {
         let db = setup_db();
         let sha = "1".repeat(40);
-        write_no_target_receipt(&db, "repo-a", &sha, "{not-json");
+        write_git_no_target_receipt(&db, "repo-a", &sha, "{not-json");
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "repo-a"), &sha, "no marker")
                 .unwrap()
@@ -528,6 +589,126 @@ mod tests {
     }
 
     #[test]
+    fn verified_svn_no_target_receipt_requires_admission_scope() {
+        let db = setup_db();
+        let svn_rev = 9_i64;
+        let projection = "{}";
+        let valid = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        write_svn_no_target_receipt(&db, "repo-a", svn_rev, &valid.to_string());
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::SkipEcho
+        );
+
+        let other_repo = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-b",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        write_svn_no_target_receipt(&db, "repo-b", svn_rev, &other_repo.to_string());
+        db.conn()
+            .execute(
+                "DELETE FROM kv_state WHERE key = ?1",
+                [format!("handled_svn_no_target_repo-a_{svn_rev}")],
+            )
+            .unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-b"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::SkipEcho
+        );
+
+        let forged_rev = 10_i64;
+        let wrong_rev = serde_json::json!({
+            "version": 1,
+            "repo_id": "repo-a",
+            "svn_revision": 11,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        write_svn_no_target_receipt(&db, "repo-a", forged_rev, &wrong_rev.to_string());
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), forged_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+
+        let weak_rev = 12_i64;
+        let weak = serde_json::json!({
+            "version": 3,
+            "repo_id": "repo-a",
+            "svn_revision": weak_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        write_svn_no_target_receipt(&db, "repo-a", weak_rev, &weak.to_string());
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), weak_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
+    fn malformed_svn_no_target_receipt_does_not_suppress() {
+        let db = setup_db();
+        let svn_rev = 13_i64;
+        write_svn_no_target_receipt(&db, "repo-a", svn_rev, "{not-json");
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "repo-a"), svn_rev, "no marker").unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
+    fn running_svn_commit_journal_defers_matching_rev_without_marker() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let fingerprint = svn_commit_target_fingerprint("pair", "uuid", "/repo", "/repo", "{}");
+        db.begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: "pair",
+            initiator_id: "worker",
+            request_id: "req-1",
+            target_fingerprint: &fingerprint,
+            source_git_sha: git_sha,
+            source_git_parent: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "/repo",
+            target_svn_root_url: "/repo",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 4,
+            pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            author: "dev",
+            source_message: "feature",
+        })
+        .unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "pair"), 5, "edited away marker").unwrap(),
+            EchoDisposition::DeferPendingJournal
+        );
+    }
+
+    #[test]
     fn running_svn_commit_journal_defers_marker_without_receipt() {
         let db = setup_db();
         db.conn()
@@ -608,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn running_svn_commit_journal_without_marker_applies_as_genuine() {
+    fn running_svn_commit_journal_without_marker_defers_only_matching_rev() {
         let db = setup_db();
         db.conn()
             .execute(
@@ -641,7 +822,11 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            classify_incoming_svn_revision(&ctx(&db, "pair"), 5, "no marker").unwrap(),
+            classify_incoming_svn_revision(&ctx(&db, "pair"), 5, "edited away marker").unwrap(),
+            EchoDisposition::DeferPendingJournal
+        );
+        assert_eq!(
+            classify_incoming_svn_revision(&ctx(&db, "pair"), 6, "no marker").unwrap(),
             EchoDisposition::ApplyGenuine
         );
     }
