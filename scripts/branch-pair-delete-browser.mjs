@@ -392,7 +392,12 @@ async function runScenarios(uiOrigin, session, mode) {
     await until(async () => ((await body()).includes(text)), text);
     if ((await pathOf()) !== `/repos/${id}`) throw new Error(`Left ${id} for ${await pathOf()}`);
     if ((await deleteCalls()).length < 1) throw new Error(`No DELETE recorded for ${id}`);
-    const explicit = (await deleteCalls()).some((entry) => entry.path.includes('delete_git=true') && entry.path.includes('delete_svn=true'));
+    const explicit = (await deleteCalls()).some(
+      (entry) =>
+        entry.path.includes('explicit_remote_deletion_opts=true')
+        && entry.path.includes('delete_git=')
+        && entry.path.includes('delete_svn='),
+    );
     if (!explicit) throw new Error(`DELETE did not submit explicit remote options: ${JSON.stringify(await deleteCalls())}`);
     if ((await body()).includes('Branch pair removed.')) throw new Error(`Failure was presented as removal: ${await body()}`);
   }
