@@ -41,7 +41,8 @@ use crate::db::team_cycle_mapping_operations::{
 use crate::db::Database;
 use crate::echo_suppression::{
     classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
-    EchoDisposition, TeamEchoContext, SYNC_MARKER,
+    verify_no_target_receipt, EchoDisposition, NoTargetReceiptVerdict, TeamEchoContext,
+    SYNC_MARKER,
 };
 use crate::errors::SyncError;
 use crate::git::client::GitClient;
@@ -798,64 +799,42 @@ impl SyncEngine {
                 None,
             ));
         };
-        if record["repo_id"] != rid || record["git_sha"] != sha || !is_full_git_oid(sha) {
-            return Err(self.record_history_block(
+        let projection = self.no_target_projection();
+        match verify_no_target_receipt(&record, rid, sha, &projection) {
+            NoTargetReceiptVerdict::Accepted => Ok(true),
+            NoTargetReceiptVerdict::RepoOrShaMismatch => Err(self.record_history_block(
                 "unverified_no_target_receipt",
                 "no-target receipt does not identify this repository and Git commit",
                 Some(sha),
                 None,
                 None,
                 None,
-            ));
-        }
-        if record["projection"] != self.no_target_projection() {
-            let reason = if record["outcome"] == "empty_commit" {
-                // Preserve the accepted legacy empty-commit rejection shape.
-                "ambiguous_checkpoint"
-            } else {
-                "receipt_policy_changed"
-            };
-            return Err(self.record_history_block(
-                reason,
-                "no-target decision belongs to a different path policy; reconcile before writes",
-                Some(sha),
-                None,
-                None,
-                None,
-            ));
-        }
-        let accepted = match (record["version"].as_u64(), record["outcome"].as_str()) {
-            (Some(1), Some("empty_commit" | "filtered")) => true,
-            (Some(3), Some("no_svn_delta")) => {
-                let target = &record["target"];
-                target["svn_revision"].as_i64().is_some_and(|rev| rev > 0)
-                    && target["svn_uuid"].as_str().is_some_and(|v| !v.is_empty())
-                    && target["svn_url"].as_str().is_some_and(|v| !v.is_empty())
-                    && target["semantic_projection"] == "regular_file_bytes_no_properties_v1"
-                    && target["paths"].as_object().is_some_and(|paths| {
-                        !paths.is_empty()
-                            && paths.values().all(|entry| {
-                                entry.is_null()
-                                    || (entry["sha256"].as_str().is_some_and(is_full_git_oid)
-                                        && entry["git_mode"] == 33188
-                                        && entry["svn_executable"] == false)
-                            })
-                    })
+            )),
+            NoTargetReceiptVerdict::ProjectionMismatch => {
+                let reason = if record["outcome"] == "empty_commit" {
+                    // Preserve the accepted legacy empty-commit rejection shape.
+                    "ambiguous_checkpoint"
+                } else {
+                    "receipt_policy_changed"
+                };
+                Err(self.record_history_block(
+                    reason,
+                    "no-target decision belongs to a different path policy; reconcile before writes",
+                    Some(sha),
+                    None,
+                    None,
+                    None,
+                ))
             }
-            // Old v1 and v2 receipts did not attest semantic target state.
-            _ => false,
-        };
-        if !accepted {
-            return Err(self.record_history_block(
+            NoTargetReceiptVerdict::UnverifiedOutcome => Err(self.record_history_block(
                 "unverified_no_target_receipt",
                 "no-target receipt lacks verified outcome evidence",
                 Some(sha),
                 None,
                 None,
                 None,
-            ));
+            )),
         }
-        Ok(true)
     }
 
     /// A clean working-copy status is not proof that a nonempty Git delta is
@@ -3560,8 +3539,18 @@ impl SyncEngine {
                 repo_id,
                 no_target_projection: "",
             };
-            return Ok(classify_incoming_svn_revision(&ctx, svn_rev, message)?
-                == EchoDisposition::SkipEcho);
+            return match classify_incoming_svn_revision(&ctx, svn_rev, message)? {
+                EchoDisposition::SkipEcho => Ok(true),
+                EchoDisposition::DeferPendingJournal => Err(SyncError::SvnCommitHeld {
+                    reason: "pending_journal_finalize".into(),
+                    detail: format!(
+                        "SVN revision {svn_rev} carries a [reposync] marker without a receipt while a Running git-to-SVN journal is still open for repository {repo_id}; finalize or reconcile the journal before applying"
+                    ),
+                }),
+                EchoDisposition::ApplyGenuineWithMarkerHint | EchoDisposition::ApplyGenuine => {
+                    Ok(false)
+                }
+            };
         }
         Ok(personal_mode_marker_echo(message))
     }
@@ -3578,8 +3567,19 @@ impl SyncEngine {
                 repo_id,
                 no_target_projection: &projection,
             };
-            return classify_incoming_git_commit(&ctx, git_sha, message)?
-                .map(|disposition| disposition == EchoDisposition::SkipEcho);
+            return match classify_incoming_git_commit(&ctx, git_sha, message)? {
+                Ok(EchoDisposition::SkipEcho) => Ok(true),
+                Ok(EchoDisposition::DeferPendingJournal) => Err(SyncError::GitPushHeld {
+                    reason: "pending_journal_finalize".into(),
+                    detail: format!(
+                        "Git commit {git_sha} carries a [reposync] marker without a receipt while a Running svn-to-Git journal is still open for repository {repo_id}; finalize or reconcile the journal before applying"
+                    ),
+                }),
+                Ok(EchoDisposition::ApplyGenuineWithMarkerHint | EchoDisposition::ApplyGenuine) => {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            };
         }
         Ok(personal_mode_marker_echo(message))
     }
