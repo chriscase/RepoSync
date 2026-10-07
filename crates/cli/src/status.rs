@@ -1,5 +1,7 @@
 //! Unscoped status display helpers for `reposync status`.
 
+use std::io::Write;
+
 use anyhow::{Context, Result};
 
 use reposync_core::db::Database;
@@ -11,6 +13,60 @@ pub fn last_git_hash_display(db: &Database) -> Result<String> {
     let hash = reposync_core::sync_status::resolve_unscoped_last_git_hash(db)
         .context("failed to read last Git hash")?;
     Ok(hash.as_deref().unwrap_or("none").to_string())
+}
+
+/// Write the full `reposync status` report to `writer`.
+pub fn write_status_report(db: &Database, writer: &mut impl Write) -> Result<()> {
+    let state = reposync_core::sync_status::resolve_unscoped_sync_state(db)
+        .context("failed to read sync state")?;
+
+    let last_sync = db
+        .get_state("last_sync_at")
+        .context("failed to read last sync time")?;
+
+    let last_svn_rev = db
+        .get_last_svn_revision()
+        .context("failed to read last SVN revision")?;
+
+    let last_git_hash = last_git_hash_display(db)?;
+
+    let total_syncs = db
+        .count_sync_records()
+        .context("failed to count sync records")?;
+
+    let active_conflicts = db
+        .count_active_conflicts()
+        .context("failed to count active conflicts")?;
+
+    let total_conflicts = db
+        .count_all_conflicts()
+        .context("failed to count total conflicts")?;
+
+    let total_errors = db.count_errors().context("failed to count errors")?;
+
+    writeln!(writer, "RepoSync Status")?;
+    writeln!(writer, "=================")?;
+    writeln!(writer)?;
+    writeln!(writer, "  Sync state       : {}", state)?;
+    writeln!(
+        writer,
+        "  Last sync at     : {}",
+        last_sync.as_deref().unwrap_or("never")
+    )?;
+    writeln!(
+        writer,
+        "  Last SVN revision: {}",
+        last_svn_rev
+            .map(|r: i64| r.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    )?;
+    writeln!(writer, "  Last Git hash    : {}", last_git_hash)?;
+    writeln!(writer, "  Total sync ops   : {}", total_syncs)?;
+    writeln!(writer, "  Active conflicts : {}", active_conflicts)?;
+    writeln!(writer, "  Total conflicts  : {}", total_conflicts)?;
+    writeln!(writer, "  Total errors     : {}", total_errors)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -98,6 +154,40 @@ mod tests {
             last_git_hash_display(&db).unwrap(),
             "none",
             "multi-repo installs must not print a misleading global git tip"
+        );
+    }
+
+    #[test]
+    fn write_status_report_wires_scoped_last_git_hash_line() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("last_git_hash", "dddddddddddddddddddddddddddddddddddddddd")
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (git_sha, svn_rev, direction, synced_at) VALUES (?1, 9, 'svn_to_git', '2020-01-01T00:00:00Z')",
+                ["eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
+            )
+            .unwrap();
+        insert_repo(&db, "only", "cccccccccccccccccccccccccccccccccccccccc");
+
+        let mut output = Vec::new();
+        write_status_report(&db, &mut output).unwrap();
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(
+            rendered.contains("  Last Git hash    : cccccccccccccccccccccccccccccccccccccccc"),
+            "cmd_status wiring must print scoped tip, not global kv or commit-map max:\n{}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("dddddddddddddddddddddddddddddddddddddddd"),
+            "cmd_status wiring must not regress to global kv:\n{}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+            "cmd_status wiring must not regress to commit-map max:\n{}",
+            rendered
         );
     }
 

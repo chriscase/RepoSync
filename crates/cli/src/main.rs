@@ -350,53 +350,7 @@ fn cmd_validate(config_path: &PathBuf) -> Result<()> {
 }
 
 fn cmd_status(db: &Database) -> Result<()> {
-    let state = reposync_core::sync_status::resolve_unscoped_sync_state(db)
-        .context("failed to read sync state")?;
-
-    let last_sync = db
-        .get_state("last_sync_at")
-        .context("failed to read last sync time")?;
-
-    let last_svn_rev = db
-        .get_last_svn_revision()
-        .context("failed to read last SVN revision")?;
-
-    let last_git_hash = status::last_git_hash_display(db)?;
-
-    let total_syncs = db
-        .count_sync_records()
-        .context("failed to count sync records")?;
-
-    let active_conflicts = db
-        .count_active_conflicts()
-        .context("failed to count active conflicts")?;
-
-    let total_conflicts = db
-        .count_all_conflicts()
-        .context("failed to count total conflicts")?;
-
-    let total_errors = db.count_errors().context("failed to count errors")?;
-
-    println!("RepoSync Status");
-    println!("=================");
-    println!();
-    println!("  Sync state       : {}", state);
-    println!(
-        "  Last sync at     : {}",
-        last_sync.as_deref().unwrap_or("never")
-    );
-    println!(
-        "  Last SVN revision: {}",
-        last_svn_rev
-            .map(|r: i64| r.to_string())
-            .unwrap_or_else(|| "none".to_string())
-    );
-    println!("  Last Git hash    : {}", last_git_hash);
-    println!("  Total sync ops   : {}", total_syncs);
-    println!("  Active conflicts : {}", active_conflicts);
-    println!("  Total conflicts  : {}", total_conflicts);
-    println!("  Total errors     : {}", total_errors);
-
+    status::write_status_report(db, &mut std::io::stdout())?;
     Ok(())
 }
 
