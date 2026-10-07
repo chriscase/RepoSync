@@ -2814,6 +2814,336 @@ async fn test_replay_path_abort_restore_removes_newdir_after_lfs_failure() {
     );
 }
 
+/// Abort restore must not delete pre-existing unversioned siblings under a shared parent.
+#[tokio::test]
+async fn test_replay_path_abort_restore_preserves_preexisting_unversioned_sibling() {
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+
+    std::fs::create_dir_all(svn_wc.join("scratch")).unwrap();
+    std::fs::write(svn_wc.join("scratch/other.txt"), "keep me\n").unwrap();
+
+    let git_work = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare_dir);
+
+    std::fs::create_dir_all(git_work.join("scratch")).unwrap();
+    std::fs::write(git_work.join("scratch/note.txt"), "new note\n").unwrap();
+    let pointer_text = "version https://git-lfs.github.com/spec/v1\n\
+                        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                        size 99999\n";
+    std::fs::write(git_work.join("zzz-large.bin"), pointer_text).unwrap();
+    let oid = git_client
+        .commit(
+            "scratch note then unresolved LFS pointer",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .expect("git commit failed");
+    let commit_sha = oid.to_string();
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let config = personal_config_for_abort_restore_tests(&tmp, &svn_url);
+    let sync = git_to_svn_sync_for_abort_restore_tests(&config, &db_arc, &svn_wc, &git_work);
+
+    let gh_commit = GitHubCommit {
+        sha: commit_sha.clone(),
+        commit: GitHubCommitDetail {
+            message: "scratch note then unresolved LFS pointer".into(),
+            author: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+            committer: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+        },
+        author: None,
+    };
+
+    let result = sync.apply_git_changes_to_svn(&gh_commit).await;
+    assert!(result.is_err(), "apply must fail on unresolved LFS pointer");
+    assert!(
+        svn_wc.join("scratch/other.txt").is_file(),
+        "pre-existing unversioned sibling must survive abort restore"
+    );
+    assert!(
+        !svn_wc.join("scratch/note.txt").exists(),
+        "apply-created file must be removed on abort"
+    );
+}
+
+/// Abort restore must not remove versioned empty parent directories.
+#[tokio::test]
+async fn test_replay_path_abort_restore_preserves_versioned_empty_parent() {
+    use reposync_core::git::github::{GitHubCommit, GitHubCommitDetail, GitHubGitActor};
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+    std::fs::create_dir_all(svn_wc.join("keep/emptydir")).unwrap();
+    let status = Command::new("svn")
+        .args([
+            "add",
+            "--depth=empty",
+            svn_wc.join("keep").to_str().unwrap(),
+            svn_wc.join("keep/emptydir").to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "svn add empty keep/emptydir failed");
+    let status = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            "versioned empty keep/emptydir",
+            svn_wc.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "svn commit keep/emptydir failed");
+
+    let git_work = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare_dir);
+
+    std::fs::create_dir_all(git_work.join("keep/emptydir")).unwrap();
+    std::fs::write(git_work.join("keep/emptydir/file.txt"), "new file\n").unwrap();
+    let pointer_text = "version https://git-lfs.github.com/spec/v1\n\
+                        oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+                        size 99999\n";
+    std::fs::write(git_work.join("zzz-large.bin"), pointer_text).unwrap();
+    let oid = git_client
+        .commit(
+            "file under versioned emptydir then LFS failure",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .expect("git commit failed");
+    let commit_sha = oid.to_string();
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let config = personal_config_for_abort_restore_tests(&tmp, &svn_url);
+    let sync = git_to_svn_sync_for_abort_restore_tests(&config, &db_arc, &svn_wc, &git_work);
+
+    let gh_commit = GitHubCommit {
+        sha: commit_sha.clone(),
+        commit: GitHubCommitDetail {
+            message: "file under versioned emptydir then LFS failure".into(),
+            author: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+            committer: GitHubGitActor {
+                name: "Test User".into(),
+                email: "test@example.com".into(),
+                date: None,
+            },
+        },
+        author: None,
+    };
+
+    let result = sync.apply_git_changes_to_svn(&gh_commit).await;
+    assert!(result.is_err(), "apply must fail on unresolved LFS pointer");
+    assert!(svn_wc.join("keep").is_dir());
+    assert!(svn_wc.join("keep/emptydir").is_dir());
+    let status_out = Command::new("svn")
+        .args(["status", svn_wc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        status_out.status.success(),
+        "svn status failed: {}",
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&status_out.stdout)
+            .trim()
+            .is_empty(),
+        "svn status must be clean after abort restore, got: {}",
+        String::from_utf8_lossy(&status_out.stdout)
+    );
+}
+
+/// Touched paths with `..` must fail closed and must not delete outside the WC.
+#[tokio::test]
+async fn test_abort_restore_escape_path_does_not_delete_outside_wc() {
+    use reposync_personal::git_to_svn::ApplyAbortOwnership;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+
+    let outside_dir = tmp.path().join("outside-empty");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside_file = outside_dir.join("outside_only.txt");
+    std::fs::write(&outside_file, "outside\n").unwrap();
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let config = personal_config_for_abort_restore_tests(&tmp, &svn_url);
+    let git_work = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    setup_git_with_bare_origin(&git_work, &bare_dir);
+    let sync = git_to_svn_sync_for_abort_restore_tests(&config, &db_arc, &svn_wc, &git_work);
+
+    std::fs::write(svn_wc.join("probe_in_wc.txt"), "probe\n").unwrap();
+    let ownership = ApplyAbortOwnership {
+        touched_paths: vec!["../outside-empty/outside_only.txt".to_string()],
+        new_files: vec!["probe_in_wc.txt".to_string()],
+        created_dirs: vec![],
+    };
+
+    let result = sync
+        .restore_working_copy_after_apply_abort(&ownership)
+        .await;
+    assert!(
+        result.is_err(),
+        "restore must fail closed on escape paths, got {:?}",
+        result
+    );
+    assert!(
+        outside_file.is_file(),
+        "abort restore must not delete files outside the working copy"
+    );
+    assert!(
+        svn_wc.join("probe_in_wc.txt").is_file(),
+        "filesystem cleanup must not run when validation fails"
+    );
+}
+
+/// Non-E155010 `svn revert` errors must abort restore before filesystem cleanup.
+#[tokio::test]
+async fn test_abort_restore_non_e155010_revert_error_skips_cleanup() {
+    use reposync_personal::git_to_svn::ApplyAbortOwnership;
+
+    if !svn_available() {
+        panic!("svn and svnadmin are required; do not count a skipped diagnostic as evidence");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed", "initial seed");
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    let config = personal_config_for_abort_restore_tests(&tmp, &svn_url);
+    let git_work = tmp.path().join("git_work");
+    let bare_dir = tmp.path().join("origin.git");
+    setup_git_with_bare_origin(&git_work, &bare_dir);
+    let sync = git_to_svn_sync_for_abort_restore_tests(&config, &db_arc, &svn_wc, &git_work);
+
+    std::fs::write(svn_wc.join("probe_new.txt"), "probe\n").unwrap();
+    let ownership = ApplyAbortOwnership {
+        touched_paths: vec!["seed.txt".to_string()],
+        new_files: vec!["probe_new.txt".to_string()],
+        created_dirs: vec![],
+    };
+
+    let result = sync
+        .restore_apply_abort_reverting_paths_for_test(&ownership, &["/etc/hostname"])
+        .await;
+    assert!(
+        result.is_err(),
+        "restore must fail on E155007 revert, got {:?}",
+        result
+    );
+    assert!(
+        svn_wc.join("probe_new.txt").is_file(),
+        "filesystem cleanup must not run after non-E155010 revert failure"
+    );
+}
+
+fn personal_config_for_abort_restore_tests(tmp: &TempDir, svn_url: &str) -> PersonalConfig {
+    PersonalConfig {
+        personal: PersonalSection {
+            poll_interval_secs: 30,
+            data_dir: tmp.path().to_path_buf(),
+            log_level: "info".into(),
+            status_port: None,
+        },
+        svn: PersonalSvnConfig {
+            url: svn_url.to_string(),
+            username: "test".into(),
+            password_env: String::new(),
+            password: Some("test".into()),
+        },
+        github: PersonalGitHubConfig {
+            api_url: "https://localhost:0/unused".into(),
+            git_base_url: None,
+            repo: "test/unused".into(),
+            token_env: String::new(),
+            default_branch: "main".into(),
+            auto_create: false,
+            private: false,
+            token: Some("unused".into()),
+        },
+        developer: DeveloperConfig {
+            name: "Test User".into(),
+            email: "test@example.com".into(),
+            svn_username: "test".into(),
+        },
+        commit_format: CommitFormatConfig::default(),
+        options: PersonalOptionsConfig::default(),
+        identity: None,
+    }
+}
+
+fn git_to_svn_sync_for_abort_restore_tests(
+    config: &PersonalConfig,
+    db_arc: &Arc<Database>,
+    svn_wc: &Path,
+    git_work: &Path,
+) -> GitToSvnSync {
+    let svn_client = SvnClient::new(&config.svn.url, "test", "test");
+    let github_client = reposync_core::git::github::GitHubClient::new(
+        "https://localhost:0/unused",
+        "unused",
+        reposync_core::config::GitProvider::default(),
+    );
+    GitToSvnSync::new(
+        svn_client,
+        github_client,
+        Arc::clone(db_arc),
+        config,
+        svn_wc.to_path_buf(),
+        git_work.to_path_buf(),
+    )
+}
+
 #[test]
 fn test_resolve_lfs_pointer_reads_local_object_with_skip_smudge() {
     let tmp = tempfile::tempdir().unwrap();

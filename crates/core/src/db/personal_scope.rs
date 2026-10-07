@@ -323,9 +323,10 @@ impl Database {
                 git_author,
                 svn_watermark_key,
                 true,
-            )
-        })?;
-        self.set_legacy_import_git_sha_watermark(git_sha)
+            )?;
+            Database::set_legacy_import_git_sha_watermark_tx(tx, git_sha)?;
+            Ok(())
+        })
     }
 
     /// Record one personal full-import revision mapping (scoped `commit_map` + receipt).
@@ -615,6 +616,18 @@ mod tests {
         })
         .unwrap();
         assert!(db.is_personal_svn_rev_synced(3).unwrap());
+    }
+
+    #[test]
+    fn checkpoint_personal_snapshot_import_sets_legacy_git_sha_watermark() {
+        let db = setup_db();
+        let git_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        db.checkpoint_personal_snapshot_import(7, git_sha, "dev", "Dev", "svn_rev")
+            .unwrap();
+        assert_eq!(
+            db.get_watermark("git_sha").unwrap().as_deref(),
+            Some(git_sha)
+        );
     }
 
     #[test]
