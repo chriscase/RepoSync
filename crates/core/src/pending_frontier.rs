@@ -3,17 +3,40 @@
 //! The pending set from handled checkpoint `P` to tip `R` is commits reachable
 //! from `R` and not from `P` (`P..R`). A revwalk that stops when `P` is first
 //! visited can omit older pending commits on other merge parents. Qualified
-//! merge DAGs replay in deterministic oldest-first topological order when the
-//! full frontier fits in one batch. Linear backlogs over the reviewed cap
-//! continue in explicit batches of at most [`DEFAULT_PENDING_COMMIT_CAP`]
-//! commits per cycle; merge-DAG backlogs that exceed the cap fail closed
-//! because a single Git SHA cannot checkpoint a cut through the DAG.
+//! merge DAGs replay in deterministic oldest-first topological order across
+//! explicit batches of at most [`DEFAULT_PENDING_COMMIT_CAP`] commits per
+//! cycle. Linear backlogs use the same batching model. Merge-DAG continuation
+//! persists the admitted remote tip and the handled commit set so a DAG cut
+//! cannot be represented by a single checkpoint SHA alone.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use git2::{Oid, Repository, Sort};
+use serde::{Deserialize, Serialize};
 
 use crate::errors::GitError;
+
+/// KV prefix for durable Git replay continuation state.
+pub const GIT_REPLAY_CONTINUATION_KEY_PREFIX: &str = "git_replay_continuation_";
+
+/// Durable batch continuation across restart for linear and merge-DAG replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitReplayContinuation {
+    /// Durably handled checkpoint when the continuation sequence began.
+    pub p_origin: String,
+    /// Admitted remote tip pinned for the continuation sequence.
+    pub r_admitted: String,
+    /// Commits replayed in prior batches (required for merge-DAG cuts).
+    pub handled_shas: Vec<String>,
+    /// Whether the admitted frontier required merge-DAG batching.
+    pub merge_dag: bool,
+}
+
+impl GitReplayContinuation {
+    pub fn state_key(repo_id: &str) -> String {
+        format!("{GIT_REPLAY_CONTINUATION_KEY_PREFIX}{repo_id}")
+    }
+}
 
 /// Reviewed pending-commit batch size for replay continuation.
 pub const DEFAULT_PENDING_COMMIT_CAP: usize = 1000;
@@ -209,8 +232,20 @@ pub fn verify_linear_pending_range(
     Ok(frontier.len())
 }
 
+/// Returns `true` when the P→R pending frontier contains a merge commit.
+pub fn pending_frontier_is_merge_dag(
+    repo: &Repository,
+    since_sha: &str,
+    tip_sha: &str,
+) -> Result<bool, GitError> {
+    let since = parse_commit(repo, since_sha)?;
+    let tip = parse_commit(repo, tip_sha)?;
+    let frontier = collect_frontier_oids(repo, since, tip)?;
+    frontier_is_merge_dag(repo, &frontier)
+}
+
 /// Returns `true` when the pending frontier contains a merge commit.
-fn frontier_is_merge_dag(repo: &Repository, frontier: &[Oid]) -> Result<bool, GitError> {
+pub fn frontier_is_merge_dag(repo: &Repository, frontier: &[Oid]) -> Result<bool, GitError> {
     for oid in frontier {
         let commit = repo.find_commit(*oid).map_err(GitError::from)?;
         if commit.parent_count() >= 2 {
@@ -223,10 +258,8 @@ fn frontier_is_merge_dag(repo: &Repository, frontier: &[Oid]) -> Result<bool, Gi
 /// Select the oldest-first pending batch from P→R, at most `cap` commits.
 ///
 /// `since_sha` is hidden (the commit and its ancestors), not used as a
-/// visited-order stop. Qualified merge DAGs replay in deterministic
-/// topological order when the full frontier fits in one batch. Linear
-/// overflow returns the oldest-first prefix with `has_more = true`. Merge-DAG
-/// overflow fails closed because a single Git SHA cannot checkpoint a DAG cut.
+/// visited-order stop. Overflow returns the oldest-first prefix with
+/// `has_more = true` for both linear and qualified merge-DAG frontiers.
 pub fn select_pending_batch(
     repo: &Repository,
     since_sha: &str,
@@ -245,26 +278,60 @@ pub fn select_pending_batch(
     }
 
     let frontier = collect_frontier_oids(repo, since, tip)?;
-    let ordered = topo_sort_oldest_first(repo, &frontier)?;
+    batch_from_frontier(repo, &frontier, cap)
+}
+
+/// Select the next oldest-first batch after prior handled commits.
+///
+/// Used for merge-DAG continuation where a single checkpoint SHA cannot
+/// represent a cut through the DAG. `handled` must list every commit
+/// replayed in earlier batches of the same admitted `P→R` sequence.
+pub fn select_continuation_batch(
+    repo: &Repository,
+    since_sha: &str,
+    tip_sha: &str,
+    handled: &HashSet<Oid>,
+    cap: usize,
+) -> Result<PendingBatch, GitError> {
+    let since = parse_commit(repo, since_sha)?;
+    let tip = parse_commit(repo, tip_sha)?;
+    ensure_descendant(repo, since, tip, since_sha, tip_sha)?;
+    let frontier = collect_frontier_oids(repo, since, tip)?;
+    let total = frontier.len();
+    let remaining: Vec<Oid> = frontier
+        .into_iter()
+        .filter(|oid| !handled.contains(oid))
+        .collect();
+    let batch = batch_from_frontier(repo, &remaining, cap)?;
+    Ok(PendingBatch {
+        commits: batch.commits,
+        total,
+        has_more: batch.has_more,
+    })
+}
+
+fn batch_from_frontier(
+    repo: &Repository,
+    frontier: &[Oid],
+    cap: usize,
+) -> Result<PendingBatch, GitError> {
+    if frontier.is_empty() {
+        return Ok(PendingBatch {
+            commits: Vec::new(),
+            total: 0,
+            has_more: false,
+        });
+    }
+    let ordered = topo_sort_oldest_first(repo, frontier)?;
     let total = ordered.len();
     let batch_len = total.min(cap);
     let commits = ordered[..batch_len].to_vec();
     let has_more = total > cap;
-    if has_more {
-        if commits.is_empty() {
-            return Err(unsupported(
-                REASON_BACKLOG,
-                format!("{DETAIL_BACKLOG}: empty continuation batch"),
-            ));
-        }
-        if frontier_is_merge_dag(repo, &frontier)? {
-            return Err(unsupported(
-                REASON_MERGE_DAG,
-                format!(
-                    "{DETAIL_MERGE_DAG}: merge-DAG frontier of {total} commits exceeds cap {cap}"
-                ),
-            ));
-        }
+    if has_more && commits.is_empty() {
+        return Err(unsupported(
+            REASON_BACKLOG,
+            format!("{DETAIL_BACKLOG}: empty continuation batch"),
+        ));
     }
     Ok(PendingBatch {
         commits,
@@ -566,22 +633,58 @@ mod tests {
     }
 
     #[test]
-    fn merge_dag_continuation_batch_fails_closed_when_exceeds_cap() {
+    fn merge_dag_continuation_batches_without_reordering_or_skips() {
         let dag = older_side_merge_dag();
+        let full = select_pending_batch(
+            &dag.repo,
+            &dag.p.to_string(),
+            &dag.m.to_string(),
+            DEFAULT_PENDING_COMMIT_CAP,
+        )
+        .unwrap();
+        let mut handled = HashSet::new();
+        let mut replayed = Vec::new();
         for cap in [1, 2, 3] {
-            let error =
-                select_pending_batch(&dag.repo, &dag.p.to_string(), &dag.m.to_string(), cap)
-                    .unwrap_err();
-            match error {
-                GitError::UnsupportedHistory { reason, detail } => {
-                    assert_eq!(reason, REASON_MERGE_DAG);
+            handled.clear();
+            replayed.clear();
+            let mut batch_count = 0;
+            while replayed.len() < full.commits.len() {
+                let batch = if handled.is_empty() {
+                    select_pending_batch(&dag.repo, &dag.p.to_string(), &dag.m.to_string(), cap)
+                        .unwrap()
+                } else {
+                    select_continuation_batch(
+                        &dag.repo,
+                        &dag.p.to_string(),
+                        &dag.m.to_string(),
+                        &handled,
+                        cap,
+                    )
+                    .unwrap()
+                };
+                batch_count += 1;
+                assert!(
+                    !batch.commits.is_empty(),
+                    "cap={cap} must not emit an empty batch while work remains"
+                );
+                assert_eq!(batch.total, full.total, "cap={cap}");
+                for oid in &batch.commits {
                     assert!(
-                        detail.contains("exceeds cap"),
-                        "cap={cap} unexpected detail: {detail}"
+                        !handled.contains(oid),
+                        "cap={cap} must not replay handled commit {oid}"
                     );
                 }
-                other => panic!("cap={cap} expected merge-DAG reject, got {other:?}"),
+                replayed.extend(batch.commits.iter().copied());
+                handled.extend(batch.commits.iter().copied());
+                if !batch.has_more {
+                    break;
+                }
             }
+            assert_eq!(replayed, full.commits, "cap={cap} must drain full frontier");
+            assert!(
+                batch_count > 1,
+                "cap={cap} must require multiple batches for this DAG"
+            );
         }
     }
 

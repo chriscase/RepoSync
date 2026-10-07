@@ -3,6 +3,7 @@
 //! Marker text (`[reposync]`) is diagnostic only; skip decisions require an
 //! exact repository-scoped operation receipt.
 
+use rusqlite::params;
 use tracing::{debug, warn};
 
 use crate::db::git_push_operations::GitPushOperationState;
@@ -258,6 +259,14 @@ pub fn classify_incoming_git_commit(
         );
         return Ok(Ok(EchoDisposition::SkipEcho));
     }
+    if has_repo_applied_git_to_svn_commit(ctx, git_sha)? {
+        debug!(
+            repo_id = ctx.repo_id,
+            sha = %git_sha,
+            "skipping already-applied Git commit (repo-scoped git_to_svn receipt)"
+        );
+        return Ok(Ok(EchoDisposition::SkipEcho));
+    }
     if verified_git_no_target_receipt(ctx, git_sha)? {
         debug!(
             repo_id = ctx.repo_id,
@@ -302,6 +311,22 @@ fn verified_svn_no_target_receipt(
         verify_svn_no_target_receipt(&record, ctx.repo_id, svn_rev, ctx.no_target_projection)
             == NoTargetReceiptVerdict::Accepted,
     )
+}
+
+fn has_repo_applied_git_to_svn_commit(
+    ctx: &TeamEchoContext<'_>,
+    git_sha: &str,
+) -> Result<bool, DatabaseError> {
+    let conn = ctx.db.conn();
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sync_records
+            WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn' AND status = 'applied'
+        )",
+        params![ctx.repo_id, git_sha],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
 }
 
 fn verified_git_no_target_receipt(
@@ -548,6 +573,18 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert_eq!(disposition, EchoDisposition::SkipEcho);
+    }
+
+    #[test]
+    fn applied_git_to_svn_receipt_suppresses_without_no_target_receipt() {
+        let db = setup_db();
+        let git_sha = "9".repeat(40);
+        insert_git_to_svn_record(&db, "repo-a", 11, &git_sha);
+        let disposition =
+            classify_incoming_git_commit(&ctx(&db, "repo-a"), &git_sha, "already published to SVN")
+                .unwrap()
+                .unwrap();
         assert_eq!(disposition, EchoDisposition::SkipEcho);
     }
 

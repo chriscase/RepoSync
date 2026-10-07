@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -250,7 +250,7 @@ fn refresh_export_present_engine_lfs(dst_root: &Path, export_root: &Path) -> Res
         engine_body.as_deref(),
         true,
     );
-    write_root_gitattributes_regular_file(&dst_gitattr, &merged)?;
+    write_root_gitattributes_regular_file(dst_root, &dst_gitattr, &merged)?;
     Ok(())
 }
 
@@ -386,11 +386,12 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
                     bail!("cycle detected at '{rel}': refusing to re-enter directory");
                 }
             }
-            if !dst_path.exists() {
-                std::fs::create_dir_all(&dst_path).with_context(|| {
-                    format!("failed to create directory: {}", dst_path.display())
-                })?;
-            }
+            ensure_confined_dir_all(ctx.dst_root, &dst_path).with_context(|| {
+                format!(
+                    "failed to create confined directory: {}",
+                    dst_path.display()
+                )
+            })?;
             copy_tree_policy_inner(&src_path, &dst_path, ctx)?;
             continue;
         }
@@ -404,24 +405,15 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
             reject_hardlink_alias(ctx.db, ctx.stats, &rel)?;
         }
 
-        if file_name == ".gitattributes" && dst == ctx.dst_root {
-            crate::lfs::unlink_gitattributes_symlink(&dst_path).with_context(|| {
-                format!(
-                    "failed to unlink planted .gitattributes symlink before copy: {}",
-                    dst_path.display()
-                )
-            })?;
-        }
-
         // Size comes from no-follow metadata; never call evaluate_path (it follows).
         let decision = ctx.policy.evaluate(&rel, meta.len());
         match &decision {
             FilePolicyDecision::Allow => {
-                copy_regular_file_no_follow(&src_path, &dst_path, &meta)?;
+                copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
                 ctx.stats.copied += 1;
             }
             FilePolicyDecision::LfsTrack { size, threshold } => {
-                copy_regular_file_no_follow(&src_path, &dst_path, &meta)?;
+                copy_regular_file_no_follow(&src_path, ctx.dst_root, &dst_path, &meta)?;
                 let pattern = crate::lfs::pattern_for_path(&rel);
                 if let Err(e) = crate::lfs::ensure_lfs_tracked(ctx.dst_root, &pattern) {
                     warn!(
@@ -465,21 +457,36 @@ fn copy_tree_policy_inner(src: &Path, dst: &Path, ctx: &mut CopyTreePolicyCtx<'_
     Ok(())
 }
 
-fn copy_regular_file_no_follow(src: &Path, dst: &Path, src_meta: &std::fs::Metadata) -> Result<()> {
+fn copy_regular_file_no_follow(
+    src: &Path,
+    dst_root: &Path,
+    dst: &Path,
+    src_meta: &std::fs::Metadata,
+) -> Result<()> {
     let mut reader = open_no_follow_read(src)?;
-    let mut writer = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(dst)
-        .with_context(|| format!("failed to create {}", dst.display()))?;
-    std::io::copy(&mut reader, &mut writer)
+    publish_file_confined(dst_root, dst, file_mode(src_meta), &mut reader)
         .with_context(|| format!("failed to copy {} -> {}", src.display(), dst.display()))?;
-    writer
-        .flush()
-        .with_context(|| format!("failed to flush {}", dst.display()))?;
-    apply_source_permissions(dst, src_meta)?;
     Ok(())
+}
+
+/// Remove a planted destination symlink before publish. Applies to every copied
+/// path, not only root `.gitattributes`.
+#[cfg(not(unix))]
+fn unlink_dest_symlink_before_copy(dst: &Path) -> Result<()> {
+    crate::lfs::unlink_gitattributes_symlink(dst).with_context(|| {
+        format!(
+            "failed to unlink planted destination symlink before copy: {}",
+            dst.display()
+        )
+    })
+}
+
+/// Open a destination for write without following symlinks. Uses confined
+/// `openat` traversal from `dst_root` and create-exclusive for new paths so a
+/// symlink raced in after unlink is refused instead of written through.
+#[cfg(test)]
+fn open_no_follow_write(dst_root: &Path, dst: &Path) -> Result<std::fs::File> {
+    publish_file_confined_open(dst_root, dst)
 }
 
 fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
@@ -494,20 +501,632 @@ fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("failed to open {} without following", path.display()))
 }
 
-fn apply_source_permissions(dst: &Path, src_meta: &std::fs::Metadata) -> Result<()> {
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dst,
-            std::fs::Permissions::from_mode(src_meta.permissions().mode()),
-        )
-        .with_context(|| format!("failed to set permissions on {}", dst.display()))?;
+        meta.permissions().mode()
     }
     #[cfg(not(unix))]
     {
-        let _ = (dst, src_meta);
+        let _ = meta;
+        0o644
     }
+}
+
+#[cfg(unix)]
+fn confined_rel_components(root: &Path, path: &Path) -> Result<Vec<std::ffi::OsString>> {
+    use std::path::Component;
+    let rel = path.strip_prefix(root).with_context(|| {
+        format!(
+            "path {} is not under destination root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let mut components = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!(
+                    "refusing path component .. outside destination root {}",
+                    root.display()
+                );
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    Ok(components)
+}
+
+#[cfg(unix)]
+fn os_name_bytes(name: &OsStr) -> Vec<u8> {
+    use std::os::unix::prelude::OsStrExt;
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+#[cfg(unix)]
+fn io_error_from_errno() -> std::io::Error {
+    std::io::Error::last_os_error()
+}
+
+#[cfg(unix)]
+fn stat_is_symlink(st: &libc::stat) -> bool {
+    (st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFLNK
+}
+
+#[cfg(unix)]
+fn stat_is_dir(st: &libc::stat) -> bool {
+    (st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFDIR
+}
+
+#[cfg(unix)]
+fn stat_is_reg(st: &libc::stat) -> bool {
+    (st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+}
+
+#[cfg(unix)]
+fn open_dir_nofollow(path: &Path) -> std::io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    use std::os::unix::prelude::OsStrExt;
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains interior NUL byte",
+        )
+    })?;
+    let fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn openat_dir_nofollow(
+    dir: &std::os::unix::io::OwnedFd,
+    name: &OsStr,
+) -> std::io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    let name_c = os_name_bytes(name);
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name_c.as_ptr() as *const libc::c_char,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn fstatat_nofollow(dir: &std::os::unix::io::OwnedFd, name: &OsStr) -> std::io::Result<libc::stat> {
+    use std::os::unix::io::AsRawFd;
+    let name_c = os_name_bytes(name);
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name_c.as_ptr() as *const libc::c_char,
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(st)
+}
+
+#[cfg(unix)]
+fn unlinkat_name(dir: &std::os::unix::io::OwnedFd, name: &OsStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let name_c = os_name_bytes(name);
+    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), name_c.as_ptr() as *const libc::c_char, 0) };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn mkdirat_dir(dir: &std::os::unix::io::OwnedFd, name: &OsStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let name_c = os_name_bytes(name);
+    let rc = unsafe {
+        libc::mkdirat(
+            dir.as_raw_fd(),
+            name_c.as_ptr() as *const libc::c_char,
+            0o755 as libc::mode_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn renameat_name(
+    from_dir: &std::os::unix::io::OwnedFd,
+    from: &OsStr,
+    to_dir: &std::os::unix::io::OwnedFd,
+    to: &OsStr,
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let from_c = os_name_bytes(from);
+    let to_c = os_name_bytes(to);
+    let rc = unsafe {
+        libc::renameat(
+            from_dir.as_raw_fd(),
+            from_c.as_ptr() as *const libc::c_char,
+            to_dir.as_raw_fd(),
+            to_c.as_ptr() as *const libc::c_char,
+        )
+    };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn openat_write_nofollow(
+    dir: &std::os::unix::io::OwnedFd,
+    name: &OsStr,
+    create_exclusive: bool,
+) -> std::io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    let name_c = os_name_bytes(name);
+    let mut flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if create_exclusive {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    } else {
+        flags |= libc::O_CREAT | libc::O_TRUNC;
+    }
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name_c.as_ptr() as *const libc::c_char,
+            flags,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+static CONFINED_TEMP_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(unix, test))]
+static CONFINED_TEMP_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+fn confined_temp_copy_name() -> std::ffi::OsString {
+    let seq = CONFINED_TEMP_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::ffi::OsString::from(format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq))
+}
+
+#[cfg(unix)]
+struct ConfinedTempFileGuard<'a> {
+    parent: &'a std::os::unix::io::OwnedFd,
+    name: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl Drop for ConfinedTempFileGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(name) = &self.name {
+            let _ = unlinkat_name(self.parent, name.as_os_str());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_dirat(dir: &std::os::unix::io::OwnedFd) -> std::io::Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd_path = Path::new("/dev/fd").join(dir.as_raw_fd().to_string());
+    let entries = std::fs::read_dir(&fd_path)?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn unlinkat_dir(parent: &std::os::unix::io::OwnedFd, name: &OsStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let name_c = os_name_bytes(name);
+    let rc = unsafe {
+        libc::unlinkat(
+            parent.as_raw_fd(),
+            name_c.as_ptr() as *const libc::c_char,
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_dirat_recursive(
+    parent: &std::os::unix::io::OwnedFd,
+    name: &OsStr,
+) -> std::io::Result<()> {
+    let subdir = openat_dir_nofollow(parent, name)?;
+    for child in read_dirat(&subdir)? {
+        let child_st = fstatat_nofollow(&subdir, child.as_os_str())?;
+        if stat_is_symlink(&child_st) || stat_is_reg(&child_st) {
+            unlinkat_name(&subdir, child.as_os_str())?;
+        } else if stat_is_dir(&child_st) {
+            remove_dirat_recursive(&subdir, child.as_os_str())?;
+        } else {
+            unlinkat_name(&subdir, child.as_os_str())?;
+        }
+    }
+    unlinkat_dir(parent, name)
+}
+
+#[cfg(unix)]
+fn apply_mode_fd(fd: &std::os::unix::io::OwnedFd, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_confined_component(
+    dir: &std::os::unix::io::OwnedFd,
+    name: &OsStr,
+) -> Result<std::os::unix::io::OwnedFd> {
+    match openat_dir_nofollow(dir, name) {
+        Ok(fd) => Ok(fd),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            mkdirat_dir(dir, name).with_context(|| {
+                format!(
+                    "failed to create confined directory component {}",
+                    name.to_string_lossy()
+                )
+            })?;
+            openat_dir_nofollow(dir, name).with_context(|| {
+                format!(
+                    "failed to open confined directory component {}",
+                    name.to_string_lossy()
+                )
+            })
+        }
+        Err(e) => match fstatat_nofollow(dir, name) {
+            Ok(st) if stat_is_symlink(&st) => {
+                unlinkat_name(dir, name).with_context(|| {
+                    format!(
+                        "failed to unlink planted destination symlink {}",
+                        name.to_string_lossy()
+                    )
+                })?;
+                mkdirat_dir(dir, name).with_context(|| {
+                    format!(
+                        "failed to recreate confined directory component {}",
+                        name.to_string_lossy()
+                    )
+                })?;
+                openat_dir_nofollow(dir, name).with_context(|| {
+                    format!(
+                        "failed to open recreated confined directory component {}",
+                        name.to_string_lossy()
+                    )
+                })
+            }
+            Ok(st) if stat_is_dir(&st) => Err(e).with_context(|| {
+                format!(
+                    "failed to open confined directory component {}",
+                    name.to_string_lossy()
+                )
+            }),
+            Ok(_) => bail!(
+                "refusing to traverse non-directory component {}",
+                name.to_string_lossy()
+            ),
+            Err(_) => Err(e).with_context(|| {
+                format!(
+                    "failed to open confined directory component {}",
+                    name.to_string_lossy()
+                )
+            }),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn open_confined_parent_dir(
+    root: &Path,
+    path: &Path,
+) -> Result<(std::os::unix::io::OwnedFd, std::ffi::OsString)> {
+    let components = confined_rel_components(root, path)?;
+    if components.is_empty() {
+        bail!("refusing to publish file at destination root");
+    }
+    let file_name = components
+        .last()
+        .cloned()
+        .expect("non-empty confined path components");
+    let mut dir = open_dir_nofollow(root).with_context(|| {
+        format!(
+            "failed to open destination root {} without following",
+            root.display()
+        )
+    })?;
+    for component in components.iter().take(components.len() - 1) {
+        dir = ensure_confined_component(&dir, component.as_os_str())?;
+    }
+    Ok((dir, file_name))
+}
+
+#[cfg(unix)]
+fn ensure_confined_dir_all(root: &Path, path: &Path) -> Result<()> {
+    let components = confined_rel_components(root, path)?;
+    let mut dir = open_dir_nofollow(root).with_context(|| {
+        format!(
+            "failed to open destination root {} without following",
+            root.display()
+        )
+    })?;
+    for component in &components {
+        dir = ensure_confined_component(&dir, component.as_os_str())?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_confined_dir_all(root: &Path, path: &Path) -> Result<()> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create directory: {}", path.display()))?;
+    }
+    let _ = root;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn publish_file_confined(
+    root: &Path,
+    path: &Path,
+    mode: u32,
+    reader: &mut impl Read,
+) -> Result<()> {
+    let (parent, file_name) = open_confined_parent_dir(root, path)?;
+    let file_name_os = file_name.as_os_str();
+    match fstatat_nofollow(&parent, file_name_os) {
+        Ok(st) if stat_is_symlink(&st) => {
+            unlinkat_name(&parent, file_name_os).with_context(|| {
+                format!(
+                    "failed to unlink planted destination symlink before copy: {}",
+                    path.display()
+                )
+            })?;
+            write_confined_new_file(&parent, file_name_os, mode, reader, path)
+        }
+        Ok(st) if stat_is_reg(&st) => {
+            write_confined_via_temp_rename(&parent, file_name_os, mode, reader, path)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_confined_new_file(&parent, file_name_os, mode, reader, path)
+        }
+        Ok(_) => bail!(
+            "refusing to overwrite non-regular file at {}",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to stat {} without following before write",
+                path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn publish_file_confined(
+    _root: &Path,
+    path: &Path,
+    mode: u32,
+    reader: &mut impl Read,
+) -> Result<()> {
+    unlink_dest_symlink_before_copy(path)?;
+    let mut writer = legacy_open_no_follow_write(path)?;
+    std::io::copy(reader, &mut writer)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    apply_mode_path(path, mode)?;
+    Ok(())
+}
+
+#[cfg(all(unix, test))]
+fn publish_file_confined_open(root: &Path, path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    let (parent, file_name) = open_confined_parent_dir(root, path)?;
+    let file_name_os = file_name.as_os_str();
+    match fstatat_nofollow(&parent, file_name_os) {
+        Ok(st) if stat_is_symlink(&st) => {
+            bail!(
+                "refusing to write through symlink at {}: destination must be a regular file",
+                path.display()
+            );
+        }
+        Ok(st) if stat_is_reg(&st) => {
+            let fd = openat_write_nofollow(&parent, file_name_os, false).with_context(|| {
+                format!(
+                    "failed to open {} for write without following",
+                    path.display()
+                )
+            })?;
+            Ok(unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let fd = openat_write_nofollow(&parent, file_name_os, true).with_context(|| {
+                format!("failed to create {} without following", path.display())
+            })?;
+            Ok(unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) })
+        }
+        Ok(_) => bail!(
+            "refusing to overwrite non-regular file at {}",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to stat {} without following before write",
+                path.display()
+            )
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn publish_file_confined_open(_root: &Path, path: &Path) -> Result<std::fs::File> {
+    legacy_open_no_follow_write(path)
+}
+
+#[cfg(unix)]
+fn write_confined_new_file(
+    parent: &std::os::unix::io::OwnedFd,
+    name: &OsStr,
+    mode: u32,
+    reader: &mut impl Read,
+    display_path: &Path,
+) -> Result<()> {
+    let fd = openat_write_nofollow(parent, name, true).with_context(|| {
+        format!(
+            "failed to create {} without following",
+            display_path.display()
+        )
+    })?;
+    let mut file = copy_to_confined_fd(fd, mode, reader, display_path)?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", display_path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_confined_via_temp_rename(
+    parent: &std::os::unix::io::OwnedFd,
+    dest_name: &OsStr,
+    mode: u32,
+    reader: &mut impl Read,
+    display_path: &Path,
+) -> Result<()> {
+    let tmp_name = confined_temp_copy_name();
+    let fd = openat_write_nofollow(parent, tmp_name.as_os_str(), true).with_context(|| {
+        format!(
+            "failed to create temporary file for {}",
+            display_path.display()
+        )
+    })?;
+    let mut temp_guard = ConfinedTempFileGuard {
+        parent,
+        name: Some(tmp_name.clone()),
+    };
+    let mut file = copy_to_confined_fd(fd, mode, reader, display_path)?;
+    file.flush().with_context(|| {
+        format!(
+            "failed to flush temporary file for {}",
+            display_path.display()
+        )
+    })?;
+    renameat_name(parent, tmp_name.as_os_str(), parent, dest_name).with_context(|| {
+        format!(
+            "failed to publish confined file at {}",
+            display_path.display()
+        )
+    })?;
+    temp_guard.name = None;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_to_confined_fd(
+    fd: std::os::unix::io::OwnedFd,
+    mode: u32,
+    reader: &mut impl Read,
+    display_path: &Path,
+) -> Result<std::fs::File> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    apply_mode_fd(&fd, mode).context("failed to set confined file mode")?;
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
+    std::io::copy(reader, &mut file)
+        .with_context(|| format!("failed to write {}", display_path.display()))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn legacy_open_no_follow_write(dst: &Path) -> Result<std::fs::File> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!(
+                "refusing to write through symlink at {}: destination must be a regular file",
+                dst.display()
+            );
+        }
+        Ok(meta) if meta.file_type().is_file() => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).truncate(true);
+            opts.open(dst).with_context(|| {
+                format!(
+                    "failed to open {} for write without following",
+                    dst.display()
+                )
+            })
+        }
+        Ok(_) => {
+            bail!(
+                "refusing to overwrite non-regular file at {}",
+                dst.display()
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            opts.open(dst)
+                .with_context(|| format!("failed to create {} without following", dst.display()))
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to stat {} without following before write",
+                dst.display()
+            )
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_mode_path(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -921,6 +1540,90 @@ pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
     remove_stale_inner(src, dst, true)
 }
 
+#[cfg(unix)]
+fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
+    let dst_dir = match open_dir_nofollow(dst) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to open directory: {}", dst.display()));
+        }
+    };
+    remove_stale_inner_at(src, &dst_dir, dst, dst, at_root)
+}
+
+#[cfg(unix)]
+fn remove_stale_inner_at(
+    src: &Path,
+    dst_dir: &std::os::unix::io::OwnedFd,
+    dst_root: &Path,
+    dst_current: &Path,
+    at_root: bool,
+) -> Result<()> {
+    for file_name in read_dirat(dst_dir)? {
+        if is_stale_remove_protected(&file_name) {
+            continue;
+        }
+
+        let src_path = src.join(&file_name);
+        let dst_path = dst_current.join(&file_name);
+
+        if at_root
+            && file_name == ".gitattributes"
+            && reconcile_root_gitattributes(dst_root, &src_path, &dst_path)?
+        {
+            continue;
+        }
+
+        let dst_st = fstatat_nofollow(dst_dir, file_name.as_os_str()).with_context(|| {
+            format!(
+                "failed to stat destination entry without following: {}",
+                dst_path.display()
+            )
+        })?;
+        if stat_is_symlink(&dst_st) {
+            if src_path.is_dir() {
+                unlinkat_name(dst_dir, file_name.as_os_str()).with_context(|| {
+                    format!(
+                        "failed to unlink planted destination symlink directory: {}",
+                        dst_path.display()
+                    )
+                })?;
+                debug!(path = %dst_path.display(), "removed planted destination symlink directory");
+                continue;
+            }
+            if !src_path.exists() {
+                unlinkat_name(dst_dir, file_name.as_os_str()).with_context(|| {
+                    format!("failed to remove stale symlink: {}", dst_path.display())
+                })?;
+                debug!(path = %dst_path.display(), "removed stale symlink");
+            }
+            continue;
+        }
+        if stat_is_dir(&dst_st) {
+            if src_path.is_dir() {
+                let subdir =
+                    openat_dir_nofollow(dst_dir, file_name.as_os_str()).with_context(|| {
+                        format!("failed to open confined directory {}", dst_path.display())
+                    })?;
+                remove_stale_inner_at(&src_path, &subdir, dst_root, &dst_path, false)?;
+            } else {
+                remove_dirat_recursive(dst_dir, file_name.as_os_str()).with_context(|| {
+                    format!("failed to remove stale directory: {}", dst_path.display())
+                })?;
+                debug!(path = %dst_path.display(), "removed stale directory");
+            }
+        } else if !src_path.exists() {
+            unlinkat_name(dst_dir, file_name.as_os_str())
+                .with_context(|| format!("failed to remove stale file: {}", dst_path.display()))?;
+            debug!(path = %dst_path.display(), "removed stale file");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
     let entries = match std::fs::read_dir(dst) {
         Ok(entries) => entries,
@@ -947,7 +1650,32 @@ fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
             continue;
         }
 
-        if dst_path.is_dir() {
+        let dst_meta = std::fs::symlink_metadata(&dst_path).with_context(|| {
+            format!(
+                "failed to stat destination entry without following: {}",
+                dst_path.display()
+            )
+        })?;
+        if dst_meta.file_type().is_symlink() {
+            if src_path.is_dir() {
+                std::fs::remove_file(&dst_path).with_context(|| {
+                    format!(
+                        "failed to unlink planted destination symlink directory: {}",
+                        dst_path.display()
+                    )
+                })?;
+                debug!(path = %dst_path.display(), "removed planted destination symlink directory");
+                continue;
+            }
+            if !src_path.exists() {
+                std::fs::remove_file(&dst_path).with_context(|| {
+                    format!("failed to remove stale symlink: {}", dst_path.display())
+                })?;
+                debug!(path = %dst_path.display(), "removed stale symlink");
+            }
+            continue;
+        }
+        if dst_meta.is_dir() {
             if src_path.is_dir() {
                 remove_stale_inner(&src_path, &dst_path, false)?;
             } else {
@@ -1015,16 +1743,17 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
             } else {
                 None
             };
-            let strip_planted = crate::lfs::export_present_gitattributes_needs_strip(
-                dest_was_symlink,
-                dest_body.as_deref(),
-            );
             let export_body = read_regular_file_no_follow(src_path).with_context(|| {
                 format!(
                     "failed to read exported .gitattributes: {}",
                     src_path.display()
                 )
             })?;
+            let strip_planted = crate::lfs::export_present_gitattributes_needs_strip(
+                dest_was_symlink,
+                dest_body.as_deref(),
+                &export_body,
+            );
             let engine_body = if strip_planted {
                 crate::lfs::engine_gitattributes_body(dst_root).with_context(|| {
                     format!("failed to read engine LFS marker in {}", dst_root.display())
@@ -1038,7 +1767,7 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
                 engine_body.as_deref(),
                 strip_planted,
             );
-            write_root_gitattributes_regular_file(dst_path, &merged)?;
+            write_root_gitattributes_regular_file(dst_root, dst_path, &merged)?;
             debug!(
                 path = %dst_path.display(),
                 "reconciled export-present .gitattributes"
@@ -1050,7 +1779,7 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
     if let Some(body) = crate::lfs::engine_gitattributes_body(dst_root)
         .with_context(|| format!("failed to read engine LFS marker in {}", dst_root.display()))?
     {
-        write_root_gitattributes_regular_file(dst_path, &body)?;
+        write_root_gitattributes_regular_file(dst_root, dst_path, &body)?;
         debug!(
             path = %dst_path.display(),
             "rewrote .gitattributes to engine-recorded LFS patterns"
@@ -1076,57 +1805,16 @@ fn read_regular_file_no_follow(path: &Path) -> Result<String> {
     Ok(body)
 }
 
-fn write_root_gitattributes_regular_file(path: &Path, body: &str) -> Result<()> {
-    crate::lfs::unlink_gitattributes_symlink(path).with_context(|| {
-        format!(
-            "failed to unlink planted .gitattributes symlink before write: {}",
-            path.display()
-        )
-    })?;
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_file() => {}
-        Ok(_) => match std::fs::remove_file(path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "failed to remove non-regular .gitattributes: {}",
-                        path.display()
-                    )
-                });
-            }
-            Ok(()) => {}
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "failed to stat .gitattributes without following: {}",
-                    path.display()
-                )
-            });
-        }
-    }
-    write_regular_file_no_follow(path, body)
+fn write_root_gitattributes_regular_file(dst_root: &Path, path: &Path, body: &str) -> Result<()> {
+    write_regular_file_no_follow(dst_root, path, body)
         .with_context(|| format!("failed to write engine .gitattributes: {}", path.display()))?;
     Ok(())
 }
 
-fn write_regular_file_no_follow(path: &Path, body: &str) -> Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = opts
-        .open(path)
-        .with_context(|| format!("failed to open {} without following", path.display()))?;
-    file.write_all(body.as_bytes())
+fn write_regular_file_no_follow(dst_root: &Path, path: &Path, body: &str) -> Result<()> {
+    let mut reader = std::io::Cursor::new(body.as_bytes());
+    publish_file_confined(dst_root, path, 0o644, &mut reader)
         .with_context(|| format!("failed to write {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
     Ok(())
 }
 
@@ -3520,7 +4208,7 @@ mod tests {
         std::fs::write(src.join("ok.txt"), "ok").unwrap();
         let fifo = src.join("pipe");
         let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644 as libc::mode_t) };
         assert_eq!(rc, 0, "mkfifo failed");
 
         let started = Instant::now();
@@ -3749,7 +4437,10 @@ mod tests {
         std::fs::create_dir_all(&dst).unwrap();
         let fifo = outside.join("pipe");
         let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o644 as libc::mode_t) },
+            0
+        );
         symlink(&fifo, src.join("escape")).unwrap();
         std::fs::write(src.join("ok.txt"), "ok").unwrap();
 
@@ -3840,6 +4531,42 @@ mod tests {
             std::fs::read_to_string(&outside).unwrap(),
             "* filter=evil\n",
             "removing a planted .gitattributes symlink must not follow it"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_dir_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("canary"), "UNCHANGED").unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/keep.txt"), "keep").unwrap();
+        symlink(&outside, dst.join("sub")).unwrap();
+
+        remove_stale_files(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(outside.join("canary")).unwrap(),
+            "UNCHANGED",
+            "stale-remove must not follow or delete through a planted directory symlink"
+        );
+    }
+
+    #[test]
+    fn import_confined_rel_components_rejects_parent_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("escape.txt"), "x").unwrap();
+        let evil = root.path().join("sub/../escape.txt");
+        let err = ensure_confined_dir_all(root.path(), &evil).unwrap_err();
+        assert!(
+            err.to_string().contains(".."),
+            "expected parent-dir refusal, got: {err}"
         );
     }
 
@@ -4044,6 +4771,139 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&outside).unwrap(),
             "OUTSIDE-EXPORT-CANARY filter=evil\n"
+        );
+    }
+
+    #[test]
+    fn import_copy_nested_gitattributes_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-nested-attrs");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(dst.join("sub")).unwrap();
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        std::fs::write(src.join("sub/.gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.join("sub/readme.txt"), "hello").unwrap();
+        symlink(&outside, dst.join("sub/.gitattributes")).unwrap();
+
+        copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap();
+
+        let meta = std::fs::symlink_metadata(dst.join("sub/.gitattributes")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "nested copy must replace a planted .gitattributes symlink with a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/.gitattributes")).unwrap(),
+            "* text=auto\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "must not write through the planted nested .gitattributes symlink"
+        );
+    }
+
+    #[test]
+    fn import_copy_dest_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside-secret");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(&outside, "SECRET").unwrap();
+        std::fs::write(src.join("payload.txt"), "copied").unwrap();
+        symlink(&outside, dst.join("payload.txt")).unwrap();
+
+        copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap();
+
+        let meta = std::fs::symlink_metadata(dst.join("payload.txt")).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(
+            std::fs::read_to_string(dst.join("payload.txt")).unwrap(),
+            "copied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "SECRET",
+            "must not write through a planted destination symlink"
+        );
+    }
+
+    #[test]
+    fn confined_temp_guard_leaves_preexisting_temp_when_openat_excl_fails() {
+        use std::sync::atomic::Ordering;
+
+        let _serial = CONFINED_TEMP_GUARD_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dest.txt"), "old").unwrap();
+        let root = open_dir_nofollow(tmp.path()).unwrap();
+
+        let seq = CONFINED_TEMP_COPY_COUNTER.load(Ordering::Relaxed);
+        let planted_name = format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq);
+        std::fs::write(tmp.path().join(&planted_name), "PLANTED-TEMP").unwrap();
+
+        let mut reader = std::io::Cursor::new(b"new-bytes");
+        let err = write_confined_via_temp_rename(
+            &root,
+            std::ffi::OsStr::new("dest.txt"),
+            0o644,
+            &mut reader,
+            Path::new("dest.txt"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("temporary file"),
+            "expected temp create failure, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(&planted_name)).unwrap(),
+            "PLANTED-TEMP",
+            "pre-existing temp name must not be unlinked when O_EXCL fails"
+        );
+    }
+
+    #[test]
+    fn import_copy_open_no_follow_write_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let dst = tmp.path().join("dst.txt");
+        std::fs::write(&outside, "SECRET").unwrap();
+        symlink(&outside, &dst).unwrap();
+
+        let err = open_no_follow_write(tmp.path(), &dst).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "SECRET");
+    }
+
+    #[test]
+    fn import_export_present_strips_dest_only_bare_filter_lfs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.path().join("model.bin"), vec![0u8; 200]).unwrap();
+        std::fs::create_dir(dst.path().join(".git")).unwrap();
+        std::fs::write(dst.path().join(".gitattributes"), "* filter=lfs\n").unwrap();
+
+        let policy = FilePolicy::with_lfs(0, vec![], 100, &[]);
+        copy_tree_with_policy(src.path(), dst.path(), &policy, &test_db()).unwrap();
+        remove_stale_files(src.path(), dst.path()).unwrap();
+
+        let after = std::fs::read_to_string(dst.path().join(".gitattributes")).unwrap();
+        assert_eq!(
+            after,
+            "* text=auto\n*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+        assert!(
+            !after.lines().any(|line| line.trim() == "* filter=lfs"),
+            "destination-only bare filter=lfs must not survive: {after}"
         );
     }
 
