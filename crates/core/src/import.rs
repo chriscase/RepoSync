@@ -1980,7 +1980,7 @@ pub async fn run_snapshot_import(
         ));
     }
 
-    db.insert_commit_map(
+    db.insert_commit_map_with_repo(
         pin.operative_rev,
         &sha,
         "svn_to_git",
@@ -1989,6 +1989,7 @@ pub async fn run_snapshot_import(
             "{} <{}>",
             import_config.committer_name, import_config.committer_email
         ),
+        repo_id.as_deref(),
     )
     .context("failed to persist snapshot baseline mapping")?;
 
@@ -2603,12 +2604,13 @@ pub async fn run_full_import(
                 log(&progress, &ws_broadcast, log_line).await;
 
                 // Record in DB (commit_map for bidirectional mapping)
-                let map_result = db.insert_commit_map(
+                let map_result = db.insert_commit_map_with_repo(
                     rev,
                     &sha,
                     "svn_to_git",
                     &entry.author,
                     &format!("{} <{}>", author_name, author_email),
+                    repo_id.as_deref(),
                 );
                 if operation_id.is_some() {
                     map_result.context("failed to persist import mapping")?;

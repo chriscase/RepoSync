@@ -8,7 +8,7 @@
 //! - LFS pointer resolution via `git lfs smudge` (for Git→SVN)
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tracing::{debug, info};
@@ -382,24 +382,51 @@ pub fn pattern_for_path(rel_path: &str) -> String {
 // LFS pointer resolution (smudge)
 // ---------------------------------------------------------------------------
 
-/// Resolve an LFS pointer to the actual file content.
-///
-/// This shells out to `git lfs smudge` which reads the pointer from stdin
-/// and writes the actual content to stdout. Requires `git lfs install` to
-/// have been run in the repo.
-///
-/// Returns `Ok(content_bytes)` on success, `Err(message)` on failure.
-pub fn resolve_lfs_pointer(repo_root: &Path, pointer_content: &[u8]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("git")
+/// Path to a locally stored LFS object for the given OID.
+pub fn local_lfs_object_path(repo_root: &Path, oid: &str) -> PathBuf {
+    repo_root
+        .join(".git")
+        .join("lfs")
+        .join("objects")
+        .join(&oid[..2.min(oid.len())])
+        .join(&oid[2..4.min(oid.len())])
+        .join(oid)
+}
+
+/// True when the OID is present in `.git/lfs/objects`.
+pub fn local_lfs_object_available(repo_root: &Path, oid: &str) -> bool {
+    if oid.len() != 64 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    local_lfs_object_path(repo_root, oid).is_file()
+}
+
+fn read_local_lfs_object(repo_root: &Path, oid: &str) -> Result<Vec<u8>, String> {
+    let path = local_lfs_object_path(repo_root, oid);
+    std::fs::read(&path).map_err(|e| {
+        format!(
+            "failed to read local LFS object {} at {}: {}",
+            oid,
+            path.display(),
+            e
+        )
+    })
+}
+
+fn smudge_lfs_pointer(repo_root: &Path, pointer_content: &[u8]) -> Result<Vec<u8>, String> {
+    let mut command = Command::new("git");
+    command
         .args(["lfs", "smudge"])
         .current_dir(repo_root)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command.env_remove("GIT_LFS_SKIP_SMUDGE");
+
+    let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn git lfs smudge: {}", e))?;
 
-    // Write pointer to stdin.
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(pointer_content)
@@ -420,6 +447,32 @@ pub fn resolve_lfs_pointer(repo_root: &Path, pointer_content: &[u8]) -> Result<V
     }
 
     Ok(output.stdout)
+}
+
+/// Resolve an LFS pointer to the actual file content.
+///
+/// Prefers a locally cached object in `.git/lfs/objects`. Otherwise shells out
+/// to `git lfs smudge` with `GIT_LFS_SKIP_SMUDGE` removed so smudge can run.
+///
+/// Returns `Ok(content_bytes)` on success, `Err(message)` on failure.
+pub fn resolve_lfs_pointer(repo_root: &Path, pointer_content: &[u8]) -> Result<Vec<u8>, String> {
+    let pointer = parse_lfs_pointer(pointer_content)
+        .ok_or_else(|| "content is not a valid LFS pointer".to_string())?;
+
+    if local_lfs_object_available(repo_root, &pointer.oid) {
+        return read_local_lfs_object(repo_root, &pointer.oid);
+    }
+
+    let smudged = smudge_lfs_pointer(repo_root, pointer_content)?;
+
+    if smudged == pointer_content && !local_lfs_object_available(repo_root, &pointer.oid) {
+        return Err(
+            "git lfs smudge could not resolve LFS object (pointer unchanged and object missing)"
+                .to_string(),
+        );
+    }
+
+    Ok(smudged)
 }
 
 /// Run `git lfs install` in a repository to set up the LFS hooks.
@@ -724,6 +777,33 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(engine_gitattributes_body(dir.path()).unwrap().is_none());
         assert!(!dir.path().join(".gitattributes").exists());
+    }
+
+    #[test]
+    fn test_resolve_lfs_pointer_rejects_smudge_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
+        let result = resolve_lfs_pointer(dir.path(), pointer);
+        assert!(
+            result.is_err(),
+            "unresolved smudge passthrough must not count as success: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_local_lfs_object_path_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let oid = "4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393";
+        let path = local_lfs_object_path(dir.path(), oid);
+        assert!(path
+            .ends_with("4d/7a/4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393"));
+        assert!(!local_lfs_object_available(dir.path(), oid));
     }
 
     #[test]
