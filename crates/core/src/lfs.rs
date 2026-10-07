@@ -400,9 +400,8 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
     }
     body.push_str(&expected_line);
     body.push('\n');
-    crate::import::publish_repo_root_gitattributes(repo_root, &body).map_err(|e| {
-        std::io::Error::other(format!("failed to publish .gitattributes: {e:#}"))
-    })?;
+    crate::import::publish_repo_root_gitattributes(repo_root, &body)
+        .map_err(|e| std::io::Error::other(format!("failed to publish .gitattributes: {e:#}")))?;
 
     info!(pattern, path = %gitattr_path.display(), "added LFS tracking to .gitattributes");
     Ok(true)
