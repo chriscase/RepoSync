@@ -216,6 +216,118 @@ fn running_journal_defers_marker_without_receipt_for_git_echo() {
 }
 
 #[test]
+fn handled_svn_no_target_receipt_suppresses_only_when_admission_scoped() {
+    let db = setup_db();
+    let svn_rev = 8_i64;
+    let projection = "{}";
+    let receipt = serde_json::json!({
+        "version": 1,
+        "repo_id": "pair",
+        "svn_revision": svn_rev,
+        "outcome": "no_git_content",
+        "projection": projection,
+    });
+    db.set_state(
+        &format!("handled_svn_no_target_pair_{svn_rev}"),
+        &receipt.to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), svn_rev, "no marker").unwrap(),
+        EchoDisposition::SkipEcho
+    );
+
+    let other_rev = 9_i64;
+    db.set_state(
+        &format!("handled_svn_no_target_other_{other_rev}"),
+        &serde_json::json!({
+            "version": 1,
+            "repo_id": "other",
+            "svn_revision": other_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), other_rev, "no marker").unwrap(),
+        EchoDisposition::ApplyGenuine
+    );
+
+    let malformed_rev = 10_i64;
+    db.set_state(
+        &format!("handled_svn_no_target_pair_{malformed_rev}"),
+        "not-json",
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), malformed_rev, "no marker").unwrap(),
+        EchoDisposition::ApplyGenuine
+    );
+
+    let weak_rev = 11_i64;
+    db.set_state(
+        &format!("handled_svn_no_target_pair_{weak_rev}"),
+        &serde_json::json!({
+            "version": 3,
+            "repo_id": "pair",
+            "svn_revision": weak_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), weak_rev, "no marker").unwrap(),
+        EchoDisposition::ApplyGenuine
+    );
+}
+
+#[test]
+fn running_svn_journal_defers_matching_rev_without_marker() {
+    let db = setup_db();
+    db.conn()
+        .execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+             VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+            [],
+        )
+        .unwrap();
+    use reposync_core::db::svn_commit_operations::{
+        svn_commit_target_fingerprint, SvnCommitIntent,
+    };
+    let git_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let fingerprint = svn_commit_target_fingerprint("pair", "uuid", "/repo", "/repo", "{}");
+    db.begin_git_to_svn_commit(SvnCommitIntent {
+        repo_id: "pair",
+        initiator_id: "worker",
+        request_id: "req-1",
+        target_fingerprint: &fingerprint,
+        source_git_sha: git_sha,
+        source_git_parent: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+        target_svn_uuid: "uuid",
+        target_svn_path: "/repo",
+        target_svn_root_url: "/repo",
+        target_svn_branch_path: "",
+        pre_write_svn_rev: 4,
+        pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+        projection: "{}",
+        intended_changed_paths: vec![],
+        intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        author: "dev",
+        source_message: "feature",
+    })
+    .unwrap();
+    assert_eq!(
+        classify_incoming_svn_revision(&ctx(&db, "pair"), 5, "edited away marker").unwrap(),
+        EchoDisposition::DeferPendingJournal
+    );
+}
+
+#[test]
 fn running_git_journal_defers_matching_sha_without_marker() {
     let db = setup_db();
     db.conn()

@@ -3543,10 +3543,11 @@ impl SyncEngine {
         message: &str,
     ) -> Result<bool, SyncError> {
         if let Some(repo_id) = self.effective_repo_id() {
+            let projection = self.no_target_projection();
             let ctx = TeamEchoContext {
                 db: &self.db,
                 repo_id,
-                no_target_projection: "",
+                no_target_projection: &projection,
             };
             return match classify_incoming_svn_revision(&ctx, svn_rev, message)? {
                 EchoDisposition::SkipEcho => Ok(true),
@@ -3956,8 +3957,10 @@ repo = "test/test-repo"
             err,
             SyncError::GitPushHeld {
                 reason,
-                ..
+                detail,
             } if reason == "pending_journal_finalize"
+                && detail.contains("matches a Running svn-to-Git journal")
+                && detail.contains("wait for the in-flight emit")
         ));
     }
 
@@ -3976,8 +3979,10 @@ repo = "test/test-repo"
             err,
             SyncError::SvnCommitHeld {
                 reason,
-                ..
+                detail,
             } if reason == "pending_journal_finalize"
+                && detail.contains("matches a Running git-to-SVN journal")
+                && detail.contains("wait for the in-flight emit")
         ));
     }
 
@@ -4015,11 +4020,110 @@ repo = "test/test-repo"
     }
 
     #[test]
-    fn running_svn_journal_without_marker_applies_as_genuine() {
+    fn running_svn_journal_without_marker_defers_only_matching_rev() {
         let engine = team_echo_engine("pair");
         begin_running_git_to_svn_commit(engine.db(), "pair", 4);
+        assert!(matches!(
+            engine.should_skip_incoming_svn_revision(5, "edited away marker"),
+            Err(SyncError::SvnCommitHeld {
+                reason,
+                detail,
+            }) if reason == "pending_journal_finalize"
+                && detail.contains("matches a Running git-to-SVN journal")
+                && detail.contains("wait for the in-flight emit")
+        ));
         assert!(!engine
-            .should_skip_incoming_svn_revision(5, "no marker")
+            .should_skip_incoming_svn_revision(6, "no marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn running_svn_journal_with_different_rev_applies_as_genuine() {
+        let engine = team_echo_engine("pair");
+        begin_running_git_to_svn_commit(engine.db(), "pair", 4);
+        let marker = format!(
+            "synced\n\n{SYNC_MARKER} synced from Git {}",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert!(!engine
+            .should_skip_incoming_svn_revision(6, &marker)
+            .unwrap());
+        assert!(!engine
+            .should_skip_incoming_svn_revision(6, "no marker")
+            .unwrap());
+    }
+
+    #[test]
+    fn svn_no_target_receipt_skips_only_when_admission_scoped() {
+        let engine = team_echo_engine("pair");
+        let svn_rev = 9_i64;
+        let projection = engine.no_target_projection();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "svn_revision": svn_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_pair_{svn_rev}"),
+                &receipt.to_string(),
+            )
+            .unwrap();
+        assert!(engine
+            .should_skip_incoming_svn_revision(svn_rev, "no marker")
+            .unwrap());
+
+        let other_rev = 10_i64;
+        let cross_repo = serde_json::json!({
+            "version": 1,
+            "repo_id": "other",
+            "svn_revision": other_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_other_{other_rev}"),
+                &cross_repo.to_string(),
+            )
+            .unwrap();
+        assert!(!engine
+            .should_skip_incoming_svn_revision(other_rev, "no marker")
+            .unwrap());
+
+        let malformed_rev = 11_i64;
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_pair_{malformed_rev}"),
+                "not-json",
+            )
+            .unwrap();
+        assert!(!engine
+            .should_skip_incoming_svn_revision(malformed_rev, "no marker")
+            .unwrap());
+
+        let weak_rev = 12_i64;
+        let weak = serde_json::json!({
+            "version": 3,
+            "repo_id": "pair",
+            "svn_revision": weak_rev,
+            "outcome": "no_git_content",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_svn_no_target_pair_{weak_rev}"),
+                &weak.to_string(),
+            )
+            .unwrap();
+        assert!(!engine
+            .should_skip_incoming_svn_revision(weak_rev, "no marker")
             .unwrap());
     }
 
