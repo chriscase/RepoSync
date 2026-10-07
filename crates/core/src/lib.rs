@@ -11,6 +11,7 @@ pub mod conflict;
 pub mod crypto;
 pub mod data_dir;
 pub mod db;
+pub mod echo_suppression;
 pub mod errors;
 pub mod file_policy;
 pub mod git;
