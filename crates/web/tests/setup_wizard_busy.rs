@@ -899,7 +899,7 @@ async fn candidate_rs11_setup_import_config_remote_ignores_managed_chain() {
         .unwrap();
 
     let workdir = tmp.path().join("git-repo");
-    let config_origin = "http://git.test.invalid/local/history.git";
+    let config_origin = "http://x-access-token:configtok@git.test.invalid/local/history.git";
     prepare_config_git_repo(&workdir, &bare, config_origin);
 
     let client = authed_client();
@@ -918,8 +918,8 @@ async fn candidate_rs11_setup_import_config_remote_ignores_managed_chain() {
     let url = git_origin_url(&workdir);
     assert_eq!(url, config_origin);
     assert!(
-        !url.contains("x-access-token:"),
-        "setup import must not embed credentials on config remote: {url}"
+        url.contains("configtok"),
+        "setup import must preserve config remote userinfo: {url}"
     );
     assert!(
         !url.contains(managed_token),
@@ -952,7 +952,7 @@ async fn candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation() 
         .unwrap();
 
     let workdir = tmp.path().join("git-repo");
-    let config_origin = "http://git.test.invalid/local/history.git";
+    let config_origin = "http://x-access-token:configtok@git.test.invalid/local/history.git";
     prepare_config_git_repo(&workdir, &bare, config_origin);
 
     let client = authed_client();
@@ -972,6 +972,10 @@ async fn candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation() 
     assert_eq!(
         url, config_origin,
         "explicit managed-repo revocation must not strip config remote origin"
+    );
+    assert!(
+        url.contains("configtok"),
+        "explicit managed-repo revocation must not strip config remote userinfo: {url}"
     );
 
     eprintln!(
