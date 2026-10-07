@@ -439,24 +439,24 @@ impl SyncEngine {
             }
         };
         let last_git_hash = if let Some(rid) = self.effective_repo_id() {
-            let scoped = self
+            let column = self
                 .db
-                .get_state(&self.git_sha_key())
+                .get_repository(rid)
                 .map_err(SyncError::DatabaseError)?
-                .filter(|s| !s.is_empty());
-            if scoped.is_some() {
-                scoped
+                .and_then(|repo| {
+                    if repo.last_git_sha.is_empty() {
+                        None
+                    } else {
+                        Some(repo.last_git_sha)
+                    }
+                });
+            if column.is_some() {
+                column
             } else {
                 self.db
-                    .get_repository(rid)
+                    .get_state(&self.git_sha_key())
                     .map_err(SyncError::DatabaseError)?
-                    .and_then(|repo| {
-                        if repo.last_git_sha.is_empty() {
-                            None
-                        } else {
-                            Some(repo.last_git_sha)
-                        }
-                    })
+                    .filter(|s| !s.is_empty())
             }
         } else {
             match self

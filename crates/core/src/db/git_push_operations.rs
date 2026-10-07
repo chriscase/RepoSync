@@ -217,7 +217,6 @@ fn finalize_tx(
             &format!("last_svn_rev_{}", op.repo_id),
             &svn_rev.to_string(),
         )?;
-        write_value(tx, &format!("last_git_sha_{}", op.repo_id), git_sha)?;
     }
     if removed {
         op.outcome_detail =
@@ -830,9 +829,9 @@ mod tests {
             (3, "dddddddddddddddddddddddddddddddddddddddd".into())
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap().as_deref(),
-            Some("dddddddddddddddddddddddddddddddddddddddd"),
-            "svn-to-git finalize must keep scoped git cursor in step with repositories.last_git_sha"
+            db.get_state("last_git_sha_pair").unwrap(),
+            None,
+            "svn-to-git finalize must not advance scoped inbound git cursor kv"
         );
         assert_eq!(
             db.get_state("last_git_hash").unwrap(),

@@ -1743,7 +1743,7 @@ async fn candidate_r01_alternating_directional_cursors_survive_restart() {
     );
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted.clone())
+        Some(git_sha.clone())
     );
     let mapped: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND svn_rev = ?1 AND git_sha = ?2 AND status = 'applied'",
@@ -1832,7 +1832,7 @@ async fn candidate_r01_pending_both_directions_after_legacy_split() {
     );
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted_sha.clone())
+        Some(handled.clone())
     );
 
     git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
@@ -1916,7 +1916,7 @@ async fn candidate_r10_legacy_stale_copy_requires_mapped_transition() {
     );
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted.clone())
+        Some(handled.clone())
     );
     let before = fixture.snapshot().await;
     let repeat = fixture.engine.run_sync_cycle().await.unwrap();
@@ -2357,13 +2357,8 @@ async fn candidate_r01_empty_git_no_target_cursor_survives_svn_publication() {
     );
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted.clone())
+        Some(empty_sha.clone())
     );
-    fixture
-        .engine
-        .db()
-        .set_state("last_git_sha_pair", &empty_sha)
-        .unwrap();
     let before_remote = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
     let before_tree = tracked_tree(&fixture.bridge);
     let wrong_db = Database::new(&fixture.db_path).unwrap();
@@ -2462,12 +2457,6 @@ async fn candidate_r10_retention_preserves_missing_kv_pending_frontier() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (verified, emitted.clone())
     );
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
         None
@@ -2559,12 +2548,6 @@ async fn candidate_r10_prior_pruned_baseline_blocks_without_guessing() {
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
         (verified, emitted.clone())
     );
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
         None
@@ -2661,7 +2644,7 @@ async fn candidate_r10_retention_preserves_present_kv_applied_mapping() {
     let emitted = get_head_sha(&fixture.bridge);
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted.clone())
+        Some(handled.clone())
     );
     assert_eq!(
         fixture.engine.db().get_repo_watermark("pair").unwrap(),
@@ -3005,12 +2988,12 @@ async fn run_failed_apply_barrier(retry: bool) {
     }
 
     let applied = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 0));
+    assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 1));
     let after = fixture.snapshot().await;
     assert_eq!(after.watermark.0, later);
-    assert_eq!(after.mapping_count, frontier.mapping_count + 2);
-    assert_eq!(after.repo_sync_count, frontier.repo_sync_count + 2);
-    assert_eq!(after.svn_rev, later);
+    assert_eq!(after.mapping_count, frontier.mapping_count + 3);
+    assert_eq!(after.repo_sync_count, frontier.repo_sync_count + 3);
+    assert_eq!(after.svn_rev, later + 1);
     assert_eq!(
         std::fs::read_to_string(fixture.bridge.join("config")).unwrap(),
         "pending outgoing\n"
@@ -3018,7 +3001,7 @@ async fn run_failed_apply_barrier(retry: bool) {
     let outgoing_mapped: i64 = fixture.engine.db().conn().query_row(
         "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
         [&pending_git], |row| row.get(0)).unwrap();
-    assert_eq!(outgoing_mapped, 0);
+    assert_eq!(outgoing_mapped, 1);
     assert_eq!(after.remote_sha, after.bridge_sha);
     assert_eq!(after.remote_tree, after.bridge_tree);
     assert_eq!(
@@ -3493,12 +3476,6 @@ async fn candidate_r10_missing_checkpoint_object_blocks() {
         .db()
         .update_repo_watermark("pair", repo_rev, absent)
         .unwrap();
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
-        .unwrap();
     assert_pair_blocked_without_damage(&fixture, "missing_checkpoint_object").await;
 }
 
@@ -3514,12 +3491,6 @@ async fn candidate_r10_missing_repository_cursor_does_not_borrow_global() {
         .engine
         .db()
         .update_repo_watermark("pair", 2, "")
-        .unwrap();
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
         .unwrap();
     assert_pair_blocked_without_damage(&fixture, "missing_checkpoint").await;
 }
@@ -4376,11 +4347,6 @@ async fn candidate_r17_repository_cursors_remain_scoped() {
         .db()
         .update_repo_watermark("other", 2, "")
         .unwrap();
-    other_engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_other'", [])
-        .unwrap();
     let result = other_engine.run_sync_cycle().await;
     assert!(
         matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "missing_checkpoint"),
@@ -4405,12 +4371,6 @@ async fn candidate_r17_repository_cursors_remain_scoped() {
         .engine
         .db()
         .update_repo_watermark("pair", 2, absent)
-        .unwrap();
-    fixture
-        .engine
-        .db()
-        .conn()
-        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
         .unwrap();
     assert_pair_blocked_without_damage(&fixture, "missing_checkpoint_object").await;
     let other_developer = other_root.join("developer");
@@ -5839,8 +5799,9 @@ async fn candidate_rs05_get_status_scoped_svn_cursor_ignores_global() {
     );
 }
 
-/// RS-05 / #63: after Git->SVN then SVN->Git, scoped git cursor kv and
-/// `get_status` must agree with `repositories.last_git_sha`.
+/// RS-05 / #63: after Git->SVN then SVN->Git, `get_status` reports the
+/// emitted tip from `repositories.last_git_sha` while scoped inbound kv
+/// stays at the handled checkpoint for replay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
     let fixture = QualifiedPair::new().await;
@@ -5880,25 +5841,38 @@ async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
     assert_eq!(table_sha, emitted);
     assert_eq!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted.clone()),
-        "svn-to-git finalize must refresh scoped git cursor kv"
+        Some(handled.clone()),
+        "svn-to-git finalize must not collapse inbound scoped git cursor kv"
     );
 
     let status = fixture.engine.get_status().unwrap();
     assert_eq!(
         status.last_git_hash.as_deref(),
         Some(emitted.as_str()),
-        "get_status must match repositories.last_git_sha after svn-to-git finalize"
+        "get_status must report repositories.last_git_sha after svn-to-git finalize"
     );
-    assert_eq!(
+    assert_ne!(
         fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
         status.last_git_hash,
-        "get_status must prefer the refreshed scoped git cursor kv"
+        "get_status display must not advance inbound scoped git cursor kv"
     );
     assert_eq!(
         status.last_svn_revision,
         Some(revision),
         "svn-to-git finalize must keep scoped svn cursor visible in get_status"
+    );
+
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let pending = fixture.developer_commit("config", "pending after svn\n", "Pending after SVN");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let replay = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        replay.git_to_svn_count, 1,
+        "pending Git must still replay after svn-to-git finalize"
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(pending.clone())
     );
 
     eprintln!(
@@ -5907,10 +5881,12 @@ async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
             "case":"RS05_TEAM_GET_STATUS_GIT_SHA_AFTER_BIDIRECTIONAL",
             "handled_git":handled,
             "emitted_git":emitted,
+            "pending_git":pending,
             "svn_rev":revision,
             "table_git_sha":table_sha,
-            "scoped_kv_git_sha":fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
-            "status_git_sha":status.last_git_hash
+            "scoped_kv_git_sha":handled,
+            "status_git_sha":status.last_git_hash,
+            "pending_replayed":true
         })
     );
 }
@@ -7368,20 +7344,14 @@ async fn candidate_r10_policy_split_cursor_filtered_commit_rejected() {
         pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
         1
     );
-    let emitted = get_head_sha(&pair.bridge);
-    assert_ne!(emitted, filtered);
-    assert_eq!(
+    assert_ne!(
         pair.engine.db().get_repo_watermark("pair").unwrap().1,
-        emitted
+        filtered
     );
     assert_eq!(
         pair.engine.db().get_state("last_git_sha_pair").unwrap(),
-        Some(emitted.clone())
+        Some(filtered.clone())
     );
-    pair.engine
-        .db()
-        .set_state("last_git_sha_pair", &filtered)
-        .unwrap();
     let before = pair.snapshot().await;
     let db = Database::new(&pair.db_path).unwrap();
     let mut changed = SyncEngine::new(

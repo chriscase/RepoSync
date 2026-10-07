@@ -406,7 +406,7 @@
       "tier": "candidate_regression"
     },
     {
-      "id": "RS05_TEAM_SVN_TO_GIT_FINALIZE_SCOPED_GIT_KV",
+      "id": "RS05_TEAM_SVN_TO_GIT_FINALIZE_PRESERVES_INBOUND_KV",
       "binary": "reposync_core",
       "test": "db::git_push_operations::tests::persist_hold_and_confirm_with_observed_evidence",
       "tier": "candidate_regression"
