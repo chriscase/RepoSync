@@ -1137,14 +1137,8 @@ async fn spawn_import_task(
     let svn_client = SvnClient::new(&svn_import_url, &config.svn.username, &svn_password)
         .with_cancel_signal(cancel_signal.clone());
 
-    let git_token_state = if let Some(tok) = config.github.token.clone() {
-        reposync_core::db::queries::CredentialChainState::resolved(tok)
-    } else {
-        state
-            .db
-            .resolve_credential_chain_state(&repo_id, "secret_git_token")
-    };
-    let git_token = git_token_state.value.clone();
+    // Config remote credentials come only from config/env — never from a managed repo chain.
+    let config_git_token = config.github.token.clone();
     let git_repo_path = config.daemon.data_dir.join("git-repo");
 
     std::fs::create_dir_all(&config.daemon.data_dir)
@@ -1158,15 +1152,20 @@ async fn spawn_import_task(
         // inited local repository. Leave the enrolled import_operation_v1 row
         // held; do not start the importer.
         let clone_url = config.github.clone_url();
-        GitClient::clone_repo(&clone_url, &git_repo_path, git_token.as_deref()).map_err(|e| {
-            AppError::BadRequest(format!(
-                "Git target could not be cloned; import held for inspection: {e}"
-            ))
-        })?
+        GitClient::clone_repo(&clone_url, &git_repo_path, config_git_token.as_deref()).map_err(
+            |e| {
+                AppError::BadRequest(format!(
+                    "Git target could not be cloned; import held for inspection: {e}"
+                ))
+            },
+        )?
     };
 
-    reposync_core::git::apply_git_credential_chain_state(&git_client, "origin", &git_token_state)
-        .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
+    reposync_core::git::apply_config_remote_git_credentials(
+        &git_client,
+        config_git_token.as_deref(),
+    )
+    .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
 
     let git_client = Arc::new(std::sync::Mutex::new(git_client));
     let identity_mapper = IdentityMapper::new(&config.identity)
@@ -1181,7 +1180,7 @@ async fn spawn_import_task(
         committer_email: "reposync@localhost".into(),
         remote_name: "origin".into(),
         branch: config.github.default_branch.clone(),
-        push_token: git_token,
+        push_token: config_git_token,
         message_prefix: None,
         trunk_path: config.svn.trunk_path.clone(),
     };

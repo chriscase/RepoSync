@@ -852,3 +852,131 @@ async fn candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel() {
     }
     server.abort();
 }
+
+fn git_origin_url(repo_path: &Path) -> String {
+    String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["remote", "get-url", "origin"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string()
+}
+
+fn prepare_config_git_repo(workdir: &Path, bare: &Path, origin_url: &str) {
+    if workdir.exists() {
+        std::fs::remove_dir_all(workdir).ok();
+    }
+    assert!(Command::new("git")
+        .args(["clone", bare.to_str().unwrap(), workdir.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["remote", "set-url", "origin", origin_url])
+        .current_dir(workdir)
+        .status()
+        .unwrap()
+        .success());
+}
+
+/// RS-11 / #63: setup import must not embed the first managed repo's git token
+/// on the legacy config remote at `data_dir/git-repo`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_setup_import_config_remote_ignores_managed_chain() {
+    if !svn_available() {
+        eprintln!("SKIP: svnadmin not available");
+        return;
+    }
+    let (addr, state, server, tmp, repo_id, bare) = setup_wizard_fixture().await;
+    let managed_token = "managed-setup-import-token";
+    state
+        .db
+        .set_state(&format!("secret_git_token_{}", repo_id), managed_token)
+        .unwrap();
+
+    let workdir = tmp.path().join("git-repo");
+    let config_origin = format!("file://{}", bare.display());
+    prepare_config_git_repo(&workdir, &bare, &config_origin);
+
+    let client = authed_client();
+    let started = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "rs11-setup-import-managed-chain")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        started.status().is_success(),
+        "{}",
+        started.text().await.unwrap()
+    );
+
+    let url = git_origin_url(&workdir);
+    assert_eq!(url, config_origin);
+    assert!(
+        !url.contains(managed_token),
+        "setup import must not embed managed repo token on config remote: {url}"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN",
+            "config_remote_unchanged":true,
+            "foreign_token_embedded":false
+        })
+    );
+    server.abort();
+}
+
+/// RS-11 / #63: setup import must not strip the config remote when the managed
+/// repo chain carries an explicit empty git-token key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation() {
+    if !svn_available() {
+        eprintln!("SKIP: svnadmin not available");
+        return;
+    }
+    let (addr, state, server, tmp, repo_id, bare) = setup_wizard_fixture().await;
+    state
+        .db
+        .set_state(&format!("secret_git_token_{}", repo_id), "")
+        .unwrap();
+
+    let workdir = tmp.path().join("git-repo");
+    let config_origin = format!("file://{}", bare.display());
+    prepare_config_git_repo(&workdir, &bare, &config_origin);
+
+    let client = authed_client();
+    let started = client
+        .post(format!("http://{addr}/api/setup/import"))
+        .header("x-request-id", "rs11-setup-import-revocation")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        started.status().is_success(),
+        "{}",
+        started.text().await.unwrap()
+    );
+
+    let url = git_origin_url(&workdir);
+    assert_eq!(
+        url, config_origin,
+        "explicit managed-repo revocation must not strip config remote origin"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION",
+            "config_remote_unchanged":true,
+            "origin_stripped":false
+        })
+    );
+    server.abort();
+}

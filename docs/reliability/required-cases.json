@@ -945,6 +945,8 @@
     {"id":"RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT", "binary":"team_mode_e2e", "test":"candidate_rs11_scheduler_revocation_strips_embedded_git_token", "tier":"candidate_regression"},
     {"id":"RS11_STARTUP_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
     {"id":"RS11_CLI_SYNC_NOW_NO_FOREIGN_CONFIG_TOKEN", "binary":"team_mode_e2e", "test":"candidate_rs11_cli_sync_now_keeps_config_remote_without_foreign_token", "tier":"candidate_regression"},
-    {"id":"RS11_STARTUP_CHILD_REVOCATION_PRESERVED", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_child_revocation_preserved", "tier":"candidate_regression"}
+    {"id":"RS11_STARTUP_CHILD_REVOCATION_PRESERVED", "binary":"team_mode_e2e", "test":"candidate_rs11_startup_child_revocation_preserved", "tier":"candidate_regression"},
+    {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
+    {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation", "tier":"candidate_regression"}
   ]
 }
