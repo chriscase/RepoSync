@@ -157,6 +157,92 @@ pub fn classify_incoming_svn_revision(
     }
 }
 
+/// Classify an incoming SVN revision for personal mode (scope key + legacy reads).
+pub fn classify_incoming_svn_revision_personal(
+    ctx: &TeamEchoContext<'_>,
+    svn_rev: i64,
+    message: &str,
+) -> Result<EchoDisposition, DatabaseError> {
+    let has_marker = message.contains(SYNC_MARKER);
+    if ctx.db.has_personal_emitted_svn_revision(svn_rev)? {
+        debug!(
+            repo_id = ctx.repo_id,
+            rev = svn_rev,
+            "skipping echo SVN revision (personal-scoped git_to_svn receipt)"
+        );
+        return Ok(EchoDisposition::SkipEcho);
+    }
+    if verified_svn_no_target_receipt_personal(ctx, svn_rev)? {
+        debug!(
+            repo_id = ctx.repo_id,
+            rev = svn_rev,
+            "skipping handled SVN revision (personal-scoped no-target receipt)"
+        );
+        return Ok(EchoDisposition::SkipEcho);
+    }
+    if running_journal_claims_pending_svn_echo_personal(ctx, svn_rev)? {
+        warn!(
+            repo_id = ctx.repo_id,
+            rev = svn_rev,
+            "SVN revision matches a Running personal git-to-SVN journal without receipt; deferring"
+        );
+        return Ok(EchoDisposition::DeferPendingJournal);
+    }
+    if has_marker {
+        warn!(
+            repo_id = ctx.repo_id,
+            rev = svn_rev,
+            "SVN revision carries [reposync] marker without personal-scoped receipt; treating as genuine"
+        );
+        Ok(EchoDisposition::ApplyGenuineWithMarkerHint)
+    } else {
+        Ok(EchoDisposition::ApplyGenuine)
+    }
+}
+
+/// Classify an incoming Git commit for personal mode (scope key + legacy reads).
+pub fn classify_incoming_git_commit_personal(
+    ctx: &TeamEchoContext<'_>,
+    git_sha: &str,
+    message: &str,
+) -> Result<Result<EchoDisposition, SyncError>, DatabaseError> {
+    let has_marker = message.contains(SYNC_MARKER);
+    if ctx.db.has_personal_emitted_git_commit(git_sha)? {
+        debug!(
+            repo_id = ctx.repo_id,
+            sha = %git_sha,
+            "skipping echo Git commit (personal-scoped svn_to_git receipt)"
+        );
+        return Ok(Ok(EchoDisposition::SkipEcho));
+    }
+    if verified_git_no_target_receipt_personal(ctx, git_sha)? {
+        debug!(
+            repo_id = ctx.repo_id,
+            sha = %git_sha,
+            "skipping handled Git commit (personal-scoped no-target receipt)"
+        );
+        return Ok(Ok(EchoDisposition::SkipEcho));
+    }
+    if running_journal_claims_pending_git_echo_personal(ctx, git_sha)? {
+        warn!(
+            repo_id = ctx.repo_id,
+            sha = %git_sha,
+            "Git commit matches a Running personal svn-to-Git journal without receipt; deferring"
+        );
+        return Ok(Ok(EchoDisposition::DeferPendingJournal));
+    }
+    if has_marker {
+        warn!(
+            repo_id = ctx.repo_id,
+            sha = %git_sha,
+            "Git commit carries [reposync] marker without personal-scoped receipt; treating as genuine"
+        );
+        Ok(Ok(EchoDisposition::ApplyGenuineWithMarkerHint))
+    } else {
+        Ok(Ok(EchoDisposition::ApplyGenuine))
+    }
+}
+
 /// Classify an incoming Git commit for team mode.
 pub fn classify_incoming_git_commit(
     ctx: &TeamEchoContext<'_>,
@@ -249,6 +335,19 @@ fn running_journal_claims_pending_git_echo(
     Ok(op.intended_local_git_sha == git_sha)
 }
 
+fn running_journal_claims_pending_git_echo_personal(
+    ctx: &TeamEchoContext<'_>,
+    git_sha: &str,
+) -> Result<bool, DatabaseError> {
+    let Some(op) = ctx.db.active_personal_git_push_operation()? else {
+        return Ok(false);
+    };
+    if !unfinalized_journal_blocks_echo(&op.state, op.resume_authorized) {
+        return Ok(false);
+    }
+    Ok(op.intended_local_git_sha == git_sha)
+}
+
 fn running_journal_claims_pending_svn_echo(
     ctx: &TeamEchoContext<'_>,
     svn_rev: i64,
@@ -260,6 +359,63 @@ fn running_journal_claims_pending_svn_echo(
         return Ok(false);
     }
     Ok(op.pre_write_svn_rev + 1 == svn_rev)
+}
+
+fn running_journal_claims_pending_svn_echo_personal(
+    ctx: &TeamEchoContext<'_>,
+    svn_rev: i64,
+) -> Result<bool, DatabaseError> {
+    let Some(op) = ctx.db.active_personal_svn_commit_operation()? else {
+        return Ok(false);
+    };
+    if !unfinalized_journal_blocks_echo_svn(&op.state, op.resume_authorized) {
+        return Ok(false);
+    }
+    Ok(op.pre_write_svn_rev + 1 == svn_rev)
+}
+
+fn verified_svn_no_target_receipt_personal(
+    ctx: &TeamEchoContext<'_>,
+    svn_rev: i64,
+) -> Result<bool, DatabaseError> {
+    for repo_id in ctx.db.personal_repo_ids_for_read()? {
+        let key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
+        let Some(raw) = ctx.db.get_state(&key)? else {
+            continue;
+        };
+        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        let Some(record) = receipt else {
+            continue;
+        };
+        if verify_svn_no_target_receipt(&record, repo_id, svn_rev, ctx.no_target_projection)
+            == NoTargetReceiptVerdict::Accepted
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verified_git_no_target_receipt_personal(
+    ctx: &TeamEchoContext<'_>,
+    sha: &str,
+) -> Result<bool, DatabaseError> {
+    for repo_id in ctx.db.personal_repo_ids_for_read()? {
+        let key = format!("handled_git_no_target_{}_{}", repo_id, sha);
+        let Some(raw) = ctx.db.get_state(&key)? else {
+            continue;
+        };
+        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
+        let Some(record) = receipt else {
+            continue;
+        };
+        if verify_no_target_receipt(&record, repo_id, sha, ctx.no_target_projection)
+            == NoTargetReceiptVerdict::Accepted
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn unfinalized_journal_blocks_echo(state: &GitPushOperationState, resume_authorized: bool) -> bool {
@@ -290,6 +446,7 @@ pub fn personal_mode_marker_echo(message: &str) -> bool {
 mod tests {
     use super::*;
     use crate::db::git_push_operations::{git_push_target_fingerprint, GitPushIntent};
+    use crate::db::personal_scope::{LEGACY_PERSONAL_REPO_ID, PERSONAL_SCOPE_KEY};
     use crate::db::svn_commit_operations::{svn_commit_target_fingerprint, SvnCommitIntent};
     use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
@@ -929,6 +1086,47 @@ mod tests {
         assert_eq!(
             classify_incoming_git_commit(&ctx(&db, "pair"), git_sha, &marker)
                 .unwrap()
+                .unwrap(),
+            EchoDisposition::DeferPendingJournal
+        );
+    }
+
+    #[test]
+    fn legacy_unfinalized_personal_journal_holds_when_managed_personal_repo_exists() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('personal','Managed','file:///x','','','local','','r','main','team',5,0,0,1,'t','t',2,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let fingerprint =
+            svn_commit_target_fingerprint(LEGACY_PERSONAL_REPO_ID, "uuid", "/repo", "/repo", "{}");
+        db.begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: LEGACY_PERSONAL_REPO_ID,
+            initiator_id: "worker",
+            request_id: "legacy-hold",
+            target_fingerprint: &fingerprint,
+            source_git_sha: git_sha,
+            source_git_parent: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            source_git_tree: "cccccccccccccccccccccccccccccccccccccccc",
+            target_svn_uuid: "uuid",
+            target_svn_path: "/repo",
+            target_svn_root_url: "/repo",
+            target_svn_branch_path: "",
+            pre_write_svn_rev: 4,
+            pre_write_svn_tree: "dddddddddddddddddddddddddddddddddddddddd",
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            author: "dev",
+            source_message: "pre-upgrade journal",
+        })
+        .unwrap();
+        assert_eq!(
+            classify_incoming_svn_revision_personal(&ctx(&db, PERSONAL_SCOPE_KEY), 5, "no marker",)
                 .unwrap(),
             EchoDisposition::DeferPendingJournal
         );

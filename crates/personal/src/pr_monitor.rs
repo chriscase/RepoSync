@@ -104,7 +104,7 @@ impl<'a> PrMonitor<'a> {
             // Skip PRs that have already been processed.
             let already_synced = self
                 .db
-                .is_pr_synced(&merge_sha)
+                .is_personal_pr_synced(&merge_sha)
                 .context("failed to check PR sync status in database")?;
 
             if already_synced {
