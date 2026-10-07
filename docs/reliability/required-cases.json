@@ -280,6 +280,18 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_PERSONAL_LFS_ABORT_STOPS_BATCH",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_lfs_abort_cleans_sibling_and_stops_batch",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS05_PERSONAL_LFS_ABORT_RETRY_IN_ORDER",
+      "binary": "integration",
+      "test": "candidate_rs05_personal_lfs_abort_retries_in_order",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_TEAM_EQUAL_REVISION_SCOPED",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_two_repos_equal_revision_import_completion_scoped",
@@ -933,6 +945,10 @@
     {"id":"RS_C02_RENAME_BOTH_BLOCKED", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_both_endpoints_blocked_leaves_pristine_wc", "tier":"candidate_regression"},
     {"id":"RS_C02_RENAME_NO_PATH_RULES", "binary":"team_mode_e2e", "test":"candidate_rsc02_rename_no_path_rules_removes_source", "tier":"candidate_regression"},
     {"id":"RS_C02_RENAME_SOURCE_PATH_CONFLICT", "binary":"team_mode_e2e", "test":"candidate_rsc02_git_rename_svn_edit_source_path_conflict", "tier":"candidate_regression"},
+    {"id":"R17_SVNSERVE_CONCURRENT_OVERLAP", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_concurrent_overlap", "tier":"candidate_regression"},
+    {"id":"R17_SVNSERVE_CHECKPOINT_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_checkpoint_isolation", "tier":"candidate_regression"},
+    {"id":"R17_SVNSERVE_CREDENTIAL_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_credential_isolation", "tier":"candidate_regression"},
+    {"id":"R17_SVNSERVE_JOB_ISOLATION", "binary":"real_engine_scenarios", "test":"scenario_r17_svnserve_job_isolation", "tier":"candidate_regression"},
     {"id":"RS11_TEAM_CREDENTIAL_ISOLATION", "binary":"team_mode_e2e", "test":"candidate_rs11_two_repos_reload_uses_scoped_credentials", "tier":"candidate_regression"},
     {"id":"RS11_TEAM_CREDENTIAL_ROTATION_RELOAD", "binary":"team_mode_e2e", "test":"candidate_rs11_rotation_and_reopen_reload_scoped_credentials", "tier":"candidate_regression"},
     {"id":"RS11_TEAM_CREDENTIAL_REVOCATION", "binary":"team_mode_e2e", "test":"candidate_rs11_revocation_clears_without_global_fallback", "tier":"candidate_regression"},

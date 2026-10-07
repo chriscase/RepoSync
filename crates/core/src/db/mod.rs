@@ -7,6 +7,7 @@ pub mod credential_seeding;
 pub mod git_push_operations;
 pub mod import_operations;
 pub mod managed_remove;
+pub mod personal_scope;
 pub mod queries;
 pub mod schema;
 pub mod svn_commit_operations;
