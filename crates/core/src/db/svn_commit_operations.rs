@@ -304,16 +304,26 @@ fn personal_finalize_tx(
         )?;
     }
     let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM commit_map WHERE git_sha = ?1 AND direction = 'git_to_svn')",
-        params![op.source_git_sha],
+        "SELECT EXISTS(
+            SELECT 1 FROM commit_map
+            WHERE git_sha = ?1 AND direction = 'git_to_svn' AND repo_id = ?2
+        )",
+        params![op.source_git_sha, op.repo_id],
         |row| row.get(0),
     )?;
     if !exists {
         let now = Utc::now().to_rfc3339();
         tx.execute(
-            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author)
-             VALUES (?1, ?2, 'git_to_svn', ?3, ?4, ?5)",
-            params![svn_rev, op.source_git_sha, now, op.author, git_author],
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (?1, ?2, 'git_to_svn', ?3, ?4, ?5, ?6)",
+            params![
+                svn_rev,
+                op.source_git_sha,
+                now,
+                op.author,
+                git_author,
+                op.repo_id
+            ],
         )?;
     }
     let now = Utc::now().to_rfc3339();
@@ -927,6 +937,39 @@ mod tests {
             .unwrap();
         assert_eq!(held.state, SvnCommitOperationState::ReconciliationRequired);
         assert!(!held.resume_authorized);
+    }
+
+    #[test]
+    fn personal_confirm_inserts_scoped_commit_map_when_managed_row_exists() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (3, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'git_to_svn', 't', 'team', 'Team', 'managed-pair')",
+                [],
+            )
+            .unwrap();
+        let paths = vec![IntendedPath {
+            action: "A".into(),
+            path: "feature.txt".into(),
+            content_sha256: Some("d".repeat(64)),
+        }];
+        let (intent, _, _) = sample_intent(paths, "post-tree");
+        let op = db.begin_git_to_svn_commit(intent).unwrap();
+        let done = db
+            .confirm_personal_git_to_svn_commit("pair", &op.id, 3, "post-tree", "Dev User")
+            .unwrap();
+        assert_eq!(done.state, SvnCommitOperationState::Completed);
+        let personal_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE svn_rev=3 AND git_sha=?1 AND repo_id='pair' AND direction='git_to_svn'",
+                ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(personal_rows, 1);
     }
 
     #[test]
