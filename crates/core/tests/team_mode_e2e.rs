@@ -4073,13 +4073,13 @@ async fn candidate_r66_incomplete_conflict_coverage_fail_closed() {
         1
     );
     let (_tip, _chain) = build_linear_commit_chain(&fixture, 7);
-    let scoped = format!(
-        "REPOSYNC_TEST_INCOMPLETE_CONFLICT_COVERAGE__{}",
-        fixture.repo_id
-    );
-    std::env::set_var(&scoped, "1");
+    fixture
+        .engine
+        .set_incomplete_conflict_coverage_test_fault(true);
     let result = fixture.engine.run_sync_cycle().await;
-    std::env::remove_var(&scoped);
+    fixture
+        .engine
+        .set_incomplete_conflict_coverage_test_fault(false);
     let incomplete = matches!(
         &result,
         Err(SyncError::HistoryBlocked {

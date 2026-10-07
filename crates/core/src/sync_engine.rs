@@ -182,6 +182,9 @@ pub struct SyncEngine {
     /// Fixture-only replay batch cap override (debug builds).
     #[cfg(debug_assertions)]
     pending_commit_cap_override: std::sync::Mutex<Option<usize>>,
+    /// Fixture-only fault: truncate conflict coverage one commit short (debug builds).
+    #[cfg(debug_assertions)]
+    incomplete_conflict_coverage_test_fault: std::sync::Mutex<bool>,
 }
 
 impl SyncEngine {
@@ -208,6 +211,8 @@ impl SyncEngine {
             blocked_patterns: Vec::new(),
             #[cfg(debug_assertions)]
             pending_commit_cap_override: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            incomplete_conflict_coverage_test_fault: std::sync::Mutex::new(false),
         }
     }
 
@@ -215,6 +220,17 @@ impl SyncEngine {
     #[cfg(debug_assertions)]
     pub fn set_pending_commit_cap_override(&self, cap: Option<usize>) {
         *self.pending_commit_cap_override.lock().unwrap() = cap;
+    }
+
+    /// Force incomplete conflict coverage on this engine only (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_incomplete_conflict_coverage_test_fault(&self, enabled: bool) {
+        *self.incomplete_conflict_coverage_test_fault.lock().unwrap() = enabled;
+    }
+
+    #[cfg(debug_assertions)]
+    fn incomplete_conflict_coverage_test_fault_enabled(&self) -> bool {
+        *self.incomplete_conflict_coverage_test_fault.lock().unwrap()
     }
 
     fn replay_batch_cap(&self) -> Option<usize> {
@@ -3546,17 +3562,12 @@ impl SyncEngine {
             )
             .map_err(SyncError::GitError)?;
         #[cfg(debug_assertions)]
-        let conflict_commits = if let Some(rid) = self.effective_repo_id() {
-            let scoped = format!("REPOSYNC_TEST_INCOMPLETE_CONFLICT_COVERAGE__{}", rid);
-            if selection.has_more
-                && std::env::var(&scoped).is_ok()
-                && conflict_commits.len() == pending_total
-                && conflict_commits.len() > 1
-            {
-                conflict_commits[..conflict_commits.len() - 1].to_vec()
-            } else {
-                conflict_commits
-            }
+        let conflict_commits = if selection.has_more
+            && self.incomplete_conflict_coverage_test_fault_enabled()
+            && conflict_commits.len() == pending_total
+            && conflict_commits.len() > 1
+        {
+            conflict_commits[..conflict_commits.len() - 1].to_vec()
         } else {
             conflict_commits
         };
@@ -4574,5 +4585,17 @@ repo = "test/test-repo"
                 ..
             }) if reason == "incomplete_conflict_coverage"
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn incomplete_conflict_coverage_test_fault_is_per_engine() {
+        let left = team_echo_engine("left");
+        let right = team_echo_engine("right");
+        left.set_incomplete_conflict_coverage_test_fault(true);
+        assert!(left.incomplete_conflict_coverage_test_fault_enabled());
+        assert!(!right.incomplete_conflict_coverage_test_fault_enabled());
+        left.set_incomplete_conflict_coverage_test_fault(false);
+        assert!(!left.incomplete_conflict_coverage_test_fault_enabled());
     }
 }
