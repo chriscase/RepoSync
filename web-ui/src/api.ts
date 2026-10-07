@@ -492,13 +492,13 @@ export const api = {
     return body;
   },
 
-  getManagedRemoval: async (id: string): Promise<ManagedRemovalStatus> => {
+  getManagedRemoval: async (id: string): Promise<ManagedRemovalStatus | null> => {
     const token = localStorage.getItem('session_token');
     const res = await fetch(`${API_BASE}/repos/${id}/removal`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (res.status === 404) {
-      throw new Error('managed removal not found');
+      return null;
     }
     const text = await res.text();
     let body = {} as ManagedRemovalStatus & { error?: string };

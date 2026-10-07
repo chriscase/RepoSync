@@ -189,17 +189,6 @@ export default function RepoDetail() {
     retry: detailRetry,
   });
 
-  const removalStatusQuery = useQuery<ManagedRemovalStatus>({
-    queryKey: ['managed-removal', id],
-    queryFn: () => api.getManagedRemoval(id!),
-    enabled: !!id && isAdmin && (detailLive || removalReceipt?.repoId === id),
-    retry: false,
-    refetchInterval: (query) => {
-      const state = query.state.data?.state;
-      return managedRemovalNeedsPoll(state) ? 2000 : false;
-    },
-  });
-
   const skipContextEnabled = detailLive && isAdmin && status?.state === 'error_paused';
   const { data: skipContextResponse } = useQuery({
     queryKey: ['skip-commit-context', id],
@@ -403,6 +392,25 @@ export default function RepoDetail() {
         setRetiredId(id!);
         navigate('/repos', { replace: true });
       }
+    },
+  });
+
+  const removalStatusQuery = useQuery<ManagedRemovalStatus | null>({
+    queryKey: ['managed-removal', id],
+    queryFn: () => api.getManagedRemoval(id!),
+    enabled:
+      !!id
+      && isAdmin
+      && detailLive
+      && !repo?.parent_id
+      && (showRemoveConfirm
+        || removeMutation.isPending
+        || removeMutation.isSuccess
+        || removalReceipt?.repoId === id),
+    retry: false,
+    refetchInterval: (query) => {
+      const state = query.state.data?.state;
+      return managedRemovalNeedsPoll(state) ? 2000 : false;
     },
   });
 
