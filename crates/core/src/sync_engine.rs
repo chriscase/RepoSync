@@ -459,17 +459,8 @@ impl SyncEngine {
                     .filter(|s| !s.is_empty())
             }
         } else {
-            match self
-                .db
-                .get_state(&self.git_sha_key())
+            crate::sync_status::resolve_unscoped_last_git_hash(&self.db)
                 .map_err(SyncError::DatabaseError)?
-            {
-                Some(s) if !s.is_empty() => Some(s),
-                _ => self
-                    .db
-                    .get_last_git_hash()
-                    .map_err(SyncError::DatabaseError)?,
-            }
         };
         let last_error_at = self.db.last_error_at().map_err(SyncError::DatabaseError)?;
 

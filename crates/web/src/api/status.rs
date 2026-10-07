@@ -151,11 +151,8 @@ async fn get_status(
         .unwrap_or(None)
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| db.get_last_svn_revision().ok().flatten());
-    let last_git_hash = db
-        .get_state("last_git_hash")
-        .unwrap_or(None)
-        .filter(|s| !s.is_empty())
-        .or_else(|| db.get_last_git_hash().ok().flatten());
+    let last_git_hash = reposync_core::sync_status::resolve_unscoped_last_git_hash(db)
+        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
     let total_syncs = db.count_sync_records().unwrap_or(0);
     let total_conflicts = db.count_all_conflicts().unwrap_or(0);
     let active_conflicts = db.count_active_conflicts().unwrap_or(0);
