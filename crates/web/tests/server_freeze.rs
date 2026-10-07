@@ -1761,6 +1761,14 @@ async fn candidate_74_mounted_import_card_real_api_browser_journey() {
     std::env::set_var("REPOSYNC_IMPORT_CANCEL_OBSERVE", "1");
     let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "cancel").await;
     let mut browser = Some(browser);
+    // The browser child starts asynchronously; wait for it to POST /import before
+    // expecting worker fixture barriers so Chrome/Vite slowness cannot consume the
+    // after_first_local budget.
+    wait_for_file_timeout(
+        &barrier.join("import_started.ready"),
+        Duration::from_secs(60),
+    )
+    .await;
     wait_for_file(&barrier.join("after_first_local.ready")).await;
     state
         .db
@@ -2075,7 +2083,12 @@ async fn candidate_64a_real_import_completes_with_confirmed_ref_and_cursors() {
 
 #[cfg(feature = "reliability-fixture")]
 async fn wait_for_file(path: &Path) {
-    let waited = tokio::time::timeout(Duration::from_secs(30), async {
+    wait_for_file_timeout(path, Duration::from_secs(30)).await;
+}
+
+#[cfg(feature = "reliability-fixture")]
+async fn wait_for_file_timeout(path: &Path, timeout: Duration) {
+    let waited = tokio::time::timeout(timeout, async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
