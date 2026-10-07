@@ -341,19 +341,26 @@ impl<'a> InitialImport<'a> {
         for entry in &log_entries {
             let rev = entry.revision;
 
-            // Export this revision to a temp directory, then copy with policy.
-            let export_dir = match tempfile::tempdir() {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(rev, error = %e, "failed to create temp dir, skipping revision");
-                    continue;
-                }
-            };
-
-            if let Err(e) = self.svn_client.export("", rev, export_dir.path()).await {
-                warn!(rev, error = %e, "failed to export revision, skipping");
+            if self
+                .db
+                .is_personal_svn_rev_synced(rev)
+                .context("failed to check personal SVN revision sync state")?
+            {
+                debug!(
+                    rev,
+                    "SVN revision already mapped in personal scope, skipping"
+                );
                 continue;
             }
+
+            // Export this revision to a temp directory, then copy with policy.
+            let export_dir = tempfile::tempdir()
+                .with_context(|| format!("failed to create temp dir for SVN revision r{}", rev))?;
+
+            self.svn_client
+                .export("", rev, export_dir.path())
+                .await
+                .with_context(|| format!("failed to export SVN revision r{}", rev))?;
 
             // Copy with policy enforcement — propagate hard I/O errors
             // instead of silently swallowing them.

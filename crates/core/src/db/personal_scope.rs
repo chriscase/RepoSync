@@ -357,8 +357,16 @@ impl Database {
         last_svn_rev: i64,
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
-        self.set_watermark("svn_rev", &last_svn_rev.to_string())?;
-        self.set_legacy_import_git_sha_watermark(git_sha)
+        self.transaction(|tx| {
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params!["svn_rev", last_svn_rev.to_string(), now],
+            )?;
+            Database::set_legacy_import_git_sha_watermark_tx(tx, git_sha)?;
+            Ok(())
+        })
     }
 }
 
