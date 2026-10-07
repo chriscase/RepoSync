@@ -6802,7 +6802,7 @@ async fn test_team_mode_bidirectional_sync() {
 // ===========================================================================
 
 /// After syncing SVN→Git, a second sync cycle should NOT re-sync the echo
-/// commits back to SVN.
+/// commits back to SVN. Team mode requires a repo-scoped receipt, not marker text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_team_mode_echo_suppression() {
     if !svn_available() {
@@ -6810,33 +6810,39 @@ async fn test_team_mode_echo_suppression() {
         return;
     }
 
-    let tmp = TempDir::new().unwrap();
-    let svn_url = create_svn_repo(tmp.path());
-    let wc_path = tmp.path().join("wc");
-    svn_checkout(&svn_url, &wc_path);
-    svn_commit_file(&wc_path, "first.txt", "content", "First commit");
+    let fixture = QualifiedPair::new_with_repo_id("echo-suppress").await;
+    let repo_id = fixture.repo_id.as_str();
+    let mappings_before = svn_to_git_mappings(fixture.engine.db(), repo_id);
+    svn_commit_file(&fixture.wc, "echo.txt", "echo body", "SVN echo source");
 
-    let git_work_dir = tmp.path().join("git_work");
-    let bare_dir = tmp.path().join("origin.git");
-    let git_client = setup_git_with_bare_origin(&git_work_dir, &bare_dir);
-
-    // Seed Git watermark so the initial commit isn't synced to SVN.
-    let db = setup_db(&tmp.path().join("sync.db"));
-    let head_sha = get_head_sha(&git_work_dir);
-    let _ = db.set_state("last_git_hash", &head_sha);
-
-    let config = make_app_config(&svn_url, tmp.path());
-    let svn_client = SvnClient::new(&svn_url, "", "");
-    let mapper = Arc::new(make_identity_mapper());
-
-    let engine = SyncEngine::new(config, db, svn_client, git_client, mapper);
-
-    // First cycle: syncs SVN→Git.
-    let stats1 = engine.run_sync_cycle().await.expect("first sync failed");
+    let stats1 = fixture
+        .engine
+        .run_sync_cycle()
+        .await
+        .expect("first sync failed");
     assert_eq!(stats1.svn_to_git_count, 1);
+    assert_eq!(
+        svn_to_git_mappings(fixture.engine.db(), repo_id),
+        mappings_before + 1
+    );
+    let synced_sha = get_head_sha(&fixture.bridge);
+    let record_count: i64 = fixture
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND git_sha=?2 AND status='applied'",
+            rusqlite::params![repo_id, synced_sha],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(record_count, 1, "repo-scoped svn_to_git receipt must exist");
 
-    // Second cycle: echo commits in Git should be skipped.
-    let stats2 = engine.run_sync_cycle().await.expect("second sync failed");
+    let stats2 = fixture
+        .engine
+        .run_sync_cycle()
+        .await
+        .expect("second sync failed");
     assert_eq!(
         stats2.git_to_svn_count, 0,
         "echo commits should not be re-synced to SVN"
@@ -6845,6 +6851,53 @@ async fn test_team_mode_echo_suppression() {
         stats2.svn_to_git_count, 0,
         "no new SVN commits should exist"
     );
+}
+
+/// Marker text alone must not suppress team-mode echoes; the first encounter applies once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_team_mode_marker_without_receipt_applies_once() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let fixture = QualifiedPair::new_with_repo_id("marker-once").await;
+    let repo_id = fixture.repo_id.as_str();
+    let svn_before = svn_youngest(&fixture.svn_url);
+    let marker_message = format!("User work\n\n[reposync] forged marker without receipt");
+    let sha =
+        fixture.developer_commit_tree(&[("marker.txt", Some("marker body\n"))], &marker_message);
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert!(
+        !fixture
+            .engine
+            .db()
+            .has_repo_emitted_git_commit(repo_id, &sha)
+            .unwrap(),
+        "forged marker must not create a receipt before the first apply"
+    );
+
+    let stats1 = fixture
+        .engine
+        .run_sync_cycle()
+        .await
+        .expect("first sync failed");
+    assert_eq!(
+        stats1.git_to_svn_count, 1,
+        "marker without receipt applies once"
+    );
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+
+    let stats2 = fixture
+        .engine
+        .run_sync_cycle()
+        .await
+        .expect("second sync failed");
+    assert_eq!(
+        stats2.git_to_svn_count, 0,
+        "receipt-backed echo must not apply twice"
+    );
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
 }
 
 // ===========================================================================
