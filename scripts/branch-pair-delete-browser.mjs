@@ -480,8 +480,12 @@ async function runScenarios(uiOrigin, session, mode) {
   await click('delete-viewed-branch-pair');
   await confirmDelete('warn-branch', { remote: true });
   await until(async () => (await pathOf()) === '/repos/parent-1', 'parent after warnings');
+  await until(
+    async () => (await notice()).includes("failed to delete Git branch 'warn-branch'"),
+    'warning visible after navigation',
+    20000,
+  );
   const warning = await notice();
-  if (!warning.includes("failed to delete Git branch 'warn-branch'")) throw new Error(`Warning was not visible after navigation: ${warning}`);
   if (!warning.includes('cleanup warnings')) throw new Error(`Warnings were presented as a clean removal: ${warning}`);
   results.push('warnings-remain-visible');
 

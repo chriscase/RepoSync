@@ -273,9 +273,11 @@ export default function RepoDetail() {
         name: target.name,
         viewedId: id,
       };
+      const gitOpt = document.querySelector('[data-testid="delete-git-opt"]') as HTMLInputElement | null;
+      const svnOpt = document.querySelector('[data-testid="delete-svn-opt"]') as HTMLInputElement | null;
       const options = {
-        delete_git: deleteBranchOpts.delete_git,
-        delete_svn: deleteBranchOpts.delete_svn,
+        delete_git: gitOpt?.checked ?? deleteBranchOpts.delete_git,
+        delete_svn: svnOpt?.checked ?? deleteBranchOpts.delete_svn,
       };
       let parentExists: boolean | null = null;
       if (snapshot.id === snapshot.viewedId && snapshot.parentId) {
@@ -1398,6 +1400,7 @@ export default function RepoDetail() {
                               e.stopPropagation();
                               setDeleteBranchTarget(bp);
                               setDeleteBranchConfirmText('');
+                              setDeleteBranchOpts({ delete_git: false, delete_svn: false });
                               deleteBranchMutation.reset();
                             }}
                             className="text-gray-500 hover:text-red-400 transition-colors p-1"
