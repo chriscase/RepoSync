@@ -45,7 +45,7 @@ use crate::echo_suppression::{
     SYNC_MARKER,
 };
 use crate::errors::SyncError;
-use crate::git::client::GitClient;
+use crate::git::client::{GitClient, PendingCommitSelection};
 use crate::git_push::{
     inspect_svn_to_git_push, observed_git_ref, observed_git_tree, GitPushInspect,
 };
@@ -56,6 +56,7 @@ use crate::history_inspect::{
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
 use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+use crate::pending_frontier::{pending_frontier_is_merge_dag, GitReplayContinuation};
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
     hash_regular_file_tree, intended_paths_from_contents, observed_svn_tree_at_revision,
@@ -143,10 +144,13 @@ struct TeamHistoryAdmission {
 struct GitFetchResult {
     replay_batch: Vec<GitChangeSet>,
     conflict_coverage: Vec<GitChangeSet>,
+    conflict_coverage_commit_count: usize,
     has_more: bool,
     reset_target: String,
     pending_total: usize,
     deferred_mixed_pending: bool,
+    continuation_to_persist: Option<GitReplayContinuation>,
+    clear_continuation: bool,
 }
 
 /// The bidirectional sync engine.
@@ -1227,6 +1231,11 @@ impl SyncEngine {
         }
 
         // 2. Detect conflicts against the full admitted P→R path, not only the replay batch.
+        self.ensure_conflict_coverage_before_detection(
+            git_fetch.has_more,
+            git_fetch.pending_total,
+            git_fetch.conflict_coverage_commit_count,
+        )?;
         let conflicts =
             self.detect_conflicts_internal(&svn_changes, &git_fetch.conflict_coverage)?;
         stats.conflicts_detected = conflicts.len();
@@ -1311,6 +1320,12 @@ impl SyncEngine {
                     },
                 });
             }
+        }
+
+        if git_fetch.clear_continuation {
+            self.clear_git_replay_continuation()?;
+        } else if let Some(continuation) = git_fetch.continuation_to_persist {
+            self.persist_git_replay_continuation(&continuation)?;
         }
 
         info!(
@@ -3219,52 +3234,239 @@ impl SyncEngine {
         Ok(change_sets)
     }
 
+    fn load_git_replay_continuation(&self) -> Result<Option<GitReplayContinuation>, SyncError> {
+        let Some(rid) = self.effective_repo_id() else {
+            return Ok(None);
+        };
+        let key = GitReplayContinuation::state_key(rid);
+        let raw = self.db.get_state(&key).map_err(SyncError::DatabaseError)?;
+        raw.as_deref()
+            .map(|value| {
+                serde_json::from_str(value).map_err(|error| SyncError::HistoryBlocked {
+                    reason: "invalid_git_replay_continuation".into(),
+                    detail: format!("stored continuation state is unreadable: {error}"),
+                })
+            })
+            .transpose()
+    }
+
+    fn persist_git_replay_continuation(
+        &self,
+        continuation: &GitReplayContinuation,
+    ) -> Result<(), SyncError> {
+        let Some(rid) = self.effective_repo_id() else {
+            return Ok(());
+        };
+        let key = GitReplayContinuation::state_key(rid);
+        let value =
+            serde_json::to_string(continuation).map_err(|error| SyncError::HistoryBlocked {
+                reason: "invalid_git_replay_continuation".into(),
+                detail: format!("continuation state could not be encoded: {error}"),
+            })?;
+        self.db
+            .set_state(&key, &value)
+            .map_err(SyncError::DatabaseError)
+    }
+
+    fn clear_git_replay_continuation(&self) -> Result<(), SyncError> {
+        if let Some(rid) = self.effective_repo_id() {
+            let key = GitReplayContinuation::state_key(rid);
+            self.db
+                .conn()
+                .execute("DELETE FROM kv_state WHERE key = ?1", [&key])
+                .map_err(|error| {
+                    SyncError::DatabaseError(crate::errors::DatabaseError::from(error))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn svn_changes_block_git_continuation(
+        &self,
+        svn_changes: &[SvnChangeSet],
+    ) -> Result<bool, SyncError> {
+        if svn_changes.is_empty() {
+            return Ok(false);
+        }
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for change in svn_changes {
+            if change.changed_files.is_empty() {
+                continue;
+            }
+            let content = svn
+                .diff_content_only(change.revision)
+                .await
+                .map_err(SyncError::SvnError)?;
+            if !content.trim().is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn ensure_conflict_coverage_before_detection(
+        &self,
+        has_more: bool,
+        pending_total: usize,
+        coverage_len: usize,
+    ) -> Result<(), SyncError> {
+        if has_more && coverage_len != pending_total {
+            return Err(SyncError::HistoryBlocked {
+                reason: "incomplete_conflict_coverage".into(),
+                detail: format!(
+                    "conflict detection refused on partial batch state: coverage={coverage_len} pending_total={pending_total}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn pending_selection_is_merge_dag(
+        git: &GitClient,
+        since_sha: &str,
+        tip_sha: &str,
+    ) -> Result<bool, SyncError> {
+        let repo = git2::Repository::open(git.repo_path())
+            .map_err(|error| SyncError::GitError(crate::errors::GitError::Git2Error(error)))?;
+        pending_frontier_is_merge_dag(&repo, since_sha, tip_sha).map_err(SyncError::GitError)
+    }
+
+    fn next_git_replay_continuation(
+        &self,
+        admission: &TeamHistoryAdmission,
+        stored: Option<&GitReplayContinuation>,
+        selection: &PendingCommitSelection,
+        merge_dag: bool,
+    ) -> (Option<GitReplayContinuation>, bool) {
+        if selection.has_more {
+            let mut handled = stored
+                .map(|state| state.handled_shas.clone())
+                .unwrap_or_default();
+            if merge_dag {
+                handled.extend(selection.commits.iter().map(|commit| commit.sha.clone()));
+            }
+            let continuation = GitReplayContinuation {
+                p_origin: stored
+                    .map(|state| state.p_origin.clone())
+                    .unwrap_or_else(|| admission.checkpoint.clone()),
+                r_admitted: admission.remote_tip.clone(),
+                handled_shas: handled,
+                merge_dag,
+            };
+            (Some(continuation), false)
+        } else {
+            (None, stored.is_some())
+        }
+    }
+
     async fn fetch_git_changes(
         &self,
         admission: &TeamHistoryAdmission,
         svn_changes: &[SvnChangeSet],
     ) -> Result<GitFetchResult, SyncError> {
-        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-
         info!(since_sha = %admission.checkpoint, remote_sha = %admission.remote_tip, "fetching admitted Git changes");
 
         // Select P..R from the pinned inspection objects before reset so a
-        // visited-order HEAD walk cannot skip older pending work. Unsupported
-        // merge-DAG continuation batches fail closed with no mutation.
+        // visited-order HEAD walk cannot skip older pending work.
         let batch_cap = self.replay_batch_cap();
-        let selection = git
-            .pending_commits_between(&admission.checkpoint, &admission.remote_tip, batch_cap)
+        let stored = self.load_git_replay_continuation()?;
+        if let Some(continuation) = &stored {
+            if continuation.r_admitted != admission.remote_tip {
+                return Err(SyncError::HistoryBlocked {
+                    reason: "continuation_remote_drift".into(),
+                    detail: "admitted remote tip changed during incomplete Git replay continuation"
+                        .into(),
+                });
+            }
+        }
+
+        let selection_origin = stored
+            .as_ref()
+            .map(|state| state.p_origin.as_str())
+            .unwrap_or(admission.checkpoint.as_str());
+        let (selection, merge_dag): (PendingCommitSelection, bool) = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            let selection = if let Some(continuation) = &stored {
+                if continuation.merge_dag {
+                    git.pending_commits_continuation_batch(
+                        &continuation.p_origin,
+                        &admission.remote_tip,
+                        &continuation.handled_shas,
+                        batch_cap,
+                    )
+                } else {
+                    git.pending_commits_between(
+                        &admission.checkpoint,
+                        &admission.remote_tip,
+                        batch_cap,
+                    )
+                }
+            } else {
+                git.pending_commits_between(&admission.checkpoint, &admission.remote_tip, batch_cap)
+            }
             .map_err(|error| match error {
                 crate::errors::GitError::UnsupportedHistory { reason, detail } => self
                     .record_history_block(
                         &reason,
                         &detail,
-                        Some(&admission.checkpoint),
+                        Some(selection_origin),
                         None,
                         Some(&admission.remote_tip),
                         None,
                     ),
                 other => SyncError::GitError(other),
             })?;
+            let merge_dag = if let Some(state) = stored.as_ref() {
+                state.merge_dag
+            } else if selection.has_more {
+                Self::pending_selection_is_merge_dag(&git, selection_origin, &admission.remote_tip)?
+            } else {
+                false
+            };
+            (selection, merge_dag)
+        };
+        let pending_total = if stored.is_some() {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git.pending_commits_between(selection_origin, &admission.remote_tip, batch_cap)
+                .map_err(SyncError::GitError)?
+                .total
+        } else {
+            selection.total
+        };
+        let (continuation_to_persist, clear_continuation) =
+            self.next_git_replay_continuation(admission, stored.as_ref(), &selection, merge_dag);
 
-        if selection.has_more && !svn_changes.is_empty() {
+        if selection.has_more && self.svn_changes_block_git_continuation(svn_changes).await? {
             return Ok(GitFetchResult {
                 replay_batch: Vec::new(),
                 conflict_coverage: Vec::new(),
+                conflict_coverage_commit_count: 0,
                 has_more: true,
                 reset_target: admission.checkpoint.clone(),
-                pending_total: selection.total,
+                pending_total,
                 deferred_mixed_pending: true,
+                continuation_to_persist: None,
+                clear_continuation: false,
             });
         }
 
+        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
         let conflict_commits = git
             .pending_commits_for_conflict_coverage(
-                &admission.checkpoint,
+                selection_origin,
                 &admission.remote_tip,
                 batch_cap,
             )
             .map_err(SyncError::GitError)?;
+        self.ensure_conflict_coverage_before_detection(
+            selection.has_more,
+            pending_total,
+            conflict_commits.len(),
+        )?;
 
         let reset_target = if selection.has_more {
             selection.batch_tip.clone()
@@ -3308,10 +3510,13 @@ impl SyncEngine {
         Ok(GitFetchResult {
             replay_batch,
             conflict_coverage,
+            conflict_coverage_commit_count: conflict_commits.len(),
             has_more: selection.has_more,
             reset_target,
-            pending_total: selection.total,
+            pending_total,
             deferred_mixed_pending: false,
+            continuation_to_persist,
+            clear_continuation,
         })
     }
 

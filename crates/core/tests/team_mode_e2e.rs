@@ -3763,48 +3763,172 @@ async fn push_older_side_merge_dag_fixture(fixture: &QualifiedPair) -> (String, 
     (checkpoint, z, merge)
 }
 
-async fn assert_merge_dag_continuation_fail_closed_before_writes(cap: usize) {
+fn git_replay_continuation_json(fixture: &QualifiedPair) -> Option<serde_json::Value> {
+    let key = reposync_core::pending_frontier::GitReplayContinuation::state_key(&fixture.repo_id);
+    fixture
+        .engine
+        .db()
+        .get_state(&key)
+        .ok()
+        .flatten()
+        .map(|raw| serde_json::from_str(&raw).unwrap())
+}
+
+async fn assert_merge_dag_continuation_drains_without_reorder(cap: usize) {
     let fixture = QualifiedPair::new().await;
     let _cap_guard = PendingCapGuard::new(&fixture.engine, cap);
     let (checkpoint, z, merge) = push_older_side_merge_dag_fixture(&fixture).await;
-    assert_pair_blocked_without_damage(&fixture, "unsupported_merge_dag").await;
-    let block = history_block_json(&fixture);
+    let before = fixture.snapshot().await;
+    let mut batches = Vec::new();
+    let mut cycles = 0;
+    while fixture.snapshot().await.watermark.1 != merge {
+        cycles += 1;
+        assert!(
+            cycles <= 8,
+            "cap={cap} must drain within a bounded number of cycles"
+        );
+        let stats = fixture.engine.run_sync_cycle().await.unwrap();
+        batches.push(stats.git_to_svn_count);
+        if !stats.git_replay_has_more {
+            break;
+        }
+    }
+    let after = fixture.snapshot().await;
     assert!(
-        block["detail"].as_str().unwrap().contains("exceeds cap"),
-        "block detail must explain merge-DAG overflow: {block}"
+        batches.len() > 1,
+        "cap={cap} must require multiple batches, got {batches:?}"
+    );
+    assert_eq!(after.watermark.1, merge);
+    assert_eq!(after.bridge_sha, merge);
+    assert_ne!(
+        after.watermark.1, before.watermark.1,
+        "replay must advance the handled checkpoint"
+    );
+    assert!(
+        git_replay_continuation_json(&fixture).is_none(),
+        "continuation state must clear after the frontier drains"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
-            "case":"R10_MERGE_DAG_CONTINUATION_FAIL_CLOSED",
+            "case":"R10_MERGE_DAG_CONTINUATION",
             "p":checkpoint,
             "r":merge,
             "older_side":z,
-            "reason":"unsupported_merge_dag",
             "pending_cap":cap,
             "pending_commits":4,
-            "durable":true,
-            "before_writes":true,
-            "merge_dag_overflow_fail_closed":true
+            "batches":batches,
+            "merge_dag_continuation":true
         })
     );
 }
 
-/// Merge-DAG backlogs that exceed the replay cap fail closed before writes
-/// because a single Git SHA cannot checkpoint a cut through the DAG.
+/// Merge-DAG backlogs beyond the replay cap continue in deterministic batches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_continuation_fail_closed_before_writes() {
-    assert_merge_dag_continuation_fail_closed_before_writes(3).await;
+async fn candidate_r10_merge_dag_continuation_batched() {
+    assert_merge_dag_continuation_drains_without_reorder(3).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_continuation_fail_closed_cap1_before_writes() {
-    assert_merge_dag_continuation_fail_closed_before_writes(1).await;
+async fn candidate_r10_merge_dag_continuation_batched_cap1() {
+    assert_merge_dag_continuation_drains_without_reorder(1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn candidate_r10_merge_dag_continuation_fail_closed_cap2_before_writes() {
-    assert_merge_dag_continuation_fail_closed_before_writes(2).await;
+async fn candidate_r10_merge_dag_continuation_batched_cap2() {
+    assert_merge_dag_continuation_drains_without_reorder(2).await;
+}
+
+/// Durable merge-DAG continuation survives restart without reordering or skips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_merge_dag_continuation_survives_restart() {
+    let fixture = QualifiedPair::new().await;
+    let _cap_guard = PendingCapGuard::new(&fixture.engine, 2);
+    let (checkpoint, z, merge) = push_older_side_merge_dag_fixture(&fixture).await;
+    let before = fixture.snapshot().await;
+    let first = fixture.engine.run_sync_cycle().await.unwrap();
+    assert!(first.git_replay_has_more);
+    let mid = fixture.snapshot().await;
+    assert_ne!(mid.watermark.1, before.watermark.1);
+    assert_ne!(mid.watermark.1, merge);
+    let continuation = git_replay_continuation_json(&fixture).expect("has_more must persist");
+    assert_eq!(continuation["r_admitted"].as_str().unwrap(), merge);
+    assert_eq!(continuation["p_origin"].as_str().unwrap(), checkpoint);
+    assert!(continuation["merge_dag"].as_bool().unwrap());
+    let restarted = reopen_pair(&fixture);
+    _cap_guard.apply_to(&restarted);
+    let second = restarted.run_sync_cycle().await.unwrap();
+    assert!(!second.git_replay_has_more);
+    let done = fixture.snapshot().await;
+    assert_eq!(done.watermark.1, merge);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_MERGE_DAG_CONTINUATION_RESTART",
+            "p":checkpoint,
+            "r":merge,
+            "older_side":z,
+            "batch_cap":2,
+            "checkpoint_mid":mid.watermark.1,
+            "continuation":continuation,
+            "restart_mid_continuation":true
+        })
+    );
+}
+
+/// SVN-only revisions must not defer or starve pending Git replay batches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r66_drain_git_batch_past_svn_only() {
+    let fixture = QualifiedPair::new().await;
+    let _cap = PendingCapGuard::new(&fixture.engine, 3);
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let before = fixture.snapshot().await;
+    let (tip, chain) = build_linear_commit_chain(&fixture, 7);
+    let svn_only = svn_property_only_revision(&fixture.wc);
+    assert!(svn_only > before.svn_rev);
+    let stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert!(
+        !stats.deferred_mixed_pending,
+        "SVN-only work must not defer Git continuation: {stats:?}"
+    );
+    assert_eq!(
+        stats.git_to_svn_count, 3,
+        "Git batch must drain despite SVN-only work: {stats:?}"
+    );
+    assert!(stats.git_replay_has_more);
+    let after = fixture.snapshot().await;
+    assert_eq!(after.watermark.1, chain[2]);
+    assert_eq!(
+        after.svn_rev,
+        svn_only + 3,
+        "property-only SVN must checkpoint and Git replay must still publish"
+    );
+    let continuation = git_replay_continuation_json(&fixture).expect("has_more must persist");
+    assert_eq!(continuation["r_admitted"].as_str().unwrap(), tip);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R66_DRAIN_PAST_SVN_ONLY",
+            "p":synced,
+            "r":tip,
+            "batch_cap":3,
+            "pending_total":7,
+            "svn_only_rev":svn_only,
+            "git_to_svn_first_batch":3,
+            "deferred_mixed_pending":false,
+            "continuation":continuation
+        })
+    );
 }
 
 struct PendingCapGuard<'a> {
