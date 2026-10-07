@@ -9,6 +9,9 @@ import {
   removalDestination,
   repoDetailQueryKeys,
   readBranchPairRemovalNotice,
+  persistBranchPairRemovalNotice,
+  readPersistedBranchPairRemovalNotice,
+  clearPersistedBranchPairRemovalNotice,
 } from '../branchPairRemoval';
 import ImportProgressCard from '../components/ImportProgressCard';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
@@ -324,6 +327,7 @@ export default function RepoDetail() {
         setLocalNotice(null);
         setDeleteBranchTarget(null);
         setDeleteBranchConfirmText('');
+        persistBranchPairRemovalNotice(notice);
         navigate(destination ?? '/repos', {
           replace: true,
           state: { branchPairRemoval: notice },
@@ -333,6 +337,7 @@ export default function RepoDetail() {
       if (snapshot.id !== snapshot.viewedId) {
         queryClient.invalidateQueries({ queryKey: ['branch-pairs', snapshot.viewedId] });
       }
+      persistBranchPairRemovalNotice(notice);
       setLocalNotice(notice);
       setDeleteBranchTarget(null);
       setDeleteBranchConfirmText('');
@@ -553,7 +558,7 @@ export default function RepoDetail() {
     setRetiredId(null);
   }, [id, retiredId, queryClient]);
 
-  const removalNotice = localNotice ?? routedNotice;
+  const removalNotice = localNotice ?? routedNotice ?? readPersistedBranchPairRemovalNotice();
 
   if (repoMissing) {
     return (

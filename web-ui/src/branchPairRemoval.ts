@@ -82,6 +82,12 @@ export function readBranchPairRemovalNotice(state: unknown): BranchPairRemovalNo
   if (!state || typeof state !== 'object') return null;
   const notice = (state as { branchPairRemoval?: BranchPairRemovalNotice }).branchPairRemoval;
   if (!notice || (notice.outcome !== 'completed' && notice.outcome !== 'in_progress')) return null;
+  return normalizeBranchPairRemovalNotice(notice);
+}
+
+const BRANCH_PAIR_RECEIPT_KEY = 'reposync.branchPairRemovalReceipt';
+
+function normalizeBranchPairRemovalNotice(notice: BranchPairRemovalNotice): BranchPairRemovalNotice {
   return {
     outcome: notice.outcome,
     message: notice.message ?? '',
@@ -89,4 +95,32 @@ export function readBranchPairRemovalNotice(state: unknown): BranchPairRemovalNo
     operationId: notice.operationId,
     name: notice.name,
   };
+}
+
+export function persistBranchPairRemovalNotice(notice: BranchPairRemovalNotice): void {
+  try {
+    sessionStorage.setItem(BRANCH_PAIR_RECEIPT_KEY, JSON.stringify(normalizeBranchPairRemovalNotice(notice)));
+  } catch {
+    /* ignore */
+  }
+}
+
+export function readPersistedBranchPairRemovalNotice(): BranchPairRemovalNotice | null {
+  try {
+    const raw = sessionStorage.getItem(BRANCH_PAIR_RECEIPT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BranchPairRemovalNotice;
+    if (parsed.outcome !== 'completed' && parsed.outcome !== 'in_progress') return null;
+    return normalizeBranchPairRemovalNotice(parsed);
+  } catch {
+    return null;
+  }
+}
+
+export function clearPersistedBranchPairRemovalNotice(): void {
+  try {
+    sessionStorage.removeItem(BRANCH_PAIR_RECEIPT_KEY);
+  } catch {
+    /* ignore */
+  }
 }

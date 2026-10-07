@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type Repository, type SyncStatus } from '../api';
-import { readBranchPairRemovalNotice } from '../branchPairRemoval';
+import { readBranchPairRemovalNotice, readPersistedBranchPairRemovalNotice } from '../branchPairRemoval';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import { GitBranch, Plus, Database, Clock, X, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
@@ -101,7 +101,7 @@ const defaultForm: AddRepoForm = {
 export default function Repositories() {
   const navigate = useNavigate();
   const location = useLocation();
-  const removalNotice = readBranchPairRemovalNotice(location.state);
+  const removalNotice = readBranchPairRemovalNotice(location.state) ?? readPersistedBranchPairRemovalNotice();
   const queryClient = useQueryClient();
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
