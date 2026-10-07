@@ -649,7 +649,7 @@ fn mkdirat_dir(dir: &std::os::unix::io::OwnedFd, name: &OsStr) -> std::io::Resul
         libc::mkdirat(
             dir.as_raw_fd(),
             name_c.as_ptr() as *const libc::c_char,
-            0o755,
+            0o755 as libc::mode_t,
         )
     };
     if rc < 0 {
@@ -701,7 +701,7 @@ fn openat_write_nofollow(
             dir.as_raw_fd(),
             name_c.as_ptr() as *const libc::c_char,
             flags,
-            0o600,
+            0o600 as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -713,6 +713,9 @@ fn openat_write_nofollow(
 #[cfg(unix)]
 static CONFINED_TEMP_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(all(unix, test))]
+static CONFINED_TEMP_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(unix)]
 fn confined_temp_copy_name() -> std::ffi::OsString {
     let seq = CONFINED_TEMP_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -722,15 +725,14 @@ fn confined_temp_copy_name() -> std::ffi::OsString {
 #[cfg(unix)]
 struct ConfinedTempFileGuard<'a> {
     parent: &'a std::os::unix::io::OwnedFd,
-    name: std::ffi::OsString,
-    keep: bool,
+    name: Option<std::ffi::OsString>,
 }
 
 #[cfg(unix)]
 impl Drop for ConfinedTempFileGuard<'_> {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = unlinkat_name(self.parent, self.name.as_os_str());
+        if let Some(name) = &self.name {
+            let _ = unlinkat_name(self.parent, name.as_os_str());
         }
     }
 }
@@ -792,7 +794,7 @@ fn remove_dirat_recursive(
 #[cfg(unix)]
 fn apply_mode_fd(fd: &std::os::unix::io::OwnedFd, mode: u32) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode) };
+    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
     if rc < 0 {
         return Err(io_error_from_errno());
     }
@@ -1041,17 +1043,16 @@ fn write_confined_via_temp_rename(
     display_path: &Path,
 ) -> Result<()> {
     let tmp_name = confined_temp_copy_name();
-    let mut temp_guard = ConfinedTempFileGuard {
-        parent,
-        name: tmp_name.clone(),
-        keep: false,
-    };
     let fd = openat_write_nofollow(parent, tmp_name.as_os_str(), true).with_context(|| {
         format!(
             "failed to create temporary file for {}",
             display_path.display()
         )
     })?;
+    let mut temp_guard = ConfinedTempFileGuard {
+        parent,
+        name: Some(tmp_name.clone()),
+    };
     let mut file = copy_to_confined_fd(fd, mode, reader, display_path)?;
     file.flush().with_context(|| {
         format!(
@@ -1065,7 +1066,7 @@ fn write_confined_via_temp_rename(
             display_path.display()
         )
     })?;
-    temp_guard.keep = true;
+    temp_guard.name = None;
     Ok(())
 }
 
@@ -4207,7 +4208,7 @@ mod tests {
         std::fs::write(src.join("ok.txt"), "ok").unwrap();
         let fifo = src.join("pipe");
         let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644 as libc::mode_t) };
         assert_eq!(rc, 0, "mkfifo failed");
 
         let started = Instant::now();
@@ -4436,7 +4437,10 @@ mod tests {
         std::fs::create_dir_all(&dst).unwrap();
         let fifo = outside.join("pipe");
         let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o644 as libc::mode_t) },
+            0
+        );
         symlink(&fifo, src.join("escape")).unwrap();
         std::fs::write(src.join("ok.txt"), "ok").unwrap();
 
@@ -4827,6 +4831,39 @@ mod tests {
             std::fs::read_to_string(&outside).unwrap(),
             "SECRET",
             "must not write through a planted destination symlink"
+        );
+    }
+
+    #[test]
+    fn confined_temp_guard_leaves_preexisting_temp_when_openat_excl_fails() {
+        use std::sync::atomic::Ordering;
+
+        let _serial = CONFINED_TEMP_GUARD_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("dest.txt"), "old").unwrap();
+        let root = open_dir_nofollow(tmp.path()).unwrap();
+
+        let seq = CONFINED_TEMP_COPY_COUNTER.load(Ordering::Relaxed);
+        let planted_name = format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq);
+        std::fs::write(tmp.path().join(&planted_name), "PLANTED-TEMP").unwrap();
+
+        let mut reader = std::io::Cursor::new(b"new-bytes");
+        let err = write_confined_via_temp_rename(
+            &root,
+            std::ffi::OsStr::new("dest.txt"),
+            0o644,
+            &mut reader,
+            Path::new("dest.txt"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("temporary file"),
+            "expected temp create failure, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(&planted_name)).unwrap(),
+            "PLANTED-TEMP",
+            "pre-existing temp name must not be unlinked when O_EXCL fails"
         );
     }
 

@@ -381,13 +381,8 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
     // line through to the target and leave the symlink in the work tree.
     unlink_gitattributes_symlink(&gitattr_path)?;
 
-    // Read existing content. Only a regular file counts; do not follow links.
-    let existing = match std::fs::symlink_metadata(&gitattr_path) {
-        Ok(meta) if meta.file_type().is_file() => std::fs::read_to_string(&gitattr_path)?,
-        Ok(_) => String::new(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    // Read existing content through an O_NOFOLLOW fd so a swapped-in symlink is not followed.
+    let existing = read_gitattributes_existing_nofollow(repo_root)?;
 
     // Check if already tracked.
     for line in existing.lines() {
@@ -413,9 +408,9 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
 }
 
 #[cfg(unix)]
-fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::fs::File> {
+fn open_repo_root_nofollow(repo_root: &Path) -> std::io::Result<std::os::unix::io::OwnedFd> {
     use std::ffi::CString;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::io::FromRawFd;
     use std::os::unix::prelude::OsStrExt;
 
     let root_c = CString::new(repo_root.as_os_str().as_bytes()).map_err(|_| {
@@ -433,8 +428,75 @@ fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::
     if root_fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let root_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(root_fd) };
+    Ok(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(root_fd) })
+}
 
+#[cfg(unix)]
+fn gitattributes_stat_is_reg(st: &libc::stat) -> bool {
+    (st.st_mode as libc::mode_t & libc::S_IFMT) == libc::S_IFREG
+}
+
+#[cfg(unix)]
+fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<String> {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+
+    let root_owned = open_repo_root_nofollow(repo_root)?;
+    let name = CString::new(".gitattributes").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            ".gitattributes contains interior NUL byte",
+        )
+    })?;
+    let read_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe {
+        libc::openat(
+            root_owned.as_raw_fd(),
+            name.as_ptr(),
+            read_flags,
+            0 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(String::new());
+        }
+        return Err(err);
+    }
+    let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstat(owned.as_raw_fd(), &mut st) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if !gitattributes_stat_is_reg(&st) {
+        return Ok(String::new());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) };
+    let mut body = String::new();
+    file.read_to_string(&mut body)?;
+    Ok(body)
+}
+
+#[cfg(not(unix))]
+fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<String> {
+    let gitattr_path = repo_root.join(".gitattributes");
+    match std::fs::symlink_metadata(&gitattr_path) {
+        Ok(meta) if meta.file_type().is_file() => std::fs::read_to_string(&gitattr_path),
+        Ok(_) => Ok(String::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let root_owned = open_repo_root_nofollow(repo_root)?;
     let name = CString::new(".gitattributes").map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -442,19 +504,43 @@ fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::
         )
     })?;
     let append_flags = libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(root_owned.as_raw_fd(), name.as_ptr(), append_flags, 0) };
+    let open_append = || unsafe {
+        libc::openat(
+            root_owned.as_raw_fd(),
+            name.as_ptr(),
+            append_flags,
+            0 as libc::c_uint,
+        )
+    };
+    let fd = open_append();
     let fd = if fd < 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() != std::io::ErrorKind::NotFound {
             return Err(err);
         }
-        let create_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let created =
-            unsafe { libc::openat(root_owned.as_raw_fd(), name.as_ptr(), create_flags, 0o644) };
+        let create_flags = append_flags | libc::O_CREAT | libc::O_EXCL;
+        let created = unsafe {
+            libc::openat(
+                root_owned.as_raw_fd(),
+                name.as_ptr(),
+                create_flags,
+                0o644 as libc::c_uint,
+            )
+        };
         if created < 0 {
-            return Err(std::io::Error::last_os_error());
+            let create_err = std::io::Error::last_os_error();
+            if create_err.kind() == std::io::ErrorKind::AlreadyExists {
+                let retry = open_append();
+                if retry < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                retry
+            } else {
+                return Err(create_err);
+            }
+        } else {
+            created
         }
-        created
     } else {
         fd
     };
