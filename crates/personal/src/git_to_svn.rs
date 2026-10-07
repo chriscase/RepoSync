@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, instrument, warn};
 
+use reposync_core::db::git_push_operations::{GitPushOperation, GitPushOperationState};
 use reposync_core::db::svn_commit_operations::{
     svn_commit_target_fingerprint, SvnCommitIntent, SvnCommitOperation, SvnCommitOperationState,
 };
@@ -185,6 +186,15 @@ impl GitToSvnSync {
             .context("failed to read active personal git-to-svn commit")?
         {
             if let Some(reason) = blocking_svn_commit_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+        if let Some(op) = self
+            .db
+            .active_git_push_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal svn-to-git push")?
+        {
+            if let Some(reason) = blocking_git_push_hold(&op) {
                 anyhow::bail!(reason);
             }
         }
@@ -463,6 +473,15 @@ impl GitToSvnSync {
             .context("failed to read active personal git-to-svn commit")?
         {
             if let Some(reason) = blocking_svn_commit_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+        if let Some(op) = self
+            .db
+            .active_git_push_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal svn-to-git push")?
+        {
+            if let Some(reason) = blocking_git_push_hold(&op) {
                 anyhow::bail!(reason);
             }
         }
@@ -984,6 +1003,24 @@ impl GitToSvnSync {
             }
         }
     }
+}
+
+fn blocking_git_push_hold(op: &GitPushOperation) -> Option<String> {
+    if op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized {
+        return Some(format!(
+            "reconciliation_required: personal svn-to-git push held ({})",
+            op.outcome_detail
+                .as_deref()
+                .unwrap_or("inspect the exact Git ref before retrying")
+        ));
+    }
+    if !op.state.is_terminal() {
+        return Some(
+            "repository has an active personal svn-to-git push; wait for the current operation"
+                .into(),
+        );
+    }
+    None
 }
 
 fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {

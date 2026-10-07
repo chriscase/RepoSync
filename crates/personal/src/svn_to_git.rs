@@ -14,6 +14,7 @@ use tracing::{debug, info};
 use reposync_core::db::git_push_operations::{
     git_push_target_fingerprint, GitPushIntent, GitPushOperation, GitPushOperationState,
 };
+use reposync_core::db::svn_commit_operations::{SvnCommitOperation, SvnCommitOperationState};
 use reposync_core::db::Database;
 use reposync_core::echo_suppression::{
     classify_incoming_svn_revision, EchoDisposition, TeamEchoContext,
@@ -100,6 +101,15 @@ impl SvnToGitSync {
             .context("failed to read active personal svn-to-git push")?
         {
             if let Some(reason) = blocking_git_push_hold(&op) {
+                anyhow::bail!(reason);
+            }
+        }
+        if let Some(op) = self
+            .db
+            .active_svn_commit_operation(PERSONAL_REPO_ID)
+            .context("failed to read active personal git-to-svn commit")?
+        {
+            if let Some(reason) = blocking_svn_commit_hold(&op) {
                 anyhow::bail!(reason);
             }
         }
@@ -480,6 +490,24 @@ impl SvnToGitSync {
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
         remove_stale_files_shared(src, dst)
     }
+}
+
+fn blocking_svn_commit_hold(op: &SvnCommitOperation) -> Option<String> {
+    if op.state == SvnCommitOperationState::ReconciliationRequired && !op.resume_authorized {
+        return Some(format!(
+            "reconciliation_required: personal git-to-svn commit held ({})",
+            op.outcome_detail
+                .as_deref()
+                .unwrap_or("inspect the exact SVN revision before retrying")
+        ));
+    }
+    if !op.state.is_terminal() {
+        return Some(
+            "repository has an active personal git-to-svn commit; wait for the current operation"
+                .into(),
+        );
+    }
+    None
 }
 
 fn blocking_git_push_hold(op: &GitPushOperation) -> Option<String> {
