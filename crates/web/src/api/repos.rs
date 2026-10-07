@@ -1168,15 +1168,13 @@ async fn start_repo_import(
         "resolved SVN password for import"
     );
 
-    let git_token_repo = db
-        .get_state(&format!("secret_git_token_{}", id))
-        .unwrap_or(None);
-    let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
-    let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
+    let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
+    let git_token = git_token_state.value.clone();
     debug!(
         repo_id = %id,
-        source = if git_token_repo.is_some() { "repo-specific" } else if git_token_global.is_some() { "global" } else { "none" },
-        "resolved Git token for import"
+        git_token_found = git_token.is_some(),
+        git_token_revoked = git_token_state.explicitly_revoked,
+        "resolved Git token for import via credential chain"
     );
 
     // 5. Build SVN import URL
@@ -1261,8 +1259,7 @@ async fn start_repo_import(
         .map_err(|e| AppError::Internal(format!("failed to select import branch: {e}")))?;
 
     // 8. Configure git remote credentials
-    git_client
-        .ensure_remote_credentials("origin", git_token.as_deref())
+    reposync_core::git::apply_git_credential_chain_state(&git_client, "origin", &git_token_state)
         .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
 
     {
@@ -1964,11 +1961,8 @@ async fn resume_repo_import(
         .clone()
         .or(svn_password_global.clone())
         .unwrap_or_default();
-    let git_token_repo = db
-        .get_state(&format!("secret_git_token_{}", id))
-        .unwrap_or(None);
-    let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
-    let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
+    let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
+    let git_token = git_token_state.value.clone();
 
     let svn_import_url = {
         let base = repo.svn_url.trim_end_matches('/');
@@ -1989,11 +1983,12 @@ async fn resume_repo_import(
         GitClient::new(&git_repo_path)
             .map_err(|e| AppError::Internal(format!("failed to open git repo: {e}")))?,
     ));
-    git_client
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ensure_remote_credentials("origin", git_token.as_deref())
-        .map_err(|e| AppError::Internal(format!("failed to set git credentials: {e}")))?;
+    reposync_core::git::apply_git_credential_chain_state(
+        &git_client.lock().unwrap_or_else(|p| p.into_inner()),
+        "origin",
+        &git_token_state,
+    )
+    .map_err(|e| AppError::Internal(format!("failed to set git credentials: {e}")))?;
 
     let identity_config = reposync_core::config::IdentityConfig::default();
     let identity_mapper = IdentityMapper::new(&identity_config)
@@ -2536,73 +2531,34 @@ async fn save_credentials(
     let now = Utc::now().to_rfc3339();
 
     if let Some(ref password) = body.svn_password {
-        if !password.is_empty() {
-            let key = format!("secret_svn_password_{}", id);
-            let _ = db.conn().execute(
+        let key = format!("secret_svn_password_{}", id);
+        db.conn()
+            .execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
                 rusqlite::params![key, password, now],
-            );
-            // Also update global key for backward compat with current sync engine
-            let _ = db.conn().execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('secret_svn_password', ?1, ?2)",
-                rusqlite::params![password, now],
-            );
+            )
+            .map_err(|e| AppError::Internal(format!("failed to store SVN password: {}", e)))?;
+        if password.is_empty() {
+            tracing::info!(repo_id = %id, "SVN password revoked for repository");
+        } else {
             tracing::info!(repo_id = %id, "SVN password stored for repository");
-        }
-    }
-
-    if let Some(ref token) = body.git_token {
-        if !token.is_empty() {
-            let key = format!("secret_git_token_{}", id);
-            let _ = db.conn().execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![key, token, now],
-            );
-            // Also update global key for backward compat
-            let _ = db.conn().execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('secret_git_token', ?1, ?2)",
-                rusqlite::params![token, now],
-            );
-
-            // Propagate to all descendant branch pairs so a single token
-            // rotation at the parent doesn't require manual updates on
-            // every child. Uses BFS to walk the full descendant tree.
-            let mut queue: Vec<String> = vec![id.clone()];
-            let mut propagated = 0;
-            while let Some(current) = queue.pop() {
-                if let Ok(children) = db.list_child_repositories(&current) {
-                    for child in children {
-                        let child_key = format!("secret_git_token_{}", child.id);
-                        let _ = db.conn().execute(
-                            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![child_key, token, now],
-                        );
-                        queue.push(child.id);
-                        propagated += 1;
-                    }
-                }
-            }
-            tracing::info!(
-                repo_id = %id,
-                propagated_to_children = propagated,
-                "Git token stored and propagated to descendants"
-            );
-        }
-    }
-
-    if let Some(ref password) = body.svn_password {
-        if !password.is_empty() {
-            // Also propagate SVN password to descendants for the same reason.
             let mut queue: Vec<String> = vec![id.clone()];
             let mut propagated = 0;
             while let Some(current) = queue.pop() {
                 if let Ok(children) = db.list_child_repositories(&current) {
                     for child in children {
                         let child_key = format!("secret_svn_password_{}", child.id);
-                        let _ = db.conn().execute(
-                            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![child_key, password, now],
-                        );
+                        db.conn()
+                            .execute(
+                                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                                rusqlite::params![child_key, password, now],
+                            )
+                            .map_err(|e| {
+                                AppError::Internal(format!(
+                                    "failed to propagate SVN password: {}",
+                                    e
+                                ))
+                            })?;
                         queue.push(child.id);
                         propagated += 1;
                     }
@@ -2615,6 +2571,47 @@ async fn save_credentials(
                     "SVN password propagated to descendants"
                 );
             }
+        }
+    }
+
+    if let Some(ref token) = body.git_token {
+        let key = format!("secret_git_token_{}", id);
+        db.conn()
+            .execute(
+                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![key, token, now],
+            )
+            .map_err(|e| AppError::Internal(format!("failed to store Git token: {}", e)))?;
+        if token.is_empty() {
+            tracing::info!(repo_id = %id, "Git token revoked for repository");
+        } else {
+            let mut queue: Vec<String> = vec![id.clone()];
+            let mut propagated = 0;
+            while let Some(current) = queue.pop() {
+                if let Ok(children) = db.list_child_repositories(&current) {
+                    for child in children {
+                        let child_key = format!("secret_git_token_{}", child.id);
+                        db.conn()
+                            .execute(
+                                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                                rusqlite::params![child_key, token, now],
+                            )
+                            .map_err(|e| {
+                                AppError::Internal(format!(
+                                    "failed to propagate Git token: {}",
+                                    e
+                                ))
+                            })?;
+                        queue.push(child.id);
+                        propagated += 1;
+                    }
+                }
+            }
+            tracing::info!(
+                repo_id = %id,
+                propagated_to_children = propagated,
+                "Git token stored and propagated to descendants"
+            );
         }
     }
 
