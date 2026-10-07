@@ -490,6 +490,21 @@ fn open_no_follow_write(dst_root: &Path, dst: &Path) -> Result<std::fs::File> {
 }
 
 fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
+    let meta = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to stat {} without following before read",
+            path.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "refusing to read through symlink at {}: path must be a regular file",
+            path.display()
+        );
+    }
+    if !meta.file_type().is_file() {
+        bail!("refusing to read non-regular file at {}", path.display());
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -715,6 +730,13 @@ static CONFINED_TEMP_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(unix, test))]
 static CONFINED_TEMP_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Peek the next confined temp name without consuming the counter (test-only).
+#[cfg(all(unix, test))]
+fn confined_temp_copy_name_peek_for_test() -> std::ffi::OsString {
+    let seq = CONFINED_TEMP_COPY_COUNTER.load(Ordering::Relaxed);
+    std::ffi::OsString::from(format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq))
+}
 
 #[cfg(unix)]
 fn confined_temp_copy_name() -> std::ffi::OsString {
@@ -1734,14 +1756,19 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
         if src_meta.file_type().is_file() {
             let dest_was_symlink = dst_meta.file_type().is_symlink();
             let dest_body = if dst_meta.file_type().is_file() {
-                Some(std::fs::read_to_string(dst_path).with_context(|| {
+                Some(read_regular_file_no_follow(dst_path).with_context(|| {
                     format!(
                         "failed to read destination .gitattributes: {}",
                         dst_path.display()
                     )
                 })?)
-            } else {
+            } else if dest_was_symlink {
                 None
+            } else {
+                bail!(
+                    "refusing to reconcile non-regular root .gitattributes at {}",
+                    dst_path.display()
+                );
             };
             let export_body = read_regular_file_no_follow(src_path).with_context(|| {
                 format!(
@@ -1809,6 +1836,13 @@ fn write_root_gitattributes_regular_file(dst_root: &Path, path: &Path, body: &st
     write_regular_file_no_follow(dst_root, path, body)
         .with_context(|| format!("failed to write engine .gitattributes: {}", path.display()))?;
     Ok(())
+}
+
+/// Publish root `.gitattributes` through confined temp+rename (never mutates a
+/// planted destination hardlink in place).
+pub(crate) fn publish_repo_root_gitattributes(dst_root: &Path, body: &str) -> Result<()> {
+    let path = dst_root.join(".gitattributes");
+    write_root_gitattributes_regular_file(dst_root, &path, body)
 }
 
 fn write_regular_file_no_follow(dst_root: &Path, path: &Path, body: &str) -> Result<()> {
@@ -4836,15 +4870,14 @@ mod tests {
 
     #[test]
     fn confined_temp_guard_leaves_preexisting_temp_when_openat_excl_fails() {
-        use std::sync::atomic::Ordering;
-
         let _serial = CONFINED_TEMP_GUARD_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("dest.txt"), "old").unwrap();
         let root = open_dir_nofollow(tmp.path()).unwrap();
 
-        let seq = CONFINED_TEMP_COPY_COUNTER.load(Ordering::Relaxed);
-        let planted_name = format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq);
+        let planted_name = confined_temp_copy_name_peek_for_test()
+            .to_string_lossy()
+            .to_string();
         std::fs::write(tmp.path().join(&planted_name), "PLANTED-TEMP").unwrap();
 
         let mut reader = std::io::Cursor::new(b"new-bytes");
@@ -4864,6 +4897,29 @@ mod tests {
             std::fs::read_to_string(tmp.path().join(&planted_name)).unwrap(),
             "PLANTED-TEMP",
             "pre-existing temp name must not be unlinked when O_EXCL fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_root_gitattributes_fifo_rejected_without_blocking_read() {
+        use std::os::unix::prelude::OsStrExt;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
+        std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
+        let fifo = dst.path().join(".gitattributes");
+        let path_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(path_c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let err =
+            copy_tree_with_policy(src.path(), dst.path(), &noop_policy(), &test_db()).unwrap_err();
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("non-regular"),
+            "expected fail-closed on fifo .gitattributes, got: {detail}"
         );
     }
 

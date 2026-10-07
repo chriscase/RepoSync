@@ -23,7 +23,6 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::{AppConfig, SvnLayout};
-use crate::conflict::detector::git_action_to_change_kind;
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
@@ -1285,10 +1284,16 @@ impl SyncEngine {
             info!(count = conflicts.len(), "conflicts detected");
             let _ = self.persist_sync_state("conflict_found");
 
+            let mut unresolved = 0usize;
+            let mut first_unresolved_path: Option<String> = None;
             for conflict in &conflicts {
                 if self.config.sync.auto_merge && self.try_auto_merge(conflict) {
                     stats.conflicts_auto_resolved += 1;
                 } else {
+                    unresolved += 1;
+                    if first_unresolved_path.is_none() {
+                        first_unresolved_path = Some(conflict.file_path.clone());
+                    }
                     // Persist unresolved conflict
                     let mut db_conflict = crate::models::Conflict::new(conflict.file_path.clone());
                     db_conflict.conflict_type = conflict.conflict_type.to_string();
@@ -1300,6 +1305,15 @@ impl SyncEngine {
                     db_conflict.repo_id = self.repo_id.clone();
                     let _ = self.db.insert_conflict(&db_conflict);
                 }
+            }
+            if unresolved > 0 {
+                let file_path = first_unresolved_path.unwrap_or_else(|| "unknown".into());
+                return Err(SyncError::UnresolvableConflict {
+                    file_path,
+                    detail: format!(
+                        "{unresolved} unresolved conflict(s) recorded; refusing SVN/Git working-copy mutation"
+                    ),
+                });
             }
         }
 
@@ -2416,54 +2430,24 @@ impl SyncEngine {
             // 1. Get changed files and their contents from the Git commit.
             //    Lock is scoped in a block so the guard is dropped before any
             //    .await (std::sync::MutexGuard is !Send).
-            let file_contents = {
-                let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-                // Use the pre-populated changed_files from fetch_git_changes
-                // instead of re-calling get_changed_files (P5 optimization).
-                let contents: Result<Vec<_>, SyncError> = change
-                    .changed_files
-                    .iter()
-                    .map(|f| -> Result<_, SyncError> {
-                        let content = if f.action != "D" {
-                            #[cfg(debug_assertions)]
-                            let fault = std::env::var("REPOSYNC_TEST_GIT_CONTENT_FAULT")
-                                .ok()
-                                .is_some_and(|value| {
-                                    value == format!("{}|{}", change.sha, git.repo_path().display())
-                                });
-                            #[cfg(debug_assertions)]
-                            let read = if fault {
-                                Err(crate::errors::GitError::RefNotFound(f.path.clone()))
-                            } else {
-                                git.get_file_content_at_commit(&change.sha, &f.path)
-                            };
-                            #[cfg(not(debug_assertions))]
-                            let read = git.get_file_content_at_commit(&change.sha, &f.path);
-                            Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
-                                SyncError::GitError(crate::errors::GitError::RefNotFound(
-                                    f.path.clone(),
-                                ))
-                            })?)
-                        } else {
-                            None
-                        };
-                        Ok(GitToSvnInputChange {
-                            action: f.action.clone(),
-                            path: f.path.clone(),
-                            content,
-                            rename_from: f.rename_from.clone(),
-                        })
-                    })
-                    .collect();
-                contents?
-            };
+            let raw_inputs: Vec<GitToSvnInputChange> = change
+                .changed_files
+                .iter()
+                .map(|f| GitToSvnInputChange {
+                    action: f.action.clone(),
+                    path: f.path.clone(),
+                    content: None,
+                    rename_from: f.rename_from.clone(),
+                })
+                .collect();
 
             // 1b. Project the typed changeset BEFORE any SVN working-copy
-            // mutation. Allow prefixes, blocked patterns, and deletes share
-            // one component-aware matcher. Staging, verification, journal,
-            // and receipts below consume this same included set.
-            let projected = project_git_to_svn_changeset(
-                file_contents,
+            // mutation or out-of-scope Git blob read. Allow prefixes, blocked
+            // patterns, and deletes share one component-aware matcher. Staging,
+            // verification, journal, and receipts below consume this same
+            // included set.
+            let mut projected = project_git_to_svn_changeset(
+                raw_inputs,
                 &self.allowed_paths,
                 &self.blocked_patterns,
             )
@@ -2526,6 +2510,39 @@ impl SyncEngine {
                         success: true,
                         repo_id: self.effective_repo_id(),
                     });
+                }
+            }
+            {
+                let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                for item in &mut projected.included {
+                    if item.action == "D" {
+                        continue;
+                    }
+                    #[cfg(debug_assertions)]
+                    let fault = std::env::var("REPOSYNC_TEST_GIT_CONTENT_FAULT")
+                        .ok()
+                        .is_some_and(|value| {
+                            let bridge = git.repo_path().display().to_string();
+                            let parts: Vec<&str> = value.splitn(3, '|').collect();
+                            if parts.len() == 3 {
+                                parts[0] == change.sha
+                                    && parts[1] == bridge
+                                    && parts[2] == item.path
+                            } else {
+                                value == format!("{}|{}", change.sha, bridge)
+                            }
+                        });
+                    #[cfg(debug_assertions)]
+                    let read = if fault {
+                        Err(crate::errors::GitError::RefNotFound(item.path.clone()))
+                    } else {
+                        git.get_file_content_at_commit(&change.sha, &item.path)
+                    };
+                    #[cfg(not(debug_assertions))]
+                    let read = git.get_file_content_at_commit(&change.sha, &item.path);
+                    item.content = Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
+                        SyncError::GitError(crate::errors::GitError::RefNotFound(item.path.clone()))
+                    })?);
                 }
             }
             let file_contents = projected.into_file_contents();
@@ -3717,25 +3734,43 @@ impl SyncEngine {
             })
             .collect();
 
-        let git_file_changes: Vec<FileChange> = git_changes
-            .iter()
-            .flat_map(|cs| cs.changed_files.iter())
-            .map(|f| {
-                let change_kind =
-                    git_action_to_change_kind(&f.action, &f.path, f.rename_from.as_deref())
-                        .map_err(|err| {
-                            SyncError::GitError(crate::errors::GitError::ApplyFailed(
-                                err.to_string(),
-                            ))
-                        })?;
-                Ok(FileChange {
-                    path: f.path.trim_start_matches('/').to_string(),
-                    change_kind,
-                    content: f.content.clone(),
-                    is_binary: f.is_binary,
+        let mut git_file_changes: Vec<FileChange> = Vec::new();
+        for cs in git_changes {
+            let raw_inputs: Vec<GitToSvnInputChange> = cs
+                .changed_files
+                .iter()
+                .map(|f| GitToSvnInputChange {
+                    action: f.action.clone(),
+                    path: f.path.clone(),
+                    content: None,
+                    rename_from: f.rename_from.clone(),
                 })
-            })
-            .collect::<Result<Vec<_>, SyncError>>()?;
+                .collect();
+            let projected = project_git_to_svn_changeset(
+                raw_inputs,
+                &self.allowed_paths,
+                &self.blocked_patterns,
+            )
+            .map_err(|err| {
+                SyncError::GitError(crate::errors::GitError::ApplyFailed(err.to_string()))
+            })?;
+            for change in projected.included {
+                let change_kind = match change.action.as_str() {
+                    "A" => ChangeKind::Added,
+                    "D" => ChangeKind::Deleted,
+                    "M" => ChangeKind::Modified,
+                    _ => ChangeKind::Modified,
+                };
+                git_file_changes.push(FileChange {
+                    path: change.path.trim_start_matches('/').to_string(),
+                    change_kind,
+                    content: change
+                        .content
+                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string()),
+                    is_binary: false,
+                });
+            }
+        }
 
         Ok(ConflictDetector::detect(
             &svn_file_changes,

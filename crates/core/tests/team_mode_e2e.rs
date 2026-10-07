@@ -9378,6 +9378,47 @@ async fn candidate_rsc02_rename_allowed_old_to_blocked_new_projects_delete_only(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_allowed_to_blocked_does_not_read_out_of_scope_blob() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "team/seed.txt",
+        "seed payload\n",
+        "Seed allowed path in SVN",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let sha = pair.developer_git_mv(
+        "team/seed.txt",
+        "team-other/new.txt",
+        "Allowed-old to sibling-blocked-new rename",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    std::env::set_var(
+        "REPOSYNC_TEST_GIT_CONTENT_FAULT",
+        format!("{}|{}|team-other/new.txt", sha, pair.bridge.display()),
+    );
+    let result = pair.engine.run_sync_cycle().await;
+    std::env::remove_var("REPOSYNC_TEST_GIT_CONTENT_FAULT");
+    assert_eq!(
+        result.unwrap().git_to_svn_count,
+        1,
+        "must not read out-of-scope rename destination blob"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_NO_OUT_OF_SCOPE_READ",
+            "sha":sha,
+            "out_of_scope_blob_unread":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_rename_blocked_old_to_allowed_new_projects_add_only() {
     let mut pair = QualifiedPair::new().await;
     pair.developer_commit(
