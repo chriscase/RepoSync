@@ -752,6 +752,32 @@ impl Database {
         self.set_watermark("git_sha", sha)
     }
 
+    /// Transactional variant of [`set_legacy_import_git_sha_watermark`].
+    pub fn set_legacy_import_git_sha_watermark_tx(
+        tx: &rusqlite::Connection,
+        sha: &str,
+    ) -> Result<(), DatabaseError> {
+        let repo_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count > 0 {
+            return Err(DatabaseError::Other(
+                "refusing global git_sha watermark while repositories table is non-empty".into(),
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params!["git_sha", sha, now],
+        )?;
+        debug!(
+            source = "git_sha",
+            value = sha,
+            "set watermark in transaction"
+        );
+        Ok(())
+    }
+
     /// List all watermarks.
     pub fn list_watermarks(&self) -> Result<Vec<WatermarkEntry>, DatabaseError> {
         let conn = self.conn();
