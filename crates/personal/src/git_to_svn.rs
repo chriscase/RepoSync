@@ -5,8 +5,10 @@
 //! SVN with metadata trailers (Git SHA, PR number, branch) for traceability
 //! and echo suppression.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+use reposync_core::errors::SvnError;
 
 use anyhow::{Context, Result};
 use tracing::{debug, error, info, instrument, warn};
@@ -518,6 +520,7 @@ impl GitToSvnSync {
             .await
             .context("svn update failed")?;
 
+        let mut apply_ownership = ApplyAbortOwnership::default();
         let replay_result: Result<i64> = async {
             let info = self
                 .svn
@@ -528,7 +531,7 @@ impl GitToSvnSync {
                 .context("failed to hash pre-write SVN working copy")?;
 
             // 2. Copy files from Git repo to SVN working copy.
-            self.apply_git_changes_to_svn(commit)
+            self.apply_git_changes_to_svn_inner(commit, &mut apply_ownership)
                 .await
                 .context("failed to apply git changes to SVN working copy")?;
 
@@ -662,6 +665,9 @@ impl GitToSvnSync {
                 }
             };
 
+            // SVN accepted the commit; abort restore must never delete the committed tree.
+            apply_ownership.disarm();
+
             info!(
                 svn_rev,
                 git_sha = %commit.sha,
@@ -717,6 +723,25 @@ impl GitToSvnSync {
                 anyhow::bail!("reconciliation_required: {detail}");
             }
 
+            #[cfg(debug_assertions)]
+            if svn_commit_fixture_flag(
+                "REPOSYNC_SVN_COMMIT_CONFIRM_FAIL",
+                PERSONAL_REPO_ID,
+                &self.svn_wc_path,
+            ) {
+                let detail =
+                    "SVN accepted the commit but the local checkpoint write failed: simulated confirm failure";
+                let _ = self
+                    .db
+                    .hold_git_to_svn_reconciliation(PERSONAL_REPO_ID, &op.id, detail);
+                return Err(anyhow::anyhow!(detail)).with_context(|| {
+                    format!(
+                        "failed to checkpoint personal git-to-svn commit for {}; held for reconcile",
+                        commit.sha
+                    )
+                });
+            }
+
             match self.db.confirm_personal_git_to_svn_commit(
                 PERSONAL_REPO_ID,
                 &op.id,
@@ -756,15 +781,15 @@ impl GitToSvnSync {
         match replay_result {
             Ok(rev) => Ok(rev),
             Err(error) => {
-                let err_text = format!("{:#}", error);
-                if !err_text.contains("reconciliation_required") {
-                    if let Err(restore_err) = self.restore_svn_working_copy_after_abort().await {
-                        error!(
-                            error = %restore_err,
-                            git_sha = %commit.sha,
-                            "failed to restore SVN working copy after git-to-svn apply abort"
-                        );
-                    }
+                if apply_ownership.should_restore_after_abort() {
+                    self.restore_svn_working_copy_after_abort(&apply_ownership)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to restore SVN working copy after git-to-svn apply abort for {}",
+                                commit.sha
+                            )
+                        })?;
                 }
                 Err(error)
             }
@@ -778,23 +803,33 @@ impl GitToSvnSync {
     ///
     /// Public for integration testing (drives the real LFS-pointer-skip and
     /// policy-evaluation code paths without needing GitHub API calls).
+    #[allow(dead_code)]
     pub async fn apply_git_changes_to_svn(&self, commit: &GitHubCommit) -> Result<()> {
-        match self.apply_git_changes_to_svn_inner(commit).await {
+        let mut ownership = ApplyAbortOwnership::default();
+        match self
+            .apply_git_changes_to_svn_inner(commit, &mut ownership)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) => {
-                if let Err(restore_err) = self.restore_svn_working_copy_after_abort().await {
-                    error!(
-                        error = %restore_err,
-                        git_sha = %commit.sha,
-                        "failed to restore SVN working copy after git-to-svn apply abort"
-                    );
-                }
+                self.restore_svn_working_copy_after_abort(&ownership)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to restore SVN working copy after git-to-svn apply abort for {}",
+                            commit.sha
+                        )
+                    })?;
                 Err(error)
             }
         }
     }
 
-    async fn apply_git_changes_to_svn_inner(&self, commit: &GitHubCommit) -> Result<()> {
+    async fn apply_git_changes_to_svn_inner(
+        &self,
+        commit: &GitHubCommit,
+        ownership: &mut ApplyAbortOwnership,
+    ) -> Result<()> {
         let git_client = GitClient::new(&self.git_repo_path)
             .context("failed to open local git repo for commit diff")?;
 
@@ -809,17 +844,20 @@ impl GitToSvnSync {
 
         let file_changes = projected.into_file_contents();
         for (action, file_path, content) in &file_changes {
-            let dst = self.svn_wc_path.join(file_path);
+            validate_apply_rel_path(file_path)?;
 
             match action.as_str() {
                 "D" => {
                     // File was deleted in this commit: remove it from SVN WC
                     // so `svn status` picks it up as missing.
+                    refuse_apply_path_symlink_ancestors(&self.svn_wc_path, file_path)?;
+                    let dst = confined_apply_path(&self.svn_wc_path, file_path)?;
                     if dst.exists() {
                         std::fs::remove_file(&dst).with_context(|| {
                             format!("failed to remove deleted file: {}", dst.display())
                         })?;
                     }
+                    ownership.touched_paths.push(file_path.clone());
                 }
                 _ => {
                     // File was added or modified: write projected content to the SVN WC.
@@ -875,19 +913,17 @@ impl GitToSvnSync {
                                     content.clone()
                                 };
 
-                                if let Some(parent) = dst.parent() {
-                                    if !parent.exists() {
-                                        std::fs::create_dir_all(parent).with_context(|| {
-                                            format!(
-                                                "failed to create directory: {}",
-                                                parent.display()
-                                            )
-                                        })?;
-                                    }
-                                }
+                                refuse_apply_path_symlink_ancestors(&self.svn_wc_path, file_path)?;
+                                let dst = confined_apply_path(&self.svn_wc_path, file_path)?;
+                                let file_preexisted = std::fs::symlink_metadata(&dst).is_ok();
+                                ensure_apply_parent_dirs(&self.svn_wc_path, file_path, ownership)?;
                                 std::fs::write(&dst, &write_content).with_context(|| {
                                     format!("failed to write file: {}", dst.display())
                                 })?;
+                                ownership.touched_paths.push(file_path.clone());
+                                if !file_preexisted {
+                                    ownership.new_files.push(file_path.clone());
+                                }
                             }
                             FilePolicyDecision::LfsTrack { .. } => {
                                 // File exceeds LFS threshold — same LFS pointer
@@ -935,19 +971,17 @@ impl GitToSvnSync {
                                     content.clone()
                                 };
 
-                                if let Some(parent) = dst.parent() {
-                                    if !parent.exists() {
-                                        std::fs::create_dir_all(parent).with_context(|| {
-                                            format!(
-                                                "failed to create directory: {}",
-                                                parent.display()
-                                            )
-                                        })?;
-                                    }
-                                }
+                                refuse_apply_path_symlink_ancestors(&self.svn_wc_path, file_path)?;
+                                let dst = confined_apply_path(&self.svn_wc_path, file_path)?;
+                                let file_preexisted = std::fs::symlink_metadata(&dst).is_ok();
+                                ensure_apply_parent_dirs(&self.svn_wc_path, file_path, ownership)?;
                                 std::fs::write(&dst, &write_content).with_context(|| {
                                     format!("failed to write file: {}", dst.display())
                                 })?;
+                                ownership.touched_paths.push(file_path.clone());
+                                if !file_preexisted {
+                                    ownership.new_files.push(file_path.clone());
+                                }
                             }
                             FilePolicyDecision::Ignored { pattern } => {
                                 warn!(
@@ -1007,38 +1041,33 @@ impl GitToSvnSync {
         Ok(())
     }
 
-    /// Restore the SVN working copy to its pre-apply state after a mid-apply abort.
-    async fn restore_svn_working_copy_after_abort(&self) -> Result<()> {
-        self.svn
-            .revert_recursive(&self.svn_wc_path)
-            .await
-            .context("svn revert -R failed while restoring working copy")?;
+    /// Restore only the paths touched by this apply after a mid-apply abort.
+    async fn restore_svn_working_copy_after_abort(
+        &self,
+        ownership: &ApplyAbortOwnership,
+    ) -> Result<()> {
+        restore_apply_abort_on_wc(&self.svn, &self.svn_wc_path, ownership, None).await
+    }
 
-        let status_output = self
-            .svn
-            .status(&self.svn_wc_path)
-            .await
-            .context("svn status failed while restoring working copy")?;
-        remove_abort_leftover_paths(&self.svn_wc_path, &status_output)
-            .context("failed to remove unversioned apply leftovers")?;
+    /// Restore the working copy after a partial apply (integration tests).
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub async fn restore_working_copy_after_apply_abort(
+        &self,
+        ownership: &ApplyAbortOwnership,
+    ) -> Result<()> {
+        self.restore_svn_working_copy_after_abort(ownership).await
+    }
 
-        let final_status = self
-            .svn
-            .status(&self.svn_wc_path)
-            .await
-            .context("svn status failed while verifying restored working copy")?;
-        if !is_svn_working_copy_clean(&final_status) {
-            anyhow::bail!(
-                "SVN working copy is not clean after apply abort restore: {}",
-                final_status.trim()
-            );
-        }
-
-        debug!(
-            wc = %self.svn_wc_path.display(),
-            "restored SVN working copy after git-to-svn apply abort"
-        );
-        Ok(())
+    /// Restore hook for integration tests that must drive `svn revert` targets directly.
+    #[allow(dead_code)]
+    #[doc(hidden)]
+    pub async fn restore_apply_abort_reverting_paths_for_test(
+        &self,
+        ownership: &ApplyAbortOwnership,
+        revert_paths: &[&str],
+    ) -> Result<()> {
+        restore_apply_abort_on_wc(&self.svn, &self.svn_wc_path, ownership, Some(revert_paths)).await
     }
 
     /// Build the projected Git→SVN changeset for one commit.
@@ -1267,47 +1296,387 @@ fn remove_stale_files(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-/// True when `svn status` reports no pending working-copy changes.
-fn is_svn_working_copy_clean(output: &str) -> bool {
-    output.lines().all(|line| line.trim().is_empty())
+/// Column index where `svn status` paths begin (after seven status columns and a separator).
+const SVN_STATUS_PATH_OFFSET: usize = 8;
+
+fn svn_status_path(line: &str) -> Option<&str> {
+    let line = line.trim_end();
+    if line.len() <= SVN_STATUS_PATH_OFFSET {
+        return None;
+    }
+    let path = line[SVN_STATUS_PATH_OFFSET..].trim_start();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
-/// Paths created by a partial apply that must be removed after `svn revert -R`.
-fn collect_abort_leftover_paths(output: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in output.lines() {
-        if line.len() < 2 {
+fn is_path_prefix_ancestor(ancestor: &str, descendant: &str) -> bool {
+    if ancestor.is_empty() {
+        return false;
+    }
+    if descendant == ancestor {
+        return true;
+    }
+    if descendant.len() <= ancestor.len() {
+        return false;
+    }
+    descendant.starts_with(ancestor) && descendant.as_bytes().get(ancestor.len()) == Some(&b'/')
+}
+
+/// True when an `svn status` path indicates dirt on a scoped apply path we own.
+fn apply_abort_status_in_scope(status_path: &str, scope_path: &str) -> bool {
+    status_path == scope_path || is_path_prefix_ancestor(scope_path, status_path)
+}
+
+/// Integration-test helper for abort-restore cleanliness assertions.
+#[allow(dead_code)]
+#[doc(hidden)]
+pub fn personal_apply_abort_paths_clean_for_test(status_output: &str, scope: &[&str]) -> bool {
+    let scope = scope
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<Vec<_>>();
+    are_apply_paths_clean(status_output, &scope)
+}
+
+/// True when none of the touched apply paths appear in `svn status` output.
+fn are_apply_paths_clean(status_output: &str, scope: &[String]) -> bool {
+    if scope.is_empty() {
+        return true;
+    }
+    for line in status_output.lines() {
+        let Some(path) = svn_status_path(line) else {
             continue;
+        };
+        if scope
+            .iter()
+            .any(|scoped| apply_abort_status_in_scope(path, scoped))
+        {
+            return false;
         }
-        let status_char = line.chars().next().unwrap_or(' ');
-        let path = line[1..].trim_start();
-        if path.is_empty() {
-            continue;
+    }
+    true
+}
+
+/// Paths recorded while applying one commit, used to restore the WC after abort.
+#[derive(Debug, Clone)]
+pub struct ApplyAbortOwnership {
+    /// Paths passed to `svn revert` (added, modified, or deleted by this apply).
+    pub touched_paths: Vec<String>,
+    /// Files this apply created on disk (pre-existing files are reverted only).
+    pub new_files: Vec<String>,
+    /// Directories this apply created via `create_dir_all`, shallow to deep.
+    pub created_dirs: Vec<String>,
+    /// When false, SVN commit succeeded and abort restore must not run.
+    restore_armed: bool,
+}
+
+impl Default for ApplyAbortOwnership {
+    fn default() -> Self {
+        Self {
+            touched_paths: Vec::new(),
+            new_files: Vec::new(),
+            created_dirs: Vec::new(),
+            restore_armed: true,
         }
-        match status_char {
-            '?' | 'A' | 'I' => paths.push(path.to_string()),
+    }
+}
+
+impl ApplyAbortOwnership {
+    /// Build ownership records for integration tests and abort-restore helpers.
+    #[allow(dead_code)]
+    pub fn with_recorded_paths(
+        touched_paths: Vec<String>,
+        new_files: Vec<String>,
+        created_dirs: Vec<String>,
+    ) -> Self {
+        Self {
+            touched_paths,
+            new_files,
+            created_dirs,
+            restore_armed: true,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.touched_paths.is_empty() && self.new_files.is_empty() && self.created_dirs.is_empty()
+    }
+
+    /// Disarm abort restore after SVN accepts a commit.
+    fn disarm(&mut self) {
+        self.restore_armed = false;
+    }
+
+    fn should_restore_after_abort(&self) -> bool {
+        self.restore_armed && !self.is_empty()
+    }
+}
+
+fn apply_abort_cleanliness_scope(ownership: &ApplyAbortOwnership) -> Vec<String> {
+    let mut scope = ownership.touched_paths.clone();
+    scope.extend(ownership.created_dirs.iter().cloned());
+    scope
+}
+
+/// Refuse apply when any existing path component under the WC root is a symlink.
+fn refuse_apply_path_symlink_ancestors(wc_root: &Path, rel: &str) -> Result<()> {
+    validate_apply_rel_path(rel)?;
+    let wc_meta = std::fs::symlink_metadata(wc_root).with_context(|| {
+        format!(
+            "failed to read SVN working copy root metadata: {}",
+            wc_root.display()
+        )
+    })?;
+    if wc_meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "SVN working copy root is a symlink; refusing apply for '{}'",
+            rel
+        );
+    }
+
+    let mut built = wc_root.to_path_buf();
+    for component in Path::new(rel).components() {
+        if let Component::Normal(name) = component {
+            built = built.join(name);
+            let meta = match std::fs::symlink_metadata(&built) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect apply path component: {}",
+                            built.display()
+                        )
+                    });
+                }
+            };
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing apply through symlink at '{}' (requested '{}')",
+                    built.display(),
+                    rel
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn confined_apply_path(wc_root: &Path, rel: &str) -> Result<PathBuf> {
+    refuse_apply_path_symlink_ancestors(wc_root, rel)?;
+    Ok(wc_root.join(rel))
+}
+
+fn validate_apply_rel_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("apply path must not be empty");
+    }
+    let path_obj = Path::new(path);
+    if path_obj.is_absolute() {
+        anyhow::bail!("apply path must be relative: {path}");
+    }
+    for component in path_obj.components() {
+        match component {
+            Component::ParentDir => {
+                anyhow::bail!("apply path must not contain '..': {path}");
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("apply path must be relative: {path}");
+            }
             _ => {}
         }
     }
-    paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
-    paths
+    Ok(())
 }
 
-/// Remove unversioned or newly-added paths left behind by a partial apply.
-fn remove_abort_leftover_paths(wc_root: &Path, status_output: &str) -> Result<()> {
-    for rel_path in collect_abort_leftover_paths(status_output) {
-        let full_path = wc_root.join(&rel_path);
-        if full_path.is_dir() {
-            std::fs::remove_dir_all(&full_path).with_context(|| {
-                format!(
-                    "failed to remove unversioned directory: {}",
-                    full_path.display()
-                )
+fn validate_apply_ownership_paths(ownership: &ApplyAbortOwnership) -> Result<()> {
+    for path in ownership
+        .touched_paths
+        .iter()
+        .chain(&ownership.new_files)
+        .chain(&ownership.created_dirs)
+    {
+        validate_apply_rel_path(path)?;
+    }
+    Ok(())
+}
+
+fn rel_path_under_wc(wc_root: &Path, dir: &Path) -> Result<String> {
+    let rel = dir
+        .strip_prefix(wc_root)
+        .with_context(|| format!("path escapes SVN working copy: {}", dir.display()))?;
+    Ok(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn record_apply_parent_dirs_if_missing(
+    wc_root: &Path,
+    file_rel: &str,
+    ownership: &mut ApplyAbortOwnership,
+) -> Result<()> {
+    let file_path = wc_root.join(file_rel);
+    let mut parents = Vec::new();
+    let mut current = file_path.parent();
+    while let Some(dir) = current {
+        if dir == wc_root {
+            break;
+        }
+        parents.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    parents.reverse();
+    for dir in parents {
+        if std::fs::symlink_metadata(&dir).is_err() {
+            let rel = rel_path_under_wc(wc_root, &dir)?;
+            if !ownership.created_dirs.contains(&rel) {
+                ownership.created_dirs.push(rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_apply_parent_dirs(
+    wc_root: &Path,
+    file_rel: &str,
+    ownership: &mut ApplyAbortOwnership,
+) -> Result<()> {
+    record_apply_parent_dirs_if_missing(wc_root, file_rel, ownership)?;
+    let file_path = wc_root.join(file_rel);
+    if let Some(parent) = file_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn svn_stderr_error_code(stderr: &str) -> Option<&str> {
+    for line in stderr.lines() {
+        let rest = line.strip_prefix("svn: ")?.trim();
+        let code = rest.split(':').next()?.trim();
+        if code.len() > 1
+            && code.starts_with('E')
+            && code[1..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            return Some(code);
+        }
+    }
+    None
+}
+
+fn svn_revert_error_is_missing_node(error: &SvnError) -> bool {
+    match error {
+        SvnError::CommandFailed { stderr, .. } => svn_stderr_error_code(stderr) == Some("E155010"),
+        _ => false,
+    }
+}
+
+async fn restore_apply_abort_on_wc(
+    svn: &SvnClient,
+    wc_root: &Path,
+    ownership: &ApplyAbortOwnership,
+    revert_paths_override: Option<&[&str]>,
+) -> Result<()> {
+    if ownership.is_empty() {
+        return Ok(());
+    }
+    validate_apply_ownership_paths(ownership)?;
+
+    let revert_paths: Vec<&str> = match revert_paths_override {
+        Some(paths) => paths.to_vec(),
+        None => ownership
+            .touched_paths
+            .iter()
+            .map(|path| path.as_str())
+            .collect(),
+    };
+    for path in revert_paths {
+        match svn.revert_files(wc_root, &[path]).await {
+            Ok(()) => {}
+            Err(error) if svn_revert_error_is_missing_node(&error) => {
+                debug!(
+                    error = %error,
+                    path,
+                    "svn revert on touched apply path failed with E155010; continuing with recorded cleanup"
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("svn revert on touched apply path '{path}' failed"));
+            }
+        }
+    }
+
+    remove_apply_created_paths(wc_root, ownership)
+        .context("failed to remove apply-created files and directories")?;
+
+    let final_status = svn
+        .status(wc_root)
+        .await
+        .context("svn status failed while verifying restored working copy")?;
+    let scope = apply_abort_cleanliness_scope(ownership);
+    if !are_apply_paths_clean(&final_status, &scope) {
+        anyhow::bail!(
+            "SVN working copy still dirty on touched apply paths after abort restore: {}",
+            final_status.trim()
+        );
+    }
+
+    debug!(
+        wc = %wc_root.display(),
+        touched = ownership.touched_paths.len(),
+        "restored SVN working copy after git-to-svn apply abort"
+    );
+    Ok(())
+}
+
+fn remove_apply_created_paths(wc_root: &Path, ownership: &ApplyAbortOwnership) -> Result<()> {
+    for rel in &ownership.new_files {
+        validate_apply_rel_path(rel)?;
+        let full = wc_root.join(rel);
+        if full.is_file() {
+            std::fs::remove_file(&full).with_context(|| {
+                format!("failed to remove apply-created file: {}", full.display())
             })?;
-        } else if full_path.exists() {
-            std::fs::remove_file(&full_path).with_context(|| {
-                format!("failed to remove unversioned file: {}", full_path.display())
-            })?;
+        }
+    }
+
+    for rel in ownership.created_dirs.iter().rev() {
+        validate_apply_rel_path(rel)?;
+        let full = wc_root.join(rel);
+        if !full.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir(&full) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "apply-created directory is not empty after cleanup: {}",
+                        full.display()
+                    )
+                });
+            }
+            Err(error) if error.raw_os_error() == Some(39) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "apply-created directory is not empty after cleanup: {}",
+                        full.display()
+                    )
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove apply-created directory: {}",
+                        full.display()
+                    )
+                });
+            }
         }
     }
     Ok(())
@@ -1329,13 +1698,9 @@ fn parse_svn_status(output: &str) -> (Vec<String>, Vec<String>) {
         }
 
         let status_char = line.chars().next().unwrap_or(' ');
-        // The file path starts at column 8 in standard `svn status` output,
-        // but we handle both formats by trimming leading whitespace after the
-        // status character.
-        let path = line[1..].trim_start();
-        if path.is_empty() {
+        let Some(path) = svn_status_path(line) else {
             continue;
-        }
+        };
 
         match status_char {
             '?' => added.push(path.to_string()),
@@ -1378,48 +1743,151 @@ A       src/already_added.rs
     }
 
     #[test]
-    fn test_is_svn_working_copy_clean() {
-        assert!(is_svn_working_copy_clean(""));
-        assert!(is_svn_working_copy_clean("\n\n"));
-        assert!(!is_svn_working_copy_clean("M       src/lib.rs\n"));
-    }
-
-    #[test]
-    fn test_collect_abort_leftover_paths() {
-        let output = "\
-?       src/new_file.rs
+    fn test_are_apply_paths_clean() {
+        let status = "\
 M       src/modified.rs
-A       src/added.rs
-!       src/removed.rs
-?       docs/readme.md
+?       docs/unrelated.md
 ";
-        let leftovers = collect_abort_leftover_paths(output);
-        let mut expected = vec![
-            "docs/readme.md".to_string(),
-            "src/new_file.rs".to_string(),
-            "src/added.rs".to_string(),
-        ];
-        expected.sort();
-        let mut actual = leftovers;
-        actual.sort();
-        assert_eq!(actual, expected);
+        assert!(are_apply_paths_clean(status, &["other.txt".to_string()]));
+        assert!(!are_apply_paths_clean(
+            status,
+            &["src/modified.rs".to_string()]
+        ));
+        assert!(!are_apply_paths_clean(
+            "?       src/newdir\n",
+            &["src/newdir".to_string()]
+        ));
+        assert!(are_apply_paths_clean(
+            "?       scratch\n",
+            &["scratch/note.txt".to_string()]
+        ));
+        assert!(!are_apply_paths_clean(
+            "MM       src/modified.rs\n",
+            &["src/modified.rs".to_string()]
+        ));
     }
 
     #[test]
-    fn test_remove_abort_leftover_paths() {
+    fn test_remove_apply_created_paths_preserves_preexisting_unversioned_dir() {
         let wc = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(wc.path().join("src")).unwrap();
-        std::fs::write(wc.path().join("src/new_file.rs"), "new").unwrap();
-        std::fs::write(wc.path().join("src/modified.rs"), "old").unwrap();
+        std::fs::create_dir_all(wc.path().join("scratch")).unwrap();
+        std::fs::write(wc.path().join("scratch/other.txt"), "keep").unwrap();
+        std::fs::write(wc.path().join("scratch/note.txt"), "new").unwrap();
 
-        let output = "\
-?       src/new_file.rs
-M       src/modified.rs
-";
-        remove_abort_leftover_paths(wc.path(), output).unwrap();
+        let ownership = ApplyAbortOwnership {
+            touched_paths: vec!["scratch/note.txt".to_string()],
+            new_files: vec!["scratch/note.txt".to_string()],
+            created_dirs: vec![],
+            ..Default::default()
+        };
+        remove_apply_created_paths(wc.path(), &ownership).unwrap();
 
-        assert!(!wc.path().join("src/new_file.rs").exists());
-        assert!(wc.path().join("src/modified.rs").exists());
+        assert!(!wc.path().join("scratch/note.txt").exists());
+        assert!(wc.path().join("scratch/other.txt").exists());
+        assert!(wc.path().join("scratch").is_dir());
+    }
+
+    #[test]
+    fn test_remove_apply_created_paths_removes_recorded_empty_dir() {
+        let wc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wc.path().join("src/newdir")).unwrap();
+        std::fs::write(wc.path().join("src/newdir/file.txt"), "new").unwrap();
+
+        let ownership = ApplyAbortOwnership {
+            touched_paths: vec!["src/newdir/file.txt".to_string()],
+            new_files: vec!["src/newdir/file.txt".to_string()],
+            created_dirs: vec!["src/newdir".to_string()],
+            ..Default::default()
+        };
+        std::fs::remove_file(wc.path().join("src/newdir/file.txt")).unwrap();
+        remove_apply_created_paths(wc.path(), &ownership).unwrap();
+
+        assert!(!wc.path().join("src/newdir").exists());
+    }
+
+    #[test]
+    fn test_remove_apply_created_paths_skips_versioned_parent_dirs() {
+        let wc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wc.path().join("keep/emptydir")).unwrap();
+        std::fs::write(wc.path().join("keep/emptydir/file.txt"), "new").unwrap();
+
+        let ownership = ApplyAbortOwnership {
+            touched_paths: vec!["keep/emptydir/file.txt".to_string()],
+            new_files: vec!["keep/emptydir/file.txt".to_string()],
+            created_dirs: vec![],
+            ..Default::default()
+        };
+        remove_apply_created_paths(wc.path(), &ownership).unwrap();
+
+        assert!(!wc.path().join("keep/emptydir/file.txt").exists());
+        assert!(wc.path().join("keep/emptydir").is_dir());
+        assert!(wc.path().join("keep").is_dir());
+    }
+
+    #[test]
+    fn test_remove_apply_created_paths_fails_on_nonempty_ignored_dir() {
+        let wc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wc.path().join("pkg/.libs")).unwrap();
+        std::fs::write(wc.path().join("pkg/.libs/stale.o"), "obj").unwrap();
+        std::fs::write(wc.path().join("pkg/file.txt"), "new").unwrap();
+
+        let ownership = ApplyAbortOwnership {
+            touched_paths: vec!["pkg/file.txt".to_string()],
+            new_files: vec!["pkg/file.txt".to_string()],
+            created_dirs: vec!["pkg".to_string()],
+            ..Default::default()
+        };
+        std::fs::remove_file(wc.path().join("pkg/file.txt")).unwrap();
+        let err = remove_apply_created_paths(wc.path(), &ownership)
+            .expect_err("non-empty created directory must fail restore cleanup");
+        assert!(
+            format!("{err:#}").contains("not empty"),
+            "unexpected error: {err:#}"
+        );
+        assert!(wc.path().join("pkg/.libs").is_dir());
+    }
+
+    #[test]
+    fn test_apply_abort_ownership_disarm_skips_restore() {
+        let mut ownership = ApplyAbortOwnership::default();
+        ownership.touched_paths.push("a.txt".to_string());
+        assert!(ownership.should_restore_after_abort());
+        ownership.disarm();
+        assert!(!ownership.should_restore_after_abort());
+    }
+
+    #[test]
+    fn test_refuse_apply_path_symlink_ancestors() {
+        let wc = tempfile::tempdir().unwrap();
+        std::fs::write(wc.path().join("seed.txt"), "seed").unwrap();
+        std::os::unix::fs::symlink("seed.txt", wc.path().join("link")).unwrap();
+        assert!(refuse_apply_path_symlink_ancestors(wc.path(), "link/keep.txt").is_err());
+        assert!(refuse_apply_path_symlink_ancestors(wc.path(), "seed.txt").is_ok());
+    }
+
+    #[test]
+    fn test_validate_apply_rel_path_rejects_escape() {
+        assert!(validate_apply_rel_path("scratch/note.txt").is_ok());
+        assert!(validate_apply_rel_path("../outside/file.txt").is_err());
+        assert!(validate_apply_rel_path("/etc/hostname").is_err());
+    }
+
+    #[test]
+    fn test_svn_revert_error_code_classification() {
+        let e155010 = SvnError::CommandFailed {
+            exit_code: 1,
+            stderr: "svn: E155010: The node 'wc' was not found.\n".into(),
+        };
+        let e155007 = SvnError::CommandFailed {
+            exit_code: 1,
+            stderr: "svn: E155007: '/etc/hostname' is not a working copy\n".into(),
+        };
+        assert!(svn_revert_error_is_missing_node(&e155010));
+        assert!(!svn_revert_error_is_missing_node(&e155007));
+        assert_eq!(
+            svn_stderr_error_code("svn: E155007: '/etc/hostname' is not a working copy\n"),
+            Some("E155007")
+        );
     }
 
     #[test]

@@ -291,16 +291,26 @@ fn personal_finalize_tx(
         )?;
     }
     let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM commit_map WHERE svn_rev = ?1)",
-        params![svn_rev],
+        "SELECT EXISTS(
+            SELECT 1 FROM commit_map
+            WHERE svn_rev = ?1 AND direction = 'svn_to_git' AND repo_id = ?2
+        )",
+        params![svn_rev, op.repo_id],
         |row| row.get(0),
     )?;
     if !exists {
         let now = Utc::now().to_rfc3339();
         tx.execute(
-            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author)
-             VALUES (?1, ?2, 'svn_to_git', ?3, ?4, ?5)",
-            params![svn_rev, git_sha, now, op.source_svn_author, git_author],
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (?1, ?2, 'svn_to_git', ?3, ?4, ?5, ?6)",
+            params![
+                svn_rev,
+                git_sha,
+                now,
+                op.source_svn_author,
+                git_author,
+                op.repo_id
+            ],
         )?;
     }
     let watermark_now = Utc::now().to_rfc3339();
@@ -901,6 +911,40 @@ mod tests {
         let held = db.get_git_push_operation("pair", &op.id).unwrap().unwrap();
         assert_eq!(held.state, GitPushOperationState::ReconciliationRequired);
         assert!(!held.resume_authorized);
+    }
+
+    #[test]
+    fn personal_confirm_inserts_scoped_commit_map_when_managed_row_exists() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (3, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'svn_to_git', 't', 'team', 'Team', 'managed-pair')",
+                [],
+            )
+            .unwrap();
+        let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
+        let done = db
+            .confirm_personal_svn_to_git_push(
+                "pair",
+                &op.id,
+                "dddddddddddddddddddddddddddddddddddddddd",
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "svn_rev",
+                "Dev <dev@example.com>",
+            )
+            .unwrap();
+        assert_eq!(done.state, GitPushOperationState::Completed);
+        let personal_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE svn_rev=3 AND git_sha=?1 AND repo_id='pair'",
+                ["dddddddddddddddddddddddddddddddddddddddd"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(personal_rows, 1);
     }
 
     #[test]

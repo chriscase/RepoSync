@@ -5,12 +5,15 @@
 //! journals or sync records with personal mode. Reads fall back to the legacy
 //! `personal` id on upgrade unless a managed repository already owns that id.
 
-use rusqlite::params;
+use chrono::Utc;
+use rusqlite::{params, Connection};
+use uuid::Uuid;
 
 use super::git_push_operations::GitPushOperation;
 use super::svn_commit_operations::SvnCommitOperation;
 use super::Database;
 use crate::errors::DatabaseError;
+use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
 
 /// Collision-proof scope key for new personal-mode journals and receipts.
 pub const PERSONAL_SCOPE_KEY: &str = "__reposync_personal__";
@@ -208,7 +211,7 @@ impl Database {
         Ok(false)
     }
 
-    /// True when personal mode already synced this SVN revision (receipts only).
+    /// True when personal mode already synced this SVN revision (receipts and scoped `commit_map`).
     pub fn is_personal_svn_rev_synced(&self, svn_rev: i64) -> Result<bool, DatabaseError> {
         if self.has_personal_svn_to_git_receipt_scoped(svn_rev)? {
             return Ok(true);
@@ -299,6 +302,157 @@ impl Database {
         }
         Ok(false)
     }
+
+    /// Atomically record a personal snapshot-import checkpoint: scoped `commit_map`,
+    /// applied sync receipt, and legacy import watermarks.
+    pub fn checkpoint_personal_snapshot_import(
+        &self,
+        svn_rev: i64,
+        git_sha: &str,
+        svn_author: &str,
+        git_author: &str,
+        svn_watermark_key: &str,
+    ) -> Result<(), DatabaseError> {
+        self.transaction(|tx| {
+            checkpoint_personal_svn_to_git_import_tx(
+                tx,
+                PERSONAL_SCOPE_KEY,
+                svn_rev,
+                git_sha,
+                svn_author,
+                git_author,
+                svn_watermark_key,
+                true,
+            )?;
+            Database::set_legacy_import_git_sha_watermark_tx(tx, git_sha)?;
+            Ok(())
+        })
+    }
+
+    /// Record one personal full-import revision mapping (scoped `commit_map` + receipt).
+    pub fn record_personal_import_revision(
+        &self,
+        svn_rev: i64,
+        git_sha: &str,
+        svn_author: &str,
+        git_author: &str,
+    ) -> Result<(), DatabaseError> {
+        self.transaction(|tx| {
+            checkpoint_personal_svn_to_git_import_tx(
+                tx,
+                PERSONAL_SCOPE_KEY,
+                svn_rev,
+                git_sha,
+                svn_author,
+                git_author,
+                "svn_rev",
+                false,
+            )
+        })
+    }
+
+    /// Set personal full-import tail watermarks after all revisions are mapped.
+    pub fn finalize_personal_full_import_watermarks(
+        &self,
+        last_svn_rev: i64,
+        git_sha: &str,
+    ) -> Result<(), DatabaseError> {
+        self.transaction(|tx| {
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params!["svn_rev", last_svn_rev.to_string(), now],
+            )?;
+            Database::set_legacy_import_git_sha_watermark_tx(tx, git_sha)?;
+            Ok(())
+        })
+    }
+}
+
+fn personal_svn_to_git_mapping_exists(
+    tx: &Connection,
+    repo_id: &str,
+    svn_rev: i64,
+) -> Result<bool, DatabaseError> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM commit_map
+            WHERE svn_rev = ?1 AND direction = 'svn_to_git' AND repo_id = ?2
+        )",
+        params![svn_rev, repo_id],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_personal_svn_to_git_import_tx(
+    tx: &Connection,
+    repo_id: &str,
+    svn_rev: i64,
+    git_sha: &str,
+    svn_author: &str,
+    git_author: &str,
+    svn_watermark_key: &str,
+    update_watermarks: bool,
+) -> Result<(), DatabaseError> {
+    if !personal_svn_to_git_mapping_exists(tx, repo_id, svn_rev)? {
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (?1, ?2, 'svn_to_git', ?3, ?4, ?5, ?6)",
+            params![svn_rev, git_sha, now, svn_author, git_author, repo_id],
+        )?;
+    }
+    let receipt_exists: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sync_records
+            WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'
+        )",
+        params![repo_id, svn_rev],
+        |row| row.get(0),
+    )?;
+    if !receipt_exists {
+        let now = Utc::now();
+        let record = SyncRecord {
+            id: Uuid::new_v4().to_string(),
+            repo_id: Some(repo_id.to_string()),
+            svn_revision: Some(svn_rev),
+            git_hash: Some(git_sha.into()),
+            direction: SyncDirection::SvnToGit,
+            author: svn_author.into(),
+            message: format!("personal import checkpoint r{}", svn_rev),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        };
+        tx.execute(
+            "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                record.id,
+                record.repo_id,
+                record.svn_revision,
+                record.git_hash,
+                record.direction.to_string(),
+                record.author,
+                record.message,
+                record.timestamp.to_rfc3339(),
+                record.synced_at.to_rfc3339(),
+                record.status.to_string(),
+            ],
+        )?;
+    }
+    if update_watermarks {
+        let watermark_now = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![svn_watermark_key, svn_rev.to_string(), watermark_now],
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -332,7 +486,39 @@ mod tests {
             status: SyncRecordStatus::Applied,
         })
         .unwrap();
+        assert!(db.has_personal_svn_to_git_receipt_scoped(1).unwrap());
         assert!(db.is_personal_svn_rev_synced(1).unwrap());
+    }
+
+    #[test]
+    fn managed_personal_repo_null_commit_map_ignores_legacy_personal_receipt() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+                 VALUES ('personal','Managed','file:///x','','','local','','r','main','team',5,0,0,1,'t','t',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','idle',0,0)",
+                [],
+            )
+            .unwrap();
+        let git_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        db.insert_commit_map(1, git_sha, "svn_to_git", "dev", "Dev")
+            .unwrap();
+        let now = chrono::Utc::now();
+        db.insert_sync_record(&SyncRecord {
+            id: "managed-legacy-receipt".into(),
+            repo_id: Some(LEGACY_PERSONAL_REPO_ID.to_string()),
+            svn_revision: Some(1),
+            git_hash: Some(git_sha.into()),
+            direction: SyncDirection::SvnToGit,
+            author: "dev".into(),
+            message: "managed receipt".into(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        })
+        .unwrap();
+        assert!(!db.has_personal_svn_to_git_receipt_scoped(1).unwrap());
+        assert!(!db.is_personal_svn_rev_synced(1).unwrap());
     }
 
     #[test]
@@ -438,6 +624,18 @@ mod tests {
         })
         .unwrap();
         assert!(db.is_personal_svn_rev_synced(3).unwrap());
+    }
+
+    #[test]
+    fn checkpoint_personal_snapshot_import_sets_legacy_git_sha_watermark() {
+        let db = setup_db();
+        let git_sha = "dddddddddddddddddddddddddddddddddddddddd";
+        db.checkpoint_personal_snapshot_import(7, git_sha, "dev", "Dev", "svn_rev")
+            .unwrap();
+        assert_eq!(
+            db.get_watermark("git_sha").unwrap().as_deref(),
+            Some(git_sha)
+        );
     }
 
     #[test]
