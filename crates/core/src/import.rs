@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -524,14 +524,21 @@ fn confined_rel_components(root: &Path, path: &Path) -> Result<Vec<std::ffi::OsS
             root.display()
         )
     })?;
-    Ok(rel
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name.to_os_string()),
-            Component::CurDir => None,
-            _ => None,
-        })
-        .collect())
+    let mut components = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => components.push(name.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!(
+                    "refusing path component .. outside destination root {}",
+                    root.display()
+                );
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    Ok(components)
 }
 
 #[cfg(unix)]
@@ -544,7 +551,7 @@ fn os_name_bytes(name: &OsStr) -> Vec<u8> {
 
 #[cfg(unix)]
 fn io_error_from_errno() -> std::io::Error {
-    std::io::Error::from_raw_os_error(unsafe { *libc::__errno_location() })
+    std::io::Error::last_os_error()
 }
 
 #[cfg(unix)]
@@ -694,12 +701,92 @@ fn openat_write_nofollow(
             dir.as_raw_fd(),
             name_c.as_ptr() as *const libc::c_char,
             flags,
+            0o600,
         )
     };
     if fd < 0 {
         return Err(io_error_from_errno());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+static CONFINED_TEMP_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn confined_temp_copy_name() -> std::ffi::OsString {
+    let seq = CONFINED_TEMP_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::ffi::OsString::from(format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq))
+}
+
+#[cfg(unix)]
+struct ConfinedTempFileGuard<'a> {
+    parent: &'a std::os::unix::io::OwnedFd,
+    name: std::ffi::OsString,
+    keep: bool,
+}
+
+#[cfg(unix)]
+impl Drop for ConfinedTempFileGuard<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = unlinkat_name(self.parent, self.name.as_os_str());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_dirat(dir: &std::os::unix::io::OwnedFd) -> std::io::Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd_path = Path::new("/dev/fd").join(dir.as_raw_fd().to_string());
+    let entries = std::fs::read_dir(&fd_path)?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn unlinkat_dir(parent: &std::os::unix::io::OwnedFd, name: &OsStr) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let name_c = os_name_bytes(name);
+    let rc = unsafe {
+        libc::unlinkat(
+            parent.as_raw_fd(),
+            name_c.as_ptr() as *const libc::c_char,
+            libc::AT_REMOVEDIR,
+        )
+    };
+    if rc < 0 {
+        return Err(io_error_from_errno());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_dirat_recursive(
+    parent: &std::os::unix::io::OwnedFd,
+    name: &OsStr,
+) -> std::io::Result<()> {
+    let subdir = openat_dir_nofollow(parent, name)?;
+    for child in read_dirat(&subdir)? {
+        let child_st = fstatat_nofollow(&subdir, child.as_os_str())?;
+        if stat_is_symlink(&child_st) || stat_is_reg(&child_st) {
+            unlinkat_name(&subdir, child.as_os_str())?;
+        } else if stat_is_dir(&child_st) {
+            remove_dirat_recursive(&subdir, child.as_os_str())?;
+        } else {
+            unlinkat_name(&subdir, child.as_os_str())?;
+        }
+    }
+    unlinkat_dir(parent, name)
 }
 
 #[cfg(unix)]
@@ -953,7 +1040,12 @@ fn write_confined_via_temp_rename(
     reader: &mut impl Read,
     display_path: &Path,
 ) -> Result<()> {
-    let tmp_name = std::ffi::OsString::from(format!(".reposync-copy-{}.tmp", std::process::id()));
+    let tmp_name = confined_temp_copy_name();
+    let mut temp_guard = ConfinedTempFileGuard {
+        parent,
+        name: tmp_name.clone(),
+        keep: false,
+    };
     let fd = openat_write_nofollow(parent, tmp_name.as_os_str(), true).with_context(|| {
         format!(
             "failed to create temporary file for {}",
@@ -973,6 +1065,7 @@ fn write_confined_via_temp_rename(
             display_path.display()
         )
     })?;
+    temp_guard.keep = true;
     Ok(())
 }
 
@@ -1446,6 +1539,90 @@ pub fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
     remove_stale_inner(src, dst, true)
 }
 
+#[cfg(unix)]
+fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
+    let dst_dir = match open_dir_nofollow(dst) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to open directory: {}", dst.display()));
+        }
+    };
+    remove_stale_inner_at(src, &dst_dir, dst, dst, at_root)
+}
+
+#[cfg(unix)]
+fn remove_stale_inner_at(
+    src: &Path,
+    dst_dir: &std::os::unix::io::OwnedFd,
+    dst_root: &Path,
+    dst_current: &Path,
+    at_root: bool,
+) -> Result<()> {
+    for file_name in read_dirat(dst_dir)? {
+        if is_stale_remove_protected(&file_name) {
+            continue;
+        }
+
+        let src_path = src.join(&file_name);
+        let dst_path = dst_current.join(&file_name);
+
+        if at_root
+            && file_name == ".gitattributes"
+            && reconcile_root_gitattributes(dst_root, &src_path, &dst_path)?
+        {
+            continue;
+        }
+
+        let dst_st = fstatat_nofollow(dst_dir, file_name.as_os_str()).with_context(|| {
+            format!(
+                "failed to stat destination entry without following: {}",
+                dst_path.display()
+            )
+        })?;
+        if stat_is_symlink(&dst_st) {
+            if src_path.is_dir() {
+                unlinkat_name(dst_dir, file_name.as_os_str()).with_context(|| {
+                    format!(
+                        "failed to unlink planted destination symlink directory: {}",
+                        dst_path.display()
+                    )
+                })?;
+                debug!(path = %dst_path.display(), "removed planted destination symlink directory");
+                continue;
+            }
+            if !src_path.exists() {
+                unlinkat_name(dst_dir, file_name.as_os_str()).with_context(|| {
+                    format!("failed to remove stale symlink: {}", dst_path.display())
+                })?;
+                debug!(path = %dst_path.display(), "removed stale symlink");
+            }
+            continue;
+        }
+        if stat_is_dir(&dst_st) {
+            if src_path.is_dir() {
+                let subdir =
+                    openat_dir_nofollow(dst_dir, file_name.as_os_str()).with_context(|| {
+                        format!("failed to open confined directory {}", dst_path.display())
+                    })?;
+                remove_stale_inner_at(&src_path, &subdir, dst_root, &dst_path, false)?;
+            } else {
+                remove_dirat_recursive(dst_dir, file_name.as_os_str()).with_context(|| {
+                    format!("failed to remove stale directory: {}", dst_path.display())
+                })?;
+                debug!(path = %dst_path.display(), "removed stale directory");
+            }
+        } else if !src_path.exists() {
+            unlinkat_name(dst_dir, file_name.as_os_str())
+                .with_context(|| format!("failed to remove stale file: {}", dst_path.display()))?;
+            debug!(path = %dst_path.display(), "removed stale file");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
 fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
     let entries = match std::fs::read_dir(dst) {
         Ok(entries) => entries,
@@ -4350,6 +4527,42 @@ mod tests {
             std::fs::read_to_string(&outside).unwrap(),
             "* filter=evil\n",
             "removing a planted .gitattributes symlink must not follow it"
+        );
+    }
+
+    #[test]
+    fn import_stale_remove_dir_symlink_outside_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("canary"), "UNCHANGED").unwrap();
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/keep.txt"), "keep").unwrap();
+        symlink(&outside, dst.join("sub")).unwrap();
+
+        remove_stale_files(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(outside.join("canary")).unwrap(),
+            "UNCHANGED",
+            "stale-remove must not follow or delete through a planted directory symlink"
+        );
+    }
+
+    #[test]
+    fn import_confined_rel_components_rejects_parent_dir() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::write(root.path().join("escape.txt"), "x").unwrap();
+        let evil = root.path().join("sub/../escape.txt");
+        let err = ensure_confined_dir_all(root.path(), &evil).unwrap_err();
+        assert!(
+            err.to_string().contains(".."),
+            "expected parent-dir refusal, got: {err}"
         );
     }
 

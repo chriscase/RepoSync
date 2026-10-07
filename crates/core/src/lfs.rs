@@ -229,7 +229,7 @@ fn gitattributes_line_is_full_engine_lfs(line: &str) -> bool {
     gitattributes_line_has_exact_attribute(trimmed, "filter=lfs")
         && gitattributes_line_has_exact_attribute(trimmed, "diff=lfs")
         && gitattributes_line_has_exact_attribute(trimmed, "merge=lfs")
-        && trimmed.contains("-text")
+        && gitattributes_line_has_exact_attribute(trimmed, "-text")
 }
 
 fn export_body_contains_line(export_body: &str, line: &str) -> bool {
@@ -399,11 +399,8 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
         }
     }
 
-    // Append the new line.
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gitattr_path)?;
+    // Append the new line without following a planted symlink.
+    let mut file = open_gitattributes_append_nofollow(repo_root)?;
 
     // Ensure we start on a new line if the file doesn't end with one.
     if !existing.is_empty() && !existing.ends_with('\n') {
@@ -413,6 +410,63 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
 
     info!(pattern, path = %gitattr_path.display(), "added LFS tracking to .gitattributes");
     Ok(true)
+}
+
+#[cfg(unix)]
+fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::unix::prelude::OsStrExt;
+
+    let root_c = CString::new(repo_root.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination path contains interior NUL byte",
+        )
+    })?;
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let root_owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(root_fd) };
+
+    let name = CString::new(".gitattributes").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            ".gitattributes contains interior NUL byte",
+        )
+    })?;
+    let append_flags = libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(root_owned.as_raw_fd(), name.as_ptr(), append_flags, 0) };
+    let fd = if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err);
+        }
+        let create_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let created =
+            unsafe { libc::openat(root_owned.as_raw_fd(), name.as_ptr(), create_flags, 0o644) };
+        if created < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        created
+    } else {
+        fd
+    };
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(repo_root.join(".gitattributes"))
 }
 
 /// Derive a `.gitattributes` pattern for a file path.
@@ -833,6 +887,20 @@ mod tests {
         assert!(!export_present_gitattributes_needs_strip(
             false,
             Some("# don't use filter=ident here\n* text=auto\n"),
+            "* text=auto\n"
+        ));
+    }
+
+    #[test]
+    fn test_gitattributes_line_is_full_engine_lfs_requires_text_attribute_token() {
+        assert!(export_present_gitattributes_needs_strip(
+            false,
+            Some("*-text filter=lfs diff=lfs merge=lfs\n"),
+            "* text=auto\n"
+        ));
+        assert!(!export_present_gitattributes_needs_strip(
+            false,
+            Some("*.bin filter=lfs diff=lfs merge=lfs -text\n"),
             "* text=auto\n"
         ));
     }
