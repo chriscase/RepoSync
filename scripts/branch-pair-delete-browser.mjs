@@ -367,14 +367,15 @@ async function runScenarios(uiOrigin, session, mode) {
     })()`);
     await until(async () => (await evaluate(`document.querySelector('[data-testid="confirm-delete-branch-pair"]')?.disabled === false`)), 'confirm enabled');
   };
-  const uncheckRemotes = async () => {
+  const setRemoteDeletion = async (enabled) => {
     for (const testId of ['delete-git-opt', 'delete-svn-opt']) {
       const checked = await evaluate(`document.querySelector('[data-testid="${testId}"]')?.checked === true`);
-      if (checked) await click(testId);
+      if (enabled && !checked) await click(testId);
+      if (!enabled && checked) await click(testId);
     }
   };
-  const confirmDelete = async (gitBranch, { remote = true } = {}) => {
-    if (!remote) await uncheckRemotes();
+  const confirmDelete = async (gitBranch, { remote = false } = {}) => {
+    await setRemoteDeletion(remote);
     await fill(gitBranch);
     const before = await evaluate('window.__pairFetches.length');
     await click('confirm-delete-branch-pair');
@@ -477,7 +478,7 @@ async function runScenarios(uiOrigin, session, mode) {
 
   await goto('/repos/child-warn', async () => (await heading()).includes('Warn Child'));
   await click('delete-viewed-branch-pair');
-  await confirmDelete('warn-branch');
+  await confirmDelete('warn-branch', { remote: true });
   await until(async () => (await pathOf()) === '/repos/parent-1', 'parent after warnings');
   const warning = await notice();
   if (!warning.includes("failed to delete Git branch 'warn-branch'")) throw new Error(`Warning was not visible after navigation: ${warning}`);
