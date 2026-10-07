@@ -535,6 +535,10 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::echo_suppression::{
+        classify_incoming_svn_revision, verify_svn_no_target_receipt, EchoDisposition,
+        NoTargetReceiptVerdict, TeamEchoContext,
+    };
 
     #[test]
     fn svn_no_target_confirm_advances_watermark() {
@@ -547,6 +551,7 @@ mod tests {
                 ["a".repeat(40)],
             )
             .unwrap();
+        let inbound_git_before = db.get_state("last_git_sha_pair").unwrap();
         let fingerprint = team_cycle_mapping_fingerprint("pair", "unfiltered");
         let op = db
             .begin_team_cycle_mapping(TeamCycleMappingIntent {
@@ -576,11 +581,38 @@ mod tests {
             db.get_state("last_svn_rev_pair").unwrap().as_deref(),
             Some("2")
         );
-        let receipt = db
+        let receipt_raw = db
             .get_state("handled_svn_no_target_pair_2")
             .unwrap()
             .unwrap();
-        assert!(receipt.contains("no_git_content"));
+        let receipt = serde_json::from_str::<serde_json::Value>(&receipt_raw).unwrap();
+        assert_eq!(
+            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered"),
+            NoTargetReceiptVerdict::Accepted
+        );
+        let echo_ctx = TeamEchoContext {
+            db: &db,
+            repo_id: "pair",
+            no_target_projection: "unfiltered",
+        };
+        assert_eq!(
+            classify_incoming_svn_revision(&echo_ctx, 2, "no marker").unwrap(),
+            EchoDisposition::SkipEcho
+        );
+        let emitted_tip: String = db
+            .conn()
+            .query_row(
+                "SELECT last_git_sha FROM repositories WHERE id='pair'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emitted_tip, "a".repeat(40));
+        assert_eq!(
+            db.get_state("last_git_sha_pair").unwrap(),
+            inbound_git_before,
+            "svn no-target must not move inbound git cursor"
+        );
         assert!(db
             .active_team_cycle_mapping_operation("pair")
             .unwrap()
