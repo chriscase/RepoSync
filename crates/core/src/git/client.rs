@@ -182,7 +182,10 @@ impl GitClient {
         token: Option<&str>,
     ) -> Result<(), GitError> {
         let Some(tok) = token else {
-            return self.clear_remote_credentials(remote_name);
+            // Absence means "no new token to embed", not "revoke". Callers that
+            // need to strip userinfo must use [`Self::clear_remote_credentials`]
+            // or [`apply_git_credential_chain_state`] after resolving chain state.
+            return Ok(());
         };
         let remote = self.repo.find_remote(remote_name)?;
         let Some(url) = remote.url() else {

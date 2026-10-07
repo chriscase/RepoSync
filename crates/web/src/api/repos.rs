@@ -1168,15 +1168,13 @@ async fn start_repo_import(
         "resolved SVN password for import"
     );
 
-    let git_token_repo = db
-        .get_state(&format!("secret_git_token_{}", id))
-        .unwrap_or(None);
-    let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
-    let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
+    let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
+    let git_token = git_token_state.value.clone();
     debug!(
         repo_id = %id,
-        source = if git_token_repo.is_some() { "repo-specific" } else if git_token_global.is_some() { "global" } else { "none" },
-        "resolved Git token for import"
+        git_token_found = git_token.is_some(),
+        git_token_revoked = git_token_state.explicitly_revoked,
+        "resolved Git token for import via credential chain"
     );
 
     // 5. Build SVN import URL
@@ -1261,8 +1259,7 @@ async fn start_repo_import(
         .map_err(|e| AppError::Internal(format!("failed to select import branch: {e}")))?;
 
     // 8. Configure git remote credentials
-    git_client
-        .ensure_remote_credentials("origin", git_token.as_deref())
+    reposync_core::git::apply_git_credential_chain_state(&git_client, "origin", &git_token_state)
         .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
 
     {
@@ -1964,11 +1961,8 @@ async fn resume_repo_import(
         .clone()
         .or(svn_password_global.clone())
         .unwrap_or_default();
-    let git_token_repo = db
-        .get_state(&format!("secret_git_token_{}", id))
-        .unwrap_or(None);
-    let git_token_global = db.get_state("secret_git_token").unwrap_or(None);
-    let git_token: Option<String> = git_token_repo.clone().or(git_token_global.clone());
+    let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
+    let git_token = git_token_state.value.clone();
 
     let svn_import_url = {
         let base = repo.svn_url.trim_end_matches('/');
@@ -1989,11 +1983,12 @@ async fn resume_repo_import(
         GitClient::new(&git_repo_path)
             .map_err(|e| AppError::Internal(format!("failed to open git repo: {e}")))?,
     ));
-    git_client
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ensure_remote_credentials("origin", git_token.as_deref())
-        .map_err(|e| AppError::Internal(format!("failed to set git credentials: {e}")))?;
+    reposync_core::git::apply_git_credential_chain_state(
+        &git_client.lock().unwrap_or_else(|p| p.into_inner()),
+        "origin",
+        &git_token_state,
+    )
+    .map_err(|e| AppError::Internal(format!("failed to set git credentials: {e}")))?;
 
     let identity_config = reposync_core::config::IdentityConfig::default();
     let identity_mapper = IdentityMapper::new(&identity_config)

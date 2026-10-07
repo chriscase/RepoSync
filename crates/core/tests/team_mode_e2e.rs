@@ -20,13 +20,16 @@ use tempfile::TempDir;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
+use reposync_core::db::queries::CredentialChainState;
 use reposync_core::db::watermark_recovery::{
     persist_git_log_auto_detect_watermark, recover_repo_watermark_from_git_log_scan,
     recover_repo_watermark_from_global_migration,
 };
 use reposync_core::db::Database;
 use reposync_core::errors::SyncError;
-use reposync_core::git::GitClient;
+use reposync_core::git::{
+    apply_git_credential_chain_state, apply_managed_git_credentials, GitClient,
+};
 use reposync_core::identity::IdentityMapper;
 use reposync_core::models::{Repository, SyncState};
 use reposync_core::svn::SvnClient;
@@ -10896,6 +10899,179 @@ async fn candidate_rs11_parent_revocation_blocks_global_for_child() {
             "case":"RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL",
             "parent_revoked":true,
             "global_fallback":false
+        })
+    );
+}
+
+fn rs11_embedded_git_fixture(embedded_token: &str) -> (TempDir, PathBuf, PathBuf, String) {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("embedded-git.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    let repo_id = "embedded_fixture".to_string();
+    let bridge = tmp.path().join("bridge");
+    let bare = tmp.path().join("origin.git");
+    let _git = setup_git_with_bare_origin(&bridge, &bare);
+    db.insert_repository(&Repository {
+        id: repo_id.clone(),
+        name: "embedded fixture".into(),
+        svn_url: "file:///dev/null".into(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    let url = format!("https://x-access-token:{embedded_token}@git.invalid/repo.git");
+    git_cli(&bridge, &["remote", "set-url", "origin", &url]);
+    (tmp, bridge, db_path, repo_id)
+}
+
+/// RS-11 / #63: scheduler credential prep must preserve URL-embedded git tokens
+/// when the credential chain misses (post-encrypt install).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_scheduler_chain_miss_preserves_embedded_git_token() {
+    let embedded = "embedded-scheduler-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    let before = git_origin_url(&bridge);
+
+    let db = setup_db(&db_path);
+    for key in ["secret_git_token", &format!("secret_git_token_{}", repo_id)] {
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let git = GitClient::new(&bridge).unwrap();
+    apply_managed_git_credentials(&git, &db, &repo_id, "origin").unwrap();
+
+    assert_eq!(
+        git_origin_url(&bridge),
+        before,
+        "scheduler chain miss must not strip embedded git token"
+    );
+    assert!(before.contains(embedded));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_SCHEDULER_CHAIN_MISS_PRESERVES_EMBEDDED_GIT",
+            "embedded_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: import credential prep must preserve URL-embedded git tokens
+/// when the credential chain misses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_import_chain_miss_preserves_embedded_git_token() {
+    let embedded = "embedded-import-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    let before = git_origin_url(&bridge);
+
+    let db = setup_db(&db_path);
+    for key in ["secret_git_token", &format!("secret_git_token_{}", repo_id)] {
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let git = GitClient::new(&bridge).unwrap();
+    let state = db.resolve_credential_chain_state(&repo_id, "secret_git_token");
+    assert!(!state.explicitly_revoked);
+    apply_git_credential_chain_state(&git, "origin", &state).unwrap();
+
+    assert_eq!(
+        git_origin_url(&bridge),
+        before,
+        "import chain miss must not strip embedded git token"
+    );
+    assert!(before.contains(embedded));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_IMPORT_CHAIN_MISS_PRESERVES_EMBEDDED_GIT",
+            "embedded_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: a credential-chain DB error must not strip URL-embedded git
+/// tokens (fail-safe `NotFound` handling).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_chain_db_error_preserves_embedded_git_token() {
+    let embedded = "embedded-db-error-token";
+    let (_tmp, bridge, _db_path, _repo_id) = rs11_embedded_git_fixture(embedded);
+    let before = git_origin_url(&bridge);
+
+    let git = GitClient::new(&bridge).unwrap();
+    apply_git_credential_chain_state(&git, "origin", &CredentialChainState::not_found()).unwrap();
+
+    assert_eq!(
+        git_origin_url(&bridge),
+        before,
+        "chain DB error / not-found must not strip embedded git token"
+    );
+    assert!(before.contains(embedded));
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT",
+            "embedded_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: scheduler credential prep must strip URL-embedded git tokens
+/// on explicit per-repo revocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_scheduler_revocation_strips_embedded_git_token() {
+    let embedded = "embedded-scheduler-revoke-token";
+    let (_tmp, bridge, db_path, repo_id) = rs11_embedded_git_fixture(embedded);
+    assert!(git_origin_url(&bridge).contains(embedded));
+
+    let db = setup_db(&db_path);
+    db.set_state(&format!("secret_git_token_{}", repo_id), "")
+        .unwrap();
+
+    let git = GitClient::new(&bridge).unwrap();
+    apply_managed_git_credentials(&git, &db, &repo_id, "origin").unwrap();
+
+    let after = git_origin_url(&bridge);
+    assert!(
+        !after.contains("x-access-token:"),
+        "scheduler revocation must strip embedded git token: {after}"
+    );
+    assert_eq!(after, "https://git.invalid/repo.git");
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT",
+            "embedded_cleared":true
         })
     );
 }

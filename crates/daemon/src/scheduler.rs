@@ -667,14 +667,16 @@ impl Scheduler {
             let svn_password = self
                 .db
                 .resolve_credential_chain(&repo.id, "secret_svn_password");
-            let git_token = self
+            let git_token_state = self
                 .db
-                .resolve_credential_chain(&repo.id, "secret_git_token");
+                .resolve_credential_chain_state(&repo.id, "secret_git_token");
+            let git_token = git_token_state.value.clone();
 
             debug!(
                 repo_name = %repo.name,
                 svn_password_found = svn_password.is_some(),
                 git_token_found = git_token.is_some(),
+                git_token_revoked = git_token_state.explicitly_revoked,
                 "resolved credentials via chain"
             );
 
@@ -767,10 +769,13 @@ impl Scheduler {
                 }
             };
 
-            // Ensure remote has credentials embedded.
-            git_client
-                .ensure_remote_credentials("origin", git_token.as_deref())
-                .ok();
+            // Ensure remote has credentials embedded (or cleared on revocation).
+            reposync_core::git::apply_git_credential_chain_state(
+                &git_client,
+                "origin",
+                &git_token_state,
+            )
+            .ok();
 
             // Ensure HEAD is aligned with the configured branch. After
             // cloning an empty remote, libgit2 may leave HEAD pointing

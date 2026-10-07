@@ -3479,16 +3479,15 @@ impl SyncEngine {
         };
         {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            match git_state.value.as_deref() {
-                Some(tok) => {
-                    let _ = git.ensure_remote_credentials("origin", Some(tok));
+            match crate::git::apply_git_credential_chain_state(&git, "origin", &git_state) {
+                Ok(()) if git_state.value.is_some() => {
                     debug!("reloaded Git token from database");
                 }
-                None if git_state.explicitly_revoked => {
-                    let _ = git.clear_remote_credentials("origin");
+                Ok(()) if git_state.explicitly_revoked => {
                     debug!("cleared embedded git credentials after explicit revocation");
                 }
-                None => {}
+                Ok(()) => {}
+                Err(e) => warn!("failed to apply git credential chain state: {e}"),
             }
         }
     }

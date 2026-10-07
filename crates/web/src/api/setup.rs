@@ -1101,24 +1101,15 @@ async fn spawn_import_task(
         .map_err(|e| AppError::Internal(format!("failed to resolve env vars: {}", e)))?;
 
     // Load secrets from DB
-    let (db_svn_password, db_git_token) = {
+    let db_svn_password = {
         let db = &state.db;
         let conn = db.conn();
-        let svn_pw: Option<String> = conn
-            .query_row(
-                "SELECT value FROM kv_state WHERE key = 'secret_svn_password'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        let git_tok: Option<String> = conn
-            .query_row(
-                "SELECT value FROM kv_state WHERE key = 'secret_git_token'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        (svn_pw, git_tok)
+        conn.query_row(
+            "SELECT value FROM kv_state WHERE key = 'secret_svn_password'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
     };
 
     // Build clients
@@ -1146,7 +1137,14 @@ async fn spawn_import_task(
     let svn_client = SvnClient::new(&svn_import_url, &config.svn.username, &svn_password)
         .with_cancel_signal(cancel_signal.clone());
 
-    let git_token = config.github.token.clone().or(db_git_token);
+    let git_token_state = if let Some(tok) = config.github.token.clone() {
+        reposync_core::db::queries::CredentialChainState::resolved(tok)
+    } else {
+        state
+            .db
+            .resolve_credential_chain_state(&repo_id, "secret_git_token")
+    };
+    let git_token = git_token_state.value.clone();
     let git_repo_path = config.daemon.data_dir.join("git-repo");
 
     std::fs::create_dir_all(&config.daemon.data_dir)
@@ -1167,8 +1165,7 @@ async fn spawn_import_task(
         })?
     };
 
-    git_client
-        .ensure_remote_credentials("origin", git_token.as_deref())
+    reposync_core::git::apply_git_credential_chain_state(&git_client, "origin", &git_token_state)
         .map_err(|e| AppError::Internal(format!("failed to set git credentials: {}", e)))?;
 
     let git_client = Arc::new(std::sync::Mutex::new(git_client));

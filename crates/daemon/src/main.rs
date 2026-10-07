@@ -400,9 +400,16 @@ async fn main() -> Result<()> {
         }
     };
     // Ensure the remote URL has embedded credentials for reliable HTTP auth.
-    git_client
-        .ensure_remote_credentials("origin", config.github.token.as_deref())
-        .ok(); // Don't crash if this fails
+    if let Some(tok) = config.github.token.as_deref() {
+        git_client
+            .ensure_remote_credentials("origin", Some(tok))
+            .ok();
+    } else if let Ok(repos) = db.list_repositories() {
+        if let Some(repo) = repos.into_iter().find(|r| r.enabled) {
+            reposync_core::git::apply_managed_git_credentials(&git_client, &db, &repo.id, "origin")
+                .ok();
+        }
+    }
 
     // Initialize identity mapper
     let identity_mapper = Arc::new(
