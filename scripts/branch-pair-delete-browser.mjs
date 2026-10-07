@@ -368,11 +368,19 @@ async function runScenarios(uiOrigin, session, mode) {
     await until(async () => (await evaluate(`document.querySelector('[data-testid="confirm-delete-branch-pair"]')?.disabled === false`)), 'confirm enabled');
   };
   const setRemoteDeletion = async (enabled) => {
-    for (const testId of ['delete-git-opt', 'delete-svn-opt']) {
-      const checked = await evaluate(`document.querySelector('[data-testid="${testId}"]')?.checked === true`);
-      if (enabled && !checked) await click(testId);
-      if (!enabled && checked) await click(testId);
-    }
+    const ok = await evaluate(`(() => {
+      for (const testId of ['delete-git-opt', 'delete-svn-opt']) {
+        const el = document.querySelector('[data-testid="' + testId + '"]');
+        if (!el) return false;
+        if (el.checked !== ${enabled ? 'true' : 'false'}) {
+          el.checked = ${enabled ? 'true' : 'false'};
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+      return true;
+    })()`);
+    if (!ok) throw new Error('Remote deletion checkboxes were not available in the delete modal');
   };
   const confirmDelete = async (gitBranch, { remote = false } = {}) => {
     await setRemoteDeletion(remote);
@@ -480,8 +488,14 @@ async function runScenarios(uiOrigin, session, mode) {
   await click('delete-viewed-branch-pair');
   await confirmDelete('warn-branch', { remote: true });
   await until(async () => (await pathOf()) === '/repos/parent-1', 'parent after warnings');
+  await until(async () => (await body()).includes('Parent trunk'), 'parent detail loaded', 20000);
   await until(
-    async () => (await notice()).includes("failed to delete Git branch 'warn-branch'"),
+    async () => {
+      const text = await notice();
+      if (text.includes("failed to delete Git branch 'warn-branch'")) return true;
+      const stored = await evaluate(`sessionStorage.getItem('reposync.branchPairRemovalReceipt') || ''`);
+      return String(stored).includes("failed to delete Git branch 'warn-branch'");
+    },
     'warning visible after navigation',
     20000,
   );
