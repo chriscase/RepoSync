@@ -9,6 +9,7 @@ use tracing::{debug, warn};
 use crate::db::git_push_operations::GitPushOperationState;
 use crate::db::svn_commit_operations::SvnCommitOperationState;
 use crate::db::Database;
+use crate::echo_receipt_scope::{read_git_no_target_receipt, read_svn_no_target_receipt};
 use crate::errors::{DatabaseError, SyncError};
 use crate::history_inspect::is_full_git_oid;
 
@@ -299,12 +300,7 @@ fn verified_svn_no_target_receipt(
     ctx: &TeamEchoContext<'_>,
     svn_rev: i64,
 ) -> Result<bool, DatabaseError> {
-    let key = format!("handled_svn_no_target_{}_{}", ctx.repo_id, svn_rev);
-    let Some(raw) = ctx.db.get_state(&key)? else {
-        return Ok(false);
-    };
-    let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
-    let Some(record) = receipt else {
+    let Some(record) = read_svn_no_target_receipt(ctx.db, ctx.repo_id, svn_rev)? else {
         return Ok(false);
     };
     Ok(
@@ -333,12 +329,7 @@ fn verified_git_no_target_receipt(
     ctx: &TeamEchoContext<'_>,
     sha: &str,
 ) -> Result<bool, DatabaseError> {
-    let key = format!("handled_git_no_target_{}_{}", ctx.repo_id, sha);
-    let Some(raw) = ctx.db.get_state(&key)? else {
-        return Ok(false);
-    };
-    let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
-    let Some(record) = receipt else {
+    let Some(record) = read_git_no_target_receipt(ctx.db, ctx.repo_id, sha)? else {
         return Ok(false);
     };
     Ok(
@@ -404,12 +395,7 @@ fn verified_svn_no_target_receipt_personal(
     svn_rev: i64,
 ) -> Result<bool, DatabaseError> {
     for repo_id in ctx.db.personal_repo_ids_for_read()? {
-        let key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
-        let Some(raw) = ctx.db.get_state(&key)? else {
-            continue;
-        };
-        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
-        let Some(record) = receipt else {
+        let Some(record) = read_svn_no_target_receipt(ctx.db, repo_id, svn_rev)? else {
             continue;
         };
         if verify_svn_no_target_receipt(&record, repo_id, svn_rev, ctx.no_target_projection)
@@ -426,12 +412,7 @@ fn verified_git_no_target_receipt_personal(
     sha: &str,
 ) -> Result<bool, DatabaseError> {
     for repo_id in ctx.db.personal_repo_ids_for_read()? {
-        let key = format!("handled_git_no_target_{}_{}", repo_id, sha);
-        let Some(raw) = ctx.db.get_state(&key)? else {
-            continue;
-        };
-        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
-        let Some(record) = receipt else {
+        let Some(record) = read_git_no_target_receipt(ctx.db, repo_id, sha)? else {
             continue;
         };
         if verify_no_target_receipt(&record, repo_id, sha, ctx.no_target_projection)

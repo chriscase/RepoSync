@@ -33,7 +33,8 @@ use reposync_core::path_projection::{
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
 use reposync_core::svn_commit::{
-    hash_regular_file_tree, intended_paths_from_contents, observed_svn_tree_at_revision,
+    append_durable_git_to_svn_identity, hash_regular_file_tree, inspect_git_to_svn_commit,
+    intended_paths_from_contents, observed_svn_tree_at_revision, SvnCommitInspect,
 };
 
 use crate::commit_format::CommitFormatter;
@@ -497,7 +498,24 @@ impl GitToSvnSync {
             .active_personal_svn_commit_operation()
             .context("failed to read active personal git-to-svn commit")?
         {
-            if let Some(reason) = blocking_svn_commit_hold(&op) {
+            if op.state == SvnCommitOperationState::ReconciliationRequired
+                && op.source_git_sha == commit.sha
+            {
+                let git_author = commit.commit.author.name.as_str();
+                match self
+                    .finalize_held_personal_git_to_svn_if_proven(&op, git_author)
+                    .await
+                {
+                    Ok(Some(svn_rev)) => return Ok(svn_rev),
+                    Ok(None) if op.resume_authorized => {}
+                    Ok(None) => {
+                        if let Some(reason) = blocking_svn_commit_hold(&op) {
+                            anyhow::bail!(reason);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(reason) = blocking_svn_commit_hold(&op) {
                 anyhow::bail!(reason);
             }
         }
@@ -639,11 +657,15 @@ impl GitToSvnSync {
             }
 
             // 4. Format commit message with trailers and commit after durable intent.
-            let formatted_message = self.formatter.format_git_to_svn(
-                &commit.commit.message,
+            let formatted_message = append_durable_git_to_svn_identity(
+                &self.formatter.format_git_to_svn(
+                    &commit.commit.message,
+                    &commit.sha,
+                    pr_number,
+                    pr_branch,
+                ),
                 &commit.sha,
-                pr_number,
-                pr_branch,
+                &op.id,
             );
 
             let svn_rev = match self
@@ -1131,6 +1153,53 @@ impl GitToSvnSync {
     }
 }
 
+impl GitToSvnSync {
+    async fn finalize_held_personal_git_to_svn_if_proven(
+        &self,
+        op: &SvnCommitOperation,
+        git_author: &str,
+    ) -> Result<Option<i64>> {
+        if op.state != SvnCommitOperationState::ReconciliationRequired {
+            return Ok(None);
+        }
+        let inspect = inspect_git_to_svn_commit(&self.svn, op).await;
+        match inspect {
+            SvnCommitInspect::UniqueMatch {
+                svn_rev, svn_tree, ..
+            } => {
+                self.db
+                    .finalize_personal_verified_git_to_svn_commit(
+                        PERSONAL_REPO_ID,
+                        &op.id,
+                        svn_rev,
+                        &svn_tree,
+                        git_author,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to finalize held personal git-to-svn commit for {}",
+                            op.source_git_sha
+                        )
+                    })?;
+                info!(
+                    svn_rev,
+                    operation_id = %op.id,
+                    git_sha = %op.source_git_sha,
+                    "held personal git-to-svn commit verified and checkpointed"
+                );
+                Ok(Some(svn_rev))
+            }
+            SvnCommitInspect::AbsentUnchanged => Ok(None),
+            SvnCommitInspect::Conflict { reason } => anyhow::bail!(
+                "reconciliation_required: cannot prove held SVN revision is ours: {reason}"
+            ),
+            SvnCommitInspect::Unavailable { reason } => {
+                anyhow::bail!("reconciliation_required: {reason}")
+            }
+        }
+    }
+}
+
 fn blocking_git_push_hold(op: &GitPushOperation) -> Option<String> {
     if op.state == GitPushOperationState::ReconciliationRequired && !op.resume_authorized {
         return Some(format!(
@@ -1201,10 +1270,7 @@ fn svn_commit_fixture_flag(var: &str, repo_id: &str, svn_wc_path: &Path) -> bool
         repo_id,
         svn_commit_fixture_scope(svn_wc_path)
     );
-    if std::env::var(&scoped).is_ok() {
-        return true;
-    }
-    std::env::var(var).ok().as_deref() == Some(repo_id)
+    std::env::var(&scoped).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1637,7 +1703,11 @@ fn remove_apply_created_paths(wc_root: &Path, ownership: &ApplyAbortOwnership) -
     for rel in &ownership.new_files {
         validate_apply_rel_path(rel)?;
         let full = wc_root.join(rel);
-        if full.is_file() {
+        if full
+            .symlink_metadata()
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+        {
             std::fs::remove_file(&full).with_context(|| {
                 format!("failed to remove apply-created file: {}", full.display())
             })?;

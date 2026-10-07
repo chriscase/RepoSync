@@ -1255,10 +1255,12 @@ impl Database {
                 "nonempty no-target outcome requires target verification".into(),
             ));
         }
-        let receipt = serde_json::json!({
+        let generation = crate::echo_receipt_scope::repo_echo_generation(self, repo_id)?;
+        let mut receipt = serde_json::json!({
             "version": 1, "repo_id": repo_id, "git_sha": git_sha,
             "outcome": outcome, "projection": projection,
         });
+        crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
@@ -1269,11 +1271,13 @@ impl Database {
         projection: &str,
         target: &serde_json::Value,
     ) -> Result<(), DatabaseError> {
-        let receipt = serde_json::json!({
+        let generation = crate::echo_receipt_scope::repo_echo_generation(self, repo_id)?;
+        let mut receipt = serde_json::json!({
             "version": 3, "repo_id": repo_id, "git_sha": git_sha,
             "outcome": "no_svn_delta", "projection": projection,
             "target": target,
         });
+        crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
@@ -1354,6 +1358,13 @@ impl Database {
         git_sha: &str,
         no_target: Option<serde_json::Value>,
     ) -> Result<(), DatabaseError> {
+        let receipt_generation = if no_target.is_some() {
+            Some(crate::echo_receipt_scope::repo_echo_generation(
+                self, repo_id,
+            )?)
+        } else {
+            None
+        };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
 
@@ -1379,7 +1390,10 @@ impl Database {
         }
 
         if let Some(receipt) = no_target {
-            let key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+            let generation = receipt_generation.expect("receipt generation");
+            let key = crate::echo_receipt_scope::handled_git_no_target_state_key(
+                repo_id, generation, git_sha,
+            );
             tx.execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
                 params![key, receipt.to_string(), now],

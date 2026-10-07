@@ -645,6 +645,38 @@ impl Database {
         })
     }
 
+    /// Finalize a held personal Git→SVN journal after remote inspection proves
+    /// the one planned SVN revision is ours.
+    pub fn finalize_personal_verified_git_to_svn_commit(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        svn_rev: i64,
+        svn_tree: &str,
+        git_author: &str,
+    ) -> Result<SvnCommitOperation, DatabaseError> {
+        self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
+                return Err(DatabaseError::Other(
+                    "stale or inactive git-to-svn commit operation".into(),
+                ));
+            }
+            let op = parse(&read_value(tx, &key("document", op_id))?.ok_or_else(|| {
+                DatabaseError::Other("missing git-to-svn commit document".into())
+            })?)?;
+            if op.repo_id != repo_id
+                || op.operation_type != "git_to_svn_commit"
+                || op.state != SvnCommitOperationState::ReconciliationRequired
+            {
+                return Err(DatabaseError::Other(
+                    "operation is not an active git-to-svn reconciliation hold".into(),
+                ));
+            }
+            personal_finalize_tx(tx, op, svn_rev, svn_tree, git_author)
+        })
+    }
+
     /// Personal-mode checkpoint: journal completion plus `commit_map`.
     pub fn confirm_personal_git_to_svn_commit(
         &self,
