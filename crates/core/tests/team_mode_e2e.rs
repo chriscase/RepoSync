@@ -5698,6 +5698,199 @@ async fn candidate_rs05_get_status_scoped_git_cursor_ignores_global() {
     );
 }
 
+/// RS-05 / #63: managed `get_status` must not borrow another pair's SVN
+/// revision when scoped `last_svn_rev_<repo>` is absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_get_status_scoped_svn_cursor_ignores_global() {
+    let fixture = QualifiedPair::new().await;
+    let pair_rev = fixture.engine.db().get_repo_watermark("pair").unwrap().0;
+    let other_rev = pair_rev + 5;
+
+    fixture.engine.db().set_state("last_svn_rev", "99").unwrap();
+    fixture
+        .engine
+        .db()
+        .insert_sync_record(&reposync_core::models::SyncRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: Some("other".into()),
+            svn_revision: Some(other_rev),
+            git_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            direction: reposync_core::models::SyncDirection::SvnToGit,
+            author: "fixture".into(),
+            message: "other pair".into(),
+            timestamp: chrono::Utc::now(),
+            synced_at: chrono::Utc::now(),
+            status: reposync_core::models::SyncRecordStatus::Applied,
+        })
+        .unwrap();
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    shared_db.initialize().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "pending".into(),
+            name: "pending pair".into(),
+            svn_url: fixture.svn_repo_root.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: fixture.bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+
+    let mut pending_engine = SyncEngine::new(
+        make_app_config(&fixture.svn_repo_root, fixture.tmp.path()),
+        shared_db,
+        SvnClient::new(&fixture.svn_url, "", ""),
+        GitClient::new(&fixture.bridge).expect("git client"),
+        Arc::new(make_identity_mapper()),
+    );
+    pending_engine.set_repo_id("pending".into());
+
+    let status_pair = fixture.engine.get_status().unwrap();
+    assert_eq!(
+        status_pair.last_svn_revision,
+        Some(pair_rev),
+        "pair get_status must report scoped SVN cursor"
+    );
+
+    let status_pending = pending_engine.get_status().unwrap();
+    assert_eq!(
+        status_pending.last_svn_revision, None,
+        "missing scoped SVN cursor must report absent revision, not global MAX"
+    );
+    assert!(
+        fixture.engine.db().get_last_svn_revision().unwrap() == Some(other_rev),
+        "global MAX must still reflect the other pair for legacy callers"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_GET_STATUS_SCOPED_SVN_CURSOR",
+            "pair_scoped_rev":pair_rev,
+            "other_pair_rev":other_rev,
+            "global_max_svn_rev":other_rev,
+            "pair_status_svn":status_pair.last_svn_revision,
+            "pending_status_svn":status_pending.last_svn_revision
+        })
+    );
+}
+
+/// RS-05 / #63: after Git->SVN then SVN->Git, `get_status` reports the
+/// emitted tip from `repositories.last_git_sha` while scoped inbound kv
+/// stays at the handled checkpoint for replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_get_status_git_sha_after_git_then_svn_to_git() {
+    let fixture = QualifiedPair::new().await;
+    let handled = fixture.developer_commit("config", "handled Git\n", "Handled Git direction");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let revision = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "emitted SVN\n",
+        "Emitted SVN direction",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    let emitted = get_head_sha(&fixture.bridge);
+    assert_ne!(
+        handled, emitted,
+        "svn-to-git must advance bridge to a new Git SHA"
+    );
+
+    let (_, table_sha) = fixture.engine.db().get_repo_watermark("pair").unwrap();
+    assert_eq!(table_sha, emitted);
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(handled.clone()),
+        "svn-to-git finalize must not collapse inbound scoped git cursor kv"
+    );
+
+    let status = fixture.engine.get_status().unwrap();
+    assert_eq!(
+        status.last_git_hash.as_deref(),
+        Some(emitted.as_str()),
+        "get_status must report repositories.last_git_sha after svn-to-git finalize"
+    );
+    assert_ne!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        status.last_git_hash,
+        "get_status display must not advance inbound scoped git cursor kv"
+    );
+    assert_eq!(
+        status.last_svn_revision,
+        Some(revision),
+        "svn-to-git finalize must keep scoped svn cursor visible in get_status"
+    );
+
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let pending = fixture.developer_commit("config", "pending after svn\n", "Pending after SVN");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let replay = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        replay.git_to_svn_count, 1,
+        "pending Git must still replay after svn-to-git finalize"
+    );
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(pending.clone())
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_TEAM_GET_STATUS_GIT_SHA_AFTER_BIDIRECTIONAL",
+            "handled_git":handled,
+            "emitted_git":emitted,
+            "pending_git":pending,
+            "svn_rev":revision,
+            "table_git_sha":table_sha,
+            "scoped_kv_git_sha":handled,
+            "status_git_sha":status.last_git_hash,
+            "pending_replayed":true
+        })
+    );
+}
+
 /// RS-05 / #63: team-mode git-to-svn advancement updates only the managed
 /// repo checkpoint and must not advance the global `last_git_hash`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

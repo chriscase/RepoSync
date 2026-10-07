@@ -828,6 +828,16 @@ mod tests {
             db.get_repo_watermark("pair").unwrap(),
             (3, "dddddddddddddddddddddddddddddddddddddddd".into())
         );
+        assert_eq!(
+            db.get_state("last_git_sha_pair").unwrap(),
+            None,
+            "svn-to-git finalize must not advance scoped inbound git cursor kv"
+        );
+        assert_eq!(
+            db.get_state("last_git_hash").unwrap(),
+            None,
+            "team-mode svn-to-git finalize must not write global last_git_hash"
+        );
     }
 
     #[test]
