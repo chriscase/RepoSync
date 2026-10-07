@@ -3431,59 +3431,64 @@ impl SyncEngine {
     // Credential hot-reload
     // -----------------------------------------------------------------------
 
+    /// Fixture-only accessor for credential isolation proofs.
+    #[doc(hidden)]
+    pub fn fixture_svn_password_marker(&self) -> String {
+        self.svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .fixture_password_marker()
+            .to_string()
+    }
+
     /// Re-read SVN password and Git token from the DB so that credentials
     /// saved via the repo detail page take effect without a daemon restart.
-    /// Tries per-repo keys first (secret_svn_password_{repo_id}), then falls
-    /// back to global keys for backward compatibility.
+    /// Uses the same scoped resolver as the scheduler: repo → parent chain →
+    /// global, with explicit per-repo revocation blocking broader fallback.
     fn reload_credentials(&self) {
-        // SVN password — per-repo key first, then global
-        let svn_pw = self
-            .repo_id
-            .as_ref()
-            .and_then(|rid| {
-                self.db
-                    .get_state(&format!("secret_svn_password_{}", rid))
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            })
-            .or_else(|| {
-                self.db
-                    .get_state("secret_svn_password")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            });
+        use crate::db::queries::CredentialChainState;
 
-        if let Some(pw) = svn_pw {
+        let svn_state = match self.repo_id.as_deref() {
+            Some(rid) => self
+                .db
+                .resolve_credential_chain_state(rid, "secret_svn_password"),
+            None => match self.db.get_state("secret_svn_password") {
+                Ok(Some(pw)) if !pw.is_empty() => CredentialChainState::resolved(pw),
+                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+            },
+        };
+        {
             let mut svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner());
-            svn.set_password(pw);
-            debug!("reloaded SVN password from database");
+            if let Some(pw) = svn_state.value {
+                svn.set_password(pw);
+                debug!("reloaded SVN password from database");
+            } else if svn_state.explicitly_revoked {
+                svn.set_password("");
+                debug!("cleared SVN password after explicit revocation");
+            }
         }
 
-        // Git token — per-repo key first, then global
-        let git_tok = self
-            .repo_id
-            .as_ref()
-            .and_then(|rid| {
-                self.db
-                    .get_state(&format!("secret_git_token_{}", rid))
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            })
-            .or_else(|| {
-                self.db
-                    .get_state("secret_git_token")
-                    .ok()
-                    .flatten()
-                    .filter(|v| !v.is_empty())
-            });
-
-        if let Some(token) = git_tok {
+        let git_state = match self.repo_id.as_deref() {
+            Some(rid) => self
+                .db
+                .resolve_credential_chain_state(rid, "secret_git_token"),
+            None => match self.db.get_state("secret_git_token") {
+                Ok(Some(tok)) if !tok.is_empty() => CredentialChainState::resolved(tok),
+                Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+            },
+        };
+        {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            let _ = git.ensure_remote_credentials("origin", Some(&token));
-            debug!("reloaded Git token from database");
+            match crate::git::apply_git_credential_chain_state(&git, "origin", &git_state) {
+                Ok(()) if git_state.value.is_some() => {
+                    debug!("reloaded Git token from database");
+                }
+                Ok(()) if git_state.explicitly_revoked => {
+                    debug!("cleared embedded git credentials after explicit revocation");
+                }
+                Ok(()) => {}
+                Err(e) => warn!("failed to apply git credential chain state: {e}"),
+            }
         }
     }
 
