@@ -214,3 +214,40 @@ fn running_journal_defers_marker_without_receipt_for_git_echo() {
         EchoDisposition::DeferPendingJournal
     );
 }
+
+#[test]
+fn running_git_journal_defers_matching_sha_without_marker() {
+    let db = setup_db();
+    db.conn()
+        .execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors)
+             VALUES ('pair','p','file:///svn','','','local','','repo','main','team',5,0,0,1,'t','t',2,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','idle',0,0)",
+            [],
+        )
+        .unwrap();
+    let git_sha = "dddddddddddddddddddddddddddddddddddddddd";
+    let fingerprint = git_push_target_fingerprint("pair", "origin", "main");
+    db.begin_svn_to_git_push(GitPushIntent {
+        repo_id: "pair",
+        initiator_id: "worker",
+        request_id: "req-1",
+        target_fingerprint: &fingerprint,
+        source_svn_rev: 3,
+        source_svn_author: "dev",
+        source_svn_message: "add feature",
+        pre_push_git_remote: "origin",
+        pre_push_git_branch: "main",
+        pre_push_git_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        pre_push_git_tree: Some("cccccccccccccccccccccccccccccccccccccccc"),
+        intended_local_git_sha: git_sha,
+        intended_local_git_parent: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        intended_local_git_tree: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    })
+    .unwrap();
+    assert_eq!(
+        classify_incoming_git_commit(&ctx(&db, "pair"), git_sha, "edited away marker")
+            .unwrap()
+            .unwrap(),
+        EchoDisposition::DeferPendingJournal
+    );
+}
