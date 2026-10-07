@@ -136,7 +136,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct. RS-11 team cases prove per-repo git/svn canary reload across two independent repos with a contaminating global key: rotation on one repo does not change the sibling, reopen reloads the scoped value, and explicit revocation clears embedded git credentials without global fallback.",
+      "evidence": "A two-pair engine fixture keeps repository cursors scoped and leaves an unrelated healthy pair runnable while one is blocked. The pinned old-import inventory keeps two r2 imports and a disabled third repository distinct. RS-11 team cases prove per-repo git/svn canary reload across two independent repos with a contaminating global key: rotation on one repo does not change the sibling, reopen reloads the scoped value, explicit revocation clears embedded git credentials without global fallback, missed lookups preserve in-memory and URL-embedded secrets, legacy CLI config passwords survive reload without kv_state keys, and a revoked parent blocks global fallback for a keyless child.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -144,7 +144,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "copy_only",
-      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. RS-11 proves team reload/rotation/revocation stay scoped per repo with dummy canaries in .git/config and fixture SVN markers; descendant inheritance remains later work.",
+      "evidence": "Inventory preserves a disabled third repository without polling it. Import holds exclude the scheduler for that repository. RS-11 proves team reload/rotation/revocation stay scoped per repo with dummy canaries in .git/config and fixture SVN markers, and parent revocation blocks global fallback for keyless children.",
       "diagnostic_expected_baseline_failure": false
     },
     {

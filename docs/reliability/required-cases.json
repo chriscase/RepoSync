@@ -935,6 +935,9 @@
     {"id":"RS_C02_RENAME_SOURCE_PATH_CONFLICT", "binary":"team_mode_e2e", "test":"candidate_rsc02_git_rename_svn_edit_source_path_conflict", "tier":"candidate_regression"},
     {"id":"RS11_TEAM_CREDENTIAL_ISOLATION", "binary":"team_mode_e2e", "test":"candidate_rs11_two_repos_reload_uses_scoped_credentials", "tier":"candidate_regression"},
     {"id":"RS11_TEAM_CREDENTIAL_ROTATION_RELOAD", "binary":"team_mode_e2e", "test":"candidate_rs11_rotation_and_reopen_reload_scoped_credentials", "tier":"candidate_regression"},
-    {"id":"RS11_TEAM_CREDENTIAL_REVOCATION", "binary":"team_mode_e2e", "test":"candidate_rs11_revocation_clears_without_global_fallback", "tier":"candidate_regression"}
+    {"id":"RS11_TEAM_CREDENTIAL_REVOCATION", "binary":"team_mode_e2e", "test":"candidate_rs11_revocation_clears_without_global_fallback", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED", "binary":"team_mode_e2e", "test":"candidate_rs11_missed_lookup_preserves_embedded_credentials", "tier":"candidate_regression"},
+    {"id":"RS11_TEAM_CREDENTIAL_CONFIG_SURVIVES_RELOAD", "binary":"team_mode_e2e", "test":"candidate_rs11_config_credentials_survive_reload_without_repo_id", "tier":"candidate_regression"},
+    {"id":"RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL", "binary":"team_mode_e2e", "test":"candidate_rs11_parent_revocation_blocks_global_for_child", "tier":"candidate_regression"}
   ]
 }

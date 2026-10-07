@@ -63,6 +63,36 @@ pub struct WatermarkEntry {
     pub updated_at: String,
 }
 
+/// Outcome of walking the credential chain for a managed repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialChainState {
+    pub value: Option<String>,
+    pub explicitly_revoked: bool,
+}
+
+impl CredentialChainState {
+    pub fn resolved(value: String) -> Self {
+        Self {
+            value: Some(value),
+            explicitly_revoked: false,
+        }
+    }
+
+    pub fn not_found() -> Self {
+        Self {
+            value: None,
+            explicitly_revoked: false,
+        }
+    }
+
+    pub fn revoked() -> Self {
+        Self {
+            value: None,
+            explicitly_revoked: true,
+        }
+    }
+}
+
 /// A row from the `audit_log` table.
 #[derive(Debug, Clone)]
 pub struct AuditLogEntry {
@@ -2543,12 +2573,23 @@ impl Database {
     /// An explicit per-repo key with an empty value is treated as revocation:
     /// the chain stops and no broader key is consulted.
     pub fn resolve_credential_chain(&self, repo_id: &str, key_prefix: &str) -> Option<String> {
+        self.resolve_credential_chain_state(repo_id, key_prefix)
+            .value
+    }
+
+    /// Like [`Self::resolve_credential_chain`] but distinguishes explicit
+    /// revocation from a plain miss so callers can preserve existing secrets.
+    pub fn resolve_credential_chain_state(
+        &self,
+        repo_id: &str,
+        key_prefix: &str,
+    ) -> CredentialChainState {
         let repo_key = format!("{}_{}", key_prefix, repo_id);
         match self.get_state(&repo_key) {
-            Ok(Some(val)) if val.is_empty() => return None,
-            Ok(Some(val)) => return Some(val),
+            Ok(Some(val)) if val.is_empty() => return CredentialChainState::revoked(),
+            Ok(Some(val)) => return CredentialChainState::resolved(val),
             Ok(None) => {}
-            Err(_) => return None,
+            Err(_) => return CredentialChainState::not_found(),
         }
         // 2. Walk parent chain
         let mut pid = self
@@ -2561,13 +2602,12 @@ impl Database {
             if !visited.insert(current_pid.clone()) {
                 break;
             }
-            if let Some(val) = self
-                .get_state(&format!("{}_{}", key_prefix, current_pid))
-                .ok()
-                .flatten()
-                .filter(|v| !v.is_empty())
-            {
-                return Some(val);
+            let ancestor_key = format!("{}_{}", key_prefix, current_pid);
+            match self.get_state(&ancestor_key) {
+                Ok(Some(val)) if val.is_empty() => return CredentialChainState::revoked(),
+                Ok(Some(val)) => return CredentialChainState::resolved(val),
+                Ok(None) => {}
+                Err(_) => return CredentialChainState::not_found(),
             }
             pid = self
                 .get_repository(&current_pid)
@@ -2576,10 +2616,10 @@ impl Database {
                 .and_then(|r| r.parent_id);
         }
         // 3. Fall back to global key
-        self.get_state(key_prefix)
-            .ok()
-            .flatten()
-            .filter(|v| !v.is_empty())
+        match self.get_state(key_prefix) {
+            Ok(Some(val)) if !val.is_empty() => CredentialChainState::resolved(val),
+            Ok(Some(_)) | Ok(None) | Err(_) => CredentialChainState::not_found(),
+        }
     }
 
     /// Recursively collect all descendant repository IDs for a given repo.
@@ -3443,5 +3483,42 @@ mod tests {
             db.resolve_credential_chain("repo_a", "secret_git_token"),
             None
         );
+        assert_eq!(
+            db.resolve_credential_chain_state("repo_a", "secret_git_token"),
+            CredentialChainState::revoked()
+        );
+    }
+
+    #[test]
+    fn resolve_credential_chain_parent_revocation_blocks_global_fallback() {
+        let db = setup_db();
+        let mut parent = create_test_repo(&db, "parent", "Parent");
+        parent.sync_mode = "team".into();
+        db.update_repository(&parent).unwrap();
+        let mut child = create_test_repo(&db, "child", "Child");
+        child.sync_mode = "team".into();
+        child.parent_id = Some("parent".into());
+        db.update_repository(&child).unwrap();
+        db.set_state("secret_git_token_parent", "").unwrap();
+        db.set_state("secret_git_token", "canary-global").unwrap();
+
+        assert_eq!(
+            db.resolve_credential_chain("child", "secret_git_token"),
+            None
+        );
+        assert_eq!(
+            db.resolve_credential_chain_state("child", "secret_git_token"),
+            CredentialChainState::revoked()
+        );
+    }
+
+    #[test]
+    fn resolve_credential_chain_miss_is_not_revocation() {
+        let db = setup_db();
+        create_test_repo(&db, "repo_a", "Repo A");
+
+        let state = db.resolve_credential_chain_state("repo_a", "secret_git_token");
+        assert_eq!(state.value, None);
+        assert!(!state.explicitly_revoked);
     }
 }

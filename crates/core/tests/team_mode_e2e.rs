@@ -10663,3 +10663,239 @@ async fn candidate_rs11_revocation_clears_without_global_fallback() {
         })
     );
 }
+
+/// RS-11 / #63: a credential-chain miss must not wipe in-memory SVN secrets or
+/// HTTP origin userinfo that were already loaded from scoped keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_missed_lookup_preserves_embedded_credentials() {
+    let mut fixture = TwoRepoCredentialFixture::new().await;
+    fixture.reload_all().await;
+
+    let scoped = fixture.repo("repo_a");
+    let svn_before = scoped.engine.fixture_svn_password_marker().to_string();
+    let git_before = git_origin_url(&scoped.bridge);
+    assert!(git_before.contains(&git_canary_token("repo_a")));
+
+    let db = setup_db(&fixture.db_path);
+    for key in [
+        "secret_git_token_repo_a",
+        "secret_svn_password_repo_a",
+        "secret_git_token",
+        "secret_svn_password",
+    ] {
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key = ?1", [key])
+            .unwrap();
+    }
+
+    let _ = scoped.engine.run_sync_cycle().await;
+    assert_eq!(
+        scoped.engine.fixture_svn_password_marker(),
+        svn_before,
+        "missed SVN lookup must keep the in-memory password"
+    );
+    assert_eq!(
+        git_origin_url(&scoped.bridge),
+        git_before,
+        "missed git lookup must keep URL-embedded credentials"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED",
+            "svn_preserved":true,
+            "url_token_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: legacy CLI `sync now` without a repo id must keep config/env
+/// SVN secrets when plaintext kv_state keys are absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_config_credentials_survive_reload_without_repo_id() {
+    assert!(
+        svn_available(),
+        "SVN tools are required for candidate evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+
+    let bridge = tmp.path().join("bridge");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&bridge, &bare);
+    let db = setup_db(&tmp.path().join("cli-credentials.db"));
+    db.set_state("last_svn_rev", "1").unwrap();
+    db.set_state("last_git_hash", &get_head_sha(&bridge))
+        .unwrap();
+
+    let config_svn_password = "cli-config-svn-password";
+    let mut config = make_app_config(&svn_url, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    config.svn.password = Some(config_svn_password.into());
+
+    let engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_url, "fixture", config_svn_password),
+        git_client,
+        Arc::new(make_identity_mapper()),
+    );
+
+    let _ = engine.run_sync_cycle().await;
+    assert_eq!(
+        engine.fixture_svn_password_marker(),
+        config_svn_password,
+        "config/env SVN password must survive reload without kv_state secrets"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_TEAM_CREDENTIAL_CONFIG_SURVIVES_RELOAD",
+            "repo_id":null,
+            "svn_preserved":true
+        })
+    );
+}
+
+/// RS-11 / #63: an explicit empty key on a parent must block global fallback
+/// for a keyless child during credential reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs11_parent_revocation_blocks_global_for_child() {
+    assert!(
+        svn_available(),
+        "SVN tools are required for candidate evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("parent-child-credentials.db");
+    let db = setup_db(&db_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.set_state("secret_git_token", "canary-git-token-global")
+        .unwrap();
+    db.set_state("secret_svn_password", "canary-svn-password-global")
+        .unwrap();
+
+    let root = tmp.path().join("child");
+    std::fs::create_dir_all(&root).unwrap();
+    let svn_repo_root = create_svn_repo(&root);
+    let wc = root.join("wc");
+    svn_checkout(&svn_repo_root, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor");
+    svn_commit_file(&wc, "origin.txt", "SVN origin\n", "Verified SVN origin");
+    let baseline_svn_rev = svn_youngest(&svn_repo_root);
+    let bridge = root.join("bridge");
+    let bare = root.join("origin.git");
+    let git = setup_git_with_bare_origin(&bridge, &bare);
+    let initial = get_head_sha(&bridge);
+    drop(git);
+
+    db.insert_repository(&Repository {
+        id: "parent".into(),
+        name: "parent".into(),
+        svn_url: svn_repo_root.clone(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: baseline_svn_rev - 1,
+        last_git_sha: initial.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.insert_repository(&Repository {
+        id: "child".into(),
+        name: "child".into(),
+        svn_url: svn_repo_root.clone(),
+        svn_branch: String::new(),
+        svn_username: "fixture".into(),
+        git_provider: "local".into(),
+        git_api_url: String::new(),
+        git_repo: bare.to_string_lossy().to_string(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: Some("parent".into()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_svn_rev: baseline_svn_rev - 1,
+        last_git_sha: initial.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    seed_svn_to_git_baseline(&db, "child", baseline_svn_rev, &initial);
+    db.set_state("secret_git_token_parent", "").unwrap();
+    db.set_state("secret_svn_password_parent", "").unwrap();
+
+    let http_origin = "https://git.invalid/child/repo.git";
+    git_cli(&bridge, &["remote", "set-url", "origin", http_origin]);
+
+    let mut config = make_app_config(&svn_repo_root, tmp.path());
+    config.svn.layout = reposync_core::config::SvnLayout::Custom;
+    let mut engine = SyncEngine::new(
+        config,
+        setup_db(&db_path),
+        SvnClient::new(&svn_repo_root, "fixture", ""),
+        GitClient::new(&bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+    engine.set_repo_id("child".into());
+
+    let _ = engine.run_sync_cycle().await;
+    let child_url = git_origin_url(&bridge);
+    assert!(
+        !child_url.contains("canary-git-token-global"),
+        "revoked parent must block global git fallback: {child_url}"
+    );
+    assert!(
+        !child_url.contains("x-access-token:"),
+        "child must not embed credentials after parent revocation: {child_url}"
+    );
+    assert_eq!(
+        engine.fixture_svn_password_marker(),
+        "",
+        "child must not inherit global SVN password after parent revocation"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL",
+            "parent_revoked":true,
+            "global_fallback":false
+        })
+    );
+}
