@@ -7,7 +7,7 @@ This is the host-side rollup for epic [#61](https://github.com/chriscase/RepoSyn
 | Command | What it proves | What it does not prove |
 | --- | --- | --- |
 | `python3 scripts/reliability-acceptance-matrix.py --check --report` | Manifest completeness, R01–R24 rollup, GOAL hash, no silent PASS | Runtime SVN/Git correctness |
-| `scripts/real-engine-scenario-suite.sh` + `real-engine-scenario-report.py ci-gate` | Host svnserve real-engine scenarios; suite keeps honest exit `3` on PARTIAL | Full R16 catalog beyond loopback fixtures |
+| `scripts/real-engine-scenario-suite.sh` + `real-engine-scenario-report.py ci-gate` | Host svnserve real-engine scenarios; suite exits `3` on PARTIAL but `1` if any scenario FAIL; ci-gate requires every cataloged real-engine case id and rejects SKIP | Full R16 catalog beyond loopback fixtures |
 | `scripts/reliability-container.sh --all` | Isolated required-case execution against disposable remotes | Deployed-version or live acceptance |
 | `scripts/reliability-compare.sh` | Matched-lock base vs candidate identities | Production upgrade |
 
