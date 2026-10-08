@@ -8018,13 +8018,15 @@ async fn candidate_r65_credential_chain_inheritance_preview() {
         .iter()
         .find(|c| c["key"] == format!("secret_svn_password_{parent_id}"))
         .expect("parent svn credential");
+    let inheriting = svn["inheriting_repo_ids"].as_array().unwrap();
     assert!(
-        svn["retained_for_repo_ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == child_id),
-        "child inheriting parent credential must be retained: {svn}"
+        inheriting.iter().any(|v| v == child_id),
+        "child inheriting parent credential must be listed as inheriting: {svn}"
+    );
+    let retained = svn["retained_for_repo_ids"].as_array().unwrap();
+    assert!(
+        !retained.iter().any(|v| v == child_id),
+        "inheriting child must not be listed as retaining its own key: {svn}"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -8044,16 +8046,10 @@ async fn candidate_r65_blank_git_remote_not_shared_registration() {
     blank.git_api_url = String::new();
     blank.git_repo = String::new();
     state.db.insert_repository(&blank).unwrap();
-    state
-        .db
-        .insert_repository(&fixture_branch_repo(
-            "r65-other-remote",
-            "Other",
-            None,
-            "main",
-            "trunk",
-        ))
-        .unwrap();
+    let mut blank2 = fixture_branch_repo("r65-blank-remote-2", "Blank2", None, "main", "trunk");
+    blank2.git_api_url = String::new();
+    blank2.git_repo = String::new();
+    state.db.insert_repository(&blank2).unwrap();
     let preview = client
         .get(format!("{base}/api/repos/{blank_id}/removal/preview"))
         .send()
@@ -8091,6 +8087,22 @@ async fn candidate_r65_restore_managed_registration() {
         .unwrap();
     state
         .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "restore-token")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("last_git_sha_{repo_id}"), "inbound-checkpoint")
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha=?1 WHERE id=?2",
+            rusqlite::params!["emitted-tip", repo_id],
+        )
+        .unwrap();
+    state
+        .db
         .conn()
         .execute(
             "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
@@ -8118,6 +8130,21 @@ async fn candidate_r65_restore_managed_registration() {
     assert_eq!(restore_body["state"], "restored");
     let repo = state.db.get_repository(repo_id).unwrap().unwrap();
     assert!(!repo.enabled);
+    assert!(repo.last_git_sha.is_empty());
+    assert_eq!(
+        state
+            .db
+            .resolve_credential_chain(repo_id, "secret_git_token")
+            .as_deref(),
+        Some("restore-token")
+    );
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("last_git_sha_{repo_id}"))
+            .unwrap(),
+        None
+    );
     assert!(state.db.removal_tombstone(repo_id).unwrap().is_none());
 
     let again = client
@@ -8217,5 +8244,97 @@ async fn candidate_r65_removal_preview_reports_202_or_409_for_active_removal() {
             "cancelling_http": 202
         })
     );
+    server.abort();
+}
+
+/// #65: managed child removal records remote deletion outcomes and fails closed on error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_remote_deletion_outcomes() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-remote-parent";
+    let child_id = "r65-remote-child";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Remote parent",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_id,
+            "Remote child",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{child_id}"), "")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{parent_id}"), "parent-token")
+        .unwrap();
+    std::fs::create_dir_all(tmp.path().join("repos").join(child_id)).unwrap();
+
+    let remove = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = remove.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["state"], "failed");
+    assert_eq!(body["remote_git"], "failed");
+    assert_eq!(body["remote_svn"], "untouched");
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
+
+    server.abort();
+}
+
+/// #65: missing parent during managed remote deletion must fail the operation (not hang Running).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_missing_parent_fails_operation() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let child_id = "r65-orphan-child";
+    let child = fixture_branch_repo(
+        child_id,
+        "Orphan",
+        Some("r65-missing-parent"),
+        "feature",
+        "branches/feature",
+    );
+    state.db.insert_repository(&child).unwrap();
+    std::fs::create_dir_all(state.config.daemon.data_dir.join("repos").join(child_id)).unwrap();
+
+    let remove = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = remove.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["state"], "failed");
+    use reposync_core::db::managed_remove::ManagedRemoveState;
+    let op = state.db.managed_removal(child_id).unwrap().unwrap();
+    assert_eq!(op.state, ManagedRemoveState::Failed);
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
+
     server.abort();
 }

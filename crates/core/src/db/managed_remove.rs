@@ -10,6 +10,8 @@
 //! restore while recovery data exists. A tombstone blocks a stale job from
 //! inserting the same id again until restore or purge.
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -114,6 +116,39 @@ pub struct RemovalTombstone {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// Per-repo scoped secret state captured before owned keys are deleted.
+    #[serde(default)]
+    pub scoped_secrets: HashMap<String, TombstoneScopedSecret>,
+    /// Inbound Git checkpoint (`last_git_sha_<repo>`) at removal time (recovery only).
+    #[serde(default)]
+    pub inbound_last_git_sha: Option<String>,
+}
+
+/// Scoped credential snapshot for restore (ciphertext at rest; empty revocation is explicit).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TombstoneScopedSecret {
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ciphertext: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
+}
+
+/// Remote branch/path outcomes recorded on managed removal completion.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ManagedRemoveRemoteOutcome {
+    pub remote_git: String,
+    pub remote_svn: String,
+}
+
+impl ManagedRemoveRemoteOutcome {
+    pub fn untouched() -> Self {
+        Self {
+            remote_git: "untouched".into(),
+            remote_svn: "untouched".into(),
+        }
+    }
 }
 
 fn default_git_provider() -> String {
@@ -431,6 +466,7 @@ pub struct CredentialKeyPreview {
     pub key: String,
     pub action: String,
     pub retained_for_repo_ids: Vec<String>,
+    pub inheriting_repo_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -506,6 +542,132 @@ fn credential_key_nonempty(conn: &Connection, key: &str) -> Result<bool, Databas
         .unwrap_or(false))
 }
 
+fn scoped_secret_present(conn: &Connection, key: &str) -> Result<bool, DatabaseError> {
+    if read_value(conn, key)?.is_some() {
+        return Ok(true);
+    }
+    Ok(read_encrypted_secret_tx(conn, key)?.is_some())
+}
+
+fn read_encrypted_secret_tx(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<(String, String)>, DatabaseError> {
+    conn.query_row(
+        "SELECT ciphertext, nonce FROM encrypted_secrets WHERE key = ?1",
+        [key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map_err(DatabaseError::from)
+}
+
+fn classify_chain_dependent_repo(
+    conn: &Connection,
+    repo_id: &str,
+    key_prefix: &str,
+) -> Result<&'static str, DatabaseError> {
+    let repo_key = format!("{}_{}", key_prefix, repo_id);
+    if scoped_secret_present(conn, &repo_key)? {
+        Ok("own")
+    } else {
+        Ok("inherits")
+    }
+}
+
+fn capture_one_scoped_secret(
+    conn: &Connection,
+    key: &str,
+    enc_key: &[u8; 32],
+) -> Result<Option<TombstoneScopedSecret>, DatabaseError> {
+    if let Some((ct, nonce)) = read_encrypted_secret_tx(conn, key)? {
+        return Ok(Some(TombstoneScopedSecret {
+            revoked: false,
+            ciphertext: Some(ct),
+            nonce: Some(nonce),
+        }));
+    }
+    match read_value(conn, key)? {
+        None => Ok(None),
+        Some(val) if val.is_empty() => Ok(Some(TombstoneScopedSecret {
+            revoked: true,
+            ciphertext: None,
+            nonce: None,
+        })),
+        Some(val) => {
+            let (ct, nonce) =
+                crate::crypto::encrypt_credential(&val, enc_key).map_err(|error| {
+                    DatabaseError::Other(format!("secret encryption failed: {error}"))
+                })?;
+            Ok(Some(TombstoneScopedSecret {
+                revoked: false,
+                ciphertext: Some(ct),
+                nonce: Some(nonce),
+            }))
+        }
+    }
+}
+
+fn capture_owned_scoped_secrets(
+    conn: &Connection,
+    repo_id: &str,
+    enc_key: &[u8; 32],
+) -> Result<HashMap<String, TombstoneScopedSecret>, DatabaseError> {
+    let mut out = HashMap::new();
+    for key in owned_secret_keys(repo_id) {
+        if let Some(snap) = capture_one_scoped_secret(conn, &key, enc_key)? {
+            out.insert(key, snap);
+        }
+    }
+    Ok(out)
+}
+
+fn restore_scoped_secrets_from_tombstone(
+    conn: &Connection,
+    enc_key: &[u8; 32],
+    repo_id: &str,
+    tombstone: &RemovalTombstone,
+) -> Result<(), DatabaseError> {
+    for key in owned_secret_keys(repo_id) {
+        let Some(snap) = tombstone.scoped_secrets.get(&key) else {
+            continue;
+        };
+        if snap.revoked {
+            write_value(conn, &key, "")?;
+            conn.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&key])?;
+            continue;
+        }
+        if let (Some(ct), Some(nonce)) = (&snap.ciphertext, &snap.nonce) {
+            let plaintext =
+                crate::crypto::decrypt_credential(ct, nonce, enc_key).map_err(|error| {
+                    DatabaseError::Other(format!("secret decryption failed: {error}"))
+                })?;
+            write_value(conn, &key, &plaintext)?;
+            conn.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&key])?;
+        }
+    }
+    Ok(())
+}
+
+fn completed_removal_outcome_detail(
+    remote: &ManagedRemoveRemoteOutcome,
+    restore_supported: bool,
+) -> String {
+    let mut parts = vec!["removed from active listings; owned local data cleaned".to_string()];
+    if remote.remote_git == "untouched" && remote.remote_svn == "untouched" {
+        parts.push("remote Git and SVN history were not modified".into());
+    } else {
+        parts.push(format!(
+            "remote Git branch outcome: {}; remote SVN path outcome: {}",
+            remote.remote_git, remote.remote_svn
+        ));
+    }
+    if restore_supported {
+        parts.push("registration can be restored while recovery metadata remains".into());
+    }
+    parts.join("; ")
+}
+
 fn build_credential_preview(
     conn: &Connection,
     repo: &Repository,
@@ -527,19 +689,26 @@ fn build_credential_preview(
                 retained.push(child.id);
             }
         }
+        let mut inheriting = Vec::new();
         for id in repos_sharing_credential_holder(
             conn,
             &CredentialHolder::Repo(repo.id.clone()),
             "secret_svn_password",
         )? {
-            if id != repo.id && !retained.contains(&id) {
-                retained.push(id);
+            if id == repo.id {
+                continue;
+            }
+            match classify_chain_dependent_repo(conn, &id, "secret_svn_password")? {
+                "own" if !retained.contains(&id) => retained.push(id),
+                "inherits" if !inheriting.contains(&id) => inheriting.push(id),
+                _ => {}
             }
         }
         out.push(CredentialKeyPreview {
             key: svn_key,
             action: "delete_if_present".into(),
             retained_for_repo_ids: retained,
+            inheriting_repo_ids: inheriting,
         });
     }
     if credential_key_nonempty(conn, &git_key)? {
@@ -556,19 +725,26 @@ fn build_credential_preview(
                 retained.push(child.id);
             }
         }
+        let mut inheriting = Vec::new();
         for id in repos_sharing_credential_holder(
             conn,
             &CredentialHolder::Repo(repo.id.clone()),
             "secret_git_token",
         )? {
-            if id != repo.id && !retained.contains(&id) {
-                retained.push(id);
+            if id == repo.id {
+                continue;
+            }
+            match classify_chain_dependent_repo(conn, &id, "secret_git_token")? {
+                "own" if !retained.contains(&id) => retained.push(id),
+                "inherits" if !inheriting.contains(&id) => inheriting.push(id),
+                _ => {}
             }
         }
         out.push(CredentialKeyPreview {
             key: git_key,
             action: "delete_if_present".into(),
             retained_for_repo_ids: retained,
+            inheriting_repo_ids: inheriting,
         });
     }
     for global in ["secret_svn_password", "secret_git_token"] {
@@ -579,6 +755,7 @@ fn build_credential_preview(
                 key: global.to_string(),
                 action: "never_deleted_by_managed_remove".into(),
                 retained_for_repo_ids: retained,
+                inheriting_repo_ids: Vec::new(),
             });
         }
     }
@@ -893,7 +1070,7 @@ impl Database {
                         tx,
                         repo_id,
                         "managed_remove_accepted",
-                        "explicit managed removal accepted; remote Git and SVN history will not be modified; restore is available after completion when recovery metadata remains",
+                        "explicit managed removal accepted; restore is available after completion when recovery metadata remains",
                         true,
                     )?;
                     op
@@ -947,12 +1124,26 @@ impl Database {
         op_id: &str,
         detail: &str,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        self.fail_managed_remove_with_remote(repo_id, op_id, detail, None)
+    }
+
+    pub fn fail_managed_remove_with_remote(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        detail: &str,
+        remote: Option<&ManagedRemoveRemoteOutcome>,
+    ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Err(DatabaseError::Other(
                     "completed removal cannot be marked failed".into(),
                 ));
+            }
+            if let Some(remote) = remote {
+                op.remote_git = remote.remote_git.clone();
+                op.remote_svn = remote.remote_svn.clone();
             }
             op.state = ManagedRemoveState::Failed;
             op.outcome_detail = Some(detail.into());
@@ -969,7 +1160,19 @@ impl Database {
         &self,
         repo_id: &str,
         op_id: &str,
+        remote: &ManagedRemoveRemoteOutcome,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
+        let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
+            DatabaseError::Other(format!("encryption key unavailable: {error}"))
+        })?;
+        let scoped_secrets = {
+            let conn = self.conn();
+            capture_owned_scoped_secrets(&conn, repo_id, &enc_key)?
+        };
+        let inbound_last_git_sha = {
+            let conn = self.conn();
+            read_value(&conn, &format!("last_git_sha_{repo_id}"))?
+        };
         self.transaction(|tx| {
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
@@ -1007,10 +1210,12 @@ impl Database {
                 last_svn_rev: repo.last_svn_rev,
                 last_git_sha: repo.last_git_sha.clone(),
                 commit_map_count,
-                remote_git: "untouched".into(),
-                remote_svn: "untouched".into(),
+                remote_git: remote.remote_git.clone(),
+                remote_svn: remote.remote_svn.clone(),
                 restore_supported: true,
                 retention: "tombstone_audit_mappings_retained_restore_available".into(),
+                scoped_secrets,
+                inbound_last_git_sha,
                 svn_username: repo.svn_username.clone(),
                 git_provider: repo.git_provider.clone(),
                 sync_mode: repo.sync_mode.clone(),
@@ -1046,10 +1251,9 @@ impl Database {
             }
             op.state = ManagedRemoveState::Completed;
             op.restore_supported = true;
-            op.outcome_detail = Some(
-                "removed from active listings; owned local data cleaned; remote Git and SVN history were not modified; registration can be restored while recovery metadata remains"
-                    .into(),
-            );
+            op.remote_git = remote.remote_git.clone();
+            op.remote_svn = remote.remote_svn.clone();
+            op.outcome_detail = Some(completed_removal_outcome_detail(remote, true));
             op.updated_at = Utc::now().to_rfc3339();
             op.last_svn_rev = repo.last_svn_rev;
             op.last_git_sha = repo.last_git_sha;
@@ -1072,6 +1276,9 @@ impl Database {
         &self,
         repo_id: &str,
     ) -> Result<RestoreAdvance, DatabaseError> {
+        let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
+            DatabaseError::Other(format!("encryption key unavailable: {error}"))
+        })?;
         self.transaction(|tx| {
             if removal_in_progress(tx, repo_id)? {
                 return Err(DatabaseError::Other(
@@ -1137,7 +1344,7 @@ impl Database {
                 },
                 updated_at: now.clone(),
                 last_svn_rev: tombstone.last_svn_rev,
-                last_git_sha: tombstone.last_git_sha.clone(),
+                last_git_sha: String::new(),
                 last_sync_at: None,
                 sync_status: "idle".into(),
                 total_syncs: tombstone.total_syncs,
@@ -1180,6 +1387,11 @@ impl Database {
                     restored.consecutive_errors,
                     restored.teams_webhook_url,
                 ],
+            )?;
+            restore_scoped_secrets_from_tombstone(tx, &enc_key, repo_id, &tombstone)?;
+            tx.execute(
+                "DELETE FROM kv_state WHERE key=?1",
+                [format!("last_git_sha_{repo_id}")],
             )?;
             tx.execute(
                 "DELETE FROM kv_state WHERE key=?1",
@@ -1228,6 +1440,7 @@ fn require_active(
 mod tests {
     use super::*;
     use crate::db::import_operations::ImportOperationState;
+    use crate::db::queries::CredentialChainState;
 
     fn setup() -> Database {
         let db = Database::in_memory().unwrap();
@@ -1294,8 +1507,12 @@ mod tests {
             .unwrap()
         {
             RemovalAdvance::Cleanup { operation } => {
-                db.complete_managed_remove("child-1", &operation.id)
-                    .unwrap();
+                db.complete_managed_remove(
+                    "child-1",
+                    &operation.id,
+                    &ManagedRemoveRemoteOutcome::untouched(),
+                )
+                .unwrap();
             }
             other => panic!("expected child cleanup, got {other:?}"),
         }
@@ -1388,7 +1605,11 @@ mod tests {
                 assert_eq!(operation.id, op.id);
                 crate::managed_remove::remove_owned_repo_tree(data.path(), "parent-1").unwrap();
                 let done = db
-                    .complete_managed_remove("parent-1", &operation.id)
+                    .complete_managed_remove(
+                        "parent-1",
+                        &operation.id,
+                        &ManagedRemoveRemoteOutcome::untouched(),
+                    )
                     .unwrap();
                 assert_eq!(done.state, ManagedRemoveState::Completed);
                 assert!(done.restore_supported);
@@ -1720,9 +1941,15 @@ mod tests {
             .find(|c| c.key == "secret_svn_password_inherit-parent")
             .expect("parent svn credential preview");
         assert!(
-            svn.retained_for_repo_ids
+            svn.inheriting_repo_ids
                 .contains(&"inherit-child".to_string()),
-            "child inheriting parent credential must be listed as retained: {:?}",
+            "child inheriting parent credential must be listed as inheriting: {:?}",
+            svn.inheriting_repo_ids
+        );
+        assert!(
+            !svn.retained_for_repo_ids
+                .contains(&"inherit-child".to_string()),
+            "inheriting child must not appear as retaining its own key: {:?}",
             svn.retained_for_repo_ids
         );
     }
@@ -1735,13 +1962,77 @@ mod tests {
         blank.git_api_url = String::new();
         blank.git_repo = String::new();
         db.insert_repository(&blank).unwrap();
-        db.insert_repository(&repo("other-remote", "Other", None))
-            .unwrap();
+        let mut blank2 = repo("blank-remote-2", "Blank2", None);
+        blank2.git_api_url = String::new();
+        blank2.git_repo = String::new();
+        db.insert_repository(&blank2).unwrap();
         let preview = db
             .removal_dependency_preview("blank-remote")
             .unwrap()
             .unwrap();
         assert!(preview.shared_git_registrations.is_empty());
+    }
+
+    #[test]
+    fn restore_round_trips_scoped_secrets_and_revocations() {
+        let db = setup();
+        let parent = repo("sec-parent", "Parent", None);
+        db.insert_repository(&parent).unwrap();
+        let mut child = repo("sec-child", "Child", Some("sec-parent"));
+        db.insert_repository(&child).unwrap();
+        db.set_state("secret_git_token_sec-parent", "parent-token")
+            .unwrap();
+        db.set_state("secret_git_token_sec-child", "").unwrap();
+        db.set_state("secret_svn_password_sec-child", "child-svn")
+            .unwrap();
+        db.set_state("secret_git_token", "global-token").unwrap();
+        db.set_state("last_git_sha_sec-child", "inbound-sha")
+            .unwrap();
+        child.last_git_sha = "emitted-sha".into();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha=?1 WHERE id=?2",
+                params![child.last_git_sha, child.id],
+            )
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } = db
+            .prepare_managed_remove("sec-child", "admin", "req")
+            .unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        crate::managed_remove::remove_owned_repo_tree(
+            tempfile::tempdir().unwrap().path(),
+            "sec-child",
+        )
+        .unwrap();
+        db.complete_managed_remove(
+            "sec-child",
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+        assert!(db.get_repository("sec-child").unwrap().is_none());
+
+        let RestoreAdvance::Restored { repo: restored } =
+            db.restore_managed_registration("sec-child").unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert!(!restored.enabled);
+        assert!(restored.last_git_sha.is_empty());
+        assert_eq!(
+            db.resolve_credential_chain_state("sec-child", "secret_git_token"),
+            CredentialChainState::revoked()
+        );
+        assert_eq!(
+            db.resolve_credential_chain("sec-child", "secret_svn_password")
+                .as_deref(),
+            Some("child-svn")
+        );
+        assert_eq!(db.get_state("last_git_sha_sec-child").unwrap(), None);
+        let tombstone = db.removal_tombstone("sec-child").unwrap();
+        assert!(tombstone.is_none());
     }
 
     #[test]
@@ -1767,8 +2058,12 @@ mod tests {
             "restore-me",
         )
         .unwrap();
-        db.complete_managed_remove("restore-me", &operation.id)
-            .unwrap();
+        db.complete_managed_remove(
+            "restore-me",
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
         assert!(db.get_repository("restore-me").unwrap().is_none());
         let RestoreAdvance::Restored { repo: restored } =
             db.restore_managed_registration("restore-me").unwrap()

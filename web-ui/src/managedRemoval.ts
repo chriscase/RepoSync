@@ -68,7 +68,7 @@ export function managedRemovalStateLabel(state: string | undefined): string {
     case 'completed':
       return 'Removed from RepoSync';
     default:
-      return state;
+      return state ?? '';
   }
 }
 
@@ -142,6 +142,7 @@ export interface RemovalDependencyPreview {
     key: string;
     action: string;
     retained_for_repo_ids: string[];
+    inheriting_repo_ids: string[];
   }>;
   managed_local_path: string;
   sibling_local_paths_preserved: string[];

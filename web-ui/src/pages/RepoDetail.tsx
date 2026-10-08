@@ -401,6 +401,10 @@ export default function RepoDetail() {
         && `${result.state}`.toLowerCase() === 'completed'
         && registrationGone;
       if (leaveViewedPair) {
+        for (const queryKey of repoDetailQueryKeys(target.id)) {
+          await queryClient.cancelQueries({ queryKey });
+        }
+        setRetiredId(target.id);
         navigate('/repos', { replace: true });
       }
     },
@@ -1847,7 +1851,7 @@ export default function RepoDetail() {
             <h3 className="text-lg font-semibold text-gray-100 mb-2">{removalConfirmLabel}</h3>
             <p className="text-sm text-gray-400 mb-4">
               Remove <span className="font-semibold text-gray-200">{removalSubject.name}</span> from active listings and
-              clean only RepoSync-owned local data. Remote Git and SVN history are not deleted unless you opt in below.
+              clean only RepoSync-owned local data. Remote Git and SVN history are not modified by this action.
               Completed removals can be restored while recovery metadata remains.
             </p>
             {removalPreviewQuery.isLoading && (
@@ -1885,7 +1889,10 @@ export default function RepoDetail() {
                         <li key={cred.key}>
                           {cred.key} — {cred.action}
                           {cred.retained_for_repo_ids.length > 0
-                            ? ` (other registrations keep their own keys: ${cred.retained_for_repo_ids.join(', ')})`
+                            ? ` (registrations with their own keys: ${cred.retained_for_repo_ids.join(', ')})`
+                            : ''}
+                          {cred.inheriting_repo_ids.length > 0
+                            ? ` (will lose inherited credential when deleted: ${cred.inheriting_repo_ids.join(', ')})`
                             : ''}
                         </li>
                       ))}

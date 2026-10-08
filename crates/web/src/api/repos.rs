@@ -918,6 +918,8 @@ async fn remove_repo(
         }
     };
 
+    use reposync_core::db::managed_remove::ManagedRemoveRemoteOutcome;
+    let mut remote_outcome = ManagedRemoveRemoteOutcome::untouched();
     if opts.explicit_remote_deletion_opts {
         let (delete_git, delete_svn) = remote_deletion_flags(
             opts.explicit_remote_deletion_opts,
@@ -925,21 +927,53 @@ async fn remove_repo(
             opts.delete_svn,
         );
         if delete_git || delete_svn {
-            if let Some(repo) = state
+            let repo = state
                 .db
                 .get_repository(&id)
                 .map_err(|e| AppError::Internal(e.to_string()))?
-            {
-                if let Some(parent_id) = repo.parent_id.as_deref() {
-                    let parent = state
+                .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+            if let Some(parent_id) = repo.parent_id.as_deref() {
+                let parent = match state.db.get_repository(parent_id) {
+                    Ok(Some(parent)) => parent,
+                    Ok(None) => {
+                        let detail =
+                            "parent registration is missing; remote deletion cannot proceed";
+                        let operation = state
+                            .db
+                            .fail_managed_remove(&id, &operation.id, detail)
+                            .map_err(|e| AppError::Internal(e.to_string()))?;
+                        let listed = registration_listed(&state.db, &id)?;
+                        let (status, body) = removal_response(&state.db, &operation, listed)?;
+                        return Ok((status, body).into_response());
+                    }
+                    Err(error) => {
+                        return Err(AppError::Internal(error.to_string()));
+                    }
+                };
+                let deletion = optional_branch_pair_remote_deletion(
+                    &state.db, &parent, &repo, delete_git, delete_svn,
+                )
+                .await;
+                remote_outcome.remote_git = deletion.remote_git;
+                remote_outcome.remote_svn = deletion.remote_svn;
+                if remote_outcome.remote_git == "failed" || remote_outcome.remote_svn == "failed" {
+                    let detail = if deletion.warnings.is_empty() {
+                        "requested remote deletion failed".into()
+                    } else {
+                        deletion.warnings.join("; ")
+                    };
+                    let operation = state
                         .db
-                        .get_repository(parent_id)
-                        .map_err(|e| AppError::Internal(e.to_string()))?
-                        .ok_or_else(|| AppError::Internal("parent repository not found".into()))?;
-                    let _warnings = optional_branch_pair_remote_deletion(
-                        &state.db, &parent, &repo, delete_git, delete_svn,
-                    )
-                    .await;
+                        .fail_managed_remove_with_remote(
+                            &id,
+                            &operation.id,
+                            &detail,
+                            Some(&remote_outcome),
+                        )
+                        .map_err(|e| AppError::Internal(e.to_string()))?;
+                    let listed = registration_listed(&state.db, &id)?;
+                    let (status, body) = removal_response(&state.db, &operation, listed)?;
+                    return Ok((status, body).into_response());
                 }
             }
         }
@@ -956,7 +990,10 @@ async fn remove_repo(
         let (status, body) = removal_response(&state.db, &operation, listed)?;
         return Ok((status, body).into_response());
     }
-    match state.db.complete_managed_remove(&id, &operation.id) {
+    match state
+        .db
+        .complete_managed_remove(&id, &operation.id, &remote_outcome)
+    {
         Ok(operation) => {
             let listed = registration_listed(&state.db, &id)?;
             let (status, body) = removal_response(&state.db, &operation, listed)?;
@@ -3390,17 +3427,35 @@ fn branch_pair_remote_delete_flags(opts: &DeleteBranchPairQuery) -> (bool, bool)
     )
 }
 
+struct BranchPairRemoteDeletionOutcome {
+    remote_git: String,
+    remote_svn: String,
+    warnings: Vec<String>,
+}
+
+fn remote_branch_outcome(requested: bool, branch_nonempty: bool, succeeded: bool) -> String {
+    if !requested || !branch_nonempty {
+        "untouched".into()
+    } else if succeeded {
+        "deleted".into()
+    } else {
+        "failed".into()
+    }
+}
+
 async fn optional_branch_pair_remote_deletion(
     db: &Database,
     parent: &reposync_core::models::Repository,
     repo: &reposync_core::models::Repository,
     delete_git: bool,
     delete_svn: bool,
-) -> Vec<String> {
+) -> BranchPairRemoteDeletionOutcome {
     let mut warnings: Vec<String> = Vec::new();
+    let mut git_ok = !delete_git || repo.git_branch.is_empty();
+    let mut svn_ok = !delete_svn || repo.svn_branch.is_empty();
     if delete_git && !repo.git_branch.is_empty() {
         let git_token = db
-            .resolve_credential_chain(&parent.id, "secret_git_token")
+            .resolve_credential_chain(&repo.id, "secret_git_token")
             .unwrap_or_default();
         let provider = match parent.git_provider.as_str() {
             "gitea" => reposync_core::config::GitProvider::Gitea,
@@ -3415,8 +3470,12 @@ async fn optional_branch_pair_remote_deletion(
             .delete_branch(&parent.git_repo, &repo.git_branch)
             .await
         {
-            Ok(()) => info!(branch = %repo.git_branch, "deleted Git branch"),
+            Ok(()) => {
+                git_ok = true;
+                info!(branch = %repo.git_branch, "deleted Git branch");
+            }
             Err(e) => {
+                git_ok = false;
                 let msg = format!("failed to delete Git branch '{}': {}", repo.git_branch, e);
                 warn!(%msg);
                 warnings.push(msg);
@@ -3425,7 +3484,7 @@ async fn optional_branch_pair_remote_deletion(
     }
     if delete_svn && !repo.svn_branch.is_empty() {
         let svn_password = db
-            .resolve_credential_chain(&parent.id, "secret_svn_password")
+            .resolve_credential_chain(&repo.id, "secret_svn_password")
             .unwrap_or_default();
         let svn_client = reposync_core::svn::SvnClient::new(
             &parent.svn_url,
@@ -3433,15 +3492,23 @@ async fn optional_branch_pair_remote_deletion(
             &svn_password,
         );
         match svn_client.delete_branch(&repo.svn_branch).await {
-            Ok(()) => info!(branch = %repo.svn_branch, "deleted SVN branch"),
+            Ok(()) => {
+                svn_ok = true;
+                info!(branch = %repo.svn_branch, "deleted SVN branch");
+            }
             Err(e) => {
+                svn_ok = false;
                 let msg = format!("failed to delete SVN branch '{}': {}", repo.svn_branch, e);
                 warn!(%msg);
                 warnings.push(msg);
             }
         }
     }
-    warnings
+    BranchPairRemoteDeletionOutcome {
+        remote_git: remote_branch_outcome(delete_git, !repo.git_branch.is_empty(), git_ok),
+        remote_svn: remote_branch_outcome(delete_svn, !repo.svn_branch.is_empty(), svn_ok),
+        warnings,
+    }
 }
 
 async fn delete_branch_pair(
@@ -3497,8 +3564,9 @@ async fn delete_branch_pair(
         .ok_or_else(|| AppError::Internal("parent repository not found".into()))?;
 
     let (delete_git, delete_svn) = branch_pair_remote_delete_flags(&opts);
-    let mut warnings =
+    let remote_deletion =
         optional_branch_pair_remote_deletion(db, &parent, &repo, delete_git, delete_svn).await;
+    let mut warnings = remote_deletion.warnings;
 
     // Delete local filesystem (git clone)
     let repo_dir = state.config.daemon.data_dir.join("repos").join(&id);
