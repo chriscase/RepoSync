@@ -464,9 +464,17 @@ export const api = {
       managed_removal: boolean;
     }>(`/repos/${id}/disable`, { method: 'POST' }),
 
-  removeManagedRepo: async (id: string): Promise<ManagedRemovalStatus> => {
+  removeManagedRepo: async (
+    id: string,
+    remoteOpts?: { delete_git?: boolean; delete_svn?: boolean },
+  ): Promise<ManagedRemovalStatus> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${id}/remove`, {
+    const params = new URLSearchParams({
+      explicit_remote_deletion_opts: 'true',
+      delete_git: String(remoteOpts?.delete_git ?? false),
+      delete_svn: String(remoteOpts?.delete_svn ?? false),
+    });
+    const res = await fetch(`${API_BASE}/repos/${id}/remove?${params}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -494,6 +502,49 @@ export const api = {
       throw new Error(message);
     }
     return body;
+  },
+
+  restoreManagedRepo: async (id: string): Promise<{
+    ok: boolean;
+    action: string;
+    state: string;
+    repo_id: string;
+    enabled: boolean;
+    message: string;
+  }> => {
+    const token = localStorage.getItem('session_token');
+    const res = await fetch(`${API_BASE}/repos/${id}/restore`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+    const text = await res.text();
+    let body = {} as {
+      ok?: boolean;
+      action?: string;
+      state?: string;
+      repo_id?: string;
+      enabled?: boolean;
+      message?: string;
+      error?: string;
+    };
+    if (text) {
+      body = JSON.parse(text) as typeof body;
+    }
+    const message = body.error || body.message || text || `API error ${res.status}`;
+    if (!res.ok) {
+      throw new Error(message);
+    }
+    return {
+      ok: body.ok ?? true,
+      action: body.action ?? 'managed_restore',
+      state: body.state ?? 'restored',
+      repo_id: body.repo_id ?? id,
+      enabled: body.enabled ?? false,
+      message: body.message ?? message,
+    };
   },
 
   getRemovalDependencyPreview: async (id: string): Promise<import('./managedRemoval').RemovalPreviewResponse> => {

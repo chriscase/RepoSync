@@ -5391,7 +5391,7 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
     assert_eq!(body["state"], "completed");
     assert_eq!(body["remote_git"], "untouched");
     assert_eq!(body["remote_svn"], "untouched");
-    assert_eq!(body["restore_supported"], false);
+    assert_eq!(body["restore_supported"], true);
     assert_eq!(body["registration_listed"], false);
     assert!(!owned.exists());
     assert_eq!(
@@ -5443,7 +5443,7 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
         .unwrap();
     assert_eq!(maps, 1);
     let tombstone = state.db.removal_tombstone(&id).unwrap().unwrap();
-    assert!(!tombstone.restore_supported);
+    assert!(tombstone.restore_supported);
     assert_eq!(tombstone.remote_git, "untouched");
     let listed: Vec<serde_json::Value> = client
         .get(format!("{base}/api/repos"))
@@ -5484,7 +5484,7 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
     assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"R02_MANAGED_REMOVE","state":"completed","remote":"unchanged","owned_local":"removed","sibling":"kept","restore_supported":false})
+        serde_json::json!({"case":"R02_MANAGED_REMOVE","state":"completed","remote":"unchanged","owned_local":"removed","sibling":"kept","restore_supported":true})
     );
     server.abort();
 }
@@ -7974,6 +7974,172 @@ async fn candidate_r65_child_removal_preserves_sibling_local_path() {
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({"case": "R65_CHILD_SIBLING_PATH", "sibling_tree": "kept"})
+    );
+    server.abort();
+}
+
+/// #65: credential-chain inheritance appears in removal preview retained_for_repo_ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_credential_chain_inheritance_preview() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-inherit-parent";
+    let child_id = "r65-inherit-child";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Inherit parent",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_id,
+            "Inherit child",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{parent_id}"), "shared")
+        .unwrap();
+    let preview = client
+        .get(format!("{base}/api/repos/{parent_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = preview.json().await.unwrap();
+    let creds = body["dependency_preview"]["credentials"]
+        .as_array()
+        .unwrap();
+    let svn = creds
+        .iter()
+        .find(|c| c["key"] == format!("secret_svn_password_{parent_id}"))
+        .expect("parent svn credential");
+    assert!(
+        svn["retained_for_repo_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == child_id),
+        "child inheriting parent credential must be retained: {svn}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_CREDENTIAL_CHAIN_INHERIT", "child_listed": true})
+    );
+    server.abort();
+}
+
+/// #65: blank Git remote must not produce shared registration entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_blank_git_remote_not_shared_registration() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let blank_id = "r65-blank-remote";
+    let mut blank = fixture_branch_repo(blank_id, "Blank remote", None, "main", "trunk");
+    blank.git_api_url = String::new();
+    blank.git_repo = String::new();
+    state.db.insert_repository(&blank).unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            "r65-other-remote",
+            "Other",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    let preview = client
+        .get(format!("{base}/api/repos/{blank_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = preview.json().await.unwrap();
+    assert!(body["dependency_preview"]["shared_git_registrations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_BLANK_GIT_REMOTE", "shared": 0})
+    );
+    server.abort();
+}
+
+/// #65: restore completed managed removal while recovery metadata remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_restore_managed_registration() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let repo_id = "r65-restore-root";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            repo_id,
+            "Restore me",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (1, 'abc', 'svn_to_git', 't', 'a', 'b', ?1)",
+            [repo_id],
+        )
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    std::fs::create_dir_all(data.join("repos").join(repo_id)).unwrap();
+
+    let removed = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::OK);
+
+    let restore = client
+        .post(format!("{base}/api/repos/{repo_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), reqwest::StatusCode::OK);
+    let restore_body: serde_json::Value = restore.json().await.unwrap();
+    assert_eq!(restore_body["state"], "restored");
+    let repo = state.db.get_repository(repo_id).unwrap().unwrap();
+    assert!(!repo.enabled);
+    assert!(state.db.removal_tombstone(repo_id).unwrap().is_none());
+
+    let again = client
+        .post(format!("{base}/api/repos/{repo_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        again.json::<serde_json::Value>().await.unwrap()["state"],
+        "already_listed"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_MANAGED_RESTORE", "enabled": false})
     );
     server.abort();
 }

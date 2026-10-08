@@ -6,8 +6,9 @@
 //! Removal disables the registration, waits until #64 import / Git→SVN /
 //! SVN→Git ownership is quiet, then deletes only exact per-repo secret keys and the
 //! repository row. Commit mappings, audit rows, and remote history are kept.
-//! Restore is not supported. A tombstone blocks a stale job from inserting
-//! the same id again.
+//! Completed removals keep a tombstone and retained mappings for optional
+//! restore while recovery data exists. A tombstone blocks a stale job from
+//! inserting the same id again until restore or purge.
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -81,6 +82,58 @@ pub struct RemovalTombstone {
     pub remote_svn: String,
     pub restore_supported: bool,
     pub retention: String,
+    #[serde(default)]
+    pub svn_username: String,
+    #[serde(default = "default_git_provider")]
+    pub git_provider: String,
+    #[serde(default = "default_sync_mode")]
+    pub sync_mode: String,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: i64,
+    #[serde(default)]
+    pub lfs_threshold_mb: i64,
+    #[serde(default = "default_auto_merge")]
+    pub auto_merge: bool,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub allowed_paths: Option<String>,
+    #[serde(default)]
+    pub blocked_patterns: Option<String>,
+    #[serde(default)]
+    pub consecutive_errors: i64,
+    #[serde(default)]
+    pub teams_webhook_url: Option<String>,
+    #[serde(default)]
+    pub total_syncs: i64,
+    #[serde(default)]
+    pub total_errors: i64,
+    #[serde(default = "default_sync_status")]
+    pub sync_status: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+fn default_git_provider() -> String {
+    "gitea".into()
+}
+
+fn default_sync_mode() -> String {
+    "direct".into()
+}
+
+fn default_poll_interval() -> i64 {
+    60
+}
+
+fn default_auto_merge() -> bool {
+    true
+}
+
+fn default_sync_status() -> String {
+    "idle".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +192,12 @@ impl RemovalBlocker {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum RestoreAdvance {
+    Restored { repo: Repository },
+    AlreadyListed { repo: Repository },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemovalAdvance {
     NotFound,
@@ -195,6 +254,94 @@ pub fn new_work_blocked(conn: &Connection, repo_id: &str) -> Result<bool, Databa
 
 pub fn tombstone_present(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
     Ok(read_value(conn, &key("tombstone", repo_id))?.is_some())
+}
+
+/// True when a non-terminal managed removal still owns the registration id.
+pub fn removal_in_progress(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+    let Some(op_id) = read_value(conn, &key("active", repo_id))? else {
+        return Ok(false);
+    };
+    let Some(raw) = read_value(conn, &key("document", &op_id))? else {
+        return Ok(true);
+    };
+    let op = parse_op(&raw)?;
+    Ok(!op.state.is_terminal_success())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CredentialHolder {
+    Revoked,
+    Repo(String),
+    Global,
+    None,
+}
+
+fn credential_holder(conn: &Connection, repo_id: &str, key_prefix: &str) -> CredentialHolder {
+    let repo_key = format!("{}_{}", key_prefix, repo_id);
+    match read_value(conn, &repo_key) {
+        Ok(Some(val)) if val.is_empty() => return CredentialHolder::Revoked,
+        Ok(Some(_)) => return CredentialHolder::Repo(repo_id.to_string()),
+        Ok(None) => {}
+        Err(_) => return CredentialHolder::None,
+    }
+    let mut pid = load_repo(conn, repo_id)
+        .ok()
+        .flatten()
+        .and_then(|r| r.parent_id);
+    let mut visited = std::collections::HashSet::new();
+    while let Some(current_pid) = pid {
+        if !visited.insert(current_pid.clone()) {
+            break;
+        }
+        let ancestor_key = format!("{}_{}", key_prefix, current_pid);
+        match read_value(conn, &ancestor_key) {
+            Ok(Some(val)) if val.is_empty() => return CredentialHolder::Revoked,
+            Ok(Some(_)) => return CredentialHolder::Repo(current_pid),
+            Ok(None) => {}
+            Err(_) => return CredentialHolder::None,
+        }
+        pid = load_repo(conn, &current_pid)
+            .ok()
+            .flatten()
+            .and_then(|r| r.parent_id);
+    }
+    match read_value(conn, key_prefix) {
+        Ok(Some(val)) if !val.is_empty() => CredentialHolder::Global,
+        _ => CredentialHolder::None,
+    }
+}
+
+fn list_all_repo_ids(conn: &Connection) -> Result<Vec<String>, DatabaseError> {
+    let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)
+}
+
+fn repos_sharing_credential_holder(
+    conn: &Connection,
+    holder: &CredentialHolder,
+    key_prefix: &str,
+) -> Result<Vec<String>, DatabaseError> {
+    let mut out = Vec::new();
+    for id in list_all_repo_ids(conn)? {
+        let theirs = credential_holder(conn, &id, key_prefix);
+        let matches = match holder {
+            CredentialHolder::Repo(owner) => {
+                matches!(&theirs, CredentialHolder::Repo(h) if h == owner)
+            }
+            CredentialHolder::Global => theirs == CredentialHolder::Global,
+            _ => false,
+        };
+        if matches {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+fn git_remote_identity_nonempty(repo: &Repository) -> bool {
+    !repo.git_api_url.trim().is_empty() && !repo.git_repo.trim().is_empty()
 }
 
 fn owned_secret_keys(repo_id: &str) -> [String; 2] {
@@ -321,6 +468,9 @@ fn shared_git_registrations(
     conn: &Connection,
     repo: &Repository,
 ) -> Result<Vec<SharedGitRegistrationRef>, DatabaseError> {
+    if !git_remote_identity_nonempty(repo) {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "SELECT id, name, git_branch, svn_branch, parent_id FROM repositories
          WHERE git_api_url=?1 AND git_repo=?2 AND id!=?3
@@ -377,6 +527,15 @@ fn build_credential_preview(
                 retained.push(child.id);
             }
         }
+        for id in repos_sharing_credential_holder(
+            conn,
+            &CredentialHolder::Repo(repo.id.clone()),
+            "secret_svn_password",
+        )? {
+            if id != repo.id && !retained.contains(&id) {
+                retained.push(id);
+            }
+        }
         out.push(CredentialKeyPreview {
             key: svn_key,
             action: "delete_if_present".into(),
@@ -397,6 +556,15 @@ fn build_credential_preview(
                 retained.push(child.id);
             }
         }
+        for id in repos_sharing_credential_holder(
+            conn,
+            &CredentialHolder::Repo(repo.id.clone()),
+            "secret_git_token",
+        )? {
+            if id != repo.id && !retained.contains(&id) {
+                retained.push(id);
+            }
+        }
         out.push(CredentialKeyPreview {
             key: git_key,
             action: "delete_if_present".into(),
@@ -405,10 +573,12 @@ fn build_credential_preview(
     }
     for global in ["secret_svn_password", "secret_git_token"] {
         if credential_key_nonempty(conn, global)? {
+            let retained =
+                repos_sharing_credential_holder(conn, &CredentialHolder::Global, global)?;
             out.push(CredentialKeyPreview {
                 key: global.to_string(),
                 action: "never_deleted_by_managed_remove".into(),
-                retained_for_repo_ids: vec![],
+                retained_for_repo_ids: retained,
             });
         }
     }
@@ -723,7 +893,7 @@ impl Database {
                         tx,
                         repo_id,
                         "managed_remove_accepted",
-                        "explicit managed removal accepted; remote Git and SVN history will not be modified; restore is not supported",
+                        "explicit managed removal accepted; remote Git and SVN history will not be modified; restore is available after completion when recovery metadata remains",
                         true,
                     )?;
                     op
@@ -839,8 +1009,24 @@ impl Database {
                 commit_map_count,
                 remote_git: "untouched".into(),
                 remote_svn: "untouched".into(),
-                restore_supported: false,
-                retention: "tombstone_audit_and_mappings_retained_no_restore".into(),
+                restore_supported: true,
+                retention: "tombstone_audit_mappings_retained_restore_available".into(),
+                svn_username: repo.svn_username.clone(),
+                git_provider: repo.git_provider.clone(),
+                sync_mode: repo.sync_mode.clone(),
+                poll_interval_secs: repo.poll_interval_secs,
+                lfs_threshold_mb: repo.lfs_threshold_mb,
+                auto_merge: repo.auto_merge,
+                created_by: repo.created_by.clone(),
+                allowed_paths: repo.allowed_paths.clone(),
+                blocked_patterns: repo.blocked_patterns.clone(),
+                consecutive_errors: repo.consecutive_errors,
+                teams_webhook_url: repo.teams_webhook_url.clone(),
+                total_syncs: repo.total_syncs,
+                total_errors: repo.total_errors,
+                sync_status: repo.sync_status.clone(),
+                created_at: repo.created_at.clone(),
+                updated_at: repo.updated_at.clone(),
             };
             write_value(
                 tx,
@@ -859,8 +1045,9 @@ impl Database {
                 ));
             }
             op.state = ManagedRemoveState::Completed;
+            op.restore_supported = true;
             op.outcome_detail = Some(
-                "removed from active listings; owned local data cleaned; remote Git and SVN history were not modified; restore is not supported"
+                "removed from active listings; owned local data cleaned; remote Git and SVN history were not modified; registration can be restored while recovery metadata remains"
                     .into(),
             );
             op.updated_at = Utc::now().to_rfc3339();
@@ -875,6 +1062,137 @@ impl Database {
                 true,
             )?;
             Ok(op)
+        })
+    }
+
+    /// Restore a completed managed removal while its tombstone and retained
+    /// mappings still exist. The registration returns disabled until the user
+    /// explicitly enables sync again.
+    pub fn restore_managed_registration(
+        &self,
+        repo_id: &str,
+    ) -> Result<RestoreAdvance, DatabaseError> {
+        self.transaction(|tx| {
+            if removal_in_progress(tx, repo_id)? {
+                return Err(DatabaseError::Other(
+                    "managed removal is still in progress; restore is not available".into(),
+                ));
+            }
+            if let Some(existing) = load_repo(tx, repo_id)? {
+                return Ok(RestoreAdvance::AlreadyListed { repo: existing });
+            }
+            let Some(raw) = read_value(tx, &key("tombstone", repo_id))? else {
+                return Err(DatabaseError::NotFound {
+                    entity: "removal_tombstone".into(),
+                    id: repo_id.into(),
+                });
+            };
+            let tombstone: RemovalTombstone = serde_json::from_str(&raw).map_err(|error| {
+                DatabaseError::Other(format!("invalid removal tombstone: {error}"))
+            })?;
+            if !tombstone.restore_supported || tombstone.retention.contains("purged") {
+                return Err(DatabaseError::Other(
+                    "recovery data was purged; restore is not supported".into(),
+                ));
+            }
+            if let Some(parent_id) = tombstone.parent_id.as_deref() {
+                if load_repo(tx, parent_id)?.is_none() {
+                    return Err(DatabaseError::Other(
+                        "parent registration is missing; child restore is not available".into(),
+                    ));
+                }
+            }
+            let maps: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                [repo_id],
+                |row| row.get(0),
+            )?;
+            if maps < tombstone.commit_map_count {
+                return Err(DatabaseError::Other(
+                    "retained commit mappings were purged; restore is not available".into(),
+                ));
+            }
+            let now = Utc::now().to_rfc3339();
+            let restored = Repository {
+                id: tombstone.repo_id.clone(),
+                name: tombstone.name.clone(),
+                svn_url: tombstone.svn_url.clone(),
+                svn_branch: tombstone.svn_branch.clone(),
+                svn_username: tombstone.svn_username.clone(),
+                git_provider: tombstone.git_provider.clone(),
+                git_api_url: tombstone.git_api_url.clone(),
+                git_repo: tombstone.git_repo.clone(),
+                git_branch: tombstone.git_branch.clone(),
+                sync_mode: tombstone.sync_mode.clone(),
+                poll_interval_secs: tombstone.poll_interval_secs,
+                lfs_threshold_mb: tombstone.lfs_threshold_mb,
+                auto_merge: tombstone.auto_merge,
+                enabled: false,
+                created_by: tombstone.created_by.clone(),
+                parent_id: tombstone.parent_id.clone(),
+                created_at: if tombstone.created_at.is_empty() {
+                    now.clone()
+                } else {
+                    tombstone.created_at.clone()
+                },
+                updated_at: now.clone(),
+                last_svn_rev: tombstone.last_svn_rev,
+                last_git_sha: tombstone.last_git_sha.clone(),
+                last_sync_at: None,
+                sync_status: "idle".into(),
+                total_syncs: tombstone.total_syncs,
+                total_errors: tombstone.total_errors,
+                allowed_paths: tombstone.allowed_paths.clone(),
+                blocked_patterns: tombstone.blocked_patterns.clone(),
+                consecutive_errors: tombstone.consecutive_errors,
+                teams_webhook_url: tombstone.teams_webhook_url.clone(),
+            };
+            tx.execute(
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                params![
+                    restored.id,
+                    restored.name,
+                    restored.svn_url,
+                    restored.svn_branch,
+                    restored.svn_username,
+                    restored.git_provider,
+                    restored.git_api_url,
+                    restored.git_repo,
+                    restored.git_branch,
+                    restored.sync_mode,
+                    restored.poll_interval_secs,
+                    restored.lfs_threshold_mb,
+                    restored.auto_merge as i32,
+                    0i32,
+                    restored.created_by,
+                    restored.created_at,
+                    restored.updated_at,
+                    restored.last_svn_rev,
+                    restored.last_git_sha,
+                    restored.last_sync_at,
+                    restored.sync_status,
+                    restored.total_syncs,
+                    restored.total_errors,
+                    restored.parent_id,
+                    restored.allowed_paths,
+                    restored.blocked_patterns,
+                    restored.consecutive_errors,
+                    restored.teams_webhook_url,
+                ],
+            )?;
+            tx.execute(
+                "DELETE FROM kv_state WHERE key=?1",
+                [key("tombstone", repo_id)],
+            )?;
+            audit(
+                tx,
+                repo_id,
+                "managed_remove_restored",
+                "registration restored from tombstone; sync remains disabled until explicitly enabled",
+                true,
+            )?;
+            Ok(RestoreAdvance::Restored { repo: restored })
         })
     }
 }
@@ -1073,7 +1391,7 @@ mod tests {
                     .complete_managed_remove("parent-1", &operation.id)
                     .unwrap();
                 assert_eq!(done.state, ManagedRemoveState::Completed);
-                assert!(!done.restore_supported);
+                assert!(done.restore_supported);
                 assert_eq!(done.remote_git, "untouched");
                 assert_eq!(done.remote_svn, "untouched");
             }
@@ -1125,7 +1443,7 @@ mod tests {
             .unwrap();
         assert!(audits >= 1);
         let tombstone = db.removal_tombstone("parent-1").unwrap().unwrap();
-        assert!(!tombstone.restore_supported);
+        assert!(tombstone.restore_supported);
         assert_eq!(tombstone.commit_map_count, 1);
         assert_eq!(tombstone.remote_svn, "untouched");
 
@@ -1381,5 +1699,116 @@ mod tests {
             }
             other => panic!("expected svn-commit reconcile wait, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn credential_chain_inheritance_lists_dependent_repos_in_retained_for_repo_ids() {
+        let db = setup();
+        db.insert_repository(&repo("inherit-parent", "Parent", None))
+            .unwrap();
+        db.insert_repository(&repo("inherit-child", "Child", Some("inherit-parent")))
+            .unwrap();
+        db.set_state("secret_svn_password_inherit-parent", "shared")
+            .unwrap();
+        let preview = db
+            .removal_dependency_preview("inherit-parent")
+            .unwrap()
+            .unwrap();
+        let svn = preview
+            .credentials
+            .iter()
+            .find(|c| c.key == "secret_svn_password_inherit-parent")
+            .expect("parent svn credential preview");
+        assert!(
+            svn.retained_for_repo_ids
+                .contains(&"inherit-child".to_string()),
+            "child inheriting parent credential must be listed as retained: {:?}",
+            svn.retained_for_repo_ids
+        );
+    }
+
+    #[test]
+    fn blank_git_remote_does_not_surface_shared_registrations() {
+        let db = setup();
+        let blank = repo("blank-remote", "Blank", None);
+        let mut blank = blank;
+        blank.git_api_url = String::new();
+        blank.git_repo = String::new();
+        db.insert_repository(&blank).unwrap();
+        db.insert_repository(&repo("other-remote", "Other", None))
+            .unwrap();
+        let preview = db
+            .removal_dependency_preview("blank-remote")
+            .unwrap()
+            .unwrap();
+        assert!(preview.shared_git_registrations.is_empty());
+    }
+
+    #[test]
+    fn restore_managed_registration_is_idempotent_and_disabled() {
+        let db = setup();
+        let r = repo("restore-me", "Restore", None);
+        db.insert_repository(&r).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (1, 'abc', 'svn_to_git', 't', 'a', 'b', 'restore-me')",
+                [],
+            )
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } = db
+            .prepare_managed_remove("restore-me", "admin", "req")
+            .unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        crate::managed_remove::remove_owned_repo_tree(
+            &tempfile::tempdir().unwrap().path(),
+            "restore-me",
+        )
+        .unwrap();
+        db.complete_managed_remove("restore-me", &operation.id)
+            .unwrap();
+        assert!(db.get_repository("restore-me").unwrap().is_none());
+        let RestoreAdvance::Restored { repo: restored } =
+            db.restore_managed_registration("restore-me").unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert!(!restored.enabled);
+        assert_eq!(restored.name, "Restore");
+        assert!(db.removal_tombstone("restore-me").unwrap().is_none());
+        let again = db.restore_managed_registration("restore-me").unwrap();
+        assert!(matches!(again, RestoreAdvance::AlreadyListed { .. }));
+    }
+
+    #[test]
+    fn restore_rejects_while_removal_in_progress() {
+        let db = setup();
+        let r = repo("busy-restore", "Busy", None);
+        db.insert_repository(&r).unwrap();
+        db.create_import_operation("busy-restore", "admin", "imp", "fp")
+            .unwrap();
+        match db
+            .prepare_managed_remove("busy-restore", "admin", "req")
+            .unwrap()
+        {
+            RemovalAdvance::Waiting { .. } => {}
+            other => panic!("expected waiting, got {other:?}"),
+        };
+        assert!(removal_in_progress(&db.conn(), "busy-restore").unwrap());
+        let err = db
+            .restore_managed_registration("busy-restore")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("in progress"), "{err}");
+        let import = db.active_import_operation("busy-restore").unwrap().unwrap();
+        db.finish_import_operation(
+            "busy-restore",
+            &import.id,
+            ImportOperationState::Cancelled,
+            "cancel",
+        )
+        .unwrap();
     }
 }

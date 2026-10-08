@@ -5,10 +5,14 @@ export default function ManagedRemovalPanel({
   status,
   onRetry,
   retryPending,
+  onRestore,
+  restorePending,
 }: {
   status: ManagedRemovalStatus;
   onRetry?: () => void;
   retryPending?: boolean;
+  onRestore?: () => void;
+  restorePending?: boolean;
 }) {
   const state = `${status.state}`.toLowerCase();
   const tone =
@@ -52,12 +56,30 @@ export default function ManagedRemovalPanel({
           data-testid="managed-removal-recovery"
           className="text-xs border border-current/30 rounded p-2 space-y-1"
         >
-          <p className="font-medium">Recovery metadata (restore not supported)</p>
+          <p className="font-medium">
+            {status.recovery.restore_supported
+              ? 'Recovery metadata (restore available)'
+              : 'Recovery metadata (restore not supported)'}
+          </p>
           <p>
             {status.recovery.name}: maps={status.recovery.commit_map_count}, tip r
             {status.recovery.last_svn_rev} / {status.recovery.last_git_sha.slice(0, 8)}
           </p>
           <p>{status.recovery.retention}</p>
+          {status.recovery.restore_supported
+            && status.state === 'completed'
+            && status.registration_listed === false
+            && onRestore && (
+            <button
+              type="button"
+              data-testid="managed-removal-restore"
+              disabled={restorePending}
+              onClick={onRestore}
+              className="mt-2 px-3 py-1.5 rounded-md bg-blue-800 hover:bg-blue-700 disabled:opacity-50 text-xs font-medium"
+            >
+              {restorePending ? 'Restoring registration…' : 'Restore registration (stays disabled)'}
+            </button>
+          )}
         </div>
       )}
       {status.retryable && onRetry && (
