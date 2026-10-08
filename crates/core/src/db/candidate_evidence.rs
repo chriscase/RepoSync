@@ -86,17 +86,17 @@ pub fn imported_evidence(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (owner, phase, current, total) in progress {
-        if owner.as_deref() == Some(repo) || owner.is_none() {
-            if current != rev || total != rev || phase != "completed" {
-                reasons.push(
-                    if owner.is_some() {
-                        "owned_import_progress_conflicts"
-                    } else {
-                        "unowned_import_progress_requires_reconciliation"
-                    }
-                    .into(),
-                );
-            }
+        if (owner.as_deref() == Some(repo) || owner.is_none())
+            && (current != rev || total != rev || phase != "completed")
+        {
+            reasons.push(
+                if owner.is_some() {
+                    "owned_import_progress_conflicts"
+                } else {
+                    "unowned_import_progress_requires_reconciliation"
+                }
+                .into(),
+            );
         }
     }
     let unknown = keys.contains_key(&format!("{}{repo}", v.unknown_effect_prefix));

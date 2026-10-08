@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use reposync_core::config::{AppConfig, IdentityConfig};
+use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -659,13 +660,7 @@ async fn test_sustained_load_under_sync_cycles() {
                 }
 
                 // Update max latency.
-                let _ = max_lat.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    if elapsed_ms > cur {
-                        Some(elapsed_ms)
-                    } else {
-                        None
-                    }
-                });
+                let _ = max_lat.fetch_max(elapsed_ms, Ordering::Relaxed);
 
                 if is_health {
                     // Immediate assertion for health: must be fast.
@@ -5391,7 +5386,7 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
     assert_eq!(body["state"], "completed");
     assert_eq!(body["remote_git"], "untouched");
     assert_eq!(body["remote_svn"], "untouched");
-    assert_eq!(body["restore_supported"], false);
+    assert_eq!(body["restore_supported"], true);
     assert_eq!(body["registration_listed"], false);
     assert!(!owned.exists());
     assert_eq!(
@@ -5443,7 +5438,7 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
         .unwrap();
     assert_eq!(maps, 1);
     let tombstone = state.db.removal_tombstone(&id).unwrap().unwrap();
-    assert!(!tombstone.restore_supported);
+    assert!(tombstone.restore_supported);
     assert_eq!(tombstone.remote_git, "untouched");
     let listed: Vec<serde_json::Value> = client
         .get(format!("{base}/api/repos"))
@@ -5484,7 +5479,7 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
     assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case":"R02_MANAGED_REMOVE","state":"completed","remote":"unchanged","owned_local":"removed","sibling":"kept","restore_supported":false})
+        serde_json::json!({"case":"R02_MANAGED_REMOVE","state":"completed","remote":"unchanged","owned_local":"removed","sibling":"kept","restore_supported":true})
     );
     server.abort();
 }
@@ -7978,6 +7973,240 @@ async fn candidate_r65_child_removal_preserves_sibling_local_path() {
     server.abort();
 }
 
+/// #65: credential-chain inheritance appears in removal preview retained_for_repo_ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_credential_chain_inheritance_preview() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-inherit-parent";
+    let child_id = "r65-inherit-child";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Inherit parent",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_id,
+            "Inherit child",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{parent_id}"), "shared")
+        .unwrap();
+    let preview = client
+        .get(format!("{base}/api/repos/{parent_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = preview.json().await.unwrap();
+    let creds = body["dependency_preview"]["credentials"]
+        .as_array()
+        .unwrap();
+    let svn = creds
+        .iter()
+        .find(|c| c["key"] == format!("secret_svn_password_{parent_id}"))
+        .expect("parent svn credential");
+    let inheriting = svn["inheriting_repo_ids"].as_array().unwrap();
+    assert!(
+        inheriting.iter().any(|v| v == child_id),
+        "child inheriting parent credential must be listed as inheriting: {svn}"
+    );
+    let retained = svn["retained_for_repo_ids"].as_array().unwrap();
+    assert!(
+        !retained.iter().any(|v| v == child_id),
+        "inheriting child must not be listed as retaining its own key: {svn}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_CREDENTIAL_CHAIN_INHERIT", "child_listed": true})
+    );
+    server.abort();
+}
+
+/// #65: blank Git remote must not produce shared registration entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_blank_git_remote_not_shared_registration() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let blank_id = "r65-blank-remote";
+    let mut blank = fixture_branch_repo(blank_id, "Blank remote", None, "main", "trunk");
+    blank.git_api_url = String::new();
+    blank.git_repo = String::new();
+    state.db.insert_repository(&blank).unwrap();
+    let mut blank2 = fixture_branch_repo("r65-blank-remote-2", "Blank2", None, "main", "trunk");
+    blank2.git_api_url = String::new();
+    blank2.git_repo = String::new();
+    state.db.insert_repository(&blank2).unwrap();
+    let preview = client
+        .get(format!("{base}/api/repos/{blank_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = preview.json().await.unwrap();
+    assert!(body["dependency_preview"]["shared_git_registrations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_BLANK_GIT_REMOTE", "shared": 0})
+    );
+    server.abort();
+}
+
+/// #65: restore completed managed removal while recovery metadata remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_restore_managed_registration() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let repo_id = "r65-restore-root";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            repo_id,
+            "Restore me",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{repo_id}"), "restore-token")
+        .unwrap();
+    const SYNCED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    let import = state
+        .db
+        .create_import_operation(repo_id, "admin", "imp", "fp")
+        .unwrap();
+    state
+        .db
+        .start_import_operation(repo_id, &import.id)
+        .unwrap();
+    state
+        .db
+        .note_import_local(repo_id, &import.id, 4, SYNCED_SHA, 1, 1)
+        .unwrap();
+    state
+        .db
+        .begin_import_publication(repo_id, &import.id, "refs/heads/main", SYNCED_SHA)
+        .unwrap();
+    state
+        .db
+        .confirm_import_publication(repo_id, &import.id, SYNCED_SHA)
+        .unwrap();
+    state
+        .db
+        .complete_import_operation(repo_id, &import.id, 4, SYNCED_SHA)
+        .unwrap();
+    let mut synced_row = state.db.get_repository(repo_id).unwrap().unwrap();
+    synced_row.last_sync_at = Some("2026-01-02T00:00:00Z".into());
+    state.db.update_repository(&synced_row).unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+             VALUES (1, 'abc', 'svn_to_git', 't', 'a', 'b', ?1)",
+            [repo_id],
+        )
+        .unwrap();
+    state
+        .db
+        .set_state(
+            &format!("last_git_sha_{repo_id}"),
+            "inboundcheckpoint0123456789abcdef0123456789",
+        )
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    std::fs::create_dir_all(data.join("repos").join(repo_id)).unwrap();
+
+    let removed = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::OK);
+
+    let restore = client
+        .post(format!("{base}/api/repos/{repo_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), reqwest::StatusCode::OK);
+    let restore_body: serde_json::Value = restore.json().await.unwrap();
+    assert_eq!(restore_body["state"], "restored");
+    let repo = state.db.get_repository(repo_id).unwrap().unwrap();
+    assert!(!repo.enabled);
+    assert_eq!(repo.last_svn_rev, 4);
+    assert_eq!(repo.last_git_sha, SYNCED_SHA);
+    assert_eq!(repo.last_sync_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+    assert_eq!(
+        state
+            .db
+            .resolve_credential_chain(repo_id, "secret_git_token")
+            .as_deref(),
+        Some("restore-token")
+    );
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("last_git_sha_{repo_id}"))
+            .unwrap()
+            .as_deref(),
+        Some("inboundcheckpoint0123456789abcdef0123456789")
+    );
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("last_svn_rev_{repo_id}"))
+            .unwrap()
+            .as_deref(),
+        Some("4")
+    );
+    assert_eq!(
+        resolve_repo_import_baseline(&state.db, repo_id).unwrap(),
+        RepoImportBaseline::Verified {
+            svn_rev: 4,
+            git_sha: SYNCED_SHA.into(),
+        }
+    );
+    assert!(state.db.removal_tombstone(repo_id).unwrap().is_none());
+
+    let again = client
+        .post(format!("{base}/api/repos/{repo_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        again.json::<serde_json::Value>().await.unwrap()["state"],
+        "already_listed"
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_MANAGED_RESTORE", "enabled": false})
+    );
+    server.abort();
+}
+
 /// #65: removal preview surfaces active managed removal as HTTP 202 or 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r65_removal_preview_reports_202_or_409_for_active_removal() {
@@ -8057,5 +8286,414 @@ async fn candidate_r65_removal_preview_reports_202_or_409_for_active_removal() {
             "cancelling_http": 202
         })
     );
+    server.abort();
+}
+
+/// #65: managed child removal uses the target credential chain and records remote outcomes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_remote_deletion_outcomes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let auth_hits = Arc::new(AtomicUsize::new(0));
+    let auth_seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let delete_hits = Arc::new(AtomicUsize::new(0));
+    let revoked_auth_hits = Arc::new(AtomicUsize::new(0));
+    let revoked_delete_hits = Arc::new(AtomicUsize::new(0));
+
+    fn authorized_child_delete(headers: &axum::http::HeaderMap) -> bool {
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer child-only-token")
+    }
+
+    let mock = axum::Router::new()
+        .route(
+            "/repos/org/parent/git/refs/heads/feature",
+            axum::routing::delete({
+                let auth_hits = auth_hits.clone();
+                let auth_seen = auth_seen.clone();
+                let delete_hits = delete_hits.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let auth_hits = auth_hits.clone();
+                    let auth_seen = auth_seen.clone();
+                    let delete_hits = delete_hits.clone();
+                    async move {
+                        auth_hits.fetch_add(1, Ordering::SeqCst);
+                        let token = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("");
+                        *auth_seen.lock().await = token.to_string();
+                        if !authorized_child_delete(&headers) {
+                            return axum::http::StatusCode::UNAUTHORIZED;
+                        }
+                        delete_hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repos/org/revoked/git/refs/heads/feature",
+            axum::routing::delete({
+                let revoked_auth_hits = revoked_auth_hits.clone();
+                let revoked_delete_hits = revoked_delete_hits.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let revoked_auth_hits = revoked_auth_hits.clone();
+                    let revoked_delete_hits = revoked_delete_hits.clone();
+                    async move {
+                        revoked_auth_hits.fetch_add(1, Ordering::SeqCst);
+                        if !authorized_child_delete(&headers) {
+                            return axum::http::StatusCode::UNAUTHORIZED;
+                        }
+                        revoked_delete_hits.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let mock_handle = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-remote-parent";
+    let child_id = "r65-remote-child";
+    let revoked_child = "r65-remote-revoked-child";
+    let mut parent = fixture_branch_repo(parent_id, "Remote parent", None, "main", "trunk");
+    parent.git_api_url = format!("http://{mock_addr}");
+    parent.git_repo = "org/parent".into();
+    state.db.insert_repository(&parent).unwrap();
+    let mut child = fixture_branch_repo(
+        child_id,
+        "Remote child",
+        Some(parent_id),
+        "feature",
+        "branches/feature",
+    );
+    child.git_api_url = parent.git_api_url.clone();
+    child.git_repo = parent.git_repo.clone();
+    state.db.insert_repository(&child).unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{child_id}"), "child-only-token")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{parent_id}"), "parent-token")
+        .unwrap();
+    std::fs::create_dir_all(tmp.path().join("repos").join(child_id)).unwrap();
+
+    let remove = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = remove.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["state"], "completed");
+    assert_eq!(body["remote_git"], "deleted");
+    assert_eq!(body["remote_svn"], "untouched");
+    assert!(state.db.get_repository(child_id).unwrap().is_none());
+    assert_eq!(auth_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        auth_seen.lock().await.as_str(),
+        "Bearer child-only-token",
+        "remote deletion must use the child repo id credential chain, not the parent token"
+    );
+
+    let mut revoked_parent = parent.clone();
+    revoked_parent.id = "r65-remote-revoked-parent".into();
+    revoked_parent.name = "Remote revoked parent".into();
+    revoked_parent.git_repo = "org/revoked".into();
+    state.db.insert_repository(&revoked_parent).unwrap();
+    let mut revoked = child.clone();
+    revoked.id = revoked_child.into();
+    revoked.parent_id = Some(revoked_parent.id.clone());
+    revoked.git_repo = revoked_parent.git_repo.clone();
+    state.db.insert_repository(&revoked).unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{}", revoked_child), "")
+        .unwrap();
+    state
+        .db
+        .set_state(
+            &format!("secret_git_token_{}", revoked_parent.id),
+            "parent-token",
+        )
+        .unwrap();
+    std::fs::create_dir_all(tmp.path().join("repos").join(revoked_child)).unwrap();
+
+    let revoked_remove = client
+        .post(format!(
+            "{base}/api/repos/{revoked_child}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_remove.status(), reqwest::StatusCode::CONFLICT);
+    let revoked_body: serde_json::Value = revoked_remove.json().await.unwrap();
+    assert_eq!(revoked_body["ok"], false);
+    assert_eq!(revoked_body["state"], "failed");
+    assert_eq!(revoked_body["remote_git"], "failed");
+    assert_eq!(
+        revoked_delete_hits.load(Ordering::SeqCst),
+        0,
+        "revoked child must not complete a Git delete"
+    );
+    assert!(state.db.get_repository(revoked_child).unwrap().is_some());
+
+    server.abort();
+    mock_handle.abort();
+}
+
+/// #65: a retry after remote delete succeeds must not issue another remote DELETE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_retry_skips_recorded_remote_delete() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let delete_hits = Arc::new(AtomicUsize::new(0));
+    let mock = axum::Router::new().route(
+        "/repos/org/parent/git/refs/heads/feature",
+        axum::routing::delete({
+            let delete_hits = delete_hits.clone();
+            move |_headers: axum::http::HeaderMap| {
+                let delete_hits = delete_hits.clone();
+                async move {
+                    delete_hits.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let mock_handle = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-retry-parent";
+    let child_id = "r65-retry-child";
+    let mut parent = fixture_branch_repo(parent_id, "Retry parent", None, "main", "trunk");
+    parent.git_api_url = format!("http://{mock_addr}");
+    parent.git_repo = "org/parent".into();
+    state.db.insert_repository(&parent).unwrap();
+    let mut child = fixture_branch_repo(
+        child_id,
+        "Retry child",
+        Some(parent_id),
+        "feature",
+        "branches/feature",
+    );
+    child.git_api_url = parent.git_api_url.clone();
+    child.git_repo = parent.git_repo.clone();
+    state.db.insert_repository(&child).unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{child_id}"), "child-only-token")
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    let repos_root = data.join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let outside = tmp.path().join("retry-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let owned = repos_root.join(child_id);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &owned).unwrap();
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&owned).unwrap();
+        server.abort();
+        mock_handle.abort();
+        return;
+    }
+
+    let first = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(first_status, reqwest::StatusCode::CONFLICT, "{first_body}");
+    assert_eq!(first_body["state"], "failed");
+    assert_eq!(first_body["remote_git"], "deleted");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
+
+    std::fs::remove_file(&owned).unwrap();
+    std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+    std::fs::write(owned.join("owned.txt"), "owned\n").unwrap();
+
+    let retry = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        retry.text().await.unwrap()
+    );
+    let retry_body: serde_json::Value = retry.json().await.unwrap();
+    assert_eq!(retry_body["state"], "completed");
+    assert_eq!(retry_body["remote_git"], "deleted");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert!(state.db.get_repository(child_id).unwrap().is_none());
+
+    server.abort();
+    mock_handle.abort();
+}
+
+/// #65: remove → restore → enable → remove must start a new operation and finish removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_remove_restore_enable_remove_cycle() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let repo_id = "r65-remove-cycle";
+    const SYNCED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            repo_id, "Cycle", None, "main", "trunk",
+        ))
+        .unwrap();
+    let import = state
+        .db
+        .create_import_operation(repo_id, "admin", "imp", "fp")
+        .unwrap();
+    state
+        .db
+        .start_import_operation(repo_id, &import.id)
+        .unwrap();
+    state
+        .db
+        .note_import_local(repo_id, &import.id, 2, SYNCED_SHA, 1, 1)
+        .unwrap();
+    state
+        .db
+        .begin_import_publication(repo_id, &import.id, "refs/heads/main", SYNCED_SHA)
+        .unwrap();
+    state
+        .db
+        .confirm_import_publication(repo_id, &import.id, SYNCED_SHA)
+        .unwrap();
+    state
+        .db
+        .complete_import_operation(repo_id, &import.id, 2, SYNCED_SHA)
+        .unwrap();
+    std::fs::create_dir_all(tmp.path().join("repos").join(repo_id)).unwrap();
+
+    let first = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    let first_op = first_body["operation_id"].as_str().unwrap().to_string();
+    assert!(state.db.get_repository(repo_id).unwrap().is_none());
+
+    let restore = client
+        .post(format!("{base}/api/repos/{repo_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), reqwest::StatusCode::OK);
+
+    let probe = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), reqwest::StatusCode::OK);
+    let probe_body: serde_json::Value = probe.json().await.unwrap();
+    assert_ne!(
+        probe_body["operation_id"].as_str().unwrap(),
+        first_op,
+        "restored registration must not replay the completed removal receipt"
+    );
+
+    client
+        .post(format!("{base}/api/repos/{repo_id}/restore"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put(format!("{base}/api/repos/{repo_id}"))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(state.db.get_repository(repo_id).unwrap().unwrap().enabled);
+
+    let second = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    let second_body: serde_json::Value = second.json().await.unwrap();
+    assert_ne!(second_body["operation_id"].as_str().unwrap(), first_op);
+    assert_eq!(second_body["state"], "completed");
+    assert!(state.db.get_repository(repo_id).unwrap().is_none());
+
+    server.abort();
+}
+
+/// #65: missing parent during managed remote deletion must fail the operation (not hang Running).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_missing_parent_fails_operation() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let child_id = "r65-orphan-child";
+    let child = fixture_branch_repo(
+        child_id,
+        "Orphan",
+        Some("r65-missing-parent"),
+        "feature",
+        "branches/feature",
+    );
+    state.db.insert_repository(&child).unwrap();
+    std::fs::create_dir_all(state.config.daemon.data_dir.join("repos").join(child_id)).unwrap();
+
+    let remove = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = remove.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["state"], "failed");
+    use reposync_core::db::managed_remove::ManagedRemoveState;
+    let op = state.db.managed_removal(child_id).unwrap().unwrap();
+    assert_eq!(op.state, ManagedRemoveState::Failed);
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
+
     server.abort();
 }

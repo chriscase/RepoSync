@@ -40,7 +40,9 @@ use crate::db::team_cycle_mapping_operations::{
 };
 use crate::db::Database;
 use crate::echo_receipt_scope::{
-    handled_git_no_target_state_key, read_git_no_target_receipt, repo_echo_generation,
+    handled_git_no_target_state_key, read_git_no_target_receipt,
+    read_git_no_target_receipt_any_generation, repo_echo_generation,
+    stored_git_no_target_receipt_exists,
 };
 use crate::echo_suppression::{
     classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
@@ -681,10 +683,14 @@ impl SyncEngine {
                 // bump.
                 let old_import_projection =
                     self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
-                if (applied_outbound > 0
+                let kv_handled_proved = applied_outbound > 0
                     || (old_import_projection && svn_origin > 0)
-                    || kv_no_target)
-                    && is_full_git_oid(column.as_deref().unwrap())
+                    || kv_no_target;
+                let column_sha = column.as_deref().unwrap();
+                let column_emit_proved = self.proved_svn_emitted_column_git_sha(rid, column_sha)?;
+                if kv_handled_proved
+                    && column_emit_proved
+                    && is_full_git_oid(column_sha)
                     && is_full_git_oid(kv.as_deref().unwrap())
                 {
                     let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
@@ -693,7 +699,7 @@ impl SyncEngine {
                             "merge-base",
                             "--is-ancestor",
                             kv.as_deref().unwrap(),
-                            column.as_deref().unwrap(),
+                            column_sha,
                         ])
                         .current_dir(git.repo_path())
                         .output();
@@ -873,6 +879,60 @@ impl SyncEngine {
 
     fn no_target_projection(&self) -> String {
         serde_json::json!({"allowed_paths": self.allowed_paths, "blocked_patterns": self.blocked_patterns}).to_string()
+    }
+
+    /// The repository column may point at an SVN-emitted Git tip only when that
+    /// SHA is backed by applied SVN→Git mapping, an active no-target receipt,
+    /// or a stale-generation receipt that still matches repository, SHA, and
+    /// projection identity.
+    fn proved_svn_emitted_column_git_sha(
+        &self,
+        rid: &str,
+        column_sha: &str,
+    ) -> Result<bool, SyncError> {
+        if !is_full_git_oid(column_sha) {
+            return Ok(false);
+        }
+        let emitted_mapping: i64 = {
+            let conn = self.db.conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                rusqlite::params![rid, column_sha],
+                |row| row.get(0),
+            )
+            .map_err(crate::errors::DatabaseError::from)?
+        };
+        if emitted_mapping > 0 {
+            return Ok(true);
+        }
+        let projection = self.no_target_projection();
+        if stored_git_no_target_receipt_exists(&self.db, rid, column_sha, &projection)
+            .map_err(SyncError::DatabaseError)?
+        {
+            return Ok(true);
+        }
+        if let Some(record) = read_git_no_target_receipt_any_generation(&self.db, rid, column_sha)
+            .map_err(SyncError::DatabaseError)?
+        {
+            let generation =
+                repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+            let receipt_projection = record["projection"].as_str().unwrap_or("");
+            if record["repo_id"] == rid
+                && record["git_sha"] == column_sha
+                && is_full_git_oid(column_sha)
+                && !receipt_projection.is_empty()
+                && verify_no_target_receipt(
+                    &record,
+                    rid,
+                    column_sha,
+                    receipt_projection,
+                    generation,
+                ) == NoTargetReceiptVerdict::StaleGeneration
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
@@ -4778,6 +4838,60 @@ repo = "test/test-repo"
                 synced_at: now,
                 status: SyncRecordStatus::Applied,
             })
+            .unwrap();
+        assert!(matches!(
+            engine.team_git_checkpoint(),
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn team_git_checkpoint_split_cursor_rejects_unproved_emitted_column() {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+        use uuid::Uuid;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let repo_path = engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let handled = git_fixture_commit(&repo_path, "handled.txt", "h\n", "handled H");
+        let _middle = git_fixture_commit(&repo_path, "middle.txt", "n\n", "unproved N");
+        let echo_tip = git_fixture_commit(
+            &repo_path,
+            "echo.txt",
+            "e\n",
+            "SVN echo with [reposync] marker",
+        );
+        let now = chrono::Utc::now();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: Uuid::new_v4().to_string(),
+                repo_id: Some("pair".into()),
+                svn_revision: None,
+                git_hash: Some(handled.clone()),
+                direction: SyncDirection::GitToSvn,
+                author: "dev".into(),
+                message: "handled outbound".into(),
+                timestamp: now,
+                synced_at: now,
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        engine
+            .db()
+            .set_state(&format!("last_git_sha_{}", "pair"), &handled)
+            .unwrap();
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&echo_tip],
+            )
             .unwrap();
         assert!(matches!(
             engine.team_git_checkpoint(),

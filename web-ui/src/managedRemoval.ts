@@ -53,8 +53,8 @@ export function managedRemovalNeedsPoll(state: string | undefined): boolean {
   return !!state && !managedRemovalIsTerminal(state);
 }
 
-export function managedRemovalStateLabel(state: string): string {
-  switch (state.toLowerCase()) {
+export function managedRemovalStateLabel(state: string | undefined): string {
+  switch (`${state ?? ''}`.toLowerCase()) {
     case 'cancelling':
       return 'Cancelling in-flight work';
     case 'queued':
@@ -68,7 +68,7 @@ export function managedRemovalStateLabel(state: string): string {
     case 'completed':
       return 'Removed from RepoSync';
     default:
-      return state;
+      return state ?? '';
   }
 }
 
@@ -142,6 +142,7 @@ export interface RemovalDependencyPreview {
     key: string;
     action: string;
     retained_for_repo_ids: string[];
+    inheriting_repo_ids: string[];
   }>;
   managed_local_path: string;
   sibling_local_paths_preserved: string[];

@@ -2131,7 +2131,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
-    let restored_db = Database::new(&restored.join("reposync.db")).unwrap();
+    let restored_db = Database::new(restored.join("reposync.db")).unwrap();
     assert_eq!(
         restored_db.get_repo_watermark("pair").unwrap(),
         (old_svn_rev, old_tip.clone())
@@ -12427,6 +12427,9 @@ async fn candidate_echo_generation_stale_receipt_same_sha_split_inbound_checkpoi
             "handled":handled,
             "filtered":filtered,
             "emitted_tip":table_tip,
+            "kv_inbound_checkpoint":handled,
+            "filtered_no_target_git_sha":filtered,
+            "column_git_sha":table_tip,
             "svn_tree":tree_hashes(&tree)
         })
     );
@@ -12580,7 +12583,7 @@ async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
 
     let mut pair = QualifiedPair::new().await;
     let repo_id = pair.repo_id.clone();
-    pair.developer_commit("handled.txt", "baseline\n", "Establish outbound cursor");
+    let handled = pair.developer_commit("handled.txt", "baseline\n", "Establish outbound cursor");
     git_cli(&pair.developer, &["push", "origin", "main"]);
     assert_eq!(
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
@@ -12625,17 +12628,51 @@ async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
         "Ordinary work after reimport reset bump",
     );
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    let engine = reopen_pair(&pair);
     use reposync_core::echo_suppression::{
         classify_incoming_git_commit, EchoDisposition, TeamEchoContext,
     };
+    use reposync_core::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+    use uuid::Uuid;
+    let now = chrono::Utc::now();
+    pair.engine
+        .db()
+        .insert_sync_record(&SyncRecord {
+            id: Uuid::new_v4().to_string(),
+            repo_id: Some(repo_id.clone()),
+            svn_revision: Some(2),
+            git_hash: Some(handled.clone()),
+            direction: SyncDirection::GitToSvn,
+            author: "dev".into(),
+            message: "re-established handled outbound".into(),
+            timestamp: now,
+            synced_at: now,
+            status: SyncRecordStatus::Applied,
+        })
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state(&format!("last_git_sha_{repo_id}"), &handled)
+        .unwrap();
+    let svn_tip = svn_youngest(&pair.svn_url);
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev = ?1 WHERE id = ?2",
+            rusqlite::params![svn_tip, repo_id],
+        )
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state(&format!("last_svn_rev_{repo_id}"), &svn_tip.to_string())
+        .unwrap();
     let projection = serde_json::json!({
         "allowed_paths": ["allow/"],
         "blocked_patterns": []
     })
     .to_string();
     let ctx = TeamEchoContext {
-        db: engine.db(),
+        db: pair.engine.db(),
         repo_id: &repo_id,
         no_target_projection: &projection,
     };
@@ -12652,6 +12689,18 @@ async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
             .unwrap(),
         EchoDisposition::ApplyGenuine
     );
+    git_cli(&pair.bridge, &["pull", "--rebase", "origin", "main"]);
+    let svn_before = svn_youngest(&pair.svn_url);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1,
+        "successor must apply once after reimport reset and generation bump"
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(svn_youngest(&pair.svn_url), svn_before + 1);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
@@ -12660,7 +12709,8 @@ async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
             "successor":successor,
             "generation_before":generation_before,
             "generation_after":generation_after,
-            "sync_records_cleared":true
+            "sync_records_cleared":true,
+            "successor_applied_to_svn":true
         })
     );
 }
@@ -12828,6 +12878,233 @@ async fn candidate_echo_identity_path_recreation_stale_svn_receipt_not_valid() {
             "recreated_rev":recreated_rev,
             "generation":generation,
             "automatic_path_incarnation_bump":"NOT_IMPLEMENTED"
+        })
+    );
+}
+
+// Refs #63: unproved SVN-emitted column with proved KV must stay ambiguous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_split_cursor_unproved_emitted_column_ambiguous_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new().await;
+    let handled = fixture.developer_commit(
+        "handled.txt",
+        "handled baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let unproved = fixture.developer_commit(
+        "ordinary.txt",
+        "unproved middle\n",
+        "Ordinary Git commit without mapping",
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    git_cli(&fixture.bridge, &["pull", "--rebase", "origin", "main"]);
+    svn_commit_file(
+        &fixture.wc,
+        "svn-echo.txt",
+        "svn side\n",
+        "SVN work before forged echo tip",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    let svn_after_echo = svn_youngest(&fixture.svn_url);
+    let echo_tip = get_head_sha(&fixture.bridge);
+    assert_ne!(echo_tip, handled);
+    assert_ne!(echo_tip, unproved);
+    let echo_message = get_git_commit_message(&fixture.bridge, 0);
+    assert!(
+        echo_message.contains("[reposync]"),
+        "SVN→Git bridge commit must carry the sync marker"
+    );
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_sha_pair", &handled)
+        .unwrap();
+    assert_eq!(
+        fixture.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(handled.clone())
+    );
+    {
+        let conn = fixture.engine.db().conn();
+        conn.execute(
+            "DELETE FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git'",
+            [&echo_tip],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&echo_tip],
+        )
+        .unwrap();
+    }
+    let applied_echo_rows: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'svn_to_git' AND status = 'applied'",
+        [&echo_tip],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(applied_echo_rows, 0);
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "unproved emitted column must not admit handled..echo replay: {result:?}"
+    );
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_after_echo);
+    let outbound_rows: i64 = fixture.engine.db().conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'pair' AND git_sha = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+        [&echo_tip],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(outbound_rows, 0);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_SPLIT_CURSOR_UNPROVED_COLUMN",
+            "kv_inbound_checkpoint":handled,
+            "unproved_middle":unproved,
+            "column_git_sha":echo_tip,
+            "svn_revision_unchanged":svn_after_echo
+        })
+    );
+}
+
+/// #65: managed remove + restore re-adopts sync checkpoints and resumes incremental sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_restore_resumes_sync() {
+    if !svn_available() {
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"R65_MANAGED_RESTORE_SYNC","skipped":"svn_unavailable"})
+        );
+        return;
+    }
+    use reposync_core::db::managed_remove::{
+        ManagedRemoveRemoteOutcome, RemovalAdvance, RestoreAdvance,
+    };
+
+    let pair = QualifiedPair::new().await;
+    let repo_id = pair.repo_id.clone();
+    let baseline_maps: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let baseline_watermark = pair.engine.db().get_repo_watermark(&repo_id).unwrap();
+    let data_dir = pair.engine.config().daemon.data_dir.clone();
+
+    let RemovalAdvance::Cleanup { operation } = pair
+        .engine
+        .db()
+        .prepare_managed_remove(&repo_id, "admin", "remove-1")
+        .unwrap()
+    else {
+        panic!("expected cleanup advance");
+    };
+    reposync_core::managed_remove::remove_owned_repo_tree(&data_dir, &repo_id).unwrap();
+    pair.engine
+        .db()
+        .complete_managed_remove(
+            &repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+    assert!(pair.engine.db().get_repository(&repo_id).unwrap().is_none());
+
+    let RestoreAdvance::Restored { repo: restored } = pair
+        .engine
+        .db()
+        .restore_managed_registration(&repo_id)
+        .unwrap()
+    else {
+        panic!("expected restore");
+    };
+    assert!(!restored.enabled);
+    assert_eq!(
+        resolve_repo_import_baseline(pair.engine.db(), &repo_id).unwrap(),
+        RepoImportBaseline::Verified {
+            svn_rev: baseline_watermark.0,
+            git_sha: baseline_watermark.1.clone(),
+        }
+    );
+    let maps_after_restore: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps_after_restore, baseline_maps);
+
+    let mut enabled = pair.engine.db().get_repository(&repo_id).unwrap().unwrap();
+    enabled.enabled = true;
+    enabled.last_sync_at = Some("2020-01-01T00:00:00Z".into());
+    pair.engine.db().update_repository(&enabled).unwrap();
+
+    svn_commit_file(
+        &pair.wc,
+        "after-restore.txt",
+        "after restore\n",
+        "SVN after restore",
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1
+    );
+    let after_watermark = pair.engine.db().get_repo_watermark(&repo_id).unwrap();
+    assert_eq!(after_watermark.0, baseline_watermark.0 + 1);
+    assert_ne!(after_watermark.1, baseline_watermark.1);
+    let maps_after_sync: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps_after_sync, baseline_maps + 1);
+    assert_eq!(
+        std::fs::read_to_string(pair.bridge.join("after-restore.txt")).unwrap(),
+        "after restore\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R65_MANAGED_RESTORE_SYNC",
+            "baseline_svn":baseline_watermark.0,
+            "after_svn":after_watermark.0,
+            "maps":maps_after_restore
         })
     );
 }

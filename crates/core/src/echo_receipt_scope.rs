@@ -122,6 +122,32 @@ pub fn read_git_no_target_receipt(
     Ok(None)
 }
 
+/// Load a stored Git no-target receipt for `git_sha` without requiring the active generation.
+pub fn read_git_no_target_receipt_any_generation(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<Option<serde_json::Value>, DatabaseError> {
+    let generation = repo_echo_generation(db, repo_id)?;
+    let mut keys = Vec::new();
+    keys.push(format!("handled_git_no_target_{}_{}", repo_id, git_sha));
+    for gen in 1..=generation {
+        keys.push(handled_git_no_target_state_key(repo_id, gen, git_sha));
+    }
+    for key in keys {
+        let Some(raw) = db.get_state(&key)? else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if record["repo_id"] == repo_id && record["git_sha"] == git_sha {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
 /// Whether a generation-accepted, admission-scoped Git no-target receipt exists for `git_sha`.
 pub fn stored_git_no_target_receipt_exists(
     db: &Database,
