@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY Cargo.toml ./
 COPY crates ./crates
+COPY web-ui ./web-ui
 COPY docs/reliability/legacy-evidence-vocabulary.json ./docs/reliability/legacy-evidence-vocabulary.json
 COPY docs/reliability/fixtures/Cargo.lock ./Cargo.lock
 COPY scripts/reliability-prep.py /usr/local/bin/reliability-prep
