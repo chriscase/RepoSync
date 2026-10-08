@@ -851,19 +851,33 @@ impl SyncEngine {
                     }
                 }
             }
-            if let Some(sha) = column.as_ref().or(kv.as_ref()) {
-                if !self.proved_scoped_inbound_git_checkpoint(rid, sha)? {
+            if let Some(kv_sha) = kv {
+                // Unified column+KV copies claim inbound P; KV-only bootstrap may
+                // precede a repository row (late pair checkpoint transition).
+                if column.as_deref() == Some(kv_sha.as_str())
+                    && !self.proved_scoped_inbound_git_checkpoint(rid, &kv_sha)?
+                {
                     return Err(self.record_history_block(
                         "ambiguous_checkpoint",
                         "legacy Git cursor lacks scoped provenance for this repository",
-                        Some(sha),
+                        Some(&kv_sha),
                         None,
                         None,
                         None,
                     ));
                 }
+                return Ok(Some(kv_sha));
             }
-            return Ok(column.or(kv));
+            if let Some(col) = column {
+                if self.proved_scoped_inbound_git_checkpoint(rid, &col)? {
+                    return Ok(Some(col));
+                }
+                // Without scoped KV the column is emitted-tip bookkeeping or
+                // install bootstrap; only agreeing column+KV copies form a
+                // unified legacy cursor that must prove inbound authority.
+                return Ok(Some(col));
+            }
+            return Ok(None);
         }
 
         // Older single-repository callers use a global key. It is never
@@ -982,8 +996,26 @@ impl SyncEngine {
         if applied_outbound > 0 {
             return Ok(true);
         }
-        stored_git_no_target_receipt_exists(&self.db, rid, sha, &self.no_target_projection())
-            .map_err(SyncError::DatabaseError)
+        let projection = self.no_target_projection();
+        if stored_git_no_target_receipt_exists(&self.db, rid, sha, &projection)
+            .map_err(SyncError::DatabaseError)?
+        {
+            return Ok(true);
+        }
+        for record in collect_git_no_target_receipts_for_sha(&self.db, rid, sha)
+            .map_err(SyncError::DatabaseError)?
+        {
+            let receipt_generation = record
+                .get("generation")
+                .and_then(|value| value.as_i64())
+                .unwrap_or(PAIR_GENERATION);
+            if verify_no_target_receipt(&record, rid, sha, &projection, receipt_generation)
+                == NoTargetReceiptVerdict::Accepted
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
@@ -4988,6 +5020,31 @@ repo = "test/test-repo"
             engine.team_git_checkpoint(),
             Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
         ));
+    }
+
+    #[test]
+    fn team_git_checkpoint_column_without_scoped_kv_allows_bootstrap() {
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let repo_path = engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let bootstrap = git_fixture_commit(&repo_path, "boot.txt", "boot\n", "bootstrap tip");
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&bootstrap],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.team_git_checkpoint().unwrap(),
+            Some(bootstrap),
+            "install bootstrap may seed only the emitted-tip column"
+        );
     }
 
     #[test]
