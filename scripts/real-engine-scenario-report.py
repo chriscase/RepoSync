@@ -128,6 +128,17 @@ def write_summary(results_path: Path, summary_path: Path, toolchain_status: str,
     return summary
 
 
+def counts_from_scenarios(scenarios: list) -> dict[str, int]:
+    counts = {"PASS": 0, "FAIL": 0, "PARTIAL": 0, "NOT RUN": 0, "SKIP": 0}
+    for row in scenarios:
+        if not isinstance(row, dict):
+            continue
+        status = row.get("status")
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
 def load_ci_partial_allowlist(path: Path) -> set[str]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     ids = payload.get("allowed_partial_scenario_ids")
@@ -174,12 +185,27 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
         if case_id not in expected_ids:
             errors.append(f"unexpected scenario id: {case_id}")
 
+    computed_counts = counts_from_scenarios(scenarios)
+    reported_counts = summary.get("counts")
+    if not isinstance(reported_counts, dict):
+        errors.append("summary.counts must be an object")
+    else:
+        for key in ("PASS", "FAIL", "PARTIAL", "NOT RUN", "SKIP"):
+            reported = reported_counts.get(key, 0)
+            if reported != computed_counts[key]:
+                errors.append(
+                    f"counts.{key}={reported!r} disagrees with scenario rows ({computed_counts[key]})"
+                )
+
+    row_statuses: list[str] = []
     for row in scenarios:
         if not isinstance(row, dict):
             errors.append("invalid scenario row (not an object)")
             continue
         case_id = row.get("id", "<unknown>")
         status = row.get("status")
+        if isinstance(status, str):
+            row_statuses.append(status)
         if status == "FAIL":
             errors.append(f"{case_id}: FAIL")
         elif status == "SKIP":
@@ -197,10 +223,18 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
     elif overall == "NOT RUN":
         errors.append("overall: NOT RUN")
     elif overall == "PARTIAL":
+        if row_statuses and all(status == "PASS" for status in row_statuses):
+            errors.append("overall PARTIAL but every scenario row is PASS")
         partial_ids = [r["id"] for r in scenarios if r.get("status") == "PARTIAL"]
         unexpected = [cid for cid in partial_ids if cid not in allowed]
         if unexpected:
             errors.append(f"overall PARTIAL with non-allowlisted ids: {', '.join(unexpected)}")
+    elif overall == "PASS":
+        if computed_counts["FAIL"] > 0 or computed_counts["PARTIAL"] > 0:
+            errors.append(
+                "overall PASS but scenario rows include FAIL or PARTIAL "
+                f"(counts={computed_counts})"
+            )
     elif overall != "PASS":
         errors.append(f"overall: unexpected {overall!r}")
 
@@ -223,7 +257,7 @@ def run_self_test() -> None:
         payload = {
             "suite": "real-engine-scenarios",
             "scenarios": scenarios,
-            "counts": {},
+            "counts": counts_from_scenarios(scenarios),
             "overall": overall,
         }
         summary_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -281,6 +315,43 @@ def run_self_test() -> None:
                 row["status"] = "NOT RUN"
         code, errs = ci_gate(write_summary(tmp, not_run, "NOT RUN"), allowlist_path)
         assert code != 0 and errs, (code, errs)
+
+        duplicate = full_pass_rows()
+        duplicate.append({"id": expected_ids[0], "status": "PASS"})
+        code, errs = ci_gate(write_summary(tmp, duplicate, "PASS"), allowlist_path)
+        assert code != 0 and any("duplicate scenario id" in e for e in errs), (
+            code,
+            errs,
+        )
+
+        unexpected_id = full_pass_rows()
+        unexpected_id.append({"id": "R99_UNEXPECTED_SCENARIO", "status": "PASS"})
+        code, errs = ci_gate(
+            write_summary(tmp, unexpected_id, "PASS"), allowlist_path
+        )
+        assert code != 0 and any("unexpected scenario id" in e for e in errs), (
+            code,
+            errs,
+        )
+
+        all_pass_partial_overall = full_pass_rows()
+        code, errs = ci_gate(
+            write_summary(tmp, all_pass_partial_overall, "PARTIAL"), allowlist_path
+        )
+        assert code != 0 and any(
+            "overall PARTIAL but every scenario row is PASS" in e for e in errs
+        ), (code, errs)
+
+        mismatched_counts = full_pass_rows()
+        summary_path = write_summary(tmp, mismatched_counts, "PASS")
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        payload["counts"]["PASS"] = 0
+        summary_path.write_text(json.dumps(payload), encoding="utf-8")
+        code, errs = ci_gate(summary_path, allowlist_path)
+        assert code != 0 and any("counts.PASS" in e and "disagrees" in e for e in errs), (
+            code,
+            errs,
+        )
 
     ci_yml = ROOT / ".github/workflows/ci.yml"
     ci_text = ci_yml.read_text(encoding="utf-8")
