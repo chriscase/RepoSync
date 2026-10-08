@@ -975,6 +975,10 @@ async fn remove_repo(
                     let (status, body) = removal_response(&state.db, &operation, listed)?;
                     return Ok((status, body).into_response());
                 }
+                state
+                    .db
+                    .record_managed_remove_remote_progress(&id, &operation.id, &remote_outcome)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
             }
         }
     }
@@ -984,7 +988,12 @@ async fn remove_repo(
     if let Err(error) = cleanup {
         let operation = state
             .db
-            .fail_managed_remove(&id, &operation.id, &error.to_string())
+            .fail_managed_remove_with_remote(
+                &id,
+                &operation.id,
+                &error.to_string(),
+                Some(&remote_outcome),
+            )
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let listed = registration_listed(&state.db, &id)?;
         let (status, body) = removal_response(&state.db, &operation, listed)?;
@@ -1002,7 +1011,12 @@ async fn remove_repo(
         Err(error) => {
             let operation = state
                 .db
-                .fail_managed_remove(&id, &operation.id, &error.to_string())
+                .fail_managed_remove_with_remote(
+                    &id,
+                    &operation.id,
+                    &error.to_string(),
+                    Some(&remote_outcome),
+                )
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             let listed = registration_listed(&state.db, &id)?;
             let (status, body) = removal_response(&state.db, &operation, listed)?;

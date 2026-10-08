@@ -984,6 +984,8 @@
     {"id":"R65_CREDENTIAL_CHAIN_INHERIT", "binary":"server_freeze", "test":"candidate_r65_credential_chain_inheritance_preview", "tier":"candidate_regression"},
     {"id":"R65_BLANK_GIT_REMOTE", "binary":"server_freeze", "test":"candidate_r65_blank_git_remote_not_shared_registration", "tier":"candidate_regression"},
     {"id":"R65_MANAGED_RESTORE", "binary":"server_freeze", "test":"candidate_r65_restore_managed_registration", "tier":"candidate_regression"},
+    {"id":"R65_REMOVE_RESTORE_CYCLE", "binary":"server_freeze", "test":"candidate_r65_remove_restore_enable_remove_cycle", "tier":"candidate_regression"},
+    {"id":"R65_MANAGED_RESTORE_SYNC", "binary":"reposync_core", "test":"candidate_r65_managed_remove_restore_resumes_sync", "tier":"candidate_regression"},
     {"id":"R11_SNAPSHOT_FIXED_R", "binary":"server_freeze", "test":"candidate_r11_snapshot_at_fixed_revision", "tier":"candidate_regression"},
     {"id":"R11_PIN_HOLDS_AFTER_ADVANCE", "binary":"server_freeze", "test":"candidate_r11_pin_holds_when_svn_advances", "tier":"candidate_regression"},
     {"id":"R11_MISMATCHED_TARGET", "binary":"server_freeze", "test":"candidate_r11_mismatched_target_is_refused", "tier":"candidate_regression"},
