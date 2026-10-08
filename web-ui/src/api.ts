@@ -1,6 +1,7 @@
 import { buildBranchPairDeleteQuery } from './branchPairDeletion';
 import type { BranchPairRemovalResult } from './branchPairRemoval';
 import type { ManagedRemovalStatus } from './managedRemoval';
+import type { RepoImportMode, SnapshotPin, StartRepoImportRequest } from './importBaseline';
 
 const API_BASE = '/api';
 
@@ -440,6 +441,18 @@ export const api = {
   getRepos: () => fetchJson<Repository[]>('/repos'),
   createRepo: (data: Partial<Repository>) =>
     fetchJson<Repository>('/repos', { method: 'POST', body: JSON.stringify(data) }),
+  startRepoImport: (id: string, body: StartRepoImportRequest = {}) =>
+    fetchJson<{
+      ok: boolean;
+      operation_id?: string;
+      import_mode?: RepoImportMode;
+      starting_revision?: number | null;
+      history_boundary?: string | null;
+      lifecycle?: ImportStatus['lifecycle'];
+    }>(`/repos/${id}/import`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   getRepo: (id: string) => fetchJson<Repository>(`/repos/${id}`),
   updateRepo: (id: string, data: Partial<Repository>) =>
     fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
@@ -858,6 +871,11 @@ export interface Repository {
   blocked_patterns: string | null;
   consecutive_errors: number;
   sync_status: string;
+  initializing?: boolean;
+  import_mode?: RepoImportMode | string | null;
+  starting_revision?: number | null;
+  history_boundary?: string | null;
+  snapshot_pin?: SnapshotPin | null;
 }
 
 export interface ImportStatus {
@@ -887,4 +905,9 @@ export interface ImportStatus {
   intended_ref?: string | null;
   intended_git_sha?: string | null;
   outcome_detail?: string | null;
+  import_mode?: RepoImportMode | string | null;
+  starting_revision?: number | null;
+  history_boundary?: string | null;
+  earlier_history_imported?: boolean | null;
+  snapshot_pin?: SnapshotPin | null;
 }
