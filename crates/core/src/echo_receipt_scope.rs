@@ -7,6 +7,8 @@
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::db::Database;
 use crate::echo_suppression::{verify_no_target_receipt, NoTargetReceiptVerdict};
@@ -41,12 +43,24 @@ pub fn repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, Databas
     }
 }
 
+#[cfg(test)]
+static TEST_FORCE_SPLIT_FAIL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn test_force_next_split_fail() {
+    TEST_FORCE_SPLIT_FAIL.store(true, Ordering::SeqCst);
+}
+
 /// When a generation bump follows a unified no-target cursor, restore the scoped
 /// KV copy to the last applied outbound Git SHA so stale receipts cannot admit P.
 fn split_unified_git_cursor_to_outbound_kv_tx(
     tx: &Connection,
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
+    #[cfg(test)]
+    if TEST_FORCE_SPLIT_FAIL.swap(false, Ordering::SeqCst) {
+        return Err(DatabaseError::Other("test forced split failure".into()));
+    }
     let column: Option<String> = tx
         .query_row(
             "SELECT last_git_sha FROM repositories WHERE id = ?1",
@@ -109,7 +123,18 @@ pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i6
 /// Bump the echo generation after a reset/re-anchor so stale receipts fail closed.
 pub fn bump_repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, DatabaseError> {
     let conn = db.conn();
-    bump_repo_echo_generation_tx(&conn, repo_id)
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = bump_repo_echo_generation_tx(&conn, repo_id);
+    match result {
+        Ok(next) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(next)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub fn receipt_generation_accepted(record: &serde_json::Value, current_generation: i64) -> bool {
@@ -369,6 +394,39 @@ mod tests {
         assert!(read_svn_no_target_receipt(&db, "pair", 3)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn bump_repo_echo_generation_rolls_back_when_split_fails() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_api_url, git_repo, git_branch, enabled, created_at, updated_at, last_svn_rev, last_git_sha)
+                 VALUES ('pair', 'pair', '', '', '', '', '', '', 1, 't', 't', 0, '')",
+                [],
+            )
+            .unwrap();
+        let handled = "b".repeat(40);
+        let filtered = "c".repeat(40);
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES ('out', 'pair', NULL, ?1, 'git_to_svn', '', '', ?2, ?2, 'applied')",
+                rusqlite::params![handled, now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&filtered],
+            )
+            .unwrap();
+        db.set_state("last_git_sha_pair", &filtered).unwrap();
+        assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
+        test_force_next_split_fail();
+        assert!(bump_repo_echo_generation(&db, "pair").is_err());
+        assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
     }
 
     #[test]

@@ -203,11 +203,6 @@ fn advance_git_with_receipt_tx(
             "team cycle mapping lacks a full Git SHA".into(),
         ));
     }
-    let outbound_applied: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
-        [repo_id],
-        |row| row.get(0),
-    )?;
     let updated = tx.execute(
         "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
         params![git_sha, repo_id],
@@ -224,7 +219,7 @@ fn advance_git_with_receipt_tx(
     let receipt_proves_kv = crate::echo_suppression::verify_no_target_receipt(
         &receipt, repo_id, git_sha, projection, generation,
     ) == crate::echo_suppression::NoTargetReceiptVerdict::Accepted;
-    if outbound_applied == 0 || receipt_proves_kv {
+    if receipt_proves_kv {
         write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
     }
     let receipt_key =

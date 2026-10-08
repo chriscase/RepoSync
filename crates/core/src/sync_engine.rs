@@ -12,9 +12,12 @@
 //! A lock mechanism prevents concurrent sync cycles.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use rusqlite::OptionalExtension;
@@ -219,6 +222,65 @@ struct GitContentReadTestFault {
 struct SvnApplyTestFault {
     revision: i64,
     bridge: String,
+}
+
+fn sync_git_command_output(
+    repo_path: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let repo_path = repo_path.to_path_buf();
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let output = Command::new("git")
+            .args(&args)
+            .current_dir(&repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output();
+        let _ = tx.send(output);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Some(output),
+        _ => None,
+    }
+}
+
+fn advertised_remote_tip_is_sha(
+    repo_path: &Path,
+    branch: &str,
+    sha: &str,
+    timeout: Duration,
+) -> bool {
+    let remote_branch = format!("refs/heads/{}", branch);
+    let output = match sync_git_command_output(
+        repo_path,
+        &[
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &remote_branch,
+        ],
+        timeout,
+    ) {
+        Some(output) => output,
+        None => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let advertised_text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = advertised_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() != 1 {
+        return false;
+    }
+    let advertised_sha = lines[0].split_whitespace().next().unwrap_or("");
+    is_full_git_oid(advertised_sha) && lines[0].ends_with(&remote_branch) && advertised_sha == sha
 }
 
 impl SyncEngine {
@@ -670,67 +732,35 @@ impl SyncEngine {
         }
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
         let repo_path = git.repo_path();
+        let timeout = Duration::from_secs(45);
         let spec = format!("{}^{{commit}}", sha);
-        if Command::new("git")
-            .args(["cat-file", "-e", &spec])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .is_ok_and(|output| output.status.success())
+        if sync_git_command_output(repo_path, &["cat-file", "-e", &spec], timeout)
+            .is_some_and(|output| output.status.success())
         {
             return Ok(false);
         }
         let branch = &self.config.github.default_branch;
-        let remote_branch = format!("refs/heads/{}", branch);
-        let advertised = Command::new("git")
-            .args([
-                "ls-remote",
-                "--exit-code",
-                "--heads",
-                "origin",
-                &remote_branch,
-            ])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output();
-        if let Ok(output) = advertised {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let advertised_sha = stdout
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().next())
-                    .unwrap_or("");
-                if advertised_sha == sha {
-                    return Ok(false);
-                }
-            }
+        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout) {
+            return Ok(false);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
-        let fetched = Command::new("git")
-            .args([
+        let fetched = sync_git_command_output(
+            repo_path,
+            &[
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
                 "origin",
                 &format!("{}:{}", sha, probe_ref),
-            ])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .is_ok_and(|output| output.status.success());
+            ],
+            timeout,
+        )
+        .is_some_and(|output| output.status.success());
         let present = fetched
-            && Command::new("git")
-                .args(["cat-file", "-e", &spec])
-                .current_dir(repo_path)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output()
-                .is_ok_and(|output| output.status.success());
+            && sync_git_command_output(repo_path, &["cat-file", "-e", &spec], timeout)
+                .is_some_and(|output| output.status.success());
         if present {
-            let _ = Command::new("git")
-                .args(["update-ref", "-d", &probe_ref])
-                .current_dir(repo_path)
-                .output();
+            let _ = sync_git_command_output(repo_path, &["update-ref", "-d", &probe_ref], timeout);
             return Ok(false);
         }
         Ok(true)
