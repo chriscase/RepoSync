@@ -255,23 +255,56 @@ impl Database {
     ) -> Result<LatePairPublishOperation, DatabaseError> {
         self.transaction(|tx| {
             crate::writer_fence::require_current(tx)?;
-            let raw = read_value(tx, &key("document", op_id))?.ok_or_else(|| {
-                DatabaseError::Other("late-pair publish operation not found".into())
-            })?;
-            let mut op = parse(&raw)?;
-            if op.parent_repo_id != parent_repo_id {
-                return Err(DatabaseError::Other(
-                    "late-pair publish operation parent mismatch".into(),
-                ));
-            }
-            op.state = LatePairPublishState::Completed;
-            op.updated_at = Utc::now().to_rfc3339();
-            write_op(tx, &op)?;
-            tx.execute(
-                "DELETE FROM kv_state WHERE key=?1 AND value=?2",
-                params![key("active", parent_repo_id), op_id],
-            )?;
-            Ok(op)
+            finalize_late_pair_publish_op_in_tx(tx, parent_repo_id, op_id, None)
         })
     }
+
+    /// Atomically mark the journal completed and enable the child (crash-safe publish finish).
+    pub fn finalize_late_pair_publish_enabling_child(
+        &self,
+        parent_repo_id: &str,
+        op_id: &str,
+        child_repo_id: &str,
+        git_tip: &str,
+    ) -> Result<LatePairPublishOperation, DatabaseError> {
+        self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            finalize_late_pair_publish_op_in_tx(
+                tx,
+                parent_repo_id,
+                op_id,
+                Some((child_repo_id, git_tip)),
+            )
+        })
+    }
+}
+
+fn finalize_late_pair_publish_op_in_tx(
+    tx: &Connection,
+    parent_repo_id: &str,
+    op_id: &str,
+    enable_child: Option<(&str, &str)>,
+) -> Result<LatePairPublishOperation, DatabaseError> {
+    let raw = read_value(tx, &key("document", op_id))?
+        .ok_or_else(|| DatabaseError::Other("late-pair publish operation not found".into()))?;
+    let mut op = parse(&raw)?;
+    if op.parent_repo_id != parent_repo_id {
+        return Err(DatabaseError::Other(
+            "late-pair publish operation parent mismatch".into(),
+        ));
+    }
+    if let Some((child_id, git_tip)) = enable_child {
+        tx.execute(
+            "UPDATE repositories SET enabled = 1, sync_status = 'idle', last_git_sha = ?1, updated_at = ?2 WHERE id = ?3",
+            params![git_tip, Utc::now().to_rfc3339(), child_id],
+        )?;
+    }
+    op.state = LatePairPublishState::Completed;
+    op.updated_at = Utc::now().to_rfc3339();
+    write_op(tx, &op)?;
+    tx.execute(
+        "DELETE FROM kv_state WHERE key=?1 AND value=?2",
+        params![key("active", parent_repo_id), op_id],
+    )?;
+    Ok(op)
 }

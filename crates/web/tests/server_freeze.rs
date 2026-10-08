@@ -174,14 +174,28 @@ fn authed_client() -> reqwest::Client {
 
 /// Axum server on its own OS thread/runtime so in-process HTTP clients do not deadlock the test runtime.
 struct TestServerGuard {
-    shutdown: std::sync::mpsc::Sender<()>,
-    thread: std::thread::JoinHandle<()>,
+    shutdown: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TestServerGuard {
-    fn abort(self) {
-        let _ = self.shutdown.send(());
-        let _ = self.thread.join();
+    fn abort(mut self) {
+        self.stop();
+    }
+
+    fn stop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for TestServerGuard {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -217,8 +231,8 @@ fn spawn_isolated_test_server(app: Router) -> (SocketAddr, TestServerGuard) {
     (
         addr,
         TestServerGuard {
-            shutdown: shutdown_tx,
-            thread,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
         },
     )
 }
@@ -6874,6 +6888,7 @@ async fn candidate_r06_late_pair_publish_http_resume_after_replay_error() {
         LatePairPublishTestHook {
             fail_replay_once: true,
             abort_after_svn_copy_before_journal: false,
+            ..Default::default()
         },
     );
     let client = authed_client();
@@ -6913,6 +6928,7 @@ async fn candidate_r06_late_pair_publish_http_resume_after_svn_copy() {
         LatePairPublishTestHook {
             fail_replay_once: false,
             abort_after_svn_copy_before_journal: true,
+            ..Default::default()
         },
     );
     let client = authed_client();
@@ -6946,6 +6962,7 @@ async fn candidate_r06_late_pair_publish_http_refuses_fingerprint_mismatch() {
         LatePairPublishTestHook {
             fail_replay_once: false,
             abort_after_svn_copy_before_journal: true,
+            ..Default::default()
         },
     );
     let client = authed_client();

@@ -21,10 +21,11 @@ use crate::db::late_pair_publish_operations::{
 };
 use crate::db::queries::CredentialChainState;
 use crate::db::Database;
-use crate::errors::DatabaseError;
+use crate::errors::{redact_vcs_error_detail, DatabaseError};
 use crate::git::apply_git_credential_chain_state;
 use crate::git::client::GitClient;
 use crate::git::remote_url::derive_git_remote_url;
+use crate::git::subprocess_auth::build_git_ls_remote_command;
 use crate::identity::IdentityMapper;
 use crate::late_pair::{LatePairPlan, LatePairRequest, SvnTargetProbe};
 use crate::models::{Repository, SyncDirection, SyncRecord, SyncRecordStatus};
@@ -40,6 +41,9 @@ pub const PUBLISH_POLICY_VERSION: &str = "late_pair_publish_v1";
 pub struct LatePairPublishTestHook {
     pub fail_replay_once: bool,
     pub abort_after_svn_copy_before_journal: bool,
+    pub fail_svn_copy_once: bool,
+    /// Fail inside `replay_pending_git` after this many newly replayed commits (0 = disabled).
+    pub fail_replay_after_commits: u32,
 }
 
 #[cfg(debug_assertions)]
@@ -68,6 +72,9 @@ pub fn clear_late_pair_publish_test_hook(parent_repo_id: &str) {
 pub struct LatePairPublishTestHook {
     pub fail_replay_once: bool,
     pub abort_after_svn_copy_before_journal: bool,
+    pub fail_svn_copy_once: bool,
+    /// Fail inside `replay_pending_git` after this many newly replayed commits (0 = disabled).
+    pub fail_replay_after_commits: u32,
 }
 
 #[cfg(not(debug_assertions))]
@@ -149,6 +156,31 @@ fn take_fail_replay_once(parent_repo_id: &str) -> bool {
     false
 }
 
+fn take_fail_svn_copy_once(parent_repo_id: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        let mut hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
+        if let Some(hook) = hooks.get_mut(parent_repo_id) {
+            if hook.fail_svn_copy_once {
+                hook.fail_svn_copy_once = false;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn replay_fail_after_commits(parent_repo_id: &str) -> u32 {
+    #[cfg(debug_assertions)]
+    {
+        let hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
+        if let Some(hook) = hooks.get(parent_repo_id) {
+            return hook.fail_replay_after_commits;
+        }
+    }
+    0
+}
+
 fn take_abort_after_svn_copy(parent_repo_id: &str) -> bool {
     #[cfg(debug_assertions)]
     {
@@ -184,7 +216,7 @@ pub struct LatePairPublishRefusal {
 
 impl LatePairPublishRefusal {
     pub fn error_message(&self) -> String {
-        format!("{}: {}", self.reason, self.detail)
+        format!("{}: {}", self.reason, redact_vcs_error_detail(&self.detail))
     }
 }
 
@@ -247,25 +279,8 @@ pub fn validate_git_publish_preflight(
     if !clone_url_needs_http_credentials(&clone_url) {
         return Ok(());
     }
-    let authenticated = match token {
-        Some(tok) if clone_url.starts_with("https://") => {
-            let rest = clone_url.strip_prefix("https://").unwrap();
-            format!("https://x-access-token:{tok}@{rest}")
-        }
-        Some(tok) if clone_url.starts_with("http://") => {
-            let rest = clone_url.strip_prefix("http://").unwrap();
-            format!("http://x-access-token:{tok}@{rest}")
-        }
-        _ => clone_url.clone(),
-    };
-    let output = Command::new("git")
-        .args([
-            "ls-remote",
-            "--exit-code",
-            &authenticated,
-            &format!("refs/heads/{git_branch}"),
-        ])
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let refspec = format!("refs/heads/{git_branch}");
+    let output = build_git_ls_remote_command(&clone_url, token, &refspec)
         .output()
         .map_err(|e| LatePairPublishRefusal {
             reason: "git_preflight_failed".into(),
@@ -547,6 +562,13 @@ async fn svn_copy_at_baseline(
     copy_source_rev: i64,
     source_path: &str,
 ) -> Result<i64, LatePairPublishRefusal> {
+    if take_fail_svn_copy_once(&parent.id) {
+        return Err(LatePairPublishRefusal {
+            reason: "svn_copy_failed".into(),
+            detail: "test hook: simulated svn copy failure".into(),
+            plan: None,
+        });
+    }
     let root_client = SvnClient::new(&parent.svn_url, &parent.svn_username, svn_password);
     let (branches_path, branch_name) = parse_svn_branch(svn_branch)?;
     root_client
@@ -563,7 +585,7 @@ async fn svn_copy_at_baseline(
             } else {
                 LatePairPublishRefusal {
                     reason: "svn_copy_failed".into(),
-                    detail: err,
+                    detail: redact_vcs_error_detail(&err),
                     plan: None,
                 }
             }
@@ -576,7 +598,7 @@ async fn svn_copy_at_baseline(
     let target = SvnClient::new(&target_url, &parent.svn_username, svn_password);
     let info = target.info().await.map_err(|e| LatePairPublishRefusal {
         reason: "svn_copy_failed".into(),
-        detail: e.to_string(),
+        detail: redact_vcs_error_detail(&e.to_string()),
         plan: None,
     })?;
     Ok(info.latest_rev)
@@ -646,6 +668,11 @@ async fn replay_pending_git(
     engine.set_repo_id(child.id.clone());
 
     let mut replayed = Vec::new();
+    let fail_after = child
+        .parent_id
+        .as_deref()
+        .map(replay_fail_after_commits)
+        .unwrap_or(0);
     for _ in 0..32 {
         let handled_before = engine
             .db()
@@ -671,7 +698,7 @@ async fn replay_pending_git(
             .await
             .map_err(|e| LatePairPublishRefusal {
                 reason: "replay_failed".into(),
-                detail: e.to_string(),
+                detail: redact_vcs_error_detail(&e.to_string()),
                 plan: None,
             })?;
         if stats.git_to_svn_count == 0 && stats.svn_to_git_count == 0 {
@@ -694,6 +721,13 @@ async fn replay_pending_git(
             .unwrap_or_else(|| handled_before.clone());
         if handled_after != handled_before {
             replayed.push(handled_after.clone());
+            if fail_after > 0 && replayed.len() as u32 >= fail_after {
+                return Err(LatePairPublishRefusal {
+                    reason: "replay_failed".into(),
+                    detail: "test hook: simulated mid-replay failure".into(),
+                    plan: None,
+                });
+            }
         }
         if handled_after == pinned_tip {
             break;
@@ -1054,7 +1088,7 @@ pub async fn publish_admitted_late_pair(
             Ok(replayed) => replayed,
             Err(err) => {
                 op.state = LatePairPublishState::ReplayInProgress;
-                op.outcome_detail = Some(err.detail.clone());
+                op.outcome_detail = Some(redact_vcs_error_detail(&err.detail));
                 db.update_late_pair_publish_operation(op).map_err(db_err)?;
                 return Err(err);
             }
@@ -1063,23 +1097,12 @@ pub async fn publish_admitted_late_pair(
         op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
     }
 
-    let mut child = db
-        .get_repository(&effective_child_id)
-        .map_err(db_err)?
-        .unwrap();
-    child.enabled = true;
-    child.sync_status = "idle".into();
-    child.last_git_sha = git_tip.clone();
-    child.updated_at = chrono::Utc::now().to_rfc3339();
-    db.update_repository(&child)
+    db.finalize_late_pair_publish_enabling_child(&parent.id, &op.id, &effective_child_id, &git_tip)
         .map_err(|e| LatePairPublishRefusal {
             reason: "finalize_failed".into(),
-            detail: e.to_string(),
+            detail: redact_vcs_error_detail(&e.to_string()),
             plan: Some(Box::new(plan.clone())),
         })?;
-
-    db.finalize_late_pair_publish_operation(&parent.id, &op.id)
-        .map_err(db_err)?;
 
     Ok(LatePairPlan {
         mode: "published".into(),
@@ -1183,6 +1206,33 @@ mod tests {
             http_git_token_for_clone("file:///tmp/repo.git", &state).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn preflight_ls_remote_command_argv_has_no_token() {
+        use crate::git::subprocess_auth::command_args_contain_secret;
+
+        let token = "ghp_test_preflight_argv_secret";
+        let cmd = build_git_ls_remote_command(
+            "https://github.com/acme/widget.git",
+            Some(token),
+            "refs/heads/feature",
+        );
+        assert!(!command_args_contain_secret(&cmd, token));
+        assert!(!command_args_contain_secret(&cmd, "x-access-token"));
+    }
+
+    #[test]
+    fn refusal_error_message_redacts_credentialed_remote_detail() {
+        let refusal = LatePairPublishRefusal {
+            reason: "replay_failed".into(),
+            detail: "git fetch failed: fatal: https://x-access-token:ghp_LEAKED@github.com/o/r.git"
+                .into(),
+            plan: None,
+        };
+        let msg = refusal.error_message();
+        assert!(!msg.contains("ghp_LEAKED"));
+        assert!(msg.contains("[REDACTED]"));
     }
 
     #[test]
