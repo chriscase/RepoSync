@@ -28,11 +28,39 @@ def evidence_detail(log_text: str, case_id: str | None, want_status: str) -> dic
     return {}
 
 
+def evidence_status(log_text: str, case_id: str) -> tuple[str, dict]:
+    for line in log_text.splitlines():
+        if "RELIABILITY_EVIDENCE" not in line:
+            continue
+        payload = line.split("RELIABILITY_EVIDENCE", 1)[1].strip()
+        start = payload.find("{")
+        if start < 0:
+            continue
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(payload[start:])
+        except json.JSONDecodeError:
+            continue
+        if obj.get("case") != case_id:
+            continue
+        status = obj.get("status")
+        if status in {"PASS", "PARTIAL", "NOT RUN"}:
+            detail = obj.get("detail", {})
+            return status, detail if isinstance(detail, dict) else {}
+    return "PASS", {}
+
+
 def classify(log_path: Path, case_id: str, test_exit: int) -> tuple[str, dict]:
     text = log_path.read_text() if log_path.is_file() else ""
     if '"status":"NOT RUN"' in text or '"status": "NOT RUN"' in text:
         return "NOT RUN", evidence_detail(text, None, "NOT RUN")
     if test_exit == 0 and "test result: ok" in text:
+        status, detail = evidence_status(text, case_id)
+        if status == "PARTIAL":
+            return "PARTIAL", detail
+        if status == "NOT RUN":
+            return "NOT RUN", detail
+        if detail:
+            return "PASS", detail
         return "PASS", evidence_detail(text, case_id, "PASS")
     tail = next((line for line in reversed(text.splitlines()) if line.strip()), "")
     return "FAIL", {"tail": tail[-500:]}
