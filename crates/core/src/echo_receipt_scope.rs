@@ -47,14 +47,18 @@ fn split_unified_git_cursor_to_outbound_kv_tx(
     tx: &Connection,
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
-    let column: String = tx.query_row(
-        "SELECT last_git_sha FROM repositories WHERE id = ?1",
-        [repo_id],
-        |row| row.get(0),
-    )?;
-    if column.is_empty() {
+    let column: Option<String> = tx
+        .query_row(
+            "SELECT last_git_sha FROM repositories WHERE id = ?1",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let column = column.filter(|value| !value.is_empty());
+    if column.is_none() {
         return Ok(());
     }
+    let column = column.unwrap();
     let kv_key = format!("last_git_sha_{}", repo_id);
     let kv: Option<String> = tx
         .query_row(
