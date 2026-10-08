@@ -8207,6 +8207,112 @@ async fn candidate_r65_restore_managed_registration() {
     server.abort();
 }
 
+/// #65 RS-16: GET /removal?operation_id= returns the receipt operation document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_get_removal_status_by_operation_id() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let repo_id = "r65-removal-by-op";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            repo_id, "By op", None, "main", "trunk",
+        ))
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    let repos_root = data.join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let outside = tmp.path().join("by-op-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let owned = repos_root.join(repo_id);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &owned).unwrap();
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&owned).unwrap();
+        server.abort();
+        return;
+    }
+
+    let failed = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::CONFLICT);
+    let failed_body: serde_json::Value = failed.json().await.unwrap();
+    let op_id = failed_body["operation_id"].as_str().unwrap();
+    assert_eq!(failed_body["state"], "failed");
+    assert!(failed_body["partial_cleanup"].is_object());
+
+    let by_id = client
+        .get(format!(
+            "{base}/api/repos/{repo_id}/removal?operation_id={op_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(by_id.status(), reqwest::StatusCode::CONFLICT);
+    let by_id_body: serde_json::Value = by_id.json().await.unwrap();
+    assert_eq!(by_id_body["operation_id"], op_id);
+    assert_eq!(
+        by_id_body["partial_cleanup"]["remote_git"],
+        failed_body["remote_git"]
+    );
+
+    let missing = client
+        .get(format!(
+            "{base}/api/repos/{repo_id}/removal?operation_id=not-a-real-op"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    std::fs::remove_file(&owned).unwrap();
+    std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+    std::fs::write(owned.join("owned.txt"), "owned\n").unwrap();
+
+    let retry = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), reqwest::StatusCode::OK);
+    let retry_body: serde_json::Value = retry.json().await.unwrap();
+    assert_eq!(retry_body["state"], "completed");
+
+    let latest = client
+        .get(format!("{base}/api/repos/{repo_id}/removal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(latest.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        latest.json::<serde_json::Value>().await.unwrap()["state"],
+        "completed"
+    );
+
+    let historical = client
+        .get(format!(
+            "{base}/api/repos/{repo_id}/removal?operation_id={op_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(historical.status(), reqwest::StatusCode::OK);
+    let historical_body: serde_json::Value = historical.json().await.unwrap();
+    assert_eq!(historical_body["operation_id"], op_id);
+    assert_eq!(historical_body["state"], "completed");
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_REMOVAL_BY_OPERATION_ID", "failed_op": op_id})
+    );
+    server.abort();
+}
+
 /// #65: removal preview surfaces active managed removal as HTTP 202 or 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r65_removal_preview_reports_202_or_409_for_active_removal() {
@@ -8560,6 +8666,110 @@ async fn candidate_r65_managed_remove_retry_skips_recorded_remote_delete() {
     assert_eq!(retry_body["remote_git"], "deleted");
     assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
     assert!(state.db.get_repository(child_id).unwrap().is_none());
+
+    server.abort();
+    mock_handle.abort();
+}
+
+/// #65: a stored failed remote side that this retry does not target must not abort cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_retry_ignores_unrequested_remote_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let delete_hits = Arc::new(AtomicUsize::new(0));
+    let mock = axum::Router::new().route(
+        "/repos/org/parent/git/refs/heads/feature",
+        axum::routing::delete({
+            let delete_hits = delete_hits.clone();
+            move |_headers: axum::http::HeaderMap| {
+                let delete_hits = delete_hits.clone();
+                async move {
+                    delete_hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "git delete failed",
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let mock_handle = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-unreq-parent";
+    let child_id = "r65-unreq-child";
+    let mut parent = fixture_branch_repo(parent_id, "Unreq parent", None, "main", "trunk");
+    parent.git_api_url = format!("http://{mock_addr}");
+    parent.git_repo = "org/parent".into();
+    state.db.insert_repository(&parent).unwrap();
+    let mut child = fixture_branch_repo(
+        child_id,
+        "Unreq child",
+        Some(parent_id),
+        "feature",
+        "branches/feature",
+    );
+    child.git_api_url = parent.git_api_url.clone();
+    child.git_repo = parent.git_repo.clone();
+    state.db.insert_repository(&child).unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{child_id}"), "child-only-token")
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    let repos_root = data.join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let outside = tmp.path().join("unreq-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let owned = repos_root.join(child_id);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &owned).unwrap();
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&owned).unwrap();
+        server.abort();
+        mock_handle.abort();
+        return;
+    }
+
+    let first = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::CONFLICT);
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(first_body["state"], "failed");
+    assert_eq!(first_body["remote_git"], "failed");
+    assert_eq!(first_body["remote_svn"], "untouched");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+
+    std::fs::remove_file(&owned).unwrap();
+    std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+    std::fs::write(owned.join("owned.txt"), "owned\n").unwrap();
+
+    let retry = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=true"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), reqwest::StatusCode::CONFLICT);
+    let retry_body: serde_json::Value = retry.json().await.unwrap();
+    assert_eq!(retry_body["state"], "failed");
+    assert_eq!(retry_body["remote_git"], "failed");
+    assert_eq!(retry_body["remote_svn"], "failed");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
 
     server.abort();
     mock_handle.abort();

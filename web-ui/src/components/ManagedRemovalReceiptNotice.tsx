@@ -16,6 +16,21 @@ export default function ManagedRemovalReceiptNotice({ receipt }: { receipt: Mana
       <p className="font-medium">{managedRemovalStateLabel(receipt.state)}</p>
       {receipt.message && <p className="mt-1">{receipt.message}</p>}
       <p className="mt-1 font-mono text-xs">Operation {receipt.operationId}</p>
+      {receipt.partial_cleanup && (
+        <div
+          data-testid="managed-removal-receipt-partial-cleanup"
+          className="mt-2 text-xs border border-current/30 rounded p-2 space-y-1"
+        >
+          <p className="font-medium">Partial cleanup receipt</p>
+          {receipt.partial_cleanup.outcome_detail && (
+            <p>{receipt.partial_cleanup.outcome_detail}</p>
+          )}
+          <p>
+            Remote Git: {receipt.partial_cleanup.remote_git} · SVN:{' '}
+            {receipt.partial_cleanup.remote_svn}
+          </p>
+        </div>
+      )}
     </div>
   );
 }
