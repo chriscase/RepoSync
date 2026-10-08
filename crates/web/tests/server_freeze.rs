@@ -8759,17 +8759,23 @@ async fn candidate_r65_managed_remove_retry_ignores_unrequested_remote_failure()
 
     let retry = client
         .post(format!(
-            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=true"
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=false"
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(retry.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        retry.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        retry.text().await.unwrap()
+    );
     let retry_body: serde_json::Value = retry.json().await.unwrap();
-    assert_eq!(retry_body["state"], "failed");
+    assert_eq!(retry_body["state"], "completed");
     assert_eq!(retry_body["remote_git"], "failed");
-    assert_eq!(retry_body["remote_svn"], "failed");
+    assert_eq!(retry_body["remote_svn"], "untouched");
     assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert!(state.db.get_repository(child_id).unwrap().is_none());
 
     server.abort();
     mock_handle.abort();
