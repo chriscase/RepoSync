@@ -147,18 +147,43 @@ pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// Escape `s` for use inside single-quoted Bash literals.
+pub fn bash_single_quoted_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Bash `[[ ... ]]` test for one allowed prefix (component-aware, matches
-/// [`path_matches_prefix`]).
+/// [`path_matches_prefix`]). Prefixes are embedded as single-quoted literals so
+/// `$(...)`, backticks, and newlines cannot execute.
 pub fn bash_allowed_prefix_test(file_expr: &str, prefix: &str) -> String {
     let prefix = normalize_policy_path(prefix);
     let prefix = prefix.trim_end_matches('/');
     if prefix.is_empty() {
         return "false".to_string();
     }
+    let quoted = bash_single_quoted_literal(prefix);
     format!(
-        "[[ \"{file}\" == \"{prefix}\" || \"{file}\" == \"{prefix}/\"* ]]",
-        file = file_expr,
-        prefix = prefix.replace('"', "\\\"")
+        "[[ {file} == {quoted} || {file} == {quoted}/* ]]",
+        file = file_expr
+    )
+}
+
+/// One `case` arm for a blocked pattern (matches [`path_matches_blocked`]).
+pub fn bash_blocked_pattern_case_arm(pattern: &str) -> String {
+    let pattern = normalize_policy_path(pattern);
+    if pattern.is_empty() {
+        return String::new();
+    }
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return format!("*{}", bash_single_quoted_literal(suffix));
+    }
+    let prefix = pattern.trim_end_matches('/');
+    if prefix.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{literal}|{literal}/*",
+        literal = bash_single_quoted_literal(prefix)
     )
 }
 
@@ -201,12 +226,25 @@ pub fn render_pre_commit_hook_script(allowed: &[String], blocked: &[String]) -> 
     }
 
     if !blocked.is_empty() {
-        script.push_str("# Blocked patterns\n");
-        for pattern in blocked {
-            script.push_str(&format!(
-                "for file in $(git diff --cached --name-only --diff-filter=ACM); do\n  case \"$file\" in\n    {}) echo \"ERROR: '$file' matches blocked pattern '{}'\"; ERRORS=$((ERRORS + 1));;\n  esac\ndone\n\n",
-                pattern, pattern
-            ));
+        script.push_str("# Blocked patterns (component-aware; secret matches secret/leak.txt)\n");
+        let arms: Vec<String> = blocked
+            .iter()
+            .map(|pattern| bash_blocked_pattern_case_arm(pattern))
+            .filter(|arm| !arm.is_empty())
+            .collect();
+        if !arms.is_empty() {
+            script.push_str(
+                "for file in $(git diff --cached --name-only --diff-filter=ACM); do\n  case \"$file\" in\n",
+            );
+            for (index, arm) in arms.iter().enumerate() {
+                if index > 0 {
+                    script.push('|');
+                }
+                script.push_str(arm);
+            }
+            script.push_str(
+                ")\n      echo \"ERROR: '$file' matches a blocked path pattern\"\n      ERRORS=$((ERRORS + 1))\n      ;;\n  esac\ndone\n\n",
+            );
         }
     }
 
@@ -384,21 +422,195 @@ mod tests {
         }
     }
 
+    fn init_git_repo(repo: &std::path::Path) {
+        std::fs::create_dir_all(repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@example.invalid"])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+    }
+
+    fn run_hook_on_staged_paths(
+        script: &str,
+        staged_paths: &[(&str, &str)],
+    ) -> std::process::ExitStatus {
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("pre-commit");
+        std::fs::write(&hook, script).unwrap();
+        let repo = dir.path().join("repo");
+        init_git_repo(&repo);
+        for (rel, contents) in staged_paths {
+            let path = repo.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, contents).unwrap();
+            std::process::Command::new("git")
+                .args(["add", rel])
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+        }
+        std::process::Command::new("bash")
+            .arg(&hook)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+    }
+
     #[test]
     fn bash_allowed_prefix_test_matches_component_rules() {
         assert_eq!(
             bash_allowed_prefix_test("$file", "team"),
-            "[[ \"$file\" == \"team\" || \"$file\" == \"team/\"* ]]"
+            "[[ $file == 'team' || $file == 'team'/* ]]"
         );
         assert!(path_matches_prefix("team/foo", "team"));
         assert!(!path_matches_prefix("team-other/foo", "team"));
     }
 
     #[test]
+    fn bash_blocked_suffix_pattern_uses_quoted_literal() {
+        assert_eq!(bash_blocked_pattern_case_arm("*[0].txt"), "*'[0].txt'");
+    }
+
+    #[test]
     fn pre_commit_hook_uses_component_aware_allowed_prefix_tests() {
         let script = render_pre_commit_hook_script(&["team".into()], &[]);
-        assert!(script.contains("\"$file\" == \"team/\"*"));
+        assert!(script.contains("$file == 'team'/*"));
         assert!(!script.contains("== \"$prefix\"*"));
+    }
+
+    #[test]
+    fn pre_commit_hook_allowed_prefix_team_rules_in_bash() {
+        let script = render_pre_commit_hook_script(&["team".into()], &[]);
+        assert!(
+            run_hook_on_staged_paths(&script, &[("team", "x\n")]).success(),
+            "exact prefix team must be allowed"
+        );
+        assert!(
+            run_hook_on_staged_paths(&script, &[("team/foo.txt", "x\n")]).success(),
+            "team/foo.txt must be allowed"
+        );
+        assert!(
+            !run_hook_on_staged_paths(&script, &[("team-other/foo.txt", "x\n")]).success(),
+            "team-other/foo must be rejected"
+        );
+    }
+
+    #[test]
+    fn pre_commit_hook_rejects_metacharacter_prefixes_via_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("evil-marker");
+        let prefix = format!("$(touch {})", marker.display());
+        let script = render_pre_commit_hook_script(&[prefix], &[]);
+        let hook = dir.path().join("pre-commit");
+        std::fs::write(&hook, script).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("safe.txt"), "ok\n").unwrap();
+        init_git_repo(&repo);
+        std::process::Command::new("git")
+            .args(["add", "safe.txt"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let evil = std::process::Command::new("bash")
+            .arg(&hook)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(!evil.success(), "out-of-prefix file must be rejected");
+        assert!(
+            !marker.exists(),
+            "metacharacters in prefix must not execute"
+        );
+        let backtick_marker = dir.path().join("backtick-marker");
+        let backtick_prefix = format!("`touch {}`", backtick_marker.display());
+        let backtick_script = render_pre_commit_hook_script(&[backtick_prefix], &[]);
+        assert!(!run_hook_on_staged_paths(&backtick_script, &[("safe.txt", "ok\n")]).success());
+        assert!(!backtick_marker.exists());
+        let newline_prefix = "team\n$(touch newline-evil)".to_string();
+        let newline_script = render_pre_commit_hook_script(&[newline_prefix], &[]);
+        let newline_marker = dir.path().join("newline-evil");
+        assert!(!run_hook_on_staged_paths(&newline_script, &[("safe.txt", "ok\n")]).success());
+        assert!(!newline_marker.exists());
+        let apostrophe_script = render_pre_commit_hook_script(&["it's".into()], &[]);
+        assert!(
+            run_hook_on_staged_paths(&apostrophe_script, &[("it's", "ok\n")]).success(),
+            "embedded apostrophe in prefix must match literally"
+        );
+        assert!(!run_hook_on_staged_paths(&apostrophe_script, &[("its", "ok\n")]).success());
+    }
+
+    #[test]
+    fn pre_commit_hook_blocked_pattern_matches_descendants_in_bash() {
+        let script = render_pre_commit_hook_script(&[], &["secret".into()]);
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("pre-commit");
+        std::fs::write(&hook, script).unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("secret")).unwrap();
+        std::fs::write(repo.join("secret/leak.txt"), "no\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@example.invalid"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "secret/leak.txt"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let blocked = std::process::Command::new("bash")
+            .arg(&hook)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(!blocked.success());
+    }
+
+    #[test]
+    fn pre_commit_hook_blocked_suffix_pattern_literal_in_bash() {
+        let script = render_pre_commit_hook_script(&[], &["*[0].txt".into()]);
+        assert!(
+            !run_hook_on_staged_paths(&script, &[("a[0].txt", "x\n")]).success(),
+            "suffix glob must match literally"
+        );
+        assert!(
+            run_hook_on_staged_paths(&script, &[("a0.txt", "x\n")]).success(),
+            "non-matching path must be allowed"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("suffix-evil");
+        let pattern = format!("*$(touch {})", marker.display());
+        let evil_script = render_pre_commit_hook_script(&[], &[pattern]);
+        assert!(
+            run_hook_on_staged_paths(&evil_script, &[("safe.txt", "x\n")]).success(),
+            "non-matching staged path must not expand blocked suffix pattern"
+        );
+        assert!(!marker.exists(), "suffix metacharacters must not execute");
     }
 
     #[test]

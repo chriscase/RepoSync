@@ -14,6 +14,7 @@ acceptance.
 | #67 | [67-late-pair-admission.md](67-late-pair-admission.md) | Late-pair admission/preview only; does not close #67 |
 | #69 | [69-pair-refresh.md](69-pair-refresh.md) | Update-pair-from-parent preview only; re-anchor and execution are NOT IMPLEMENTED; does not close #69 |
 | #71 | [71-git-operation-requests.md](71-git-operation-requests.md) | Manual preview/status client and workflow docs; refresh execute is NOT IMPLEMENTED; no live webhooks or branch rules; does not close #71 |
+| #89 | [89-projected-changeset.md](89-projected-changeset.md) | RS-C02 projected Git→SVN changeset, persisted conflict apply gate, hook literals; does not close #89 |
 
 Authoritative sources that these contracts must not silently rewrite:
 
