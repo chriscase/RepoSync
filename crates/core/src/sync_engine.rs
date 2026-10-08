@@ -682,7 +682,14 @@ impl SyncEngine {
                 // ancestors remain in the replay range.
                 let old_import_projection =
                     self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
-                if emitted > 0
+                let column_git_no_target_tip = emitted == 0
+                    && crate::echo_receipt_scope::stored_git_no_target_receipt_exists(
+                        &self.db,
+                        rid,
+                        column.as_deref().unwrap(),
+                    )
+                    .map_err(SyncError::DatabaseError)?;
+                if (emitted > 0 || column_git_no_target_tip)
                     && (applied_outbound > 0
                         || (old_import_projection && svn_origin > 0)
                         || kv_no_target)

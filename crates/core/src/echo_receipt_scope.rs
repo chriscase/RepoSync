@@ -121,6 +121,26 @@ pub fn read_git_no_target_receipt(
     Ok(None)
 }
 
+/// Whether any generation-scoped or legacy Git no-target receipt exists for `git_sha`.
+pub fn stored_git_no_target_receipt_exists(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<bool, DatabaseError> {
+    let legacy = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+    if db.get_state(&legacy)?.is_some() {
+        return Ok(true);
+    }
+    let generation = repo_echo_generation(db, repo_id)?;
+    for gen in 1..=generation {
+        let key = handled_git_no_target_state_key(repo_id, gen, git_sha);
+        if db.get_state(&key)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Resolve a stored SVN no-target receipt for the active generation.
 pub fn read_svn_no_target_receipt(
     db: &Database,
@@ -180,6 +200,40 @@ mod tests {
         )
         .unwrap();
         bump_repo_echo_generation(&db, "pair").unwrap();
+        let ctx = TeamEchoContext {
+            db: &db,
+            repo_id: "pair",
+            no_target_projection: "{}",
+        };
+        assert_eq!(
+            classify_incoming_git_commit(&ctx, &sha, "no marker")
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
+    fn fieldless_legacy_receipt_rejected_at_generation_two() {
+        let db = setup_db();
+        let sha = "c".repeat(40);
+        db.set_state(
+            &format!("handled_git_no_target_pair_{sha}"),
+            &serde_json::json!({
+                "version": 1,
+                "repo_id": "pair",
+                "git_sha": sha,
+                "outcome": "filtered",
+                "projection": "{}",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        bump_repo_echo_generation(&db, "pair").unwrap();
+        assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 2);
+        assert!(read_git_no_target_receipt(&db, "pair", &sha)
+            .unwrap()
+            .is_none());
         let ctx = TeamEchoContext {
             db: &db,
             repo_id: "pair",
