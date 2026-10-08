@@ -214,18 +214,20 @@
         "R06_SNAPSHOT_BASELINE",
         "R06_SKIP_IMPORT_BLOCKED",
         "R06_EXISTING_TARGET_NOT_EQUIVALENT",
-        "R06_NO_ACTIVE_ON_PARTIAL"
+        "R06_NO_ACTIVE_ON_PARTIAL",
+        "R06_LATE_PAIR_PUBLISH_REPLAY",
+        "R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE"
       ],
       "supporting_case_ids": [
         "R06_CHECKPOINT"
       ],
       "open": [
-        "Replay of pending Git commits into SVN is not implemented",
-        "Conflict resolution for overlapping SVN/Git edits is not implemented",
-        "Default publish of a fully reconciled scheduler-active pair is not implemented",
+        "Existing SVN target dual-side reconcile and conflict resolution are not implemented",
+        "Cancel/restart after partial replay with full engine recovery is not fully proven",
+        "Parent SVN-ahead retention into Git is not implemented",
         "Issue #67 remains open"
       ],
-      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Candidate admission/preview proves an SVN-derived tip is planned with pinned Git tip and baseline SVN revision, snapshot-bounded ancestry is enough, unsafe skip_import is refused without watermark writes, an existing SVN target is not treated as equivalent, and dry_run=false does not insert a scheduler-active child. Replay and publish stay later.",
+      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Admission/preview pins tips and baseline. Publish journals svn_copy_pending before svn copy, copies at the verified baseline revision, sets baseline watermarks, replays pending Git through SyncEngine, and enables the child when the pinned tip is handled (R06_LATE_PAIR_PUBLISH_REPLAY). Replay errors remain on replay_in_progress (not terminal failed) with outcome_detail for resume. HTTPS preflight refuses empty/revoked tokens before SVN mutation (R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE). Existing foreign SVN targets block publish without activating a child (R06_NO_ACTIVE_ON_PARTIAL).",
       "diagnostic_expected_baseline_failure": true
     },
     {

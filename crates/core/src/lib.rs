@@ -21,6 +21,7 @@ pub mod history_inspect;
 pub mod identity;
 pub mod import;
 pub mod late_pair;
+pub mod late_pair_publish;
 pub mod ldap_auth;
 pub mod lfs;
 pub mod managed_remove;
