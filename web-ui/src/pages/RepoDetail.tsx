@@ -432,6 +432,8 @@ export default function RepoDetail() {
       !!id
       && isAdmin
       && detailLive
+      && !repo?.parent_id
+      && !branchPairDeleteTarget
       && (showRemoveConfirm
         || removeMutation.isPending
         || removeMutation.isSuccess
@@ -650,7 +652,7 @@ export default function RepoDetail() {
           {branchPairDeleteError}
         </div>
       )}
-      {isAdmin && removalPanelStatus && (
+      {isAdmin && !repo.parent_id && removalPanelStatus && (
         <ManagedRemovalPanel
           status={removalPanelStatus}
           onRetry={

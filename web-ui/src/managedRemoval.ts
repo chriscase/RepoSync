@@ -53,8 +53,8 @@ export function managedRemovalNeedsPoll(state: string | undefined): boolean {
   return !!state && !managedRemovalIsTerminal(state);
 }
 
-export function managedRemovalStateLabel(state: string): string {
-  switch (state.toLowerCase()) {
+export function managedRemovalStateLabel(state: string | undefined): string {
+  switch (`${state ?? ''}`.toLowerCase()) {
     case 'cancelling':
       return 'Cancelling in-flight work';
     case 'queued':
