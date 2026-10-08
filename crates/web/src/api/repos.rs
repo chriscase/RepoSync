@@ -17,6 +17,7 @@ use reposync_core::db::import_operations::{
     import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
     RepoImportBaseline, SnapshotPin,
 };
+use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
@@ -28,7 +29,9 @@ use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress, Imp
 use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, probe_svn_target, LatePairRequest,
 };
-use reposync_core::late_pair_publish::{publish_admitted_late_pair, PublishCredentials};
+use reposync_core::late_pair_publish::{
+    publish_admitted_late_pair, publish_resuming, resolve_publish_child_id, PublishCredentials,
+};
 use reposync_core::pair_refresh::{
     analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
     format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
@@ -2955,10 +2958,10 @@ struct CreateBranchPairRequest {
     #[serde(default)]
     skip_import: bool,
     /// Explicit compatibility flag for the historical skip_import / start-from-now
-    /// request. Even when set, this slice never applies watermarks or publishes.
+    /// request. Even when set, publish never applies skip_import watermarks.
     #[serde(default)]
     compatibility_skip_import: bool,
-    /// Preview/plan only. Defaults to true so this slice cannot publish.
+    /// Preview/plan only. Defaults to true; set false to publish/replay.
     #[serde(default = "default_true")]
     dry_run: bool,
     /// Alias for dry_run. When true, forces preview mode.
@@ -3096,16 +3099,9 @@ async fn create_branch_pair(
         ));
     }
 
-    // Duplicate check: ensure no existing child has the same git_branch
     let existing_children = db
         .list_child_repositories(&parent.id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    if existing_children.iter().any(|c| c.git_branch == git_branch) {
-        return Err(AppError::BadRequest(format!(
-            "a branch pair with git_branch '{}' already exists",
-            git_branch
-        )));
-    }
 
     // #67 admission/preview: prove SVN-origin lineage before any copy,
     // checkpoint, remote mutation, or scheduler-active child row.
@@ -3176,6 +3172,15 @@ async fn create_branch_pair(
     attach_svn_probe(&parent, db, &mut plan).await;
 
     if dry_run {
+        if existing_children
+            .iter()
+            .any(|c| c.git_branch == git_branch && c.enabled)
+        {
+            return Err(AppError::BadRequest(format!(
+                "a branch pair with git_branch '{}' already exists",
+                git_branch
+            )));
+        }
         if body.auto_create_svn_branch.unwrap_or(true)
             || body.auto_create_git_branch.unwrap_or(true)
         {
@@ -3196,32 +3201,57 @@ async fn create_branch_pair(
         })?));
     }
 
-    if plan.existing_svn_target.exists {
-        return Err(AppError::BadRequest(
-            "existing_svn_target_blocks_publish: SVN target already exists and is not equivalent; reconcile is not implemented in this slice"
-                .into(),
-        ));
-    }
-
     let svn_password = db
         .resolve_credential_chain(&parent.id, "secret_svn_password")
-        .unwrap_or_default();
-    let git_token = db
-        .resolve_credential_chain(&parent.id, "secret_git_token")
         .unwrap_or_default();
     let identity_config = reposync_core::config::IdentityConfig::default();
     let identity_mapper = IdentityMapper::new(&identity_config)
         .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {e}")))?;
-    let child_id = Uuid::new_v4().to_string();
+    let baseline = plan.verified_baseline.as_ref().ok_or_else(|| {
+        AppError::BadRequest("missing_baseline: admitted plan has no verified baseline".into())
+    })?;
+    let git_tip = plan
+        .git_tip
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("missing_git_tip".into()))?;
+    let fingerprint = late_pair_publish_fingerprint(
+        &parent.id,
+        &git_branch,
+        &svn_branch,
+        git_tip,
+        &baseline.git_sha,
+        baseline.svn_revision,
+    );
+    let fallback_child = Uuid::new_v4().to_string();
+    let child_id = resolve_publish_child_id(db, &parent.id, &fingerprint, &fallback_child)
+        .map_err(|e| AppError::Internal(format!("database error: {e}")))?;
+    if existing_children
+        .iter()
+        .any(|c| c.git_branch == git_branch && c.id != child_id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "a branch pair with git_branch '{}' already exists",
+            git_branch
+        )));
+    }
+    let resuming_publish = db
+        .latest_late_pair_publish_operation(&parent.id)
+        .ok()
+        .flatten()
+        .filter(|op| !op.state.is_terminal() && op.target_fingerprint == fingerprint)
+        .is_some_and(|op| publish_resuming(&op));
+    if plan.existing_svn_target.exists && !resuming_publish {
+        return Err(AppError::BadRequest(
+            "existing_svn_target_blocks_publish: existing SVN target requires lineage verification before publish"
+                .into(),
+        ));
+    }
     let request_id = Uuid::new_v4().to_string();
     let probe = plan.existing_svn_target.clone();
     let published = publish_admitted_late_pair(
         db,
         &state.config,
-        &PublishCredentials {
-            svn_password,
-            git_token: Some(git_token),
-        },
+        &PublishCredentials { svn_password },
         &parent,
         &request,
         &plan,

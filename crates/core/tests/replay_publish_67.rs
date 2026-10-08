@@ -244,7 +244,6 @@ async fn candidate_r06_late_pair_publish_replays_pending_git() {
         &config,
         &PublishCredentials {
             svn_password: String::new(),
-            git_token: None,
         },
         &parent,
         &request,
