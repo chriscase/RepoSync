@@ -104,6 +104,7 @@ export default function RepoDetail() {
   const [showBranchModal, setShowBranchModal] = useState(false);
   const [removalTarget, setRemovalTarget] = useState<Repository | null>(null);
   const [branchPairDeleteTarget, setBranchPairDeleteTarget] = useState<Repository | null>(null);
+  const [branchPairDeleteError, setBranchPairDeleteError] = useState<string | null>(null);
   const [removeConfirmText, setRemoveConfirmText] = useState('');
   const [removeBranchOpts, setRemoveBranchOpts] = useState({ delete_git: false, delete_svn: false });
   const [branchForm, setBranchForm] = useState({
@@ -297,6 +298,7 @@ export default function RepoDetail() {
 
   const removeMutation = useMutation({
     mutationFn: async () => {
+      setBranchPairDeleteError(null);
       const target = branchPairDeleteTarget ?? removalTarget ?? repo;
       if (!target?.id || !id) {
         throw new Error('No repository selected for removal');
@@ -333,10 +335,16 @@ export default function RepoDetail() {
       const result = await api.removeManagedRepo(target.id);
       return { kind: 'managed' as const, result, target };
     },
+    onError: (error) => {
+      if (branchPairDeleteTarget) {
+        setBranchPairDeleteError(error instanceof Error ? error.message : String(error));
+      }
+    },
     onSuccess: async (payload) => {
       setShowRemoveConfirm(false);
       setRemovalTarget(null);
       setBranchPairDeleteTarget(null);
+      setBranchPairDeleteError(null);
       setRemoveConfirmText('');
       queryClient.invalidateQueries({ queryKey: ['repos'] });
 
@@ -637,9 +645,9 @@ export default function RepoDetail() {
   return (
     <div className="space-y-6" data-testid="repo-detail" data-repo-id={id}>
       {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
-      {removeMutation.isError && branchPairDeleteSubject && (
+      {branchPairDeleteError && (
         <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
-          {removeMutation.error?.message}
+          {branchPairDeleteError}
         </div>
       )}
       {isAdmin && removalPanelStatus && (
@@ -1450,6 +1458,7 @@ export default function RepoDetail() {
                             onClick={(e) => {
                               e.stopPropagation();
                               setBranchPairDeleteTarget(bp);
+                              setBranchPairDeleteError(null);
                               setRemoveConfirmText('');
                               setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                               removeMutation.reset();
@@ -1689,6 +1698,7 @@ export default function RepoDetail() {
                   onClick={() => {
                     if (!repo) return;
                     setBranchPairDeleteTarget(repo);
+                    setBranchPairDeleteError(null);
                     setRemoveConfirmText('');
                     setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                     removeMutation.reset();
@@ -1804,6 +1814,7 @@ export default function RepoDetail() {
                 data-testid="cancel-delete-branch-pair"
                 onClick={() => {
                   setBranchPairDeleteTarget(null);
+                  setBranchPairDeleteError(null);
                   setRemoveConfirmText('');
                   removeMutation.reset();
                 }}
