@@ -169,6 +169,57 @@ fn authed_client() -> reqwest::Client {
         .unwrap()
 }
 
+/// Axum server on its own OS thread/runtime so in-process HTTP clients do not deadlock the test runtime.
+struct TestServerGuard {
+    shutdown: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl TestServerGuard {
+    fn abort(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.thread.join();
+    }
+}
+
+fn spawn_isolated_test_server(app: Router) -> (SocketAddr, TestServerGuard) {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = std_listener.local_addr().expect("local_addr");
+    std_listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("server runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std");
+            ready_tx.send(()).ok();
+            let shutdown = async move {
+                while shutdown_rx.try_recv().is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .expect("serve");
+        });
+    });
+    ready_rx.recv().expect("server ready");
+    (
+        addr,
+        TestServerGuard {
+            shutdown: shutdown_tx,
+            thread,
+        },
+    )
+}
+
 /// Like `build_test_server` but merges more route modules (repos, audit)
 /// so we can exercise a wider surface area under load.
 async fn build_test_server_full() -> (
@@ -1553,7 +1604,7 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
 async fn import_fixture() -> (
     SocketAddr,
     Arc<AppState>,
-    tokio::task::JoinHandle<()>,
+    TestServerGuard,
     tempfile::TempDir,
     String,
     std::path::PathBuf,
@@ -1654,11 +1705,7 @@ async fn import_fixture() -> (
     let app = Router::new()
         .merge(api::repos::routes())
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (addr, server) = spawn_isolated_test_server(app);
     let client = authed_client();
     let response = client
         .post(format!("http://{addr}/api/repos"))
@@ -1671,12 +1718,10 @@ async fn import_fixture() -> (
         .send()
         .await
         .unwrap();
-    assert!(
-        response.status().is_success(),
-        "{}",
-        response.text().await.unwrap()
-    );
-    let created: serde_json::Value = response.json().await.unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "{}", body);
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     (
         addr,
         state,
@@ -6322,7 +6367,7 @@ fn svn_youngest(svn_repo: &std::path::Path) -> i64 {
 async fn snapshot_imported_parent() -> (
     std::net::SocketAddr,
     std::sync::Arc<AppState>,
-    tokio::task::JoinHandle<()>,
+    TestServerGuard,
     tempfile::TempDir,
     String,
     std::path::PathBuf,
@@ -6710,7 +6755,7 @@ async fn candidate_r06_no_active_on_partial() {
     assert!(Command::new("svn")
         .args([
             "copy",
-            &format!("{svn_url}/trunk"),
+            &format!("{svn_url}/trunk@1"),
             &format!("{svn_url}/branches/feature"),
             "-m",
             "existing target",
@@ -6751,6 +6796,50 @@ async fn candidate_r06_no_active_on_partial() {
             "publish_refused":true
         })
     );
+    server.abort();
+}
+
+fn late_pair_publish_body() -> serde_json::Value {
+    serde_json::json!({
+        "svn_branch": "branches/feature",
+        "git_branch": "feature",
+        "skip_import": false,
+        "dry_run": false,
+        "preview": false
+    })
+}
+
+/// R06: HTTPS publish refuses empty/revoked credentials before SVN mutation (HTTP path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_https_refuse_before_svn() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = svn_youngest(&svn_repo);
+    let mut parent = state.db.get_repository(&id).unwrap().unwrap();
+    parent.git_api_url = "https://api.github.com".into();
+    parent.git_repo = "acme/widget".into();
+    state.db.update_repository(&parent).unwrap();
+
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&late_pair_publish_body())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("git_credentials_missing"),
+        "{body}"
+    );
+    assert_eq!(svn_youngest(&svn_repo), before);
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
     server.abort();
 }
 
@@ -6922,7 +7011,7 @@ fn svn_commit_on(
 async fn refresh_pair_fixture() -> (
     std::net::SocketAddr,
     std::sync::Arc<AppState>,
-    tokio::task::JoinHandle<()>,
+    TestServerGuard,
     tempfile::TempDir,
     String,
     String,

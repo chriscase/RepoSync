@@ -30,7 +30,8 @@ use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, probe_svn_target, LatePairRequest,
 };
 use reposync_core::late_pair_publish::{
-    publish_admitted_late_pair, publish_resuming, resolve_publish_child_id, PublishCredentials,
+    publish_admitted_late_pair, resolve_publish_child_id, take_pending_publish_refusal,
+    PublishCredentials,
 };
 use reposync_core::pair_refresh::{
     analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
@@ -3234,18 +3235,6 @@ async fn create_branch_pair(
             git_branch
         )));
     }
-    let resuming_publish = db
-        .latest_late_pair_publish_operation(&parent.id)
-        .ok()
-        .flatten()
-        .filter(|op| !op.state.is_terminal() && op.target_fingerprint == fingerprint)
-        .is_some_and(|op| publish_resuming(&op));
-    if plan.existing_svn_target.exists && !resuming_publish {
-        return Err(AppError::BadRequest(
-            "existing_svn_target_blocks_publish: existing SVN target requires lineage verification before publish"
-                .into(),
-        ));
-    }
     let request_id = Uuid::new_v4().to_string();
     let probe = plan.existing_svn_target.clone();
     let published = publish_admitted_late_pair(
@@ -3263,6 +3252,9 @@ async fn create_branch_pair(
     )
     .await
     .map_err(|refuse| AppError::BadRequest(refuse.error_message()))?;
+    if let Some(pending) = take_pending_publish_refusal(&parent.id) {
+        return Err(AppError::BadRequest(pending.error_message()));
+    }
 
     info!(
         parent_id = %parent.id,

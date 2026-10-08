@@ -7,6 +7,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
+#[cfg(debug_assertions)]
+use std::sync::{LazyLock, Mutex};
+
 use tracing::info;
 
 use crate::config::AppConfig;
@@ -22,12 +27,153 @@ use crate::git::client::GitClient;
 use crate::git::remote_url::derive_git_remote_url;
 use crate::identity::IdentityMapper;
 use crate::late_pair::{LatePairPlan, LatePairRequest, SvnTargetProbe};
-use crate::models::Repository;
+use crate::models::{Repository, SyncDirection, SyncRecord, SyncRecordStatus};
 use crate::svn::SvnClient;
 use crate::sync_engine::SyncEngine;
 use std::sync::Arc;
 
 pub const PUBLISH_POLICY_VERSION: &str = "late_pair_publish_v1";
+
+/// Debug-only hooks for integration tests (keyed by parent repository id).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default)]
+pub struct LatePairPublishTestHook {
+    pub fail_replay_once: bool,
+    pub abort_after_svn_copy_before_journal: bool,
+}
+
+#[cfg(debug_assertions)]
+static PUBLISH_TEST_HOOKS: LazyLock<Mutex<HashMap<String, LatePairPublishTestHook>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(debug_assertions)]
+static PENDING_PUBLISH_REFUSALS: LazyLock<Mutex<HashMap<String, LatePairPublishRefusal>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(debug_assertions)]
+pub fn set_late_pair_publish_test_hook(parent_repo_id: &str, hook: LatePairPublishTestHook) {
+    PUBLISH_TEST_HOOKS
+        .lock()
+        .unwrap()
+        .insert(parent_repo_id.to_string(), hook);
+}
+
+#[cfg(debug_assertions)]
+pub fn clear_late_pair_publish_test_hook(parent_repo_id: &str) {
+    PUBLISH_TEST_HOOKS.lock().unwrap().remove(parent_repo_id);
+}
+
+#[cfg(not(debug_assertions))]
+#[derive(Debug, Clone, Default)]
+pub struct LatePairPublishTestHook {
+    pub fail_replay_once: bool,
+    pub abort_after_svn_copy_before_journal: bool,
+}
+
+#[cfg(not(debug_assertions))]
+pub fn set_late_pair_publish_test_hook(_parent_repo_id: &str, _hook: LatePairPublishTestHook) {}
+
+#[cfg(not(debug_assertions))]
+pub fn clear_late_pair_publish_test_hook(_parent_repo_id: &str) {}
+
+/// Debug-only: refusal stashed by a test hook when returning `Ok` avoids async-drop hangs.
+pub fn take_pending_publish_refusal(parent_repo_id: &str) -> Option<LatePairPublishRefusal> {
+    #[cfg(debug_assertions)]
+    {
+        return PENDING_PUBLISH_REFUSALS
+            .lock()
+            .unwrap()
+            .remove(parent_repo_id);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+#[cfg(debug_assertions)]
+fn stash_pending_publish_refusal(parent_repo_id: &str, refusal: LatePairPublishRefusal) {
+    PENDING_PUBLISH_REFUSALS
+        .lock()
+        .unwrap()
+        .insert(parent_repo_id.to_string(), refusal);
+}
+
+fn refused_publish_plan_stub(
+    plan: &LatePairPlan,
+    parent: &Repository,
+    request: &LatePairRequest,
+    probe: &SvnTargetProbe,
+    baseline: &crate::late_pair::VerifiedMapping,
+    git_tip: &str,
+) -> LatePairPlan {
+    LatePairPlan {
+        mode: "publish_refused".into(),
+        published: false,
+        admitted: plan.admitted,
+        pair_state: plan.pair_state.clone(),
+        scheduler_active: false,
+        policy_version: PUBLISH_POLICY_VERSION.into(),
+        parent_id: parent.id.clone(),
+        git_branch: request.git_branch.clone(),
+        svn_branch: request.svn_branch.clone(),
+        git_tip: Some(git_tip.to_string()),
+        svn_source_revision: plan.svn_source_revision,
+        svn_target_revision: plan.svn_target_revision,
+        verified_baseline: Some(baseline.clone()),
+        baseline_missing_reason: plan.baseline_missing_reason.clone(),
+        inherited_work: plan.inherited_work.clone(),
+        pending_git: plan.pending_git.clone(),
+        pending_svn: plan.pending_svn.clone(),
+        conflicts: plan.conflicts.clone(),
+        unknowns: plan.unknowns.clone(),
+        proposed_svn_copy_source_revision: plan.proposed_svn_copy_source_revision,
+        existing_svn_target: probe.clone(),
+        skip_import_requested: request.skip_import,
+        skip_import_applied: false,
+        skip_import_note: plan.skip_import_note.clone(),
+    }
+}
+
+fn take_fail_replay_once(parent_repo_id: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        let mut hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
+        if let Some(hook) = hooks.get_mut(parent_repo_id) {
+            if hook.fail_replay_once {
+                hook.fail_replay_once = false;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn take_abort_after_svn_copy(parent_repo_id: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        let mut hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
+        if let Some(hook) = hooks.get_mut(parent_repo_id) {
+            if hook.abort_after_svn_copy_before_journal {
+                hook.abort_after_svn_copy_before_journal = false;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn resolve_svn_copy_source_revision(
+    in_flight: Option<&LatePairPublishOperation>,
+    plan: &LatePairPlan,
+    baseline_svn_rev: i64,
+) -> i64 {
+    if let Some(op) = in_flight {
+        return op.svn_copy_source_rev;
+    }
+    plan.proposed_svn_copy_source_revision
+        .unwrap_or(baseline_svn_rev)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatePairPublishRefusal {
@@ -211,7 +357,17 @@ async fn verify_existing_svn_target_matches_copy_intent(
     );
     let expected_src = normalize_svn_repo_path(expected_source_path);
     let branch_path = format!("/{}", svn_branch.trim_start_matches('/'));
-    for rev in (branch_tip.saturating_sub(8)..=branch_tip).rev() {
+    if branch_tip < 1 {
+        return Err(LatePairPublishRefusal {
+            reason: "existing_svn_target_blocks_publish".into(),
+            detail:
+                "existing SVN target does not match the journaled copy-from baseline for this publish"
+                    .into(),
+            plan: None,
+        });
+    }
+    let start_rev = branch_tip.saturating_sub(8).max(1);
+    for rev in (start_rev..=branch_tip).rev() {
         let entries = root
             .log(rev, rev)
             .await
@@ -363,6 +519,24 @@ fn apply_baseline_watermarks(
                 plan: None,
             })?;
     }
+    let baseline_record = SyncRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        repo_id: Some(child_id.to_string()),
+        svn_revision: Some(svn_rev),
+        git_hash: Some(baseline_git_sha.to_string()),
+        direction: SyncDirection::SvnToGit,
+        author: "late_pair_publish".into(),
+        message: "verified import baseline for late-pair publish".into(),
+        timestamp: chrono::Utc::now(),
+        synced_at: chrono::Utc::now(),
+        status: SyncRecordStatus::Applied,
+    };
+    db.insert_sync_record(&baseline_record)
+        .map_err(|e| LatePairPublishRefusal {
+            reason: "watermark_failed".into(),
+            detail: format!("failed to record baseline provenance: {e}"),
+            plan: None,
+        })?;
     Ok(())
 }
 
@@ -595,14 +769,6 @@ pub async fn publish_admitted_late_pair(
             detail: "admitted plan is missing verified baseline".into(),
             plan: Some(Box::new(plan.clone())),
         })?;
-    let copy_rev =
-        plan.proposed_svn_copy_source_revision
-            .ok_or_else(|| LatePairPublishRefusal {
-                reason: "missing_copy_source".into(),
-                detail: "admitted plan is missing proposed_svn_copy_source_revision".into(),
-                plan: Some(Box::new(plan.clone())),
-            })?;
-
     let fingerprint = late_pair_publish_fingerprint(
         &parent.id,
         &request.git_branch,
@@ -612,30 +778,65 @@ pub async fn publish_admitted_late_pair(
         baseline.svn_revision,
     );
 
-    let mut op = match db
+    let mut test_hook_short_circuit: Option<LatePairPlan> = None;
+
+    let latest = db
         .latest_late_pair_publish_operation(&parent.id)
-        .map_err(db_err)?
-    {
-        Some(existing) if !existing.state.is_terminal() => {
-            if existing.target_fingerprint != fingerprint {
-                return Err(LatePairPublishRefusal {
-                    reason: "publish_fingerprint_mismatch".into(),
-                    detail: "an in-flight late-pair publish targets a different plan".into(),
-                    plan: Some(Box::new(plan.clone())),
-                });
-            }
-            if existing.git_branch != request.git_branch
-                || existing.svn_branch != request.svn_branch
-            {
-                return Err(LatePairPublishRefusal {
-                    reason: "publish_branch_mismatch".into(),
-                    detail: "an in-flight late-pair publish targets different branch names".into(),
-                    plan: Some(Box::new(plan.clone())),
-                });
-            }
-            existing
+        .map_err(db_err)?;
+
+    if let Some(existing) = latest.as_ref().filter(|op| !op.state.is_terminal()) {
+        if existing.target_fingerprint != fingerprint {
+            return Err(LatePairPublishRefusal {
+                reason: "publish_fingerprint_mismatch".into(),
+                detail: "an in-flight late-pair publish targets a different plan".into(),
+                plan: Some(Box::new(plan.clone())),
+            });
         }
-        _ => db
+        if existing.git_branch != request.git_branch || existing.svn_branch != request.svn_branch {
+            return Err(LatePairPublishRefusal {
+                reason: "publish_branch_mismatch".into(),
+                detail: "an in-flight late-pair publish targets different branch names".into(),
+                plan: Some(Box::new(plan.clone())),
+            });
+        }
+    }
+
+    let in_flight = latest
+        .filter(|existing| !existing.state.is_terminal())
+        .filter(|existing| existing.target_fingerprint == fingerprint)
+        .filter(|existing| {
+            existing.git_branch == request.git_branch && existing.svn_branch == request.svn_branch
+        });
+
+    let copy_rev =
+        resolve_svn_copy_source_revision(in_flight.as_ref(), plan, baseline.svn_revision);
+
+    if in_flight.is_none() && probe.exists {
+        let source_path = parent_svn_branch_path(parent);
+        match verify_existing_svn_target_matches_copy_intent(
+            parent,
+            &creds.svn_password,
+            &request.svn_branch,
+            &source_path,
+            copy_rev,
+        )
+        .await
+        {
+            Ok(_) => {
+                return Err(LatePairPublishRefusal {
+                    reason: "existing_svn_target_blocks_publish".into(),
+                    detail: "existing SVN target without a resumable late-pair publish journal"
+                        .into(),
+                    plan: Some(Box::new(plan.clone())),
+                });
+            }
+            Err(refusal) => return Err(refusal),
+        }
+    }
+
+    let mut op = match in_flight {
+        Some(existing) => existing,
+        None => db
             .create_late_pair_publish_operation(
                 &parent.id,
                 initiator_id,
@@ -651,15 +852,6 @@ pub async fn publish_admitted_late_pair(
             )
             .map_err(db_err)?,
     };
-
-    let resuming = publish_resuming(&op);
-    if !resuming && probe.exists {
-        return Err(LatePairPublishRefusal {
-            reason: "existing_svn_target_blocks_publish".into(),
-            detail: "existing SVN target requires lineage verification before publish".into(),
-            plan: Some(Box::new(plan.clone())),
-        });
-    }
 
     let effective_child_id = op
         .child_repo_id
@@ -711,9 +903,24 @@ pub async fn publish_admitted_late_pair(
             )
             .await?
         };
-        op.svn_branch_head_rev = Some(svn_head);
-        op.state = LatePairPublishState::SvnCopied;
-        op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
+        if take_abort_after_svn_copy(&parent.id) {
+            stash_pending_publish_refusal(
+                &parent.id,
+                LatePairPublishRefusal {
+                    reason: "publish_test_hook".into(),
+                    detail: "simulated failure after svn copy before journal".into(),
+                    plan: None,
+                },
+            );
+            test_hook_short_circuit = Some(refused_publish_plan_stub(
+                plan, parent, request, probe, &baseline, &git_tip,
+            ));
+        }
+        if test_hook_short_circuit.is_none() {
+            op.svn_branch_head_rev = Some(svn_head);
+            op.state = LatePairPublishState::SvnCopied;
+            op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
+        }
         info!(
             parent_id = %parent.id,
             svn_branch = %request.svn_branch,
@@ -721,6 +928,10 @@ pub async fn publish_admitted_late_pair(
             resumed_existing = probe.exists,
             "late-pair SVN branch at verified baseline revision"
         );
+    }
+
+    if let Some(stub) = test_hook_short_circuit {
+        return Ok(stub);
     }
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -779,8 +990,27 @@ pub async fn publish_admitted_late_pair(
         }
         apply_baseline_watermarks(db, &effective_child_id, &baseline.git_sha, svn_head)?;
         op.child_repo_id = Some(effective_child_id.clone());
-        op.state = LatePairPublishState::ChildRegistered;
-        op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
+        if take_fail_replay_once(&parent.id) {
+            stash_pending_publish_refusal(
+                &parent.id,
+                LatePairPublishRefusal {
+                    reason: "replay_incomplete".into(),
+                    detail: "test hook: simulated replay failure".into(),
+                    plan: None,
+                },
+            );
+            test_hook_short_circuit = Some(refused_publish_plan_stub(
+                plan, parent, request, probe, &baseline, &git_tip,
+            ));
+        }
+        if test_hook_short_circuit.is_none() {
+            op.state = LatePairPublishState::ChildRegistered;
+            op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
+        }
+    }
+
+    if let Some(stub) = test_hook_short_circuit {
+        return Ok(stub);
     }
 
     let child = db
