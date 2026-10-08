@@ -2,6 +2,8 @@
 !Cargo.toml
 !crates/
 !crates/**
+!web-ui/
+!web-ui/**
 !scripts/
 !scripts/reliability-prep.py
 !scripts/reliability-runtime.py

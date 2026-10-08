@@ -4202,7 +4202,8 @@ mod import_reconciliation_tests {
             fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
             0
         );
-        let mappings = fixture.state.db.list_commit_map(100).unwrap().len();
+        let expected_map_rows =
+            fixture.state.db.list_commit_map(100).unwrap().len() + op.pending_commit_maps.len();
         let fixture = fixture.restart().await;
         fixture.trace_remote_inspection();
         let (code, result) = fixture.reconcile().await;
@@ -4216,7 +4217,7 @@ mod import_reconciliation_tests {
         assert_eq!(fixture.svn_head(), svn_before);
         assert_eq!(
             fixture.state.db.list_commit_map(100).unwrap().len(),
-            mappings
+            expected_map_rows
         );
         assert_eq!(
             fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),
@@ -4259,7 +4260,7 @@ mod import_reconciliation_tests {
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64B_LOST_REPLY_COMPLETE",
             "operation_id":fixture.operation_id,"remote_before_after":before,"checkpoint":3,
-            "mappings_before_after":mappings,"confirmed_batches":1,"command_trace":fixture.trace(),
+            "mappings_before_after":expected_map_rows,"confirmed_batches":1,"command_trace":fixture.trace(),
             "restart":true,"idempotent":true})
         );
         HeldFixture::clear_trace();

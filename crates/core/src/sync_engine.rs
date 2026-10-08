@@ -194,6 +194,9 @@ pub struct SyncEngine {
     /// Fixture-only: fail `get_file_content_at_commit` for one projected path.
     #[cfg(debug_assertions)]
     git_content_read_test_fault: std::sync::Mutex<Option<GitContentReadTestFault>>,
+    /// Fixture-only: replace one SVN revision's git-apply stdin on this engine.
+    #[cfg(debug_assertions)]
+    svn_apply_test_fault: std::sync::Mutex<Option<SvnApplyTestFault>>,
     /// Fixture-only: paths whose blobs were read during Git→SVN apply.
     #[cfg(debug_assertions)]
     git_blob_reads_recorded: std::sync::Mutex<Vec<String>>,
@@ -208,6 +211,14 @@ struct GitContentReadTestFault {
     sha: String,
     bridge: String,
     path: String,
+}
+
+/// Per-engine SVN→Git git-apply fault (debug builds only).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone)]
+struct SvnApplyTestFault {
+    revision: i64,
+    bridge: String,
 }
 
 impl SyncEngine {
@@ -238,6 +249,8 @@ impl SyncEngine {
             incomplete_conflict_coverage_test_fault: std::sync::Mutex::new(false),
             #[cfg(debug_assertions)]
             git_content_read_test_fault: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            svn_apply_test_fault: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             git_blob_reads_recorded: std::sync::Mutex::new(Vec::new()),
             #[cfg(debug_assertions)]
@@ -299,6 +312,31 @@ impl SyncEngine {
             .unwrap()
             .as_ref()
             .is_some_and(|fault| fault.sha == sha && fault.bridge == bridge && fault.path == path)
+    }
+
+    /// Replace git-apply stdin for one SVN revision on this engine (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_svn_apply_test_fault(&self, revision: i64, bridge: &std::path::Path) {
+        *self.svn_apply_test_fault.lock().unwrap() = Some(SvnApplyTestFault {
+            revision,
+            bridge: bridge.display().to_string(),
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn clear_svn_apply_test_fault(&self) {
+        *self.svn_apply_test_fault.lock().unwrap() = None;
+    }
+
+    #[cfg(debug_assertions)]
+    fn svn_apply_test_fault_matches(&self, bridge: &std::path::Path, revision: i64) -> bool {
+        self.svn_apply_test_fault
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fault| {
+                fault.revision == revision && fault.bridge == bridge.display().to_string()
+            })
     }
 
     fn replay_batch_cap(&self) -> Option<usize> {
@@ -1890,9 +1928,19 @@ impl SyncEngine {
 
             let mut apply_error = None;
             let diff_applied = if !git_diff.trim().is_empty() {
-                let result =
-                    apply_diff_to_path_revision(&repo_path, &git_diff, Some(change.revision), None)
-                        .await;
+                #[cfg(debug_assertions)]
+                let inject_apply_fault =
+                    self.svn_apply_test_fault_matches(&repo_path, change.revision);
+                #[cfg(not(debug_assertions))]
+                let inject_apply_fault = false;
+                let result = apply_diff_to_path_revision(
+                    &repo_path,
+                    &git_diff,
+                    Some(change.revision),
+                    None,
+                    inject_apply_fault,
+                )
+                .await;
                 if result.is_ok() {
                     // Verify: check that files were created at the correct paths
                     for cf in &change.changed_files {
@@ -4501,7 +4549,7 @@ pub async fn apply_diff_to_path(
     repo_path: &std::path::Path,
     diff_content: &str,
 ) -> Result<(), crate::errors::GitError> {
-    apply_diff_to_path_revision(repo_path, diff_content, None, None).await
+    apply_diff_to_path_revision(repo_path, diff_content, None, None, false).await
 }
 
 /// The existing Git apply path with import-scoped subprocess supervision.
@@ -4510,7 +4558,7 @@ pub async fn apply_diff_to_path_for_import(
     diff_content: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Result<(), crate::errors::GitError> {
-    apply_diff_to_path_revision(repo_path, diff_content, None, Some(cancel)).await
+    apply_diff_to_path_revision(repo_path, diff_content, None, Some(cancel), false).await
 }
 
 async fn apply_diff_to_path_revision(
@@ -4518,6 +4566,7 @@ async fn apply_diff_to_path_revision(
     diff_content: &str,
     revision: Option<i64>,
     cancel: Option<&Arc<AtomicBool>>,
+    inject_from_engine: bool,
 ) -> Result<(), crate::errors::GitError> {
     use std::process::Stdio;
     use tokio::process::Command;
@@ -4533,19 +4582,20 @@ async fn apply_diff_to_path_revision(
     // Only debug fixture runs may replace one exact SVN revision's patch
     // bytes. The production git-apply subprocess and error path still run.
     #[cfg(debug_assertions)]
-    let injected = std::env::var("REPOSYNC_TEST_SVN_APPLY_FAULT")
-        .ok()
-        .and_then(|value| {
-            value
-                .split_once('|')
-                .map(|(rev, path)| (rev.to_string(), path.to_string()))
-        })
-        .is_some_and(|(rev, path)| {
-            revision.is_some_and(|actual| rev == actual.to_string())
-                && std::path::Path::new(&path) == repo_path
-        });
+    let injected = inject_from_engine
+        || std::env::var("REPOSYNC_TEST_SVN_APPLY_FAULT")
+            .ok()
+            .and_then(|value| {
+                value
+                    .split_once('|')
+                    .map(|(rev, path)| (rev.to_string(), path.to_string()))
+            })
+            .is_some_and(|(rev, path)| {
+                revision.is_some_and(|actual| rev == actual.to_string())
+                    && std::path::Path::new(&path) == repo_path
+            });
     #[cfg(not(debug_assertions))]
-    let _ = revision;
+    let _ = (revision, inject_from_engine);
     #[cfg(not(debug_assertions))]
     let injected = false;
     let input = if injected {
