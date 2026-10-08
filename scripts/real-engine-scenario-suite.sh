@@ -46,6 +46,9 @@ SCENARIOS=(
   "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN:scenario_r01_svnserve_multi_commit_git_to_svn"
   "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE:scenario_r16_svnserve_git_remote_unreachable"
   "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE:scenario_r16_svnserve_svn_remote_unreachable"
+  "R16_SVNSERVE_SVN_AUTH_DENIED:scenario_r16_svnserve_svn_auth_denied"
+  "R16_SVNSERVE_MISSING_GIT_BRANCH:scenario_r16_svnserve_missing_git_branch"
+  "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP:scenario_r01_svnserve_bidirectional_roundtrip"
 )
 
 mkdir -p "$ARTIFACT_DIR"
@@ -90,7 +93,9 @@ fi
 
 "${CARGO[@]}" build --tests -p reposync-core --test real_engine_scenarios --locked >/dev/null
 
-suite_exit=0
+suite_fail=0
+suite_partial=0
+suite_not_run=0
 for entry in "${SCENARIOS[@]}"; do
   id="${entry%%:*}"
   test_name="${entry##*:}"
@@ -102,14 +107,27 @@ for entry in "${SCENARIOS[@]}"; do
 
   append_exit=0
   python3 scripts/real-engine-scenario-report.py append "$RESULTS_FILE" "$id" "$test_name" "$test_exit" "$log_file" || append_exit=$?
-  if [[ "$append_exit" -gt "$suite_exit" ]]; then
-    suite_exit="$append_exit"
-  fi
+  case "$append_exit" in
+    1) suite_fail=1 ;;
+    3) suite_partial=1 ;;
+    2) suite_not_run=1 ;;
+  esac
 done
 
 summary_exit=0
 python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" PASS || summary_exit=$?
-if [[ "$summary_exit" -gt "$suite_exit" ]]; then
-  suite_exit="$summary_exit"
+case "$summary_exit" in
+  1) suite_fail=1 ;;
+  3) suite_partial=1 ;;
+  2) suite_not_run=1 ;;
+esac
+if [[ "$suite_fail" -eq 1 ]]; then
+  exit 1
 fi
-exit "$suite_exit"
+if [[ "$suite_partial" -eq 1 ]]; then
+  exit 3
+fi
+if [[ "$suite_not_run" -eq 1 ]]; then
+  exit 2
+fi
+exit 0
