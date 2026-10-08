@@ -50,6 +50,15 @@ pub fn operation_commit_message(original: &str, git_sha: &str, operation_id: &st
     )
 }
 
+/// Append durable operation identity trailers to a formatted personal Git→SVN message.
+pub fn append_durable_git_to_svn_identity(
+    message: &str,
+    git_sha: &str,
+    operation_id: &str,
+) -> String {
+    format!("{message}\n{OPERATION_TRAILER} {operation_id}\n{GIT_SHA_TRAILER} {git_sha}")
+}
+
 pub fn hash_regular_file_tree(root: &Path) -> Result<String, std::io::Error> {
     let mut files = BTreeMap::new();
     collect_regular_files(root, root, &mut files)?;
@@ -176,17 +185,27 @@ fn paths_match(
 
 fn message_carries_identity(message: &str, op: &SvnCommitOperation) -> bool {
     let mut saw_operation = false;
-    let mut saw_sha = false;
+    let mut saw_repo_sync_sha = false;
+    let mut saw_personal_git_sha = false;
     for line in message.lines() {
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix(OPERATION_TRAILER) {
             saw_operation |= value.trim() == op.id;
         }
         if let Some(value) = trimmed.strip_prefix(GIT_SHA_TRAILER) {
-            saw_sha |= value.trim() == op.source_git_sha;
+            saw_repo_sync_sha |= value.trim() == op.source_git_sha;
+        }
+        if let Some(value) = trimmed.strip_prefix("Git-SHA:") {
+            saw_personal_git_sha |= value.trim() == op.source_git_sha;
         }
     }
-    saw_operation && saw_sha
+    let sha_ok = saw_repo_sync_sha || saw_personal_git_sha;
+    if saw_operation {
+        return sha_ok;
+    }
+    // Personal-format commits may omit RepoSync-Operation; the Git-SHA trailer
+    // still binds the durable intent when tree/path proof succeeds below.
+    sha_ok
 }
 
 pub async fn inspect_git_to_svn_commit(

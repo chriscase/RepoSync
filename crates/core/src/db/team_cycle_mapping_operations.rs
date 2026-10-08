@@ -183,7 +183,11 @@ fn advance_svn_with_receipt_tx(
         ));
     }
     advance_svn_only_tx(tx, repo_id, svn_rev)?;
-    let receipt_key = format!("handled_svn_no_target_{}_{}", repo_id, svn_rev);
+    let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
+    let mut receipt = receipt;
+    crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+    let receipt_key =
+        crate::echo_receipt_scope::handled_svn_no_target_state_key(repo_id, generation, svn_rev);
     write_value(tx, &receipt_key, &receipt.to_string())?;
     Ok(())
 }
@@ -209,7 +213,11 @@ fn advance_git_with_receipt_tx(
         ));
     }
     write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
-    let receipt_key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+    let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
+    let mut receipt = receipt;
+    crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+    let receipt_key =
+        crate::echo_receipt_scope::handled_git_no_target_state_key(repo_id, generation, git_sha);
     write_value(tx, &receipt_key, &receipt.to_string())?;
     Ok(())
 }

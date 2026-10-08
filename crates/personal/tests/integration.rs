@@ -2989,22 +2989,40 @@ async fn test_replay_commit_confirm_fail_preserves_committed_tree() {
         tmp.path().join("git_work"),
         tmp.path(),
     );
-    let again = syncer2
+    drop(_fault);
+    let svn_after_hold = svn_youngest(&svn_url);
+    let recovered = syncer2
         .replay_commit(
             &github_commit(git_sha_commit.clone(), "Add src/newdir/file.txt"),
             9,
             "feature/confirm-fail",
         )
         .await
-        .expect_err("held commit must block replay");
-    assert!(
-        format!("{again:#}").contains("reconciliation_required")
-            || format!("{again:#}").contains("held"),
-        "{again:#}"
+        .expect("held confirm-fail checkpoint must finalize on replay");
+    assert_eq!(
+        recovered, svn_after_hold,
+        "finalize must not create a second SVN revision"
     );
     assert!(
-        svn_wc.join("src/newdir/file.txt").is_file(),
-        "working copy must stay intact across blocked replay"
+        !db_arc
+            .active_personal_svn_commit_operation()
+            .unwrap()
+            .is_some(),
+        "journal must clear after finalize"
+    );
+    let mapped = db_arc
+        .list_commit_map(10)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.direction == "git_to_svn" && entry.git_sha == git_sha_commit);
+    assert!(
+        mapped.is_some(),
+        "scoped commit_map must record the held git-to-svn mapping"
+    );
+    assert_eq!(
+        svn_youngest(&svn_url),
+        svn_after_hold,
+        "SVN youngest must remain unchanged after finalize"
     );
 }
 
@@ -5164,19 +5182,33 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         format!("{again:#}").contains("reconciliation_required"),
         "{again:#}"
     );
-    let replay_again = syncer2
-        .replay_commit(&github_commit(git_sha, "Add feature.txt"), 8, "feature/x")
+    let recovered = syncer2
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            8,
+            "feature/x",
+        )
         .await
-        .expect_err("held commit must block another write");
-    assert!(
-        format!("{replay_again:#}").contains("reconciliation_required"),
-        "{replay_again:#}"
-    );
+        .expect("lost-reply hold must finalize on replay without a second SVN write");
+    assert_eq!(recovered, svn_after);
     assert_eq!(
         svn_youngest(&svn_url),
         svn_after,
         "held retry must not write SVN again"
     );
+    assert!(!db_arc
+        .active_personal_svn_commit_operation()
+        .unwrap()
+        .is_some());
+    assert!(
+        db_arc
+            .list_commit_map(10)
+            .unwrap()
+            .into_iter()
+            .any(|entry| entry.direction == "git_to_svn" && entry.svn_rev == svn_after),
+        "commit_map must record the held git-to-svn mapping"
+    );
+
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
