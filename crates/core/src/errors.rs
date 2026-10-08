@@ -165,7 +165,7 @@ impl GitError {
 }
 
 /// Sanitize sensitive tokens from error messages before displaying to users.
-/// Removes GitHub tokens and x-access-token URLs.
+/// Removes embedded credentials in Git/SVN remote URLs and known token patterns.
 pub fn sanitize_error_message(msg: &str) -> String {
     let mut result = msg.to_string();
 
@@ -198,7 +198,41 @@ pub fn sanitize_error_message(msg: &str) -> String {
         }
     }
 
+    redact_url_userinfo(&result)
+}
+
+/// Redact userinfo (`user:pass@`) from `http://` and `https://` URLs.
+pub fn redact_url_userinfo(msg: &str) -> String {
+    let mut result = msg.to_string();
+    for scheme in ["https://", "http://"] {
+        let mut search_from = 0;
+        while let Some(pos) = result[search_from..].find(scheme) {
+            let start = search_from + pos + scheme.len();
+            let rest = &result[start..];
+            let end_host = rest.find(&['/', '?', '#'][..]).unwrap_or(rest.len());
+            let authority = &rest[..end_host];
+            if let Some(at) = authority.find('@') {
+                let userinfo = &authority[..at];
+                if userinfo.starts_with("x-access-token:") || userinfo.contains("[REDACTED]") {
+                    search_from = start + end_host;
+                    continue;
+                }
+                if userinfo.contains(':') || userinfo.contains("oauth2") {
+                    let redacted = format!("{scheme}[REDACTED]@");
+                    result.replace_range(search_from + pos..start + at + 1, &redacted);
+                    search_from = search_from + pos + redacted.len();
+                    continue;
+                }
+            }
+            search_from = start + end_host;
+        }
+    }
     result
+}
+
+/// Shared redaction for git/svn stderr and operation detail persisted or returned to clients.
+pub fn redact_vcs_error_detail(msg: &str) -> String {
+    sanitize_error_message(msg)
 }
 
 // ---------------------------------------------------------------------------

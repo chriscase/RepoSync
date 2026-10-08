@@ -12,8 +12,10 @@ This slice follows [67-late-pair-admission.md](67-late-pair-admission.md). It do
 4. Replays pending Git commits through the production `SyncEngine` Git→SVN path.
 5. Validates Git reachability (credential chain + `git ls-remote` for HTTP(S) remotes) **before** any SVN copy.
 6. Clones the child Git workdir from the parent’s derived remote URL with credentials applied like normal sync (never uses the token as a URL host).
-7. Records a durable `late_pair_publish` operation (`late_pair_publish_v1` journal) with resumable phases through `svn_copy_pending` / `svn_copied` / `child_registered` / `replay_in_progress` (replay errors stay `replay_in_progress` with `outcome_detail`, not terminal `failed`).
-8. Enables the child (`scheduler_active=true` in the response plan) only after the pinned Git tip is handled.
+7. Records a durable `late_pair_publish` operation (`late_pair_publish_v1` journal) with resumable phases through `svn_copy_pending` / `svn_copied` / `child_registered` / `replay_in_progress` (replay errors stay `replay_in_progress` with redacted `outcome_detail`, not terminal `failed`).
+8. Enables the child (`scheduler_active=true` in the response plan) only after the pinned Git tip is handled, in the **same database transaction** as journal finalize (so a crash cannot leave an enabled child with a non-terminal journal).
+
+HTTP(S) Git preflight and import/setup git CLI calls authenticate via `GIT_CONFIG_*` `http.extraHeader` (token never appears in child argv). Git/SVN stderr stored in the journal or returned to clients is passed through shared `redact_vcs_error_detail`.
 
 Policy identity for published plans: `late_pair_publish_v1`.
 
@@ -27,4 +29,4 @@ Policy identity for published plans: `late_pair_publish_v1`.
 
 ## Tests
 
-Named cases: `R06_LATE_PAIR_PUBLISH_REPLAY`, `R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE`, `R06_NO_ACTIVE_ON_PARTIAL` (foreign existing target blocks publish). Core integration tests cover publish replay and foreign-target refusal; HTTPS credential refusal uses the same preflight gate as publish before SVN mutation.
+Named cases: `R06_LATE_PAIR_PUBLISH_REPLAY`, `R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE` (HTTP path proves SVN youngest unchanged before mutation), `R06_NO_ACTIVE_ON_PARTIAL` (foreign existing target blocks publish). Core integration tests cover publish replay, mid-replay resume, and SVN-copy error resume; HTTPS credential refusal uses the same preflight gate as publish before SVN mutation.
