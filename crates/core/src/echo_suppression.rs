@@ -48,6 +48,30 @@ pub(crate) enum NoTargetReceiptVerdict {
 }
 
 /// Validate a Git no-target receipt with the same scoping the admission writer binds.
+/// A prior-generation Git no-target receipt may prove an SVN-emitted column tip
+/// only when it carries verified outcome bytes for that SHA and projection.
+pub(crate) fn stale_generation_receipt_proves_emitted_git_column(
+    record: &serde_json::Value,
+    repo_id: &str,
+    column_sha: &str,
+    current_generation: i64,
+) -> bool {
+    if record["repo_id"] != repo_id
+        || record["git_sha"] != column_sha
+        || !is_full_git_oid(column_sha)
+    {
+        return false;
+    }
+    if receipt_generation_accepted(record, current_generation) {
+        return false;
+    }
+    let projection = record["projection"].as_str().unwrap_or("");
+    if projection.is_empty() {
+        return false;
+    }
+    git_no_target_outcome_is_verified(record)
+}
+
 pub(crate) fn verify_no_target_receipt(
     record: &serde_json::Value,
     repo_id: &str,
@@ -77,7 +101,11 @@ pub(crate) fn verify_svn_no_target_receipt(
     repo_id: &str,
     svn_rev: i64,
     projection: &str,
+    current_generation: i64,
 ) -> NoTargetReceiptVerdict {
+    if !receipt_generation_accepted(record, current_generation) {
+        return NoTargetReceiptVerdict::StaleGeneration;
+    }
     if record["repo_id"] != repo_id
         || record["svn_revision"].as_i64() != Some(svn_rev)
         || svn_rev <= 0
@@ -94,7 +122,7 @@ pub(crate) fn verify_svn_no_target_receipt(
     }
 }
 
-fn git_no_target_outcome_is_verified(record: &serde_json::Value) -> bool {
+pub(crate) fn git_no_target_outcome_is_verified(record: &serde_json::Value) -> bool {
     match (record["version"].as_u64(), record["outcome"].as_str()) {
         (Some(1), Some("empty_commit" | "filtered")) => true,
         (Some(3), Some("no_svn_delta")) => {
@@ -311,10 +339,14 @@ fn verified_svn_no_target_receipt(
     let Some(record) = read_svn_no_target_receipt(ctx.db, ctx.repo_id, svn_rev)? else {
         return Ok(false);
     };
-    Ok(
-        verify_svn_no_target_receipt(&record, ctx.repo_id, svn_rev, ctx.no_target_projection)
-            == NoTargetReceiptVerdict::Accepted,
-    )
+    let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
+    Ok(verify_svn_no_target_receipt(
+        &record,
+        ctx.repo_id,
+        svn_rev,
+        ctx.no_target_projection,
+        generation,
+    ) == NoTargetReceiptVerdict::Accepted)
 }
 
 fn has_repo_applied_git_to_svn_commit(
@@ -410,8 +442,14 @@ fn verified_svn_no_target_receipt_personal(
         let Some(record) = read_svn_no_target_receipt(ctx.db, repo_id, svn_rev)? else {
             continue;
         };
-        if verify_svn_no_target_receipt(&record, repo_id, svn_rev, ctx.no_target_projection)
-            == NoTargetReceiptVerdict::Accepted
+        let generation = repo_echo_generation(ctx.db, repo_id)?;
+        if verify_svn_no_target_receipt(
+            &record,
+            repo_id,
+            svn_rev,
+            ctx.no_target_projection,
+            generation,
+        ) == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
         }

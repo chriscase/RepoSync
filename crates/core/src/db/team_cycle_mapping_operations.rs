@@ -595,7 +595,7 @@ mod tests {
             .unwrap();
         let receipt = serde_json::from_str::<serde_json::Value>(&receipt_raw).unwrap();
         assert_eq!(
-            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered"),
+            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1),
             NoTargetReceiptVerdict::Accepted
         );
         let echo_ctx = TeamEchoContext {

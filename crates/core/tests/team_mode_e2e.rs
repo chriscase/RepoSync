@@ -12829,11 +12829,11 @@ async fn candidate_echo_identity_path_recreation_stale_svn_receipt_not_valid() {
         imported >= 1,
         "path delete/recreate must still import as new SVN work (got {imported})"
     );
-    let tree = svn_tree(&fixture, recreated_rev).await;
+    let bridge_tree = tracked_tree(&fixture.bridge);
     assert_eq!(
-        tree.get(path),
+        bridge_tree.get(path),
         Some(&b"second incarnation\n".to_vec()),
-        "recreated path must reach Git via SVN→Git"
+        "recreated path must reach the bridge Git tree via SVN→Git"
     );
 
     let stale_rev = recreated_rev - 1;
@@ -12985,6 +12985,49 @@ async fn candidate_echo_split_cursor_unproved_emitted_column_ambiguous_checkpoin
             "unproved_middle":unproved,
             "column_git_sha":echo_tip,
             "svn_revision_unchanged":svn_after_echo
+        })
+    );
+}
+
+// Refs #63: agreeing column and scoped KV without outbound proof stay ambiguous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_legacy_unified_cursor_without_provenance_ambiguous_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new().await;
+    let forged = fixture.developer_commit(
+        "forged.txt",
+        "no applied mapping\n",
+        "Unproven unified legacy cursor",
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_sha_pair", &forged)
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&forged],
+        )
+        .unwrap();
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "unified legacy cursor without scoped provenance must not be trusted: {result:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_LEGACY_UNIFIED_CURSOR_UNPROVEN",
+            "forged_sha":forged
         })
     );
 }

@@ -128,12 +128,26 @@ pub fn read_git_no_target_receipt_any_generation(
     repo_id: &str,
     git_sha: &str,
 ) -> Result<Option<serde_json::Value>, DatabaseError> {
+    Ok(
+        collect_git_no_target_receipts_for_sha(db, repo_id, git_sha)?
+            .into_iter()
+            .next(),
+    )
+}
+
+/// Every stored Git no-target receipt for `git_sha`, including legacy key shapes.
+pub fn collect_git_no_target_receipts_for_sha(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<Vec<serde_json::Value>, DatabaseError> {
     let generation = repo_echo_generation(db, repo_id)?;
     let mut keys = Vec::new();
     keys.push(format!("handled_git_no_target_{}_{}", repo_id, git_sha));
     for gen in 1..=generation {
         keys.push(handled_git_no_target_state_key(repo_id, gen, git_sha));
     }
+    let mut records = Vec::new();
     for key in keys {
         let Some(raw) = db.get_state(&key)? else {
             continue;
@@ -142,10 +156,10 @@ pub fn read_git_no_target_receipt_any_generation(
             continue;
         };
         if record["repo_id"] == repo_id && record["git_sha"] == git_sha {
-            return Ok(Some(record));
+            records.push(record);
         }
     }
-    Ok(None)
+    Ok(records)
 }
 
 /// Whether a generation-accepted, admission-scoped Git no-target receipt exists for `git_sha`.
@@ -281,6 +295,28 @@ mod tests {
             !stored_git_no_target_receipt_exists(&db, "pair", &sha, "{}").unwrap(),
             "arbitrary legacy kv bytes must not count as a verified no-target receipt"
         );
+    }
+
+    #[test]
+    fn stale_generation_svn_receipt_is_not_read() {
+        let db = setup_db();
+        bump_repo_echo_generation(&db, "pair").unwrap();
+        db.set_state(
+            &format!("handled_svn_no_target_pair_3"),
+            &serde_json::json!({
+                "version": 1,
+                "repo_id": "pair",
+                "svn_revision": 3,
+                "outcome": "no_git_content",
+                "projection": "{}",
+                "generation": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(read_svn_no_target_receipt(&db, "pair", 3)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

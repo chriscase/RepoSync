@@ -322,6 +322,12 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "ECHO_SPLIT_CURSOR_UNPROVED_COLUMN",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_split_cursor_unproved_emitted_column_ambiguous_checkpoint",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "ECHO_MARKER_FORGED",
       "binary": "team_mode_e2e",
       "test": "test_team_mode_marker_without_receipt_applies_once",
