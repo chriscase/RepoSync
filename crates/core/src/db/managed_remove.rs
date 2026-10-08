@@ -121,7 +121,7 @@ impl RemovalBlocker {
                     .into()
             }
             Self::ChildRegistrations { count } => format!(
-                "parent removal is blocked while {count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
+                "parent removal is blocked while {count} child registration(s) exist; remove child branch pairs first — children are not removed automatically"
             ),
         }
     }
@@ -253,6 +253,224 @@ fn child_count(conn: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
         |row| row.get(0),
     )?;
     Ok(count)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalChildRef {
+    pub id: String,
+    pub name: String,
+    pub git_branch: String,
+    pub svn_branch: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalParentRef {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedGitRegistrationRef {
+    pub id: String,
+    pub name: String,
+    pub git_branch: String,
+    pub svn_branch: String,
+    pub relationship: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialKeyPreview {
+    pub key: String,
+    pub action: String,
+    pub retained_for_repo_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalDependencyPreview {
+    pub repo_id: String,
+    pub repo_name: String,
+    pub parent: Option<RemovalParentRef>,
+    pub children: Vec<RemovalChildRef>,
+    pub parent_removal_blocked: bool,
+    pub block_reason: Option<String>,
+    pub credentials: Vec<CredentialKeyPreview>,
+    pub managed_local_path: String,
+    pub sibling_local_paths_preserved: Vec<String>,
+    pub shared_git_registrations: Vec<SharedGitRegistrationRef>,
+}
+
+fn list_children(conn: &Connection, repo_id: &str) -> Result<Vec<RemovalChildRef>, DatabaseError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, git_branch, svn_branch, enabled FROM repositories WHERE parent_id=?1 ORDER BY name",
+    )?;
+    let rows = stmt.query_map([repo_id], |row| {
+        Ok(RemovalChildRef {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            git_branch: row.get(2)?,
+            svn_branch: row.get(3)?,
+            enabled: row.get::<_, i32>(4)? != 0,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)
+}
+
+fn shared_git_registrations(
+    conn: &Connection,
+    repo: &Repository,
+) -> Result<Vec<SharedGitRegistrationRef>, DatabaseError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, git_branch, svn_branch, parent_id FROM repositories
+         WHERE git_api_url=?1 AND git_repo=?2 AND id!=?3
+         ORDER BY name",
+    )?;
+    let rows = stmt.query_map(params![repo.git_api_url, repo.git_repo, repo.id], |row| {
+        let id: String = row.get(0)?;
+        let parent_id: Option<String> = row.get(4)?;
+        let relationship = if parent_id.as_deref() == Some(repo.id.as_str()) {
+            "child_branch_pair"
+        } else if repo.parent_id.as_deref() == Some(id.as_str()) {
+            "parent_registration"
+        } else if parent_id == repo.parent_id && parent_id.is_some() {
+            "sibling_branch_pair"
+        } else {
+            "shared_remote_registration"
+        };
+        Ok(SharedGitRegistrationRef {
+            id,
+            name: row.get(1)?,
+            git_branch: row.get(2)?,
+            svn_branch: row.get(3)?,
+            relationship: relationship.to_string(),
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(DatabaseError::from)
+}
+
+fn credential_key_nonempty(conn: &Connection, key: &str) -> Result<bool, DatabaseError> {
+    Ok(read_value(conn, key)?
+        .map(|v| !v.is_empty())
+        .unwrap_or(false))
+}
+
+fn build_credential_preview(
+    conn: &Connection,
+    repo: &Repository,
+) -> Result<Vec<CredentialKeyPreview>, DatabaseError> {
+    let mut out = Vec::new();
+    let svn_key = format!("secret_svn_password_{}", repo.id);
+    let git_key = format!("secret_git_token_{}", repo.id);
+    if credential_key_nonempty(conn, &svn_key)? {
+        let mut retained = Vec::new();
+        if let Some(parent_id) = repo.parent_id.as_deref() {
+            let parent_key = format!("secret_svn_password_{parent_id}");
+            if credential_key_nonempty(conn, &parent_key)? {
+                retained.push(parent_id.to_string());
+            }
+        }
+        for child in list_children(conn, &repo.id)? {
+            let child_key = format!("secret_svn_password_{}", child.id);
+            if credential_key_nonempty(conn, &child_key)? {
+                retained.push(child.id);
+            }
+        }
+        out.push(CredentialKeyPreview {
+            key: svn_key,
+            action: "delete_if_present".into(),
+            retained_for_repo_ids: retained,
+        });
+    }
+    if credential_key_nonempty(conn, &git_key)? {
+        let mut retained = Vec::new();
+        if let Some(parent_id) = repo.parent_id.as_deref() {
+            let parent_key = format!("secret_git_token_{parent_id}");
+            if credential_key_nonempty(conn, &parent_key)? {
+                retained.push(parent_id.to_string());
+            }
+        }
+        for child in list_children(conn, &repo.id)? {
+            let child_key = format!("secret_git_token_{}", child.id);
+            if credential_key_nonempty(conn, &child_key)? {
+                retained.push(child.id);
+            }
+        }
+        out.push(CredentialKeyPreview {
+            key: git_key,
+            action: "delete_if_present".into(),
+            retained_for_repo_ids: retained,
+        });
+    }
+    for global in ["secret_svn_password", "secret_git_token"] {
+        if credential_key_nonempty(conn, global)? {
+            out.push(CredentialKeyPreview {
+                key: global.to_string(),
+                action: "never_deleted_by_managed_remove".into(),
+                retained_for_repo_ids: vec![],
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn sibling_local_paths(conn: &Connection, repo: &Repository) -> Result<Vec<String>, DatabaseError> {
+    let mut paths = Vec::new();
+    if let Some(parent_id) = repo.parent_id.as_deref() {
+        paths.push(format!("repos/{parent_id}"));
+        for child in list_children(conn, parent_id)? {
+            if child.id != repo.id {
+                paths.push(format!("repos/{}", child.id));
+            }
+        }
+    } else {
+        for child in list_children(conn, &repo.id)? {
+            paths.push(format!("repos/{}", child.id));
+        }
+    }
+    Ok(paths)
+}
+
+pub fn build_removal_dependency_preview(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<Option<RemovalDependencyPreview>, DatabaseError> {
+    let Some(repo) = load_repo(conn, repo_id)? else {
+        return Ok(None);
+    };
+    let children = list_children(conn, repo_id)?;
+    let blocked = !children.is_empty();
+    let block_reason = if blocked {
+        Some(
+            RemovalBlocker::ChildRegistrations {
+                count: children.len() as i64,
+            }
+            .detail(),
+        )
+    } else {
+        None
+    };
+    let parent = if let Some(parent_id) = repo.parent_id.clone() {
+        load_repo(conn, &parent_id)?.map(|p| RemovalParentRef {
+            id: p.id,
+            name: p.name,
+        })
+    } else {
+        None
+    };
+    Ok(Some(RemovalDependencyPreview {
+        repo_id: repo.id.clone(),
+        repo_name: repo.name.clone(),
+        parent,
+        children,
+        parent_removal_blocked: blocked,
+        block_reason,
+        credentials: build_credential_preview(conn, &repo)?,
+        managed_local_path: format!("repos/{}", repo.id),
+        sibling_local_paths_preserved: sibling_local_paths(conn, &repo)?,
+        shared_git_registrations: shared_git_registrations(conn, &repo)?,
+    }))
 }
 
 fn fingerprint(repo: &Repository) -> String {
@@ -436,6 +654,14 @@ impl Database {
     ) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
         let conn = self.conn();
         read_op(&conn, repo_id)
+    }
+
+    pub fn removal_dependency_preview(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<RemovalDependencyPreview>, DatabaseError> {
+        let conn = self.conn();
+        build_removal_dependency_preview(&conn, repo_id)
     }
 
     pub fn removal_tombstone(
