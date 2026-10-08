@@ -72,39 +72,145 @@ export function managedRemovalStateLabel(state: string | undefined): string {
   }
 }
 
-const RECEIPT_KEY = 'reposync.managedRemovalReceipt';
+const RECEIPT_PREFIX = 'reposync.managedRemovalReceipt.';
+const LEGACY_RECEIPT_KEY = 'reposync.managedRemovalReceipt';
 
 export interface ManagedRemovalReceipt {
   repoId: string;
   operationId: string;
   state: string;
   message: string;
+  remote_git: string;
+  remote_svn: string;
+  restore_supported: boolean;
+  retryable: boolean;
+  registration_listed: boolean;
   recovery?: ManagedRemovalRecovery | null;
+  partial_cleanup?: ManagedRemovalPartialCleanup | null;
+  updated_at: string;
+}
+
+export function managedRemovalReceiptFromStatus(
+  repoId: string,
+  status: ManagedRemovalStatus,
+): ManagedRemovalReceipt {
+  return {
+    repoId,
+    operationId: status.operation_id,
+    state: status.state,
+    message: status.message,
+    remote_git: status.remote_git,
+    remote_svn: status.remote_svn,
+    restore_supported: status.restore_supported,
+    retryable: status.retryable,
+    registration_listed: status.registration_listed,
+    recovery: status.recovery,
+    partial_cleanup: status.partial_cleanup,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+export function managedRemovalStatusFromReceipt(
+  receipt: ManagedRemovalReceipt,
+): ManagedRemovalStatus {
+  return {
+    ok: receipt.state.toLowerCase() === 'completed',
+    action: 'managed_remove',
+    state: receipt.state,
+    operation_id: receipt.operationId,
+    message: receipt.message,
+    remote_git: receipt.remote_git,
+    remote_svn: receipt.remote_svn,
+    restore_supported: receipt.restore_supported,
+    retryable: receipt.retryable,
+    registration_listed: receipt.registration_listed,
+    recovery: receipt.recovery,
+    partial_cleanup: receipt.partial_cleanup,
+  };
+}
+
+function receiptStorageKey(repoId: string): string {
+  return `${RECEIPT_PREFIX}${repoId}`;
+}
+
+function migrateLegacyReceipt(): void {
+  try {
+    const raw = sessionStorage.getItem(LEGACY_RECEIPT_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
+    if (parsed?.repoId && parsed?.operationId) {
+      persistManagedRemovalReceipt({
+        ...parsed,
+        remote_git: parsed.remote_git ?? 'untouched',
+        remote_svn: parsed.remote_svn ?? 'untouched',
+        restore_supported: parsed.restore_supported ?? false,
+        retryable: parsed.retryable ?? parsed.state !== 'completed',
+        registration_listed: parsed.registration_listed ?? parsed.state !== 'completed',
+        updated_at: parsed.updated_at ?? new Date().toISOString(),
+      });
+    }
+    sessionStorage.removeItem(LEGACY_RECEIPT_KEY);
+  } catch {
+    /* ignore */
+  }
 }
 
 export function persistManagedRemovalReceipt(receipt: ManagedRemovalReceipt): void {
   try {
-    sessionStorage.setItem(RECEIPT_KEY, JSON.stringify(receipt));
+    const payload: ManagedRemovalReceipt = {
+      ...receipt,
+      updated_at: receipt.updated_at || new Date().toISOString(),
+    };
+    localStorage.setItem(receiptStorageKey(receipt.repoId), JSON.stringify(payload));
   } catch {
     /* ignore quota */
   }
 }
 
-export function readManagedRemovalReceipt(): ManagedRemovalReceipt | null {
+export function readManagedRemovalReceipt(repoId?: string): ManagedRemovalReceipt | null {
+  migrateLegacyReceipt();
   try {
-    const raw = sessionStorage.getItem(RECEIPT_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
-    if (!parsed?.repoId || !parsed?.operationId) return null;
-    return parsed;
+    if (repoId) {
+      const raw = localStorage.getItem(receiptStorageKey(repoId));
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
+      if (!parsed?.repoId || !parsed?.operationId) return null;
+      return parsed;
+    }
+    let latest: ManagedRemovalReceipt | null = null;
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(RECEIPT_PREFIX)) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
+      if (!parsed?.repoId || !parsed?.operationId) continue;
+      if (
+        !latest
+        || (parsed.updated_at && (!latest.updated_at || parsed.updated_at > latest.updated_at))
+      ) {
+        latest = parsed;
+      }
+    }
+    return latest;
   } catch {
     return null;
   }
 }
 
-export function clearManagedRemovalReceipt(): void {
+export function clearManagedRemovalReceipt(repoId?: string): void {
   try {
-    sessionStorage.removeItem(RECEIPT_KEY);
+    if (repoId) {
+      localStorage.removeItem(receiptStorageKey(repoId));
+      return;
+    }
+    for (let i = localStorage.length - 1; i >= 0; i -= 1) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(RECEIPT_PREFIX)) {
+        localStorage.removeItem(key);
+      }
+    }
+    sessionStorage.removeItem(LEGACY_RECEIPT_KEY);
   } catch {
     /* ignore */
   }

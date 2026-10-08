@@ -1115,6 +1115,24 @@ impl Database {
         read_op(&conn, repo_id)
     }
 
+    /// Load a specific managed-removal document when the UI holds a receipt
+    /// `operation_id` that may differ from the current `latest` pointer.
+    pub fn managed_removal_operation(
+        &self,
+        repo_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
+        let conn = self.conn();
+        let Some(raw) = read_value(&conn, &key("document", operation_id))? else {
+            return Ok(None);
+        };
+        let op = parse_op(&raw)?;
+        if op.repo_id != repo_id {
+            return Ok(None);
+        }
+        Ok(Some(op))
+    }
+
     pub fn removal_dependency_preview(
         &self,
         repo_id: &str,
@@ -2637,6 +2655,30 @@ mod tests {
             .fail_managed_remove_with_remote(repo_id, &retry.id, "would downgrade", Some(&worse))
             .unwrap();
         assert_eq!(merged.remote_git, "deleted");
+    }
+
+    #[test]
+    fn managed_removal_operation_loads_document_by_id() {
+        let db = setup();
+        let repo_id = "op-by-id";
+        db.insert_repository(&repo(repo_id, "Op", None)).unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        db.fail_managed_remove(repo_id, &operation.id, "injected")
+            .unwrap();
+        let loaded = db
+            .managed_removal_operation(repo_id, &operation.id)
+            .unwrap()
+            .expect("expected document");
+        assert_eq!(loaded.id, operation.id);
+        assert_eq!(loaded.state, ManagedRemoveState::Failed);
+        assert!(db
+            .managed_removal_operation(repo_id, "missing-op")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

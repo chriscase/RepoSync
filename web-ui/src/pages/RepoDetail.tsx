@@ -16,8 +16,11 @@ import ImportProgressCard from '../components/ImportProgressCard';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalPanel from '../components/ManagedRemovalPanel';
 import {
+  type ManagedRemovalReceipt,
   type ManagedRemovalStatus,
   managedRemovalNeedsPoll,
+  managedRemovalReceiptFromStatus,
+  managedRemovalStatusFromReceipt,
   persistManagedRemovalReceipt,
   readManagedRemovalReceipt,
   clearManagedRemovalReceipt,
@@ -94,7 +97,7 @@ export default function RepoDetail() {
   const [form, setForm] = useState<EditForm | null>(null);
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
-  const [removalReceipt, setRemovalReceipt] = useState(readManagedRemovalReceipt());
+  const [removalReceipt, setRemovalReceipt] = useState<ManagedRemovalReceipt | null>(null);
   const [expandedAuditGroups, setExpandedAuditGroups] = useState<Set<number>>(new Set());
   const [expandedDetails, setExpandedDetails] = useState<Set<number>>(new Set());
   const [svnTestResult, setSvnTestResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -385,13 +388,7 @@ export default function RepoDetail() {
       }
 
       const { result, target } = payload;
-      const receipt = {
-        repoId: target.id,
-        operationId: result.operation_id,
-        state: result.state,
-        message: result.message,
-        recovery: result.recovery,
-      };
+      const receipt = managedRemovalReceiptFromStatus(target.id, result);
       persistManagedRemovalReceipt(receipt);
       setRemovalReceipt(receipt);
       queryClient.setQueryData(['managed-removal', target.id], result);
@@ -413,7 +410,7 @@ export default function RepoDetail() {
   const restoreMutation = useMutation({
     mutationFn: () => api.restoreManagedRepo(id!),
     onSuccess: () => {
-      clearManagedRemovalReceipt();
+      clearManagedRemovalReceipt(id!);
       setRemovalReceipt(null);
       queryClient.invalidateQueries({ queryKey: ['repo', id] });
       queryClient.invalidateQueries({ queryKey: ['repos'] });
@@ -424,14 +421,33 @@ export default function RepoDetail() {
   const removalPreviewQuery = useQuery({
     queryKey: ['removal-preview', removalSubjectId],
     queryFn: () => api.getRemovalDependencyPreview(removalSubjectId!),
-    enabled: !!removalSubjectId && isAdmin && showRemoveConfirm && detailLive && !removalSubject?.parent_id,
+    enabled: !!removalSubjectId && isAdmin && showRemoveConfirm && detailLive,
     retry: false,
   });
+
+  const branchPairPreviewQuery = useQuery({
+    queryKey: ['removal-preview', branchPairDeleteSubject?.id],
+    queryFn: () => api.getRemovalDependencyPreview(branchPairDeleteSubject!.id),
+    enabled:
+      !!branchPairDeleteSubject?.id
+      && isAdmin
+      && detailLive
+      && !!branchPairDeleteSubject.parent_id,
+    retry: false,
+  });
+  const branchPairDependencyPreview = branchPairPreviewQuery.data?.dependency_preview;
+  const branchPairPreviewReady = !!branchPairDependencyPreview
+    && !branchPairPreviewQuery.isLoading
+    && !branchPairPreviewQuery.isFetching
+    && !branchPairPreviewQuery.isError;
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
 
+  const trackedRemovalOperationId =
+    removalReceipt?.repoId === id ? removalReceipt.operationId : undefined;
+
   const removalStatusQuery = useQuery<ManagedRemovalStatus | null>({
-    queryKey: ['managed-removal', id],
-    queryFn: () => api.getManagedRemoval(id!),
+    queryKey: ['managed-removal', id, trackedRemovalOperationId ?? 'latest'],
+    queryFn: () => api.getManagedRemoval(id!, trackedRemovalOperationId),
     enabled:
       !!id
       && isAdmin
@@ -449,22 +465,16 @@ export default function RepoDetail() {
     },
   });
 
-  const removalPanelStatus: ManagedRemovalStatus | undefined = removalStatusQuery.data
-    ?? (removalReceipt && removalReceipt.repoId === id
-      ? {
-          ok: removalReceipt.state === 'completed',
-          action: 'managed_remove',
-          state: removalReceipt.state,
-          operation_id: removalReceipt.operationId,
-          message: removalReceipt.message,
-          remote_git: 'untouched',
-          remote_svn: 'untouched',
-          restore_supported: removalReceipt.recovery?.restore_supported ?? false,
-          retryable: removalReceipt.state !== 'completed',
-          registration_listed: removalReceipt.state !== 'completed',
-          recovery: removalReceipt.recovery,
-        }
-      : undefined);
+  const removalPanelStatus: ManagedRemovalStatus | undefined = (() => {
+    const live = removalStatusQuery.data;
+    if (live && (!trackedRemovalOperationId || live.operation_id === trackedRemovalOperationId)) {
+      return live;
+    }
+    if (removalReceipt && removalReceipt.repoId === id) {
+      return managedRemovalStatusFromReceipt(removalReceipt);
+    }
+    return live ?? undefined;
+  })();
 
   const childRemovalConfirm = !!(removalSubject?.parent_id);
   const removalPreviewReady = !!removalDependencyPreview
@@ -594,10 +604,23 @@ export default function RepoDetail() {
 
   useEffect(() => {
     setLocalNotice(null);
-    if (removalReceipt && removalReceipt.repoId !== id) {
+    if (!id) {
       setRemovalReceipt(null);
+      return;
     }
-  }, [id, removalReceipt]);
+    setRemovalReceipt(readManagedRemovalReceipt(id));
+  }, [id]);
+
+  useEffect(() => {
+    if (!id || !removalStatusQuery.data) return;
+    const status = removalStatusQuery.data;
+    if (trackedRemovalOperationId && status.operation_id !== trackedRemovalOperationId) {
+      return;
+    }
+    const receipt = managedRemovalReceiptFromStatus(id, status);
+    persistManagedRemovalReceipt(receipt);
+    setRemovalReceipt(receipt);
+  }, [id, removalStatusQuery.data, trackedRemovalOperationId]);
 
   useEffect(() => {
     if (!retiredId || retiredId === id) return;
@@ -1785,6 +1808,54 @@ export default function RepoDetail() {
                 <p>Git ref: <span className="font-mono text-gray-200">{branchPairDeleteSubject.git_branch}</span> — {removeBranchOpts.delete_git ? 'will be deleted on remote when authorized' : 'left on remote'}</p>
                 <p>SVN path: <span className="font-mono text-gray-200">{branchPairDeleteSubject.svn_branch}</span> — {removeBranchOpts.delete_svn ? 'will be deleted on remote when authorized (history retained)' : 'left on remote'}</p>
               </div>
+              {branchPairPreviewQuery.isLoading && (
+                <p className="text-sm text-gray-400" data-testid="branch-removal-preview-loading">
+                  Loading dependency preview…
+                </p>
+              )}
+              {branchPairDependencyPreview && (
+                <div
+                  className="text-sm text-gray-300 space-y-2 border border-gray-600 rounded-lg p-3 bg-gray-900/40"
+                  data-testid="branch-managed-removal-dependency-preview"
+                >
+                  {branchPairDependencyPreview.credentials.length > 0 && (
+                    <div>
+                      <p className="text-gray-400 font-medium">Credentials</p>
+                      <ul className="list-disc list-inside text-gray-300 text-xs font-mono">
+                        {branchPairDependencyPreview.credentials.map((cred) => (
+                          <li key={cred.key}>
+                            {cred.key} — {cred.action}
+                            {cred.inheriting_repo_ids.length > 0
+                              ? ` (inherits: ${cred.inheriting_repo_ids.join(', ')})`
+                              : ''}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <p className="text-gray-400 text-xs">
+                    Local path removed:{' '}
+                    <span className="font-mono text-gray-200">
+                      {branchPairDependencyPreview.managed_local_path}
+                    </span>
+                  </p>
+                </div>
+              )}
+              {branchPairPreviewQuery.isError && (
+                <div className="text-sm text-red-300 space-y-2">
+                  <p data-testid="branch-removal-preview-error">
+                    Could not load dependency preview: {branchPairPreviewQuery.error?.message}
+                  </p>
+                  <button
+                    type="button"
+                    data-testid="branch-removal-preview-retry"
+                    onClick={() => branchPairPreviewQuery.refetch()}
+                    className="px-3 py-1.5 rounded-md border border-red-700 text-red-200 text-xs"
+                  >
+                    Retry preview
+                  </button>
+                </div>
+              )}
               <div className="space-y-2">
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={removeBranchOpts.delete_git}
@@ -1831,7 +1902,11 @@ export default function RepoDetail() {
               <button
                 data-testid="confirm-delete-branch-pair"
                 onClick={() => removeMutation.mutate()}
-                disabled={removeMutation.isPending || removeConfirmText !== branchPairDeleteSubject.git_branch}
+                disabled={
+                  removeMutation.isPending
+                  || removeConfirmText !== branchPairDeleteSubject.git_branch
+                  || !branchPairPreviewReady
+                }
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <Trash2 className="w-4 h-4" />

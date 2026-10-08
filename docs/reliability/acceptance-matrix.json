@@ -81,7 +81,8 @@
         "R65_REMOVE_RETRY_REMOTE",
         "R65_REMOVE_RETRY_UNREQUESTED_FAIL",
         "R65_SPLIT_SCOPED_SVN",
-        "R65_SCOPED_SECRET_REVOKE_CAPTURE"
+        "R65_SCOPED_SECRET_REVOKE_CAPTURE",
+        "R65_REMOVAL_BY_OPERATION_ID"
       ],
       "open": [
         "Optional authenticated remote Git-ref or SVN-path deletion beyond branch-pair delete is not in this slice",

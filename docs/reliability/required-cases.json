@@ -990,6 +990,7 @@
     {"id":"R65_REMOVE_RETRY_UNREQUESTED_FAIL", "binary":"server_freeze", "test":"candidate_r65_managed_remove_retry_ignores_unrequested_remote_failure", "tier":"candidate_regression"},
     {"id":"R65_SPLIT_SCOPED_SVN", "binary":"reposync_core", "test":"db::managed_remove::tests::restore_split_scoped_svn_cursor_stays_quarantined", "tier":"candidate_regression"},
     {"id":"R65_SCOPED_SECRET_REVOKE_CAPTURE", "binary":"reposync_core", "test":"db::managed_remove::tests::scoped_secret_capture_prefers_kv_revocation_over_stale_encrypted", "tier":"candidate_regression"},
+    {"id":"R65_REMOVAL_BY_OPERATION_ID", "binary":"server_freeze", "test":"candidate_r65_get_removal_status_by_operation_id", "tier":"candidate_regression"},
     {"id":"R11_SNAPSHOT_FIXED_R", "binary":"server_freeze", "test":"candidate_r11_snapshot_at_fixed_revision", "tier":"candidate_regression"},
     {"id":"R11_PIN_HOLDS_AFTER_ADVANCE", "binary":"server_freeze", "test":"candidate_r11_pin_holds_when_svn_advances", "tier":"candidate_regression"},
     {"id":"R11_MISMATCHED_TARGET", "binary":"server_freeze", "test":"candidate_r11_mismatched_target_is_refused", "tier":"candidate_regression"},

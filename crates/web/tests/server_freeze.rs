@@ -8207,6 +8207,109 @@ async fn candidate_r65_restore_managed_registration() {
     server.abort();
 }
 
+/// #65 RS-16: GET /removal?operation_id= returns the receipt operation document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_get_removal_status_by_operation_id() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let repo_id = "r65-removal-by-op";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            repo_id, "By op", None, "main", "trunk",
+        ))
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    let repos_root = data.join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let outside = tmp.path().join("by-op-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let owned = repos_root.join(repo_id);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &owned).unwrap();
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&owned).unwrap();
+        server.abort();
+        return;
+    }
+
+    let failed = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::CONFLICT);
+    let failed_body: serde_json::Value = failed.json().await.unwrap();
+    let op_id = failed_body["operation_id"].as_str().unwrap();
+    assert_eq!(failed_body["state"], "failed");
+    assert!(failed_body["partial_cleanup"].is_object());
+
+    let by_id = client
+        .get(format!(
+            "{base}/api/repos/{repo_id}/removal?operation_id={op_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(by_id.status(), reqwest::StatusCode::CONFLICT);
+    let by_id_body: serde_json::Value = by_id.json().await.unwrap();
+    assert_eq!(by_id_body["operation_id"], op_id);
+    assert_eq!(
+        by_id_body["partial_cleanup"]["remote_git"],
+        failed_body["remote_git"]
+    );
+
+    let missing = client
+        .get(format!(
+            "{base}/api/repos/{repo_id}/removal?operation_id=not-a-real-op"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    std::fs::remove_file(&owned).unwrap();
+    std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+    std::fs::write(owned.join("owned.txt"), "owned\n").unwrap();
+
+    let retry = client
+        .post(format!("{base}/api/repos/{repo_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status(), reqwest::StatusCode::OK);
+    let retry_body: serde_json::Value = retry.json().await.unwrap();
+    assert_eq!(retry_body["state"], "completed");
+
+    let latest = client
+        .get(format!("{base}/api/repos/{repo_id}/removal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(latest.status(), reqwest::StatusCode::OK);
+    assert_eq!(latest.json::<serde_json::Value>().await.unwrap()["state"], "completed");
+
+    let historical = client
+        .get(format!(
+            "{base}/api/repos/{repo_id}/removal?operation_id={op_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(historical.status(), reqwest::StatusCode::OK);
+    let historical_body: serde_json::Value = historical.json().await.unwrap();
+    assert_eq!(historical_body["operation_id"], op_id);
+    assert_eq!(historical_body["state"], "completed");
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_REMOVAL_BY_OPERATION_ID", "failed_op": op_id})
+    );
+    server.abort();
+}
+
 /// #65: removal preview surfaces active managed removal as HTTP 202 or 409.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r65_removal_preview_reports_202_or_409_for_active_removal() {
