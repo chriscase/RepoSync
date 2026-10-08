@@ -477,7 +477,10 @@ mod tests {
             .status()
             .unwrap();
         assert!(!evil.success(), "out-of-prefix file must be rejected");
-        assert!(!marker.exists(), "metacharacters in prefix must not execute");
+        assert!(
+            !marker.exists(),
+            "metacharacters in prefix must not execute"
+        );
     }
 
     #[test]
