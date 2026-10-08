@@ -365,9 +365,32 @@ def run_baseline(binaries):
                       "totals": totals, "catalog_count": len(results)}), flush=True)
 
 
+def materialize_node_wrapper():
+    """Prebuilt tests invoke Node for R65 UI contracts; expose a fixture-owned wrapper."""
+    for candidate in (Path("/usr/bin/nodejs"), Path("/usr/bin/node")):
+        if candidate.is_file():
+            wrapper = FIXTURE / "tmp" / "reposync-node"
+            wrapper.parent.mkdir(parents=True, exist_ok=True)
+            wrapper.write_text(f"#!/bin/sh\nexec {candidate} \"$@\"\n")
+            wrapper.chmod(0o755)
+            os.environ["REPOSYNC_NODE_BIN"] = str(wrapper)
+            probe = subprocess.run(
+                [str(wrapper), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if probe.returncode != 0:
+                raise AssertionError(
+                    f"node wrapper probe failed: {probe.stderr or probe.stdout}"
+                )
+            return
+    raise AssertionError("nodejs runtime missing from reliability image")
+
+
 def main():
-    os.environ.setdefault("REPOSYNC_NODE_BIN", "/usr/bin/nodejs")
     os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    materialize_node_wrapper()
     mode = sys.argv[1]
     assert mode in ("diagnostics", "candidate", "all", "baseline"), mode
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
