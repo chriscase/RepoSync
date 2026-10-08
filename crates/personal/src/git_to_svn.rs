@@ -189,7 +189,20 @@ impl GitToSvnSync {
             .active_personal_svn_commit_operation()
             .context("failed to read active personal git-to-svn commit")?
         {
-            if let Some(reason) = blocking_svn_commit_hold(&op) {
+            if op.state == SvnCommitOperationState::ReconciliationRequired {
+                match self
+                    .recover_held_personal_git_to_svn_reconciliation(&op, None)
+                    .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        if let Some(reason) = blocking_svn_commit_hold(&op) {
+                            anyhow::bail!(reason);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else if let Some(reason) = blocking_svn_commit_hold(&op) {
                 anyhow::bail!(reason);
             }
         }
@@ -501,9 +514,11 @@ impl GitToSvnSync {
             if op.state == SvnCommitOperationState::ReconciliationRequired
                 && op.source_git_sha == commit.sha
             {
-                let git_author = commit.commit.author.name.as_str();
                 match self
-                    .finalize_held_personal_git_to_svn_if_proven(&op, git_author)
+                    .recover_held_personal_git_to_svn_reconciliation(
+                        &op,
+                        Some(commit.commit.author.name.as_str()),
+                    )
                     .await
                 {
                     Ok(Some(svn_rev)) => return Ok(svn_rev),
@@ -1154,6 +1169,28 @@ impl GitToSvnSync {
 }
 
 impl GitToSvnSync {
+    async fn recover_held_personal_git_to_svn_reconciliation(
+        &self,
+        op: &SvnCommitOperation,
+        git_author_override: Option<&str>,
+    ) -> Result<Option<i64>> {
+        if op.state != SvnCommitOperationState::ReconciliationRequired {
+            return Ok(None);
+        }
+        let git_author = match git_author_override {
+            Some(name) => name.to_string(),
+            None => {
+                let git_client = GitClient::new(&self.git_repo_path)
+                    .context("failed to open git repo for held commit author")?;
+                git_client
+                    .commit_author_name(&op.source_git_sha)
+                    .context("failed to resolve git author for held personal git-to-svn commit")?
+            }
+        };
+        self.finalize_held_personal_git_to_svn_if_proven(op, &git_author)
+            .await
+    }
+
     async fn finalize_held_personal_git_to_svn_if_proven(
         &self,
         op: &SvnCommitOperation,

@@ -109,3 +109,54 @@ export function clearManagedRemovalReceipt(): void {
     /* ignore */
   }
 }
+
+/** Gate for list views: invalid or partial receipts must not render a notice. */
+export function shouldDisplayManagedRemovalReceipt(
+  receipt: ManagedRemovalReceipt | null,
+): receipt is ManagedRemovalReceipt {
+  return (
+    receipt != null
+    && typeof receipt.repoId === 'string'
+    && receipt.repoId.length > 0
+    && typeof receipt.operationId === 'string'
+    && receipt.operationId.length > 0
+  );
+}
+
+export interface RemovalChildRef {
+  id: string;
+  name: string;
+  git_branch: string;
+  svn_branch: string;
+  enabled: boolean;
+}
+
+export interface RemovalDependencyPreview {
+  repo_id: string;
+  repo_name: string;
+  parent: { id: string; name: string } | null;
+  children: RemovalChildRef[];
+  parent_removal_blocked: boolean;
+  block_reason: string | null;
+  credentials: Array<{
+    key: string;
+    action: string;
+    retained_for_repo_ids: string[];
+  }>;
+  managed_local_path: string;
+  sibling_local_paths_preserved: string[];
+  shared_git_registrations: Array<{
+    id: string;
+    name: string;
+    git_branch: string;
+    svn_branch: string;
+    relationship: string;
+  }>;
+}
+
+export interface RemovalPreviewResponse {
+  ok: boolean;
+  action: 'removal_preview';
+  dependency_preview: RemovalDependencyPreview;
+  active_removal?: ManagedRemovalStatus | null;
+}

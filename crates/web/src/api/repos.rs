@@ -273,6 +273,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id", delete(delete_repo))
         .route("/api/repos/:id/disable", post(disable_repo))
         .route("/api/repos/:id/remove", post(remove_repo))
+        .route("/api/repos/:id/removal/preview", get(get_removal_preview))
         .route("/api/repos/:id/removal", get(get_removal))
         .route("/api/repos/:id/sync", post(trigger_sync))
         .route("/api/repos/:id/import", post(start_repo_import))
@@ -607,6 +608,40 @@ fn removal_recovery_payload(
     }))
 }
 
+fn removal_dependency_preview_json(
+    db: &reposync_core::db::Database,
+    repo_id: &str,
+) -> Result<serde_json::Value, AppError> {
+    let preview = db
+        .removal_dependency_preview(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+    serde_json::to_value(preview).map_err(|e| AppError::Internal(e.to_string()))
+}
+
+fn parent_removal_blocked_response(
+    db: &reposync_core::db::Database,
+    repo_id: &str,
+    child_count: i64,
+) -> Result<axum::response::Response, AppError> {
+    let preview = removal_dependency_preview_json(db, repo_id)?;
+    let message = format!(
+        "parent removal is blocked while {child_count} child registration(s) exist; remove child branch pairs first — children are not removed automatically"
+    );
+    let body = serde_json::json!({
+        "ok": false,
+        "action": "managed_remove",
+        "state": "blocked",
+        "message": message,
+        "parent_removal_blocked": true,
+        "child_count": child_count,
+        "dependency_preview": preview,
+        "retryable": false,
+        "registration_listed": true,
+    });
+    Ok((StatusCode::CONFLICT, Json(body)).into_response())
+}
+
 fn removal_response(
     db: &reposync_core::db::Database,
     operation: &reposync_core::db::managed_remove::ManagedRemoveOperation,
@@ -728,9 +763,7 @@ async fn remove_repo(
             return Err(AppError::NotFound("repository not found".into()));
         }
         RemovalAdvance::ParentBlocked { child_count } => {
-            return Err(AppError::BadRequest(format!(
-                "parent removal is blocked while {child_count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
-            )));
+            return parent_removal_blocked_response(&state.db, &id, child_count);
         }
         RemovalAdvance::Completed { operation } => {
             let listed = registration_listed(&state.db, &id)?;
@@ -801,9 +834,7 @@ async fn remove_repo(
             return Ok((status, body).into_response());
         }
         RemovalAdvance::ParentBlocked { child_count } => {
-            return Err(AppError::BadRequest(format!(
-                "parent removal is blocked while {child_count} child registration(s) exist; dependency preview is a later #65 slice and children are not removed"
-            )));
+            return parent_removal_blocked_response(&state.db, &id, child_count);
         }
         RemovalAdvance::NotFound => {
             return Err(AppError::NotFound("repository not found".into()));
@@ -837,6 +868,42 @@ async fn remove_repo(
             Ok((status, body).into_response())
         }
     }
+}
+
+async fn get_removal_preview(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    validate_session(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if reposync_core::managed_remove::validate_repo_id(&id).is_err() {
+        return Err(AppError::BadRequest(
+            "repository id is not a single safe path component".into(),
+        ));
+    }
+    let preview = removal_dependency_preview_json(&state.db, &id)?;
+    let active = state
+        .db
+        .managed_removal(&id)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (status, active_removal) = if let Some(operation) = active {
+        let listed = registration_listed(&state.db, &id)?;
+        let (op_status, op_body) = removal_response(&state.db, &operation, listed)?;
+        (op_status, Some(op_body.0))
+    } else {
+        (StatusCode::OK, None)
+    };
+    let body = serde_json::json!({
+        "ok": true,
+        "action": "removal_preview",
+        "dependency_preview": preview,
+        "active_removal": active_removal,
+    });
+    Ok((status, Json(body)).into_response())
 }
 
 async fn get_removal(
