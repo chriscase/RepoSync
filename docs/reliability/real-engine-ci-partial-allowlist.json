@@ -1,0 +1,12 @@
+{
+  "suite": "real-engine-scenarios",
+  "description": "Scenario IDs whose PARTIAL status is expected on loopback svnserve CI and must not fail the Build & Test gate when they are the only non-PASS rows.",
+  "allowed_partial_scenario_ids": [
+    "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
+    "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
+  ],
+  "rationale": {
+    "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE": "Loopback fixture proves transport failure blocking and unchanged checkpoint; full R16 remote-recreation catalog remains open (remote_transport_failed).",
+    "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE": "Loopback svnserve cannot recreate remotes after failure; transport blocking and checkpoint isolation are still exercised."
+  }
+}

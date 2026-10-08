@@ -35,14 +35,16 @@
         "R01_NO_TARGET_STAGE_FAILURE",
         "R01_VERIFIED_NO_DELTA",
         "R01_REPRESENTED_CONTENT",
-        "R01_TARGET_MISMATCH"
+        "R01_TARGET_MISMATCH",
+        "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT",
+        "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN"
       ],
       "open": [
         "Personal-mode ordinary round-trip is not in this catalog",
         "Post-write recovery of a successful SVN/Git effect whose DB write failed remains #64/#23",
         "Deployed-version ordinary sync is NOT ESTABLISHED"
       ],
-      "evidence": "Team-engine fixtures prove linear Git replay, directional cursor splits, lagging-P admission, failed nonempty SVN apply stop-and-retry, explicit no-target metadata revisions, and ignored-path noncollision. Intermediate tree and mapping assertions exist for those subcases. A second unchanged Git run is a no-op in R01_LINEAR. Full product-level bidirectional acceptance and live upgrade remain open.",
+      "evidence": "Team-engine fixtures prove linear Git replay, directional cursor splits, lagging-P admission, failed nonempty SVN apply stop-and-retry, explicit no-target metadata revisions, and ignored-path noncollision. Intermediate tree and mapping assertions exist for those subcases. A second unchanged Git run is a no-op in R01_LINEAR. R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT and R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN drive disposable svnserve plus bare Git through production SyncEngine with ordered multi-commit tree/mapping checks and repeat no-op oracles. Full product-level bidirectional acceptance and live upgrade remain open.",
       "diagnostic_expected_baseline_failure": false
     },
     {
@@ -495,13 +497,15 @@
       ],
       "supporting_case_ids": [
         "64B_REMOTE_MISSING",
-        "64B_INSPECTION_FAILURE"
+        "64B_INSPECTION_FAILURE",
+        "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
+        "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
       ],
       "open": [
         "Credential-rotation and persistent-auth lifecycle remain open",
         "No hidden clone/init/reset as recovery is proven only for the team inspection gate and import reconcile"
       ],
-      "evidence": "Team inspection distinguishes missing configured branch (ignoring a stale tracking ref), transport failure, synthetic auth denial, and fetch failure. Import reconcile distinguishes remote absence from inspection failure. No automatic recreation or checkpoint advance in those cases.",
+      "evidence": "Team inspection distinguishes missing configured branch (ignoring a stale tracking ref), transport failure, synthetic auth denial, and fetch failure. Import reconcile distinguishes remote absence from inspection failure. R16_SVNSERVE_GIT_REMOTE_UNREACHABLE and R16_SVNSERVE_SVN_REMOTE_UNREACHABLE exercise loopback unreachable Git/SVN remotes through real-engine SyncEngine with transport-failure blocking and unchanged checkpoint, bridge HEAD, SVN revision, and mapping counts (PARTIAL vs full R16 catalog). No automatic recreation or checkpoint advance in those cases.",
       "diagnostic_expected_baseline_failure": false
     },
     {
