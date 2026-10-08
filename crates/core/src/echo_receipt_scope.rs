@@ -7,6 +7,8 @@
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::db::Database;
 use crate::echo_suppression::{verify_no_target_receipt, NoTargetReceiptVerdict};
@@ -41,6 +43,69 @@ pub fn repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, Databas
     }
 }
 
+#[cfg(test)]
+static TEST_FORCE_SPLIT_FAIL: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn test_force_next_split_fail() {
+    TEST_FORCE_SPLIT_FAIL.store(true, Ordering::SeqCst);
+}
+
+/// When a generation bump follows a unified no-target cursor, restore the scoped
+/// KV copy to the last applied outbound Git SHA so stale receipts cannot admit P.
+fn split_unified_git_cursor_to_outbound_kv_tx(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    #[cfg(test)]
+    if TEST_FORCE_SPLIT_FAIL.swap(false, Ordering::SeqCst) {
+        return Err(DatabaseError::Other("test forced split failure".into()));
+    }
+    let column: Option<String> = tx
+        .query_row(
+            "SELECT last_git_sha FROM repositories WHERE id = ?1",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let column = column.filter(|value| !value.is_empty());
+    if column.is_none() {
+        return Ok(());
+    }
+    let column = column.unwrap();
+    let kv_key = format!("last_git_sha_{}", repo_id);
+    let kv: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [&kv_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kv.as_deref() != Some(column.as_str()) {
+        return Ok(());
+    }
+    let handled: Option<String> = tx
+        .query_row(
+            "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(handled) = handled else {
+        return Ok(());
+    };
+    if handled == column {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![kv_key, handled, now],
+    )?;
+    Ok(())
+}
+
 /// Bump the echo generation on an open connection (same transaction as reset).
 pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
     let next = repo_echo_generation_tx(tx, repo_id)? + 1;
@@ -51,13 +116,25 @@ pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i6
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![key, next.to_string(), now],
     )?;
+    split_unified_git_cursor_to_outbound_kv_tx(tx, repo_id)?;
     Ok(next)
 }
 
 /// Bump the echo generation after a reset/re-anchor so stale receipts fail closed.
 pub fn bump_repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, DatabaseError> {
     let conn = db.conn();
-    bump_repo_echo_generation_tx(&conn, repo_id)
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = bump_repo_echo_generation_tx(&conn, repo_id);
+    match result {
+        Ok(next) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(next)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub fn receipt_generation_accepted(record: &serde_json::Value, current_generation: i64) -> bool {
@@ -128,12 +205,26 @@ pub fn read_git_no_target_receipt_any_generation(
     repo_id: &str,
     git_sha: &str,
 ) -> Result<Option<serde_json::Value>, DatabaseError> {
+    Ok(
+        collect_git_no_target_receipts_for_sha(db, repo_id, git_sha)?
+            .into_iter()
+            .next(),
+    )
+}
+
+/// Every stored Git no-target receipt for `git_sha`, including legacy key shapes.
+pub fn collect_git_no_target_receipts_for_sha(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<Vec<serde_json::Value>, DatabaseError> {
     let generation = repo_echo_generation(db, repo_id)?;
     let mut keys = Vec::new();
     keys.push(format!("handled_git_no_target_{}_{}", repo_id, git_sha));
     for gen in 1..=generation {
         keys.push(handled_git_no_target_state_key(repo_id, gen, git_sha));
     }
+    let mut records = Vec::new();
     for key in keys {
         let Some(raw) = db.get_state(&key)? else {
             continue;
@@ -142,10 +233,10 @@ pub fn read_git_no_target_receipt_any_generation(
             continue;
         };
         if record["repo_id"] == repo_id && record["git_sha"] == git_sha {
-            return Ok(Some(record));
+            records.push(record);
         }
     }
-    Ok(None)
+    Ok(records)
 }
 
 /// Whether a generation-accepted, admission-scoped Git no-target receipt exists for `git_sha`.
@@ -281,6 +372,61 @@ mod tests {
             !stored_git_no_target_receipt_exists(&db, "pair", &sha, "{}").unwrap(),
             "arbitrary legacy kv bytes must not count as a verified no-target receipt"
         );
+    }
+
+    #[test]
+    fn stale_generation_svn_receipt_is_not_read() {
+        let db = setup_db();
+        bump_repo_echo_generation(&db, "pair").unwrap();
+        db.set_state(
+            "handled_svn_no_target_pair_3",
+            &serde_json::json!({
+                "version": 1,
+                "repo_id": "pair",
+                "svn_revision": 3,
+                "outcome": "no_git_content",
+                "projection": "{}",
+                "generation": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(read_svn_no_target_receipt(&db, "pair", 3)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bump_repo_echo_generation_rolls_back_when_split_fails() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_api_url, git_repo, git_branch, enabled, created_at, updated_at, last_svn_rev, last_git_sha)
+                 VALUES ('pair', 'pair', '', '', '', '', '', '', 1, 't', 't', 0, '')",
+                [],
+            )
+            .unwrap();
+        let handled = "b".repeat(40);
+        let filtered = "c".repeat(40);
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES ('out', 'pair', NULL, ?1, 'git_to_svn', '', '', ?2, ?2, 'applied')",
+                rusqlite::params![handled, now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&filtered],
+            )
+            .unwrap();
+        db.set_state("last_git_sha_pair", &filtered).unwrap();
+        assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
+        test_force_next_split_fail();
+        assert!(bump_repo_echo_generation(&db, "pair").is_err());
+        assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
     }
 
     #[test]
