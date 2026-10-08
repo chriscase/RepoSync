@@ -2092,13 +2092,8 @@ mod tests {
         db.start_import_operation(repo_id, &import.id).unwrap();
         db.note_import_local(repo_id, &import.id, 4, SYNCED_GIT_SHA, 1, 1)
             .unwrap();
-        db.begin_import_publication(
-            repo_id,
-            &import.id,
-            "refs/heads/main",
-            SYNCED_GIT_SHA,
-        )
-        .unwrap();
+        db.begin_import_publication(repo_id, &import.id, "refs/heads/main", SYNCED_GIT_SHA)
+            .unwrap();
         db.confirm_import_publication(repo_id, &import.id, SYNCED_GIT_SHA)
             .unwrap();
         db.complete_import_operation(repo_id, &import.id, 4, SYNCED_GIT_SHA)
