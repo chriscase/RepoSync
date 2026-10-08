@@ -1170,12 +1170,14 @@ mod tests {
             .unwrap();
         db.start_import_operation("repo-flush", &op.id).unwrap();
         let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        db.note_import_local("repo-flush", &op.id, 1, sha, 1, 1).unwrap();
+        db.note_import_local("repo-flush", &op.id, 1, sha, 1, 1)
+            .unwrap();
         db.stage_import_commit_map("repo-flush", &op.id, 1, sha, "svn", "git <g@t.com>")
             .unwrap();
         db.begin_import_publication("repo-flush", &op.id, "refs/heads/main", sha)
             .unwrap();
-        db.confirm_import_publication("repo-flush", &op.id, sha).unwrap();
+        db.confirm_import_publication("repo-flush", &op.id, sha)
+            .unwrap();
         let rows: i64 = db
             .conn()
             .query_row(
@@ -1185,7 +1187,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1);
-        let op = db.get_import_operation("repo-flush", &op.id).unwrap().unwrap();
+        let op = db
+            .get_import_operation("repo-flush", &op.id)
+            .unwrap()
+            .unwrap();
         assert!(op.pending_commit_maps.is_empty());
     }
 
