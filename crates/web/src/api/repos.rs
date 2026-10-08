@@ -1598,8 +1598,11 @@ async fn start_repo_import(
                 "origin",
                 &format!("refs/heads/{}", repo.git_branch),
             ])
-            .current_dir(&git_repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0");
+            .current_dir(&git_repo_path);
+        reposync_core::git::subprocess_auth::apply_git_http_auth_tokio_optional(
+            &mut inspect,
+            git_token_state.value.as_deref().filter(|t| !t.is_empty()),
+        );
         let signal = progress.read().await.cancel_signal.clone();
         let remote =
             reposync_core::process::run(inspect, std::time::Duration::from_secs(60), Some(&signal))

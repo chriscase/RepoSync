@@ -419,12 +419,15 @@ async fn verify_existing_svn_target_matches_copy_intent(
     })
 }
 
-fn git_env(workdir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+fn git_env(
+    workdir: &Path,
+    args: &[&str],
+    token: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(workdir);
+    crate::git::subprocess_auth::apply_git_http_auth_optional(&mut cmd, token);
+    cmd.output()
 }
 
 fn ensure_child_git_workdir(
@@ -468,6 +471,7 @@ fn ensure_child_git_workdir(
             "origin",
             &format!("refs/heads/{git_branch}:refs/heads/{git_branch}"),
         ],
+        token,
     )
     .map_err(|e| LatePairPublishRefusal {
         reason: "git_workdir_failed".into(),
@@ -481,14 +485,16 @@ fn ensure_child_git_workdir(
             plan: None,
         });
     }
-    let checkout =
-        git_env(&git_repo_path, &["checkout", "-B", git_branch, git_branch]).map_err(|e| {
-            LatePairPublishRefusal {
-                reason: "git_workdir_failed".into(),
-                detail: format!("git checkout failed: {e}"),
-                plan: None,
-            }
-        })?;
+    let checkout = git_env(
+        &git_repo_path,
+        &["checkout", "-B", git_branch, git_branch],
+        None,
+    )
+    .map_err(|e| LatePairPublishRefusal {
+        reason: "git_workdir_failed".into(),
+        detail: format!("git checkout failed: {e}"),
+        plan: None,
+    })?;
     if !checkout.status.success() {
         return Err(LatePairPublishRefusal {
             reason: "git_workdir_failed".into(),
@@ -666,6 +672,7 @@ async fn replay_pending_git(
         identity.clone(),
     );
     engine.set_repo_id(child.id.clone());
+    engine.set_git_credential_apply_clean(true);
 
     let mut replayed = Vec::new();
     let fail_after = child

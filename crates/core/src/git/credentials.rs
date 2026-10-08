@@ -27,7 +27,11 @@ pub fn apply_git_credential_chain_state(
     }
 }
 
-/// Scheduler/sync reload: embed scoped tokens in the remote URL (RS-11 isolation).
+/// Scheduler/daemon sync reload only: embed scoped tokens in `remote.origin.url`.
+///
+/// RS-11 credential-isolation tests depend on URL-embedded canaries on this path.
+/// Import, setup, and late-pair publish/replay must use
+/// [`apply_git_credential_chain_state`] (clean URL + subprocess env auth) instead.
 pub fn apply_git_credential_chain_state_for_sync(
     git: &GitClient,
     remote_name: &str,

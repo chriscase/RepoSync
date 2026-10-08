@@ -179,6 +179,8 @@ pub struct SyncEngine {
     started_at: chrono::DateTime<Utc>,
     /// Optional repo ID for per-repo credential and watermark keys.
     repo_id: Option<String>,
+    /// When true, git credential reload keeps a clean remote URL (late-pair replay).
+    git_credential_apply_clean: AtomicBool,
     /// LFS threshold in bytes. Files larger than this are tracked via Git LFS.
     /// 0 means LFS is disabled.
     lfs_threshold_bytes: u64,
@@ -303,6 +305,7 @@ impl SyncEngine {
             running: Arc::new(AtomicBool::new(false)),
             started_at: Utc::now(),
             repo_id: None,
+            git_credential_apply_clean: AtomicBool::new(false),
             lfs_threshold_bytes: 0,
             allowed_paths: Vec::new(),
             blocked_patterns: Vec::new(),
@@ -429,6 +432,13 @@ impl SyncEngine {
     /// Set the repository ID for per-repo credential and watermark keys.
     pub fn set_repo_id(&mut self, id: String) {
         self.repo_id = Some(id);
+    }
+
+    /// Late-pair publish replay: reload git tokens without embedding them in
+    /// `remote.origin.url` (scheduler sync continues to use URL embed).
+    pub fn set_git_credential_apply_clean(&self, clean: bool) {
+        self.git_credential_apply_clean
+            .store(clean, Ordering::Release);
     }
 
     /// Set the LFS threshold in bytes. Files larger than this will be
@@ -4484,8 +4494,12 @@ impl SyncEngine {
         };
         {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            match crate::git::apply_git_credential_chain_state_for_sync(&git, "origin", &git_state)
-            {
+            let apply = if self.git_credential_apply_clean.load(Ordering::Acquire) {
+                crate::git::apply_git_credential_chain_state(&git, "origin", &git_state)
+            } else {
+                crate::git::apply_git_credential_chain_state_for_sync(&git, "origin", &git_state)
+            };
+            match apply {
                 Ok(()) if git_state.value.is_some() => {
                     debug!("reloaded Git token from database");
                 }

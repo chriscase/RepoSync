@@ -137,11 +137,10 @@ impl GitClient {
     }
 
     fn apply_cli_http_auth(&self, cmd: &mut std::process::Command, token: Option<&str>) {
-        if let Some(tok) = self.resolve_http_token(token) {
-            super::subprocess_auth::apply_git_http_auth(cmd, &tok);
-        } else {
-            cmd.env("GIT_TERMINAL_PROMPT", "0");
-        }
+        super::subprocess_auth::apply_git_http_auth_optional(
+            cmd,
+            self.resolve_http_token(token).as_deref(),
+        );
     }
 
     /// Ensure the local HEAD points at `refs/heads/<branch>`. Useful after
@@ -600,12 +599,11 @@ impl GitClient {
     pub fn ls_remote_ref(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
         let ref_name = format!("refs/heads/{branch}");
-        let output = std::process::Command::new("git")
-            .args(["ls-remote", "--exit-code", remote, &ref_name])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::IoError)?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["ls-remote", "--exit-code", remote, &ref_name])
+            .current_dir(repo_path);
+        self.apply_cli_http_auth(&mut cmd, None);
+        let output = cmd.output().map_err(GitError::IoError)?;
         if output.status.code() == Some(2) {
             return Ok(None);
         }

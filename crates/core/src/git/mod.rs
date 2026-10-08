@@ -14,5 +14,7 @@ pub use credentials::{
 pub use github::GitHubClient;
 pub use remote_url::derive_git_remote_url;
 pub use subprocess_auth::{
-    apply_git_http_auth, build_git_ls_remote_command, command_args_contain_secret,
+    apply_git_http_auth, apply_git_http_auth_optional, apply_git_http_auth_tokio,
+    apply_git_http_auth_tokio_optional, build_git_ls_remote_command, command_args_contain_secret,
+    command_env_has_git_http_auth,
 };
