@@ -3004,10 +3004,10 @@ async fn test_replay_commit_confirm_fail_preserves_committed_tree() {
         "finalize must not create a second SVN revision"
     );
     assert!(
-        !db_arc
+        db_arc
             .active_personal_svn_commit_operation()
             .unwrap()
-            .is_some(),
+            .is_none(),
         "journal must clear after finalize"
     );
     let mapped = db_arc
@@ -4799,6 +4799,55 @@ fn github_commit(sha: String, message: &str) -> reposync_core::git::github::GitH
 }
 
 /// Minimal HTTP server that returns an empty GitHub pulls JSON array.
+fn remove_loose_git_object(git_work: &Path, sha: &str) {
+    let object_path = git_work
+        .join(".git/objects")
+        .join(&sha[..2])
+        .join(&sha[2..]);
+    std::fs::remove_file(object_path).expect("remove loose git object for test");
+}
+
+fn spawn_github_commit_author_stub(
+    commit_sha: &str,
+    author_name: &str,
+) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let commit_body = format!(
+        r#"{{
+            "sha": "{commit_sha}",
+            "commit": {{
+                "message": "Add feature.txt",
+                "author": {{"name": "{author_name}", "email": "author@example.com", "date": null}},
+                "committer": {{"name": "{author_name}", "email": "author@example.com", "date": null}}
+            }},
+            "parents": []
+        }}"#,
+        commit_sha = commit_sha,
+        author_name = author_name
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..8 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("/commits/") {
+                    commit_body.clone()
+                } else {
+                    "[]".to_string()
+                };
+                let response = github_stub_http_response(&body);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{}", port), handle)
+}
+
 fn spawn_empty_github_pulls_api() -> String {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
@@ -5419,15 +5468,36 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         .expect("sync must finalize a proven lost-reply hold without replay_commit");
     assert_eq!(sync_result.commits_synced, 0);
     assert_eq!(sync_result.prs_synced, 0);
+    assert!(
+        db_arc.is_personal_git_sha_synced(&git_sha).unwrap(),
+        "finalize must checkpoint sync_records and commit_map for the Git SHA"
+    );
+
+    let merge_sha = "f".repeat(40);
+    let (api_url, stub) = spawn_github_pr_sync_stub(&merge_sha, &git_sha);
+    let syncer3 = personal_git_to_svn_with_github_api(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+        &api_url,
+    );
+    let continuation = syncer3
+        .sync()
+        .await
+        .expect("sync must skip already-checkpointed SHAs when the PR is visible");
+    assert_eq!(continuation.commits_synced, 0);
+    assert_eq!(continuation.prs_synced, 1);
     assert_eq!(
         svn_youngest(&svn_url),
         svn_after,
         "held retry must not write SVN again"
     );
-    assert!(!db_arc
+    assert!(db_arc
         .active_personal_svn_commit_operation()
         .unwrap()
-        .is_some());
+        .is_none());
     assert!(
         db_arc
             .list_commit_map(10)
@@ -5444,6 +5514,7 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         std::fs::read_to_string(svn_wc.join("feature.txt")).unwrap(),
         "lost reply\n"
     );
+    drop(stub);
 
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
@@ -5456,6 +5527,284 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
             "mode": "personal"
         })
     );
+}
+
+#[tokio::test]
+async fn test_personal_git_to_svn_finalize_ignores_quoted_operation_trailer_in_message() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    use reposync_core::svn_commit::append_durable_git_to_svn_identity;
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+    std::fs::write(git_work.join("feature.txt"), "quoted trailer\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt\n\nRepoSync-Operation: decoy\nRepoSync-Git-SHA: decoysha",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let _fault = SvnCommitFaultGuard::crash_before(&svn_wc);
+    syncer
+        .replay_commit(
+            &github_commit(
+                git_sha.clone(),
+                "Add feature.txt\n\nRepoSync-Operation: decoy\nRepoSync-Git-SHA: decoysha",
+            ),
+            8,
+            "feature/x",
+        )
+        .await
+        .expect_err("crash-before must hold");
+    drop(_fault);
+
+    let op = db_arc
+        .active_personal_svn_commit_operation()
+        .unwrap()
+        .expect("active journal");
+    let body_with_decoy =
+        "Add feature.txt\n\nRepoSync-Operation: decoy\nRepoSync-Git-SHA: decoysha";
+    let landed_message = append_durable_git_to_svn_identity(body_with_decoy, &git_sha, &op.id);
+    let svn_after = svn_commit_file(&svn_wc, "feature.txt", "quoted trailer\n", &landed_message);
+    assert_eq!(svn_after, svn_before + 1);
+
+    let github_api = spawn_empty_github_pulls_api();
+    let syncer2 = personal_git_to_svn_with_github_api(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc,
+        git_work,
+        tmp.path(),
+        &github_api,
+    );
+    syncer2
+        .sync()
+        .await
+        .expect("quoted decoy trailer must not block appended RepoSync identity");
+    assert!(db_arc
+        .active_personal_svn_commit_operation()
+        .unwrap()
+        .is_none());
+    assert!(
+        db_arc.is_personal_git_sha_synced(&git_sha).unwrap(),
+        "quoted trailer in git message must not prevent finalize"
+    );
+}
+
+#[tokio::test]
+async fn test_personal_git_to_svn_finalize_resolves_author_from_github_when_local_missing() {
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn_wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+    std::fs::write(git_work.join("feature.txt"), "github author\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "GitHub Named Author",
+            "author@example.com",
+            "GitHub Named Author",
+            "author@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let _fault = SvnCommitFaultGuard::lost_reply(&svn_wc);
+    let err = syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            8,
+            "feature/x",
+        )
+        .await
+        .expect_err("lost reply must hold");
+    assert!(format!("{err:#}").contains("reconciliation_required"));
+    drop(_fault);
+
+    remove_loose_git_object(&git_work, &git_sha);
+
+    let (api_url, stub) = spawn_github_commit_author_stub(&git_sha, "GitHub Named Author");
+    let syncer2 = personal_git_to_svn_with_github_api(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc,
+        git_work,
+        tmp.path(),
+        &api_url,
+    );
+    let sync_outcome = syncer2.sync().await;
+    if let Err(error) = &sync_outcome {
+        assert!(
+            format!("{error:#}").contains("history"),
+            "unexpected sync error after promotion: {error:#}"
+        );
+    }
+    drop(stub);
+
+    assert!(
+        db_arc.is_personal_git_sha_synced(&git_sha).unwrap(),
+        "promotion must finalize from SVN proof before later sync gates"
+    );
+
+    let mapping = db_arc
+        .list_commit_map(10)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.git_sha == git_sha)
+        .expect("commit_map row");
+    assert_eq!(mapping.git_author, "GitHub Named Author");
+    assert_eq!(svn_youngest(&svn_url), svn_before + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_personal_engine_promotes_held_git_to_svn_when_pr_monitor_idle() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn-wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+    std::fs::write(git_work.join("feature.txt"), "engine idle\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let _fault = SvnCommitFaultGuard::lost_reply(&svn_wc);
+    syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            8,
+            "feature/x",
+        )
+        .await
+        .expect_err("lost reply must hold");
+    drop(_fault);
+
+    let pr_id = db_arc
+        .insert_pr_sync(
+            99,
+            "Earlier merged PR",
+            "feature/earlier",
+            &"e".repeat(40),
+            "merge",
+            1,
+        )
+        .unwrap();
+    db_arc
+        .complete_pr_sync(pr_id, svn_before, svn_before)
+        .unwrap();
+
+    let github_api = spawn_empty_github_pulls_api();
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = github_api;
+    config.github.token = Some("test-token".into());
+    let github_api_url = config.github.api_url.clone();
+
+    let engine = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new(&github_api_url, "test-token", GitProvider::GitHub),
+    );
+    let _stats = engine
+        .run_cycle()
+        .await
+        .expect("idle PR monitor must still reach git-to-svn promotion");
+    assert!(db_arc
+        .active_personal_svn_commit_operation()
+        .unwrap()
+        .is_none());
+    assert!(db_arc.is_personal_git_sha_synced(&git_sha).unwrap());
 }
 
 #[tokio::test]

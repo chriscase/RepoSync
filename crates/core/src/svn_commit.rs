@@ -183,38 +183,36 @@ fn paths_match(
     })
 }
 
+/// RepoSync appends durable trailers as the final `RepoSync-Operation` /
+/// `RepoSync-Git-SHA` pair in the SVN log message. Earlier quoted copies in
+/// `{original_message}` must not override that block.
+fn reposync_appended_trailer_pair(message: &str) -> Option<(&str, &str)> {
+    let lines: Vec<&str> = message.lines().map(str::trim).collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let sha_line = lines[lines.len() - 1];
+    let op_line = lines[lines.len() - 2];
+    let sha = sha_line.strip_prefix(GIT_SHA_TRAILER)?.trim();
+    let op_id = op_line.strip_prefix(OPERATION_TRAILER)?.trim();
+    Some((op_id, sha))
+}
+
 fn message_carries_identity(message: &str, op: &SvnCommitOperation) -> bool {
-    let mut saw_operation_trailer = false;
-    let mut operation_matches = false;
-    let mut saw_repo_sync_sha = false;
+    if let Some((op_id, sha)) = reposync_appended_trailer_pair(message) {
+        return op_id == op.id && sha == op.source_git_sha;
+    }
+
     let mut saw_personal_git_sha = false;
     for line in message.lines() {
         let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix(OPERATION_TRAILER) {
-            saw_operation_trailer = true;
-            if value.trim() == op.id {
-                operation_matches = true;
-            } else {
-                return false;
-            }
-        }
-        if let Some(value) = trimmed.strip_prefix(GIT_SHA_TRAILER) {
-            saw_repo_sync_sha |= value.trim() == op.source_git_sha;
-        }
         if let Some(value) = trimmed.strip_prefix("Git-SHA:") {
             saw_personal_git_sha |= value.trim() == op.source_git_sha;
         }
     }
-    let sha_ok = saw_repo_sync_sha || saw_personal_git_sha;
-    if operation_matches {
-        return sha_ok;
-    }
-    if saw_operation_trailer {
-        return false;
-    }
     // Personal-format commits may omit RepoSync-Operation; the Git-SHA trailer
     // still binds the durable intent when tree/path proof succeeds below.
-    sha_ok
+    saw_personal_git_sha
 }
 
 pub async fn inspect_git_to_svn_commit(
@@ -499,6 +497,16 @@ mod identity_tests {
         let sha = "d".repeat(40);
         let op = sample_op("op-expected", &sha);
         let message = format!("sync\n\nGit-SHA: {sha}");
+        assert!(message_carries_identity(&message, &op));
+    }
+
+    #[test]
+    fn quoted_operation_trailer_in_body_does_not_override_appended_block() {
+        let sha = "e".repeat(40);
+        let op = sample_op("op-expected", &sha);
+        let message = format!(
+            "release notes\n\nRepoSync-Operation: op-decoy\nRepoSync-Git-SHA: decoysha\n\nRepoSync-Operation: op-expected\nRepoSync-Git-SHA: {sha}"
+        );
         assert!(message_carries_identity(&message, &op));
     }
 }

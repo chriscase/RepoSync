@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use tracing::{error, info, warn};
 
 use reposync_core::db::personal_scope::personal_scope_key;
+use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::git::client::GitClient;
 use reposync_core::git::github::GitHubClient;
@@ -235,7 +236,14 @@ impl PersonalSyncEngine {
         let monitor = PrMonitor::new(&self.github_client, &self.db, &self.config);
         let merged_prs = monitor.check_for_merged_prs().await?;
 
-        if merged_prs.is_empty() {
+        let held_git_to_svn_needs_promotion = self
+            .db
+            .active_personal_svn_commit_operation()
+            .ok()
+            .flatten()
+            .is_some_and(|op| op.state == SvnCommitOperationState::ReconciliationRequired);
+
+        if merged_prs.is_empty() && !held_git_to_svn_needs_promotion {
             return Ok((0, 0));
         }
 
