@@ -4260,7 +4260,7 @@ mod import_reconciliation_tests {
             "RELIABILITY_EVIDENCE {}",
             serde_json::json!({"case":"64B_LOST_REPLY_COMPLETE",
             "operation_id":fixture.operation_id,"remote_before_after":before,"checkpoint":3,
-            "mappings_before_after":mappings,"confirmed_batches":1,"command_trace":fixture.trace(),
+            "mappings_before_after":expected_map_rows,"confirmed_batches":1,"command_trace":fixture.trace(),
             "restart":true,"idempotent":true})
         );
         HeldFixture::clear_trace();
