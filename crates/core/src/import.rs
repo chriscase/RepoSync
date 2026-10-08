@@ -2742,18 +2742,33 @@ pub async fn run_snapshot_import(
         ));
     }
 
-    db.insert_commit_map_with_repo(
-        pin.operative_rev,
-        &sha,
-        "svn_to_git",
-        "snapshot",
-        &format!(
-            "{} <{}>",
-            import_config.committer_name, import_config.committer_email
-        ),
-        repo_id.as_deref(),
-    )
-    .context("failed to persist snapshot baseline mapping")?;
+    if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+        db.stage_import_commit_map(
+            repo,
+            op,
+            pin.operative_rev,
+            &sha,
+            "snapshot",
+            &format!(
+                "{} <{}>",
+                import_config.committer_name, import_config.committer_email
+            ),
+        )
+        .context("failed to stage snapshot baseline mapping")?;
+    } else {
+        db.insert_commit_map_with_repo(
+            pin.operative_rev,
+            &sha,
+            "svn_to_git",
+            "snapshot",
+            &format!(
+                "{} <{}>",
+                import_config.committer_name, import_config.committer_email
+            ),
+            repo_id.as_deref(),
+        )
+        .context("failed to persist snapshot baseline mapping")?;
+    }
 
     if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
         db.note_import_local(repo, op, pin.operative_rev, &sha, 1, 1)
@@ -3366,16 +3381,28 @@ pub async fn run_full_import(
                 log(&progress, &ws_broadcast, log_line).await;
 
                 // Record in DB (commit_map for bidirectional mapping)
-                let map_result = db.insert_commit_map_with_repo(
-                    rev,
-                    &sha,
-                    "svn_to_git",
-                    &entry.author,
-                    &format!("{} <{}>", author_name, author_email),
-                    repo_id.as_deref(),
-                );
-                if operation_id.is_some() {
-                    map_result.context("failed to persist import mapping")?;
+                if let (Some(repo), Some(op)) = (&repo_id, &operation_id) {
+                    db.stage_import_commit_map(
+                        repo,
+                        op,
+                        rev,
+                        &sha,
+                        &entry.author,
+                        &format!("{} <{}>", author_name, author_email),
+                    )
+                    .context("failed to stage import mapping")?;
+                } else {
+                    let map_result = db.insert_commit_map_with_repo(
+                        rev,
+                        &sha,
+                        "svn_to_git",
+                        &entry.author,
+                        &format!("{} <{}>", author_name, author_email),
+                        repo_id.as_deref(),
+                    );
+                    if let Err(e) = map_result {
+                        debug!(rev, error = %e, "failed to insert commit_map during import");
+                    }
                 }
 
                 // Record sync_record for audit trail and UI display
