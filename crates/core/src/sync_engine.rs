@@ -658,12 +658,8 @@ impl SyncEngine {
                 false
             };
             if column.is_some() && kv.is_some() && column != kv {
-                let (emitted, applied_outbound, svn_origin) = {
+                let (applied_outbound, svn_origin) = {
                     let conn = self.db.conn();
-                    let emitted: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
-                        rusqlite::params![rid, column.as_deref()], |row| row.get(0),
-                    ).map_err(crate::errors::DatabaseError::from)?;
                     let applied_outbound: i64 = conn.query_row(
                         "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn' AND status = 'applied'",
                         rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
@@ -672,28 +668,22 @@ impl SyncEngine {
                         "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev <= (SELECT last_svn_rev FROM repositories WHERE id = ?1)",
                         rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
                     ).map_err(crate::errors::DatabaseError::from)?;
-                    (emitted, applied_outbound, svn_origin)
+                    (applied_outbound, svn_origin)
                 };
                 // The column is also used by the old SVN->Git writer to hold
                 // its emitted tip. That is not the inbound handled cursor P.
                 // Keep the older handled cursor when its outcome (applied
                 // outbound, imported SVN origin, or no-target receipt) and
                 // ancestry to the emitted tip are both proved. Pending Git
-                // ancestors remain in the replay range.
+                // ancestors remain in the replay range. The column pointer is
+                // authoritative for the emitted tip even when that tip only
+                // has a stale or absent no-target receipt after a generation
+                // bump.
                 let old_import_projection =
                     self.allowed_paths.is_empty() && self.blocked_patterns.is_empty();
-                let column_git_no_target_tip = emitted == 0
-                    && crate::echo_receipt_scope::stored_git_no_target_receipt_exists(
-                        &self.db,
-                        rid,
-                        column.as_deref().unwrap(),
-                        &self.no_target_projection(),
-                    )
-                    .map_err(SyncError::DatabaseError)?;
-                if (emitted > 0 || column_git_no_target_tip)
-                    && (applied_outbound > 0
-                        || (old_import_projection && svn_origin > 0)
-                        || kv_no_target)
+                if (applied_outbound > 0
+                    || (old_import_projection && svn_origin > 0)
+                    || kv_no_target)
                     && is_full_git_oid(column.as_deref().unwrap())
                     && is_full_git_oid(kv.as_deref().unwrap())
                 {
