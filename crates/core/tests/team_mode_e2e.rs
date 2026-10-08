@@ -9826,6 +9826,14 @@ async fn assert_git_rename_svn_divergence_stops_before_apply(
             )
         });
     assert_eq!(row.status, "detected");
+    assert_eq!(
+        conflicts
+            .iter()
+            .filter(|c| c.file_path == conflict_path)
+            .count(),
+        1,
+        "retry-stable conflict row for {conflict_path}"
+    );
     let after = pair.snapshot().await;
     assert_eq!(after.svn_rev, before.svn_rev, "SVN must not be published");
     assert_eq!(
@@ -9841,6 +9849,15 @@ async fn assert_git_rename_svn_divergence_stops_before_apply(
     let after_retry = pair.snapshot().await;
     assert_eq!(after_retry.svn_rev, before.svn_rev);
     assert_eq!(after_retry.remote_sha, before.remote_sha);
+    let conflicts_retry = pair.engine.db().list_conflicts(None, 10).unwrap();
+    assert_eq!(
+        conflicts_retry
+            .iter()
+            .filter(|c| c.file_path == conflict_path)
+            .count(),
+        1,
+        "idempotent conflict persistence across rename retries"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9971,6 +9988,175 @@ async fn candidate_rsc02_content_conflict_stops_before_apply() {
             .count(),
         1,
         "idempotent conflict persistence across retries"
+    );
+    let after_retry = pair.snapshot().await;
+    assert_eq!(
+        after_retry.svn_rev, before.svn_rev,
+        "retry must not publish SVN"
+    );
+    assert_eq!(
+        after_retry.remote_sha, before.remote_sha,
+        "retry must not publish Git remote"
+    );
+    let svn_tree_retry = svn_tree(&pair, after_retry.svn_rev).await;
+    let svn_tree_before = svn_tree(&pair, before.svn_rev).await;
+    assert_eq!(
+        svn_tree_retry.get("shared.txt").map(|b| b.as_slice()),
+        svn_tree_before.get("shared.txt").map(|b| b.as_slice()),
+        "SVN shared.txt must stay at pre-conflict bytes after retry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_persisted_conflict_gate_survives_git_force_push_back() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("shared.txt", "base line\n", "Seed shared file");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success(), "svn update failed");
+    svn_commit_file(
+        &pair.wc,
+        "shared.txt",
+        "SVN edited shared\n",
+        "SVN edits shared path",
+    );
+    pair.developer_commit("shared.txt", "Git edited shared\n", "Git edits shared path");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pair.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("first conflict cycle must finish within bounded time");
+    assert!(
+        matches!(first, Err(SyncError::UnresolvableConflict { .. })),
+        "expected content conflict before apply, got {first:?}"
+    );
+    let after_conflict = pair.snapshot().await;
+    assert_eq!(after_conflict.svn_rev, before.svn_rev);
+    assert_eq!(after_conflict.remote_sha, before.remote_sha);
+    git_cli(&pair.developer, &["reset", "--hard", &before.remote_sha]);
+    git_cli(&pair.developer, &["push", "--force", "origin", "main"]);
+    assert_eq!(
+        git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+        before.remote_sha,
+        "Git remote must be restored to pre-divergence tip"
+    );
+    let gated = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pair.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("persisted-conflict gate cycle must finish within bounded time");
+    assert!(
+        matches!(gated, Err(SyncError::UnresolvableConflict { .. })),
+        "persisted conflict row must block apply when detector is empty, got {gated:?}"
+    );
+    let after_gate = pair.snapshot().await;
+    assert_eq!(after_gate.svn_rev, before.svn_rev);
+    assert_eq!(after_gate.remote_sha, before.remote_sha);
+    assert_eq!(after_gate.watermark, before.watermark);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_PERSISTED_GATE_FORCE_PUSH_BACK",
+            "remote_restored_sha":before.remote_sha,
+            "svn_unchanged":after_gate.svn_rev == before.svn_rev,
+            "remote_unchanged":after_gate.remote_sha == before.remote_sha
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_resume_authorized_push_blocked_by_persisted_conflict() {
+    if !svn_available() {
+        return;
+    }
+    let fixture = QualifiedPair::new_with_repo_id("rsc02-resume-conflict-gate").await;
+    let repo_id = fixture.repo_id.as_str();
+    svn_commit_file(
+        &fixture.wc,
+        "feature.txt",
+        "resume blocked by conflict row\n",
+        "RS-C02 resume gate",
+    );
+    let remote_before = git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]);
+    let _fault = GitPushFaultGuard::set("REPOSYNC_GIT_PUSH_CRASH_BEFORE", repo_id);
+    let crashed = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        fixture.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("held push cycle must finish within bounded time");
+    assert!(
+        matches!(
+            &crashed,
+            Err(SyncError::GitPushHeld { reason, .. })
+                if reason == "intent_recorded_push_not_issued"
+        ),
+        "{crashed:?}"
+    );
+    drop(_fault);
+    let op = fixture
+        .engine
+        .db()
+        .active_git_push_operation(repo_id)
+        .unwrap()
+        .unwrap();
+    let result = auto_reconcile_fixture(&fixture).await;
+    let attempt = result
+        .attempts
+        .iter()
+        .find(|a| a.kind == reposync_core::auto_reconcile::HeldExternalWriteKind::SvnToGitPush)
+        .expect("svn-to-git auto-reconcile attempt");
+    assert!(attempt.resume_authorized, "{attempt:?}");
+    let mut conflict = reposync_core::models::Conflict::new("shared.txt".into());
+    conflict.repo_id = Some(repo_id.to_string());
+    fixture.engine.db().insert_conflict(&conflict).unwrap();
+    let blocked = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        fixture.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("resume with persisted conflict must finish within bounded time");
+    assert!(
+        matches!(blocked, Err(SyncError::UnresolvableConflict { .. })),
+        "resume_authorized push must consult persisted conflicts, got {blocked:?}"
+    );
+    assert_eq!(
+        git_output(&fixture.bare, &["rev-parse", "refs/heads/main"]),
+        remote_before,
+        "persisted conflict must block the authorized SVN→Git push"
+    );
+    assert!(
+        fixture
+            .engine
+            .db()
+            .active_git_push_operation(repo_id)
+            .unwrap()
+            .is_some(),
+        "push operation {:?} must remain held",
+        op.id
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RESUME_BLOCKED_BY_PERSISTED_CONFLICT",
+            "operation_id":op.id,
+            "remote_unchanged":true,
+            "resume_authorized":true
+        })
     );
 }
 

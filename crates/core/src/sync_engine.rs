@@ -1661,6 +1661,7 @@ impl SyncEngine {
                 }
             }
         }
+        self.refuse_apply_while_persisted_conflicts_block()?;
         // Authorized SVN→Git resume must publish the recorded local commit
         // before history inspect. The unpushed bridge tip is the intended
         // SHA; inspect would otherwise classify it as unpublished_local_history
@@ -1771,6 +1772,8 @@ impl SyncEngine {
                 });
             }
         }
+
+        self.refuse_apply_while_persisted_conflicts_block()?;
 
         // 3. Apply SVN -> Git.
         let _ = self.persist_sync_state("applying");
@@ -2410,6 +2413,33 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Refuse SVN/Git apply while the conflicts table still has blocking rows
+    /// for this repository (read from SQLite; do not trust in-cycle detection).
+    fn refuse_apply_while_persisted_conflicts_block(&self) -> Result<(), SyncError> {
+        let Some(rid) = self.effective_repo_id() else {
+            return Ok(());
+        };
+        let count = self
+            .db
+            .count_conflicts_blocking_apply_for_repo(rid)
+            .map_err(SyncError::DatabaseError)?;
+        if count == 0 {
+            return Ok(());
+        }
+        let file_path = self
+            .db
+            .first_conflict_blocking_apply_for_repo(rid)
+            .map_err(SyncError::DatabaseError)?
+            .map(|(_, path)| path)
+            .unwrap_or_else(|| "unknown".into());
+        Err(SyncError::UnresolvableConflict {
+            file_path,
+            detail: format!(
+                "{count} persisted conflict row(s) block apply; only resolved or dismissed rows allow SVN/Git mutation"
+            ),
+        })
+    }
+
     /// Issue the one recorded SVN→Git push after observe-first resume, or
     /// finalize a unique match that landed before the worker ran.
     ///
@@ -2421,6 +2451,7 @@ impl SyncEngine {
         let Some(rid) = self.effective_repo_id() else {
             return Ok(());
         };
+        self.refuse_apply_while_persisted_conflicts_block()?;
         let Some(op) = self
             .db
             .active_git_push_operation(rid)

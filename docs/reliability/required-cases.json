@@ -1085,6 +1085,8 @@
     {"id":"RS_C02_SVN_RENAME_GIT_RENAME_CONFLICT_STOP", "binary":"team_mode_e2e", "test":"candidate_rsc02_svn_rename_git_rename_conflict_stops_before_apply", "tier":"candidate_regression"},
     {"id":"RS_C02_EMPTY_RULES_RENAME_CONFLICT_STOP", "binary":"team_mode_e2e", "test":"candidate_rsc02_empty_rules_svn_delete_git_rename_conflict_stops_before_apply", "tier":"candidate_regression"},
     {"id":"RS_C02_CONTENT_CONFLICT_STOP", "binary":"team_mode_e2e", "test":"candidate_rsc02_content_conflict_stops_before_apply", "tier":"candidate_regression"},
+    {"id":"RS_C02_PERSISTED_GATE_FORCE_PUSH_BACK", "binary":"team_mode_e2e", "test":"candidate_rsc02_persisted_conflict_gate_survives_git_force_push_back", "tier":"candidate_regression"},
+    {"id":"RS_C02_RESUME_BLOCKED_BY_PERSISTED_CONFLICT", "binary":"team_mode_e2e", "test":"candidate_rsc02_resume_authorized_push_blocked_by_persisted_conflict", "tier":"candidate_regression"},
     {"id":"RS_C88_IMPORT_COPY_PARENT_SYMLINK", "binary":"import_copy_confinement", "test":"import_copy_parent_dir_symlink_outside_untouched", "tier":"candidate_regression"},
     {"id":"RS_C88_IMPORT_COPY_DEST_HARDLINK", "binary":"import_copy_confinement", "test":"import_copy_dest_hardlink_outside_untouched", "tier":"candidate_regression"},
     {"id":"RS_C88_IMPORT_COPY_GITATTRIBUTES_HARDLINK", "binary":"import_copy_confinement", "test":"import_copy_gitattributes_hardlink_outside_untouched", "tier":"candidate_regression"},

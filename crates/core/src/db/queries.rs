@@ -362,47 +362,124 @@ impl Database {
         Ok(conflict.id.clone())
     }
 
+    /// Conflict statuses that must block SVN/Git apply in team mode.
+    ///
+    /// Only `resolved` and `dismissed` rows allow apply; every other stored
+    /// status (including `deferred`) keeps the repository held.
+    pub fn count_conflicts_blocking_apply_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<i64, DatabaseError> {
+        let conn = self.conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conflicts
+             WHERE repo_id = ?1
+               AND status NOT IN ('resolved', 'dismissed')",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// First persisted conflict row that blocks apply for `repo_id`, if any.
+    pub fn first_conflict_blocking_apply_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<(String, String)>, DatabaseError> {
+        let conn = self.conn();
+        let row = conn
+            .query_row(
+                "SELECT id, file_path FROM conflicts
+                 WHERE repo_id = ?1
+                   AND status NOT IN ('resolved', 'dismissed')
+                 ORDER BY created_at ASC LIMIT 1",
+                params![repo_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// Insert or refresh an unresolved detected conflict for idempotent cycles.
     ///
     /// When the same repository already has a non-resolved row for `file_path`,
     /// update its fields and keep the existing id instead of inserting a duplicate.
+    /// In-progress statuses (`queued`, `resolving`, `active`) and `deferred` are
+    /// never demoted to `detected`.
     pub fn record_detected_conflict(
         &self,
         conflict: &models::Conflict,
     ) -> Result<String, DatabaseError> {
-        let existing: Option<String> = {
-            let conn = self.conn();
-            conn.query_row(
-                "SELECT id FROM conflicts
-                 WHERE file_path = ?1
-                   AND ((?2 IS NULL AND repo_id IS NULL) OR repo_id = ?2)
-                   AND status IN ('detected', 'queued', 'resolving', 'active')
-                 ORDER BY created_at DESC LIMIT 1",
-                params![conflict.file_path, conflict.repo_id],
-                |row| row.get(0),
-            )
-            .optional()?
-        };
-        if let Some(id) = existing {
-            let conn = self.conn();
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let existing: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT id, status FROM conflicts
+                     WHERE file_path = ?1
+                       AND ((?2 IS NULL AND repo_id IS NULL) OR repo_id = ?2)
+                       AND status NOT IN ('resolved', 'dismissed')
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![conflict.file_path, conflict.repo_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, status)) = existing {
+                let next_status = if status == "detected" {
+                    "detected"
+                } else {
+                    status.as_str()
+                };
+                conn.execute(
+                    "UPDATE conflicts SET conflict_type = ?1, svn_content = ?2, git_content = ?3,
+                     base_content = ?4, svn_rev = ?5, git_sha = ?6, status = ?7
+                     WHERE id = ?8",
+                    params![
+                        conflict.conflict_type,
+                        conflict.svn_content,
+                        conflict.git_content,
+                        conflict.base_content,
+                        conflict.svn_revision,
+                        conflict.git_hash,
+                        next_status,
+                        id,
+                    ],
+                )?;
+                debug!(id = %id, file_path = %conflict.file_path, status = next_status, "refreshed conflict row");
+                return Ok(id);
+            }
+            let now = Utc::now().to_rfc3339();
             conn.execute(
-                "UPDATE conflicts SET conflict_type = ?1, svn_content = ?2, git_content = ?3,
-                 base_content = ?4, svn_rev = ?5, git_sha = ?6, status = 'detected'
-                 WHERE id = ?7",
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+                 base_content, svn_rev, git_sha, status, created_at, repo_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
+                    conflict.id,
+                    conflict.file_path,
                     conflict.conflict_type,
                     conflict.svn_content,
                     conflict.git_content,
                     conflict.base_content,
                     conflict.svn_revision,
                     conflict.git_hash,
-                    id,
+                    conflict.status,
+                    now,
+                    conflict.repo_id
                 ],
             )?;
-            debug!(id = %id, file_path = %conflict.file_path, "refreshed detected conflict");
-            return Ok(id);
+            debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted detected conflict");
+            Ok(conflict.id.clone())
+        })();
+        match result {
+            Ok(id) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(id)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        self.insert_conflict(conflict)
     }
 
     /// Get a conflict by ID (returns an error if not found).
@@ -3056,6 +3133,60 @@ mod tests {
             .unwrap();
         let resolved = db.get_conflict_entry(&id).unwrap();
         assert_eq!(resolved.status, "resolved");
+    }
+
+    #[test]
+    fn record_detected_conflict_preserves_in_progress_status() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+                 VALUES ('c1', 'shared.txt', 'content', 'queued', '2020-01-01T00:00:00Z', 'repo-a')",
+                [],
+            )
+            .unwrap();
+        let mut refresh = models::Conflict::new("shared.txt".into());
+        refresh.id = "c2".into();
+        refresh.svn_content = Some("svn".into());
+        refresh.git_content = Some("git".into());
+        refresh.svn_revision = Some(1);
+        refresh.git_hash = Some("abc".into());
+        refresh.repo_id = Some("repo-a".into());
+        let id = db.record_detected_conflict(&refresh).unwrap();
+        assert_eq!(id, "c1");
+        assert_eq!(db.get_conflict_entry(&id).unwrap().status, "queued");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn record_detected_conflict_matches_deferred_instead_of_duplicating() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+                 VALUES ('c1', 'shared.txt', 'content', 'deferred', '2020-01-01T00:00:00Z', 'repo-a')",
+                [],
+            )
+            .unwrap();
+        let mut refresh = models::Conflict::new("shared.txt".into());
+        refresh.id = "c2".into();
+        refresh.svn_content = Some("svn".into());
+        refresh.git_content = Some("git".into());
+        refresh.svn_revision = Some(2);
+        refresh.git_hash = Some("def".into());
+        refresh.repo_id = Some("repo-a".into());
+        let id = db.record_detected_conflict(&refresh).unwrap();
+        assert_eq!(id, "c1");
+        assert_eq!(db.get_conflict_entry(&id).unwrap().status, "deferred");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
