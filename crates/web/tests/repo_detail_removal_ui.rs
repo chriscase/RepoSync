@@ -55,8 +55,20 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
         "Root delete copy must not promise permanent removal while disabling"
     );
     assert!(
+        src.contains("removeBranchOpts"),
+        "Branch remote deletion must default to false in managed removal UI"
+    );
+    assert!(
         src.contains("delete_git: false, delete_svn: false"),
         "Branch remote deletion must default to false in UI"
+    );
+    assert!(
+        src.contains("removalPreviewReady"),
+        "Remove confirm must wait for dependency preview to load"
+    );
+    assert!(
+        src.contains("data-testid=\"removal-preview-retry\""),
+        "Remove confirm must offer retry when preview fails"
     );
     let query_builder = include_str!("../../../web-ui/src/branchPairDeletion.ts");
     assert!(
@@ -84,6 +96,10 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
     assert!(
         panel.contains("Retry only retries owned local cleanup"),
         "Retry copy must not imply remote deletion"
+    );
+    assert!(
+        panel.contains("managed-removal-restore"),
+        "Managed removal panel must expose restore control"
     );
     assert!(
         src.contains("managed-removal-dependency-preview"),

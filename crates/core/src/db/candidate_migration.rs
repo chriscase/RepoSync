@@ -630,7 +630,39 @@ impl CopySession {
         let svn_root = owned_root(svn_root)?;
         let git_remote = owned_root(git_remote)?;
         let c = source_db(&self.source.join("reposync.db"))?;
-        let (url,branch,provider,api,git_repo,git_branch,rev,sha,enabled,paths,blocks):(String,String,String,String,String,String,i64,String,i64,Option<String>,Option<String>)=c.query_row("SELECT svn_url,svn_branch,git_provider,git_api_url,git_repo,git_branch,last_svn_rev,last_git_sha,enabled,allowed_paths,blocked_patterns FROM repositories WHERE id=?1",[repo],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)))?;
+        type RepoIdentityRow = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+        );
+        let (url, branch, provider, api, git_repo, git_branch, rev, sha, enabled, paths, blocks): RepoIdentityRow =
+            c.query_row(
+                "SELECT svn_url,svn_branch,git_provider,git_api_url,git_repo,git_branch,last_svn_rev,last_git_sha,enabled,allowed_paths,blocked_patterns FROM repositories WHERE id=?1",
+                [repo],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                    ))
+                },
+            )?;
         ensure!(
             enabled == 1 && paths.is_none() && blocks.is_none(),
             "disabled/filtered policy unqualified"
@@ -837,7 +869,7 @@ impl CopySession {
             ensure!(
                 imported
                     .last()
-                    .map_or(true, |previous_rev| imported_rev > *previous_rev),
+                    .is_none_or(|previous_rev| imported_rev > *previous_rev),
                 "duplicate/unordered import revision"
             );
             ensure!(c.query_row("SELECT count(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",rusqlite::params![repo,imported_rev,oid],|r|r.get::<_,i64>(0))?==1,"pruned/ambiguous applied history");
