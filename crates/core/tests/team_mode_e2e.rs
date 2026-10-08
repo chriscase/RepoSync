@@ -2131,7 +2131,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
-    let restored_db = Database::new(&restored.join("reposync.db")).unwrap();
+    let restored_db = Database::new(restored.join("reposync.db")).unwrap();
     assert_eq!(
         restored_db.get_repo_watermark("pair").unwrap(),
         (old_svn_rev, old_tip.clone())

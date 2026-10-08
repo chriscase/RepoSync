@@ -1763,7 +1763,7 @@ mod tests {
             panic!("expected cleanup");
         };
         crate::managed_remove::remove_owned_repo_tree(
-            &tempfile::tempdir().unwrap().path(),
+            tempfile::tempdir().unwrap().path(),
             "restore-me",
         )
         .unwrap();

@@ -4,6 +4,7 @@ import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
+  branchPairRemovalOutcome,
   isNotFoundError,
   removalDestination,
   repoDetailQueryKeys,
@@ -102,6 +103,7 @@ export default function RepoDetail() {
   const [gitTesting, setGitTesting] = useState(false);
   const [showBranchModal, setShowBranchModal] = useState(false);
   const [removalTarget, setRemovalTarget] = useState<Repository | null>(null);
+  const [branchPairDeleteTarget, setBranchPairDeleteTarget] = useState<Repository | null>(null);
   const [removeConfirmText, setRemoveConfirmText] = useState('');
   const [removeBranchOpts, setRemoveBranchOpts] = useState({ delete_git: false, delete_svn: false });
   const [branchForm, setBranchForm] = useState({
@@ -291,21 +293,90 @@ export default function RepoDetail() {
 
   const removalSubject = removalTarget ?? repo;
   const removalSubjectId = removalSubject?.id ?? id;
+  const branchPairDeleteSubject = branchPairDeleteTarget;
 
   const removeMutation = useMutation({
     mutationFn: async () => {
-      const target = removalTarget ?? repo;
-      if (!target?.id) {
+      const target = branchPairDeleteTarget ?? removalTarget ?? repo;
+      if (!target?.id || !id) {
         throw new Error('No repository selected for removal');
       }
-      const remoteOpts = target.parent_id ? removeBranchOpts : undefined;
-      const result = await api.removeManagedRepo(target.id, remoteOpts);
-      return { result, target };
+      if (target.parent_id) {
+        const gitOpt = document.querySelector('[data-testid="delete-git-opt"]') as HTMLInputElement | null;
+        const svnOpt = document.querySelector('[data-testid="delete-svn-opt"]') as HTMLInputElement | null;
+        const options = {
+          delete_git: gitOpt?.checked ?? removeBranchOpts.delete_git,
+          delete_svn: svnOpt?.checked ?? removeBranchOpts.delete_svn,
+        };
+        let parentExists: boolean | null = null;
+        if (target.id === id && target.parent_id) {
+          try {
+            await api.getRepo(target.parent_id);
+            parentExists = true;
+          } catch (lookupError) {
+            parentExists = isNotFoundError(lookupError) ? false : null;
+          }
+        }
+        const destination = removalDestination({
+          viewedId: id,
+          targetId: target.id,
+          parentId: target.parent_id,
+          parentExists,
+        });
+        const result = await api.deleteBranchPair(target.id, options);
+        const outcome = branchPairRemovalOutcome(result);
+        if (outcome === 'rejected') {
+          throw new Error(result.message || 'Branch pair was not removed');
+        }
+        return { kind: 'branch_pair' as const, result, target, destination, outcome };
+      }
+      const result = await api.removeManagedRepo(target.id);
+      return { kind: 'managed' as const, result, target };
     },
-    onSuccess: async ({ result, target }) => {
+    onSuccess: async (payload) => {
       setShowRemoveConfirm(false);
       setRemovalTarget(null);
+      setBranchPairDeleteTarget(null);
       setRemoveConfirmText('');
+      queryClient.invalidateQueries({ queryKey: ['repos'] });
+
+      if (payload.kind === 'branch_pair') {
+        const { result, target, destination, outcome } = payload;
+        const notice: RemovalNotice = {
+          outcome: outcome === 'in_progress' ? 'in_progress' : 'completed',
+          message: result.message
+            || (outcome === 'in_progress'
+              ? 'The removal request was accepted and has not finished.'
+              : `Branch pair ${target.name} was removed.`),
+          warnings: result.warnings ?? [],
+          operationId: result.operation_id,
+          name: target.name,
+        };
+        const registrationGone = result.registration_listed === false;
+        const leaveViewedPair = target.id === id
+          && (outcome === 'completed' || registrationGone);
+        if (leaveViewedPair) {
+          for (const queryKey of repoDetailQueryKeys(target.id)) {
+            await queryClient.cancelQueries({ queryKey });
+          }
+          setRetiredId(target.id);
+          setLocalNotice(null);
+          persistBranchPairRemovalNotice(notice);
+          navigate(destination ?? '/repos', {
+            replace: true,
+            state: { branchPairRemoval: notice },
+          });
+          return;
+        }
+        if (target.id !== id) {
+          queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
+        }
+        persistBranchPairRemovalNotice(notice);
+        setLocalNotice(notice);
+        return;
+      }
+
+      const { result, target } = payload;
       const receipt = {
         repoId: target.id,
         operationId: result.operation_id,
@@ -317,48 +388,12 @@ export default function RepoDetail() {
       setRemovalReceipt(receipt);
       queryClient.setQueryData(['managed-removal', target.id], result);
       queryClient.invalidateQueries({ queryKey: ['managed-removal', target.id] });
-      queryClient.invalidateQueries({ queryKey: ['repos'] });
-      if (target.id !== id) {
-        queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
-      }
-      if (result.state === 'completed' && result.registration_listed === false) {
-        const notice: RemovalNotice = {
-          outcome: 'completed',
-          message: result.message,
-          warnings: [],
-          operationId: result.operation_id,
-          name: target.name,
-        };
-        let parentExists: boolean | null = null;
-        if (target.parent_id) {
-          try {
-            await api.getRepo(target.parent_id);
-            parentExists = true;
-          } catch (lookupError) {
-            parentExists = isNotFoundError(lookupError) ? false : null;
-          }
-        }
-        const destination = removalDestination({
-          viewedId: id!,
-          targetId: target.id,
-          parentId: target.parent_id,
-          parentExists,
-        });
-        if (target.id === id) {
-          for (const queryKey of repoDetailQueryKeys(target.id)) {
-            await queryClient.cancelQueries({ queryKey });
-          }
-          setRetiredId(target.id);
-          if (target.parent_id) {
-            persistBranchPairRemovalNotice(notice);
-            navigate(destination ?? '/repos', { replace: true, state: { branchPairRemoval: notice } });
-          } else {
-            navigate('/repos', { replace: true });
-          }
-        } else {
-          persistBranchPairRemovalNotice(notice);
-          setLocalNotice(notice);
-        }
+      const registrationGone = result.registration_listed === false;
+      const leaveViewedPair = target.id === id
+        && `${result.state}`.toLowerCase() === 'completed'
+        && registrationGone;
+      if (leaveViewedPair) {
+        navigate('/repos', { replace: true });
       }
     },
   });
@@ -377,7 +412,7 @@ export default function RepoDetail() {
   const removalPreviewQuery = useQuery({
     queryKey: ['removal-preview', removalSubjectId],
     queryFn: () => api.getRemovalDependencyPreview(removalSubjectId!),
-    enabled: !!removalSubjectId && isAdmin && showRemoveConfirm && detailLive,
+    enabled: !!removalSubjectId && isAdmin && showRemoveConfirm && detailLive && !removalSubject?.parent_id,
     retry: false,
   });
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
@@ -417,11 +452,11 @@ export default function RepoDetail() {
         }
       : undefined);
 
+  const childRemovalConfirm = !!(removalSubject?.parent_id);
   const removalPreviewReady = !!removalDependencyPreview
     && !removalPreviewQuery.isLoading
     && !removalPreviewQuery.isFetching
     && !removalPreviewQuery.isError;
-  const childRemovalConfirm = !!(removalSubject?.parent_id);
   const removalConfirmLabel = childRemovalConfirm ? 'Remove branch pair' : 'Remove from RepoSync';
 
   const auditEntries = auditLog?.entries ?? [];
@@ -602,6 +637,11 @@ export default function RepoDetail() {
   return (
     <div className="space-y-6" data-testid="repo-detail" data-repo-id={id}>
       {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
+      {removeMutation.isError && branchPairDeleteSubject && (
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
+          {removeMutation.error?.message}
+        </div>
+      )}
       {isAdmin && removalPanelStatus && (
         <ManagedRemovalPanel
           status={removalPanelStatus}
@@ -1409,11 +1449,10 @@ export default function RepoDetail() {
                             data-testid={`delete-child-pair-${bp.id}`}
                             onClick={(e) => {
                               e.stopPropagation();
-                              setRemovalTarget(bp);
+                              setBranchPairDeleteTarget(bp);
                               setRemoveConfirmText('');
                               setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                               removeMutation.reset();
-                              setShowRemoveConfirm(true);
                             }}
                             className="text-gray-500 hover:text-red-400 transition-colors p-1"
                             title="Delete branch pair"
@@ -1648,11 +1687,11 @@ export default function RepoDetail() {
                 <button
                   data-testid="delete-viewed-branch-pair"
                   onClick={() => {
-                    setRemovalTarget(null);
+                    if (!repo) return;
+                    setBranchPairDeleteTarget(repo);
                     setRemoveConfirmText('');
                     setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                     removeMutation.reset();
-                    setShowRemoveConfirm(true);
                   }}
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-red-700 text-red-400 hover:bg-red-900/30 text-sm font-medium transition-colors"
                 >
@@ -1713,54 +1752,91 @@ export default function RepoDetail() {
         </div>
       )}
 
-      {showRemoveConfirm && removalSubject && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" data-testid="managed-remove-modal">
+      {branchPairDeleteSubject && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" data-testid="delete-branch-modal">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
+            <div className="p-6 space-y-4">
+              {removeMutation.isError && (
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error">
+                  {removeMutation.error?.message}
+                </div>
+              )}
+              <p className="text-sm text-gray-300">
+                Remove branch pair <span className="font-semibold text-gray-100">{branchPairDeleteSubject.name}</span>{' '}
+                from RepoSync. Remote ref/path deletion is opt-in below.
+              </p>
+              <div className="text-xs text-gray-400 border border-gray-600 rounded p-2 space-y-1" data-testid="branch-remote-deletion-preview">
+                <p>Git ref: <span className="font-mono text-gray-200">{branchPairDeleteSubject.git_branch}</span> — {removeBranchOpts.delete_git ? 'will be deleted on remote when authorized' : 'left on remote'}</p>
+                <p>SVN path: <span className="font-mono text-gray-200">{branchPairDeleteSubject.svn_branch}</span> — {removeBranchOpts.delete_svn ? 'will be deleted on remote when authorized (history retained)' : 'left on remote'}</p>
+              </div>
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={removeBranchOpts.delete_git}
+                    data-testid="delete-git-opt"
+                    onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_git: e.target.checked }))}
+                    className="rounded border-gray-600 bg-gray-700 text-red-600" />
+                  <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-500 font-mono">({branchPairDeleteSubject.git_branch})</span></span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="checkbox" checked={removeBranchOpts.delete_svn}
+                    data-testid="delete-svn-opt"
+                    onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_svn: e.target.checked }))}
+                    className="rounded border-gray-600 bg-gray-700 text-red-600" />
+                  <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-500 font-mono">({branchPairDeleteSubject.svn_branch})</span></span>
+                </label>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400 mb-2">
+                  Type <span className="font-mono text-yellow-300">{branchPairDeleteSubject.git_branch}</span> to confirm:
+                </p>
+                <input
+                  type="text"
+                  data-testid="delete-branch-confirm-input"
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
+                  value={removeConfirmText}
+                  onChange={(e) => setRemoveConfirmText(e.target.value)}
+                  placeholder={branchPairDeleteSubject.git_branch}
+                />
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
+              <button
+                data-testid="cancel-delete-branch-pair"
+                onClick={() => {
+                  setBranchPairDeleteTarget(null);
+                  setRemoveConfirmText('');
+                  removeMutation.reset();
+                }}
+                className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                data-testid="confirm-delete-branch-pair"
+                onClick={() => removeMutation.mutate()}
+                disabled={removeMutation.isPending || removeConfirmText !== branchPairDeleteSubject.git_branch}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+                {removeMutation.isPending ? 'Deleting...' : 'Delete Branch Pair'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showRemoveConfirm && removalSubject && !branchPairDeleteSubject && (
+        <div
+          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+          data-testid="managed-remove-modal"
+        >
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
             <h3 className="text-lg font-semibold text-gray-100 mb-2">{removalConfirmLabel}</h3>
             <p className="text-sm text-gray-400 mb-4">
               Remove <span className="font-semibold text-gray-200">{removalSubject.name}</span> from active listings and
               clean only RepoSync-owned local data. Remote Git and SVN history are not deleted unless you opt in below.
-              {childRemovalConfirm
-                ? ' Managed removal keeps parent and sibling data unless preview shows otherwise.'
-                : ' Completed removals can be restored while recovery metadata remains.'}
+              Completed removals can be restored while recovery metadata remains.
             </p>
-            {childRemovalConfirm && (
-              <>
-                <div className="text-xs text-gray-400 border border-gray-600 rounded p-2 space-y-1 mb-4" data-testid="branch-remote-deletion-preview">
-                  <p>Git ref: <span className="font-mono text-gray-200">{removalSubject.git_branch}</span> — {removeBranchOpts.delete_git ? 'will be deleted on remote when authorized' : 'left on remote'}</p>
-                  <p>SVN path: <span className="font-mono text-gray-200">{removalSubject.svn_branch}</span> — {removeBranchOpts.delete_svn ? 'will be deleted on remote when authorized (history retained)' : 'left on remote'}</p>
-                </div>
-                <div className="space-y-2 mb-4">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" checked={removeBranchOpts.delete_git}
-                      data-testid="delete-git-opt"
-                      onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_git: e.target.checked }))}
-                      className="rounded border-gray-600 bg-gray-700 text-red-600" />
-                    <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-500 font-mono">({removalSubject.git_branch})</span></span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input type="checkbox" checked={removeBranchOpts.delete_svn}
-                      data-testid="delete-svn-opt"
-                      onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_svn: e.target.checked }))}
-                      className="rounded border-gray-600 bg-gray-700 text-red-600" />
-                    <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-500 font-mono">({removalSubject.svn_branch})</span></span>
-                  </label>
-                </div>
-                <div className="mb-4">
-                  <p className="text-sm text-gray-400 mb-2">
-                    Type <span className="font-mono text-yellow-300">{removalSubject.git_branch}</span> to confirm:
-                  </p>
-                  <input
-                    type="text"
-                    data-testid="delete-branch-confirm-input"
-                    className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
-                    value={removeConfirmText}
-                    onChange={(e) => setRemoveConfirmText(e.target.value)}
-                    placeholder={removalSubject.git_branch}
-                  />
-                </div>
-              </>
-            )}
             {removalPreviewQuery.isLoading && (
               <p className="text-sm text-gray-400 mb-4" data-testid="removal-preview-loading">
                 Loading dependency preview…
@@ -1860,13 +1936,12 @@ export default function RepoDetail() {
                 Cancel
               </button>
               <button
-                data-testid={childRemovalConfirm ? 'confirm-delete-branch-pair' : 'confirm-remove-from-reposync'}
+                data-testid="confirm-remove-from-reposync"
                 onClick={() => removeMutation.mutate()}
                 disabled={
                   removeMutation.isPending
                   || !removalPreviewReady
                   || removalDependencyPreview?.parent_removal_blocked
-                  || (childRemovalConfirm && removeConfirmText !== removalSubject.git_branch)
                 }
                 className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >

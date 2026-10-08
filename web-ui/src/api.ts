@@ -642,7 +642,7 @@ export const api = {
       }
       throw new Error(message || 'Session expired — please log in again');
     }
-    if (!res.ok) {
+    if (!res.ok && res.status !== 202) {
       throw new Error(message);
     }
     return body;

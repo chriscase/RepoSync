@@ -3004,10 +3004,10 @@ async fn test_replay_commit_confirm_fail_preserves_committed_tree() {
         "finalize must not create a second SVN revision"
     );
     assert!(
-        !db_arc
+        db_arc
             .active_personal_svn_commit_operation()
             .unwrap()
-            .is_some(),
+            .is_none(),
         "journal must clear after finalize"
     );
     let mapped = db_arc
@@ -5424,10 +5424,10 @@ async fn test_personal_git_to_svn_lost_reply_holds_without_checkpoint() {
         svn_after,
         "held retry must not write SVN again"
     );
-    assert!(!db_arc
+    assert!(db_arc
         .active_personal_svn_commit_operation()
         .unwrap()
-        .is_some());
+        .is_none());
     assert!(
         db_arc
             .list_commit_map(10)
