@@ -50,7 +50,9 @@ SCENARIOS=(
   "R16_SVNSERVE_MISSING_GIT_BRANCH:scenario_r16_svnserve_missing_git_branch"
   "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP:scenario_r01_svnserve_bidirectional_roundtrip"
   "R16_SVNSERVE_CREDENTIAL_ROTATION:scenario_r16_svnserve_credential_rotation"
+  "R16_SVNSERVE_PARENT_CHILD_CREDENTIAL_CHAIN_ROTATION:scenario_r16_svnserve_parent_child_credential_chain_rotation"
   "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD:scenario_r17_svnserve_concurrent_credential_reload"
+  "R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD:scenario_r17_svnserve_parent_child_concurrent_credential_reload"
 )
 
 mkdir -p "$ARTIFACT_DIR"
