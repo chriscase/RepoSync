@@ -203,6 +203,11 @@ fn advance_git_with_receipt_tx(
             "team cycle mapping lacks a full Git SHA".into(),
         ));
     }
+    let outbound_applied: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+        [repo_id],
+        |row| row.get(0),
+    )?;
     let updated = tx.execute(
         "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
         params![git_sha, repo_id],
@@ -212,7 +217,9 @@ fn advance_git_with_receipt_tx(
             "team cycle mapping lost its repository registration".into(),
         ));
     }
-    write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
+    if outbound_applied == 0 {
+        write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
+    }
     let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
     let mut receipt = receipt;
     crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);

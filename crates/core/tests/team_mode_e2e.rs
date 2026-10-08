@@ -13174,13 +13174,72 @@ async fn candidate_echo_column_bootstrap_sync_cycle_bounded_no_db_mutex_hang() {
     .await;
     assert!(
         cycle.is_ok(),
-        "sync cycle must finish within bounded time when proving column-only bootstrap inbound cursor"
+        "sync cycle must finish within bounded time (must not deadlock on database mutex reentrancy)"
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"ECHO_COLUMN_BOOTSTRAP_BOUNDED",
+            "cycle_completed":true,
             "cycle_ok":cycle.unwrap().is_ok()
+        })
+    );
+}
+
+// Refs #63: post-history column-only cursor must block without hanging the sync cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_shape1_column_only_unproved_blocks_sync_cycle_bounded() {
+    if !svn_available() {
+        return;
+    }
+    let fixture = QualifiedPair::new().await;
+    let handled = fixture
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT git_sha FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let unproved = fixture.developer_commit("shape1.txt", "n\n", "unproved tip");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&unproved],
+        )
+        .unwrap();
+    let cycle = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fixture.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("sync cycle must not hang");
+    assert!(
+        matches!(
+            cycle,
+            Err(SyncError::HistoryBlocked { ref reason, .. })
+                if reason == "ambiguous_checkpoint"
+        ),
+        "unproved column-only cursor after history must block: {cycle:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_SHAPE1_COLUMN_ONLY_UNPROVED",
+            "handled":handled,
+            "unproved":unproved
         })
     );
 }
