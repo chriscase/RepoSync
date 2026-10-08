@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -35,6 +35,8 @@ const CASE_SVN_REMOTE: &str = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE";
 const CASE_SVN_AUTH: &str = "R16_SVNSERVE_SVN_AUTH_DENIED";
 const CASE_MISSING_BRANCH: &str = "R16_SVNSERVE_MISSING_GIT_BRANCH";
 const CASE_BIDIRECTIONAL: &str = "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP";
+const CASE_CREDENTIAL_ROTATION: &str = "R16_SVNSERVE_CREDENTIAL_ROTATION";
+const CASE_CONCURRENT_CREDENTIAL_RELOAD: &str = "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD";
 
 // ===========================================================================
 // Tooling and evidence helpers
@@ -80,11 +82,14 @@ struct CycleWindow {
     end: Instant,
 }
 
+static IMPORT_CYCLE_ID: AtomicUsize = AtomicUsize::new(1);
+
 struct ImportCycleOracle {
     windows: Mutex<Vec<CycleWindow>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
-    active_cycles: Mutex<HashSet<String>>,
+    active_cycle_ids: Mutex<HashSet<usize>>,
+    cycle_id_labels: Mutex<std::collections::HashMap<usize, String>>,
     finished_while_peer_in_flight: Mutex<HashSet<String>>,
 }
 
@@ -94,9 +99,67 @@ impl ImportCycleOracle {
             windows: Mutex::new(Vec::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
-            active_cycles: Mutex::new(HashSet::new()),
+            active_cycle_ids: Mutex::new(HashSet::new()),
+            cycle_id_labels: Mutex::new(std::collections::HashMap::new()),
             finished_while_peer_in_flight: Mutex::new(HashSet::new()),
         }
+    }
+
+    fn alloc_cycle_id() -> usize {
+        IMPORT_CYCLE_ID.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn begin_import_cycle(&self, cycle_id: usize, label: &str) -> bool {
+        let active = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(active, Ordering::SeqCst);
+        let mut ids = self.active_cycle_ids.lock().unwrap();
+        let peer_present = !ids.is_empty();
+        ids.insert(cycle_id);
+        self.cycle_id_labels
+            .lock()
+            .unwrap()
+            .insert(cycle_id, label.to_string());
+        peer_present
+    }
+
+    fn has_peer_cycle(&self, cycle_id: usize) -> bool {
+        self.active_cycle_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| *id != cycle_id)
+    }
+
+    fn both_labels_in_flight(&self, left: &str, right: &str) -> bool {
+        let labels = self.cycle_id_labels.lock().unwrap();
+        let mut seen_left = false;
+        let mut seen_right = false;
+        for label in labels.values() {
+            if label == left {
+                seen_left = true;
+            }
+            if label == right {
+                seen_right = true;
+            }
+        }
+        seen_left && seen_right
+    }
+
+    fn end_import_cycle(
+        &self,
+        cycle_id: usize,
+        label: &str,
+        span_start: Instant,
+        span_end: Instant,
+    ) {
+        self.active_cycle_ids.lock().unwrap().remove(&cycle_id);
+        self.cycle_id_labels.lock().unwrap().remove(&cycle_id);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.windows.lock().unwrap().push(CycleWindow {
+            label: label.to_string(),
+            start: span_start,
+            end: span_end,
+        });
     }
 
     fn windows_overlap(&self, left: &str, right: &str) -> bool {
@@ -117,46 +180,41 @@ async fn run_import_with_lock_retry(
     label: &str,
     oracle: Option<&ImportCycleOracle>,
 ) -> Result<SyncStats, SyncError> {
+    let cycle_id = oracle
+        .map(|_| ImportCycleOracle::alloc_cycle_id())
+        .unwrap_or(0);
+    let span_start = Instant::now();
+    let mut peer_overlap_latch = false;
+    if let Some(tracker) = oracle {
+        peer_overlap_latch = tracker.begin_import_cycle(cycle_id, label);
+    }
     for attempt in 0..12 {
-        let cycle_start = Instant::now();
-        if let Some(tracker) = oracle {
-            let active = tracker.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            tracker.max_in_flight.fetch_max(active, Ordering::SeqCst);
-            tracker
-                .active_cycles
-                .lock()
-                .unwrap()
-                .insert(label.to_string());
-        }
         let cycle_result = engine.run_sync_cycle().await;
         let cycle_end = Instant::now();
-        if let Some(tracker) = oracle {
-            let peer_cycle_still_active = {
-                let active = tracker.active_cycles.lock().unwrap();
-                active.len() > 1
-            };
-            if matches!(&cycle_result, Ok(_)) && peer_cycle_still_active {
-                tracker
-                    .finished_while_peer_in_flight
-                    .lock()
-                    .unwrap()
-                    .insert(label.to_string());
-            }
-            tracker.active_cycles.lock().unwrap().remove(label);
-            tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
-            tracker.windows.lock().unwrap().push(CycleWindow {
-                label: label.to_string(),
-                start: cycle_start,
-                end: cycle_end,
-            });
-        }
         match cycle_result {
-            Ok(stats) => return Ok(stats),
+            Ok(stats) => {
+                if let Some(tracker) = oracle {
+                    if peer_overlap_latch || tracker.has_peer_cycle(cycle_id) {
+                        tracker
+                            .finished_while_peer_in_flight
+                            .lock()
+                            .unwrap()
+                            .insert(label.to_string());
+                    }
+                    tracker.end_import_cycle(cycle_id, label, span_start, cycle_end);
+                }
+                return Ok(stats);
+            }
             Err(error) if is_transient_import_contention(&error) && attempt + 1 < 12 => {
                 tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
                     .await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if let Some(tracker) = oracle {
+                    tracker.end_import_cycle(cycle_id, label, span_start, cycle_end);
+                }
+                return Err(error);
+            }
         }
     }
     unreachable!("retry loop must return")
@@ -389,6 +447,14 @@ fn make_identity_mapper() -> IdentityMapper {
         ..Default::default()
     };
     IdentityMapper::new(&config).unwrap()
+}
+
+fn rotate_svnserve_password(repo_dir: &Path, username: &str, new_password: &str) {
+    write_svnserve_auth(repo_dir, username, new_password);
+}
+
+fn svnserve_repo_dir(svn_root: &Path, repo_id: &str) -> PathBuf {
+    svn_root.join(repo_id)
 }
 
 fn write_svnserve_auth(repo_dir: &Path, username: &str, password: &str) {
@@ -937,6 +1003,10 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
         .lock()
         .unwrap()
         .is_empty();
+    assert!(
+        max_in_flight <= 2,
+        "lock-retry must not double-count in_flight (saw {max_in_flight})"
+    );
     assert!(
         peak_concurrent_import_cycles
             && import_cycle_windows_overlapped
@@ -1815,4 +1885,233 @@ async fn scenario_r16_svnserve_missing_git_branch() {
             "mapping_count_before_after": [mappings_before, mappings_after],
         }),
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_r16_svnserve_credential_rotation() {
+    if !require_toolchain(CASE_CREDENTIAL_ROTATION) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let before = fixture.checkpoint_snapshot();
+    let svn_root = fixture.tmp.path().join("svnserve-root");
+    let repo_dir = svnserve_repo_dir(&svn_root, &fixture.repo.id);
+    let rotated = "syncer-rotated-secret-only";
+    rotate_svnserve_password(&repo_dir, &fixture.repo.username, rotated);
+    let db = setup_db(&fixture.db_path);
+    db.set_state(&format!("secret_svn_password_{}", fixture.repo.id), rotated)
+        .unwrap();
+    let old_client = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    assert!(
+        old_client.info().await.is_err(),
+        "svnserve must reject the pre-rotation password"
+    );
+    let new_client = SvnClient::new(&fixture.repo.svn_url, &fixture.repo.username, rotated);
+    assert!(
+        new_client.info().await.is_ok(),
+        "svnserve must accept the rotated password"
+    );
+    let reopened = fixture.make_engine();
+    let _rev = svn_commit_file(
+        &fixture.wc,
+        "after-rotation.txt",
+        "post rotation\n",
+        "SVN after credential rotation",
+        &fixture.repo.username,
+        rotated,
+    );
+    let stats = reopened.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    let after = fixture.checkpoint_snapshot();
+    assert_ne!(after, before);
+    emit_evidence(
+        CASE_CREDENTIAL_ROTATION,
+        "PASS",
+        serde_json::json!({
+            "old_password_rejected": true,
+            "new_password_accepted": true,
+            "reopened_engine_sync_after_rotation": true,
+            "checkpoint_before_after": [before, after],
+            "note": "real svnserve passwd-db rotation with scoped kv reload on new SyncEngine cycle",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_r17_svnserve_concurrent_credential_reload() {
+    if !require_toolchain(CASE_CONCURRENT_CREDENTIAL_RELOAD) {
+        return;
+    }
+    let fixture = DualRepoFixture::new();
+    let alpha = fixture.repos[0].clone();
+    let beta = fixture.repos[1].clone();
+    let svn_root = fixture.tmp.path().join("svnserve-root");
+    let alpha_repo_dir = svnserve_repo_dir(&svn_root, &alpha.id);
+    let overlap_kv_marker = "alpha-kv-only-mid-overlap-marker";
+    let rotated = "alpha-rotated-after-overlap-only";
+    let db = setup_db(&fixture.db_path);
+    let beta_secret_before = db
+        .get_state("secret_svn_password_repo_beta")
+        .unwrap()
+        .clone();
+    let alpha_secret_before = db
+        .get_state("secret_svn_password_repo_alpha")
+        .unwrap()
+        .clone();
+    let ready = Arc::new(tokio::sync::Barrier::new(3));
+    let oracle = Arc::new(ImportCycleOracle::new());
+    let overlap_at_kv_rewrite = Arc::new(AtomicBool::new(false));
+    let kv_rewrite_during_overlap = Arc::new(AtomicBool::new(false));
+
+    let (alpha_result, beta_result, _) = tokio::join!(
+        async {
+            ready.wait().await;
+            let mut engine = fixture.make_engine(&alpha);
+            run_import_with_lock_retry(&mut engine, "repo_alpha", Some(&oracle)).await
+        },
+        async {
+            ready.wait().await;
+            let mut engine = fixture.make_engine(&beta);
+            run_import_with_lock_retry(&mut engine, "repo_beta", Some(&oracle)).await
+        },
+        async {
+            ready.wait().await;
+            let mut saw_overlap = false;
+            for _ in 0..400 {
+                if oracle.both_labels_in_flight("repo_alpha", "repo_beta") {
+                    saw_overlap = true;
+                    overlap_at_kv_rewrite.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            if saw_overlap {
+                setup_db(&fixture.db_path)
+                    .set_state("secret_svn_password_repo_alpha", overlap_kv_marker)
+                    .unwrap();
+                kv_rewrite_during_overlap.store(true, Ordering::SeqCst);
+            }
+        }
+    );
+
+    let max_in_flight = oracle.max_in_flight.load(Ordering::SeqCst);
+    let peak_concurrent = max_in_flight >= 2;
+    let db = setup_db(&fixture.db_path);
+    let credential_crossover = db.get_state("secret_svn_password_repo_beta").unwrap()
+        == Some(overlap_kv_marker.into())
+        || db.get_state("secret_svn_password_repo_alpha").unwrap() == beta_secret_before;
+
+    let mut detail = serde_json::json!({
+        "overlap_at_kv_rewrite": overlap_at_kv_rewrite.load(Ordering::SeqCst),
+        "kv_rewrite_during_overlap": kv_rewrite_during_overlap.load(Ordering::SeqCst),
+        "peak_concurrent_import_cycles": peak_concurrent,
+        "max_in_flight": max_in_flight,
+        "beta_secret_unchanged": db.get_state("secret_svn_password_repo_beta").unwrap()
+            == beta_secret_before,
+        "credential_crossover": credential_crossover,
+    });
+
+    let case_status = if alpha_result.is_err() || beta_result.is_err() {
+        "PARTIAL"
+    } else if !overlap_at_kv_rewrite.load(Ordering::SeqCst)
+        || !kv_rewrite_during_overlap.load(Ordering::SeqCst)
+        || !peak_concurrent
+        || max_in_flight > 2
+    {
+        "PARTIAL"
+    } else {
+        let alpha_stats = alpha_result.as_ref().unwrap();
+        let beta_stats = beta_result.as_ref().unwrap();
+        assert_eq!(alpha_stats.svn_to_git_count, 1);
+        assert_eq!(beta_stats.svn_to_git_count, 1);
+        assert_eq!(
+            db.get_state("secret_svn_password_repo_alpha")
+                .unwrap()
+                .as_deref(),
+            Some(overlap_kv_marker),
+            "kv rewrite must remain visible after overlapping imports"
+        );
+        assert!(
+            db.get_state("secret_svn_password_repo_beta").unwrap() == beta_secret_before,
+            "beta scoped secret must not change during alpha kv rewrite"
+        );
+        assert!(!credential_crossover, "scoped secrets must not cross repos");
+        rotate_svnserve_password(&alpha_repo_dir, &alpha.username, rotated);
+        db.set_state("secret_svn_password_repo_alpha", rotated)
+            .unwrap();
+        let old_client = SvnClient::new(
+            &alpha.svn_url,
+            &alpha.username,
+            alpha_secret_before.as_deref().unwrap_or(&alpha.password),
+        );
+        assert!(
+            old_client.info().await.is_err(),
+            "post-overlap svnserve must reject the pre-rotation password"
+        );
+        let rotated_client = SvnClient::new(&alpha.svn_url, &alpha.username, rotated);
+        assert!(
+            rotated_client.info().await.is_ok(),
+            "post-overlap svnserve must accept the rotated password"
+        );
+        let reopened = fixture.make_engine(&alpha);
+        assert_eq!(
+            reopened.fixture_svn_password_marker(),
+            alpha.password,
+            "new engine still carries construction-time svn password until cycle reload"
+        );
+        let _rev = svn_commit_file(
+            &fixture.tmp.path().join("repo_alpha_wc"),
+            "post-reload.txt",
+            "after reload\n",
+            "SVN after concurrent credential reload",
+            &alpha.username,
+            rotated,
+        );
+        let reload_stats = reopened.run_sync_cycle().await;
+        match reload_stats {
+            Ok(stats) if stats.svn_to_git_count == 1 => {
+                assert_eq!(reopened.fixture_svn_password_marker(), rotated);
+                detail["in_flight_import_succeeded_with_pre_rewrite_credential"] =
+                    serde_json::json!(true);
+                detail["post_overlap_cycle_reloaded_rotated_credential"] = serde_json::json!(true);
+                detail["post_reload_mapping"] = serde_json::json!(true);
+                "PASS"
+            }
+            other => {
+                detail["post_overlap_cycle_reloaded_rotated_credential"] = serde_json::json!(false);
+                detail["reload_error"] = serde_json::json!(other.err().map(|e| e.to_string()));
+                "PARTIAL"
+            }
+        }
+    };
+
+    if case_status == "PARTIAL" {
+        if let (Ok(alpha_stats), Ok(beta_stats)) = (&alpha_result, &beta_result) {
+            detail["alpha_svn_to_git"] = serde_json::json!(alpha_stats.svn_to_git_count);
+            detail["beta_svn_to_git"] = serde_json::json!(beta_stats.svn_to_git_count);
+        }
+        detail["note"] = serde_json::json!(
+            "requires overlapping repo_alpha/repo_beta import cycles, kv rewrite only while both labels are in-flight, successful in-flight import with pre-rewrite svn credential, and a later cycle that reloads rotated svnserve/kv credentials"
+        );
+    } else {
+        detail["note"] = serde_json::json!(
+            "kv rewrite while both labels in-flight; in-flight alpha import kept construction-time svn password; post-overlap cycle reloaded rotated scoped secret"
+        );
+    }
+
+    emit_evidence(CASE_CONCURRENT_CREDENTIAL_RELOAD, case_status, detail);
+    if case_status == "PASS" {
+        return;
+    }
+    if alpha_result.is_err() || beta_result.is_err() {
+        panic!(
+            "concurrent credential reload imports failed: alpha={alpha_result:?} beta={beta_result:?}"
+        );
+    }
 }

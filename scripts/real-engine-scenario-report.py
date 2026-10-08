@@ -342,6 +342,17 @@ def run_self_test() -> None:
             "overall PARTIAL but every scenario row is PASS" in e for e in errs
         ), (code, errs)
 
+        stamped_pass_with_partial_rows = full_pass_rows()
+        for row in stamped_pass_with_partial_rows:
+            if row["id"] in {git_id, svn_id}:
+                row["status"] = "PARTIAL"
+        code, errs = ci_gate(
+            write_summary(tmp, stamped_pass_with_partial_rows, "PASS"), allowlist_path
+        )
+        assert code != 0 and any(
+            "overall PASS but scenario rows include FAIL or PARTIAL" in e for e in errs
+        ), (code, errs)
+
         mismatched_counts = full_pass_rows()
         summary_path = write_summary(tmp, mismatched_counts, "PASS")
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
