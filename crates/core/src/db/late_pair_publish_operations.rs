@@ -16,6 +16,8 @@ const PREFIX: &str = "late_pair_publish_v1:";
 #[serde(rename_all = "snake_case")]
 pub enum LatePairPublishState {
     Queued,
+    /// SVN copy intent persisted; copy may be in flight or complete but not yet journaled.
+    SvnCopyPending,
     SvnCopied,
     ChildRegistered,
     ReplayInProgress,
@@ -54,6 +56,8 @@ pub struct LatePairPublishOperation {
     pub baseline_git_sha: String,
     pub baseline_svn_rev: i64,
     pub svn_copy_source_rev: i64,
+    #[serde(default)]
+    pub svn_copy_source_path: Option<String>,
     #[serde(default)]
     pub svn_branch_head_rev: Option<i64>,
     #[serde(default)]
@@ -175,6 +179,7 @@ impl Database {
                 baseline_git_sha: baseline_git_sha.into(),
                 baseline_svn_rev,
                 svn_copy_source_rev,
+                svn_copy_source_path: None,
                 svn_branch_head_rev: None,
                 replayed_git_shas: Vec::new(),
                 outcome_detail: None,

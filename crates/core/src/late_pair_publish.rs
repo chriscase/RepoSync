@@ -178,6 +178,76 @@ fn parent_svn_branch_path(parent: &Repository) -> String {
     }
 }
 
+fn normalize_svn_repo_path(path: &str) -> String {
+    path.trim().trim_start_matches('/').to_string()
+}
+
+/// When the SVN target already exists, prove it is our journaled copy (not a foreign branch).
+async fn verify_existing_svn_target_matches_copy_intent(
+    parent: &Repository,
+    svn_password: &str,
+    svn_branch: &str,
+    expected_source_path: &str,
+    expected_copy_rev: i64,
+) -> Result<i64, LatePairPublishRefusal> {
+    let target_url = format!(
+        "{}/{}",
+        parent.svn_url.trim_end_matches('/'),
+        svn_branch.trim_start_matches('/')
+    );
+    let target = SvnClient::new(&target_url, &parent.svn_username, svn_password);
+    let branch_tip = target
+        .last_changed_revision()
+        .await
+        .map_err(|e| LatePairPublishRefusal {
+            reason: "svn_verify_failed".into(),
+            detail: e.to_string(),
+            plan: None,
+        })?;
+    let root = SvnClient::new(
+        parent.svn_url.trim_end_matches('/'),
+        &parent.svn_username,
+        svn_password,
+    );
+    let expected_src = normalize_svn_repo_path(expected_source_path);
+    let branch_path = format!("/{}", svn_branch.trim_start_matches('/'));
+    for rev in (branch_tip.saturating_sub(8)..=branch_tip).rev() {
+        let entries = root
+            .log(rev, rev)
+            .await
+            .map_err(|e| LatePairPublishRefusal {
+                reason: "svn_verify_failed".into(),
+                detail: e.to_string(),
+                plan: None,
+            })?;
+        for entry in entries {
+            for path in entry.changed_paths {
+                let path_norm = normalize_svn_repo_path(&path.path);
+                let branch_norm = normalize_svn_repo_path(&branch_path);
+                if path_norm != branch_norm {
+                    continue;
+                }
+                if let (Some(cf_path), Some(cf_rev)) =
+                    (path.copy_from_path.as_deref(), path.copy_from_rev)
+                {
+                    if normalize_svn_repo_path(cf_path) == expected_src
+                        && cf_rev == expected_copy_rev
+                    {
+                        return Ok(branch_tip);
+                    }
+                }
+            }
+        }
+    }
+    Err(LatePairPublishRefusal {
+        reason: "existing_svn_target_blocks_publish".into(),
+        detail:
+            "existing SVN target does not match the journaled copy-from baseline for this publish"
+                .into(),
+        plan: None,
+    })
+}
+
 fn git_env(workdir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new("git")
         .args(args)
@@ -596,20 +666,51 @@ pub async fn publish_admitted_late_pair(
         .clone()
         .unwrap_or_else(|| child_id.to_string());
 
-    if op.state == LatePairPublishState::Queued {
+    if matches!(
+        op.state,
+        LatePairPublishState::Queued | LatePairPublishState::SvnCopyPending
+    ) {
         validate_git_publish_preflight(parent, &request.git_branch, db)?;
     }
 
     let source_path = parent_svn_branch_path(parent);
     if op.state == LatePairPublishState::Queued {
-        let svn_head = svn_copy_at_baseline(
-            parent,
-            &creds.svn_password,
-            &request.svn_branch,
-            copy_rev,
-            &source_path,
-        )
-        .await?;
+        op.svn_copy_source_path = Some(source_path.clone());
+        op.state = LatePairPublishState::SvnCopyPending;
+        op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
+        info!(
+            parent_id = %parent.id,
+            svn_branch = %request.svn_branch,
+            copy_source_rev = copy_rev,
+            copy_source_path = %source_path,
+            "late-pair SVN copy intent journaled before svn copy"
+        );
+    }
+
+    if op.state == LatePairPublishState::SvnCopyPending {
+        let intent_source = op
+            .svn_copy_source_path
+            .clone()
+            .unwrap_or_else(|| source_path.clone());
+        let svn_head = if probe.exists {
+            verify_existing_svn_target_matches_copy_intent(
+                parent,
+                &creds.svn_password,
+                &request.svn_branch,
+                &intent_source,
+                copy_rev,
+            )
+            .await?
+        } else {
+            svn_copy_at_baseline(
+                parent,
+                &creds.svn_password,
+                &request.svn_branch,
+                copy_rev,
+                &intent_source,
+            )
+            .await?
+        };
         op.svn_branch_head_rev = Some(svn_head);
         op.state = LatePairPublishState::SvnCopied;
         op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
@@ -617,7 +718,8 @@ pub async fn publish_admitted_late_pair(
             parent_id = %parent.id,
             svn_branch = %request.svn_branch,
             svn_head,
-            "late-pair SVN branch copied from verified baseline revision"
+            resumed_existing = probe.exists,
+            "late-pair SVN branch at verified baseline revision"
         );
     }
 
@@ -718,7 +820,7 @@ pub async fn publish_admitted_late_pair(
         {
             Ok(replayed) => replayed,
             Err(err) => {
-                op.state = LatePairPublishState::Failed;
+                op.state = LatePairPublishState::ReplayInProgress;
                 op.outcome_detail = Some(err.detail.clone());
                 db.update_late_pair_publish_operation(op).map_err(db_err)?;
                 return Err(err);
@@ -873,6 +975,7 @@ mod tests {
             baseline_git_sha: "base".into(),
             baseline_svn_rev: 2,
             svn_copy_source_rev: 2,
+            svn_copy_source_path: None,
             svn_branch_head_rev: None,
             replayed_git_shas: Vec::new(),
             outcome_detail: None,
@@ -882,5 +985,9 @@ mod tests {
         copied.state = LatePairPublishState::SvnCopied;
         copied.svn_branch_head_rev = Some(10);
         assert!(publish_resuming(&copied));
+        let mut pending = op.clone();
+        pending.state = LatePairPublishState::SvnCopyPending;
+        pending.svn_copy_source_path = Some("trunk".into());
+        assert!(publish_resuming(&pending));
     }
 }
