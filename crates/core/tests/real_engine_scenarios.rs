@@ -2054,9 +2054,7 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
         || max_in_flight > 2
     {
         "PARTIAL"
-    } else {
-        let alpha_stats = alpha_result.as_ref().unwrap();
-        let beta_stats = beta_result.as_ref().unwrap();
+    } else if let (Ok(alpha_stats), Ok(beta_stats)) = (&alpha_result, &beta_result) {
         assert_eq!(alpha_stats.svn_to_git_count, 1);
         assert_eq!(beta_stats.svn_to_git_count, 1);
         assert_eq!(
@@ -2137,6 +2135,8 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
                 "PARTIAL"
             }
         }
+    } else {
+        "PARTIAL"
     };
 
     if case_status == "PARTIAL" {
@@ -2587,26 +2587,23 @@ async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
     }
 }
 
-fn block_git_apply_on_bridge_path(bridge: &Path, relative: &str) {
-    let target = bridge.join(relative);
-    if target.exists() {
-        if target.is_dir() {
-            std::fs::remove_dir_all(&target).unwrap();
-        } else {
-            std::fs::remove_file(&target).unwrap();
-        }
-    }
-    std::fs::create_dir(&target).unwrap();
+/// Arms the debug-only per-engine SVN apply fault (real `git apply` runs; stdin patch
+/// bytes are invalid for that revision on this engine only).
+struct RealEngineApplyFaultGuard<'a> {
+    engine: &'a SyncEngine,
 }
 
-fn restore_git_apply_bridge_path(bridge: &Path, relative: &str, content: &str) {
-    let target = bridge.join(relative);
-    if target.is_dir() {
-        std::fs::remove_dir_all(&target).unwrap();
-    } else if target.exists() {
-        std::fs::remove_file(&target).unwrap();
+impl<'a> RealEngineApplyFaultGuard<'a> {
+    fn arm(engine: &'a SyncEngine, revision: i64, bridge: &Path) -> Self {
+        engine.set_svn_apply_test_fault(revision, bridge);
+        Self { engine }
     }
-    std::fs::write(&target, content).unwrap();
+}
+
+impl Drop for RealEngineApplyFaultGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.clear_svn_apply_test_fault();
+    }
 }
 
 async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
@@ -2645,25 +2642,25 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
         &fixture.repo.password,
     );
     assert_eq!((failed, later), (before.0 + 2, before.0 + 3));
-    block_git_apply_on_bridge_path(&fixture.repo.bridge, "fault-apply.txt");
+    let fault = RealEngineApplyFaultGuard::arm(&engine, failed, &fixture.repo.bridge);
     let blocked = engine.run_sync_cycle().await;
     let apply_failed = matches!(
         &blocked,
-        Err(SyncError::GitError(
-            reposync_core::errors::GitError::ApplyFailed(_)
-        ))
+        Err(SyncError::GitError(reposync_core::errors::GitError::ApplyFailed(
+            message
+        ))) if message.contains(&format!("r{failed}"))
     );
     let local_dirty = matches!(
         &blocked,
         Err(SyncError::HistoryBlocked { reason, .. }) if reason == "local_dirty"
     );
     if local_dirty {
-        restore_git_apply_bridge_path(&fixture.repo.bridge, "fault-apply.txt", "");
+        drop(fault);
         emit_evidence(
             CASE_FAILED_APPLY_BARRIER,
             "PARTIAL",
             serde_json::json!({
-                "fault": "bridge_path_is_directory",
+                "fault": "invalid_patch_at_revision",
                 "blocked_before_apply": true,
                 "cycle_error": blocked.as_ref().err().map(|e| e.to_string()),
                 "note": "pre-cycle local_dirty blocked before git apply; svnserve F06 apply barrier not reached",
@@ -2674,20 +2671,20 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
                 CASE_FAILED_APPLY_RETRY,
                 "PARTIAL",
                 serde_json::json!({
-                    "fault": "bridge_path_is_directory",
+                    "fault": "invalid_patch_at_revision",
                     "note": "retry not attempted because barrier injection did not reach git apply",
                 }),
             );
         }
         return;
     }
-    restore_git_apply_bridge_path(&fixture.repo.bridge, "fault-apply.txt", "");
+    drop(fault);
     if !apply_failed {
         emit_evidence(
             CASE_FAILED_APPLY_BARRIER,
             "PARTIAL",
             serde_json::json!({
-                "fault": "bridge_path_is_directory",
+                "fault": "invalid_patch_at_revision",
                 "cycle_error": blocked.as_ref().err().map(|e| e.to_string()),
                 "cycle_ok": blocked.is_ok(),
             }),
@@ -2697,7 +2694,7 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
                 CASE_FAILED_APPLY_RETRY,
                 "PARTIAL",
                 serde_json::json!({
-                    "fault": "bridge_path_is_directory",
+                    "fault": "invalid_patch_at_revision",
                     "note": "unexpected cycle outcome prevented retry proof",
                 }),
             );
@@ -2711,9 +2708,8 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
         "verified N-1\n"
     );
     assert!(
-        !fixture.repo.bridge.join("fault-apply.txt").exists()
-            || fixture.repo.bridge.join("fault-apply.txt").is_dir(),
-        "failed revision file must not be applied as a regular file"
+        !fixture.repo.bridge.join("fault-apply.txt").exists(),
+        "failed revision file must not be applied while apply is blocked"
     );
     let db = setup_db(&fixture.db_path);
     for revision in [failed, later] {
@@ -2734,13 +2730,14 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
         CASE_FAILED_APPLY_BARRIER,
         "PASS",
         serde_json::json!({
-            "fault": "bridge_path_is_directory",
+            "fault": "invalid_patch_at_revision",
             "verified_revision": verified,
             "failed_revision": failed,
             "queued_revision": later,
             "frontier_watermark": frontier.0,
             "bridge_origin_at_frontier": "verified N-1\n",
             "mapping_at_frontier": mapping_at_frontier,
+            "apply_failed_at_revision": failed,
         }),
     );
     if !retry {
@@ -2760,13 +2757,23 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
     );
     let repeat = engine.run_sync_cycle().await.unwrap();
     assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    let db = setup_db(&fixture.db_path);
+    for revision in [failed, later] {
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+            rusqlite::params![fixture.repo.id, revision],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "retry must map applied r{revision}");
+    }
     emit_evidence(
         CASE_FAILED_APPLY_RETRY,
         "PASS",
         serde_json::json!({
             "final_watermark": after.0,
             "repeat_noop": true,
-            "fault": "bridge_path_is_directory",
+            "fault": "invalid_patch_at_revision",
+            "mappings_after_retry": [failed, later],
         }),
     );
 }
@@ -3028,12 +3035,12 @@ async fn scenario_r17_svnserve_notification_isolation() {
         _ => false,
     };
     let per_repo_sync_counters = alpha_row.total_syncs >= 1 && beta_row.total_syncs >= 1;
-    let case_status = if imports_ok
-        && !webhook_crossover
-        && !sync_status_crossover
-        && audit_crossover == 0
-        && per_repo_sync_counters
-    {
+    let webhook_fields_persist = !webhook_crossover;
+    let confinement_ok = webhook_fields_persist && !sync_status_crossover && audit_crossover == 0;
+    let notification_delivery_observed = false;
+    let case_status = if !confinement_ok {
+        "FAIL"
+    } else if notification_delivery_observed {
         "PASS"
     } else {
         "PARTIAL"
@@ -3048,6 +3055,11 @@ async fn scenario_r17_svnserve_notification_isolation() {
             "per_repo_sync_counters": per_repo_sync_counters,
             "alpha_total_syncs": alpha_row.total_syncs,
             "beta_total_syncs": beta_row.total_syncs,
+            "imports_ok": imports_ok,
+            "webhook_fields_persist": webhook_fields_persist,
+            "confinement_ok": confinement_ok,
+            "notification_delivery_observed": notification_delivery_observed,
+            "note": "SyncEngine does not read per-repo teams_webhook_url or invoke Notifier on svnserve cycles; webhook URL persistence and sync_status/audit confinement only",
         }),
     );
 }

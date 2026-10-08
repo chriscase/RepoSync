@@ -111,6 +111,13 @@ fn setup_git_with_bare_origin(
     let git_client = GitClient::init(work_dir).unwrap();
     let repo = git2::Repository::open(work_dir).unwrap();
     repo.remote("origin", bare_dir.to_str().unwrap()).unwrap();
+    // Match `import_config().branch` (`main`) so publication can succeed.
+    assert!(Command::new("git")
+        .args(["checkout", "-B", "main"])
+        .current_dir(work_dir)
+        .status()
+        .unwrap()
+        .success());
     Arc::new(std::sync::Mutex::new(git_client))
 }
 

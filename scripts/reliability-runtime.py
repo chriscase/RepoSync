@@ -105,6 +105,18 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def assert_runtime_source_isolation():
+    """Reject a full checkout in the fixture namespace; allow web-ui slice only."""
+    src = Path("/src")
+    if not src.exists():
+        return
+    top_level = sorted(p.name for p in src.iterdir())
+    assert top_level == ["web-ui"], f"unexpected /src in runtime: {top_level}"
+    forbidden = ("crates", "Cargo.toml", "Dockerfile.reliability", "scripts", "docs")
+    for name in forbidden:
+        assert not (src / name).exists(), "full source checkout was mounted into runtime"
+
+
 def probe_connection(address):
     try:
         with socket.create_connection(address, timeout=1):
@@ -354,12 +366,14 @@ def run_baseline(binaries):
 
 
 def main():
+    os.environ.setdefault("REPOSYNC_NODE_BIN", "/usr/bin/nodejs")
+    os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     mode = sys.argv[1]
     assert mode in ("diagnostics", "candidate", "all", "baseline"), mode
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
     assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
     assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
-    assert not Path("/src").exists(), "source checkout was mounted into runtime"
+    assert_runtime_source_isolation()
     assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
     canaries = boundary_canaries()
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")

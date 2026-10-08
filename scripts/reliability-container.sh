@@ -16,7 +16,7 @@ context_root="${REPOSYNC_BUILD_CONTEXT:-$repo_root}"
 prepared_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-build-context.XXXXXX")"
 trap 'rm -rf "$prepared_context"' EXIT
 cp "$context_root/Cargo.toml" "$context_root/Dockerfile.reliability" "$context_root/.dockerignore" "$prepared_context/"
-cp -R "$context_root/crates" "$context_root/docs" "$context_root/scripts" "$prepared_context/"
+cp -R "$context_root/crates" "$context_root/docs" "$context_root/scripts" "$context_root/web-ui" "$prepared_context/"
 mkdir "$prepared_context/legacy-old"
 git archive 87379741779a6259f7eeb52a68cc6f061174e5ef | tar -x -C "$prepared_context/legacy-old"
 python3 "$repo_root/scripts/reliability-lock-overlay.py" "$prepared_context/legacy-old"

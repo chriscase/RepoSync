@@ -3,6 +3,11 @@
 use std::path::Path;
 use std::process::Command;
 
+fn node_command() -> Command {
+    let bin = std::env::var("REPOSYNC_NODE_BIN").unwrap_or_else(|_| "node".into());
+    Command::new(bin)
+}
+
 #[test]
 fn branch_pair_delete_query_defaults_explicit_safe() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -16,7 +21,7 @@ if (omitted.get('delete_git') !== 'false' || omitted.get('delete_svn') !== 'fals
 const on = buildBranchPairDeleteQuery({ delete_git: true, delete_svn: false });
 if (on.get('delete_git') !== 'true' || on.get('delete_svn') !== 'false') process.exit(5);
 "#;
-    let output = Command::new("node")
+    let output = node_command()
         .arg("--experimental-strip-types")
         .arg("--input-type=module")
         .arg("-e")
@@ -244,7 +249,7 @@ if (all[0].repoId !== 'repo-b' || all[1].repoId !== 'repo-a') process.exit(18);
 clearManagedRemovalReceipt('repo-a');
 if (readManagedRemovalReceipt('repo-a') !== null) process.exit(6);
 "#;
-    let output = Command::new("node")
+    let output = node_command()
         .arg("--experimental-strip-types")
         .arg("--input-type=module")
         .arg("-e")
