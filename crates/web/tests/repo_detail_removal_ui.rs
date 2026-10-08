@@ -85,8 +85,8 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
         "Repositories list must gate managed-removal receipt rendering"
     );
     assert!(
-        repos_list.contains("managedRemovalReceiptNotice"),
-        "Repositories list must bind receipt notice to the display gate"
+        repos_list.contains("readAllManagedRemovalReceipts"),
+        "Repositories list must show every persisted managed-removal receipt"
     );
     let panel = include_str!("../../../web-ui/src/components/ManagedRemovalPanel.tsx");
     assert!(
@@ -141,6 +141,18 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
         notice.contains("managed-removal-receipt-partial-cleanup"),
         "Receipt notice must surface partial cleanup"
     );
+    assert!(
+        src.contains("removalDependencyPreview?.parent_removal_blocked"),
+        "Managed remove confirm must honor parent_removal_blocked"
+    );
+    assert!(
+        src.contains("branchPairDependencyPreview?.parent_removal_blocked"),
+        "Branch pair remove confirm must honor parent_removal_blocked"
+    );
+    assert!(
+        managed_src.contains("shouldPersistPolledManagedRemovalReceipt"),
+        "Polled removal status must not overwrite cleared or newer receipts"
+    );
 }
 
 #[test]
@@ -166,11 +178,32 @@ import {
   shouldDisplayManagedRemovalReceipt,
   clearManagedRemovalReceipt,
   removalDependencyPreviewConfirmReady,
+  shouldPersistPolledManagedRemovalReceipt,
+  readAllManagedRemovalReceipts,
 } from './web-ui/src/managedRemoval.ts';
 
 if (removalDependencyPreviewConfirmReady({ isLoading: true, isFetching: false, isError: false, dependencyPreview: null })) process.exit(8);
 if (!removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: true, dependencyPreview: null })) process.exit(9);
+if (removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: false, dependencyPreview: null })) process.exit(11);
+if (removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: true, isError: true, dependencyPreview: null })) process.exit(12);
 if (!removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: false, dependencyPreview: { repo_id: 'x', repo_name: 'x', parent: null, children: [], parent_removal_blocked: false, block_reason: null, credentials: [], managed_local_path: 'p', sibling_local_paths_preserved: [], shared_git_registrations: [] } })) process.exit(10);
+
+const storedReceipt = {
+  repoId: 'repo-a',
+  operationId: 'op-1',
+  state: 'failed',
+  message: 'x',
+  remote_git: 'failed',
+  remote_svn: 'untouched',
+  restore_supported: false,
+  retryable: true,
+  registration_listed: true,
+  updated_at: '2026-10-08T12:00:00.000Z',
+};
+if (shouldPersistPolledManagedRemovalReceipt(null, { operation_id: 'op-1', updated_at: '2026-10-08T13:00:00.000Z' })) process.exit(13);
+if (shouldPersistPolledManagedRemovalReceipt(storedReceipt, { operation_id: 'op-2' })) process.exit(14);
+if (shouldPersistPolledManagedRemovalReceipt(storedReceipt, { operation_id: 'op-1', updated_at: '2026-10-08T11:00:00.000Z' })) process.exit(15);
+if (!shouldPersistPolledManagedRemovalReceipt(storedReceipt, { operation_id: 'op-1', updated_at: '2026-10-08T13:00:00.000Z' })) process.exit(16);
 
 if (shouldDisplayManagedRemovalReceipt(null)) process.exit(2);
 if (shouldDisplayManagedRemovalReceipt({ repoId: '', operationId: 'op', state: 'completed', message: '' })) process.exit(3);
@@ -199,6 +232,15 @@ persistManagedRemovalReceipt(receipt);
 const restored = readManagedRemovalReceipt('repo-a');
 if (!restored || restored.operationId !== 'op-1') process.exit(5);
 if (!restored.partial_cleanup || restored.partial_cleanup.remote_git !== 'deleted') process.exit(7);
+persistManagedRemovalReceipt({
+  ...receipt,
+  repoId: 'repo-b',
+  operationId: 'op-2',
+  updated_at: '2026-10-08T01:00:00.000Z',
+});
+const all = readAllManagedRemovalReceipts();
+if (all.length !== 2) process.exit(17);
+if (all[0].repoId !== 'repo-b' || all[1].repoId !== 'repo-a') process.exit(18);
 clearManagedRemovalReceipt('repo-a');
 if (readManagedRemovalReceipt('repo-a') !== null) process.exit(6);
 "#;

@@ -700,6 +700,7 @@ fn removal_response(
             "action": "managed_remove",
             "state": operation.state,
             "operation_id": operation.id,
+            "updated_at": operation.updated_at,
             "message": message,
             "remote_git": operation.remote_git,
             "remote_svn": operation.remote_svn,
