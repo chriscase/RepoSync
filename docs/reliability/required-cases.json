@@ -322,6 +322,44 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "ECHO_MARKER_FORGED",
+      "binary": "team_mode_e2e",
+      "test": "test_team_mode_marker_without_receipt_applies_once",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_MARKER_DUPLICATE",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_marker_duplicate_git_trailer_applies_without_receipt",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_MARKER_EDITED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_marker_edited_svn_trailer_applies_without_receipt",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_IDENTITY_REIMPORT_RESET",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_identity_reimport_bumps_stale_no_target_receipt",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_IDENTITY_SVN_UUID_AUTO",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_identity_svn_uuid_auto_bump_not_implemented",
+      "tier": "candidate_regression",
+      "supporting_note": "documents NOT IMPLEMENTED automatic echo-generation bump on repositories.svn_url UUID swap without explicit reimport reset"
+    },
+    {
+      "id": "ECHO_IDENTITY_PATH_RECREATION",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_identity_path_recreation_stale_svn_receipt_not_valid",
+      "tier": "candidate_regression",
+      "supporting_note": "path delete/recreate imports as new SVN work; automatic incarnation bump is NOT IMPLEMENTED (manual generation bump invalidates stale SVN no-target receipts)"
+    },
+    {
       "id": "RS05_TEAM_SINGLE_IMPORT_NOOP",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_single_repo_import_then_noop_sync",
