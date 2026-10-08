@@ -2131,7 +2131,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!(baseline_receipt["svn_rev"], old_svn_rev);
     let restored_bridge = restored.join("repos/pair/git-repo");
     assert_eq!(get_head_sha(&restored_bridge), old_tip);
-    let restored_db = Database::new(&restored.join("reposync.db")).unwrap();
+    let restored_db = Database::new(restored.join("reposync.db")).unwrap();
     assert_eq!(
         restored_db.get_repo_watermark("pair").unwrap(),
         (old_svn_rev, old_tip.clone())
@@ -12420,6 +12420,126 @@ async fn candidate_echo_generation_stale_receipt_same_sha_split_inbound_checkpoi
             "filtered":filtered,
             "emitted_tip":table_tip,
             "svn_tree":tree_hashes(&tree)
+        })
+    );
+}
+
+/// #65: managed remove + restore re-adopts sync checkpoints and resumes incremental sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_restore_resumes_sync() {
+    if !svn_available() {
+        eprintln!(
+            "RELIABILITY_EVIDENCE {}",
+            serde_json::json!({"case":"R65_MANAGED_RESTORE_SYNC","skipped":"svn_unavailable"})
+        );
+        return;
+    }
+    use reposync_core::db::managed_remove::{
+        ManagedRemoveRemoteOutcome, RemovalAdvance, RestoreAdvance,
+    };
+
+    let pair = QualifiedPair::new().await;
+    let repo_id = pair.repo_id.clone();
+    let baseline_maps: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let baseline_watermark = pair.engine.db().get_repo_watermark(&repo_id).unwrap();
+    let data_dir = pair.engine.config().daemon.data_dir.clone();
+
+    let RemovalAdvance::Cleanup { operation } = pair
+        .engine
+        .db()
+        .prepare_managed_remove(&repo_id, "admin", "remove-1")
+        .unwrap()
+    else {
+        panic!("expected cleanup advance");
+    };
+    reposync_core::managed_remove::remove_owned_repo_tree(&data_dir, &repo_id).unwrap();
+    pair.engine
+        .db()
+        .complete_managed_remove(
+            &repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+    assert!(pair.engine.db().get_repository(&repo_id).unwrap().is_none());
+
+    let RestoreAdvance::Restored { repo: restored } = pair
+        .engine
+        .db()
+        .restore_managed_registration(&repo_id)
+        .unwrap()
+    else {
+        panic!("expected restore");
+    };
+    assert!(!restored.enabled);
+    assert_eq!(
+        resolve_repo_import_baseline(pair.engine.db(), &repo_id).unwrap(),
+        RepoImportBaseline::Verified {
+            svn_rev: baseline_watermark.0,
+            git_sha: baseline_watermark.1.clone(),
+        }
+    );
+    let maps_after_restore: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps_after_restore, baseline_maps);
+
+    let mut enabled = pair.engine.db().get_repository(&repo_id).unwrap().unwrap();
+    enabled.enabled = true;
+    enabled.last_sync_at = Some("2020-01-01T00:00:00Z".into());
+    pair.engine.db().update_repository(&enabled).unwrap();
+
+    svn_commit_file(
+        &pair.wc,
+        "after-restore.txt",
+        "after restore\n",
+        "SVN after restore",
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1
+    );
+    let after_watermark = pair.engine.db().get_repo_watermark(&repo_id).unwrap();
+    assert_eq!(after_watermark.0, baseline_watermark.0 + 1);
+    assert_ne!(after_watermark.1, baseline_watermark.1);
+    let maps_after_sync: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(maps_after_sync, baseline_maps + 1);
+    assert_eq!(
+        std::fs::read_to_string(pair.bridge.join("after-restore.txt")).unwrap(),
+        "after restore\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R65_MANAGED_RESTORE_SYNC",
+            "baseline_svn":baseline_watermark.0,
+            "after_svn":after_watermark.0,
+            "maps":maps_after_restore
         })
     );
 }
