@@ -192,6 +192,9 @@ pub struct SyncEngine {
     /// Fixture-only fault: truncate conflict coverage one commit short (debug builds).
     #[cfg(debug_assertions)]
     incomplete_conflict_coverage_test_fault: std::sync::Mutex<bool>,
+    /// Fixture-only: skip persisted-conflict apply gate (debug builds).
+    #[cfg(debug_assertions)]
+    persisted_conflict_gate_test_bypass: std::sync::Mutex<bool>,
     /// Fixture-only: fail `get_file_content_at_commit` for one projected path.
     #[cfg(debug_assertions)]
     git_content_read_test_fault: std::sync::Mutex<Option<GitContentReadTestFault>>,
@@ -308,6 +311,8 @@ impl SyncEngine {
             #[cfg(debug_assertions)]
             incomplete_conflict_coverage_test_fault: std::sync::Mutex::new(false),
             #[cfg(debug_assertions)]
+            persisted_conflict_gate_test_bypass: std::sync::Mutex::new(false),
+            #[cfg(debug_assertions)]
             git_content_read_test_fault: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             svn_apply_test_fault: std::sync::Mutex::new(None),
@@ -333,6 +338,17 @@ impl SyncEngine {
     #[cfg(debug_assertions)]
     fn incomplete_conflict_coverage_test_fault_enabled(&self) -> bool {
         *self.incomplete_conflict_coverage_test_fault.lock().unwrap()
+    }
+
+    /// Force the persisted-conflict apply gate open on this engine (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_persisted_conflict_gate_test_bypass(&self, enabled: bool) {
+        *self.persisted_conflict_gate_test_bypass.lock().unwrap() = enabled;
+    }
+
+    #[cfg(debug_assertions)]
+    fn persisted_conflict_gate_test_bypass_enabled(&self) -> bool {
+        *self.persisted_conflict_gate_test_bypass.lock().unwrap()
     }
 
     /// Record Git blob paths read during Git→SVN apply (fixture tests).
@@ -2416,6 +2432,18 @@ impl SyncEngine {
     /// Refuse SVN/Git apply while the conflicts table still has blocking rows
     /// for this repository (read from SQLite; do not trust in-cycle detection).
     fn refuse_apply_while_persisted_conflicts_block(&self) -> Result<(), SyncError> {
+        #[cfg(debug_assertions)]
+        if self.persisted_conflict_gate_test_bypass_enabled() {
+            return Ok(());
+        }
+        let _ = self
+            .db
+            .attribute_null_conflict_repo_ids()
+            .map_err(SyncError::DatabaseError)?;
+        let unattributed_rows = self
+            .db
+            .unattributed_null_conflict_rows_blocking_apply()
+            .map_err(SyncError::DatabaseError)?;
         let (count, file_path) = match self.effective_repo_id() {
             Some(rid) => {
                 let count = self
@@ -2447,10 +2475,22 @@ impl SyncEngine {
         if count == 0 {
             return Ok(());
         }
+        let legacy_hint = if unattributed_rows.is_empty() {
+            String::new()
+        } else {
+            let described = unattributed_rows
+                .iter()
+                .map(|(id, path)| format!("id={id} path={path}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "; unattributed legacy conflict row(s): {described} (set conflicts.repo_id to the owning repository id or dismiss each row)"
+            )
+        };
         Err(SyncError::UnresolvableConflict {
             file_path,
             detail: format!(
-                "{count} persisted conflict row(s) block apply; only resolved or dismissed rows allow SVN/Git mutation"
+                "{count} persisted conflict row(s) block apply; only resolved or dismissed rows allow SVN/Git mutation{legacy_hint}"
             ),
         })
     }
