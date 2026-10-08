@@ -5810,6 +5810,53 @@ async fn candidate_r12_omitted_mode_is_full_history() {
     server.abort();
 }
 
+/// R12 / #68: mounted import card keeps full history as the default start choice.
+#[cfg(feature = "reliability-browser")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r68_import_card_full_default_ui() {
+    let (addr, _state, server, tmp, id, _bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "full-default").await;
+    let output = tokio::time::timeout(Duration::from_secs(60), browser.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    server.abort();
+}
+
+/// R11 / #68: mounted import card exposes snapshot mode and history boundary copy.
+#[cfg(feature = "reliability-browser")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r68_import_card_snapshot_boundary_ui() {
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    let (browser, mut vite) =
+        run_import_card_browser(addr, &id, &barrier, "snapshot-boundary").await;
+    let output = tokio::time::timeout(Duration::from_secs(180), browser.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 2);
+    server.abort();
+}
+
 /// R11: mismatched existing Git target is refused without reset or overwrite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r11_mismatched_target_is_refused() {

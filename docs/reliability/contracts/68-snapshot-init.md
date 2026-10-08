@@ -30,6 +30,20 @@ Full-history import remains the default and still uses `run_full_import`.
 
 R11 and R12 stay **PARTIAL**. This slice does not close #68.
 
+## Mode / API compatibility
+
+| Consumer | Full history (default) | Snapshot |
+| --- | --- | --- |
+| `POST /api/repos/{id}/import` with no body | `import_mode=full` | — |
+| JSON `{"import_mode":"snapshot","svn_revision":"HEAD"}` or `"<n>"` | rejected if `svn_revision` set on full | pins once, returns `starting_revision` + `history_boundary` |
+| Query `?import_mode=snapshot&svn_revision=…` | same as omitting body for full | same as JSON |
+| Upgraded installs / omitted fields | unchanged full replay | opt-in only |
+| Web UI: Add Repository → Initial SVN import | pre-selects full; prefs flow to repo detail | optional HEAD or numeric revision |
+| Web UI: Import progress card | `Start full history import` sends `{}` | `Start snapshot import` sends snapshot body |
+| `GET /api/repos/{id}/import/status` and repo detail | `earlier_history_imported=true` when applicable | `earlier_history_imported=false`, boundary text |
+
+**User-facing limitation:** Snapshot mode builds Git from one verified SVN revision and **does not import earlier SVN history**. The mirror is still SVN-origin; later revisions sync normally from that baseline.
+
 ## Still later
 
 - Rich onboarding UI / wizard polish
@@ -40,4 +54,4 @@ R11 and R12 stay **PARTIAL**. This slice does not close #68.
 
 ## Tests
 
-Named cases: `R11_SNAPSHOT_FIXED_R`, `R11_PIN_HOLDS_AFTER_ADVANCE`, `R11_MISMATCHED_TARGET`, `R11_INVALID_REV`, plus supporting `R11_SNAPSHOT_LFS` and `R11_SNAPSHOT_RECONCILE`. `R12_FULL_DEFAULT` stays next to the existing full-import cases `64A_ORDINARY` / `74_APPLY_POSITIVE` / `74_LFS_POSITIVE`. The journal unit `snapshot_reconcile_completes_exact_baseline_and_refuses_dishonest_evidence` covers exact-SHA completion, confirmed-receipt recovery, and refusals (wrong SHA, missing pin, drifted pin, widened total, non-import type) without a second remote write.
+Named cases: `R11_SNAPSHOT_FIXED_R`, `R11_PIN_HOLDS_AFTER_ADVANCE`, `R11_MISMATCHED_TARGET`, `R11_INVALID_REV`, plus supporting `R11_SNAPSHOT_LFS` and `R11_SNAPSHOT_RECONCILE`. `R12_FULL_DEFAULT` stays next to the existing full-import cases `64A_ORDINARY` / `74_APPLY_POSITIVE` / `74_LFS_POSITIVE`. UI: `candidate_r68_import_card_full_default_ui` and `candidate_r68_import_card_snapshot_boundary_ui` (mounted import card, headless Chrome). Unit: `web-ui/src/importBaseline.test.ts`. The journal unit `snapshot_reconcile_completes_exact_baseline_and_refuses_dishonest_evidence` covers exact-SHA completion, confirmed-receipt recovery, and refusals (wrong SHA, missing pin, drifted pin, widened total, non-import type) without a second remote write.

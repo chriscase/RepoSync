@@ -13,6 +13,8 @@ import {
   readPersistedBranchPairRemovalNotice,
 } from '../branchPairRemoval';
 import ImportProgressCard from '../components/ImportProgressCard';
+import ImportHistoryNotice from '../components/ImportHistoryNotice';
+import { DEFAULT_REPO_IMPORT_MODE, type RepoImportMode } from '../importBaseline';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalPanel from '../components/ManagedRemovalPanel';
 import {
@@ -91,6 +93,8 @@ export default function RepoDetail() {
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
   const routedNotice = readBranchPairRemovalNotice(location.state);
+  const importPrefs = (location.state as { importPrefs?: { importMode: RepoImportMode; svnRevision: string } } | null)
+    ?.importPrefs;
   const [localNotice, setLocalNotice] = useState<RemovalNotice | null>(null);
   const [retiredId, setRetiredId] = useState<string | null>(null);
 
@@ -447,7 +451,7 @@ export default function RepoDetail() {
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
 
   const trackedRemovalOperationId =
-    removalReceipt?.repoId === id ? removalReceipt.operationId : undefined;
+    removalReceipt && removalReceipt.repoId === id ? removalReceipt.operationId : undefined;
 
   const removalStatusQuery = useQuery<ManagedRemovalStatus | null>({
     queryKey: ['managed-removal', id, trackedRemovalOperationId ?? 'latest'],
@@ -1156,8 +1160,28 @@ export default function RepoDetail() {
         />
       </div>
 
+      {repo && (repo.import_mode || repo.history_boundary || repo.initializing) && (
+        <ImportHistoryNotice
+          fields={{
+            import_mode: repo.import_mode,
+            starting_revision: repo.starting_revision,
+            history_boundary: repo.history_boundary,
+            snapshot_pin: repo.snapshot_pin,
+            earlier_history_imported:
+              repo.import_mode === 'snapshot' ? false : undefined,
+          }}
+        />
+      )}
+
       {/* Import Progress */}
-      {detailLive && <ImportProgressCard repoId={id} repoName={repo?.name} />}
+      {detailLive && (
+        <ImportProgressCard
+          repoId={id}
+          repoName={repo?.name}
+          defaultImportMode={importPrefs?.importMode ?? DEFAULT_REPO_IMPORT_MODE}
+          defaultSvnRevision={importPrefs?.svnRevision ?? 'HEAD'}
+        />
+      )}
 
       {/* Sync Records */}
       <div className="bg-gray-800 shadow rounded-lg border border-gray-700">
