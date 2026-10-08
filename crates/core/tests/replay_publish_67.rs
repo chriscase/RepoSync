@@ -14,6 +14,7 @@ async fn replay_publish_67_guard() -> tokio::sync::MutexGuard<'static, ()> {
 
 use chrono::Utc;
 use reposync_core::config::{AppConfig, IdentityConfig};
+use reposync_core::db::late_pair_publish_operations::LatePairPublishState;
 use reposync_core::db::Database;
 use reposync_core::git::client::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -22,11 +23,9 @@ use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, LatePairPlan, LatePairRequest,
 };
 use reposync_core::late_pair_publish::{
-    clear_late_pair_publish_test_hook, publish_admitted_late_pair,
-    set_late_pair_publish_test_hook, validate_git_publish_preflight, LatePairPublishTestHook,
-    PublishCredentials,
+    clear_late_pair_publish_test_hook, publish_admitted_late_pair, set_late_pair_publish_test_hook,
+    validate_git_publish_preflight, LatePairPublishTestHook, PublishCredentials,
 };
-use reposync_core::db::late_pair_publish_operations::LatePairPublishState;
 use reposync_core::models::{Repository, SyncDirection, SyncRecord, SyncRecordStatus};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;

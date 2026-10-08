@@ -3868,7 +3868,7 @@ mod import_reconciliation_tests {
     struct HeldFixture {
         addr: SocketAddr,
         state: Arc<AppState>,
-        server: tokio::task::JoinHandle<()>,
+        server: TestServerGuard,
         tmp: tempfile::TempDir,
         id: String,
         bare: std::path::PathBuf,
@@ -3976,7 +3976,6 @@ mod import_reconciliation_tests {
             let engine = state.sync_engine.clone();
             let sync_trigger = state.sync_trigger.clone();
             server.abort();
-            let _ = server.await;
             drop(state);
             let db = Database::new(tmp.path().join("reposync.db")).unwrap();
             db.initialize().unwrap();
@@ -3996,11 +3995,7 @@ mod import_reconciliation_tests {
             let app = Router::new()
                 .merge(api::repos::routes())
                 .with_state(state.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let (addr, server) = spawn_isolated_test_server(app);
             Self {
                 addr,
                 state,
