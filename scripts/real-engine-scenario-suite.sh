@@ -14,7 +14,9 @@
 #   REPOSYNC_REAL_ENGINE_USE_COMPOSE=1 scripts/real-engine-scenario-suite.sh
 #
 # Output: artifacts/real-engine-scenarios/<UTC_TIMESTAMP>/summary.json
-# Exit code: 0 when every scenario is PASS or NOT RUN; non-zero on any FAIL.
+# Exit code: 0 only when suite overall is PASS (every scenario PASS or NOT RUN with
+# no PARTIAL rows). Exit 1 on FAIL, 2 when every scenario is NOT RUN, 3 when any
+# scenario is PARTIAL (including mixed PASS + PARTIAL).
 # ============================================================================
 
 set -euo pipefail
@@ -72,10 +74,6 @@ fi
 
 export REPOSYNC_TEST_SVN_PW="${REPOSYNC_TEST_SVN_PW:-fixture-only-svn-secret}"
 export REPOSYNC_TEST_GH_TOKEN="${REPOSYNC_TEST_GH_TOKEN:-fixture-only-git-secret}"
-export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Test User}"
-export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-test@example.com}"
-export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-Test User}"
-export GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-test@example.com}"
 
 if command -v rustup >/dev/null 2>&1 && rustup toolchain list | grep -q '^stable'; then
   CARGO=(rustup run stable cargo)
@@ -85,7 +83,7 @@ fi
 
 "${CARGO[@]}" build --tests -p reposync-core --test real_engine_scenarios --locked >/dev/null
 
-overall_fail=0
+suite_exit=0
 for entry in "${SCENARIOS[@]}"; do
   id="${entry%%:*}"
   test_name="${entry##*:}"
@@ -95,10 +93,16 @@ for entry in "${SCENARIOS[@]}"; do
   test_exit=$?
   set -e
 
-  if ! python3 scripts/real-engine-scenario-report.py append "$RESULTS_FILE" "$id" "$test_name" "$test_exit" "$log_file"; then
-    overall_fail=1
+  append_exit=0
+  python3 scripts/real-engine-scenario-report.py append "$RESULTS_FILE" "$id" "$test_name" "$test_exit" "$log_file" || append_exit=$?
+  if [[ "$append_exit" -gt "$suite_exit" ]]; then
+    suite_exit="$append_exit"
   fi
 done
 
-python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" PASS
-exit "$overall_fail"
+summary_exit=0
+python3 scripts/real-engine-scenario-report.py summary "$RESULTS_FILE" "$SUMMARY_FILE" PASS || summary_exit=$?
+if [[ "$summary_exit" -gt "$suite_exit" ]]; then
+  suite_exit="$summary_exit"
+fi
+exit "$suite_exit"

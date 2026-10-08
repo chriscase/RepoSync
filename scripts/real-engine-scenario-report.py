@@ -28,7 +28,7 @@ def evidence_detail(log_text: str, case_id: str | None, want_status: str) -> dic
     return {}
 
 
-def evidence_status(log_text: str, case_id: str) -> tuple[str, dict]:
+def evidence_status(log_text: str, case_id: str) -> tuple[str | None, dict]:
     for line in log_text.splitlines():
         if "RELIABILITY_EVIDENCE" not in line:
             continue
@@ -46,7 +46,7 @@ def evidence_status(log_text: str, case_id: str) -> tuple[str, dict]:
         if status in {"PASS", "PARTIAL", "NOT RUN"}:
             detail = obj.get("detail", {})
             return status, detail if isinstance(detail, dict) else {}
-    return "PASS", {}
+    return None, {}
 
 
 def classify(log_path: Path, case_id: str, test_exit: int) -> tuple[str, dict]:
@@ -55,13 +55,15 @@ def classify(log_path: Path, case_id: str, test_exit: int) -> tuple[str, dict]:
         return "NOT RUN", evidence_detail(text, None, "NOT RUN")
     if test_exit == 0 and "test result: ok" in text:
         status, detail = evidence_status(text, case_id)
+        if status is None:
+            return "NOT RUN", {"reason": "missing_evidence", "case": case_id}
         if status == "PARTIAL":
             return "PARTIAL", detail
         if status == "NOT RUN":
             return "NOT RUN", detail
         if detail:
             return "PASS", detail
-        return "PASS", evidence_detail(text, case_id, "PASS")
+        return "NOT RUN", {"reason": "missing_evidence_detail", "case": case_id}
     tail = next((line for line in reversed(text.splitlines()) if line.strip()), "")
     return "FAIL", {"tail": tail[-500:]}
 
@@ -85,6 +87,8 @@ def write_summary(results_path: Path, summary_path: Path, toolchain_status: str,
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     if counts["FAIL"] > 0:
         overall = "FAIL"
+    elif counts["PARTIAL"] > 0:
+        overall = "PARTIAL"
     elif counts["NOT RUN"] == len(results) and results:
         overall = "NOT RUN"
     else:
@@ -105,11 +109,21 @@ def main(argv: list[str]) -> int:
     command = argv[1]
     if command == "append":
         status = append_result(Path(argv[2]), argv[3], argv[4], int(argv[5]), Path(argv[6]))
-        return 1 if status == "FAIL" else 0
+        if status == "FAIL":
+            return 1
+        if status == "PARTIAL":
+            return 3
+        return 0
     if command == "summary":
         summary = write_summary(Path(argv[2]), Path(argv[3]), argv[4], argv[5] if len(argv) > 5 else None)
         print(json.dumps(summary, indent=2))
-        return 1 if summary["overall"] == "FAIL" else (2 if summary["overall"] == "NOT RUN" else 0)
+        if summary["overall"] == "FAIL":
+            return 1
+        if summary["overall"] == "PARTIAL":
+            return 3
+        if summary["overall"] == "NOT RUN":
+            return 2
+        return 0
     raise SystemExit(f"unknown command: {command}")
 
 

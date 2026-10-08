@@ -4,11 +4,13 @@
 //! the production `SyncEngine` team path. Each scenario emits `RELIABILITY_EVIDENCE`
 //! with a stable case id for the host runner (`scripts/real-engine-scenario-suite.sh`).
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::ImportOperationState;
@@ -68,9 +70,62 @@ fn is_transient_import_contention(error: &SyncError) -> bool {
         || message.contains("checkpoint_write_failed")
 }
 
-async fn run_import_with_lock_retry(engine: &mut SyncEngine) -> Result<SyncStats, SyncError> {
+struct CycleWindow {
+    label: String,
+    start: Instant,
+    end: Instant,
+}
+
+struct ImportCycleOracle {
+    windows: Mutex<Vec<CycleWindow>>,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+impl ImportCycleOracle {
+    fn new() -> Self {
+        Self {
+            windows: Mutex::new(Vec::new()),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn windows_overlap(&self, left: &str, right: &str) -> bool {
+        let windows = self.windows.lock().unwrap();
+        for a in windows.iter().filter(|w| w.label == left) {
+            for b in windows.iter().filter(|w| w.label == right) {
+                if a.start < b.end && b.start < a.end {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+async fn run_import_with_lock_retry(
+    engine: &mut SyncEngine,
+    label: &str,
+    oracle: Option<&ImportCycleOracle>,
+) -> Result<SyncStats, SyncError> {
     for attempt in 0..12 {
-        match engine.run_sync_cycle().await {
+        let cycle_start = Instant::now();
+        if let Some(tracker) = oracle {
+            let active = tracker.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            tracker.max_in_flight.fetch_max(active, Ordering::SeqCst);
+        }
+        let cycle_result = engine.run_sync_cycle().await;
+        let cycle_end = Instant::now();
+        if let Some(tracker) = oracle {
+            tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
+            tracker.windows.lock().unwrap().push(CycleWindow {
+                label: label.to_string(),
+                start: cycle_start,
+                end: cycle_end,
+            });
+        }
+        match cycle_result {
             Ok(stats) => return Ok(stats),
             Err(error) if is_transient_import_contention(&error) && attempt + 1 < 12 => {
                 tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
@@ -80,6 +135,68 @@ async fn run_import_with_lock_retry(engine: &mut SyncEngine) -> Result<SyncStats
         }
     }
     unreachable!("retry loop must return")
+}
+
+fn git_commit_identity_args() -> [&'static str; 4] {
+    [
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.com",
+    ]
+}
+
+fn git_committer_identity_args() -> [&'static str; 4] {
+    [
+        "-c",
+        "committer.name=Test User",
+        "-c",
+        "committer.email=test@example.com",
+    ]
+}
+
+fn git_path_missing(repo: &Path, object: &str, path: &str) -> bool {
+    let spec = format!("{}:{}", object, path);
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &spec])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+}
+
+fn assert_git_ancestor(repo: &Path, ancestor: &str, descendant: &str) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{} must be an ancestor of {} in {}",
+        ancestor,
+        descendant,
+        repo.display()
+    );
+}
+
+fn is_remote_transport_failure(error: &SyncError) -> bool {
+    match error {
+        SyncError::HistoryBlocked { reason, .. } => reason == "remote_transport_failed",
+        other => {
+            let lowered = other.to_string().to_ascii_lowercase();
+            lowered.contains("transport")
+                || lowered.contains("can't connect")
+                || lowered.contains("could not connect")
+                || lowered.contains("connection refused")
+                || lowered.contains("failed to connect")
+                || lowered.contains("econnrefused")
+        }
+    }
 }
 
 fn require_toolchain(case: &str) -> bool {
@@ -343,6 +460,16 @@ fn svn_checkout(url: &str, wc_path: &Path, username: &str, password: &str) {
     assert!(status.success(), "svn checkout failed for {url}");
 }
 
+fn wait_for_svnserve(port: u16) {
+    for attempt in 0..40 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25 * (attempt as u64 + 1)));
+    }
+    panic!("svnserve did not accept connections on port {port}");
+}
+
 fn pick_loopback_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .expect("failed to bind ephemeral port")
@@ -375,7 +502,7 @@ impl SvnserveDaemon {
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to spawn svnserve");
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_svnserve(port);
         Self { child, port }
     }
 
@@ -662,15 +789,24 @@ impl SingleRepoFixture {
         }
         std::fs::write(&file, content).unwrap();
         git_cli(&self.developer, &["add", path]);
-        git_cli(
-            &self.developer,
-            &[
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&self.developer)
+            .args(git_commit_identity_args())
+            .args(git_committer_identity_args())
+            .args([
                 "commit",
                 "-m",
                 message,
                 "--author",
                 "Test User <test@example.com>",
-            ],
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "git commit in {}",
+            self.developer.display()
         );
         get_head_sha(&self.developer)
     }
@@ -724,30 +860,18 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
     let alpha_bridge = alpha.bridge.clone();
     let beta_bridge = beta.bridge.clone();
     let ready = Arc::new(tokio::sync::Barrier::new(2));
-    let overlap_ready = Arc::new(tokio::sync::Barrier::new(2));
-    let in_flight = Arc::new(AtomicUsize::new(0));
-    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let oracle = Arc::new(ImportCycleOracle::new());
 
     let (alpha_result, beta_result) = tokio::join!(
         async {
             ready.wait().await;
-            let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            max_in_flight.fetch_max(active, Ordering::SeqCst);
-            overlap_ready.wait().await;
             let mut engine = fixture.make_engine(&alpha);
-            let result = run_import_with_lock_retry(&mut engine).await;
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-            result
+            run_import_with_lock_retry(&mut engine, "repo_alpha", Some(&oracle)).await
         },
         async {
             ready.wait().await;
-            let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            max_in_flight.fetch_max(active, Ordering::SeqCst);
-            overlap_ready.wait().await;
             let mut engine = fixture.make_engine(&beta);
-            let result = run_import_with_lock_retry(&mut engine).await;
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-            result
+            run_import_with_lock_retry(&mut engine, "repo_beta", Some(&oracle)).await
         }
     );
     let alpha_stats = alpha_result.unwrap();
@@ -770,11 +894,9 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
         "beta-origin\n"
     );
 
-    let concurrent_import = max_in_flight.load(Ordering::SeqCst) >= 2;
-    assert!(
-        concurrent_import,
-        "both imports must overlap inside run_sync_cycle"
-    );
+    let concurrent_import = oracle.windows_overlap("repo_alpha", "repo_beta");
+    let max_in_flight = oracle.max_in_flight.load(Ordering::SeqCst);
+    let case_status = if concurrent_import { "PASS" } else { "PARTIAL" };
     let checkpoint_crossover = alpha_sha == beta_sha
         || matches!(
             (
@@ -786,7 +908,7 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
 
     emit_evidence(
         CASE_CONCURRENT,
-        "PASS",
+        case_status,
         serde_json::json!({
             "repo_alpha_rev": 2,
             "repo_beta_rev": 2,
@@ -794,8 +916,9 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
             "shared_branch_name": git_symbolic_ref(&alpha_bridge, "HEAD"),
             "alpha_git_sha": alpha_sha,
             "beta_git_sha": beta_sha,
-            "max_in_flight": max_in_flight.load(Ordering::SeqCst),
+            "max_in_flight": max_in_flight,
             "concurrent_import": concurrent_import,
+            "serialized_sqlite_import": !concurrent_import && max_in_flight <= 1,
             "checkpoint_crossover": checkpoint_crossover,
         }),
     );
@@ -811,9 +934,29 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
     for repo in &fixture.repos {
         let engine = fixture.make_engine(repo);
         assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
-        let watermark = db.get_repo_watermark(&repo.id).unwrap();
-        db.set_state(&format!("last_git_sha_{}", repo.id), &watermark.1)
+        std::fs::write(repo.bridge.join("inbound-seed.txt"), "seed\n").unwrap();
+        git_cli(&repo.bridge, &["add", "inbound-seed.txt"]);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo.bridge)
+            .args(git_commit_identity_args())
+            .args(git_committer_identity_args())
+            .args([
+                "commit",
+                "-m",
+                "Seed inbound Git checkpoint",
+                "--author",
+                "Test User <test@example.com>",
+            ])
+            .status()
             .unwrap();
+        assert!(status.success());
+        git_cli(&repo.bridge, &["push", "origin", "main"]);
+        let git_to_svn = fixture.make_engine(repo);
+        assert_eq!(
+            git_to_svn.run_sync_cycle().await.unwrap().git_to_svn_count,
+            1
+        );
     }
 
     let beta_before = db.get_repo_watermark("repo_beta").unwrap();
@@ -821,11 +964,11 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
     let alpha_inbound_before = db
         .get_state("last_git_sha_repo_alpha")
         .unwrap()
-        .expect("import must seed inbound checkpoint kv");
+        .expect("Git-to-SVN cycle must write inbound checkpoint kv");
     let beta_inbound_before = db
         .get_state("last_git_sha_repo_beta")
         .unwrap()
-        .expect("import must seed inbound checkpoint kv");
+        .expect("Git-to-SVN cycle must write inbound checkpoint kv");
     assert_ne!(alpha_inbound_before, beta_inbound_before);
     let tampered_inbound = "cccccccccccccccccccccccccccccccccccccccc";
     db.set_state("last_git_sha_repo_alpha", tampered_inbound)
@@ -848,8 +991,19 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
     let alpha_engine = fixture.make_engine(&fixture.repos[0]);
     let blocked = alpha_engine.run_sync_cycle().await;
     assert!(
-        blocked.is_err(),
-        "tampered alpha inbound checkpoint must block"
+        matches!(
+            &blocked,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "ambiguous_checkpoint"
+        ),
+        "tampered alpha inbound checkpoint must block with ambiguous_checkpoint: {blocked:?}"
+    );
+    let alpha_after = db.get_repo_watermark("repo_alpha").unwrap();
+    assert_eq!(
+        alpha_after, alpha_before,
+        "alpha emitted tip must stay unchanged after blocked cycle"
     );
 
     let alpha_records: i64 = db
@@ -890,7 +1044,9 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
             "beta_inbound_before": beta_inbound_before,
             "beta_watermark_after": db.get_repo_watermark("repo_beta").unwrap(),
             "beta_inbound_after": db.get_state("last_git_sha_repo_beta").unwrap(),
-            "alpha_blocked_after_tamper": blocked.is_err(),
+            "alpha_watermark_after": alpha_after,
+            "alpha_blocked_after_tamper": true,
+            "alpha_emitted_tip_unchanged": alpha_after == alpha_before,
             "beta_still_healthy": beta_still_healthy,
             "global_cursor_not_borrowed": global_cursor_not_borrowed,
         }),
@@ -1083,16 +1239,31 @@ async fn scenario_r01_svnserve_multi_commit_svn_to_git() {
     assert_eq!(stats.svn_to_git_count, 2);
     assert_eq!(stats.git_to_svn_count, 0);
     let db = setup_db(&fixture.db_path);
-    for (revision, path, content) in [
-        (first_rev, "step-a.txt", "first svn delta\n"),
-        (second_rev, "step-b.txt", "second svn delta\n"),
+    let first_git_sha: String = db.conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
+        rusqlite::params![fixture.repo.id, first_rev],
+        |row| row.get(0),
+    ).unwrap();
+    let second_git_sha: String = db.conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
+        rusqlite::params![fixture.repo.id, second_rev],
+        |row| row.get(0),
+    ).unwrap();
+    assert_git_ancestor(&fixture.repo.bridge, &first_git_sha, &second_git_sha);
+    assert!(
+        git_path_missing(&fixture.repo.bridge, &first_git_sha, "step-b.txt"),
+        "first mapped git commit must not contain step-b.txt"
+    );
+    for (revision, path, content, git_sha) in [
+        (first_rev, "step-a.txt", "first svn delta\n", &first_git_sha),
+        (
+            second_rev,
+            "step-b.txt",
+            "second svn delta\n",
+            &second_git_sha,
+        ),
     ] {
-        let git_sha: String = db.conn().query_row(
-            "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
-            rusqlite::params![fixture.repo.id, revision],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(git_show_blob(&fixture.repo.bridge, &git_sha, path), content);
+        assert_eq!(git_show_blob(&fixture.repo.bridge, git_sha, path), content);
         assert_eq!(
             svn_read_file(
                 &fixture.repo.svn_url,
@@ -1232,33 +1403,31 @@ async fn scenario_r16_svnserve_git_remote_unreachable() {
         matches!(&result, Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_transport_failed"),
         "unreachable git remote must block without reset: {result:?}"
     );
-    assert_eq!(get_head_sha(&fixture.repo.bridge), bridge_before);
-    assert_eq!(fixture.checkpoint_snapshot(), before);
-    assert_eq!(
-        SvnClient::new(
-            &fixture.repo.svn_url,
-            &fixture.repo.username,
-            &fixture.repo.password,
-        )
-        .info()
-        .await
-        .unwrap()
-        .latest_rev,
-        svn_before
-    );
-    assert_eq!(
-        setup_db(&fixture.db_path).count_sync_records().unwrap(),
-        mappings_before
-    );
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
+    let checkpoint_after = fixture.checkpoint_snapshot();
+    let svn_after = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
+    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    assert_eq!(bridge_after, bridge_before);
+    assert_eq!(checkpoint_after, before);
+    assert_eq!(svn_after, svn_before);
+    assert_eq!(mappings_after, mappings_before);
     emit_evidence(
         CASE_GIT_REMOTE,
         "PARTIAL",
         serde_json::json!({
             "reason": "remote_transport_failed",
-            "checkpoint_before_after": before,
-            "bridge_head_before_after": bridge_before,
-            "svn_revision_before_after": svn_before,
-            "mapping_count_before": mappings_before,
+            "checkpoint_before_after": [before, checkpoint_after],
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "svn_revision_before_after": [svn_before, svn_after],
+            "mapping_count_before_after": [mappings_before, mappings_after],
             "note": "svnserve fixture covers local transport failure only",
         }),
     );
@@ -1287,22 +1456,26 @@ async fn scenario_r16_svnserve_svn_remote_unreachable() {
     );
     blocked_engine.set_repo_id(fixture.repo.id.clone());
     let result = blocked_engine.run_sync_cycle().await;
-    assert!(result.is_err(), "unreachable svn remote must not succeed");
-    assert_eq!(get_head_sha(&fixture.repo.bridge), bridge_before);
-    assert_eq!(fixture.checkpoint_snapshot(), before);
-    assert_eq!(
-        setup_db(&fixture.db_path).count_sync_records().unwrap(),
-        mappings_before
+    assert!(
+        matches!(&result, Err(error) if is_remote_transport_failure(error)),
+        "unreachable svn remote must fail as transport error: {result:?}"
     );
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
+    let checkpoint_after = fixture.checkpoint_snapshot();
+    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    assert_eq!(bridge_after, bridge_before);
+    assert_eq!(checkpoint_after, before);
+    assert_eq!(mappings_after, mappings_before);
     emit_evidence(
         CASE_SVN_REMOTE,
         "PARTIAL",
         serde_json::json!({
             "bad_svn_url": bad_url,
             "error": result.err().map(|e| e.to_string()),
-            "checkpoint_before_after": before,
-            "bridge_head_before_after": bridge_before,
-            "mapping_count_before": mappings_before,
+            "transport_failure": true,
+            "checkpoint_before_after": [before, checkpoint_after],
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "mapping_count_before_after": [mappings_before, mappings_after],
             "note": "loopback svnserve fixture does not recreate remotes on failure",
         }),
     );
