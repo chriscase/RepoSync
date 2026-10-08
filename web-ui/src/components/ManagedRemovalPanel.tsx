@@ -33,9 +33,11 @@ export default function ManagedRemovalPanel({
       <p className="font-medium">{managedRemovalStateLabel(status.state)}</p>
       <p>{status.message}</p>
       <p className="font-mono text-xs">Operation {status.operation_id}</p>
-      <p className="text-xs">
-        Remote Git ({status.remote_git}) and SVN ({status.remote_svn}) are not deleted by managed
-        removal. Retry only retries owned local cleanup.
+      <p className="text-xs" data-testid="managed-removal-remote-outcome">
+        Remote Git: {status.remote_git} · SVN: {status.remote_svn}.
+        {status.partial_cleanup?.retry_is_local_cleanup_only
+          ? ' Retry only retries owned local cleanup; recorded remote outcomes are kept.'
+          : ' Managed removal does not delete remotes unless you separately authorize branch deletion.'}
       </p>
       {status.partial_cleanup && (
         <div

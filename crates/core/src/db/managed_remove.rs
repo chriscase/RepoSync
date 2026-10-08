@@ -583,15 +583,7 @@ fn capture_one_scoped_secret(
     key: &str,
     enc_key: &[u8; 32],
 ) -> Result<Option<TombstoneScopedSecret>, DatabaseError> {
-    if let Some((ct, nonce)) = read_encrypted_secret_tx(conn, key)? {
-        return Ok(Some(TombstoneScopedSecret {
-            revoked: false,
-            ciphertext: Some(ct),
-            nonce: Some(nonce),
-        }));
-    }
     match read_value(conn, key)? {
-        None => Ok(None),
         Some(val) if val.is_empty() => Ok(Some(TombstoneScopedSecret {
             revoked: true,
             ciphertext: None,
@@ -607,6 +599,16 @@ fn capture_one_scoped_secret(
                 ciphertext: Some(ct),
                 nonce: Some(nonce),
             }))
+        }
+        None => {
+            if let Some((ct, nonce)) = read_encrypted_secret_tx(conn, key)? {
+                return Ok(Some(TombstoneScopedSecret {
+                    revoked: false,
+                    ciphertext: Some(ct),
+                    nonce: Some(nonce),
+                }));
+            }
+            Ok(None)
         }
     }
 }
@@ -1113,6 +1115,24 @@ impl Database {
         read_op(&conn, repo_id)
     }
 
+    /// Load a specific managed-removal document when the UI holds a receipt
+    /// `operation_id` that may differ from the current `latest` pointer.
+    pub fn managed_removal_operation(
+        &self,
+        repo_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<ManagedRemoveOperation>, DatabaseError> {
+        let conn = self.conn();
+        let Some(raw) = read_value(&conn, &key("document", operation_id))? else {
+            return Ok(None);
+        };
+        let op = parse_op(&raw)?;
+        if op.repo_id != repo_id {
+            return Ok(None);
+        }
+        Ok(Some(op))
+    }
+
     pub fn removal_dependency_preview(
         &self,
         repo_id: &str,
@@ -1225,8 +1245,8 @@ impl Database {
             if op.state.is_terminal_success() {
                 return Ok(());
             }
-            op.remote_git = remote.remote_git.clone();
-            op.remote_svn = remote.remote_svn.clone();
+            op.remote_git = merge_remote_branch_outcome(&op.remote_git, &remote.remote_git);
+            op.remote_svn = merge_remote_branch_outcome(&op.remote_svn, &remote.remote_svn);
             op.updated_at = Utc::now().to_rfc3339();
             store_op(tx, &op)?;
             Ok(())
@@ -1299,15 +1319,9 @@ impl Database {
         let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
             DatabaseError::Other(format!("encryption key unavailable: {error}"))
         })?;
-        let scoped_secrets = {
-            let conn = self.conn();
-            capture_owned_scoped_secrets(&conn, repo_id, &enc_key)?
-        };
-        let inbound_last_git_sha = {
-            let conn = self.conn();
-            read_value(&conn, &format!("last_git_sha_{repo_id}"))?
-        };
         self.transaction(|tx| {
+            let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
+            let inbound_last_git_sha = read_value(tx, &format!("last_git_sha_{repo_id}"))?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
@@ -1330,6 +1344,12 @@ impl Database {
                 [repo_id],
                 |row| row.get(0),
             )?;
+            let remote_git = merge_remote_branch_outcome(&op.remote_git, &remote.remote_git);
+            let remote_svn = merge_remote_branch_outcome(&op.remote_svn, &remote.remote_svn);
+            let merged_remote = ManagedRemoveRemoteOutcome {
+                remote_git: remote_git.clone(),
+                remote_svn: remote_svn.clone(),
+            };
             let tombstone = RemovalTombstone {
                 version: 1,
                 repo_id: repo.id.clone(),
@@ -1344,8 +1364,8 @@ impl Database {
                 last_svn_rev: repo.last_svn_rev,
                 last_git_sha: repo.last_git_sha.clone(),
                 commit_map_count,
-                remote_git: remote.remote_git.clone(),
-                remote_svn: remote.remote_svn.clone(),
+                remote_git,
+                remote_svn,
                 restore_supported: true,
                 retention: "tombstone_audit_mappings_retained_restore_available".into(),
                 scoped_secrets,
@@ -1386,9 +1406,9 @@ impl Database {
             }
             op.state = ManagedRemoveState::Completed;
             op.restore_supported = true;
-            op.remote_git = remote.remote_git.clone();
-            op.remote_svn = remote.remote_svn.clone();
-            op.outcome_detail = Some(completed_removal_outcome_detail(remote, true));
+            op.remote_git = merged_remote.remote_git.clone();
+            op.remote_svn = merged_remote.remote_svn.clone();
+            op.outcome_detail = Some(completed_removal_outcome_detail(&merged_remote, true));
             op.updated_at = Utc::now().to_rfc3339();
             op.last_svn_rev = repo.last_svn_rev;
             op.last_git_sha = repo.last_git_sha;
@@ -2635,6 +2655,86 @@ mod tests {
             .fail_managed_remove_with_remote(repo_id, &retry.id, "would downgrade", Some(&worse))
             .unwrap();
         assert_eq!(merged.remote_git, "deleted");
+    }
+
+    #[test]
+    fn managed_removal_operation_loads_document_by_id() {
+        let db = setup();
+        let repo_id = "op-by-id";
+        db.insert_repository(&repo(repo_id, "Op", None)).unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        db.fail_managed_remove(repo_id, &operation.id, "injected")
+            .unwrap();
+        let loaded = db
+            .managed_removal_operation(repo_id, &operation.id)
+            .unwrap()
+            .expect("expected document");
+        assert_eq!(loaded.id, operation.id);
+        assert_eq!(loaded.state, ManagedRemoveState::Failed);
+        assert!(db
+            .managed_removal_operation(repo_id, "missing-op")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn record_remote_progress_merge_keeps_deleted_when_incoming_untouched() {
+        let db = setup();
+        let repo_id = "record-merge-deleted";
+        db.insert_repository(&repo(repo_id, "Record merge", None))
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        db.record_managed_remove_remote_progress(
+            repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome {
+                remote_git: "deleted".into(),
+                remote_svn: "untouched".into(),
+            },
+        )
+        .unwrap();
+        db.record_managed_remove_remote_progress(
+            repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+        let op = db.managed_removal(repo_id).unwrap().unwrap();
+        assert_eq!(op.remote_git, "deleted");
+        assert_eq!(op.remote_svn, "untouched");
+    }
+
+    #[test]
+    fn scoped_secret_capture_prefers_kv_revocation_over_stale_encrypted() {
+        let db = setup();
+        let repo_id = "revoke-over-enc";
+        db.insert_repository(&repo(repo_id, "Revoke", None))
+            .unwrap();
+        let key = format!("secret_git_token_{repo_id}");
+        db.set_state(&key, "").unwrap();
+        let enc_key = crate::crypto::get_or_create_encryption_key(&db).unwrap();
+        let (ct, nonce) = crate::crypto::encrypt_credential("stale-plain", &enc_key).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "INSERT INTO encrypted_secrets (key, ciphertext, nonce, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![&key, ct, nonce, now],
+            )
+            .unwrap();
+        let conn = db.conn();
+        let snap = capture_one_scoped_secret(&conn, &key, &enc_key)
+            .unwrap()
+            .expect("expected snapshot");
+        assert!(snap.revoked);
+        assert!(snap.ciphertext.is_none());
     }
 
     #[test]
