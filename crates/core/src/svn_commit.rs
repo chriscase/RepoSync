@@ -184,13 +184,19 @@ fn paths_match(
 }
 
 fn message_carries_identity(message: &str, op: &SvnCommitOperation) -> bool {
-    let mut saw_operation = false;
+    let mut saw_operation_trailer = false;
+    let mut operation_matches = false;
     let mut saw_repo_sync_sha = false;
     let mut saw_personal_git_sha = false;
     for line in message.lines() {
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix(OPERATION_TRAILER) {
-            saw_operation |= value.trim() == op.id;
+            saw_operation_trailer = true;
+            if value.trim() == op.id {
+                operation_matches = true;
+            } else {
+                return false;
+            }
         }
         if let Some(value) = trimmed.strip_prefix(GIT_SHA_TRAILER) {
             saw_repo_sync_sha |= value.trim() == op.source_git_sha;
@@ -200,8 +206,11 @@ fn message_carries_identity(message: &str, op: &SvnCommitOperation) -> bool {
         }
     }
     let sha_ok = saw_repo_sync_sha || saw_personal_git_sha;
-    if saw_operation {
+    if operation_matches {
         return sha_ok;
+    }
+    if saw_operation_trailer {
+        return false;
     }
     // Personal-format commits may omit RepoSync-Operation; the Git-SHA trailer
     // still binds the durable intent when tree/path proof succeeds below.
@@ -436,5 +445,60 @@ pub async fn apply_svn_commit_reconciliation(
                 resume_authorized: false,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::message_carries_identity;
+    use crate::db::svn_commit_operations::{SvnCommitOperation, SvnCommitOperationState};
+
+    fn sample_op(operation_id: &str, git_sha: &str) -> SvnCommitOperation {
+        SvnCommitOperation {
+            version: 1,
+            id: operation_id.into(),
+            repo_id: "pair".into(),
+            operation_type: "git_to_svn".into(),
+            initiator_id: "test".into(),
+            request_id: "req".into(),
+            target_fingerprint: "fp".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+            updated_at: "2020-01-01T00:00:00Z".into(),
+            state: SvnCommitOperationState::ReconciliationRequired,
+            source_git_sha: git_sha.into(),
+            source_git_parent: None,
+            source_git_tree: "tree".into(),
+            target_svn_uuid: "uuid".into(),
+            target_svn_path: "/svn".into(),
+            target_svn_root_url: String::new(),
+            target_svn_branch_path: String::new(),
+            pre_write_svn_rev: 1,
+            pre_write_svn_tree: "pre".into(),
+            projection: "{}".into(),
+            intended_changed_paths: Vec::new(),
+            intended_svn_tree: "intended".into(),
+            author: "svn".into(),
+            source_message: "msg".into(),
+            last_confirmed_svn_rev: None,
+            last_confirmed_svn_tree: None,
+            resume_authorized: false,
+            outcome_detail: None,
+        }
+    }
+
+    #[test]
+    fn repo_sync_operation_trailer_must_match_operation_id() {
+        let sha = "c".repeat(40);
+        let op = sample_op("op-expected", &sha);
+        let message = format!("sync\n\nRepoSync-Operation: op-other\nRepoSync-Git-SHA: {sha}");
+        assert!(!message_carries_identity(&message, &op));
+    }
+
+    #[test]
+    fn legacy_git_sha_without_operation_trailer_still_matches() {
+        let sha = "d".repeat(40);
+        let op = sample_op("op-expected", &sha);
+        let message = format!("sync\n\nGit-SHA: {sha}");
+        assert!(message_carries_identity(&message, &op));
     }
 }

@@ -835,6 +835,14 @@ impl GitClient {
         Ok(())
     }
 
+    /// Author display name for a commit SHA.
+    pub fn commit_author_name(&self, sha: &str) -> Result<String, GitError> {
+        let oid = Oid::from_str(sha)?;
+        let commit = self.repo.find_commit(oid)?;
+        let name = commit.author().name().unwrap_or("").to_string();
+        Ok(name)
+    }
+
     /// Get the number of parents a commit has (useful for merge detection).
     pub fn get_parent_count(&self, sha: &str) -> Result<usize, GitError> {
         let oid = Oid::from_str(sha)?;
