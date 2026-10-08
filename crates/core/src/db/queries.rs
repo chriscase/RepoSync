@@ -3571,6 +3571,16 @@ mod tests {
         let db = setup_db();
         create_test_repo(&db, "pair-a", "Pair A");
         create_test_repo(&db, "pair-b", "Pair B");
+        let scoped_sha = "a".repeat(40);
+        db.set_state("last_git_sha_pair-a", &scoped_sha).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+                 VALUES ('row-a', 'pair-a', NULL, ?1, 'git_to_svn', '', '', ?2, ?2, 'applied')",
+                rusqlite::params![scoped_sha, now],
+            )
+            .unwrap();
         let before_personal = crate::echo_receipt_scope::repo_echo_generation(
             &db,
             crate::db::personal_scope::PERSONAL_SCOPE_KEY,
@@ -3595,6 +3605,12 @@ mod tests {
             crate::echo_receipt_scope::repo_echo_generation(&db, "pair-b").unwrap(),
             before_b + 1
         );
+        let sync_rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM sync_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sync_rows, 0);
+        assert!(db.get_state("last_git_sha_pair-a").unwrap().is_none());
     }
 
     #[test]

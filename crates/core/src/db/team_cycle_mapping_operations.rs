@@ -212,10 +212,16 @@ fn advance_git_with_receipt_tx(
             "team cycle mapping lost its repository registration".into(),
         ));
     }
-    write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
     let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
     let mut receipt = receipt;
     crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+    let projection = receipt["projection"].as_str().unwrap_or("");
+    let receipt_proves_kv = crate::echo_suppression::verify_no_target_receipt(
+        &receipt, repo_id, git_sha, projection, generation,
+    ) == crate::echo_suppression::NoTargetReceiptVerdict::Accepted;
+    if receipt_proves_kv {
+        write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
+    }
     let receipt_key =
         crate::echo_receipt_scope::handled_git_no_target_state_key(repo_id, generation, git_sha);
     write_value(tx, &receipt_key, &receipt.to_string())?;
@@ -595,7 +601,7 @@ mod tests {
             .unwrap();
         let receipt = serde_json::from_str::<serde_json::Value>(&receipt_raw).unwrap();
         assert_eq!(
-            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered"),
+            verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1),
             NoTargetReceiptVerdict::Accepted
         );
         let echo_ctx = TeamEchoContext {

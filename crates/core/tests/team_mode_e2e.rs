@@ -12890,11 +12890,11 @@ async fn candidate_echo_identity_path_recreation_stale_svn_receipt_not_valid() {
         imported >= 1,
         "path delete/recreate must still import as new SVN work (got {imported})"
     );
-    let tree = svn_tree(&fixture, recreated_rev).await;
+    let bridge_tree = tracked_tree(&fixture.bridge);
     assert_eq!(
-        tree.get(path),
+        bridge_tree.get(path),
         Some(&b"second incarnation\n".to_vec()),
-        "recreated path must reach Git via SVN→Git"
+        "recreated path must reach the bridge Git tree via SVN→Git"
     );
 
     let stale_rev = recreated_rev - 1;
@@ -13050,6 +13050,49 @@ async fn candidate_echo_split_cursor_unproved_emitted_column_ambiguous_checkpoin
     );
 }
 
+// Refs #63: agreeing column and scoped KV without outbound proof stay ambiguous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_legacy_unified_cursor_without_provenance_ambiguous_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new().await;
+    let forged = fixture.developer_commit(
+        "forged.txt",
+        "no applied mapping\n",
+        "Unproven unified legacy cursor",
+    );
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    fixture
+        .engine
+        .db()
+        .set_state("last_git_sha_pair", &forged)
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&forged],
+        )
+        .unwrap();
+    let result = fixture.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "unified legacy cursor without scoped provenance must not be trusted: {result:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_LEGACY_UNIFIED_CURSOR_UNPROVEN",
+            "forged_sha":forged
+        })
+    );
+}
+
 /// #65: managed remove + restore re-adopts sync checkpoints and resumes incremental sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r65_managed_remove_restore_resumes_sync() {
@@ -13166,6 +13209,227 @@ async fn candidate_r65_managed_remove_restore_resumes_sync() {
             "baseline_svn":baseline_watermark.0,
             "after_svn":after_watermark.0,
             "maps":maps_after_restore
+        })
+    );
+}
+
+// Refs #63: column-only install bootstrap must not self-deadlock on Database::conn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_column_bootstrap_sync_cycle_bounded_no_db_mutex_hang() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new().await;
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
+        .unwrap();
+    let cycle = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fixture.engine.run_sync_cycle(),
+    )
+    .await;
+    assert!(
+        cycle.is_ok(),
+        "sync cycle must finish within bounded time (must not deadlock on database mutex reentrancy)"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_COLUMN_BOOTSTRAP_BOUNDED",
+            "cycle_completed":true,
+            "cycle_ok":cycle.unwrap().is_ok()
+        })
+    );
+}
+
+// Refs #63: post-history column-only cursor must block without hanging the sync cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_shape1_column_only_unproved_blocks_sync_cycle_bounded() {
+    if !svn_available() {
+        return;
+    }
+    let fixture = QualifiedPair::new().await;
+    let handled = fixture
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT git_sha FROM sync_records WHERE repo_id = 'pair' AND direction = 'svn_to_git' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    let unproved = fixture.developer_commit("shape1.txt", "n\n", "unproved tip");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
+        .unwrap();
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&unproved],
+        )
+        .unwrap();
+    let cycle = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fixture.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("sync cycle must not hang");
+    assert!(
+        matches!(
+            cycle,
+            Err(SyncError::HistoryBlocked { ref reason, .. })
+                if reason == "ambiguous_checkpoint"
+        ),
+        "unproved column-only cursor after history must block: {cycle:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_SHAPE1_COLUMN_ONLY_UNPROVED",
+            "handled":handled,
+            "unproved":unproved
+        })
+    );
+}
+
+// Refs #63: stale or bogus unified receipts must not admit team_git_checkpoint P.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_unified_bogus_no_target_receipt_ambiguous_checkpoint() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let handled = pair
+        .engine
+        .db()
+        .get_state("last_git_sha_pair")
+        .unwrap()
+        .unwrap();
+    let child = pair.developer_commit(
+        "blocked.txt",
+        "bogus probe\n",
+        "Unified bogus receipt probe",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let bogus = serde_json::json!({
+        "version": 1,
+        "repo_id": "pair",
+        "git_sha": child,
+        "outcome": "bogus",
+        "projection": "not-the-policy",
+        "generation": 99,
+    });
+    pair.engine
+        .db()
+        .set_state(
+            &format!("handled_git_no_target_pair_{child}"),
+            &bogus.to_string(),
+        )
+        .unwrap();
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&child],
+        )
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state("last_git_sha_pair", &child)
+        .unwrap();
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "bogus unified receipt must not admit checkpoint: {result:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_UNIFIED_BOGUS_RECEIPT",
+            "handled":handled,
+            "child":child,
+            "blocked":"ambiguous_checkpoint"
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_unified_stale_filtered_receipt_after_bump_ambiguous_checkpoint() {
+    if !svn_available() {
+        return;
+    }
+    use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
+
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Filtered before generation bump",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
+    pair.engine
+        .db()
+        .set_state("last_git_sha_pair", &filtered)
+        .unwrap();
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&filtered],
+        )
+        .unwrap();
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "stale generation-1 filtered receipt on unified cursor must block: {result:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_UNIFIED_STALE_FILTERED_AFTER_BUMP",
+            "filtered":filtered,
+            "blocked":"ambiguous_checkpoint"
         })
     );
 }
