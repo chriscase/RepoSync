@@ -293,6 +293,30 @@ fn git_head_sha(repo: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn git_show_blob(repo: &Path, object: &str, path: &str) -> String {
+    let spec = format!("{}:{}", object, path);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show", &spec])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git show {} in {}",
+        spec,
+        repo.display()
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn personal_commit_map_git_sha(db: &Database, direction: &str, git_sha: &str) -> bool {
+    db.list_commit_map(50)
+        .unwrap()
+        .iter()
+        .any(|row| row.direction == direction && row.git_sha == git_sha)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scenario_r01_svnserve_personal_roundtrip() {
     if let Some(missing) = toolchain_available() {
@@ -369,7 +393,7 @@ async fn scenario_r01_svnserve_personal_roundtrip() {
     );
     engine.run_cycle().await.expect("post-import cycle");
 
-    svn_commit_file(
+    let svn_personal_rev = svn_commit_file(
         &wc,
         "from_svn_personal.txt",
         "svn leg\n",
@@ -379,6 +403,20 @@ async fn scenario_r01_svnserve_personal_roundtrip() {
     );
     let svn_stats = engine.run_cycle().await.expect("SVN→Git personal cycle");
     assert_eq!(svn_stats.svn_to_git_count, 1);
+    let db_after_svn = Database::new(&db_path).unwrap();
+    let svn_to_git_head = git_head_sha(&git_work);
+    assert_eq!(
+        git_show_blob(&git_work, &svn_to_git_head, "from_svn_personal.txt"),
+        "svn leg\n"
+    );
+    let svn_to_git_map = db_after_svn
+        .list_commit_map(20)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.direction == "svn_to_git" && row.svn_rev == svn_personal_rev)
+        .expect("svn_to_git commit_map row")
+        .git_sha;
+    assert_eq!(svn_to_git_map, svn_to_git_head);
 
     std::fs::write(git_work.join("from_git_personal.txt"), "git leg\n").unwrap();
     let git_client = GitClient::new(&git_work).unwrap();
@@ -396,6 +434,7 @@ async fn scenario_r01_svnserve_personal_roundtrip() {
 
     let svn_wc = tmp.path().join("svn-wc");
     svn_checkout(&svn_url, &svn_wc, user, pass);
+    let svn_wc_path = svn_wc.clone();
     let db_arc = Arc::new(Database::new(&db_path).unwrap());
     let syncer = GitToSvnSync::new(
         SvnClient::new(&svn_url, user, pass),
@@ -414,7 +453,18 @@ async fn scenario_r01_svnserve_personal_roundtrip() {
         .await
         .expect("git→svn replay");
     assert!(svn_rev > svn_after_seed);
-    assert!(db_arc.is_personal_git_sha_synced(&git_sha).unwrap());
+    assert!(
+        personal_commit_map_git_sha(&db_arc, "git_to_svn", &git_sha),
+        "git_to_svn commit_map must record the replayed SHA directly"
+    );
+    assert_eq!(
+        std::fs::read_to_string(svn_wc_path.join("from_git_personal.txt")).unwrap(),
+        "git leg\n"
+    );
+    assert_eq!(
+        git_show_blob(&git_work, &git_sha, "from_git_personal.txt"),
+        "git leg\n"
+    );
 
     emit_evidence(
         CASE_PERSONAL_ROUNDTRIP,
@@ -426,6 +476,9 @@ async fn scenario_r01_svnserve_personal_roundtrip() {
             "git_to_svn_rev": svn_rev,
             "git_sha": git_sha,
             "git_head_after": git_head_sha(&git_work),
+            "svn_to_git_tree_checked": true,
+            "git_to_svn_tree_checked": true,
+            "commit_map_checked": true,
         }),
     );
 }
