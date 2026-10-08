@@ -765,19 +765,21 @@ fn openat_write_nofollow(
 static CONFINED_TEMP_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(unix, test))]
-static CONFINED_TEMP_COPY_NAME_OVERRIDE: std::sync::Mutex<Option<std::ffi::OsString>> =
-    std::sync::Mutex::new(None);
+thread_local! {
+    static CONFINED_TEMP_COPY_NAME_OVERRIDE: std::cell::Cell<Option<std::ffi::OsString>> =
+        const { std::cell::Cell::new(None) };
+}
 
-/// Force the next confined temp name (single test call only).
+/// Force the next confined temp name on this thread (single test call only).
 #[cfg(all(unix, test))]
 fn set_confined_temp_copy_name_override_for_test(name: Option<std::ffi::OsString>) {
-    *CONFINED_TEMP_COPY_NAME_OVERRIDE.lock().unwrap() = name;
+    CONFINED_TEMP_COPY_NAME_OVERRIDE.set(name);
 }
 
 #[cfg(unix)]
 fn confined_temp_copy_name() -> std::ffi::OsString {
     #[cfg(test)]
-    if let Some(name) = CONFINED_TEMP_COPY_NAME_OVERRIDE.lock().unwrap().take() {
+    if let Some(name) = CONFINED_TEMP_COPY_NAME_OVERRIDE.take() {
         return name;
     }
     let seq = CONFINED_TEMP_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1770,6 +1772,12 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
     })?;
     if dst_meta.is_dir() {
         return Ok(false);
+    }
+    if !dst_meta.file_type().is_file() && !dst_meta.file_type().is_symlink() {
+        bail!(
+            "refusing to reconcile non-regular root .gitattributes at {}",
+            dst_path.display()
+        );
     }
 
     let src_meta = match std::fs::symlink_metadata(src_path) {

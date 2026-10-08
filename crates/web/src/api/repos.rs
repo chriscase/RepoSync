@@ -4139,63 +4139,7 @@ async fn get_pre_commit_hook(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
-    let mut script = String::from("#!/bin/bash\n");
-    script.push_str("# RepoSync pre-commit hook — validates file paths against SVN rules\n");
-    script.push_str(
-        "# Install: cp this file .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit\n",
-    );
-    script.push_str("# Or: mkdir -p .githooks && cp this file .githooks/pre-commit && git config core.hooksPath .githooks\n\n");
-
-    if allowed.is_empty() && blocked.is_empty() {
-        script.push_str("# No path rules configured for this repository.\nexit 0\n");
-    } else {
-        script.push_str("ERRORS=0\n\n");
-
-        if !allowed.is_empty() {
-            script.push_str("# Allowed path prefixes\n");
-            script.push_str("ALLOWED_PATHS=(");
-            for (i, p) in allowed.iter().enumerate() {
-                if i > 0 {
-                    script.push(' ');
-                }
-                script.push_str(&format!("\"{}\"", p));
-            }
-            script.push_str(")\n\n");
-
-            script.push_str("for file in $(git diff --cached --name-only --diff-filter=ACM); do\n");
-            script.push_str("  ALLOWED=0\n");
-            script.push_str("  for prefix in \"${ALLOWED_PATHS[@]}\"; do\n");
-            script.push_str("    if [[ \"$file\" == \"$prefix\"* ]]; then\n");
-            script.push_str("      ALLOWED=1\n");
-            script.push_str("      break\n");
-            script.push_str("    fi\n");
-            script.push_str("  done\n");
-            script.push_str("  if [ $ALLOWED -eq 0 ]; then\n");
-            script.push_str(
-                "    echo \"ERROR: '$file' is not under an allowed path: ${ALLOWED_PATHS[*]}\"\n",
-            );
-            script.push_str("    ERRORS=$((ERRORS + 1))\n");
-            script.push_str("  fi\n");
-            script.push_str("done\n\n");
-        }
-
-        if !blocked.is_empty() {
-            script.push_str("# Blocked patterns\n");
-            for pattern in &blocked {
-                script.push_str(&format!(
-                    "for file in $(git diff --cached --name-only --diff-filter=ACM); do\n  case \"$file\" in\n    {}) echo \"ERROR: '$file' matches blocked pattern '{}'\"; ERRORS=$((ERRORS + 1));;\n  esac\ndone\n\n",
-                    pattern, pattern
-                ));
-            }
-        }
-
-        script.push_str("if [ $ERRORS -gt 0 ]; then\n");
-        script.push_str("  echo \"\"\n");
-        script.push_str("  echo \"Commit blocked: $ERRORS file(s) violate SVN path rules.\"\n");
-        script.push_str("  echo \"These files would be rejected by the SVN server.\"\n");
-        script.push_str("  exit 1\n");
-        script.push_str("fi\n");
-    }
+    let script = reposync_core::path_projection::render_pre_commit_hook_script(&allowed, &blocked);
 
     Ok(axum::response::Response::builder()
         .status(200)
