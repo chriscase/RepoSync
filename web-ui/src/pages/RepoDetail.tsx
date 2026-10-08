@@ -13,6 +13,14 @@ import {
   readPersistedBranchPairRemovalNotice,
 } from '../branchPairRemoval';
 import ImportProgressCard from '../components/ImportProgressCard';
+import ImportHistoryNotice from '../components/ImportHistoryNotice';
+import {
+  DEFAULT_REPO_IMPORT_MODE,
+  hasVerifiedSnapshotBaseline,
+  importBaselineFailureNotice,
+  type RepoImportMode,
+} from '../importBaseline';
+import type { ImportStatus } from '../api';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalPanel from '../components/ManagedRemovalPanel';
 import {
@@ -91,6 +99,8 @@ export default function RepoDetail() {
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
   const routedNotice = readBranchPairRemovalNotice(location.state);
+  const importPrefs = (location.state as { importPrefs?: { importMode: RepoImportMode; svnRevision: string } } | null)
+    ?.importPrefs;
   const [localNotice, setLocalNotice] = useState<RemovalNotice | null>(null);
   const [retiredId, setRetiredId] = useState<string | null>(null);
 
@@ -189,6 +199,47 @@ export default function RepoDetail() {
   });
 
   // Branch pairs
+  const needsImportStatusForNotice =
+    detailLive
+    && repo?.import_mode === 'snapshot'
+    && !hasVerifiedSnapshotBaseline({
+      import_mode: repo?.import_mode,
+      starting_revision: repo?.starting_revision,
+      history_boundary: repo?.history_boundary,
+      snapshot_pin: repo?.snapshot_pin,
+    });
+
+  const { data: importStatus } = useQuery<ImportStatus>({
+    queryKey: ['import-status', id],
+    queryFn: async () => {
+      const token = localStorage.getItem('session_token');
+      const res = await fetch(`/api/repos/${id}/import/status`, {
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      });
+      if (!res.ok) throw new Error(`Import status unavailable (${res.status})`);
+      return res.json();
+    },
+    enabled: Boolean(needsImportStatusForNotice),
+    refetchInterval: needsImportStatusForNotice ? 5000 : false,
+  });
+
+  const baselineNoticeFields = repo
+    ? {
+        import_mode: repo.import_mode,
+        starting_revision: repo.starting_revision,
+        history_boundary: repo.history_boundary,
+        snapshot_pin: repo.snapshot_pin,
+        phase: importStatus?.phase,
+        lifecycle: importStatus?.lifecycle,
+        outcome_detail: importStatus?.outcome_detail,
+      }
+    : null;
+
+  const showBaselineNotice =
+    baselineNoticeFields
+    && (hasVerifiedSnapshotBaseline(baselineNoticeFields)
+      || Boolean(importBaselineFailureNotice(baselineNoticeFields)));
+
   const { data: branchPairs } = useQuery({
     queryKey: ['branch-pairs', id],
     queryFn: () => api.listBranchPairs(id!),
@@ -447,7 +498,7 @@ export default function RepoDetail() {
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
 
   const trackedRemovalOperationId =
-    removalReceipt?.repoId === id ? removalReceipt.operationId : undefined;
+    removalReceipt && removalReceipt.repoId === id ? removalReceipt.operationId : undefined;
 
   const removalStatusQuery = useQuery<ManagedRemovalStatus | null>({
     queryKey: ['managed-removal', id, trackedRemovalOperationId ?? 'latest'],
@@ -1156,8 +1207,19 @@ export default function RepoDetail() {
         />
       </div>
 
+      {showBaselineNotice && baselineNoticeFields && (
+        <ImportHistoryNotice fields={baselineNoticeFields} />
+      )}
+
       {/* Import Progress */}
-      {detailLive && <ImportProgressCard repoId={id} repoName={repo?.name} />}
+      {detailLive && (
+        <ImportProgressCard
+          repoId={id}
+          repoName={repo?.name}
+          defaultImportMode={importPrefs?.importMode ?? DEFAULT_REPO_IMPORT_MODE}
+          defaultSvnRevision={importPrefs?.svnRevision ?? 'HEAD'}
+        />
+      )}
 
       {/* Sync Records */}
       <div className="bg-gray-800 shadow rounded-lg border border-gray-700">

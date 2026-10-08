@@ -1,6 +1,16 @@
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Clock, ArrowRight, Terminal, CheckCircle2 } from 'lucide-react';
 import { api, type ImportStatus } from '../api';
+import {
+  DEFAULT_REPO_IMPORT_MODE,
+  buildStartImportBody,
+  startImportButtonLabel,
+  validateSvnRevisionInput,
+  type RepoImportMode,
+} from '../importBaseline';
+import ImportHistoryNotice from './ImportHistoryNotice';
+import ImportModeFields from './ImportModeFields';
 import { getStoredUser } from '../utils/auth';
 
 // ---------------------------------------------------------------------------
@@ -93,9 +103,29 @@ function PhaseDots({ phase }: { phase: string }) {
 // Component (self-fetching)
 // ---------------------------------------------------------------------------
 
-export default function ImportProgressCard({ repoId, repoName, hideIfIdle = false }: { repoId?: string; repoName?: string; hideIfIdle?: boolean } = {}) {
+export default function ImportProgressCard({
+  repoId,
+  repoName,
+  hideIfIdle = false,
+  defaultImportMode = DEFAULT_REPO_IMPORT_MODE,
+  defaultSvnRevision = 'HEAD',
+}: {
+  repoId?: string;
+  repoName?: string;
+  hideIfIdle?: boolean;
+  defaultImportMode?: RepoImportMode;
+  defaultSvnRevision?: string;
+} = {}) {
   const queryClient = useQueryClient();
   const admin = getStoredUser()?.role === 'admin';
+  const [importMode, setImportMode] = useState<RepoImportMode>(defaultImportMode);
+  const [svnRevision, setSvnRevision] = useState(defaultSvnRevision);
+  const [startError, setStartError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setImportMode(defaultImportMode);
+    setSvnRevision(defaultSvnRevision);
+  }, [defaultImportMode, defaultSvnRevision, repoId]);
   const { data: status, isError } = useQuery<ImportStatus>({
     queryKey: ['import-status', repoId || 'global'],
     queryFn: async () => {
@@ -115,14 +145,37 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
 
   const start = useMutation({
     mutationFn: async () => {
+      if (!repoId) throw new Error('Repository id required');
+      setStartError(null);
+      let body: ReturnType<typeof buildStartImportBody>;
+      try {
+        body = buildStartImportBody(importMode, svnRevision);
+      } catch (e) {
+        throw e instanceof Error ? e : new Error(String(e));
+      }
       const res = await fetch(`/api/repos/${repoId}/import`, {
-        method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}`,
-          'X-Request-ID': crypto.randomUUID() },
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${localStorage.getItem('session_token')}`,
+          'Content-Type': 'application/json',
+          'X-Request-ID': crypto.randomUUID(),
+        },
+        body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error((await res.json()).error || `Import start failed (${res.status})`);
-      return res.json() as Promise<{ operation_id: string }>;
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || `Import start failed (${res.status})`);
+      }
+      return payload as { operation_id: string };
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['import-status', repoId] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['import-status', repoId] });
+      queryClient.invalidateQueries({ queryKey: ['repo', repoId] });
+    },
+    onError: (e: Error) => {
+      setStartError(e.message);
+      queryClient.invalidateQueries({ queryKey: ['import-status', repoId] });
+    },
   });
   const cancel = useMutation({
     mutationFn: async (operationId: string) => {
@@ -167,12 +220,33 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
           </h3>
             <p className="text-xs text-gray-500 mt-1">No import history</p>
             {repoId && admin && status.can_start && (
-              <button type="button" onClick={() => start.mutate()} disabled={start.isPending}
-                className="mt-3 rounded bg-blue-600 px-3 py-1 text-xs text-white disabled:opacity-50">
-                {start.isPending ? 'Starting…' : 'Start full import'}
-              </button>
+              <div className="mt-3 space-y-3">
+                <ImportModeFields
+                  mode={importMode}
+                  svnRevision={svnRevision}
+                  onModeChange={setImportMode}
+                  onRevisionChange={setSvnRevision}
+                  disabled={start.isPending}
+                  radioGroupName={repoId ? `repo-import-mode-${repoId}` : 'repo-import-mode'}
+                />
+                <button
+                  type="button"
+                  data-testid="start-repo-import"
+                  onClick={() => start.mutate()}
+                  disabled={
+                    start.isPending
+                    || (importMode === 'snapshot'
+                      && Boolean(validateSvnRevisionInput(svnRevision)))
+                  }
+                  className="rounded bg-blue-600 px-3 py-1 text-xs text-white disabled:opacity-50"
+                >
+                  {start.isPending ? 'Starting…' : startImportButtonLabel(importMode)}
+                </button>
+              </div>
             )}
-            {start.isError && <p className="mt-2 text-xs text-red-400">{start.error.message}</p>}
+            {(start.isError || startError) && (
+              <p className="mt-2 text-xs text-red-400">{startError ?? start.error?.message}</p>
+            )}
           </div>
           <a
             href="/repos"
@@ -217,6 +291,9 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
           <StatCell label="Commits" value={`${status.commits_created}`} />
           <StatCell label="Batches" value={`${status.batches_pushed}`} />
           <StatCell label="LFS Files" value={`${status.lfs_unique_count}`} />
+        </div>
+        <div className="mb-3">
+          <ImportHistoryNotice fields={status} />
         </div>
         {status.outcome_detail && <p className="mb-3 text-xs text-emerald-300">{status.outcome_detail}</p>}
         {repoId && (
@@ -290,6 +367,9 @@ export default function ImportProgressCard({ repoId, repoName, hideIfIdle = fals
         <StatCell label="Commits" value={`${status.commits_created}`} />
         <StatCell label="Batches" value={`${status.batches_pushed}`} />
         <StatCell label="LFS Files" value={`${status.lfs_unique_count}`} />
+      </div>
+      <div className="mb-3">
+        <ImportHistoryNotice fields={status} compact />
       </div>
       {status.operation_id && <p className="mb-2 text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>}
       {status.last_local_svn_rev != null && (
