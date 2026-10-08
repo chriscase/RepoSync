@@ -25,4 +25,4 @@ Policy identity for published plans: `late_pair_publish_v1`.
 
 ## Tests
 
-Named cases: `R06_LATE_PAIR_PUBLISH_REPLAY`, `R06_PUBLISH_RESUME_AFTER_SVN_COPY`, updated `R06_NO_ACTIVE_ON_PARTIAL` (existing target blocks publish).
+Named cases: `R06_LATE_PAIR_PUBLISH_REPLAY`, updated `R06_NO_ACTIVE_ON_PARTIAL` (existing target blocks publish). Restart/resume after `svn_copied` is implemented in the journal but not yet a named fixture.

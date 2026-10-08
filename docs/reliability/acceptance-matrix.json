@@ -213,8 +213,7 @@
         "R06_SKIP_IMPORT_BLOCKED",
         "R06_EXISTING_TARGET_NOT_EQUIVALENT",
         "R06_NO_ACTIVE_ON_PARTIAL",
-        "R06_LATE_PAIR_PUBLISH_REPLAY",
-        "R06_PUBLISH_RESUME_AFTER_SVN_COPY"
+        "R06_LATE_PAIR_PUBLISH_REPLAY"
       ],
       "supporting_case_ids": [
         "R06_CHECKPOINT"
@@ -225,7 +224,7 @@
         "Parent SVN-ahead retention into Git is not implemented",
         "Issue #67 remains open"
       ],
-      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Admission/preview pins tips and baseline. Publish copies SVN at the verified baseline revision, sets baseline watermarks, replays pending Git through SyncEngine, and enables the child when the pinned tip is handled (R06_LATE_PAIR_PUBLISH_REPLAY). Durable late_pair_publish operations resume from svn_copied (R06_PUBLISH_RESUME_AFTER_SVN_COPY). Existing SVN targets block publish without activating a child (R06_NO_ACTIVE_ON_PARTIAL).",
+      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Admission/preview pins tips and baseline. Publish copies SVN at the verified baseline revision, sets baseline watermarks, replays pending Git through SyncEngine, and enables the child when the pinned tip is handled (R06_LATE_PAIR_PUBLISH_REPLAY). Durable late_pair_publish operations record svn_copied for resume; a dedicated restart fixture after SVN copy remains open. Existing SVN targets block publish without activating a child (R06_NO_ACTIVE_ON_PARTIAL).",
       "diagnostic_expected_baseline_failure": true
     },
     {
