@@ -3526,11 +3526,15 @@ mod tests {
     #[test]
     fn clear_sync_data_bumps_personal_echo_generation() {
         let db = setup_db();
-        let before = crate::echo_receipt_scope::repo_echo_generation(
+        create_test_repo(&db, "pair-a", "Pair A");
+        create_test_repo(&db, "pair-b", "Pair B");
+        let before_personal = crate::echo_receipt_scope::repo_echo_generation(
             &db,
             crate::db::personal_scope::PERSONAL_SCOPE_KEY,
         )
         .unwrap();
+        let before_a = crate::echo_receipt_scope::repo_echo_generation(&db, "pair-a").unwrap();
+        let before_b = crate::echo_receipt_scope::repo_echo_generation(&db, "pair-b").unwrap();
         db.clear_sync_data().unwrap();
         assert_eq!(
             crate::echo_receipt_scope::repo_echo_generation(
@@ -3538,7 +3542,15 @@ mod tests {
                 crate::db::personal_scope::PERSONAL_SCOPE_KEY,
             )
             .unwrap(),
-            before + 1
+            before_personal + 1
+        );
+        assert_eq!(
+            crate::echo_receipt_scope::repo_echo_generation(&db, "pair-a").unwrap(),
+            before_a + 1
+        );
+        assert_eq!(
+            crate::echo_receipt_scope::repo_echo_generation(&db, "pair-b").unwrap(),
+            before_b + 1
         );
     }
 

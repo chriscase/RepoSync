@@ -1169,6 +1169,22 @@ impl GitToSvnSync {
 }
 
 impl GitToSvnSync {
+    /// Finalize a proven held personal Git→SVN journal (SVN inspect before author).
+    pub async fn promote_held_git_to_svn_reconciliation_if_proven(&self) -> Result<Option<i64>> {
+        let Some(op) = self
+            .db
+            .active_personal_svn_commit_operation()
+            .context("failed to read active personal git-to-svn commit")?
+        else {
+            return Ok(None);
+        };
+        if op.state != SvnCommitOperationState::ReconciliationRequired {
+            return Ok(None);
+        }
+        self.recover_held_personal_git_to_svn_reconciliation(&op, None)
+            .await
+    }
+
     async fn recover_held_personal_git_to_svn_reconciliation(
         &self,
         op: &SvnCommitOperation,
@@ -1201,7 +1217,14 @@ impl GitToSvnSync {
             .get_commit(&self.github_repo, &op.source_git_sha)
             .await
             .context("failed to resolve git author for held personal git-to-svn commit")?;
-        Ok(detail.commit.author.name)
+        let name = detail.commit.author.name.trim();
+        if name.is_empty() {
+            anyhow::bail!(
+                "reconciliation_required: GitHub author name is empty for held commit {}",
+                op.source_git_sha
+            );
+        }
+        Ok(name.to_string())
     }
 
     async fn finalize_held_personal_git_to_svn_if_proven(
