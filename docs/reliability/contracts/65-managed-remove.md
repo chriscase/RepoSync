@@ -7,8 +7,10 @@ This is the smallest product slice of issue #65. It does **not** close #65 or #6
 | Operation | Route | Effect |
 | --- | --- | --- |
 | Legacy disable | `DELETE /api/repos/{id}` | Sets `enabled=false` only. Registration, mappings, secrets, local files, and remotes stay. Response `action` is `disable` and `message` remains `repository disabled`. No removal journal is written. |
+| Explicit disable | `POST /api/repos/{id}/disable` | Same contract as legacy DELETE for new UI clients. Adds `preservation`, `remote_git`, `remote_svn`, and `managed_removal: false`. |
 | Managed removal | `POST /api/repos/{id}/remove` | Explicit and additive. Uses the v12 `kv_state` journal `managed_remove_v1:` (same storage family as #64 import and Git→SVN journals). Schema stays v12. |
-| Removal status | `GET /api/repos/{id}/removal` | Read-only state. Does not delete anything. |
+| Removal status | `GET /api/repos/{id}/removal` | Read-only state. Does not delete anything. Returns `operation_id`, `partial_cleanup` on failure/hold, and `recovery` tombstone metadata when present. |
+| Branch-pair remote delete | `DELETE /api/repos/{id}/branch-pair` | Legacy callers omitting `delete_git` / `delete_svn` still default both to **true**. New UI sends `explicit_remote_deletion_opts=true` with explicit `delete_git` / `delete_svn` (default **false** when omitted). |
 
 Managed removal:
 
@@ -24,10 +26,8 @@ Managed removal:
 
 ## Still later
 
-- UI wording polish beyond this API distinction
-- Parent/child dependency preview
-- Optional authenticated remote Git-ref / SVN-path deletion
-- Changing branch-pair `DELETE /api/repos/{id}/branch-pair`, which still defaults omitted `delete_git` / `delete_svn` to true
+- Rich parent/child dependency preview (UI shows child count; API still refuses parent removal)
+- Optional authenticated remote Git-ref / SVN-path deletion beyond branch-pair delete
 - Closing #65
 
 ## Tests
