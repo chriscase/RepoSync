@@ -59,16 +59,19 @@
       ],
       "supporting_case_ids": [
         "R02_PATH_CONFINEMENT",
-        "R02_JOURNAL_RETRY"
+        "R02_JOURNAL_RETRY",
+        "R65_REMOVE_RECONCILIATION",
+        "R65_BRANCH_REMOTE_OPTS",
+        "R65_EXPLICIT_DISABLE",
+        "R65_UI_DISABLE_REMOVE",
+        "R65_BRANCH_PAIR_QUERY"
       ],
       "open": [
-        "UI wording beyond the disable versus managed-remove API responses is a later #65 slice",
-        "Parent/child dependency preview is not implemented; parent removal is refused while child rows exist and does not cascade",
-        "Optional authenticated remote Git-ref or SVN-path deletion is not in this slice",
-        "Branch-pair DELETE still defaults omitted remote-deletion parameters to true; that transition is later and was not changed here",
+        "Rich parent/child dependency preview beyond child-count refusal is not implemented",
+        "Optional authenticated remote Git-ref or SVN-path deletion beyond branch-pair delete is not in this slice",
         "Restore is not supported; the tombstone is not a trash bin"
       ],
-      "evidence": "R02_R03_ROUTE and R02_LEGACY_DELETE keep legacy DELETE as disable-only: the registration, commit_map row, and per-repo secret remain, no managed-removal journal is written, and disposable SVN/Git remotes are byte-identical. R02_MANAGED_REMOVE and R02_REMOVE_RETRY add POST /api/repos/{id}/remove. It waits while a worker holds the repo, refuses symlink roots without following them, retries a visible failure, then removes only the owned local tree and exact per-repo secrets. Mappings, audit, sibling data, global secrets, and both remotes stay. Restore is not supported. Parent removal is refused while children exist.",
+      "evidence": "R02_R03_ROUTE and R02_LEGACY_DELETE keep legacy DELETE as disable-only: the registration, commit_map row, and per-repo secret remain, no managed-removal journal is written, and disposable SVN/Git remotes are byte-identical. R02_MANAGED_REMOVE and R02_REMOVE_RETRY add POST /api/repos/{id}/remove. It waits while a worker holds the repo, refuses symlink roots without following them, retries a visible failure, then removes only the owned local tree and exact per-repo secrets. Mappings, audit, sibling data, global secrets, and both remotes stay. R65 adds POST /disable, GET /removal recovery metadata, HTTP 409 reconciliation_required, explicit branch-pair remote opt-in with legacy destructive defaults preserved, and UI distinction between pause/disable and managed removal.",
       "diagnostic_expected_baseline_failure": false
     },
     {

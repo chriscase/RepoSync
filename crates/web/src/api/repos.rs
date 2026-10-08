@@ -271,6 +271,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/repos/:id", get(get_repo))
         .route("/api/repos/:id", put(update_repo))
         .route("/api/repos/:id", delete(delete_repo))
+        .route("/api/repos/:id/disable", post(disable_repo))
         .route("/api/repos/:id/remove", post(remove_repo))
         .route("/api/repos/:id/removal", get(get_removal))
         .route("/api/repos/:id/sync", post(trigger_sync))
@@ -528,8 +529,25 @@ async fn delete_repo(
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    disable_repo_inner(&state, &headers, &id).await
+}
+
+/// Explicit pause/disable for new clients. Same non-destructive contract as legacy DELETE.
+async fn disable_repo(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    disable_repo_inner(&state, &headers, &id).await
+}
+
+async fn disable_repo_inner(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    id: &str,
+) -> Result<Json<serde_json::Value>, AppError> {
     let (_user_id, role) = validate_session_with_role(
-        &state,
+        state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
@@ -539,12 +557,12 @@ async fn delete_repo(
     }
 
     let db = &state.db;
-    reject_held_import(db, &id)?;
+    reject_held_import(db, id)?;
 
     // Legacy DELETE stays non-destructive: disable only. Managed removal is
     // POST /api/repos/:id/remove and never runs from this route.
     let disabled = db
-        .legacy_disable_repository(&id)
+        .legacy_disable_repository(id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
     if !disabled {
         return Err(AppError::NotFound("repository not found".into()));
@@ -554,14 +572,46 @@ async fn delete_repo(
         "ok": true,
         "action": "disable",
         "message": "repository disabled",
+        "preservation": "registration, mappings, secrets, local files, and remotes are preserved",
         "enabled": false,
+        "remote_git": "untouched",
+        "remote_svn": "untouched",
+        "managed_removal": false,
     })))
 }
 
+fn removal_recovery_payload(
+    db: &reposync_core::db::Database,
+    repo_id: &str,
+) -> Result<Option<serde_json::Value>, AppError> {
+    let tombstone = db
+        .removal_tombstone(repo_id)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(tombstone.map(|t| {
+        serde_json::json!({
+            "operation_id": t.operation_id,
+            "name": t.name,
+            "svn_url": t.svn_url,
+            "svn_branch": t.svn_branch,
+            "git_repo": t.git_repo,
+            "git_branch": t.git_branch,
+            "parent_id": t.parent_id,
+            "last_svn_rev": t.last_svn_rev,
+            "last_git_sha": t.last_git_sha,
+            "commit_map_count": t.commit_map_count,
+            "remote_git": t.remote_git,
+            "remote_svn": t.remote_svn,
+            "restore_supported": t.restore_supported,
+            "retention": t.retention,
+        })
+    }))
+}
+
 fn removal_response(
+    db: &reposync_core::db::Database,
     operation: &reposync_core::db::managed_remove::ManagedRemoveOperation,
     registration_listed: bool,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     use reposync_core::db::managed_remove::ManagedRemoveState;
     let status = match operation.state {
         ManagedRemoveState::Completed => StatusCode::OK,
@@ -588,7 +638,22 @@ fn removal_response(
         }
         .to_string()
     });
-    (
+    let recovery = removal_recovery_payload(db, &operation.repo_id)?;
+    let partial_cleanup = if matches!(
+        operation.state,
+        ManagedRemoveState::Failed | ManagedRemoveState::ReconciliationRequired
+    ) {
+        Some(serde_json::json!({
+            "outcome_detail": operation.outcome_detail,
+            "registration_listed": registration_listed,
+            "remote_git": operation.remote_git,
+            "remote_svn": operation.remote_svn,
+            "retry_is_local_cleanup_only": true,
+        }))
+    } else {
+        None
+    };
+    Ok((
         status,
         Json(serde_json::json!({
             "ok": operation.state.is_terminal_success(),
@@ -596,13 +661,15 @@ fn removal_response(
             "state": operation.state,
             "operation_id": operation.id,
             "message": message,
-            "remote_git": "untouched",
-            "remote_svn": "untouched",
-            "restore_supported": false,
+            "remote_git": operation.remote_git,
+            "remote_svn": operation.remote_svn,
+            "restore_supported": operation.restore_supported,
             "retryable": retryable,
             "registration_listed": registration_listed,
+            "recovery": recovery,
+            "partial_cleanup": partial_cleanup,
         })),
-    )
+    ))
 }
 
 fn registration_listed(db: &Database, repo_id: &str) -> Result<bool, AppError> {
@@ -667,7 +734,7 @@ async fn remove_repo(
         }
         RemovalAdvance::Completed { operation } => {
             let listed = registration_listed(&state.db, &id)?;
-            let (status, body) = removal_response(&operation, listed);
+            let (status, body) = removal_response(&state.db, &operation, listed)?;
             return Ok((status, body).into_response());
         }
         RemovalAdvance::Waiting { operation, blocker } => {
@@ -675,7 +742,7 @@ async fn remove_repo(
                 signal_import_stop(&state, &id).await;
             }
             let listed = registration_listed(&state.db, &id)?;
-            let (status, body) = removal_response(&operation, listed);
+            let (status, body) = removal_response(&state.db, &operation, listed)?;
             return Ok((status, body).into_response());
         }
         RemovalAdvance::Cleanup { operation } => operation,
@@ -698,7 +765,7 @@ async fn remove_repo(
             )
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let listed = registration_listed(&state.db, &id)?;
-        let (status, body) = removal_response(&operation, listed);
+        let (status, body) = removal_response(&state.db, &operation, listed)?;
         return Ok((status, body).into_response());
     }
     let Some(_busy) = reposync_core::busy::try_acquire(&id) else {
@@ -711,7 +778,7 @@ async fn remove_repo(
             )
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let listed = registration_listed(&state.db, &id)?;
-        let (status, body) = removal_response(&operation, listed);
+        let (status, body) = removal_response(&state.db, &operation, listed)?;
         return Ok((status, body).into_response());
     };
     let advance = state
@@ -722,7 +789,7 @@ async fn remove_repo(
         RemovalAdvance::Cleanup { operation } => operation,
         RemovalAdvance::Completed { operation } => {
             let listed = registration_listed(&state.db, &id)?;
-            let (status, body) = removal_response(&operation, listed);
+            let (status, body) = removal_response(&state.db, &operation, listed)?;
             return Ok((status, body).into_response());
         }
         RemovalAdvance::Waiting { operation, blocker } => {
@@ -730,7 +797,7 @@ async fn remove_repo(
                 signal_import_stop(&state, &id).await;
             }
             let listed = registration_listed(&state.db, &id)?;
-            let (status, body) = removal_response(&operation, listed);
+            let (status, body) = removal_response(&state.db, &operation, listed)?;
             return Ok((status, body).into_response());
         }
         RemovalAdvance::ParentBlocked { child_count } => {
@@ -751,13 +818,13 @@ async fn remove_repo(
             .fail_managed_remove(&id, &operation.id, &error.to_string())
             .map_err(|e| AppError::Internal(e.to_string()))?;
         let listed = registration_listed(&state.db, &id)?;
-        let (status, body) = removal_response(&operation, listed);
+        let (status, body) = removal_response(&state.db, &operation, listed)?;
         return Ok((status, body).into_response());
     }
     match state.db.complete_managed_remove(&id, &operation.id) {
         Ok(operation) => {
             let listed = registration_listed(&state.db, &id)?;
-            let (status, body) = removal_response(&operation, listed);
+            let (status, body) = removal_response(&state.db, &operation, listed)?;
             Ok((status, body).into_response())
         }
         Err(error) => {
@@ -766,7 +833,7 @@ async fn remove_repo(
                 .fail_managed_remove(&id, &operation.id, &error.to_string())
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             let listed = registration_listed(&state.db, &id)?;
-            let (status, body) = removal_response(&operation, listed);
+            let (status, body) = removal_response(&state.db, &operation, listed)?;
             Ok((status, body).into_response())
         }
     }
@@ -790,7 +857,7 @@ async fn get_removal(
         return Err(AppError::NotFound("managed removal not found".into()));
     };
     let listed = registration_listed(&state.db, &id)?;
-    let (status, body) = removal_response(&operation, listed);
+    let (status, body) = removal_response(&state.db, &operation, listed)?;
     Ok((status, body).into_response())
 }
 
@@ -3125,11 +3192,27 @@ async fn list_branch_pairs(
 
 #[derive(Deserialize)]
 struct DeleteBranchPairQuery {
-    #[serde(default = "default_true")]
-    delete_git: bool,
-    #[serde(default = "default_true")]
-    delete_svn: bool,
+    /// When true, omitted `delete_git` / `delete_svn` default to false (new UI contract).
+    #[serde(default)]
+    explicit_remote_deletion_opts: bool,
+    delete_git: Option<bool>,
+    delete_svn: Option<bool>,
 }
+
+fn branch_pair_remote_delete_flags(opts: &DeleteBranchPairQuery) -> (bool, bool) {
+    if opts.explicit_remote_deletion_opts {
+        (
+            opts.delete_git.unwrap_or(false),
+            opts.delete_svn.unwrap_or(false),
+        )
+    } else {
+        (
+            opts.delete_git.unwrap_or(true),
+            opts.delete_svn.unwrap_or(true),
+        )
+    }
+}
+
 async fn delete_branch_pair(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -3183,9 +3266,10 @@ async fn delete_branch_pair(
         .ok_or_else(|| AppError::Internal("parent repository not found".into()))?;
 
     let mut warnings: Vec<String> = Vec::new();
+    let (delete_git, delete_svn) = branch_pair_remote_delete_flags(&opts);
 
     // Optionally delete Git branch on remote
-    if opts.delete_git && !repo.git_branch.is_empty() {
+    if delete_git && !repo.git_branch.is_empty() {
         let git_token = db
             .resolve_credential_chain(&parent.id, "secret_git_token")
             .unwrap_or_default();
@@ -3212,7 +3296,7 @@ async fn delete_branch_pair(
     }
 
     // Optionally delete SVN branch on remote
-    if opts.delete_svn && !repo.svn_branch.is_empty() {
+    if delete_svn && !repo.svn_branch.is_empty() {
         let svn_password = db
             .resolve_credential_chain(&parent.id, "secret_svn_password")
             .unwrap_or_default();
@@ -3289,6 +3373,14 @@ async fn delete_branch_pair(
         "ok": true,
         "message": format!("Branch pair '{}' deleted", repo_name),
         "warnings": warnings,
+        "registration_listed": false,
+        "remote_deletion": {
+            "explicit_opts": opts.explicit_remote_deletion_opts,
+            "delete_git_requested": delete_git,
+            "delete_svn_requested": delete_svn,
+            "git_ref": if delete_git { repo.git_branch.clone() } else { String::new() },
+            "svn_path": if delete_svn { repo.svn_branch.clone() } else { String::new() },
+        },
     })))
 }
 
