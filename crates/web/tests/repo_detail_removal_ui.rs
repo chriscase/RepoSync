@@ -69,12 +69,12 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
     );
     let repos_list = include_str!("../../../web-ui/src/pages/Repositories.tsx");
     assert!(
-        repos_list.contains("readManagedRemovalReceipt"),
-        "Repositories list must restore managed-removal receipts after navigation or reload"
+        repos_list.contains("shouldDisplayManagedRemovalReceipt"),
+        "Repositories list must gate managed-removal receipt rendering"
     );
     assert!(
-        repos_list.contains("ManagedRemovalReceiptNotice"),
-        "Repositories list must render managed-removal receipt notice"
+        repos_list.contains("managedRemovalReceiptNotice"),
+        "Repositories list must bind receipt notice to the display gate"
     );
     let panel = include_str!("../../../web-ui/src/components/ManagedRemovalPanel.tsx");
     assert!(
@@ -84,5 +84,56 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
     assert!(
         panel.contains("Retry only retries owned local cleanup"),
         "Retry copy must not imply remote deletion"
+    );
+    assert!(
+        src.contains("managed-removal-dependency-preview"),
+        "Remove confirm must render dependency preview from the API"
+    );
+    assert!(
+        src.contains("getRemovalDependencyPreview"),
+        "Remove confirm must load dependency preview before confirmation"
+    );
+}
+
+#[test]
+fn managed_removal_receipt_display_gate_and_roundtrip() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = r#"
+const store = new Map();
+globalThis.sessionStorage = {
+  getItem(key) { return store.has(key) ? store.get(key) : null; },
+  setItem(key, value) { store.set(key, String(value)); },
+  removeItem(key) { store.delete(key); },
+};
+import {
+  persistManagedRemovalReceipt,
+  readManagedRemovalReceipt,
+  shouldDisplayManagedRemovalReceipt,
+  clearManagedRemovalReceipt,
+} from './web-ui/src/managedRemoval.ts';
+
+if (shouldDisplayManagedRemovalReceipt(null)) process.exit(2);
+if (shouldDisplayManagedRemovalReceipt({ repoId: '', operationId: 'op', state: 'completed', message: '' })) process.exit(3);
+
+const receipt = { repoId: 'repo-a', operationId: 'op-1', state: 'completed', message: 'done' };
+if (!shouldDisplayManagedRemovalReceipt(receipt)) process.exit(4);
+persistManagedRemovalReceipt(receipt);
+const restored = readManagedRemovalReceipt();
+if (!restored || restored.operationId !== 'op-1') process.exit(5);
+clearManagedRemovalReceipt();
+if (readManagedRemovalReceipt() !== null) process.exit(6);
+"#;
+    let output = Command::new("node")
+        .arg("--experimental-strip-types")
+        .arg("--input-type=module")
+        .arg("-e")
+        .arg(script)
+        .current_dir(&root)
+        .output()
+        .expect("spawn managed removal receipt behavioral check");
+    assert!(
+        output.status.success(),
+        "managed removal receipt behavioral check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

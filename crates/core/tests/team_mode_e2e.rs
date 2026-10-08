@@ -359,6 +359,49 @@ async fn svn_tree(fixture: &QualifiedPair, revision: i64) -> BTreeMap<String, Ve
     exported_tree(&destination)
 }
 
+fn svn_rename_file(wc: &Path, from: &str, to: &str, message: &str) -> i64 {
+    let from_path = wc.join(from);
+    let to_path = wc.join(to);
+    if let Some(parent) = to_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+    }
+    let output = Command::new("svn")
+        .args(["mv", from_path.to_str().unwrap(), to_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn mv: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("svn")
+        .args([
+            "commit",
+            "-m",
+            message,
+            wc.to_str().unwrap(),
+            "--username",
+            "fixture",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "svn rename commit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = String::from_utf8_lossy(&output.stdout);
+    line.lines()
+        .find_map(|line| line.strip_prefix("Committed revision "))
+        .unwrap()
+        .trim_end_matches('.')
+        .parse()
+        .unwrap()
+}
+
 fn svn_delete_file(wc: &Path, name: &str, message: &str) -> i64 {
     let output = Command::new("svn")
         .args(["rm", wc.join(name).to_str().unwrap()])
@@ -7883,21 +7926,45 @@ async fn candidate_r10_policy_kv_only_filtered_commit_rejected() {
     );
 }
 
-struct TestOutboundFault(&'static str);
-impl TestOutboundFault {
-    fn new(kind: &'static str, sha: &str, bridge: &Path) -> Self {
-        let name = match kind {
-            "read" => "REPOSYNC_TEST_GIT_CONTENT_FAULT",
-            "stage" => "REPOSYNC_TEST_SVN_STAGE_FAULT",
+struct TestOutboundFault<'a> {
+    engine: &'a reposync_core::sync_engine::SyncEngine,
+    kind: &'static str,
+    env_key: Option<&'static str>,
+}
+impl TestOutboundFault<'_> {
+    fn new<'a>(
+        engine: &'a reposync_core::sync_engine::SyncEngine,
+        kind: &'static str,
+        sha: &str,
+        bridge: &Path,
+        git_path: &str,
+    ) -> TestOutboundFault<'a> {
+        match kind {
+            "read" => engine.set_git_content_read_test_fault(sha, bridge, git_path),
+            "stage" => std::env::set_var(
+                "REPOSYNC_TEST_SVN_STAGE_FAULT",
+                format!("{}|{}", sha, bridge.display()),
+            ),
             _ => panic!("unknown fault"),
-        };
-        std::env::set_var(name, format!("{}|{}", sha, bridge.display()));
-        Self(name)
+        }
+        TestOutboundFault {
+            engine,
+            kind,
+            env_key: if kind == "stage" {
+                Some("REPOSYNC_TEST_SVN_STAGE_FAULT")
+            } else {
+                None
+            },
+        }
     }
 }
-impl Drop for TestOutboundFault {
+impl Drop for TestOutboundFault<'_> {
     fn drop(&mut self) {
-        std::env::remove_var(self.0);
+        if self.kind == "read" {
+            self.engine.clear_git_content_read_test_fault();
+        } else if let Some(key) = self.env_key {
+            std::env::remove_var(key);
+        }
     }
 }
 
@@ -7935,7 +8002,7 @@ async fn assert_outbound_fault_stops_and_retries(kind: &'static str, case: &str)
     let second = pair.developer_commit("later.txt", "later work\n", "Second queued Git change");
     git_cli(&pair.developer, &["push", "origin", "main"]);
     let before = pair.snapshot().await;
-    let fault = TestOutboundFault::new(kind, &first, &pair.bridge);
+    let fault = TestOutboundFault::new(&pair.engine, kind, &first, &pair.bridge, "fault.txt");
     let result = pair.engine.run_sync_cycle().await;
     assert!(
         result.is_err(),
@@ -9378,6 +9445,55 @@ async fn candidate_rsc02_rename_allowed_old_to_blocked_new_projects_delete_only(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_rename_allowed_to_blocked_does_not_read_out_of_scope_blob() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "team/seed.txt",
+        "seed payload\n",
+        "Seed allowed path in SVN",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let sha = pair.developer_git_mv(
+        "team/seed.txt",
+        "team-other/new.txt",
+        "Allowed-old to sibling-blocked-new rename",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    pair.engine.set_git_blob_read_recording(true);
+    pair.engine
+        .set_git_content_read_test_fault(&sha, &pair.bridge, "team-other/new.txt");
+    let result = pair.engine.run_sync_cycle().await;
+    pair.engine.clear_git_content_read_test_fault();
+    let reads = pair.engine.git_blob_reads_recorded();
+    assert_eq!(
+        result.unwrap().git_to_svn_count,
+        1,
+        "must not read out-of-scope rename destination blob"
+    );
+    assert!(
+        !reads.iter().any(|path| path == "team-other/new.txt"),
+        "out-of-scope blob read paths: {reads:?}"
+    );
+    let tree = svn_tree(&pair, svn_youngest(&pair.svn_url)).await;
+    assert!(!tree.contains_key("team/seed.txt"));
+    assert!(!tree.contains_key("team-other/new.txt"));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_RENAME_NO_OUT_OF_SCOPE_READ",
+            "sha":sha,
+            "git_blob_reads":reads,
+            "out_of_scope_blob_unread":!reads.iter().any(|p| p == "team-other/new.txt")
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_rename_blocked_old_to_allowed_new_projects_add_only() {
     let mut pair = QualifiedPair::new().await;
     pair.developer_commit(
@@ -9676,6 +9792,117 @@ async fn candidate_rsc02_git_rename_svn_edit_source_path_conflict() {
             "svn_tree_unchanged":svn_tree_before == svn_tree_after
         })
     );
+}
+
+async fn assert_git_rename_svn_divergence_stops_before_apply(
+    pair: &QualifiedPair,
+    conflict_path: &str,
+    before: &PairSnapshot,
+) {
+    let sync_result = pair.engine.run_sync_cycle().await;
+    assert!(
+        sync_result.is_err(),
+        "expected sync cycle to stop before apply, got {sync_result:?}"
+    );
+    let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+    let row = conflicts
+        .iter()
+        .find(|c| c.file_path == conflict_path)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected persisted conflict for {conflict_path}, got {:?}",
+                conflicts
+                    .iter()
+                    .map(|c| (&c.file_path, c.conflict_type.as_str()))
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(row.status, "detected");
+    let after = pair.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev, "SVN must not be published");
+    assert_eq!(
+        after.remote_sha, before.remote_sha,
+        "Git must not be pushed"
+    );
+    assert_eq!(after.watermark, before.watermark);
+    let retry = pair.engine.run_sync_cycle().await;
+    assert!(
+        retry.is_err(),
+        "second cycle must remain stable (no apply retry loop), got {retry:?}"
+    );
+    let after_retry = pair.snapshot().await;
+    assert_eq!(after_retry.svn_rev, before.svn_rev);
+    assert_eq!(after_retry.remote_sha, before.remote_sha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_svn_delete_git_rename_in_scope_conflict_stops_before_apply() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("team/old.txt", "seed\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success(), "svn update failed");
+    svn_delete_file(&pair.wc, "team/old.txt", "SVN deletes rename source");
+    let _sha = pair.developer_git_mv("team/old.txt", "team/new.txt", "Git renames in scope");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    assert_git_rename_svn_divergence_stops_before_apply(&pair, "team/old.txt", &before).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_svn_rename_git_rename_conflict_stops_before_apply() {
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("team/old.txt", "seed\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["team".into()], Vec::new());
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success(), "svn update failed");
+    svn_rename_file(
+        &pair.wc,
+        "team/old.txt",
+        "team/svn-other.txt",
+        "SVN renames to different destination",
+    );
+    let _sha = pair.developer_git_mv("team/old.txt", "team/new.txt", "Git renames elsewhere");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    assert_git_rename_svn_divergence_stops_before_apply(&pair, "team/old.txt", &before).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_empty_rules_svn_delete_git_rename_conflict_stops_before_apply() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("old.txt", "seed\n", "Seed rename source");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success(), "svn update failed");
+    svn_delete_file(&pair.wc, "old.txt", "SVN deletes rename source");
+    let _sha = pair.developer_git_mv("old.txt", "new.txt", "Git renames with empty rules");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    assert_git_rename_svn_divergence_stops_before_apply(&pair, "old.txt", &before).await;
 }
 
 // ---------------------------------------------------------------------------

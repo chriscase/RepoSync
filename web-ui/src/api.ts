@@ -488,6 +488,29 @@ export const api = {
       throw new Error(message);
     }
     if (!body.operation_id) {
+      if (res.status === 409 && body.state === 'blocked') {
+        throw new Error(message);
+      }
+      throw new Error(message);
+    }
+    return body;
+  },
+
+  getRemovalDependencyPreview: async (id: string): Promise<import('./managedRemoval').RemovalPreviewResponse> => {
+    const token = localStorage.getItem('session_token');
+    const res = await fetch(`${API_BASE}/repos/${id}/removal/preview`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    const text = await res.text();
+    let body = {} as import('./managedRemoval').RemovalPreviewResponse & { error?: string };
+    if (text) {
+      body = JSON.parse(text) as import('./managedRemoval').RemovalPreviewResponse & { error?: string };
+    }
+    const message = (body as { error?: string }).error || text || `API error ${res.status}`;
+    if (!res.ok && res.status !== 409 && res.status !== 202) {
+      throw new Error(message);
+    }
+    if (!body.dependency_preview) {
       throw new Error(message);
     }
     return body;

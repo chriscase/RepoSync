@@ -195,7 +195,18 @@ impl ConflictDetector {
 
         for svn_change in svn_changes {
             if let Some(git_change) = git_by_path.get(svn_change.path.as_str()) {
-                let conflict_type = classify_conflict(svn_change, git_change);
+                let conflict_type = if matches!(svn_change.change_kind, ChangeKind::Deleted)
+                    && matches!(git_change.change_kind, ChangeKind::Deleted)
+                    && git_changes.iter().any(|git| {
+                        matches!(
+                            git.change_kind,
+                            ChangeKind::Renamed { ref from } if from == &svn_change.path
+                        )
+                    }) {
+                    Some(ConflictType::EditDelete)
+                } else {
+                    classify_conflict(svn_change, git_change)
+                };
                 if let Some(ct) = conflict_type {
                     let mut conflict = Conflict::new(&svn_change.path, ct);
                     conflict.svn_content = svn_change.content.clone();
@@ -435,6 +446,26 @@ mod tests {
             content: None,
             is_binary: false,
         }];
+        let conflicts = ConflictDetector::detect(&svn, &git);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].file_path, "old.txt");
+        assert_eq!(conflicts[0].conflict_type, ConflictType::EditDelete);
+    }
+
+    #[test]
+    fn test_projected_delete_pair_on_rename_source_is_edit_delete_conflict() {
+        let svn = vec![change("old.txt", ChangeKind::Deleted)];
+        let git = vec![
+            change("old.txt", ChangeKind::Deleted),
+            FileChange {
+                path: "new.txt".to_string(),
+                change_kind: ChangeKind::Renamed {
+                    from: "old.txt".to_string(),
+                },
+                content: None,
+                is_binary: false,
+            },
+        ];
         let conflicts = ConflictDetector::detect(&svn, &git);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].file_path, "old.txt");

@@ -394,14 +394,14 @@ pub fn ensure_lfs_tracked(repo_root: &Path, pattern: &str) -> std::io::Result<bo
         }
     }
 
-    // Append the new line without following a planted symlink.
-    let mut file = open_gitattributes_append_nofollow(repo_root)?;
-
-    // Ensure we start on a new line if the file doesn't end with one.
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        writeln!(file)?;
+    let mut body = existing;
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
     }
-    writeln!(file, "{}", expected_line)?;
+    body.push_str(&expected_line);
+    body.push('\n');
+    crate::import::publish_repo_root_gitattributes(repo_root, &body)
+        .map_err(|e| std::io::Error::other(format!("failed to publish .gitattributes: {e:#}")))?;
 
     info!(pattern, path = %gitattr_path.display(), "added LFS tracking to .gitattributes");
     Ok(true)
@@ -449,7 +449,7 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
             ".gitattributes contains interior NUL byte",
         )
     })?;
-    let read_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let read_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
     let fd = unsafe {
         libc::openat(
             root_owned.as_raw_fd(),
@@ -465,15 +465,28 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
         }
         return Err(err);
     }
-    let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstat(owned.as_raw_fd(), &mut st) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
     }
     if !gitattributes_stat_is_reg(&st) {
-        return Ok(String::new());
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to read non-regular root .gitattributes",
+        ));
     }
+    let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if current >= 0 && (current & libc::O_NONBLOCK) != 0 {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, current & !libc::O_NONBLOCK) };
+    }
+    let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
     let mut file = unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) };
     let mut body = String::new();
     file.read_to_string(&mut body)?;
@@ -489,70 +502,6 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e),
     }
-}
-
-#[cfg(unix)]
-fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::fs::File> {
-    use std::ffi::CString;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-
-    let root_owned = open_repo_root_nofollow(repo_root)?;
-    let name = CString::new(".gitattributes").map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            ".gitattributes contains interior NUL byte",
-        )
-    })?;
-    let append_flags = libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let open_append = || unsafe {
-        libc::openat(
-            root_owned.as_raw_fd(),
-            name.as_ptr(),
-            append_flags,
-            0 as libc::c_uint,
-        )
-    };
-    let fd = open_append();
-    let fd = if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::NotFound {
-            return Err(err);
-        }
-        let create_flags = append_flags | libc::O_CREAT | libc::O_EXCL;
-        let created = unsafe {
-            libc::openat(
-                root_owned.as_raw_fd(),
-                name.as_ptr(),
-                create_flags,
-                0o644 as libc::c_uint,
-            )
-        };
-        if created < 0 {
-            let create_err = std::io::Error::last_os_error();
-            if create_err.kind() == std::io::ErrorKind::AlreadyExists {
-                let retry = open_append();
-                if retry < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                retry
-            } else {
-                return Err(create_err);
-            }
-        } else {
-            created
-        }
-    } else {
-        fd
-    };
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(not(unix))]
-fn open_gitattributes_append_nofollow(repo_root: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(repo_root.join(".gitattributes"))
 }
 
 /// Derive a `.gitattributes` pattern for a file path.
