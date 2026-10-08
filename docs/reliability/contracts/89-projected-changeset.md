@@ -23,7 +23,13 @@ alone is not sufficient.
 When any blocking row exists, the cycle returns `UnresolvableConflict` and must
 not mutate SVN, the Git remote, or publish mappings. A row can remain after the
 live Git remote no longer shows the divergent commit (for example force-push
-back); the persisted row still blocks until resolved or dismissed.
+back to the pre-divergence tip while only the SVN edit remains pending); the
+persisted row still blocks until resolved or dismissed even when live detection
+is empty.
+
+Scoped engines count rows for their `repo_id` **and** rows with `repo_id IS
+NULL` so legacy conflict rows cannot be bypassed. Cycles with no repository id
+on the engine consult **all** blocking rows before apply (CLI `sync now` path).
 
 ## Conflict upsert integrity
 

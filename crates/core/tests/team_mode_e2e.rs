@@ -10030,9 +10030,15 @@ async fn candidate_rsc02_persisted_conflict_gate_survives_git_force_push_back() 
         "SVN edited shared\n",
         "SVN edits shared path",
     );
+    let pre_divergence_remote = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
+    let svn_after_edit = pair.snapshot().await;
     pair.developer_commit("shared.txt", "Git edited shared\n", "Git edits shared path");
     git_cli(&pair.developer, &["push", "origin", "main"]);
-    let before = pair.snapshot().await;
+    assert_ne!(
+        git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+        pre_divergence_remote,
+        "divergent Git commit must advance the remote"
+    );
     let first = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         pair.engine.run_sync_cycle(),
@@ -10044,13 +10050,15 @@ async fn candidate_rsc02_persisted_conflict_gate_survives_git_force_push_back() 
         "expected content conflict before apply, got {first:?}"
     );
     let after_conflict = pair.snapshot().await;
-    assert_eq!(after_conflict.svn_rev, before.svn_rev);
-    assert_eq!(after_conflict.remote_sha, before.remote_sha);
-    git_cli(&pair.developer, &["reset", "--hard", &before.remote_sha]);
+    assert_eq!(after_conflict.svn_rev, svn_after_edit.svn_rev);
+    git_cli(
+        &pair.developer,
+        &["reset", "--hard", &pre_divergence_remote],
+    );
     git_cli(&pair.developer, &["push", "--force", "origin", "main"]);
     assert_eq!(
         git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
-        before.remote_sha,
+        pre_divergence_remote,
         "Git remote must be restored to pre-divergence tip"
     );
     let gated = tokio::time::timeout(
@@ -10059,21 +10067,29 @@ async fn candidate_rsc02_persisted_conflict_gate_survives_git_force_push_back() 
     )
     .await
     .expect("persisted-conflict gate cycle must finish within bounded time");
-    assert!(
-        matches!(gated, Err(SyncError::UnresolvableConflict { .. })),
-        "persisted conflict row must block apply when detector is empty, got {gated:?}"
-    );
+    match gated {
+        Err(SyncError::UnresolvableConflict { detail, .. }) => {
+            assert!(
+                detail.contains("persisted conflict row(s) block apply"),
+                "expected persisted-row gate refusal, got detail={detail:?}"
+            );
+        }
+        other => panic!(
+            "persisted conflict row must block apply when live detection is empty, got {other:?}"
+        ),
+    }
     let after_gate = pair.snapshot().await;
-    assert_eq!(after_gate.svn_rev, before.svn_rev);
-    assert_eq!(after_gate.remote_sha, before.remote_sha);
-    assert_eq!(after_gate.watermark, before.watermark);
+    assert_eq!(after_gate.svn_rev, svn_after_edit.svn_rev);
+    assert_eq!(after_gate.remote_sha, pre_divergence_remote);
+    assert_eq!(after_gate.watermark, svn_after_edit.watermark);
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"RS_C02_PERSISTED_GATE_FORCE_PUSH_BACK",
-            "remote_restored_sha":before.remote_sha,
-            "svn_unchanged":after_gate.svn_rev == before.svn_rev,
-            "remote_unchanged":after_gate.remote_sha == before.remote_sha
+            "remote_restored_sha":pre_divergence_remote,
+            "svn_unchanged":after_gate.svn_rev == svn_after_edit.svn_rev,
+            "remote_unchanged":after_gate.remote_sha == pre_divergence_remote,
+            "persisted_gate_detail":true
         })
     );
 }
@@ -13618,4 +13634,81 @@ async fn candidate_echo_unified_stale_filtered_receipt_after_bump_ambiguous_chec
             "blocked":"ambiguous_checkpoint"
         })
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_null_repo_id_conflict_blocks_scoped_engine() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+         VALUES ('legacy-null', 'orphan.txt', 'content', 'detected', '2020-01-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+    let before = pair.snapshot().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pair.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("cycle must finish within bounded time");
+    match result {
+        Err(SyncError::UnresolvableConflict { detail, .. }) => {
+            assert!(
+                detail.contains("persisted conflict row(s) block apply"),
+                "expected persisted gate, got {detail:?}"
+            );
+        }
+        other => panic!("NULL repo_id row must block scoped engine, got {other:?}"),
+    }
+    let after = pair.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev);
+    assert_eq!(after.remote_sha, before.remote_sha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_unscoped_engine_blocks_on_persisted_conflict() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    let db = Database::new(&pair.db_path).unwrap();
+    db.initialize().unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+         VALUES ('scoped-row', 'held.txt', 'content', 'detected', '2020-01-01T00:00:00Z', ?1)",
+            [&pair.repo_id],
+        )
+        .unwrap();
+    let git = GitClient::new(&pair.bridge).unwrap();
+    let engine = SyncEngine::new(
+        pair.engine.config().clone(),
+        db,
+        SvnClient::new(&pair.svn_url, "", ""),
+        git,
+        Arc::new(make_identity_mapper()),
+    );
+    let before = pair.snapshot().await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), engine.run_sync_cycle())
+        .await
+        .expect("unscoped cycle must finish within bounded time");
+    match result {
+        Err(SyncError::UnresolvableConflict { detail, .. }) => {
+            assert!(
+                detail.contains("persisted conflict row(s) block apply"),
+                "expected persisted gate, got {detail:?}"
+            );
+        }
+        other => panic!("unscoped engine must block on any persisted conflict, got {other:?}"),
+    }
+    let after = pair.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev);
+    assert_eq!(after.remote_sha, before.remote_sha);
 }

@@ -373,7 +373,7 @@ impl Database {
         let conn = self.conn();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM conflicts
-             WHERE repo_id = ?1
+             WHERE (repo_id = ?1 OR repo_id IS NULL)
                AND status NOT IN ('resolved', 'dismissed')",
             params![repo_id],
             |row| row.get(0),
@@ -381,7 +381,22 @@ impl Database {
         Ok(count)
     }
 
+    /// Count blocking conflict rows with no repository scope (legacy CLI cycles).
+    pub fn count_conflicts_blocking_apply_unscoped(&self) -> Result<i64, DatabaseError> {
+        let conn = self.conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM conflicts
+             WHERE status NOT IN ('resolved', 'dismissed')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// First persisted conflict row that blocks apply for `repo_id`, if any.
+    ///
+    /// Rows with `repo_id IS NULL` also block scoped engines so legacy rows cannot
+    /// be bypassed by per-repo scheduling.
     pub fn first_conflict_blocking_apply_for_repo(
         &self,
         repo_id: &str,
@@ -390,10 +405,27 @@ impl Database {
         let row = conn
             .query_row(
                 "SELECT id, file_path FROM conflicts
-                 WHERE repo_id = ?1
+                 WHERE (repo_id = ?1 OR repo_id IS NULL)
                    AND status NOT IN ('resolved', 'dismissed')
                  ORDER BY created_at ASC LIMIT 1",
                 params![repo_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// First blocking conflict row when no repository id is set on the engine.
+    pub fn first_conflict_blocking_apply_unscoped(
+        &self,
+    ) -> Result<Option<(String, String)>, DatabaseError> {
+        let conn = self.conn();
+        let row = conn
+            .query_row(
+                "SELECT id, file_path FROM conflicts
+                 WHERE status NOT IN ('resolved', 'dismissed')
+                 ORDER BY created_at ASC LIMIT 1",
+                [],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
@@ -471,10 +503,13 @@ impl Database {
             Ok(conflict.id.clone())
         })();
         match result {
-            Ok(id) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(id)
-            }
+            Ok(id) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(id),
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
             Err(error) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 Err(error)
@@ -3160,6 +3195,49 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM conflicts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn count_blocking_apply_includes_null_repo_id_for_scoped_engine() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+                 VALUES ('legacy', 'orphan.txt', 'content', 'detected', '2020-01-01T00:00:00Z', NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.count_conflicts_blocking_apply_for_repo("repo-a")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.first_conflict_blocking_apply_for_repo("repo-a")
+                .unwrap()
+                .unwrap()
+                .1,
+            "orphan.txt"
+        );
+        assert_eq!(
+            db.count_conflicts_blocking_apply_for_repo("repo-b")
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn count_blocking_apply_unscoped_counts_all_repositories() {
+        let db = setup_db();
+        db.conn()
+            .execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+                 VALUES ('a', 'a.txt', 'content', 'detected', '2020-01-01T00:00:00Z', 'repo-a'),
+                        ('b', 'b.txt', 'content', 'deferred', '2020-01-01T00:00:00Z', NULL)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.count_conflicts_blocking_apply_unscoped().unwrap(), 2);
     }
 
     #[test]

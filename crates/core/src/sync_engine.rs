@@ -2416,22 +2416,37 @@ impl SyncEngine {
     /// Refuse SVN/Git apply while the conflicts table still has blocking rows
     /// for this repository (read from SQLite; do not trust in-cycle detection).
     fn refuse_apply_while_persisted_conflicts_block(&self) -> Result<(), SyncError> {
-        let Some(rid) = self.effective_repo_id() else {
-            return Ok(());
+        let (count, file_path) = match self.effective_repo_id() {
+            Some(rid) => {
+                let count = self
+                    .db
+                    .count_conflicts_blocking_apply_for_repo(rid)
+                    .map_err(SyncError::DatabaseError)?;
+                let file_path = self
+                    .db
+                    .first_conflict_blocking_apply_for_repo(rid)
+                    .map_err(SyncError::DatabaseError)?
+                    .map(|(_, path)| path)
+                    .unwrap_or_else(|| "unknown".into());
+                (count, file_path)
+            }
+            None => {
+                let count = self
+                    .db
+                    .count_conflicts_blocking_apply_unscoped()
+                    .map_err(SyncError::DatabaseError)?;
+                let file_path = self
+                    .db
+                    .first_conflict_blocking_apply_unscoped()
+                    .map_err(SyncError::DatabaseError)?
+                    .map(|(_, path)| path)
+                    .unwrap_or_else(|| "unknown".into());
+                (count, file_path)
+            }
         };
-        let count = self
-            .db
-            .count_conflicts_blocking_apply_for_repo(rid)
-            .map_err(SyncError::DatabaseError)?;
         if count == 0 {
             return Ok(());
         }
-        let file_path = self
-            .db
-            .first_conflict_blocking_apply_for_repo(rid)
-            .map_err(SyncError::DatabaseError)?
-            .map(|(_, path)| path)
-            .unwrap_or_else(|| "unknown".into());
         Err(SyncError::UnresolvableConflict {
             file_path,
             detail: format!(
