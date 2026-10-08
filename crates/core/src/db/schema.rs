@@ -293,11 +293,19 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         ALTER TABLE repositories ADD COLUMN teams_webhook_url TEXT;
         "#,
     ),
+    (
+        13,
+        "durable repository scope_uuid for echo/checkpoint keys",
+        r#"
+        ALTER TABLE repositories ADD COLUMN scope_uuid TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_scope_uuid ON repositories(scope_uuid);
+        "#,
+    ),
 ];
 
-/// Operational schema version for ordinary startup. Candidate v13/v14 SQL is
+/// Operational schema version for ordinary startup. Candidate v14+ SQL is
 /// not registered here and must not be applied by [`run_migrations`].
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 
 /// Run all pending migrations against `conn`.
 ///
@@ -355,6 +363,14 @@ fn apply_one_migration(
             version,
             detail: e.to_string(),
         })?;
+    if version == 13 {
+        super::repo_scope_identity::migrate_v13_scope_uuid(&tx).map_err(|e| {
+            DatabaseError::MigrationFailed {
+                version,
+                detail: e.to_string(),
+            }
+        })?;
+    }
     set_schema_version(&tx, version).map_err(|e| DatabaseError::MigrationFailed {
         version,
         detail: e.to_string(),

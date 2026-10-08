@@ -1,7 +1,8 @@
 # #63 contract: canonical lineage, directional checkpoints, non-destructive migration
 
-**Status:** design/contract for review. No DDL, reader activation, or installer
-change ships in this PR. Normal startup remains SQLite `user_version=12`.
+**Status:** design/contract for review. Operational startup is SQLite
+`user_version=13` with durable `repositories.scope_uuid` for echo/receipt/checkpoint
+KV scope. Candidate v14 pair-generation tables remain fixture-only.
 
 **Depends on:** #62 catalog (`docs/reliability/acceptance-matrix.json`).
 **Coordinates with:** #54 nullable `commit_map.git_sha`; do not introduce a
@@ -55,7 +56,17 @@ A no-target row has a reason, policy snapshot, and NULL target as appropriate.
 NULL is not “missing row.” Preserve source/target parents/trees or stable
 fingerprints sufficient to verify an external effect.
 
-## Current v12 compatibility (must keep working)
+## Operational v13 scope identity (shipped slice)
+
+- Each managed repository row carries an immutable `scope_uuid` assigned at
+  registration (v13 backfill for existing rows).
+- Echo generation, Git checkpoint KV, no-target receipts, and durable history
+  blocks key off `scope_uuid`, not the human `id`, so delete + re-register cannot
+  reuse stale scoped state.
+- Legacy repo-id KV/receipts without `scope_uuid` remain authoritative only when
+  at most one repository row exists; otherwise they are ignored.
+
+## Current v12/v13 compatibility (must keep working)
 
 Operational authority today is the bounded table in [design.md](../design.md):
 
@@ -111,7 +122,8 @@ is unacceptable.
 
 ## Smallest next implementation slice (after this review)
 
-Do **not** activate v13/v14. Ordinary startup remains `user_version=12`.
+Do **not** activate candidate v14 tables. Ordinary startup remains
+`user_version=13` with scoped KV only (no `pair_lineages` activation).
 
 The three items below are the reviewed implementation slice. Candidate tables,
 operational typed readers, and installer wiring stay later.

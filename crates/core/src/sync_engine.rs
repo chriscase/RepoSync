@@ -17,6 +17,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -230,20 +231,43 @@ fn sync_git_command_output(
     args: &[&str],
     timeout: Duration,
 ) -> Option<std::process::Output> {
-    let repo_path = repo_path.to_path_buf();
-    let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(&repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output();
-        let _ = tx.send(output);
+    use std::process::Stdio;
+    let child = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => Some(output),
-        _ => None,
+        Ok(Err(_)) => None,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            terminate_git_child(pid);
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => None,
+    }
+}
+
+fn terminate_git_child(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .status();
     }
 }
 
@@ -456,7 +480,14 @@ impl SyncEngine {
     /// Uses per-repo key if repo_id is set, otherwise global key.
     fn git_sha_key(&self) -> String {
         match &self.repo_id {
-            Some(rid) if !rid.is_empty() => format!("last_git_sha_{}", rid),
+            Some(rid) if !rid.is_empty() => {
+                if let Ok(scope) =
+                    crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid)
+                {
+                    return crate::db::repo_scope_identity::last_git_sha_kv_key(&scope);
+                }
+                format!("last_git_sha_{}", rid)
+            }
             _ => "last_git_hash".to_string(),
         }
     }
@@ -706,7 +737,11 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
 
     fn history_block_key(&self) -> String {
-        history_block_key(self.effective_repo_id())
+        match self.effective_repo_id() {
+            Some(rid) => crate::history_inspect::history_block_key_for_repo(&self.db, rid)
+                .unwrap_or_else(|_| history_block_key(Some(rid))),
+            None => history_block_key(None),
+        }
     }
 
     fn record_history_block(
@@ -810,11 +845,8 @@ impl SyncEngine {
                 .map_err(crate::errors::DatabaseError::from)?
             };
             let column = column.filter(|value| !value.is_empty());
-            let kv = self
-                .db
-                .get_state(&format!("last_git_sha_{}", rid))
-                .map_err(SyncError::DatabaseError)?
-                .filter(|value| !value.is_empty());
+            let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
+                .map_err(SyncError::DatabaseError)?;
             if let Some(ref sha) = column {
                 self.reject_missing_checkpoint_object(sha)?;
             }
@@ -1187,8 +1219,10 @@ impl SyncEngine {
     }
 
     fn repo_has_stored_no_target_receipt_kv(&self, rid: &str) -> Result<bool, SyncError> {
-        let git_like = format!("handled_git_no_target_{}_%", rid);
-        let svn_like = format!("handled_svn_no_target_{}_%", rid);
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid)
+            .map_err(SyncError::DatabaseError)?;
+        let git_like = format!("handled_git_no_target_{}_%", scope);
+        let svn_like = format!("handled_svn_no_target_{}_%", scope);
         let count: i64 = {
             let conn = self.db.conn();
             conn.query_row(
@@ -1307,8 +1341,10 @@ impl SyncEngine {
             };
         }
         let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid)
+            .map_err(SyncError::DatabaseError)?;
         let legacy_key = format!("handled_git_no_target_{}_{}", rid, sha);
-        let canonical_key = handled_git_no_target_state_key(rid, generation, sha);
+        let canonical_key = handled_git_no_target_state_key(&scope, generation, sha);
         for key in [canonical_key.clone(), legacy_key.clone()] {
             let Some(raw) = self.db.get_state(&key).map_err(SyncError::DatabaseError)? else {
                 continue;
@@ -1622,6 +1658,12 @@ impl SyncEngine {
     /// This runs before SVN legacy adoption or any checkout reset.
     fn inspect_team_history(&self) -> Result<TeamHistoryAdmission, SyncError> {
         enforce_durable_history_block(&self.db, &self.history_block_key())?;
+        if let Some(rid) = self.effective_repo_id() {
+            let legacy = history_block_key(Some(rid));
+            if legacy != self.history_block_key() {
+                enforce_durable_history_block(&self.db, &legacy)?;
+            }
+        }
         let p = self.team_git_checkpoint()?;
         let git = self
             .git_client
@@ -1695,9 +1737,7 @@ impl SyncEngine {
                 .db
                 .get_repo_watermark(rid)
                 .map_err(SyncError::DatabaseError)?;
-            let kv = self
-                .db
-                .get_state(&format!("last_git_sha_{}", rid))
+            let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
             if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
                 self.materialize_git_baseline(&column, revision)?;
@@ -2484,7 +2524,7 @@ impl SyncEngine {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "; unattributed legacy conflict row(s): {described} (set conflicts.repo_id to the owning repository id or dismiss each row)"
+                "; unattributed legacy conflict row id(s): {described} (set conflicts.repo_id to the owning repository id or dismiss each row)"
             )
         };
         Err(SyncError::UnresolvableConflict {

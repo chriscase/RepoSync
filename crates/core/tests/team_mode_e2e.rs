@@ -40,6 +40,24 @@ use reposync_core::sync_engine::SyncEngine;
 // Helpers
 // ===========================================================================
 
+fn load_repo_history_block(db: &Database, repo_id: &str) -> serde_json::Value {
+    reposync_core::history_inspect::load_history_block_for_repo(db, repo_id)
+        .unwrap()
+        .expect("expected durable history block in kv_state")
+}
+
+fn set_repo_git_checkpoint_kv(db: &Database, repo_id: &str, sha: &str) {
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
+            rusqlite::params![sha, repo_id],
+        )
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(&db.conn(), repo_id, sha, &now)
+        .unwrap();
+}
+
 fn svn_available() -> bool {
     let svn_ok = Command::new("svn")
         .arg("--version")
@@ -927,11 +945,11 @@ impl QualifiedPair {
             bridge_status,
             bridge_feature: std::fs::read_to_string(self.bridge.join("feature.txt")).ok(),
             watermark: self.engine.db().get_repo_watermark(&self.repo_id).unwrap(),
-            kv_cursor: self
-                .engine
-                .db()
-                .get_state(&format!("last_git_sha_{}", self.repo_id))
-                .unwrap(),
+            kv_cursor: reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(
+                self.engine.db(),
+                &self.repo_id,
+            )
+            .unwrap(),
             mapping_count,
             repo_sync_count,
         }
@@ -968,15 +986,7 @@ async fn assert_pair_blocked_without_damage(fixture: &QualifiedPair, reason: &st
         before,
         "rejected pair changed protected state"
     );
-    let block: serde_json::Value = serde_json::from_str(
-        &fixture
-            .engine
-            .db()
-            .get_state(&format!("team_history_block_{}", fixture.repo_id))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let block = load_repo_history_block(fixture.engine.db(), &fixture.repo_id);
     assert_eq!(block["reason"], reason);
     assert_eq!(
         fixture
@@ -1305,15 +1315,7 @@ async fn run_candidate_r09_rewrite(metadata_only_amend: bool) {
         restarted.get_status().unwrap().state,
         SyncState::ReconciliationRequired
     );
-    let block: serde_json::Value = serde_json::from_str(
-        &fixture
-            .engine
-            .db()
-            .get_state(&format!("team_history_block_{}", fixture.repo_id))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    let block = load_repo_history_block(fixture.engine.db(), &fixture.repo_id);
     assert_eq!(block["reason"], "non_fast_forward");
     assert_eq!(block["p_handled"], old_synced);
     assert_eq!(block["r_fresh_remote"], replacement);
@@ -1350,15 +1352,7 @@ fn unique_pair_id(label: &str) -> String {
 }
 
 fn history_block_json(fixture: &QualifiedPair) -> serde_json::Value {
-    serde_json::from_str(
-        &fixture
-            .engine
-            .db()
-            .get_state(&format!("team_history_block_{}", fixture.repo_id))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap()
+    load_repo_history_block(fixture.engine.db(), &fixture.repo_id)
 }
 
 /// Named polling-only force-push: no webhook is delivered; inspection still
@@ -7750,9 +7744,23 @@ async fn candidate_r10_policy_equal_cursor_filtered_commit_rejected() {
     assert_eq!(pair.snapshot().await, before);
     drop(changed);
     let saved_receipt = pair.engine.db().get_state(&receipt_key).unwrap().unwrap();
+    let generation =
+        reposync_core::echo_receipt_scope::repo_echo_generation(pair.engine.db(), "pair").unwrap();
+    let scope = reposync_core::db::repo_scope_identity::repository_scope_uuid(
+        &pair.engine.db().conn(),
+        "pair",
+    )
+    .unwrap();
+    let scoped_receipt_key = reposync_core::echo_receipt_scope::handled_git_no_target_state_key(
+        &scope, generation, &filtered,
+    );
     pair.engine
         .db()
         .set_state(&receipt_key, "{malformed")
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state(&scoped_receipt_key, "{malformed")
         .unwrap();
     assert!(matches!(pair.engine.run_sync_cycle().await,
         Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "unverified_no_target_receipt"));
@@ -12920,10 +12928,7 @@ async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
             status: SyncRecordStatus::Applied,
         })
         .unwrap();
-    pair.engine
-        .db()
-        .set_state(&format!("last_git_sha_{repo_id}"), &handled)
-        .unwrap();
+    set_repo_git_checkpoint_kv(pair.engine.db(), &repo_id, &handled);
     let svn_tip = svn_youngest(&pair.svn_url);
     pair.engine
         .db()
@@ -13900,6 +13905,10 @@ async fn candidate_rsc02_ambiguous_null_repo_id_surfaces_row_ids() {
             assert!(
                 detail.contains("id=legacy-null") && detail.contains("path=orphan.txt"),
                 "ambiguous NULL row must name id and path for operators, got {detail:?}"
+            );
+            assert!(
+                detail.contains("unattributed legacy conflict row id(s)"),
+                "operator detail must use unattributed legacy row id(s) hint, got {detail:?}"
             );
         }
         other => panic!("NULL row with ambiguous ownership must block, got {other:?}"),

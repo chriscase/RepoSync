@@ -11,6 +11,7 @@ pub mod late_pair_publish_operations;
 pub mod managed_remove;
 pub mod personal_scope;
 pub mod queries;
+pub mod repo_scope_identity;
 pub mod schema;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
@@ -42,6 +43,8 @@ use crate::errors::DatabaseError;
 /// `Mutex` so that `Database` is `Send + Sync`, enabling use inside `Arc`.
 pub struct Database {
     conn: Mutex<Connection>,
+    #[cfg(test)]
+    test_force_echo_split_fail: Mutex<bool>,
 }
 
 impl Database {
@@ -87,6 +90,8 @@ impl Database {
         debug!("database opened successfully with WAL mode");
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            test_force_echo_split_fail: Mutex::new(false),
         })
     }
 
@@ -96,7 +101,22 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            #[cfg(test)]
+            test_force_echo_split_fail: Mutex::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_force_next_echo_split_fail(&self) {
+        *self.test_force_echo_split_fail.lock().unwrap() = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_test_force_echo_split_fail(&self) -> bool {
+        let mut guard = self.test_force_echo_split_fail.lock().unwrap();
+        let value = *guard;
+        *guard = false;
+        value
     }
 
     /// Run all schema migrations to bring the database up to date.

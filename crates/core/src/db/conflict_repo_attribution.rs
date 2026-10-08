@@ -57,8 +57,7 @@ pub fn unattributed_null_conflict_ids(conn: &Connection) -> Result<Vec<String>, 
                  ORDER BY created_at ASC"
         ))?
         .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ids)
 }
 
@@ -73,8 +72,7 @@ pub fn unattributed_null_conflict_rows(
                  ORDER BY created_at ASC"
         ))?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 

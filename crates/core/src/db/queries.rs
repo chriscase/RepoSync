@@ -1351,7 +1351,7 @@ impl Database {
                 "DELETE FROM commit_map WHERE repo_id = ?1",
                 params![repo_id],
             )?;
-            crate::echo_receipt_scope::bump_repo_echo_generation_tx(&conn, repo_id)?;
+            crate::echo_receipt_scope::bump_repo_echo_generation_tx(None, &conn, repo_id)?;
             Ok(())
         })();
         match result {
@@ -1471,6 +1471,7 @@ impl Database {
             "outcome": outcome, "projection": projection,
         });
         crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+        crate::echo_receipt_scope::attach_scope_to_new_receipt(self, repo_id, &mut receipt)?;
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
@@ -1488,6 +1489,7 @@ impl Database {
             "target": target,
         });
         crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+        crate::echo_receipt_scope::attach_scope_to_new_receipt(self, repo_id, &mut receipt)?;
         self.advance_git_watermarks(repo_id, git_sha, Some(receipt))
     }
 
@@ -1524,11 +1526,7 @@ impl Database {
             params![frontier_sha, repo_id],
         )?;
 
-        let kv_key = format!("last_git_sha_{}", repo_id);
-        tx.execute(
-            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![kv_key, frontier_sha, now],
-        )?;
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&tx, repo_id, frontier_sha, &now)?;
 
         if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
             tx.execute(
@@ -1584,13 +1582,8 @@ impl Database {
             params![git_sha, repo_id],
         )?;
 
-        // 2. Update per-repo kv_state key
-        let kv_key = format!("last_git_sha_{}", repo_id);
         let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![kv_key, git_sha, now],
-        )?;
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&tx, repo_id, git_sha, &now)?;
 
         if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
             tx.execute(
@@ -1601,12 +1594,13 @@ impl Database {
 
         if let Some(receipt) = no_target {
             let generation = receipt_generation.expect("receipt generation");
-            let key = crate::echo_receipt_scope::handled_git_no_target_state_key(
-                repo_id, generation, git_sha,
-            );
-            tx.execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                params![key, receipt.to_string(), now],
+            crate::echo_receipt_scope::write_git_no_target_receipt_kv(
+                &tx,
+                repo_id,
+                generation,
+                git_sha,
+                &receipt.to_string(),
+                &now,
             )?;
         }
         tx.commit()?;
@@ -2460,9 +2454,10 @@ impl Database {
                 ));
             }
         }
+        let scope_uuid = crate::db::repo_scope_identity::new_scope_uuid();
         conn.execute(
-            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, scope_uuid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 repo.id,
                 repo.name,
@@ -2492,6 +2487,7 @@ impl Database {
                 repo.blocked_patterns,
                 repo.consecutive_errors,
                 repo.teams_webhook_url,
+                scope_uuid,
             ],
         )?;
         debug!(id = %repo.id, name = %repo.name, "inserted repository");
@@ -2939,9 +2935,10 @@ impl Database {
              DELETE FROM kv_state WHERE key LIKE 'last_%' OR key LIKE 'sync_%';",
             )?;
             for repo_id in &repo_ids {
-                crate::echo_receipt_scope::bump_repo_echo_generation_tx(&conn, repo_id)?;
+                crate::echo_receipt_scope::bump_repo_echo_generation_tx(None, &conn, repo_id)?;
             }
             crate::echo_receipt_scope::bump_repo_echo_generation_tx(
+                None,
                 &conn,
                 crate::db::personal_scope::PERSONAL_SCOPE_KEY,
             )?;
@@ -3731,7 +3728,7 @@ mod tests {
 
         db.advance_all_watermarks("repo1", "sha456").unwrap();
 
-        let kv_val = db.get_state("last_git_sha_repo1").unwrap();
+        let kv_val = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "repo1").unwrap();
         assert_eq!(kv_val.as_deref(), Some("sha456"));
     }
 
@@ -3763,7 +3760,9 @@ mod tests {
             "team-mode managed repo must not clobber global last_git_hash"
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair")
+                .unwrap()
+                .as_deref(),
             Some("sha7890123456789012345678901234567890")
         );
     }
