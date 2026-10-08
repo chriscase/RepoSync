@@ -9913,6 +9913,67 @@ async fn candidate_rsc02_empty_rules_svn_delete_git_rename_conflict_stops_before
     assert_git_rename_svn_divergence_stops_before_apply(&pair, "old.txt", &before).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_content_conflict_stops_before_apply() {
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("shared.txt", "base line\n", "Seed shared file");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success(), "svn update failed");
+    svn_commit_file(
+        &pair.wc,
+        "shared.txt",
+        "SVN edited shared\n",
+        "SVN edits shared path",
+    );
+    pair.developer_commit("shared.txt", "Git edited shared\n", "Git edits shared path");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let before = pair.snapshot().await;
+    let sync_result = pair.engine.run_sync_cycle().await;
+    assert!(
+        sync_result.is_err(),
+        "expected content conflict to stop before apply, got {sync_result:?}"
+    );
+    let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+    assert_eq!(
+        conflicts
+            .iter()
+            .filter(|c| c.file_path == "shared.txt")
+            .count(),
+        1,
+        "retry-stable conflict row for shared.txt, got {:?}",
+        conflicts
+            .iter()
+            .map(|c| (&c.file_path, c.conflict_type.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let after = pair.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev);
+    assert_eq!(after.remote_sha, before.remote_sha);
+    assert_eq!(after.watermark, before.watermark);
+    let retry = pair.engine.run_sync_cycle().await;
+    assert!(
+        retry.is_err(),
+        "second cycle must remain blocked, got {retry:?}"
+    );
+    let conflicts_retry = pair.engine.db().list_conflicts(None, 10).unwrap();
+    assert_eq!(
+        conflicts_retry
+            .iter()
+            .filter(|c| c.file_path == "shared.txt")
+            .count(),
+        1,
+        "idempotent conflict persistence across retries"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RS-C14 / #64: branch-relative path identity for lost-reply reconciliation
 // ---------------------------------------------------------------------------

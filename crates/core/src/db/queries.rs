@@ -362,6 +362,49 @@ impl Database {
         Ok(conflict.id.clone())
     }
 
+    /// Insert or refresh an unresolved detected conflict for idempotent cycles.
+    ///
+    /// When the same repository already has a non-resolved row for `file_path`,
+    /// update its fields and keep the existing id instead of inserting a duplicate.
+    pub fn record_detected_conflict(
+        &self,
+        conflict: &models::Conflict,
+    ) -> Result<String, DatabaseError> {
+        let existing: Option<String> = {
+            let conn = self.conn();
+            conn.query_row(
+                "SELECT id FROM conflicts
+                 WHERE file_path = ?1
+                   AND ((?2 IS NULL AND repo_id IS NULL) OR repo_id = ?2)
+                   AND status IN ('detected', 'queued', 'resolving', 'active')
+                 ORDER BY created_at DESC LIMIT 1",
+                params![conflict.file_path, conflict.repo_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        if let Some(id) = existing {
+            let conn = self.conn();
+            conn.execute(
+                "UPDATE conflicts SET conflict_type = ?1, svn_content = ?2, git_content = ?3,
+                 base_content = ?4, svn_rev = ?5, git_sha = ?6, status = 'detected'
+                 WHERE id = ?7",
+                params![
+                    conflict.conflict_type,
+                    conflict.svn_content,
+                    conflict.git_content,
+                    conflict.base_content,
+                    conflict.svn_revision,
+                    conflict.git_hash,
+                    id,
+                ],
+            )?;
+            debug!(id = %id, file_path = %conflict.file_path, "refreshed detected conflict");
+            return Ok(id);
+        }
+        self.insert_conflict(conflict)
+    }
+
     /// Get a conflict by ID (returns an error if not found).
     pub fn get_conflict_entry(&self, id: &str) -> Result<ConflictEntry, DatabaseError> {
         let conn = self.conn();
