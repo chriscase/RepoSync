@@ -22,6 +22,7 @@ import {
   managedRemovalReceiptFromStatus,
   managedRemovalStatusFromReceipt,
   removalDependencyPreviewConfirmReady,
+  shouldPersistPolledManagedRemovalReceipt,
   persistManagedRemovalReceipt,
   readManagedRemovalReceipt,
   clearManagedRemovalReceipt,
@@ -392,7 +393,7 @@ export default function RepoDetail() {
       const receipt = managedRemovalReceiptFromStatus(target.id, result);
       persistManagedRemovalReceipt(receipt);
       setRemovalReceipt(receipt);
-      queryClient.setQueryData(['managed-removal', target.id], result);
+      queryClient.setQueryData(['managed-removal', target.id, result.operation_id], result);
       queryClient.invalidateQueries({ queryKey: ['managed-removal', target.id] });
       const registrationGone = result.registration_listed === false;
       const leaveViewedPair = target.id === id
@@ -413,9 +414,9 @@ export default function RepoDetail() {
     onSuccess: () => {
       clearManagedRemovalReceipt(id!);
       setRemovalReceipt(null);
+      queryClient.removeQueries({ queryKey: ['managed-removal', id] });
       queryClient.invalidateQueries({ queryKey: ['repo', id] });
       queryClient.invalidateQueries({ queryKey: ['repos'] });
-      queryClient.invalidateQueries({ queryKey: ['managed-removal', id] });
     },
   });
 
@@ -459,7 +460,6 @@ export default function RepoDetail() {
       && !branchPairDeleteTarget
       && (showRemoveConfirm
         || removeMutation.isPending
-        || removeMutation.isSuccess
         || removalReceipt?.repoId === id),
     retry: false,
     refetchInterval: (query) => {
@@ -622,6 +622,10 @@ export default function RepoDetail() {
     if (trackedRemovalOperationId && status.operation_id !== trackedRemovalOperationId) {
       return;
     }
+    const stored = readManagedRemovalReceipt(id);
+    if (!shouldPersistPolledManagedRemovalReceipt(stored, status)) {
+      return;
+    }
     const receipt = managedRemovalReceiptFromStatus(id, status);
     persistManagedRemovalReceipt(receipt);
     setRemovalReceipt(receipt);
@@ -724,14 +728,15 @@ export default function RepoDetail() {
                 : 'bg-gray-700 text-gray-400'
             }`}
           >
-            {repo.enabled ? 'Enabled' : 'Disabled'}
+            {repo.enabled ? 'Sync enabled' : 'Sync paused'}
           </span>
         </div>
         <div className="flex items-center gap-3">
-          {/* Enable/Disable toggle */}
+          {/* Quick sync toggle (PATCH enabled) — not the explicit Pause/disable API in Danger Zone */}
           <button
             onClick={() => toggleMutation.mutate(!repo.enabled)}
             disabled={toggleMutation.isPending}
+            title="Quick sync on/off via registration update. Use Pause / disable in Danger Zone for the explicit disable API."
             className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
               repo.enabled
                 ? 'border border-yellow-600 text-yellow-300 hover:bg-yellow-900/30'
@@ -739,7 +744,7 @@ export default function RepoDetail() {
             } disabled:opacity-50`}
           >
             <Power className="w-4 h-4" />
-            {repo.enabled ? 'Disable' : 'Enable'}
+            {repo.enabled ? 'Turn sync off' : 'Turn sync on'}
           </button>
 
           {!editing ? (
@@ -1700,9 +1705,11 @@ export default function RepoDetail() {
             {!repo?.parent_id && (
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm text-gray-300 font-medium">Pause / disable sync</p>
+                  <p className="text-sm text-gray-300 font-medium">Pause / disable sync (explicit API)</p>
                   <p className="text-sm text-gray-500 mt-0.5">
-                    Stops scheduling. Registration, mappings, secrets, local files, and remotes stay.
+                    Calls POST /disable (same contract as legacy DELETE). Stops scheduling; registration,
+                    mappings, secrets, local files, and remotes stay. The header toggle only updates
+                    enabled on the registration.
                   </p>
                 </div>
                 <button
@@ -1830,8 +1837,17 @@ export default function RepoDetail() {
                         {branchPairDependencyPreview.credentials.map((cred) => (
                           <li key={cred.key}>
                             {cred.key} — {cred.action}
+                            {cred.action === 'never_deleted_by_managed_remove'
+                              ? (cred.retained_for_repo_ids.length > 0
+                                ? ` (global credential — still used by registrations: ${cred.retained_for_repo_ids.join(', ')})`
+                                : ' (global credential — not removed by managed removal)')
+                              : ''}
+                            {cred.action !== 'never_deleted_by_managed_remove'
+                              && cred.retained_for_repo_ids.length > 0
+                              ? ` (other registrations keep their own keys: ${cred.retained_for_repo_ids.join(', ')})`
+                              : ''}
                             {cred.inheriting_repo_ids.length > 0
-                              ? ` (inherits: ${cred.inheriting_repo_ids.join(', ')})`
+                              ? ` (child registrations inherit this key and would lose access: ${cred.inheriting_repo_ids.join(', ')})`
                               : ''}
                           </li>
                         ))}
@@ -1918,6 +1934,7 @@ export default function RepoDetail() {
                   removeMutation.isPending
                   || removeConfirmText !== branchPairDeleteSubject.git_branch
                   || !branchPairPreviewReady
+                  || branchPairDependencyPreview?.parent_removal_blocked
                 }
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
@@ -1975,11 +1992,17 @@ export default function RepoDetail() {
                       {removalDependencyPreview.credentials.map((cred) => (
                         <li key={cred.key}>
                           {cred.key} — {cred.action}
-                          {cred.retained_for_repo_ids.length > 0
-                            ? ` (registrations with their own keys: ${cred.retained_for_repo_ids.join(', ')})`
+                          {cred.action === 'never_deleted_by_managed_remove'
+                            ? (cred.retained_for_repo_ids.length > 0
+                              ? ` (global credential — still used by registrations: ${cred.retained_for_repo_ids.join(', ')})`
+                              : ' (global credential — not removed by managed removal)')
+                            : ''}
+                          {cred.action !== 'never_deleted_by_managed_remove'
+                            && cred.retained_for_repo_ids.length > 0
+                            ? ` (other registrations keep their own keys: ${cred.retained_for_repo_ids.join(', ')})`
                             : ''}
                           {cred.inheriting_repo_ids.length > 0
-                            ? ` (will lose inherited credential when deleted: ${cred.inheriting_repo_ids.join(', ')})`
+                            ? ` (child registrations inherit this key and would lose access: ${cred.inheriting_repo_ids.join(', ')})`
                             : ''}
                         </li>
                       ))}

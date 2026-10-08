@@ -25,6 +25,7 @@ export interface ManagedRemovalStatus {
   action: 'managed_remove';
   state: string;
   operation_id: string;
+  updated_at?: string;
   message: string;
   remote_git: string;
   remote_svn: string;
@@ -109,6 +110,7 @@ export interface ManagedRemovalReceipt {
 export function managedRemovalReceiptFromStatus(
   repoId: string,
   status: ManagedRemovalStatus,
+  updatedAt?: string,
 ): ManagedRemovalReceipt {
   return {
     repoId,
@@ -122,8 +124,26 @@ export function managedRemovalReceiptFromStatus(
     registration_listed: status.registration_listed,
     recovery: status.recovery,
     partial_cleanup: status.partial_cleanup,
-    updated_at: new Date().toISOString(),
+    updated_at: updatedAt ?? status.updated_at ?? new Date().toISOString(),
   };
+}
+
+/** Poll responses must not resurrect a cleared receipt or overwrite a newer POST receipt. */
+export function shouldPersistPolledManagedRemovalReceipt(
+  stored: ManagedRemovalReceipt | null,
+  polled: ManagedRemovalStatus,
+): boolean {
+  if (!stored) {
+    return false;
+  }
+  if (stored.operationId !== polled.operation_id) {
+    return false;
+  }
+  const polledAt = polled.updated_at;
+  if (polledAt && stored.updated_at && polledAt < stored.updated_at) {
+    return false;
+  }
+  return true;
 }
 
 export function managedRemovalStatusFromReceipt(
@@ -183,32 +203,45 @@ export function persistManagedRemovalReceipt(receipt: ManagedRemovalReceipt): vo
   }
 }
 
+function parseStoredReceipt(raw: string): ManagedRemovalReceipt | null {
+  const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
+  if (!parsed?.repoId || !parsed?.operationId) return null;
+  return parsed;
+}
+
+export function readAllManagedRemovalReceipts(): ManagedRemovalReceipt[] {
+  migrateLegacyReceipt();
+  const receipts: ManagedRemovalReceipt[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (!key?.startsWith(RECEIPT_PREFIX)) continue;
+      const raw = localStorage.getItem(key);
+      if (!raw) continue;
+      const parsed = parseStoredReceipt(raw);
+      if (parsed) receipts.push(parsed);
+    }
+    receipts.sort((a, b) => {
+      const at = a.updated_at ?? '';
+      const bt = b.updated_at ?? '';
+      return bt.localeCompare(at);
+    });
+    return receipts;
+  } catch {
+    return [];
+  }
+}
+
 export function readManagedRemovalReceipt(repoId?: string): ManagedRemovalReceipt | null {
   migrateLegacyReceipt();
   try {
     if (repoId) {
       const raw = localStorage.getItem(receiptStorageKey(repoId));
       if (!raw) return null;
-      const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
-      if (!parsed?.repoId || !parsed?.operationId) return null;
-      return parsed;
+      return parseStoredReceipt(raw);
     }
-    let latest: ManagedRemovalReceipt | null = null;
-    for (let i = 0; i < localStorage.length; i += 1) {
-      const key = localStorage.key(i);
-      if (!key?.startsWith(RECEIPT_PREFIX)) continue;
-      const raw = localStorage.getItem(key);
-      if (!raw) continue;
-      const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
-      if (!parsed?.repoId || !parsed?.operationId) continue;
-      if (
-        !latest
-        || (parsed.updated_at && (!latest.updated_at || parsed.updated_at > latest.updated_at))
-      ) {
-        latest = parsed;
-      }
-    }
-    return latest;
+    const all = readAllManagedRemovalReceipts();
+    return all[0] ?? null;
   } catch {
     return null;
   }
