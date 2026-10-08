@@ -477,6 +477,12 @@ fn complete_import_tx(
             "import lacks a fully confirmed final tip".into(),
         ));
     }
+    flush_pending_commit_maps_tx(tx, repo_id, &mut op, svn_rev)?;
+    if !op.pending_commit_maps.is_empty() {
+        return Err(DatabaseError::Other(
+            "import cannot complete with unflushed commit mappings".into(),
+        ));
+    }
     if tx.execute(
         "UPDATE repositories SET last_svn_rev=?1,last_git_sha=?2,last_sync_at=datetime('now') WHERE id=?3",
         params![svn_rev, sha, repo_id],
@@ -1266,6 +1272,162 @@ mod tests {
             copy_from_rev: None,
             requested: rev.to_string(),
         }
+    }
+
+    fn assert_commit_map_and_drained_pending(
+        db: &Database,
+        repo_id: &str,
+        op_id: &str,
+        expected_rows: i64,
+    ) {
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, expected_rows);
+        let op = db.get_import_operation(repo_id, op_id).unwrap().unwrap();
+        assert!(op.pending_commit_maps.is_empty());
+    }
+
+    #[test]
+    fn staged_commit_maps_flush_on_completed_reconcile() {
+        let (_dir, db, workdir) = open_repo("snap-pending");
+        let fp = fingerprint(&db, "snap-pending", &workdir);
+        let op = db
+            .create_import_operation("snap-pending", "admin", "req-snap-pending", &fp)
+            .unwrap();
+        db.pin_snapshot_import("snap-pending", &op.id, pin_at(4))
+            .unwrap();
+        db.start_import_operation("snap-pending", &op.id).unwrap();
+        db.note_import_local("snap-pending", &op.id, 4, BASELINE_SHA, 1, 1)
+            .unwrap();
+        db.stage_import_commit_map(
+            "snap-pending",
+            &op.id,
+            4,
+            BASELINE_SHA,
+            "svn",
+            "git <g@t.com>",
+        )
+        .unwrap();
+        db.begin_import_publication("snap-pending", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        db.finish_import_operation(
+            "snap-pending",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "crash before confirm",
+        )
+        .unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                    ["snap-pending"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let done = db
+            .reconcile_verified_import(
+                "snap-pending",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert!(done.publication_recorded);
+        assert_eq!(done.operation.state, ImportOperationState::Completed);
+        assert_commit_map_and_drained_pending(&db, "snap-pending", &op.id, 1);
+
+        let (_dir, full, workdir) = open_repo("full-pending");
+        let fp = fingerprint(&full, "full-pending", &workdir);
+        let op = full
+            .create_import_operation("full-pending", "admin", "req-full-pending", &fp)
+            .unwrap();
+        full.start_import_operation("full-pending", &op.id).unwrap();
+        full.note_import_total("full-pending", &op.id, 3).unwrap();
+        full.note_import_local("full-pending", &op.id, 3, BASELINE_SHA, 3, 3)
+            .unwrap();
+        for rev in 1..=3 {
+            full.stage_import_commit_map(
+                "full-pending",
+                &op.id,
+                rev,
+                BASELINE_SHA,
+                "svn",
+                "git <g@t.com>",
+            )
+            .unwrap();
+        }
+        full.begin_import_publication("full-pending", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        full.finish_import_operation(
+            "full-pending",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let done = full
+            .reconcile_verified_import(
+                "full-pending",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert_commit_map_and_drained_pending(&full, "full-pending", &op.id, 3);
+
+        let (_dir, held, workdir) = open_repo("held-confirm");
+        let fp = fingerprint(&held, "held-confirm", &workdir);
+        let op = held
+            .create_import_operation("held-confirm", "admin", "req-held-confirm", &fp)
+            .unwrap();
+        held.pin_snapshot_import("held-confirm", &op.id, pin_at(2))
+            .unwrap();
+        held.start_import_operation("held-confirm", &op.id).unwrap();
+        held.note_import_local("held-confirm", &op.id, 2, BASELINE_SHA, 1, 1)
+            .unwrap();
+        held.stage_import_commit_map(
+            "held-confirm",
+            &op.id,
+            2,
+            BASELINE_SHA,
+            "svn",
+            "git <g@t.com>",
+        )
+        .unwrap();
+        held.begin_import_publication("held-confirm", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        held.finish_import_operation(
+            "held-confirm",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "worker stopped after push",
+        )
+        .unwrap();
+        let done = held
+            .reconcile_verified_import(
+                "held-confirm",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert!(done.publication_recorded);
+        assert_commit_map_and_drained_pending(&held, "held-confirm", &op.id, 1);
     }
 
     #[test]
