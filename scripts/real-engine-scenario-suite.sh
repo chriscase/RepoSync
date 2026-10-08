@@ -53,6 +53,12 @@ SCENARIOS=(
   "R16_SVNSERVE_PARENT_CHILD_CREDENTIAL_CHAIN_ROTATION:scenario_r16_svnserve_parent_child_credential_chain_rotation"
   "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD:scenario_r17_svnserve_concurrent_credential_reload"
   "R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD:scenario_r17_svnserve_parent_child_concurrent_credential_reload"
+  "R01_SVNSERVE_FAILED_APPLY_BARRIER:scenario_r01_svnserve_failed_apply_barrier"
+  "R01_SVNSERVE_FAILED_APPLY_RETRY:scenario_r01_svnserve_failed_apply_retry"
+  "R01_SVNSERVE_POST_WRITE_RECOVERY:scenario_r01_svnserve_post_write_recovery"
+  "R16_SVNSERVE_SVN_REMOTE_RECREATION:scenario_r16_svnserve_svn_remote_recreation"
+  "R16_SVNSERVE_GIT_REMOTE_RECREATION:scenario_r16_svnserve_git_remote_recreation"
+  "R17_SVNSERVE_NOTIFICATION_ISOLATION:scenario_r17_svnserve_notification_isolation"
 )
 
 mkdir -p "$ARTIFACT_DIR"
