@@ -147,6 +147,78 @@ pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// Bash `[[ ... ]]` test for one allowed prefix (component-aware, matches
+/// [`path_matches_prefix`]).
+pub fn bash_allowed_prefix_test(file_expr: &str, prefix: &str) -> String {
+    let prefix = normalize_policy_path(prefix);
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        return "false".to_string();
+    }
+    format!(
+        "[[ \"{file}\" == \"{prefix}\" || \"{file}\" == \"{prefix}/\"* ]]",
+        file = file_expr,
+        prefix = prefix.replace('"', "\\\"")
+    )
+}
+
+/// Render the pre-commit hook script that enforces repository path rules.
+pub fn render_pre_commit_hook_script(allowed: &[String], blocked: &[String]) -> String {
+    let mut script = String::from("#!/bin/bash\n");
+    script.push_str("# RepoSync pre-commit hook — validates file paths against SVN rules\n");
+    script.push_str(
+        "# Install: cp this file .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit\n",
+    );
+    script.push_str(
+        "# Or: mkdir -p .githooks && cp this file .githooks/pre-commit && git config core.hooksPath .githooks\n\n",
+    );
+
+    if allowed.is_empty() && blocked.is_empty() {
+        script.push_str("# No path rules configured for this repository.\nexit 0\n");
+        return script;
+    }
+
+    script.push_str("ERRORS=0\n\n");
+
+    if !allowed.is_empty() {
+        script.push_str(
+            "# Allowed path prefixes (component-aware; team does not match team-other)\n",
+        );
+        script.push_str("for file in $(git diff --cached --name-only --diff-filter=ACM); do\n");
+        script.push_str("  ALLOWED=0\n");
+        for prefix in allowed {
+            let test = bash_allowed_prefix_test("$file", prefix);
+            script.push_str(&format!("  if {test}; then\n"));
+            script.push_str("    ALLOWED=1\n");
+            script.push_str("    break\n");
+            script.push_str("  fi\n");
+        }
+        script.push_str("  if [ $ALLOWED -eq 0 ]; then\n");
+        script.push_str("    echo \"ERROR: '$file' is not under an allowed path prefix\"\n");
+        script.push_str("    ERRORS=$((ERRORS + 1))\n");
+        script.push_str("  fi\n");
+        script.push_str("done\n\n");
+    }
+
+    if !blocked.is_empty() {
+        script.push_str("# Blocked patterns\n");
+        for pattern in blocked {
+            script.push_str(&format!(
+                "for file in $(git diff --cached --name-only --diff-filter=ACM); do\n  case \"$file\" in\n    {}) echo \"ERROR: '$file' matches blocked pattern '{}'\"; ERRORS=$((ERRORS + 1));;\n  esac\ndone\n\n",
+                pattern, pattern
+            ));
+        }
+    }
+
+    script.push_str("if [ $ERRORS -gt 0 ]; then\n");
+    script.push_str("  echo \"\"\n");
+    script.push_str("  echo \"Commit blocked: $ERRORS file(s) violate SVN path rules.\"\n");
+    script.push_str("  echo \"These files would be rejected by the SVN server.\"\n");
+    script.push_str("  exit 1\n");
+    script.push_str("fi\n");
+    script
+}
+
 /// Blocked-pattern match (suffix glob, directory prefix, or exact/component path).
 pub fn path_matches_blocked(path: &str, pattern: &str) -> bool {
     let path = normalize_policy_path(path);
@@ -310,6 +382,23 @@ mod tests {
             content: Some(b"renamed payload".to_vec()),
             rename_from: Some(from.to_string()),
         }
+    }
+
+    #[test]
+    fn bash_allowed_prefix_test_matches_component_rules() {
+        assert_eq!(
+            bash_allowed_prefix_test("$file", "team"),
+            "[[ \"$file\" == \"team\" || \"$file\" == \"team/\"* ]]"
+        );
+        assert!(path_matches_prefix("team/foo", "team"));
+        assert!(!path_matches_prefix("team-other/foo", "team"));
+    }
+
+    #[test]
+    fn pre_commit_hook_uses_component_aware_allowed_prefix_tests() {
+        let script = render_pre_commit_hook_script(&["team".into()], &[]);
+        assert!(script.contains("\"$file\" == \"team/\"*"));
+        assert!(!script.contains("== \"$prefix\"*"));
     }
 
     #[test]

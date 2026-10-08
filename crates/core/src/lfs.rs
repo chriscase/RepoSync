@@ -482,6 +482,12 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
             "refusing to read non-regular root .gitattributes",
         ));
     }
+    if st.st_nlink > 1 {
+        unsafe {
+            libc::close(fd);
+        }
+        return Ok(String::new());
+    }
     let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if current >= 0 && (current & libc::O_NONBLOCK) != 0 {
         let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, current & !libc::O_NONBLOCK) };
@@ -813,6 +819,29 @@ mod tests {
         ensure_lfs_tracked(dir.path(), "*.bin").unwrap();
         assert!(engine_gitattributes_body(dir.path()).unwrap().is_none());
         assert!(!dir.path().join(".git").exists());
+    }
+
+    #[test]
+    fn test_ensure_lfs_tracked_replaces_hardlink_without_mutating_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let outside = dir.path().join("outside-attrs");
+        std::fs::write(&outside, "* filter=evil\n").unwrap();
+        std::fs::hard_link(&outside, dir.path().join(".gitattributes")).unwrap();
+
+        assert!(ensure_lfs_tracked(dir.path(), "*.bin").unwrap());
+
+        let meta = std::fs::symlink_metadata(dir.path().join(".gitattributes")).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap(),
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "* filter=evil\n",
+            "must not append through a planted destination hardlink"
+        );
     }
 
     #[test]

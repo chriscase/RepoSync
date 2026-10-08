@@ -63,9 +63,7 @@ use crate::history_inspect::{
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
 use crate::pair_refresh::PAIR_GENERATION;
-use crate::path_projection::{
-    path_is_projected, project_git_to_svn_changeset, GitToSvnInputChange,
-};
+use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
 use crate::pending_frontier::{pending_frontier_is_merge_dag, GitReplayContinuation};
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
@@ -1749,7 +1747,6 @@ impl SyncEngine {
                     if first_unresolved_path.is_none() {
                         first_unresolved_path = Some(conflict.file_path.clone());
                     }
-                    // Persist unresolved conflict
                     let mut db_conflict = crate::models::Conflict::new(conflict.file_path.clone());
                     db_conflict.conflict_type = conflict.conflict_type.to_string();
                     db_conflict.svn_content = conflict.svn_content.clone();
@@ -1758,7 +1755,10 @@ impl SyncEngine {
                     db_conflict.svn_revision = conflict.svn_rev;
                     db_conflict.git_hash = conflict.git_sha.clone();
                     db_conflict.repo_id = self.repo_id.clone();
-                    let _ = self.db.insert_conflict(&db_conflict);
+                    let _ = self
+                        .db
+                        .record_detected_conflict(&db_conflict)
+                        .map_err(SyncError::DatabaseError)?;
                 }
             }
             if unresolved > 0 {
@@ -4194,7 +4194,11 @@ impl SyncEngine {
     ) -> Vec<FileChange> {
         use std::collections::HashSet;
 
-        let mut in_scope_renames: HashSet<(String, String)> = HashSet::new();
+        use crate::path_projection::project_rename_endpoints;
+
+        // Pair rename endpoints exactly as Git→SVN apply does (per-endpoint projection),
+        // not from raw Git rename paths alone.
+        let mut projected_renames: HashSet<(String, String)> = HashSet::new();
         for change in raw_inputs {
             if change.action != "R" {
                 continue;
@@ -4202,10 +4206,18 @@ impl SyncEngine {
             let Some(rename_from) = change.rename_from.as_ref() else {
                 continue;
             };
-            if path_is_projected(rename_from, allowed, blocked)
-                && path_is_projected(&change.path, allowed, blocked)
-            {
-                in_scope_renames.insert((rename_from.clone(), change.path.clone()));
+            let (endpoints, _) =
+                project_rename_endpoints(rename_from, &change.path, None, allowed, blocked);
+            let delete_from = endpoints
+                .iter()
+                .find(|c| c.action == "D")
+                .map(|c| c.path.clone());
+            let add_to = endpoints
+                .iter()
+                .find(|c| c.action == "A")
+                .map(|c| c.path.clone());
+            if let (Some(from), Some(to)) = (delete_from, add_to) {
+                projected_renames.insert((from, to));
             }
         }
 
@@ -4213,14 +4225,14 @@ impl SyncEngine {
         for change in projected_included {
             let path = change.path.trim_start_matches('/').to_string();
             if change.action == "D"
-                && in_scope_renames
+                && projected_renames
                     .iter()
                     .any(|(from, _)| from.as_str() == path.as_str())
             {
                 continue;
             }
             if change.action == "A" {
-                if let Some((from, to)) = in_scope_renames
+                if let Some((from, to)) = projected_renames
                     .iter()
                     .find(|(_, to)| to.as_str() == path.as_str())
                     .map(|(from, to)| (from.clone(), to.clone()))
@@ -6042,6 +6054,29 @@ repo = "test/test-repo"
             !git_changes.iter().any(|c| c.path == "team/old.txt"),
             "rename source delete must not collapse to dual-delete"
         );
+    }
+
+    #[test]
+    fn git_file_changes_for_conflict_detection_uses_projected_rename_endpoints() {
+        use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+
+        let raw = vec![GitToSvnInputChange {
+            action: "R".into(),
+            path: "team/leak.exe".into(),
+            content: None,
+            rename_from: Some("team/old.txt".into()),
+        }];
+        let projected =
+            project_git_to_svn_changeset(raw.clone(), &["team".into()], &["*.exe".into()]).unwrap();
+        let git_changes = SyncEngine::git_file_changes_for_conflict_detection(
+            &raw,
+            &projected.included,
+            &["team".into()],
+            &["*.exe".into()],
+        );
+        assert_eq!(git_changes.len(), 1);
+        assert_eq!(git_changes[0].path, "team/old.txt");
+        assert!(matches!(git_changes[0].change_kind, ChangeKind::Deleted));
     }
 
     #[test]
