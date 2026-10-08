@@ -65,7 +65,7 @@ jobs:
           summary="$(ls -td artifacts/real-engine-scenarios/*/summary.json 2>/dev/null | head -1 || true)"
           if [[ -z "$summary" ]]; then
             echo "::error::real-engine suite did not emit summary.json"
-            exit "${suite_ec:-1}"
+            exit 1
           fi
           set -e
           python3 scripts/real-engine-scenario-report.py ci-gate "$summary"
