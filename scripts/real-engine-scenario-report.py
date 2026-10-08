@@ -10,6 +10,24 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CI_PARTIAL_ALLOWLIST = (
     ROOT / "docs/reliability/real-engine-ci-partial-allowlist.json"
 )
+REQUIRED_CASES_PATH = ROOT / "docs/reliability/required-cases.json"
+REAL_ENGINE_BINARY = "real_engine_scenarios"
+
+
+def load_expected_real_engine_case_ids() -> list[str]:
+    payload = json.loads(REQUIRED_CASES_PATH.read_text(encoding="utf-8"))
+    ids: list[str] = []
+    for tier in ("diagnostics", "candidate"):
+        for row in payload.get(tier, []):
+            if (
+                isinstance(row, dict)
+                and row.get("binary") == REAL_ENGINE_BINARY
+                and row.get("id")
+            ):
+                ids.append(str(row["id"]))
+    if not ids:
+        raise ValueError(f"{REQUIRED_CASES_PATH}: no {REAL_ENGINE_BINARY} case ids")
+    return sorted(set(ids))
 
 
 def evidence_detail(log_text: str, case_id: str | None, want_status: str) -> dict:
@@ -133,6 +151,29 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
     if not isinstance(scenarios, list):
         return 1, ["summary.scenarios must be a list"]
 
+    try:
+        expected_ids = load_expected_real_engine_case_ids()
+    except (OSError, ValueError, json.JSONDecodeError, KeyError) as exc:
+        return 1, [f"expected case catalog: {exc}"]
+
+    seen: dict[str, int] = {}
+    for row in scenarios:
+        if not isinstance(row, dict):
+            continue
+        case_id = str(row.get("id", "<unknown>"))
+        if case_id != "<unknown>":
+            seen[case_id] = seen.get(case_id, 0) + 1
+
+    for case_id in expected_ids:
+        if seen.get(case_id, 0) == 0:
+            errors.append(f"missing expected scenario id: {case_id}")
+    for case_id, count in sorted(seen.items()):
+        if count > 1:
+            errors.append(f"duplicate scenario id: {case_id} ({count} rows)")
+    for case_id in sorted(seen):
+        if case_id not in expected_ids:
+            errors.append(f"unexpected scenario id: {case_id}")
+
     for row in scenarios:
         if not isinstance(row, dict):
             errors.append("invalid scenario row (not an object)")
@@ -141,6 +182,8 @@ def ci_gate(summary_path: Path, allowlist_path: Path) -> tuple[int, list[str]]:
         status = row.get("status")
         if status == "FAIL":
             errors.append(f"{case_id}: FAIL")
+        elif status == "SKIP":
+            errors.append(f"{case_id}: SKIP is not allowed in CI summaries")
         elif status == "NOT RUN":
             errors.append(f"{case_id}: NOT RUN (missing evidence or tools in CI)")
         elif status == "PARTIAL" and case_id not in allowed:
@@ -172,6 +215,8 @@ def run_self_test() -> None:
     git_id = "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE"
     svn_id = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
     assert git_id in allowed and svn_id in allowed
+    expected_ids = load_expected_real_engine_case_ids()
+    assert len(expected_ids) >= 8
 
     def write_summary(tmp: Path, scenarios: list[dict], overall: str) -> Path:
         summary_path = tmp / "summary.json"
@@ -186,32 +231,54 @@ def run_self_test() -> None:
 
     import tempfile
 
+    def full_pass_rows() -> list[dict]:
+        return [{"id": case_id, "status": "PASS"} for case_id in expected_ids]
+
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
-        pass_only = [
-            {"id": "R17_SVNSERVE_JOB_ISOLATION", "status": "PASS"},
-        ]
-        code, errs = ci_gate(write_summary(tmp, pass_only, "PASS"), allowlist_path)
-        assert code == 0 and not errs, (code, errs)
+        missing_summary = tmp / "no-such-summary.json"
+        code, errs = ci_gate(missing_summary, allowlist_path)
+        assert code == 1 and errs and "missing summary" in errs[0], (code, errs)
 
-        allowlisted_partial = pass_only + [
-            {"id": git_id, "status": "PARTIAL"},
-            {"id": svn_id, "status": "PARTIAL"},
-        ]
+        short = [{"id": expected_ids[0], "status": "PASS"}]
+        code, errs = ci_gate(write_summary(tmp, short, "PASS"), allowlist_path)
+        assert code != 0 and any("missing expected scenario" in e for e in errs), (
+            code,
+            errs,
+        )
+
+        skipped = full_pass_rows()
+        skipped[0] = {**skipped[0], "status": "SKIP"}
+        code, errs = ci_gate(write_summary(tmp, skipped, "PASS"), allowlist_path)
+        assert code != 0 and any("SKIP" in e for e in errs), (code, errs)
+
+        allowlisted_partial = full_pass_rows()
+        for row in allowlisted_partial:
+            if row["id"] in {git_id, svn_id}:
+                row["status"] = "PARTIAL"
         code, errs = ci_gate(
             write_summary(tmp, allowlisted_partial, "PARTIAL"), allowlist_path
         )
         assert code == 0 and not errs, (code, errs)
 
-        surprise = pass_only + [{"id": "R17_SVNSERVE_JOB_ISOLATION", "status": "PARTIAL"}]
+        surprise = full_pass_rows()
+        for row in surprise:
+            if row["id"] == "R17_SVNSERVE_JOB_ISOLATION":
+                row["status"] = "PARTIAL"
         code, errs = ci_gate(write_summary(tmp, surprise, "PARTIAL"), allowlist_path)
         assert code != 0 and errs, (code, errs)
 
-        failed = pass_only + [{"id": git_id, "status": "FAIL"}]
+        failed = full_pass_rows()
+        for row in failed:
+            if row["id"] == git_id:
+                row["status"] = "FAIL"
         code, errs = ci_gate(write_summary(tmp, failed, "FAIL"), allowlist_path)
         assert code != 0 and errs, (code, errs)
 
-        not_run = [{"id": git_id, "status": "NOT RUN"}]
+        not_run = full_pass_rows()
+        for row in not_run:
+            if row["id"] == git_id:
+                row["status"] = "NOT RUN"
         code, errs = ci_gate(write_summary(tmp, not_run, "NOT RUN"), allowlist_path)
         assert code != 0 and errs, (code, errs)
 

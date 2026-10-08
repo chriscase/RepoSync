@@ -15,7 +15,7 @@ use std::time::Instant;
 use reposync_core::config::{AppConfig, IdentityConfig};
 use reposync_core::db::import_operations::ImportOperationState;
 use reposync_core::db::Database;
-use reposync_core::errors::SyncError;
+use reposync_core::errors::{SvnError, SyncError};
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::models::Repository;
@@ -31,6 +31,9 @@ const CASE_SVN_MULTI: &str = "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT";
 const CASE_GIT_MULTI: &str = "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN";
 const CASE_GIT_REMOTE: &str = "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE";
 const CASE_SVN_REMOTE: &str = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE";
+const CASE_SVN_AUTH: &str = "R16_SVNSERVE_SVN_AUTH_DENIED";
+const CASE_MISSING_BRANCH: &str = "R16_SVNSERVE_MISSING_GIT_BRANCH";
+const CASE_BIDIRECTIONAL: &str = "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP";
 
 // ===========================================================================
 // Tooling and evidence helpers
@@ -182,6 +185,16 @@ fn assert_git_ancestor(repo: &Path, ancestor: &str, descendant: &str) {
         descendant,
         repo.display()
     );
+}
+
+fn is_svn_auth_failure(error: &SyncError) -> bool {
+    match error {
+        SyncError::SvnError(SvnError::AuthenticationFailed { .. }) => true,
+        SyncError::SvnError(SvnError::CommandFailed { stderr, .. }) => {
+            stderr.to_ascii_lowercase().contains("authentication")
+        }
+        _ => false,
+    }
 }
 
 fn is_remote_transport_failure(error: &SyncError) -> bool {
@@ -918,7 +931,7 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
             "beta_git_sha": beta_sha,
             "max_in_flight": max_in_flight,
             "concurrent_import": concurrent_import,
-            "serialized_sqlite_import": !concurrent_import && max_in_flight <= 1,
+            "overlapping_import_cycle_windows": concurrent_import,
             "checkpoint_crossover": checkpoint_crossover,
         }),
     );
@@ -1477,6 +1490,194 @@ async fn scenario_r16_svnserve_svn_remote_unreachable() {
             "bridge_head_before_after": [bridge_before, bridge_after],
             "mapping_count_before_after": [mappings_before, mappings_after],
             "note": "loopback svnserve fixture does not recreate remotes on failure",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r01_svnserve_bidirectional_roundtrip() {
+    if !require_toolchain(CASE_BIDIRECTIONAL) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let svn_rev_a = svn_commit_file(
+        &fixture.wc,
+        "roundtrip-a.txt",
+        "svn leg a\n",
+        "SVN roundtrip A",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    let svn_rev_b = svn_commit_file(
+        &fixture.wc,
+        "roundtrip-b.txt",
+        "svn leg b\n",
+        "SVN roundtrip B",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    let svn_stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(svn_stats.svn_to_git_count, 2);
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let git_a = fixture.developer_commit("roundtrip-git.txt", "git leg a\n", "Git roundtrip A");
+    let git_b = fixture.developer_commit("roundtrip-git.txt", "git leg b\n", "Git roundtrip B");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let git_stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(git_stats.git_to_svn_count, 2);
+    let svn_head = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
+    assert_eq!(svn_head, svn_rev_b + 2);
+    let after = fixture.checkpoint_snapshot();
+    assert_eq!(after.1, git_b);
+    assert_eq!(
+        svn_read_file(
+            &fixture.repo.svn_url,
+            &fixture.repo.username,
+            &fixture.repo.password,
+            svn_rev_b + 1,
+            "roundtrip-git.txt",
+        )
+        .await,
+        "git leg a\n"
+    );
+    assert_eq!(
+        svn_read_file(
+            &fixture.repo.svn_url,
+            &fixture.repo.username,
+            &fixture.repo.password,
+            svn_rev_b + 2,
+            "roundtrip-git.txt",
+        )
+        .await,
+        "git leg b\n"
+    );
+    let repeat = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(fixture.checkpoint_snapshot(), after);
+    emit_evidence(
+        CASE_BIDIRECTIONAL,
+        "PASS",
+        serde_json::json!({
+            "svn_revisions": [svn_rev_a, svn_rev_b],
+            "git_shas": [git_a, git_b],
+            "checkpoint_after": after,
+            "repeat_noop": true,
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r16_svnserve_svn_auth_denied() {
+    if !require_toolchain(CASE_SVN_AUTH) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let before = fixture.checkpoint_snapshot();
+    let bridge_before = get_head_sha(&fixture.repo.bridge);
+    let mappings_before = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let db = setup_db(&fixture.db_path);
+    db.set_state(
+        &format!("secret_svn_password_{}", fixture.repo.id),
+        "wrong-password-not-in-passwd-db",
+    )
+    .unwrap();
+    let result = engine.run_sync_cycle().await;
+    assert!(
+        is_svn_auth_failure(result.as_ref().err().expect("sync must fail")),
+        "wrong svnserve password must fail as authentication: {result:?}"
+    );
+    let checkpoint_after = fixture.checkpoint_snapshot();
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
+    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    assert_eq!(checkpoint_after, before);
+    assert_eq!(bridge_after, bridge_before);
+    assert_eq!(mappings_after, mappings_before);
+    emit_evidence(
+        CASE_SVN_AUTH,
+        "PASS",
+        serde_json::json!({
+            "reason": "svn_authentication_failed",
+            "checkpoint_before_after": [before, checkpoint_after],
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "mapping_count_before_after": [mappings_before, mappings_after],
+            "note": "real svnserve passwd-db denial via hot-reloaded scoped secret",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r16_svnserve_missing_git_branch() {
+    if !require_toolchain(CASE_MISSING_BRANCH) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    git_cli(&fixture.repo.bridge, &["fetch", "origin", "main"]);
+    git_cli(&fixture.repo.bare, &["update-ref", "-d", "refs/heads/main"]);
+    let remote = Command::new("git")
+        .arg("-C")
+        .arg(&fixture.repo.bare)
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/main"])
+        .status()
+        .unwrap();
+    assert_eq!(remote.code(), Some(1));
+    let before = fixture.checkpoint_snapshot();
+    let bridge_before = get_head_sha(&fixture.repo.bridge);
+    let mappings_before = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let svn_before = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
+    let result = engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &result,
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "remote_branch_missing"
+        ),
+        "deleted bare main must block inspection without stale ref: {result:?}"
+    );
+    let checkpoint_after = fixture.checkpoint_snapshot();
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
+    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let svn_after = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
+    assert_eq!(bridge_after, bridge_before);
+    assert_eq!(checkpoint_after, before);
+    assert_eq!(svn_after, svn_before);
+    assert_eq!(mappings_after, mappings_before);
+    emit_evidence(
+        CASE_MISSING_BRANCH,
+        "PASS",
+        serde_json::json!({
+            "reason": "remote_branch_missing",
+            "checkpoint_before_after": [before, checkpoint_after],
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "svn_revision_before_after": [svn_before, svn_after],
+            "mapping_count_before_after": [mappings_before, mappings_after],
         }),
     );
 }
