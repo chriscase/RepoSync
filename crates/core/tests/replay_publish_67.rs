@@ -2,7 +2,15 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// `LatePairPublishTestHook` is keyed by parent repo id (all fixtures use `parent`).
+static REPLAY_PUBLISH_67_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+async fn replay_publish_67_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    REPLAY_PUBLISH_67_LOCK.lock().await
+}
 
 use chrono::Utc;
 use reposync_core::config::{AppConfig, IdentityConfig};
@@ -14,8 +22,11 @@ use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, LatePairPlan, LatePairRequest,
 };
 use reposync_core::late_pair_publish::{
-    publish_admitted_late_pair, validate_git_publish_preflight, PublishCredentials,
+    clear_late_pair_publish_test_hook, publish_admitted_late_pair,
+    set_late_pair_publish_test_hook, validate_git_publish_preflight, LatePairPublishTestHook,
+    PublishCredentials,
 };
+use reposync_core::db::late_pair_publish_operations::LatePairPublishState;
 use reposync_core::models::{Repository, SyncDirection, SyncRecord, SyncRecordStatus};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
@@ -282,6 +293,7 @@ async fn candidate_r06_late_pair_publish_replays_pending_git() {
         "svn and svnadmin are required; do not count a skipped test as evidence"
     );
     let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
     let child_id = "child-feature".to_string();
     let published = publish_admitted_late_pair(
         &fx.db,
@@ -395,6 +407,7 @@ fn https_validate_preflight_refuses_missing_and_revoked_tokens_quickly() {
 async fn foreign_preexisting_svn_target_still_blocks_publish() {
     assert!(svn_available());
     let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
     assert!(Command::new("svn")
         .args([
             "mkdir",
@@ -461,4 +474,167 @@ async fn foreign_preexisting_svn_target_still_blocks_publish() {
             "child_rows":0
         })
     );
+}
+
+async fn publish_with_timeout(
+    fx: &PublishFixture,
+    child_id: &str,
+    request_id: &str,
+) -> Result<LatePairPlan, reposync_core::late_pair_publish::LatePairPublishRefusal> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        publish_admitted_late_pair(
+            &fx.db,
+            &fx.config,
+            &PublishCredentials {
+                svn_password: String::new(),
+            },
+            &fx.parent,
+            &fx.request,
+            &fx.plan,
+            &fx.probe,
+            child_id,
+            "fixture",
+            request_id,
+            &fx.identity,
+        ),
+    )
+    .await
+    .expect("publish must finish within 90s (deadlock guard)")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_resumes_after_replay_hook() {
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
+    let child_id = "child-replay-hook".to_string();
+    set_late_pair_publish_test_hook(
+        &fx.parent_id,
+        LatePairPublishTestHook {
+            fail_replay_once: true,
+            abort_after_svn_copy_before_journal: false,
+        },
+    );
+    let first = publish_with_timeout(&fx, &child_id, "req-replay-1")
+        .await
+        .expect("hook path returns Ok stub");
+    clear_late_pair_publish_test_hook(&fx.parent_id);
+    assert_eq!(first.mode, "publish_refused");
+    assert!(!first.published);
+    let op = fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .expect("journal row");
+    assert_eq!(op.state, LatePairPublishState::ReplayInProgress);
+    assert_eq!(op.child_repo_id.as_deref(), Some(child_id.as_str()));
+
+    let second = publish_with_timeout(&fx, &child_id, "req-replay-2")
+        .await
+        .expect("resume publish");
+    assert!(second.published);
+    assert_eq!(second.mode, "published");
+    let child = fx.db.get_repository(&child_id).unwrap().unwrap();
+    assert!(child.enabled);
+    assert_eq!(child.last_git_sha, fx.tip);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_resumes_after_svn_copy_hook() {
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
+    let child_id = "child-svn-hook".to_string();
+    set_late_pair_publish_test_hook(
+        &fx.parent_id,
+        LatePairPublishTestHook {
+            fail_replay_once: false,
+            abort_after_svn_copy_before_journal: true,
+        },
+    );
+    let first = publish_with_timeout(&fx, &child_id, "req-svn-1")
+        .await
+        .expect("hook path returns Ok stub");
+    clear_late_pair_publish_test_hook(&fx.parent_id);
+    assert_eq!(first.mode, "publish_refused");
+    let op = fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .expect("journal");
+    assert_eq!(op.state, LatePairPublishState::SvnCopyPending);
+    assert!(fx.db.get_repository(&child_id).unwrap().is_none());
+
+    let parent_svn_url = format!("{}/trunk", fx.svn_url);
+    let target_client = SvnClient::new(&fx.target_url, "", "");
+    let parent_client = SvnClient::new(&parent_svn_url, "", "");
+    let (probe, _) = probe_svn_target(
+        &parent_client,
+        &target_client,
+        &parent_svn_url,
+        &fx.target_url,
+        fx.plan.svn_source_revision,
+    )
+    .await;
+    assert!(probe.exists);
+
+    let second = publish_admitted_late_pair(
+        &fx.db,
+        &fx.config,
+        &PublishCredentials {
+            svn_password: String::new(),
+        },
+        &fx.parent,
+        &fx.request,
+        &fx.plan,
+        &probe,
+        &child_id,
+        "fixture",
+        "req-svn-2",
+        &fx.identity,
+    )
+    .await
+    .expect("resume after svn copy hook");
+    assert!(second.published);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_refuses_fingerprint_mismatch() {
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
+    let child_id = "child-fp".to_string();
+    set_late_pair_publish_test_hook(
+        &fx.parent_id,
+        LatePairPublishTestHook {
+            fail_replay_once: false,
+            abort_after_svn_copy_before_journal: true,
+        },
+    );
+    publish_with_timeout(&fx, &child_id, "req-fp-1")
+        .await
+        .expect("partial publish");
+    clear_late_pair_publish_test_hook(&fx.parent_id);
+
+    let mut bumped = fx.request.clone();
+    bumped.svn_branch = "branches/other-feature".into();
+    let err = publish_admitted_late_pair(
+        &fx.db,
+        &fx.config,
+        &PublishCredentials {
+            svn_password: String::new(),
+        },
+        &fx.parent,
+        &bumped,
+        &fx.plan,
+        &fx.probe,
+        &child_id,
+        "fixture",
+        "req-fp-2",
+        &fx.identity,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.reason, "publish_fingerprint_mismatch");
 }

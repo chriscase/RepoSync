@@ -27,6 +27,9 @@ use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::import::ImportProgress;
+use reposync_core::late_pair_publish::{
+    clear_late_pair_publish_test_hook, set_late_pair_publish_test_hook, LatePairPublishTestHook,
+};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 use reposync_web::api;
@@ -6840,6 +6843,133 @@ async fn candidate_r06_late_pair_publish_https_refuse_before_svn() {
     );
     assert_eq!(svn_youngest(&svn_repo), before);
     assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    server.abort();
+}
+
+const LATE_PAIR_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn post_late_pair_publish(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    repo_id: &str,
+    body: &serde_json::Value,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = tokio::time::timeout(
+        LATE_PAIR_HTTP_TIMEOUT,
+        client
+            .post(format!("http://{addr}/api/repos/{repo_id}/branches"))
+            .json(body)
+            .send(),
+    )
+    .await
+    .expect("POST /branches must complete within hard timeout")
+    .expect("request transport");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("json body");
+    (status, body)
+}
+
+/// R06: HTTP publish simulates replay failure, then resumes on retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_http_resume_after_replay_error() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    set_late_pair_publish_test_hook(
+        &id,
+        LatePairPublishTestHook {
+            fail_replay_once: true,
+            abort_after_svn_copy_before_journal: false,
+        },
+    );
+    let client = authed_client();
+    let (status, body) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    clear_late_pair_publish_test_hook(&id);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("replay_incomplete"),
+        "{body}"
+    );
+    let children = state.db.list_child_repositories(&id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(!children[0].enabled);
+
+    let (status2, plan) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    assert!(status2.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "published");
+    assert_eq!(plan["published"], true);
+    let children = state.db.list_child_repositories(&id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(children[0].enabled);
+    server.abort();
+}
+
+/// R06: HTTP publish survives simulated crash after SVN copy (journal resume).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_http_resume_after_svn_copy() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    set_late_pair_publish_test_hook(
+        &id,
+        LatePairPublishTestHook {
+            fail_replay_once: false,
+            abort_after_svn_copy_before_journal: true,
+        },
+    );
+    let client = authed_client();
+    let (status, body) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    clear_late_pair_publish_test_hook(&id);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("publish_test_hook"),
+        "{body}"
+    );
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+
+    let (status2, plan) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    assert!(status2.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "published");
+    server.abort();
+}
+
+/// R06: HTTP publish refuses when the in-flight journal fingerprint no longer matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_http_refuses_fingerprint_mismatch() {
+    let (addr, _state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    set_late_pair_publish_test_hook(
+        &id,
+        LatePairPublishTestHook {
+            fail_replay_once: false,
+            abort_after_svn_copy_before_journal: true,
+        },
+    );
+    let client = authed_client();
+    let (status, _body) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    clear_late_pair_publish_test_hook(&id);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+
+    let mut other = late_pair_publish_body();
+    other["svn_branch"] = serde_json::json!("branches/other-feature");
+    let (status2, body2) = post_late_pair_publish(&client, &addr, &id, &other).await;
+    assert_eq!(status2, reqwest::StatusCode::BAD_REQUEST, "{body2}");
+    assert!(
+        body2["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("publish_fingerprint_mismatch"),
+        "{body2}"
+    );
     server.abort();
 }
 

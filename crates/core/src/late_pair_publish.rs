@@ -912,11 +912,12 @@ pub async fn publish_admitted_late_pair(
                     plan: None,
                 },
             );
+            op.svn_branch_head_rev = Some(svn_head);
+            op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
             test_hook_short_circuit = Some(refused_publish_plan_stub(
                 plan, parent, request, probe, &baseline, &git_tip,
             ));
-        }
-        if test_hook_short_circuit.is_none() {
+        } else if test_hook_short_circuit.is_none() {
             op.svn_branch_head_rev = Some(svn_head);
             op.state = LatePairPublishState::SvnCopied;
             op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
@@ -999,11 +1000,13 @@ pub async fn publish_admitted_late_pair(
                     plan: None,
                 },
             );
+            op.state = LatePairPublishState::ReplayInProgress;
+            op.outcome_detail = Some("test hook: simulated replay failure".into());
+            op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
             test_hook_short_circuit = Some(refused_publish_plan_stub(
                 plan, parent, request, probe, &baseline, &git_tip,
             ));
-        }
-        if test_hook_short_circuit.is_none() {
+        } else if test_hook_short_circuit.is_none() {
             op.state = LatePairPublishState::ChildRegistered;
             op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
         }

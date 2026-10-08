@@ -220,14 +220,15 @@ impl Database {
         &self,
         parent_repo_id: &str,
     ) -> Result<Option<LatePairPublishOperation>, DatabaseError> {
-        let conn = self.conn();
-        let op_id: Option<String> = conn
-            .query_row(
+        let op_id: Option<String> = {
+            let conn = self.conn();
+            conn.query_row(
                 "SELECT value FROM kv_state WHERE key=?1",
                 [key("latest", parent_repo_id)],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()?
+        };
         match op_id {
             Some(id) => self.get_late_pair_publish_operation(parent_repo_id, &id),
             None => Ok(None),
