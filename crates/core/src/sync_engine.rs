@@ -41,7 +41,8 @@ use crate::db::team_cycle_mapping_operations::{
 use crate::db::Database;
 use crate::echo_receipt_scope::{
     collect_git_no_target_receipts_for_sha, handled_git_no_target_state_key,
-    read_git_no_target_receipt, repo_echo_generation, stored_git_no_target_receipt_exists,
+    read_git_no_target_receipt, read_git_no_target_receipt_any_generation, repo_echo_generation,
+    stored_git_no_target_receipt_exists,
 };
 use crate::echo_suppression::{
     classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
@@ -626,6 +627,92 @@ impl SyncEngine {
         }
     }
 
+    fn checkpoint_git_object_missing(&self, sha: &str) -> Result<bool, SyncError> {
+        if !is_full_git_oid(sha) {
+            return Ok(false);
+        }
+        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+        let repo_path = git.repo_path();
+        let spec = format!("{}^{{commit}}", sha);
+        if Command::new("git")
+            .args(["cat-file", "-e", &spec])
+            .current_dir(repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return Ok(false);
+        }
+        let branch = &self.config.github.default_branch;
+        let remote_branch = format!("refs/heads/{}", branch);
+        let advertised = Command::new("git")
+            .args([
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                "origin",
+                &remote_branch,
+            ])
+            .current_dir(repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output();
+        if let Ok(output) = advertised {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let advertised_sha = stdout
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().next())
+                    .unwrap_or("");
+                if advertised_sha == sha {
+                    return Ok(false);
+                }
+            }
+        }
+        let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
+        let fetched = Command::new("git")
+            .args([
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "origin",
+                &format!("{}:{}", sha, probe_ref),
+            ])
+            .current_dir(repo_path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let present = fetched
+            && Command::new("git")
+                .args(["cat-file", "-e", &spec])
+                .current_dir(repo_path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .is_ok_and(|output| output.status.success());
+        if present {
+            let _ = Command::new("git")
+                .args(["update-ref", "-d", &probe_ref])
+                .current_dir(repo_path)
+                .output();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn reject_missing_checkpoint_object(&self, sha: &str) -> Result<(), SyncError> {
+        if self.checkpoint_git_object_missing(sha)? {
+            return Err(self.record_history_block(
+                "missing_checkpoint_object",
+                "handled Git cursor object is absent or invalid",
+                Some(sha),
+                None,
+                None,
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     /// Read a repository-owned legacy Git cursor without borrowing another
     /// pair's global maximum. A missing or conflicting cursor is not a new
     /// baseline. The schema transition remains #63.
@@ -647,6 +734,9 @@ impl SyncEngine {
                 .get_state(&format!("last_git_sha_{}", rid))
                 .map_err(SyncError::DatabaseError)?
                 .filter(|value| !value.is_empty());
+            if let Some(ref sha) = column {
+                self.reject_missing_checkpoint_object(sha)?;
+            }
             // A no-target decision is authority for the handled frontier even
             // when the old cursor copies happen to agree. Check every present
             // copy before choosing between equal, split, or KV-only shapes.
@@ -666,7 +756,7 @@ impl SyncEngine {
                         rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
                     ).map_err(crate::errors::DatabaseError::from)?;
                     let svn_origin: i64 = conn.query_row(
-                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev <= (SELECT last_svn_rev FROM repositories WHERE id = ?1)",
+                        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev IS NOT NULL AND svn_rev <= (SELECT last_svn_rev FROM repositories WHERE id = ?1)",
                         rusqlite::params![rid, kv.as_deref()], |row| row.get(0),
                     ).map_err(crate::errors::DatabaseError::from)?;
                     (applied_outbound, svn_origin)
@@ -732,7 +822,7 @@ impl SyncEngine {
                     let (emitted, last_handled): (i64, Option<String>) = {
                         let conn = self.db.conn();
                         let emitted = conn.query_row(
-                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev IS NOT NULL",
                             rusqlite::params![rid, emitted_tip], |row| row.get(0),
                         ).map_err(crate::errors::DatabaseError::from)?;
                         let last_handled = conn.query_row(
@@ -852,11 +942,45 @@ impl SyncEngine {
                 }
             }
             if let Some(kv_sha) = kv {
+                if column.is_none() {
+                    self.reject_missing_checkpoint_object(&kv_sha)?;
+                }
                 // Unified column+KV copies claim inbound P; KV-only bootstrap may
                 // precede a repository row (late pair checkpoint transition).
                 if column.as_deref() == Some(kv_sha.as_str())
                     && !self.proved_scoped_inbound_git_checkpoint(rid, &kv_sha)?
                 {
+                    let outbound_history: i64 = {
+                        let conn = self.db.conn();
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+                            [rid],
+                            |row| row.get(0),
+                        )
+                        .map_err(crate::errors::DatabaseError::from)?
+                    };
+                    let mut stale_identifies_frontier = false;
+                    if outbound_history > 0 {
+                        if let Some(record) =
+                            read_git_no_target_receipt_any_generation(&self.db, rid, &kv_sha)
+                                .map_err(SyncError::DatabaseError)?
+                        {
+                            let projection = self.no_target_projection();
+                            let generation = repo_echo_generation(&self.db, rid)
+                                .map_err(SyncError::DatabaseError)?;
+                            stale_identifies_frontier = verify_no_target_receipt(
+                                &record,
+                                rid,
+                                &kv_sha,
+                                &projection,
+                                generation,
+                            )
+                                == NoTargetReceiptVerdict::StaleGeneration;
+                        }
+                    }
+                    if stale_identifies_frontier {
+                        return Ok(Some(kv_sha));
+                    }
                     return Err(self.record_history_block(
                         "ambiguous_checkpoint",
                         "legacy Git cursor lacks scoped provenance for this repository",
@@ -929,6 +1053,7 @@ impl SyncEngine {
                 .map_err(SyncError::DatabaseError)?
                 .filter(|sha| !sha.is_empty());
             if let Some(ref sha) = global {
+                self.reject_missing_checkpoint_object(sha)?;
                 if !self.proved_scoped_inbound_git_checkpoint(&rid, sha)? {
                     return Err(self.record_history_block(
                         "ambiguous_checkpoint",
@@ -966,7 +1091,7 @@ impl SyncEngine {
         let emitted_mapping: i64 = {
             let conn = self.db.conn();
             conn.query_row(
-                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev IS NOT NULL",
                 rusqlite::params![rid, column_sha],
                 |row| row.get(0),
             )
@@ -1048,7 +1173,7 @@ impl SyncEngine {
                 .map_err(crate::errors::DatabaseError::from)?;
             let applied_inbound: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev IS NOT NULL",
                     rusqlite::params![rid, sha],
                     |row| row.get(0),
                 )

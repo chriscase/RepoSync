@@ -328,6 +328,24 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "ECHO_LEGACY_UNIFIED_CURSOR_UNPROVEN",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_legacy_unified_cursor_without_provenance_ambiguous_checkpoint",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_COLUMN_BOOTSTRAP_BOUNDED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_column_bootstrap_sync_cycle_bounded_no_db_mutex_hang",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_SHAPE1_COLUMN_ONLY_UNPROVED",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_shape1_column_only_unproved_blocks_sync_cycle_bounded",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "ECHO_MARKER_FORGED",
       "binary": "team_mode_e2e",
       "test": "test_team_mode_marker_without_receipt_applies_once",

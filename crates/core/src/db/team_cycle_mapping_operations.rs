@@ -208,6 +208,21 @@ fn advance_git_with_receipt_tx(
         [repo_id],
         |row| row.get(0),
     )?;
+    let column_before: String = tx.query_row(
+        "SELECT last_git_sha FROM repositories WHERE id = ?1",
+        [repo_id],
+        |row| row.get(0),
+    )?;
+    let scoped_kv: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [format!("last_git_sha_{}", repo_id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let unified_cursors = scoped_kv
+        .as_deref()
+        .is_some_and(|kv| !column_before.is_empty() && kv == column_before);
     let updated = tx.execute(
         "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
         params![git_sha, repo_id],
@@ -217,7 +232,7 @@ fn advance_git_with_receipt_tx(
             "team cycle mapping lost its repository registration".into(),
         ));
     }
-    if outbound_applied == 0 {
+    if outbound_applied == 0 || unified_cursors {
         write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
     }
     let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
