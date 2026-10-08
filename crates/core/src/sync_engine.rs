@@ -985,25 +985,25 @@ impl SyncEngine {
         if !is_full_git_oid(sha) {
             return Ok(false);
         }
-        let conn = self.db.conn();
-        let applied_outbound: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn' AND status = 'applied'",
-                rusqlite::params![rid, sha],
-                |row| row.get(0),
-            )
-            .map_err(crate::errors::DatabaseError::from)?;
-        if applied_outbound > 0 {
-            return Ok(true);
-        }
-        let applied_inbound: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev <= (SELECT last_svn_rev FROM repositories WHERE id = ?1)",
-                rusqlite::params![rid, sha],
-                |row| row.get(0),
-            )
-            .map_err(crate::errors::DatabaseError::from)?;
-        if applied_inbound > 0 {
+        let (applied_outbound, applied_inbound) = {
+            let conn = self.db.conn();
+            let applied_outbound: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'git_to_svn' AND status = 'applied'",
+                    rusqlite::params![rid, sha],
+                    |row| row.get(0),
+                )
+                .map_err(crate::errors::DatabaseError::from)?;
+            let applied_inbound: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND git_sha = ?2 AND direction = 'svn_to_git' AND status = 'applied' AND svn_rev <= (SELECT last_svn_rev FROM repositories WHERE id = ?1)",
+                    rusqlite::params![rid, sha],
+                    |row| row.get(0),
+                )
+                .map_err(crate::errors::DatabaseError::from)?;
+            (applied_outbound, applied_inbound)
+        };
+        if applied_outbound > 0 || applied_inbound > 0 {
             return Ok(true);
         }
         let projection = self.no_target_projection();
@@ -5077,6 +5077,40 @@ repo = "test/test-repo"
             Some(imported.as_str()),
             "branch bootstrap seeds unified cursor copies with verified SVN import proof"
         );
+    }
+
+    #[test]
+    fn team_git_checkpoint_column_bootstrap_completes_within_bounded_time() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let repo_path = engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let bootstrap = git_fixture_commit(&repo_path, "boot.txt", "boot\n", "bootstrap tip");
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&bootstrap],
+            )
+            .unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(engine.team_git_checkpoint());
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(Some(sha))) => assert_eq!(sha, bootstrap),
+            Ok(other) => panic!("unexpected checkpoint result: {other:?}"),
+            Err(_) => panic!(
+                "team_git_checkpoint hung on column-only bootstrap (database mutex reentrancy)"
+            ),
+        }
     }
 
     #[test]

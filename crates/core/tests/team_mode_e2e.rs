@@ -13151,3 +13151,36 @@ async fn candidate_r65_managed_remove_restore_resumes_sync() {
         })
     );
 }
+
+// Refs #63: column-only install bootstrap must not self-deadlock on Database::conn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_column_bootstrap_sync_cycle_bounded_no_db_mutex_hang() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new().await;
+    fixture
+        .engine
+        .db()
+        .conn()
+        .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
+        .unwrap();
+    let cycle = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        fixture.engine.run_sync_cycle(),
+    )
+    .await;
+    assert!(
+        cycle.is_ok(),
+        "sync cycle must finish within bounded time when proving column-only bootstrap inbound cursor"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_COLUMN_BOOTSTRAP_BOUNDED",
+            "cycle_ok":cycle.unwrap().is_ok()
+        })
+    );
+}
