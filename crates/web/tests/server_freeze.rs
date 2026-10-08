@@ -8289,7 +8289,10 @@ async fn candidate_r65_get_removal_status_by_operation_id() {
         .await
         .unwrap();
     assert_eq!(latest.status(), reqwest::StatusCode::OK);
-    assert_eq!(latest.json::<serde_json::Value>().await.unwrap()["state"], "completed");
+    assert_eq!(
+        latest.json::<serde_json::Value>().await.unwrap()["state"],
+        "completed"
+    );
 
     let historical = client
         .get(format!(
