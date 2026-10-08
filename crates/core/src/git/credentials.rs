@@ -10,7 +10,7 @@ use super::GitClient;
 
 /// Apply a resolved credential-chain state to an HTTP(S) remote.
 ///
-/// - **Resolved** — embed the token in the remote URL.
+/// - **Resolved** — store the token for CLI/callback auth; remote URL stays clean.
 /// - **Explicitly revoked** — strip userinfo from the remote URL.
 /// - **Not found / error** — leave the remote unchanged (fail-safe).
 pub fn apply_git_credential_chain_state(
@@ -27,9 +27,25 @@ pub fn apply_git_credential_chain_state(
     }
 }
 
+/// Scheduler/sync reload: embed scoped tokens in the remote URL (RS-11 isolation).
+pub fn apply_git_credential_chain_state_for_sync(
+    git: &GitClient,
+    remote_name: &str,
+    state: &CredentialChainState,
+) -> Result<(), GitError> {
+    if state.explicitly_revoked {
+        git.clear_remote_credentials(remote_name)
+    } else if let Some(tok) = state.value.as_deref() {
+        git.ensure_remote_credentials_embedded(remote_name, Some(tok))
+    } else {
+        Ok(())
+    }
+}
+
 /// Apply only config/env git credentials to the legacy config git-repo remote.
 ///
 /// Managed-repo credential chains must never be applied to `data_dir/git-repo`.
+/// Tokens are kept out of `.git/config` (see [`GitClient::ensure_remote_credentials`]).
 pub fn apply_config_remote_git_credentials(
     git: &GitClient,
     config_token: Option<&str>,
@@ -65,7 +81,7 @@ pub fn apply_managed_git_credentials(
             "git token not found via credential chain; preserving remote URL"
         );
     }
-    apply_git_credential_chain_state(git, remote_name, &state)
+    apply_git_credential_chain_state_for_sync(git, remote_name, &state)
 }
 
 #[cfg(test)]
@@ -76,7 +92,7 @@ mod tests {
 
     fn git_origin_url(repo_path: &Path) -> String {
         std::process::Command::new("git")
-            .args(["remote", "get-url", "origin"])
+            .args(["config", "--get", "remote.origin.url"])
             .current_dir(repo_path)
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -138,5 +154,59 @@ mod tests {
         let after = git_origin_url(&bridge);
         assert!(!after.contains("x-access-token:"));
         assert_eq!(after, "https://git.invalid/repo.git");
+    }
+
+    #[test]
+    fn apply_chain_resolved_keeps_clean_remote_url() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let work = tmp.path().join("work");
+        std::process::Command::new("git")
+            .args(["clone", bare.to_str().unwrap(), work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let clean = "https://github.com/example/widget.git";
+        let secret = "ghp_chain_resolved_secret";
+        let legacy = "https://x-access-token:legacy@github.com/example/widget.git";
+        std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", legacy])
+            .current_dir(&work)
+            .status()
+            .unwrap();
+
+        let git = GitClient::new(&work).unwrap();
+        apply_git_credential_chain_state(
+            &git,
+            "origin",
+            &CredentialChainState::resolved(secret.to_string()),
+        )
+        .unwrap();
+        let after = git_origin_url(&work);
+        let config = std::fs::read_to_string(work.join(".git/config")).unwrap();
+        assert!(!after.contains(secret));
+        assert!(!after.contains("legacy"));
+        assert!(!after.contains("x-access-token:"));
+        assert!(!config.contains(secret));
+        assert_eq!(after, clean);
+    }
+
+    #[test]
+    fn clone_repo_leaves_clean_config_for_file_remote() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let dest = tmp.path().join("dest");
+        let url = format!("file://{}", bare.display());
+        GitClient::clone_repo(&url, &dest, Some("unused-token")).unwrap();
+        let config = std::fs::read_to_string(dest.join(".git/config")).unwrap();
+        assert!(!config.contains("unused-token"));
+        assert!(!config.contains("x-access-token:"));
     }
 }

@@ -673,6 +673,97 @@ async fn candidate_r06_late_pair_publish_resumes_after_mid_replay_failure() {
         .await
         .expect("resume after mid-replay failure");
     assert!(second.published);
+    let child = fx
+        .db
+        .list_child_repositories(&fx.parent_id)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == child_id)
+        .expect("child row");
+    let replayed_git_to_svn: i64 = fx
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='git_to_svn'",
+            [&child.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        replayed_git_to_svn, 2,
+        "mid-replay resume must not double-apply Git commits"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_journaled_svn_copy_rev_wins() {
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
+    let child_id = "child-journal-copy-rev".to_string();
+    set_late_pair_publish_test_hook(
+        &fx.parent_id,
+        LatePairPublishTestHook {
+            fail_svn_copy_once: true,
+            ..Default::default()
+        },
+    );
+    let first = publish_with_timeout(&fx, &child_id, "req-copy-rev-1")
+        .await
+        .unwrap_err();
+    clear_late_pair_publish_test_hook(&fx.parent_id);
+    assert_eq!(first.reason, "svn_copy_failed");
+
+    let mut op = fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .expect("journal");
+    op.svn_copy_source_rev = 2;
+    fx.db.update_late_pair_publish_operation(op).unwrap();
+
+    let mut plan_alt = fx.plan.clone();
+    plan_alt.proposed_svn_copy_source_revision = Some(99);
+
+    let published = publish_admitted_late_pair(
+        &fx.db,
+        &fx.config,
+        &PublishCredentials {
+            svn_password: String::new(),
+        },
+        &fx.parent,
+        &fx.request,
+        &plan_alt,
+        &fx.probe,
+        &child_id,
+        "fixture",
+        "req-copy-rev-2",
+        &fx.identity,
+    )
+    .await
+    .expect("resume uses journaled svn copy source revision");
+    assert!(published.published);
+
+    let trunk_url = format!("{}/trunk", fx.svn_url);
+    let trunk_r2 = Command::new("svn")
+        .args(["cat", "-r", "2", &format!("{}/origin.txt", trunk_url)])
+        .output()
+        .unwrap();
+    assert!(trunk_r2.status.success());
+    let branch_origin = Command::new("svn")
+        .args(["cat", &format!("{}/origin.txt", fx.target_url)])
+        .output()
+        .unwrap();
+    assert!(
+        branch_origin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&branch_origin.stderr)
+    );
+    assert_eq!(trunk_r2.stdout, branch_origin.stdout);
+    assert!(
+        !String::from_utf8_lossy(&branch_origin.stdout).contains("v2"),
+        "journaled copy rev 2 must not pick up trunk revision 3 content"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -188,7 +188,15 @@ impl TestServerGuard {
             let _ = tx.send(());
         }
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = thread.join();
+                let _ = done_tx.send(());
+            });
+            if done_rx.recv_timeout(JOIN_TIMEOUT).is_err() {
+                // Join did not finish in time; detach rather than hang Drop/abort.
+            }
         }
     }
 }

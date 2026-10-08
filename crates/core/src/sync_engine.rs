@@ -4484,7 +4484,8 @@ impl SyncEngine {
         };
         {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            match crate::git::apply_git_credential_chain_state(&git, "origin", &git_state) {
+            match crate::git::apply_git_credential_chain_state_for_sync(&git, "origin", &git_state)
+            {
                 Ok(()) if git_state.value.is_some() => {
                     debug!("reloaded Git token from database");
                 }

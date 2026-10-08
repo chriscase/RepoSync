@@ -21,7 +21,7 @@ use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerpri
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
-use reposync_core::errors::DatabaseError;
+use reposync_core::errors::{redact_vcs_error_detail, DatabaseError};
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -3866,7 +3866,7 @@ async fn test_repo_svn(
                 .find(|l| l.contains("E1") || l.contains("Unable") || l.contains("Authentication"))
                 .unwrap_or("SVN command failed");
             Ok(Json(
-                serde_json::json!({"ok": false, "message": msg.trim()}),
+                serde_json::json!({"ok": false, "message": redact_vcs_error_detail(msg.trim())}),
             ))
         }
         Err(e) => Ok(Json(

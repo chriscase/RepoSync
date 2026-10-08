@@ -1097,12 +1097,28 @@ pub async fn publish_admitted_late_pair(
         op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
     }
 
-    db.finalize_late_pair_publish_enabling_child(&parent.id, &op.id, &effective_child_id, &git_tip)
+    let finalized = db
+        .finalize_late_pair_publish_enabling_child(
+            &parent.id,
+            &op.id,
+            &effective_child_id,
+            &git_tip,
+        )
         .map_err(|e| LatePairPublishRefusal {
             reason: "finalize_failed".into(),
             detail: redact_vcs_error_detail(&e.to_string()),
             plan: Some(Box::new(plan.clone())),
         })?;
+    if finalized.state != LatePairPublishState::Completed {
+        return Err(LatePairPublishRefusal {
+            reason: "finalize_refused".into(),
+            detail: finalized
+                .outcome_detail
+                .clone()
+                .unwrap_or_else(|| "late-pair publish finalize refused".into()),
+            plan: Some(Box::new(plan.clone())),
+        });
+    }
 
     Ok(LatePairPlan {
         mode: "published".into(),
