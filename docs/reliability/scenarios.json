@@ -48,7 +48,7 @@
       "baseline": "FAIL",
       "candidate": "PARTIAL",
       "tier": "local_api_real_remotes",
-      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Candidate admission/preview proves an SVN-derived tip is planned with pinned Git tip and baseline SVN revision, snapshot-bounded ancestry is enough, unsafe skip_import is refused without watermark writes, an existing SVN target is not treated as equivalent, and dry_run=false does not insert a scheduler-active child. Replay and publish stay later.",
+      "evidence": "R06_CHECKPOINT remains the baseline_observation that skip-import checkpoints omit descendant Git work. Admission/preview pins tips and baseline. Publish journals svn_copy_pending before svn copy, copies at the verified baseline revision, sets baseline watermarks, replays pending Git through SyncEngine, and enables the child when the pinned tip is handled (R06_LATE_PAIR_PUBLISH_REPLAY). Replay errors remain on replay_in_progress (not terminal failed) with outcome_detail for resume. HTTPS preflight refuses empty/revoked tokens before SVN mutation (R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE). Existing foreign SVN targets block publish without activating a child (R06_NO_ACTIVE_ON_PARTIAL).",
       "diagnostic_expected_baseline_failure": true
     },
     {

@@ -27,6 +27,9 @@ use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
 use reposync_core::import::ImportProgress;
+use reposync_core::late_pair_publish::{
+    clear_late_pair_publish_test_hook, set_late_pair_publish_test_hook, LatePairPublishTestHook,
+};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 use reposync_web::api;
@@ -167,6 +170,57 @@ fn authed_client() -> reqwest::Client {
         .default_headers(headers)
         .build()
         .unwrap()
+}
+
+/// Axum server on its own OS thread/runtime so in-process HTTP clients do not deadlock the test runtime.
+struct TestServerGuard {
+    shutdown: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl TestServerGuard {
+    fn abort(self) {
+        let _ = self.shutdown.send(());
+        let _ = self.thread.join();
+    }
+}
+
+fn spawn_isolated_test_server(app: Router) -> (SocketAddr, TestServerGuard) {
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = std_listener.local_addr().expect("local_addr");
+    std_listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("server runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(std_listener).expect("from_std");
+            ready_tx.send(()).ok();
+            let shutdown = async move {
+                while shutdown_rx.try_recv().is_err() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await
+                .expect("serve");
+        });
+    });
+    ready_rx.recv().expect("server ready");
+    (
+        addr,
+        TestServerGuard {
+            shutdown: shutdown_tx,
+            thread,
+        },
+    )
 }
 
 /// Like `build_test_server` but merges more route modules (repos, audit)
@@ -1553,7 +1607,7 @@ async fn diagnostic_r02_r03_root_delete_disables_and_per_repo_cancel_is_missing(
 async fn import_fixture() -> (
     SocketAddr,
     Arc<AppState>,
-    tokio::task::JoinHandle<()>,
+    TestServerGuard,
     tempfile::TempDir,
     String,
     std::path::PathBuf,
@@ -1654,11 +1708,7 @@ async fn import_fixture() -> (
     let app = Router::new()
         .merge(api::repos::routes())
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (addr, server) = spawn_isolated_test_server(app);
     let client = authed_client();
     let response = client
         .post(format!("http://{addr}/api/repos"))
@@ -1671,12 +1721,10 @@ async fn import_fixture() -> (
         .send()
         .await
         .unwrap();
-    assert!(
-        response.status().is_success(),
-        "{}",
-        response.text().await.unwrap()
-    );
-    let created: serde_json::Value = response.json().await.unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "{}", body);
+    let created: serde_json::Value = serde_json::from_str(&body).unwrap();
     (
         addr,
         state,
@@ -3820,7 +3868,7 @@ mod import_reconciliation_tests {
     struct HeldFixture {
         addr: SocketAddr,
         state: Arc<AppState>,
-        server: tokio::task::JoinHandle<()>,
+        server: TestServerGuard,
         tmp: tempfile::TempDir,
         id: String,
         bare: std::path::PathBuf,
@@ -3928,7 +3976,6 @@ mod import_reconciliation_tests {
             let engine = state.sync_engine.clone();
             let sync_trigger = state.sync_trigger.clone();
             server.abort();
-            let _ = server.await;
             drop(state);
             let db = Database::new(tmp.path().join("reposync.db")).unwrap();
             db.initialize().unwrap();
@@ -3948,11 +3995,7 @@ mod import_reconciliation_tests {
             let app = Router::new()
                 .merge(api::repos::routes())
                 .with_state(state.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
+            let (addr, server) = spawn_isolated_test_server(app);
             Self {
                 addr,
                 state,
@@ -6322,7 +6365,7 @@ fn svn_youngest(svn_repo: &std::path::Path) -> i64 {
 async fn snapshot_imported_parent() -> (
     std::net::SocketAddr,
     std::sync::Arc<AppState>,
-    tokio::task::JoinHandle<()>,
+    TestServerGuard,
     tempfile::TempDir,
     String,
     std::path::PathBuf,
@@ -6645,11 +6688,80 @@ async fn candidate_r06_existing_target_not_equivalent() {
     server.abort();
 }
 
-/// R06: explicit publish is refused; no scheduler-active child.
+/// R06: publish replays pending Git commits and activates the child pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_replays_git() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let feature_tip = push_feature_commits(tmp.path(), &bare, 2);
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = svn_youngest(&svn_repo);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":false,
+            "dry_run":false,
+            "preview":false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "published");
+    assert_eq!(plan["published"], true);
+    assert_eq!(plan["scheduler_active"], true);
+    assert_eq!(plan["git_tip"], feature_tip);
+    assert_eq!(plan["pending_git"]["count"], 2);
+    let children = state.db.list_child_repositories(&id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(children[0].enabled);
+    assert!(svn_youngest(&svn_repo) > before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_LATE_PAIR_PUBLISH_REPLAY",
+            "pending_git":2,
+            "child_enabled":true,
+            "svn_advanced":true
+        })
+    );
+    server.abort();
+}
+
+/// R06: publish is refused when the SVN target already exists (no scheduler-active child).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r06_no_active_on_partial() {
+    use std::process::Command;
     let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
     let _ = push_feature_commits(tmp.path(), &bare, 1);
+    let svn_url = format!("file://{}", tmp.path().join("svn-repo").display());
+    assert!(Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/branches"),
+            "-m",
+            "branches",
+            "--non-interactive"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("svn")
+        .args([
+            "copy",
+            &format!("{svn_url}/trunk@1"),
+            &format!("{svn_url}/branches/feature"),
+            "-m",
+            "existing target",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
     let client = authed_client();
     let response = client
         .post(format!("http://{addr}/api/repos/{id}/branches"))
@@ -6670,13 +6782,10 @@ async fn candidate_r06_no_active_on_partial() {
         body["error"]
             .as_str()
             .unwrap_or("")
-            .contains("publish_not_implemented"),
+            .contains("existing_svn_target_blocks_publish"),
         "{body}"
     );
     assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
-    let parent = state.db.get_repository(&id).unwrap().unwrap();
-    assert!(parent.enabled);
-    assert_ne!(parent.sync_status, "reconciling");
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
@@ -6684,6 +6793,177 @@ async fn candidate_r06_no_active_on_partial() {
             "child_rows":0,
             "publish_refused":true
         })
+    );
+    server.abort();
+}
+
+fn late_pair_publish_body() -> serde_json::Value {
+    serde_json::json!({
+        "svn_branch": "branches/feature",
+        "git_branch": "feature",
+        "skip_import": false,
+        "dry_run": false,
+        "preview": false
+    })
+}
+
+/// R06: HTTPS publish refuses empty/revoked credentials before SVN mutation (HTTP path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_https_refuse_before_svn() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = svn_youngest(&svn_repo);
+    let mut parent = state.db.get_repository(&id).unwrap().unwrap();
+    parent.git_api_url = "https://api.github.com".into();
+    parent.git_repo = "acme/widget".into();
+    state.db.update_repository(&parent).unwrap();
+
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&late_pair_publish_body())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("git_credentials_missing"),
+        "{body}"
+    );
+    assert_eq!(svn_youngest(&svn_repo), before);
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+    server.abort();
+}
+
+const LATE_PAIR_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn post_late_pair_publish(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    repo_id: &str,
+    body: &serde_json::Value,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = tokio::time::timeout(
+        LATE_PAIR_HTTP_TIMEOUT,
+        client
+            .post(format!("http://{addr}/api/repos/{repo_id}/branches"))
+            .json(body)
+            .send(),
+    )
+    .await
+    .expect("POST /branches must complete within hard timeout")
+    .expect("request transport");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("json body");
+    (status, body)
+}
+
+/// R06: HTTP publish simulates replay failure, then resumes on retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_http_resume_after_replay_error() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    set_late_pair_publish_test_hook(
+        &id,
+        LatePairPublishTestHook {
+            fail_replay_once: true,
+            abort_after_svn_copy_before_journal: false,
+        },
+    );
+    let client = authed_client();
+    let (status, body) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    clear_late_pair_publish_test_hook(&id);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("replay_incomplete"),
+        "{body}"
+    );
+    let children = state.db.list_child_repositories(&id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(!children[0].enabled);
+
+    let (status2, plan) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    assert!(status2.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "published");
+    assert_eq!(plan["published"], true);
+    let children = state.db.list_child_repositories(&id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(children[0].enabled);
+    server.abort();
+}
+
+/// R06: HTTP publish survives simulated crash after SVN copy (journal resume).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_http_resume_after_svn_copy() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    set_late_pair_publish_test_hook(
+        &id,
+        LatePairPublishTestHook {
+            fail_replay_once: false,
+            abort_after_svn_copy_before_journal: true,
+        },
+    );
+    let client = authed_client();
+    let (status, body) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    clear_late_pair_publish_test_hook(&id);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("publish_test_hook"),
+        "{body}"
+    );
+    assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
+
+    let (status2, plan) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    assert!(status2.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "published");
+    server.abort();
+}
+
+/// R06: HTTP publish refuses when the in-flight journal fingerprint no longer matches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_http_refuses_fingerprint_mismatch() {
+    let (addr, _state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let _ = push_feature_commits(tmp.path(), &bare, 2);
+    set_late_pair_publish_test_hook(
+        &id,
+        LatePairPublishTestHook {
+            fail_replay_once: false,
+            abort_after_svn_copy_before_journal: true,
+        },
+    );
+    let client = authed_client();
+    let (status, _body) =
+        post_late_pair_publish(&client, &addr, &id, &late_pair_publish_body()).await;
+    clear_late_pair_publish_test_hook(&id);
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+
+    let mut other = late_pair_publish_body();
+    other["svn_branch"] = serde_json::json!("branches/other-feature");
+    let (status2, body2) = post_late_pair_publish(&client, &addr, &id, &other).await;
+    assert_eq!(status2, reqwest::StatusCode::BAD_REQUEST, "{body2}");
+    assert!(
+        body2["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("publish_fingerprint_mismatch"),
+        "{body2}"
     );
     server.abort();
 }
@@ -6856,7 +7136,7 @@ fn svn_commit_on(
 async fn refresh_pair_fixture() -> (
     std::net::SocketAddr,
     std::sync::Arc<AppState>,
-    tokio::task::JoinHandle<()>,
+    TestServerGuard,
     tempfile::TempDir,
     String,
     String,

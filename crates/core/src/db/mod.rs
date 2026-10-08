@@ -7,6 +7,7 @@ pub mod conflict_repo_attribution;
 pub mod credential_seeding;
 pub mod git_push_operations;
 pub mod import_operations;
+pub mod late_pair_publish_operations;
 pub mod managed_remove;
 pub mod personal_scope;
 pub mod queries;

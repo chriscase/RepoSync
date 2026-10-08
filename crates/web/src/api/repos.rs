@@ -17,6 +17,7 @@ use reposync_core::db::import_operations::{
     import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
     RepoImportBaseline, SnapshotPin,
 };
+use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
 use reposync_core::db::queries::AuditLogInput;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
@@ -27,6 +28,10 @@ use reposync_core::identity::IdentityMapper;
 use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress, ImportRunState};
 use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, probe_svn_target, LatePairRequest,
+};
+use reposync_core::late_pair_publish::{
+    publish_admitted_late_pair, resolve_publish_child_id, take_pending_publish_refusal,
+    PublishCredentials,
 };
 use reposync_core::pair_refresh::{
     analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
@@ -2954,10 +2959,10 @@ struct CreateBranchPairRequest {
     #[serde(default)]
     skip_import: bool,
     /// Explicit compatibility flag for the historical skip_import / start-from-now
-    /// request. Even when set, this slice never applies watermarks or publishes.
+    /// request. Even when set, publish never applies skip_import watermarks.
     #[serde(default)]
     compatibility_skip_import: bool,
-    /// Preview/plan only. Defaults to true so this slice cannot publish.
+    /// Preview/plan only. Defaults to true; set false to publish/replay.
     #[serde(default = "default_true")]
     dry_run: bool,
     /// Alias for dry_run. When true, forces preview mode.
@@ -3095,16 +3100,9 @@ async fn create_branch_pair(
         ));
     }
 
-    // Duplicate check: ensure no existing child has the same git_branch
     let existing_children = db
         .list_child_repositories(&parent.id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    if existing_children.iter().any(|c| c.git_branch == git_branch) {
-        return Err(AppError::BadRequest(format!(
-            "a branch pair with git_branch '{}' already exists",
-            git_branch
-        )));
-    }
 
     // #67 admission/preview: prove SVN-origin lineage before any copy,
     // checkpoint, remote mutation, or scheduler-active child row.
@@ -3173,21 +3171,101 @@ async fn create_branch_pair(
     };
 
     attach_svn_probe(&parent, db, &mut plan).await;
-    if body.auto_create_svn_branch.unwrap_or(true) || body.auto_create_git_branch.unwrap_or(true) {
-        plan.unknowns.push(
-            "auto_create_svn_branch / auto_create_git_branch are ignored in this preview slice; no remote refs are created".into(),
+
+    if dry_run {
+        if existing_children
+            .iter()
+            .any(|c| c.git_branch == git_branch && c.enabled)
+        {
+            return Err(AppError::BadRequest(format!(
+                "a branch pair with git_branch '{}' already exists",
+                git_branch
+            )));
+        }
+        if body.auto_create_svn_branch.unwrap_or(true)
+            || body.auto_create_git_branch.unwrap_or(true)
+        {
+            plan.unknowns.push(
+                "auto_create_svn_branch / auto_create_git_branch are ignored in preview; publish copies SVN at the verified baseline revision".into(),
+            );
+        }
+        info!(
+            parent_id = %parent.id,
+            git_branch = %git_branch,
+            svn_branch = %svn_branch,
+            git_tip = ?plan.git_tip,
+            baseline = ?plan.svn_source_revision,
+            "late-pair preview admitted; no child row or remote mutation"
         );
+        return Ok(Json(serde_json::to_value(&plan).map_err(|e| {
+            AppError::Internal(format!("serialization error: {}", e))
+        })?));
     }
+
+    let svn_password = db
+        .resolve_credential_chain(&parent.id, "secret_svn_password")
+        .unwrap_or_default();
+    let identity_config = reposync_core::config::IdentityConfig::default();
+    let identity_mapper = IdentityMapper::new(&identity_config)
+        .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {e}")))?;
+    let baseline = plan.verified_baseline.as_ref().ok_or_else(|| {
+        AppError::BadRequest("missing_baseline: admitted plan has no verified baseline".into())
+    })?;
+    let git_tip = plan
+        .git_tip
+        .as_ref()
+        .ok_or_else(|| AppError::BadRequest("missing_git_tip".into()))?;
+    let fingerprint = late_pair_publish_fingerprint(
+        &parent.id,
+        &git_branch,
+        &svn_branch,
+        git_tip,
+        &baseline.git_sha,
+        baseline.svn_revision,
+    );
+    let fallback_child = Uuid::new_v4().to_string();
+    let child_id = resolve_publish_child_id(db, &parent.id, &fingerprint, &fallback_child)
+        .map_err(|e| AppError::Internal(format!("database error: {e}")))?;
+    if existing_children
+        .iter()
+        .any(|c| c.git_branch == git_branch && c.id != child_id)
+    {
+        return Err(AppError::BadRequest(format!(
+            "a branch pair with git_branch '{}' already exists",
+            git_branch
+        )));
+    }
+    let request_id = Uuid::new_v4().to_string();
+    let probe = plan.existing_svn_target.clone();
+    let published = publish_admitted_late_pair(
+        db,
+        &state.config,
+        &PublishCredentials { svn_password },
+        &parent,
+        &request,
+        &plan,
+        &probe,
+        &child_id,
+        &_user_id,
+        &request_id,
+        &Arc::new(identity_mapper),
+    )
+    .await
+    .map_err(|refuse| AppError::BadRequest(refuse.error_message()))?;
+    if let Some(pending) = take_pending_publish_refusal(&parent.id) {
+        return Err(AppError::BadRequest(pending.error_message()));
+    }
+
     info!(
         parent_id = %parent.id,
+        child_id = %child_id,
         git_branch = %git_branch,
         svn_branch = %svn_branch,
-        git_tip = ?plan.git_tip,
-        baseline = ?plan.svn_source_revision,
-        "late-pair preview admitted; no child row or remote mutation"
+        git_tip = ?published.git_tip,
+        "late-pair publish completed with baseline replay"
     );
 
-    Ok(Json(serde_json::to_value(&plan).map_err(|e| {
+    Ok(Json(serde_json::to_value(&published).map_err(|e| {
         AppError::Internal(format!("serialization error: {}", e))
     })?))
 }

@@ -522,21 +522,20 @@ pub fn evaluate_admission(
     }
     plan.skip_import_applied = false;
 
-    if !request.dry_run {
-        plan.mode = "publish_refused".into();
+    plan.mode = if request.dry_run {
+        "preview".into()
+    } else {
+        "publish_pending".into()
+    };
+    if request.dry_run {
+        plan.pair_state = "preparing".into();
+    } else {
         plan.unknowns.push(
-            "this slice is preview/plan only; full reconcile/replay and publish are not implemented"
+            "admission succeeded; SVN copy, replay, and scheduler activation happen in publish"
                 .into(),
         );
-        return Err(LatePairRefusal {
-            reason: "publish_not_implemented".into(),
-            detail: "late-pair publish/replay is out of scope; the pair stays preparing and is not scheduler-active".into(),
-            plan: Some(Box::new(plan)),
-        });
+        plan.pair_state = "preparing".into();
     }
-
-    plan.mode = "preview".into();
-    plan.pair_state = "preparing".into();
     Ok(plan)
 }
 
@@ -770,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_is_required_publish_stays_preparing() {
+    fn publish_request_stays_admitted_but_not_published_in_admission_only() {
         let tmp = TempDir::new().unwrap();
         let (_bare, work, base) = init_repo(tmp.path());
         git_env(&work, &["checkout", "-b", "feature"]);
@@ -780,10 +779,9 @@ mod tests {
             svn_revision: 2,
             evidence: "import_confirmed".into(),
         }];
-        let err =
-            evaluate_admission(&mappings, Some(&work), None, &request(false, false)).unwrap_err();
-        assert_eq!(err.reason, "publish_not_implemented");
-        let plan = err.plan.unwrap();
+        let plan =
+            evaluate_admission(&mappings, Some(&work), None, &request(false, false)).unwrap();
+        assert_eq!(plan.mode, "publish_pending");
         assert!(!plan.published);
         assert!(!plan.scheduler_active);
         assert_eq!(plan.pair_state, "preparing");
