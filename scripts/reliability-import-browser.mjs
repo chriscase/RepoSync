@@ -120,7 +120,7 @@ try {
     const durable = mode === 'reconcile-complete' ? 'Import completed after remote verification' :
       mode === 'reconcile-mismatch' ? 'Remote ref differs' : 'resume from the confirmed checkpoint';
     await until(async () => (await body()).includes(durable), 'durable reconciliation status after reload');
-    if (await button('Start full import') || await button('Stop import')) {
+    if (await button('Start full history import') || await button('Start snapshot import') || await button('Stop import')) {
       throw new Error('Unsafe import action available after verification');
     }
     await screenshot(`${mode}-reload.png`);
@@ -129,8 +129,75 @@ try {
     await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
     process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
   } else {
-  await until(() => button('Start full import'), 'mounted idle card');
-  await click('Start full import');
+  const setSnapshotRevision = async (rev) => {
+    await evaluate(`document.querySelector('[data-testid="import-mode-snapshot"]').click()`);
+    await evaluate(`(() => {
+      const i = document.querySelector('[data-testid="import-svn-revision"]');
+      if (!i) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(i, ${JSON.stringify(String(rev))});
+      else i.value = ${JSON.stringify(String(rev))};
+      i.dispatchEvent(new Event('input', { bubbles: true }));
+      i.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+  };
+  await until(() => button('Start full history import'), 'mounted idle card');
+  if (mode === 'snapshot-invalid-rev') {
+    await setSnapshotRevision('99');
+    await until(() => button('Start snapshot import'), 'snapshot start for invalid rev');
+    await click('Start snapshot import');
+    await until(async () => {
+      const post = (await calls()).find(c => c.method === 'POST' && c.path.endsWith('/import'));
+      return post && post.status === 400;
+    }, 'refused import POST', 30000);
+    const refused = await until(async () => {
+      const text = await body();
+      return text.includes('revision') || text.includes('refused') || text.includes('invalid');
+    }, 'visible refusal feedback', 30000);
+    if (!refused) throw new Error(`Missing refusal copy: ${await body()}`);
+    const text = await body();
+    if (/verified snapshot baseline/i.test(text) || /Bidirectional sync applies/i.test(text)) {
+      throw new Error(`Baseline claim on refused import: ${text}`);
+    }
+    await until(async () => evaluate(`!!document.querySelector('[data-testid="import-baseline-failure"]')`), 'failure notice', 30000)
+      .catch(async () => {
+        if (!/Snapshot import refused/i.test(await body())) {
+          throw new Error(`Missing failure notice: ${await body()}`);
+        }
+      });
+    const result = { mode, refusal_visible: true };
+    await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
+    process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
+  } else if (mode === 'full-default') {
+    await click('Start full history import');
+    const start = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith('/import') && c.status === 200), 'start operation');
+    if (start.payload?.import_mode !== 'full') throw new Error(`Start response not full: ${JSON.stringify(start.payload)}`);
+    const result = { mode, import_mode: start.payload?.import_mode, operation_id: start.payload?.operation_id };
+    await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
+    process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
+  } else if (mode === 'snapshot-boundary') {
+    await setSnapshotRevision('2');
+    await until(() => button('Start snapshot import'), 'snapshot start action');
+    await click('Start snapshot import');
+    const start = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith('/import') && c.status === 200), 'start operation');
+    if (start.payload?.import_mode !== 'snapshot' || start.payload?.starting_revision !== 2) {
+      throw new Error(`Snapshot start response missing pin: ${JSON.stringify(start.payload)}`);
+    }
+    await writeFile(join(barrier, 'import_started.ready'), 'ready');
+    await until(async () => (await body()).includes('before r2'), 'history boundary during import', 120000);
+    await until(async () => (await body()).includes('Import Complete') || (await body()).includes('Completed'), 'snapshot import completion', 120000);
+    const result = {
+      mode,
+      import_mode: start.payload?.import_mode,
+      starting_revision: start.payload?.starting_revision,
+      history_boundary: start.payload?.history_boundary,
+    };
+    await screenshot(`${mode}-terminal.png`);
+    await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
+    process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
+  } else {
+  await click('Start full history import');
   const start = await until(async () => (await calls()).find(c => c.method === 'POST' && c.path.endsWith('/import') && c.status === 200), 'start operation');
   await writeFile(join(barrier, 'import_started.ready'), 'ready');
   const operation = start.payload?.operation_id;
@@ -173,11 +240,14 @@ try {
   await send('Page.reload', { ignoreCache: true });
   const terminalText = mode === 'cancel' ? 'Local through SVN r1; remote confirmed through none.' : 'Reconciliation required';
   await until(async () => (await body()).includes(terminalText), 'durable status after reload');
-  if (await button('Start full import') || await button('Stop import')) throw new Error('Held import offers unsafe retry after reload');
+  if (await button('Start full history import') || await button('Start snapshot import') || await button('Stop import')) {
+    throw new Error('Held import offers unsafe retry after reload');
+  }
   result.reload = 'durable held status';
   await screenshot(`${mode}-reload.png`);
   await writeFile(join(artifacts, `${mode}.json`), JSON.stringify(result, null, 2));
   process.stdout.write(`RELIABILITY_UI_EVIDENCE ${JSON.stringify(result)}\n`);
+  }
   }
 } finally {
   ws?.close();

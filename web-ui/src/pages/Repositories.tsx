@@ -2,6 +2,11 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type Repository, type SyncStatus } from '../api';
+import {
+  DEFAULT_REPO_IMPORT_MODE,
+  type RepoImportMode,
+} from '../importBaseline';
+import ImportModeFields from '../components/ImportModeFields';
 import { readBranchPairRemovalNotice, readPersistedBranchPairRemovalNotice } from '../branchPairRemoval';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalReceiptNotice from '../components/ManagedRemovalReceiptNotice';
@@ -80,6 +85,8 @@ interface AddRepoForm {
   lfs_threshold_mb: number;
   auto_merge: boolean;
   enabled: boolean;
+  initial_import_mode: RepoImportMode;
+  initial_svn_revision: string;
 }
 
 const defaultForm: AddRepoForm = {
@@ -98,6 +105,8 @@ const defaultForm: AddRepoForm = {
   lfs_threshold_mb: 0,
   auto_merge: false,
   enabled: true,
+  initial_import_mode: DEFAULT_REPO_IMPORT_MODE,
+  initial_svn_revision: 'HEAD',
 };
 
 export default function Repositories() {
@@ -152,7 +161,10 @@ export default function Repositories() {
 
   const createMutation = useMutation({
     mutationFn: async (data: AddRepoForm) => {
-      const { svn_password, git_token, ...repoData } = data;
+      const { svn_password, git_token, initial_import_mode, initial_svn_revision, ...repoData } =
+        data;
+      void initial_import_mode;
+      void initial_svn_revision;
       const created = await api.createRepo(repoData);
       // Save credentials for the newly created repo
       if (svn_password || git_token) {
@@ -163,12 +175,17 @@ export default function Repositories() {
       }
       return created;
     },
-    onSuccess: () => {
+    onSuccess: (created) => {
       queryClient.invalidateQueries({ queryKey: ['repos'] });
       setShowAddModal(false);
+      const prefs = {
+        importMode: form.initial_import_mode,
+        svnRevision: form.initial_svn_revision,
+      };
       setForm({ ...defaultForm });
       setSvnTestResult(null);
       setGitTestResult(null);
+      navigate(`/repos/${created.id}`, { state: { importPrefs: prefs } });
     },
   });
 
@@ -557,6 +574,17 @@ export default function Repositories() {
                     )}
                   </div>
                 </div>
+              </div>
+
+              {/* Initial import baseline */}
+              <div>
+                <h3 className="text-sm font-medium text-gray-300 mb-3">Initial SVN import</h3>
+                <ImportModeFields
+                  mode={form.initial_import_mode}
+                  svnRevision={form.initial_svn_revision}
+                  onModeChange={(mode) => setField('initial_import_mode', mode)}
+                  onRevisionChange={(value) => setField('initial_svn_revision', value)}
+                />
               </div>
 
               {/* Sync Section */}
