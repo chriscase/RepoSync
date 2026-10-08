@@ -198,21 +198,51 @@ fn reposync_appended_trailer_pair(message: &str) -> Option<(&str, &str)> {
     Some((op_id, sha))
 }
 
+/// Personal-format trailers live in the final paragraph; only trailing metadata
+/// lines in that block may bind identity (not quoted/decoy lines earlier).
+fn legacy_trailing_personal_git_sha(message: &str) -> Option<&str> {
+    let trimmed = message.trim_end();
+    let block = trimmed.rsplit("\n\n").next().unwrap_or(trimmed);
+    let lines: Vec<&str> = block
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let mut trailers_rev = Vec::new();
+    for line in lines.iter().rev() {
+        if is_personal_metadata_trailer_line(line) {
+            trailers_rev.push(*line);
+        } else {
+            break;
+        }
+    }
+    for line in trailers_rev {
+        if let Some(value) = line.strip_prefix("Git-SHA:") {
+            let sha = value.trim();
+            if !sha.is_empty() {
+                return Some(sha);
+            }
+        }
+    }
+    None
+}
+
+fn is_personal_metadata_trailer_line(line: &str) -> bool {
+    line.starts_with("Git-SHA:")
+        || line.starts_with("SVN-Revision:")
+        || line.starts_with("PR-Number:")
+        || line.starts_with("PR-Branch:")
+        || line.starts_with("RepoSync-")
+}
+
 fn message_carries_identity(message: &str, op: &SvnCommitOperation) -> bool {
     if let Some((op_id, sha)) = reposync_appended_trailer_pair(message) {
         return op_id == op.id && sha == op.source_git_sha;
     }
 
-    let mut saw_personal_git_sha = false;
-    for line in message.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix("Git-SHA:") {
-            saw_personal_git_sha |= value.trim() == op.source_git_sha;
-        }
-    }
-    // Personal-format commits may omit RepoSync-Operation; the Git-SHA trailer
-    // still binds the durable intent when tree/path proof succeeds below.
-    saw_personal_git_sha
+    // Personal-format commits may omit RepoSync-Operation; only the final
+    // trailer block's Git-SHA line may bind the durable intent.
+    legacy_trailing_personal_git_sha(message) == Some(op.source_git_sha.as_str())
 }
 
 pub async fn inspect_git_to_svn_commit(
@@ -498,6 +528,17 @@ mod identity_tests {
         let op = sample_op("op-expected", &sha);
         let message = format!("sync\n\nGit-SHA: {sha}");
         assert!(message_carries_identity(&message, &op));
+    }
+
+    #[test]
+    fn legacy_git_sha_mid_message_does_not_match_without_final_trailer_block() {
+        let sha = "f".repeat(40);
+        let decoy = "e".repeat(40);
+        let op = sample_op("op-expected", &sha);
+        let message = format!("release notes\nGit-SHA: {decoy}\n\nShip\n\nGit-SHA: {sha}");
+        assert!(message_carries_identity(&message, &op));
+        let mid_only = format!("release notes\nGit-SHA: {sha}\nstill editing");
+        assert!(!message_carries_identity(&mid_only, &op));
     }
 
     #[test]

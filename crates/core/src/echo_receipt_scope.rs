@@ -194,6 +194,40 @@ mod tests {
     }
 
     #[test]
+    fn fieldless_legacy_receipt_rejected_at_generation_two() {
+        let db = setup_db();
+        let sha = "c".repeat(40);
+        db.set_state(
+            &format!("handled_git_no_target_pair_{sha}"),
+            &serde_json::json!({
+                "version": 1,
+                "repo_id": "pair",
+                "git_sha": sha,
+                "outcome": "filtered",
+                "projection": "{}",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        bump_repo_echo_generation(&db, "pair").unwrap();
+        assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 2);
+        assert!(read_git_no_target_receipt(&db, "pair", &sha)
+            .unwrap()
+            .is_none());
+        let ctx = TeamEchoContext {
+            db: &db,
+            repo_id: "pair",
+            no_target_projection: "{}",
+        };
+        assert_eq!(
+            classify_incoming_git_commit(&ctx, &sha, "no marker")
+                .unwrap()
+                .unwrap(),
+            EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
     fn active_generation_receipt_suppresses() {
         let db = setup_db();
         let sha = "b".repeat(40);

@@ -304,6 +304,18 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS05_LATE_PAIR_BC_PENDING",
+      "binary": "team_mode_e2e",
+      "test": "candidate_rs05_late_pair_bc_pending_isolation",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "ECHO_GENERATION_STALE_RECEIPT",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_generation_stale_receipt_does_not_suppress_after_bump",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_TEAM_SINGLE_IMPORT_NOOP",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_single_repo_import_then_noop_sync",

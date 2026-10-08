@@ -12026,7 +12026,7 @@ async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() 
     use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
 
     let mut pair = QualifiedPair::new().await;
-    pair.developer_commit(
+    let handled = pair.developer_commit(
         "handled.txt",
         "ordinary baseline\n",
         "Establish applied outbound cursor",
@@ -12052,16 +12052,25 @@ async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() 
 
     bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
 
-    let successor = pair.developer_commit(
-        "allow/work.txt",
-        "post-bump work\n",
-        "Ordinary work after echo generation bump",
-    );
-    git_cli(&pair.developer, &["push", "origin", "main"]);
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            rusqlite::params![handled],
+        )
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state(&format!("last_git_sha_pair"), &handled)
+        .unwrap();
+
+    pair.engine
+        .set_path_rules(vec!["blocked.txt".into()], vec![]);
     assert_eq!(
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1,
-        "stale generation-1 receipt must not suppress a new commit after bump"
+        "stale generation-1 receipt must not suppress the same Git SHA after bump"
     );
     let svn_rev = SvnClient::new(&pair.svn_url, "", "")
         .info()
@@ -12070,15 +12079,14 @@ async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() 
         .latest_rev;
     let tree = svn_tree(&pair, svn_rev).await;
     assert_eq!(
-        tree.get("allow/work.txt"),
-        Some(&b"post-bump work\n".to_vec())
+        tree.get("blocked.txt"),
+        Some(&b"filtered content\n".to_vec())
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"ECHO_GENERATION_STALE_RECEIPT",
             "filtered":filtered,
-            "successor":successor,
             "svn_tree":tree_hashes(&tree)
         })
     );
@@ -12224,6 +12232,117 @@ async fn candidate_echo_generation_same_receipt_still_suppresses_echo() {
             "case":"ECHO_GENERATION_SAME_RECEIPT_SUPPRESSES",
             "filtered":filtered,
             "svn_tree":tree_hashes(&tree)
+        })
+    );
+}
+
+/// RS-05 / #63: late-pair admission — pair B keeps syncing while pair C stays
+/// pending import with no global SVN cursor adoption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rs05_late_pair_bc_pending_isolation() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    let fixture = QualifiedPair::new_with_repo_id("pair_b").await;
+    fixture.engine.db().set_state("last_svn_rev", "12").unwrap();
+    fixture.engine.db().set_watermark("svn_rev", "12").unwrap();
+
+    let pending_root = fixture.tmp.path().join("pair_c");
+    std::fs::create_dir_all(&pending_root).unwrap();
+    let pending_svn = create_svn_repo(&pending_root);
+    let pending_wc = pending_root.join("wc");
+    svn_checkout(&pending_svn, &pending_wc);
+    svn_commit_file(&pending_wc, "seed.txt", "seed\n", "Late pair C seed");
+    let pending_bridge = pending_root.join("bridge");
+    let pending_bare = pending_root.join("origin.git");
+    let pending_git = init_git_from_svn_export(&pending_wc, &pending_bridge, &pending_bare);
+    let pending_head = get_head_sha(&pending_bridge);
+    drop(pending_git);
+
+    let shared_db = Database::new(&fixture.db_path).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    shared_db
+        .insert_repository(&Repository {
+            id: "pair_c".into(),
+            name: "Late pair C".into(),
+            svn_url: pending_svn.clone(),
+            svn_branch: String::new(),
+            svn_username: String::new(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: pending_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: pending_head,
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        resolve_repo_import_baseline(&shared_db, "pair_c").unwrap(),
+        RepoImportBaseline::Pending
+    );
+
+    let pending_svn_before = svn_youngest(&pending_svn);
+    let mut pending_engine = SyncEngine::new(
+        make_app_config(&pending_svn, &pending_root),
+        shared_db,
+        SvnClient::new(&pending_svn, "", ""),
+        GitClient::new(&pending_bridge).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+    pending_engine.set_repo_id("pair_c".into());
+    let pending_result = pending_engine.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &pending_result,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "import_baseline_pending"
+        ),
+        "late pair C must stay pending: {pending_result:?}"
+    );
+    assert_eq!(svn_youngest(&pending_svn), pending_svn_before);
+
+    let healthy_rev = svn_commit_file(
+        &fixture.wc,
+        "pair_b_work.txt",
+        "pair B still syncs\n",
+        "Pair B work while C pending",
+    );
+    let healthy_stats = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(healthy_stats.svn_to_git_count, 1);
+    assert_eq!(
+        fixture.engine.db().get_repo_watermark("pair_b").unwrap().0,
+        healthy_rev
+    );
+
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS05_LATE_PAIR_BC_PENDING",
+            "pair_b":"syncing",
+            "pair_c":"import_baseline_pending",
+            "global_svn_rev":12,
+            "healthy_revision":healthy_rev
         })
     );
 }

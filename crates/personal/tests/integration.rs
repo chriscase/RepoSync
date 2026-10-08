@@ -4848,6 +4848,26 @@ fn spawn_github_commit_author_stub(
     (format!("http://127.0.0.1:{}", port), handle)
 }
 
+fn spawn_github_pulls_error_api() -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for _ in 0..8 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let response =
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+            }
+        }
+    });
+    format!("http://127.0.0.1:{}", port)
+}
+
 fn spawn_empty_github_pulls_api() -> String {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener};
@@ -5805,6 +5825,169 @@ async fn test_personal_engine_promotes_held_git_to_svn_when_pr_monitor_idle() {
         .unwrap()
         .is_none());
     assert!(db_arc.is_personal_git_sha_synced(&git_sha).unwrap());
+    assert_eq!(svn_youngest(&svn_url), svn_before + 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_personal_engine_promotes_held_git_to_svn_when_pr_monitor_fails() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn-wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+    std::fs::write(git_work.join("feature.txt"), "pr monitor fail\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let _fault = SvnCommitFaultGuard::lost_reply(&svn_wc);
+    syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            8,
+            "feature/x",
+        )
+        .await
+        .expect_err("lost reply must hold");
+    drop(_fault);
+
+    let api_url = spawn_github_pulls_error_api();
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url.clone();
+    config.github.token = Some("test-token".into());
+
+    let engine = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new(&api_url, "test-token", GitProvider::GitHub),
+    );
+    engine
+        .run_cycle()
+        .await
+        .expect("held promotion must proceed when PR monitor RPC fails");
+    assert!(db_arc.is_personal_git_sha_synced(&git_sha).unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_personal_engine_promotes_held_git_to_svn_via_run_cycle_with_missing_git_object() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::engine::PersonalSyncEngine;
+
+    if !svn_available() {
+        eprintln!("SKIPPED: svn/svnadmin not found in PATH");
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let svn_wc = tmp.path().join("svn-wc");
+    svn_checkout(&svn_url, &svn_wc);
+    svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+
+    let git_work = tmp.path().join("git_work");
+    let bare = tmp.path().join("origin.git");
+    let git_client = setup_git_with_bare_origin(&git_work, &bare);
+    let imported_base = git_sha(&git_work);
+    git_client.push("origin", "main").unwrap();
+    std::fs::write(git_work.join("feature.txt"), "run cycle promote\n").unwrap();
+    let oid = git_client
+        .commit(
+            "Add feature.txt",
+            "GitHub Named Author",
+            "author@example.com",
+            "GitHub Named Author",
+            "author@example.com",
+        )
+        .unwrap();
+    let git_sha = oid.to_string();
+    git_client.push("origin", "main").unwrap();
+    drop(git_client);
+
+    let db_path = tmp.path().join("test.db");
+    let db_arc = Arc::new(setup_db(&db_path));
+    seed_personal_svn_import_checkpoint(&db_arc, &imported_base, 1);
+    let syncer = personal_git_to_svn(
+        &svn_url,
+        db_arc.clone(),
+        svn_wc.clone(),
+        git_work.clone(),
+        tmp.path(),
+    );
+    let _fault = SvnCommitFaultGuard::lost_reply(&svn_wc);
+    syncer
+        .replay_commit(
+            &github_commit(git_sha.clone(), "Add feature.txt"),
+            8,
+            "feature/x",
+        )
+        .await
+        .expect_err("lost reply must hold");
+    drop(_fault);
+    remove_loose_git_object(&git_work, &git_sha);
+
+    let (api_url, stub) = spawn_github_commit_author_stub(&git_sha, "GitHub Named Author");
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url.clone();
+    config.github.token = Some("test-token".into());
+
+    let engine = PersonalSyncEngine::new(
+        config,
+        Database::new(&db_path).unwrap(),
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&git_work).unwrap(),
+        GitHubClient::new(&api_url, "test-token", GitProvider::GitHub),
+    );
+    let cycle_result = engine.run_cycle().await;
+    drop(stub);
+    assert!(
+        db_arc.is_personal_git_sha_synced(&git_sha).unwrap(),
+        "held promotion must finalize via SVN inspect-before-author even when later history inspect fails: {:?}",
+        cycle_result
+    );
+    if let Err(error) = cycle_result {
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("history") || text.contains("ancestry"),
+            "unexpected run_cycle error after promotion: {text}"
+        );
+    }
 }
 
 #[tokio::test]
