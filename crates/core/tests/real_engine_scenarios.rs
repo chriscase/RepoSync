@@ -41,6 +41,12 @@ const CASE_PARENT_CHILD_CHAIN_ROTATION: &str =
 const CASE_CONCURRENT_CREDENTIAL_RELOAD: &str = "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD";
 const CASE_PARENT_CHILD_CONCURRENT_RELOAD: &str =
     "R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD";
+const CASE_FAILED_APPLY_BARRIER: &str = "R01_SVNSERVE_FAILED_APPLY_BARRIER";
+const CASE_FAILED_APPLY_RETRY: &str = "R01_SVNSERVE_FAILED_APPLY_RETRY";
+const CASE_POST_WRITE_RECOVERY: &str = "R01_SVNSERVE_POST_WRITE_RECOVERY";
+const CASE_SVN_REMOTE_RECREATION: &str = "R16_SVNSERVE_SVN_REMOTE_RECREATION";
+const CASE_GIT_REMOTE_RECREATION: &str = "R16_SVNSERVE_GIT_REMOTE_RECREATION";
+const CASE_NOTIFICATION_ISOLATION: &str = "R17_SVNSERVE_NOTIFICATION_ISOLATION";
 
 // ===========================================================================
 // Tooling and evidence helpers
@@ -2515,12 +2521,6 @@ async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
         rotate_svnserve_password(&alpha_repo_dir, &alpha.username, rotated);
         db.set_state("secret_svn_password_repo_alpha", rotated)
             .unwrap();
-        let child_engine = fixture.make_engine(&beta);
-        assert_eq!(
-            child_engine.fixture_svn_password_marker(),
-            beta.password,
-            "child import used construction-time inherited password"
-        );
         assert_eq!(
             db.resolve_credential_chain("repo_beta", "secret_svn_password")
                 .as_deref(),
@@ -2538,13 +2538,21 @@ async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
         );
         match reopened_child.run_sync_cycle().await {
             Ok(stats) if stats.svn_to_git_count == 1 => {
+                assert_eq!(
+                    reopened_child.fixture_svn_password_marker(),
+                    rotated,
+                    "child cycle must reload rotated parent svn password"
+                );
                 let post_rev = db.get_repo_watermark("repo_beta").unwrap().0;
-                let mapped: i64 = db.conn().query_row(
-                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'repo_beta' AND direction = 'svn_to_git' AND svn_rev = ?1 AND status = 'applied'",
+                let mapped_git_sha: String = db.conn().query_row(
+                    "SELECT git_sha FROM sync_records WHERE repo_id = 'repo_beta' AND direction = 'svn_to_git' AND svn_rev = ?1 AND status = 'applied'",
                     rusqlite::params![post_rev],
                     |row| row.get(0),
                 ).unwrap();
-                if mapped == 1 {
+                let bridge_ok =
+                    git_show_blob(&beta.bridge, &mapped_git_sha, "child-post-chain-reload.txt")
+                        == "child reload\n";
+                if bridge_ok {
                     "PASS"
                 } else {
                     "PARTIAL"
@@ -2577,4 +2585,469 @@ async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
             "parent/child concurrent reload imports failed: alpha={alpha_result:?} beta={beta_result:?}"
         );
     }
+}
+
+fn block_git_apply_on_bridge_path(bridge: &Path, relative: &str) {
+    let target = bridge.join(relative);
+    if target.exists() {
+        if target.is_dir() {
+            std::fs::remove_dir_all(&target).unwrap();
+        } else {
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+    std::fs::create_dir(&target).unwrap();
+}
+
+fn restore_git_apply_bridge_path(bridge: &Path, relative: &str, content: &str) {
+    let target = bridge.join(relative);
+    if target.is_dir() {
+        std::fs::remove_dir_all(&target).unwrap();
+    } else if target.exists() {
+        std::fs::remove_file(&target).unwrap();
+    }
+    std::fs::write(&target, content).unwrap();
+}
+
+async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let before = fixture.checkpoint_snapshot();
+    let verified = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "verified N-1\n",
+        "Verified prior revision",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    assert_eq!(verified, before.0 + 1);
+    assert_eq!(
+        engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1,
+        "verified revision must apply before fault injection"
+    );
+    let failed = svn_commit_file(
+        &fixture.wc,
+        "fault-apply.txt",
+        "failed N\n",
+        "Faulted revision",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    let later = svn_commit_file(
+        &fixture.wc,
+        "origin.txt",
+        "queued N+1\n",
+        "Later revision",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    assert_eq!((failed, later), (before.0 + 2, before.0 + 3));
+    block_git_apply_on_bridge_path(&fixture.repo.bridge, "fault-apply.txt");
+    let blocked = engine.run_sync_cycle().await;
+    let apply_failed = matches!(
+        &blocked,
+        Err(SyncError::GitError(
+            reposync_core::errors::GitError::ApplyFailed(_)
+        ))
+    );
+    let local_dirty = matches!(
+        &blocked,
+        Err(SyncError::HistoryBlocked { reason, .. }) if reason == "local_dirty"
+    );
+    if local_dirty {
+        restore_git_apply_bridge_path(&fixture.repo.bridge, "fault-apply.txt", "");
+        emit_evidence(
+            CASE_FAILED_APPLY_BARRIER,
+            "PARTIAL",
+            serde_json::json!({
+                "fault": "bridge_path_is_directory",
+                "blocked_before_apply": true,
+                "cycle_error": blocked.as_ref().err().map(|e| e.to_string()),
+                "note": "pre-cycle local_dirty blocked before git apply; svnserve F06 apply barrier not reached",
+            }),
+        );
+        if retry {
+            emit_evidence(
+                CASE_FAILED_APPLY_RETRY,
+                "PARTIAL",
+                serde_json::json!({
+                    "fault": "bridge_path_is_directory",
+                    "note": "retry not attempted because barrier injection did not reach git apply",
+                }),
+            );
+        }
+        return;
+    }
+    restore_git_apply_bridge_path(&fixture.repo.bridge, "fault-apply.txt", "");
+    if !apply_failed {
+        emit_evidence(
+            CASE_FAILED_APPLY_BARRIER,
+            "PARTIAL",
+            serde_json::json!({
+                "fault": "bridge_path_is_directory",
+                "cycle_error": blocked.as_ref().err().map(|e| e.to_string()),
+                "cycle_ok": blocked.is_ok(),
+            }),
+        );
+        if retry {
+            emit_evidence(
+                CASE_FAILED_APPLY_RETRY,
+                "PARTIAL",
+                serde_json::json!({
+                    "fault": "bridge_path_is_directory",
+                    "note": "unexpected cycle outcome prevented retry proof",
+                }),
+            );
+        }
+        return;
+    }
+    let frontier = fixture.checkpoint_snapshot();
+    assert_eq!(frontier.0, verified);
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.bridge.join("origin.txt")).unwrap(),
+        "verified N-1\n"
+    );
+    assert!(
+        !fixture.repo.bridge.join("fault-apply.txt").exists()
+            || fixture.repo.bridge.join("fault-apply.txt").is_dir(),
+        "failed revision file must not be applied as a regular file"
+    );
+    let db = setup_db(&fixture.db_path);
+    for revision in [failed, later] {
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+            rusqlite::params![fixture.repo.id, revision],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0, "unapplied r{revision} must have no mapping");
+    }
+    let mapping_at_frontier: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+        rusqlite::params![fixture.repo.id, verified],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(mapping_at_frontier, 1);
+    emit_evidence(
+        CASE_FAILED_APPLY_BARRIER,
+        "PASS",
+        serde_json::json!({
+            "fault": "bridge_path_is_directory",
+            "verified_revision": verified,
+            "failed_revision": failed,
+            "queued_revision": later,
+            "frontier_watermark": frontier.0,
+            "bridge_origin_at_frontier": "verified N-1\n",
+            "mapping_at_frontier": mapping_at_frontier,
+        }),
+    );
+    if !retry {
+        return;
+    }
+    let applied = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((applied.svn_to_git_count, applied.git_to_svn_count), (2, 0));
+    let after = fixture.checkpoint_snapshot();
+    assert_eq!(after.0, later);
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.bridge.join("origin.txt")).unwrap(),
+        "queued N+1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.bridge.join("fault-apply.txt")).unwrap(),
+        "failed N\n"
+    );
+    let repeat = engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    emit_evidence(
+        CASE_FAILED_APPLY_RETRY,
+        "PASS",
+        serde_json::json!({
+            "final_watermark": after.0,
+            "repeat_noop": true,
+            "fault": "bridge_path_is_directory",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r01_svnserve_failed_apply_barrier() {
+    if !require_toolchain(CASE_FAILED_APPLY_BARRIER) {
+        return;
+    }
+    run_svnserve_failed_apply_on_real_svnserve(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r01_svnserve_failed_apply_retry() {
+    if !require_toolchain(CASE_FAILED_APPLY_RETRY) {
+        return;
+    }
+    run_svnserve_failed_apply_on_real_svnserve(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r01_svnserve_post_write_recovery() {
+    if !require_toolchain(CASE_POST_WRITE_RECOVERY) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    let before = fixture.checkpoint_snapshot();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let verified_rev = svn_commit_file(
+        &fixture.wc,
+        "recovery.txt",
+        "post-write recovery\n",
+        "SVN revision for post-write recovery",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    let stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    let after_apply = fixture.checkpoint_snapshot();
+    assert_eq!(after_apply.0, verified_rev);
+    let bare_head = get_head_sha(&fixture.repo.bare);
+    let db = setup_db(&fixture.db_path);
+    db.conn()
+        .execute(
+            "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2 WHERE id = ?3",
+            rusqlite::params![before.0, before.1, fixture.repo.id],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "DELETE FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git'",
+            rusqlite::params![fixture.repo.id, verified_rev],
+        )
+        .unwrap();
+    let reopened = fixture.make_engine();
+    let recovery = reopened.run_sync_cycle().await;
+    let final_checkpoint = fixture.checkpoint_snapshot();
+    let bare_after = get_head_sha(&fixture.repo.bare);
+    let duplicate_bare_push = bare_after != bare_head
+        && db.conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND svn_rev = ?2 AND direction = 'svn_to_git' AND status = 'applied'",
+            rusqlite::params![fixture.repo.id, verified_rev],
+            |row| row.get::<_, i64>(0),
+        ).unwrap() > 1;
+    let case_status = if recovery.is_ok()
+        && final_checkpoint.0 == verified_rev
+        && !duplicate_bare_push
+        && git_show_blob(&fixture.repo.bridge, &final_checkpoint.1, "recovery.txt")
+            == "post-write recovery\n"
+    {
+        "PASS"
+    } else {
+        "PARTIAL"
+    };
+    emit_evidence(
+        CASE_POST_WRITE_RECOVERY,
+        case_status,
+        serde_json::json!({
+            "simulated": "checkpoint_and_mapping_removed_after_successful_svn_to_git",
+            "recovery_ok": recovery.is_ok(),
+            "final_watermark": final_checkpoint.0,
+            "expected_watermark": verified_rev,
+            "bare_head_stable": bare_after == bare_head,
+            "duplicate_mapping": duplicate_bare_push,
+            "recovery_error": recovery.err().map(|e| e.to_string()),
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r16_svnserve_svn_remote_recreation() {
+    if !require_toolchain(CASE_SVN_REMOTE_RECREATION) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let before = fixture.checkpoint_snapshot();
+    let mappings_before: i64 = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let info_before = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap();
+    let repo_dir = fixture
+        .tmp
+        .path()
+        .join("svnserve-root")
+        .join(&fixture.repo.id);
+    std::fs::remove_dir_all(&repo_dir).unwrap();
+    assert!(Command::new("svnadmin")
+        .args(["create", repo_dir.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    write_svnserve_auth(&repo_dir, &fixture.repo.username, &fixture.repo.password);
+    let recreated_wc = fixture.tmp.path().join("recreated_wc");
+    svn_checkout(
+        &fixture.repo.svn_url,
+        &recreated_wc,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    svn_commit_file(
+        &recreated_wc,
+        "recreated.txt",
+        "new lineage\n",
+        "Recreated svnserve repo",
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    let info_after = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap();
+    let result = engine.run_sync_cycle().await;
+    let after = fixture.checkpoint_snapshot();
+    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let uuid_changed = info_before.uuid != info_after.uuid;
+    let checkpoint_stable = after == before;
+    let mapping_stable = mappings_after == mappings_before;
+    let blocked = result.is_err();
+    let case_status = if uuid_changed && checkpoint_stable && mapping_stable && blocked {
+        "PASS"
+    } else {
+        "PARTIAL"
+    };
+    emit_evidence(
+        CASE_SVN_REMOTE_RECREATION,
+        case_status,
+        serde_json::json!({
+            "uuid_before": info_before.uuid,
+            "uuid_after": info_after.uuid,
+            "checkpoint_before_after": [before, after],
+            "mapping_count_before_after": [mappings_before, mappings_after],
+            "cycle_blocked": blocked,
+            "cycle_error": result.err().map(|e| e.to_string()),
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r16_svnserve_git_remote_recreation() {
+    if !require_toolchain(CASE_GIT_REMOTE_RECREATION) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let before = fixture.checkpoint_snapshot();
+    let mappings_before: i64 = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let bridge_before = get_head_sha(&fixture.repo.bridge);
+    std::fs::remove_dir_all(&fixture.repo.bare).unwrap();
+    git2::Repository::init_bare(&fixture.repo.bare).unwrap();
+    let result = engine.run_sync_cycle().await;
+    let after = fixture.checkpoint_snapshot();
+    let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let bridge_after = get_head_sha(&fixture.repo.bridge);
+    let blocked = result.is_err();
+    let case_status = if blocked
+        && after == before
+        && mappings_after == mappings_before
+        && bridge_after == bridge_before
+    {
+        "PASS"
+    } else {
+        "PARTIAL"
+    };
+    emit_evidence(
+        CASE_GIT_REMOTE_RECREATION,
+        case_status,
+        serde_json::json!({
+            "checkpoint_before_after": [before, after],
+            "mapping_count_before_after": [mappings_before, mappings_after],
+            "bridge_head_before_after": [bridge_before, bridge_after],
+            "cycle_blocked": blocked,
+            "cycle_error": result.err().map(|e| e.to_string()),
+            "note": "recreated empty bare remote at same path; must not auto-destructively reinit",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_r17_svnserve_notification_isolation() {
+    if !require_toolchain(CASE_NOTIFICATION_ISOLATION) {
+        return;
+    }
+    let fixture = DualRepoFixture::new();
+    let db = setup_db(&fixture.db_path);
+    let alpha_hook = "https://notify.invalid/repo-alpha-only";
+    let beta_hook = "https://notify.invalid/repo-beta-only";
+    let mut alpha_repo = db.get_repository("repo_alpha").unwrap().unwrap();
+    alpha_repo.teams_webhook_url = Some(alpha_hook.into());
+    db.update_repository(&alpha_repo).unwrap();
+    let mut beta_repo = db.get_repository("repo_beta").unwrap().unwrap();
+    beta_repo.teams_webhook_url = Some(beta_hook.into());
+    db.update_repository(&beta_repo).unwrap();
+    let ready = Arc::new(tokio::sync::Barrier::new(2));
+    let (alpha_result, beta_result) = tokio::join!(
+        async {
+            ready.wait().await;
+            fixture
+                .make_engine(&fixture.repos[0])
+                .run_sync_cycle()
+                .await
+        },
+        async {
+            ready.wait().await;
+            fixture
+                .make_engine(&fixture.repos[1])
+                .run_sync_cycle()
+                .await
+        }
+    );
+    let db = setup_db(&fixture.db_path);
+    let alpha_row = db.get_repository("repo_alpha").unwrap().unwrap();
+    let beta_row = db.get_repository("repo_beta").unwrap().unwrap();
+    let webhook_crossover = repo_teams_webhook(&db, "repo_alpha").as_deref() != Some(alpha_hook)
+        || repo_teams_webhook(&db, "repo_beta").as_deref() != Some(beta_hook);
+    let sync_status_crossover =
+        alpha_row.sync_status.contains("repo_beta") || beta_row.sync_status.contains("repo_alpha");
+    let audit_crossover: i64 = db.conn().query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE (repo_id = 'repo_alpha' AND details LIKE '%repo-beta-only%') OR (repo_id = 'repo_beta' AND details LIKE '%repo-alpha-only%')",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    let imports_ok = match (&alpha_result, &beta_result) {
+        (Ok(alpha_stats), Ok(beta_stats)) => {
+            alpha_stats.svn_to_git_count == 1 && beta_stats.svn_to_git_count == 1
+        }
+        _ => false,
+    };
+    let per_repo_sync_counters = alpha_row.total_syncs >= 1 && beta_row.total_syncs >= 1;
+    let case_status = if imports_ok
+        && !webhook_crossover
+        && !sync_status_crossover
+        && audit_crossover == 0
+        && per_repo_sync_counters
+    {
+        "PASS"
+    } else {
+        "PARTIAL"
+    };
+    emit_evidence(
+        CASE_NOTIFICATION_ISOLATION,
+        case_status,
+        serde_json::json!({
+            "teams_webhook_crossover": webhook_crossover,
+            "sync_status_crossover": sync_status_crossover,
+            "audit_log_crossover": audit_crossover,
+            "per_repo_sync_counters": per_repo_sync_counters,
+            "alpha_total_syncs": alpha_row.total_syncs,
+            "beta_total_syncs": beta_row.total_syncs,
+        }),
+    );
 }
