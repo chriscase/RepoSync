@@ -5,7 +5,7 @@ import { api, type Repository, type SyncStatus } from '../api';
 import { readBranchPairRemovalNotice, readPersistedBranchPairRemovalNotice } from '../branchPairRemoval';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalReceiptNotice from '../components/ManagedRemovalReceiptNotice';
-import { readManagedRemovalReceipt, shouldDisplayManagedRemovalReceipt } from '../managedRemoval';
+import { readAllManagedRemovalReceipts, shouldDisplayManagedRemovalReceipt } from '../managedRemoval';
 import { GitBranch, Plus, Database, Clock, X, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
 import { formatTimeAgo } from '../utils/time';
@@ -104,10 +104,9 @@ export default function Repositories() {
   const navigate = useNavigate();
   const location = useLocation();
   const removalNotice = readBranchPairRemovalNotice(location.state) ?? readPersistedBranchPairRemovalNotice();
-  const managedRemovalReceipt = readManagedRemovalReceipt();
-  const managedRemovalReceiptNotice = shouldDisplayManagedRemovalReceipt(managedRemovalReceipt)
-    ? managedRemovalReceipt
-    : null;
+  const managedRemovalReceiptNotices = readAllManagedRemovalReceipts().filter(
+    shouldDisplayManagedRemovalReceipt,
+  );
   const queryClient = useQueryClient();
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
@@ -220,9 +219,9 @@ export default function Repositories() {
     return (
       <div className="space-y-6">
         {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
-        {managedRemovalReceiptNotice && (
-          <ManagedRemovalReceiptNotice receipt={managedRemovalReceiptNotice} />
-        )}
+        {managedRemovalReceiptNotices.map((receipt) => (
+          <ManagedRemovalReceiptNotice key={`${receipt.repoId}:${receipt.operationId}`} receipt={receipt} />
+        ))}
         <div className="text-center py-8 text-gray-400">Loading repositories...</div>
       </div>
     );
@@ -232,9 +231,9 @@ export default function Repositories() {
     return (
       <div className="space-y-6">
         {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
-        {managedRemovalReceiptNotice && (
-          <ManagedRemovalReceiptNotice receipt={managedRemovalReceiptNotice} />
-        )}
+        {managedRemovalReceiptNotices.map((receipt) => (
+          <ManagedRemovalReceiptNotice key={`${receipt.repoId}:${receipt.operationId}`} receipt={receipt} />
+        ))}
         <div className="text-center py-8 text-red-400">
           Error loading repositories: {error?.message ?? 'Unknown error'}
         </div>
@@ -254,9 +253,9 @@ export default function Repositories() {
   return (
     <div className="space-y-6">
       {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
-      {managedRemovalReceiptNotice && (
-        <ManagedRemovalReceiptNotice receipt={managedRemovalReceiptNotice} />
-      )}
+      {managedRemovalReceiptNotices.map((receipt) => (
+        <ManagedRemovalReceiptNotice key={`${receipt.repoId}:${receipt.operationId}`} receipt={receipt} />
+      ))}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">

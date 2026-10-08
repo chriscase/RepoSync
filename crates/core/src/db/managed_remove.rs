@@ -960,7 +960,9 @@ pub fn remote_branch_delete_already_applied(status: &str) -> bool {
 }
 
 fn merge_remote_branch_outcome(existing: &str, incoming: &str) -> String {
-    if remote_branch_delete_already_applied(existing) {
+    if remote_branch_delete_already_applied(existing)
+        || (existing == "failed" && (incoming.is_empty() || incoming == "untouched"))
+    {
         existing.to_string()
     } else {
         incoming.to_string()
@@ -2609,6 +2611,42 @@ mod tests {
         assert_eq!(failed.remote_git, "deleted");
         assert_eq!(failed.remote_svn, "untouched");
         assert!(db.get_repository(repo_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn record_remote_progress_does_not_downgrade_failed_to_untouched() {
+        let db = setup();
+        let repo_id = "retry-remote-failed";
+        db.insert_repository(&repo(repo_id, "Retry failed", None))
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        let failed_remote = ManagedRemoveRemoteOutcome {
+            remote_git: "failed".into(),
+            remote_svn: "untouched".into(),
+        };
+        db.fail_managed_remove_with_remote(
+            repo_id,
+            &operation.id,
+            "remote failed",
+            Some(&failed_remote),
+        )
+        .unwrap();
+        let untouched = ManagedRemoveRemoteOutcome {
+            remote_git: "untouched".into(),
+            remote_svn: "untouched".into(),
+        };
+        db.record_managed_remove_remote_progress(repo_id, &operation.id, &untouched)
+            .unwrap();
+        let loaded = db
+            .managed_removal_operation(repo_id, &operation.id)
+            .unwrap()
+            .expect("operation");
+        assert_eq!(loaded.remote_git, "failed");
+        assert_eq!(loaded.remote_svn, "untouched");
     }
 
     #[test]
