@@ -4,6 +4,7 @@
 //! the production `SyncEngine` team path. Each scenario emits `RELIABILITY_EVIDENCE`
 //! with a stable case id for the host runner (`scripts/real-engine-scenario-suite.sh`).
 
+use std::collections::HashSet;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -83,6 +84,7 @@ struct ImportCycleOracle {
     windows: Mutex<Vec<CycleWindow>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    finished_while_peer_in_flight: Mutex<HashSet<String>>,
 }
 
 impl ImportCycleOracle {
@@ -91,6 +93,7 @@ impl ImportCycleOracle {
             windows: Mutex::new(Vec::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            finished_while_peer_in_flight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -121,6 +124,13 @@ async fn run_import_with_lock_retry(
         let cycle_result = engine.run_sync_cycle().await;
         let cycle_end = Instant::now();
         if let Some(tracker) = oracle {
+            if matches!(&cycle_result, Ok(_)) && tracker.in_flight.load(Ordering::SeqCst) > 1 {
+                tracker
+                    .finished_while_peer_in_flight
+                    .lock()
+                    .unwrap()
+                    .insert(label.to_string());
+            }
             tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
             tracker.windows.lock().unwrap().push(CycleWindow {
                 label: label.to_string(),
@@ -907,9 +917,19 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
         "beta-origin\n"
     );
 
-    let concurrent_import = oracle.windows_overlap("repo_alpha", "repo_beta");
+    let import_cycle_windows_overlapped = oracle.windows_overlap("repo_alpha", "repo_beta");
     let max_in_flight = oracle.max_in_flight.load(Ordering::SeqCst);
-    let case_status = if concurrent_import { "PASS" } else { "PARTIAL" };
+    let peak_concurrent_import_cycles = max_in_flight >= 2;
+    let at_least_one_import_finished_while_peer_in_flight = !oracle
+        .finished_while_peer_in_flight
+        .lock()
+        .unwrap()
+        .is_empty();
+    assert!(
+        peak_concurrent_import_cycles && import_cycle_windows_overlapped,
+        "concurrent svnserve imports must overlap in flight and in cycle windows"
+    );
+    let case_status = "PASS";
     let checkpoint_crossover = alpha_sha == beta_sha
         || matches!(
             (
@@ -930,8 +950,10 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
             "alpha_git_sha": alpha_sha,
             "beta_git_sha": beta_sha,
             "max_in_flight": max_in_flight,
-            "concurrent_import": concurrent_import,
-            "overlapping_import_cycle_windows": concurrent_import,
+            "peak_concurrent_import_cycles": peak_concurrent_import_cycles,
+            "import_cycle_windows_overlapped": import_cycle_windows_overlapped,
+            "at_least_one_import_finished_while_peer_in_flight": at_least_one_import_finished_while_peer_in_flight,
+            "note": "import_cycle_windows_overlapped is temporal overlap of SyncEngine cycles; peak_concurrent_import_cycles proves two imports were in flight together; at_least_one_import_finished_while_peer_in_flight is one successful completion before the peer cycle ended",
             "checkpoint_crossover": checkpoint_crossover,
         }),
     );
@@ -1520,7 +1542,50 @@ async fn scenario_r01_svnserve_bidirectional_roundtrip() {
     );
     let svn_stats = engine.run_sync_cycle().await.unwrap();
     assert_eq!(svn_stats.svn_to_git_count, 2);
+    let db = setup_db(&fixture.db_path);
+    let svn_git_a: String = db.conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
+        rusqlite::params![fixture.repo.id, svn_rev_a],
+        |row| row.get(0),
+    ).unwrap();
+    let svn_git_b: String = db.conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
+        rusqlite::params![fixture.repo.id, svn_rev_b],
+        |row| row.get(0),
+    ).unwrap();
+    assert_git_ancestor(&fixture.repo.bridge, &svn_git_a, &svn_git_b);
+    for (revision, path, content, git_sha) in [
+        (svn_rev_a, "roundtrip-a.txt", "svn leg a\n", &svn_git_a),
+        (svn_rev_b, "roundtrip-b.txt", "svn leg b\n", &svn_git_b),
+    ] {
+        assert_eq!(git_show_blob(&fixture.repo.bridge, git_sha, path), content);
+        assert_eq!(
+            git_show_blob(&fixture.repo.bare, "main", path),
+            content,
+            "bare origin must expose SVN-originated {}",
+            path
+        );
+        assert_eq!(
+            svn_read_file(
+                &fixture.repo.svn_url,
+                &fixture.repo.username,
+                &fixture.repo.password,
+                revision,
+                path,
+            )
+            .await,
+            content
+        );
+    }
     git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    assert_eq!(
+        git_show_blob(&fixture.developer, "main", "roundtrip-a.txt"),
+        "svn leg a\n"
+    );
+    assert_eq!(
+        git_show_blob(&fixture.developer, "main", "roundtrip-b.txt"),
+        "svn leg b\n"
+    );
     let git_a = fixture.developer_commit("roundtrip-git.txt", "git leg a\n", "Git roundtrip A");
     let git_b = fixture.developer_commit("roundtrip-git.txt", "git leg b\n", "Git roundtrip B");
     git_cli(&fixture.developer, &["push", "origin", "main"]);
@@ -1538,26 +1603,30 @@ async fn scenario_r01_svnserve_bidirectional_roundtrip() {
     assert_eq!(svn_head, svn_rev_b + 2);
     let after = fixture.checkpoint_snapshot();
     assert_eq!(after.1, git_b);
+    for (revision, content, sha) in [
+        (svn_rev_b + 1, "git leg a\n", &git_a),
+        (svn_rev_b + 2, "git leg b\n", &git_b),
+    ] {
+        assert_eq!(
+            svn_read_file(
+                &fixture.repo.svn_url,
+                &fixture.repo.username,
+                &fixture.repo.password,
+                revision,
+                "roundtrip-git.txt",
+            )
+            .await,
+            content
+        );
+        let mapped: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND svn_rev = ?2 AND git_sha = ?3 AND status = 'applied'",
+            rusqlite::params![fixture.repo.id, revision, sha],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(mapped, 1);
+    }
     assert_eq!(
-        svn_read_file(
-            &fixture.repo.svn_url,
-            &fixture.repo.username,
-            &fixture.repo.password,
-            svn_rev_b + 1,
-            "roundtrip-git.txt",
-        )
-        .await,
-        "git leg a\n"
-    );
-    assert_eq!(
-        svn_read_file(
-            &fixture.repo.svn_url,
-            &fixture.repo.username,
-            &fixture.repo.password,
-            svn_rev_b + 2,
-            "roundtrip-git.txt",
-        )
-        .await,
+        git_show_blob(&fixture.repo.bridge, &git_b, "roundtrip-git.txt"),
         "git leg b\n"
     );
     let repeat = engine.run_sync_cycle().await.unwrap();
@@ -1568,8 +1637,12 @@ async fn scenario_r01_svnserve_bidirectional_roundtrip() {
         "PASS",
         serde_json::json!({
             "svn_revisions": [svn_rev_a, svn_rev_b],
+            "svn_to_git_mapped_shas": [svn_git_a, svn_git_b],
             "git_shas": [git_a, git_b],
             "checkpoint_after": after,
+            "git_bridge_tree_checked": true,
+            "git_bare_and_developer_tree_checked": true,
+            "commit_mappings_checked": true,
             "repeat_noop": true,
         }),
     );
