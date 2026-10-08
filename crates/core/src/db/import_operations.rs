@@ -95,6 +95,17 @@ pub struct ImportOperation {
     /// Present for snapshot imports. Absent on pre-#68 full-import documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_pin: Option<SnapshotPin>,
+    /// SVN→Git mappings recorded locally but not yet flushed to `commit_map` after publication proof.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_commit_maps: Vec<PendingImportCommitMap>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingImportCommitMap {
+    pub svn_rev: i64,
+    pub git_sha: String,
+    pub svn_author: String,
+    pub git_author: String,
 }
 
 // This is the original v1 fingerprint vocabulary. Keep its JSON representation
@@ -414,6 +425,39 @@ fn parse(raw: &str) -> Result<ImportOperation, DatabaseError> {
     Ok(op)
 }
 
+fn flush_pending_commit_maps_tx(
+    tx: &Connection,
+    repo_id: &str,
+    op: &mut ImportOperation,
+    up_to_svn_rev: i64,
+) -> Result<(), DatabaseError> {
+    if op.pending_commit_maps.is_empty() {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    let mut retained = Vec::new();
+    for entry in op.pending_commit_maps.drain(..) {
+        if entry.svn_rev <= up_to_svn_rev {
+            tx.execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (?1, ?2, 'svn_to_git', ?3, ?4, ?5, ?6)",
+                params![
+                    entry.svn_rev,
+                    entry.git_sha,
+                    now,
+                    entry.svn_author,
+                    entry.git_author,
+                    repo_id,
+                ],
+            )?;
+        } else {
+            retained.push(entry);
+        }
+    }
+    op.pending_commit_maps = retained;
+    Ok(())
+}
+
 fn complete_import_tx(
     tx: &Connection,
     repo_id: &str,
@@ -431,6 +475,12 @@ fn complete_import_tx(
     {
         return Err(DatabaseError::Other(
             "import lacks a fully confirmed final tip".into(),
+        ));
+    }
+    flush_pending_commit_maps_tx(tx, repo_id, &mut op, svn_rev)?;
+    if !op.pending_commit_maps.is_empty() {
+        return Err(DatabaseError::Other(
+            "import cannot complete with unflushed commit mappings".into(),
         ));
     }
     if tx.execute(
@@ -512,6 +562,7 @@ impl Database {
                 outcome_detail: None,
                 resume_authorized: false,
                 snapshot_pin: None,
+                pending_commit_maps: Vec::new(),
             };
             write_value(
                 tx,
@@ -772,13 +823,45 @@ impl Database {
         Ok(())
     }
 
+    pub fn stage_import_commit_map(
+        &self,
+        repo_id: &str,
+        op_id: &str,
+        svn_rev: i64,
+        git_sha: &str,
+        svn_author: &str,
+        git_author: &str,
+    ) -> Result<(), DatabaseError> {
+        self.update_import_operation(repo_id, op_id, |op| {
+            op.pending_commit_maps.push(PendingImportCommitMap {
+                svn_rev,
+                git_sha: git_sha.into(),
+                svn_author: svn_author.into(),
+                git_author: git_author.into(),
+            });
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     pub fn confirm_import_publication(
         &self,
         repo_id: &str,
         op_id: &str,
         observed_sha: &str,
     ) -> Result<(), DatabaseError> {
-        self.update_import_operation(repo_id, op_id, |op| {
+        self.transaction(|tx| {
+            crate::writer_fence::require_current(tx)?;
+            let active = key("active", repo_id);
+            if read_value(tx, &active)?.as_deref() != Some(op_id) {
+                return Err(DatabaseError::Other(
+                    "stale or inactive import operation".into(),
+                ));
+            }
+            let document = key("document", op_id);
+            let mut op = parse(&read_value(tx, &document)?.ok_or_else(|| {
+                DatabaseError::Other("missing import operation document".into())
+            })?)?;
             if op.intended_git_sha.as_deref() != Some(observed_sha) {
                 return Err(DatabaseError::Other(
                     "published ref differs from recorded intent".into(),
@@ -789,6 +872,10 @@ impl Database {
             op.confirmed_batches += 1;
             op.intended_ref = None;
             op.intended_git_sha = None;
+            let confirmed_rev = op.last_confirmed_svn_rev.unwrap_or(0);
+            flush_pending_commit_maps_tx(tx, repo_id, &mut op, confirmed_rev)?;
+            op.updated_at = Utc::now().to_rfc3339();
+            write_value(tx, &document, &serde_json::to_string(&op).unwrap())?;
             Ok(())
         })?;
         Ok(())
@@ -945,8 +1032,12 @@ impl Database {
             }
             op.resume_authorized = true;
             op.outcome_detail = Some(
-                "Publication verified. Partial import remains held; resume from the confirmed checkpoint when ready.".into(),
+                "Publication verified; partial import remains held; resume from the confirmed checkpoint when ready.".into(),
             );
+            if publication_recorded {
+                let confirmed_rev = op.last_confirmed_svn_rev.unwrap_or(0);
+                flush_pending_commit_maps_tx(tx, repo_id, &mut op, confirmed_rev)?;
+            }
             op.updated_at = Utc::now().to_rfc3339();
             write_value(tx, &document, &serde_json::to_string(&op).unwrap())?;
             Ok(ReconciledImport {
@@ -1076,6 +1167,40 @@ mod tests {
     }
 
     #[test]
+    fn staged_commit_maps_flush_on_publication_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("state.db")).unwrap();
+        db.initialize().unwrap();
+        let op = db
+            .create_import_operation("repo-flush", "admin", "req-flush", "fingerprint")
+            .unwrap();
+        db.start_import_operation("repo-flush", &op.id).unwrap();
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        db.note_import_local("repo-flush", &op.id, 1, sha, 1, 1)
+            .unwrap();
+        db.stage_import_commit_map("repo-flush", &op.id, 1, sha, "svn", "git <g@t.com>")
+            .unwrap();
+        db.begin_import_publication("repo-flush", &op.id, "refs/heads/main", sha)
+            .unwrap();
+        db.confirm_import_publication("repo-flush", &op.id, sha)
+            .unwrap();
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                ["repo-flush"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        let op = db
+            .get_import_operation("repo-flush", &op.id)
+            .unwrap()
+            .unwrap();
+        assert!(op.pending_commit_maps.is_empty());
+    }
+
+    #[test]
     fn snapshot_pin_is_recorded_once_and_survives_reload() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(dir.path().join("state.db")).unwrap();
@@ -1147,6 +1272,162 @@ mod tests {
             copy_from_rev: None,
             requested: rev.to_string(),
         }
+    }
+
+    fn assert_commit_map_and_drained_pending(
+        db: &Database,
+        repo_id: &str,
+        op_id: &str,
+        expected_rows: i64,
+    ) {
+        let rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, expected_rows);
+        let op = db.get_import_operation(repo_id, op_id).unwrap().unwrap();
+        assert!(op.pending_commit_maps.is_empty());
+    }
+
+    #[test]
+    fn staged_commit_maps_flush_on_completed_reconcile() {
+        let (_dir, db, workdir) = open_repo("snap-pending");
+        let fp = fingerprint(&db, "snap-pending", &workdir);
+        let op = db
+            .create_import_operation("snap-pending", "admin", "req-snap-pending", &fp)
+            .unwrap();
+        db.pin_snapshot_import("snap-pending", &op.id, pin_at(4))
+            .unwrap();
+        db.start_import_operation("snap-pending", &op.id).unwrap();
+        db.note_import_local("snap-pending", &op.id, 4, BASELINE_SHA, 1, 1)
+            .unwrap();
+        db.stage_import_commit_map(
+            "snap-pending",
+            &op.id,
+            4,
+            BASELINE_SHA,
+            "svn",
+            "git <g@t.com>",
+        )
+        .unwrap();
+        db.begin_import_publication("snap-pending", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        db.finish_import_operation(
+            "snap-pending",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "crash before confirm",
+        )
+        .unwrap();
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                    ["snap-pending"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let done = db
+            .reconcile_verified_import(
+                "snap-pending",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert!(done.publication_recorded);
+        assert_eq!(done.operation.state, ImportOperationState::Completed);
+        assert_commit_map_and_drained_pending(&db, "snap-pending", &op.id, 1);
+
+        let (_dir, full, workdir) = open_repo("full-pending");
+        let fp = fingerprint(&full, "full-pending", &workdir);
+        let op = full
+            .create_import_operation("full-pending", "admin", "req-full-pending", &fp)
+            .unwrap();
+        full.start_import_operation("full-pending", &op.id).unwrap();
+        full.note_import_total("full-pending", &op.id, 3).unwrap();
+        full.note_import_local("full-pending", &op.id, 3, BASELINE_SHA, 3, 3)
+            .unwrap();
+        for rev in 1..=3 {
+            full.stage_import_commit_map(
+                "full-pending",
+                &op.id,
+                rev,
+                BASELINE_SHA,
+                "svn",
+                "git <g@t.com>",
+            )
+            .unwrap();
+        }
+        full.begin_import_publication("full-pending", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        full.finish_import_operation(
+            "full-pending",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "lost reply",
+        )
+        .unwrap();
+        let done = full
+            .reconcile_verified_import(
+                "full-pending",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert_commit_map_and_drained_pending(&full, "full-pending", &op.id, 3);
+
+        let (_dir, held, workdir) = open_repo("held-confirm");
+        let fp = fingerprint(&held, "held-confirm", &workdir);
+        let op = held
+            .create_import_operation("held-confirm", "admin", "req-held-confirm", &fp)
+            .unwrap();
+        held.pin_snapshot_import("held-confirm", &op.id, pin_at(2))
+            .unwrap();
+        held.start_import_operation("held-confirm", &op.id).unwrap();
+        held.note_import_local("held-confirm", &op.id, 2, BASELINE_SHA, 1, 1)
+            .unwrap();
+        held.stage_import_commit_map(
+            "held-confirm",
+            &op.id,
+            2,
+            BASELINE_SHA,
+            "svn",
+            "git <g@t.com>",
+        )
+        .unwrap();
+        held.begin_import_publication("held-confirm", &op.id, "refs/heads/main", BASELINE_SHA)
+            .unwrap();
+        held.finish_import_operation(
+            "held-confirm",
+            &op.id,
+            ImportOperationState::ReconciliationRequired,
+            "worker stopped after push",
+        )
+        .unwrap();
+        let done = held
+            .reconcile_verified_import(
+                "held-confirm",
+                &op.id,
+                &workdir,
+                "refs/heads/main",
+                BASELINE_SHA,
+            )
+            .unwrap();
+        assert!(done.completed);
+        assert!(done.publication_recorded);
+        assert_commit_map_and_drained_pending(&held, "held-confirm", &op.id, 1);
     }
 
     #[test]

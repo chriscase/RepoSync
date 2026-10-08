@@ -13,6 +13,16 @@ DEFAULT_CI_PARTIAL_ALLOWLIST = (
 REQUIRED_CASES_PATH = ROOT / "docs/reliability/required-cases.json"
 REAL_ENGINE_BINARY = "real_engine_scenarios"
 
+PINNED_CI_PARTIAL_ALLOWLIST_IDS = frozenset(
+    {
+        "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
+        "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE",
+        "R01_SVNSERVE_POST_WRITE_RECOVERY",
+        "R16_SVNSERVE_SVN_REMOTE_RECREATION",
+        "R17_SVNSERVE_NOTIFICATION_ISOLATION",
+    }
+)
+
 
 def load_expected_real_engine_case_ids() -> list[str]:
     payload = json.loads(REQUIRED_CASES_PATH.read_text(encoding="utf-8"))
@@ -248,11 +258,14 @@ def run_self_test() -> None:
     allowed = load_ci_partial_allowlist(allowlist_path)
     git_id = "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE"
     svn_id = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
-    allowlist_payload = json.loads(allowlist_path.read_text(encoding="utf-8"))
-    expected_allowed = {
-        str(item) for item in allowlist_payload.get("allowed_partial_scenario_ids", [])
+    assert allowed == PINNED_CI_PARTIAL_ALLOWLIST_IDS, (allowed, PINNED_CI_PARTIAL_ALLOWLIST_IDS)
+    json_ids = {
+        str(item)
+        for item in json.loads(allowlist_path.read_text(encoding="utf-8")).get(
+            "allowed_partial_scenario_ids", []
+        )
     }
-    assert allowed == expected_allowed, (allowed, expected_allowed)
+    assert json_ids == PINNED_CI_PARTIAL_ALLOWLIST_IDS, (json_ids, PINNED_CI_PARTIAL_ALLOWLIST_IDS)
     expected_ids = load_expected_real_engine_case_ids()
     assert len(expected_ids) >= 8
 
