@@ -5,8 +5,8 @@ import { api, type ImportStatus } from '../api';
 import {
   DEFAULT_REPO_IMPORT_MODE,
   buildStartImportBody,
-  parseSvnRevisionInput,
   startImportButtonLabel,
+  validateSvnRevisionInput,
   type RepoImportMode,
 } from '../importBaseline';
 import ImportHistoryNotice from './ImportHistoryNotice';
@@ -149,9 +149,6 @@ export default function ImportProgressCard({
       setStartError(null);
       let body: ReturnType<typeof buildStartImportBody>;
       try {
-        if (importMode === 'snapshot') {
-          parseSvnRevisionInput(svnRevision);
-        }
         body = buildStartImportBody(importMode, svnRevision);
       } catch (e) {
         throw e instanceof Error ? e : new Error(String(e));
@@ -175,7 +172,10 @@ export default function ImportProgressCard({
       queryClient.invalidateQueries({ queryKey: ['import-status', repoId] });
       queryClient.invalidateQueries({ queryKey: ['repo', repoId] });
     },
-    onError: (e: Error) => setStartError(e.message),
+    onError: (e: Error) => {
+      setStartError(e.message);
+      queryClient.invalidateQueries({ queryKey: ['import-status', repoId] });
+    },
   });
   const cancel = useMutation({
     mutationFn: async (operationId: string) => {
@@ -227,12 +227,17 @@ export default function ImportProgressCard({
                   onModeChange={setImportMode}
                   onRevisionChange={setSvnRevision}
                   disabled={start.isPending}
+                  radioGroupName={repoId ? `repo-import-mode-${repoId}` : 'repo-import-mode'}
                 />
                 <button
                   type="button"
                   data-testid="start-repo-import"
                   onClick={() => start.mutate()}
-                  disabled={start.isPending}
+                  disabled={
+                    start.isPending
+                    || (importMode === 'snapshot'
+                      && Boolean(validateSvnRevisionInput(svnRevision)))
+                  }
                   className="rounded bg-blue-600 px-3 py-1 text-xs text-white disabled:opacity-50"
                 >
                   {start.isPending ? 'Starting…' : startImportButtonLabel(importMode)}
@@ -363,11 +368,9 @@ export default function ImportProgressCard({
         <StatCell label="Batches" value={`${status.batches_pushed}`} />
         <StatCell label="LFS Files" value={`${status.lfs_unique_count}`} />
       </div>
-      {(status.import_mode || status.history_boundary) && (
-        <div className="mb-3">
-          <ImportHistoryNotice fields={status} compact />
-        </div>
-      )}
+      <div className="mb-3">
+        <ImportHistoryNotice fields={status} compact />
+      </div>
       {status.operation_id && <p className="mb-2 text-xs text-gray-400 font-mono">Operation {status.operation_id}</p>}
       {status.last_local_svn_rev != null && (
         <p className="mb-2 text-xs text-gray-400">Local through SVN r{status.last_local_svn_rev};

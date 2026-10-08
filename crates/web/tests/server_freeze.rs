@@ -5857,6 +5857,29 @@ async fn candidate_r68_import_card_snapshot_boundary_ui() {
     server.abort();
 }
 
+/// R68: mounted import card shows refusal copy without a verified-baseline claim.
+#[cfg(feature = "reliability-browser")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r68_import_card_invalid_revision_refusal_ui() {
+    let (addr, _state, server, tmp, id, _bare) = import_fixture().await;
+    let barrier = tmp.path().join(&id);
+    std::fs::create_dir(&barrier).unwrap();
+    let (browser, mut vite) =
+        run_import_card_browser(addr, &id, &barrier, "snapshot-invalid-rev").await;
+    let output = tokio::time::timeout(Duration::from_secs(90), browser.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "browser: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    vite.kill().unwrap();
+    vite.wait().unwrap();
+    server.abort();
+}
+
 /// R11: mismatched existing Git target is refused without reset or overwrite.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r11_mismatched_target_is_refused() {
@@ -5931,6 +5954,56 @@ async fn candidate_r11_mismatched_target_is_refused() {
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({"case":"R11_MISMATCHED_TARGET","refused":true,"remote":"unchanged"})
+    );
+    server.abort();
+}
+
+/// R68: refused snapshot import status omits verified boundary fields (UI must not claim a pin).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r68_refused_snapshot_status_omits_verified_boundary() {
+    let (addr, state, server, _tmp, id, bare) = import_fixture().await;
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let rejected = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"99"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    let status: serde_json::Value = client
+        .get(format!("{base}/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["lifecycle"], "failed");
+    assert_eq!(status["import_mode"], "snapshot");
+    assert!(status["starting_revision"].is_null());
+    assert!(status["history_boundary"].is_null());
+    assert_eq!(status["earlier_history_imported"], true);
+    assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 0);
+    use std::process::Command;
+    assert!(!Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "show-ref",
+            "--verify",
+            "refs/heads/main",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R68_REFUSED_NO_BOUNDARY",
+            "refused":true,
+            "watermark":0
+        })
     );
     server.abort();
 }

@@ -14,7 +14,13 @@ import {
 } from '../branchPairRemoval';
 import ImportProgressCard from '../components/ImportProgressCard';
 import ImportHistoryNotice from '../components/ImportHistoryNotice';
-import { DEFAULT_REPO_IMPORT_MODE, type RepoImportMode } from '../importBaseline';
+import {
+  DEFAULT_REPO_IMPORT_MODE,
+  hasVerifiedSnapshotBaseline,
+  importBaselineFailureNotice,
+  type RepoImportMode,
+} from '../importBaseline';
+import type { ImportStatus } from '../api';
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalPanel from '../components/ManagedRemovalPanel';
 import {
@@ -193,6 +199,47 @@ export default function RepoDetail() {
   });
 
   // Branch pairs
+  const needsImportStatusForNotice =
+    detailLive
+    && repo?.import_mode === 'snapshot'
+    && !hasVerifiedSnapshotBaseline({
+      import_mode: repo?.import_mode,
+      starting_revision: repo?.starting_revision,
+      history_boundary: repo?.history_boundary,
+      snapshot_pin: repo?.snapshot_pin,
+    });
+
+  const { data: importStatus } = useQuery<ImportStatus>({
+    queryKey: ['import-status', id],
+    queryFn: async () => {
+      const token = localStorage.getItem('session_token');
+      const res = await fetch(`/api/repos/${id}/import/status`, {
+        headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      });
+      if (!res.ok) throw new Error(`Import status unavailable (${res.status})`);
+      return res.json();
+    },
+    enabled: Boolean(needsImportStatusForNotice),
+    refetchInterval: needsImportStatusForNotice ? 5000 : false,
+  });
+
+  const baselineNoticeFields = repo
+    ? {
+        import_mode: repo.import_mode,
+        starting_revision: repo.starting_revision,
+        history_boundary: repo.history_boundary,
+        snapshot_pin: repo.snapshot_pin,
+        phase: importStatus?.phase,
+        lifecycle: importStatus?.lifecycle,
+        outcome_detail: importStatus?.outcome_detail,
+      }
+    : null;
+
+  const showBaselineNotice =
+    baselineNoticeFields
+    && (hasVerifiedSnapshotBaseline(baselineNoticeFields)
+      || Boolean(importBaselineFailureNotice(baselineNoticeFields)));
+
   const { data: branchPairs } = useQuery({
     queryKey: ['branch-pairs', id],
     queryFn: () => api.listBranchPairs(id!),
@@ -1160,17 +1207,8 @@ export default function RepoDetail() {
         />
       </div>
 
-      {repo && (repo.import_mode || repo.history_boundary || repo.initializing) && (
-        <ImportHistoryNotice
-          fields={{
-            import_mode: repo.import_mode,
-            starting_revision: repo.starting_revision,
-            history_boundary: repo.history_boundary,
-            snapshot_pin: repo.snapshot_pin,
-            earlier_history_imported:
-              repo.import_mode === 'snapshot' ? false : undefined,
-          }}
-        />
+      {showBaselineNotice && baselineNoticeFields && (
+        <ImportHistoryNotice fields={baselineNoticeFields} />
       )}
 
       {/* Import Progress */}

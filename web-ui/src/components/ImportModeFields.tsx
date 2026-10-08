@@ -1,5 +1,5 @@
 import type { RepoImportMode } from '../importBaseline';
-import { DEFAULT_REPO_IMPORT_MODE, importModeLabel } from '../importBaseline';
+import { DEFAULT_REPO_IMPORT_MODE, importModeLabel, validateSvnRevisionInput } from '../importBaseline';
 
 const inputClass =
   'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
@@ -10,13 +10,17 @@ export default function ImportModeFields({
   onModeChange,
   onRevisionChange,
   disabled = false,
+  radioGroupName = 'repo-import-mode',
 }: {
   mode: RepoImportMode;
   svnRevision: string;
   onModeChange: (mode: RepoImportMode) => void;
   onRevisionChange: (value: string) => void;
   disabled?: boolean;
+  radioGroupName?: string;
 }) {
+  const revisionError =
+    mode === 'snapshot' && svnRevision.trim() ? validateSvnRevisionInput(svnRevision) : null;
   return (
     <div className="space-y-3" data-testid="import-mode-fields">
       <p className="text-xs text-gray-400">
@@ -27,7 +31,7 @@ export default function ImportModeFields({
         <label className="flex items-start gap-2 cursor-pointer">
           <input
             type="radio"
-            name="repo-import-mode"
+            name={radioGroupName}
             data-testid="import-mode-full"
             checked={mode === DEFAULT_REPO_IMPORT_MODE}
             disabled={disabled}
@@ -44,7 +48,7 @@ export default function ImportModeFields({
         <label className="flex items-start gap-2 cursor-pointer">
           <input
             type="radio"
-            name="repo-import-mode"
+            name={radioGroupName}
             data-testid="import-mode-snapshot"
             checked={mode === 'snapshot'}
             disabled={disabled}
@@ -70,7 +74,13 @@ export default function ImportModeFields({
             disabled={disabled}
             onChange={(e) => onRevisionChange(e.target.value)}
             placeholder="HEAD"
+            aria-invalid={revisionError ? true : undefined}
           />
+          {revisionError && (
+            <p className="mt-1 text-xs text-red-400" data-testid="import-svn-revision-error">
+              {revisionError}
+            </p>
+          )}
         </div>
       )}
     </div>

@@ -42,7 +42,7 @@ R11 and R12 stay **PARTIAL**. This slice does not close #68.
 | Web UI: Import progress card | `Start full history import` sends `{}` | `Start snapshot import` sends snapshot body |
 | `GET /api/repos/{id}/import/status` and repo detail | `earlier_history_imported=true` when applicable | `earlier_history_imported=false`, boundary text |
 
-**User-facing limitation:** Snapshot mode builds Git from one verified SVN revision and **does not import earlier SVN history**. The mirror is still SVN-origin; later revisions sync normally from that baseline.
+**User-facing limitation:** Snapshot mode builds Git from one verified SVN revision and **does not import earlier SVN history**. The mirror is still SVN-origin. A refused or failed snapshot (no pin recorded) must not be described as a verified baseline; only server `history_boundary` / `starting_revision` copy is shown after verification.
 
 ## Still later
 
