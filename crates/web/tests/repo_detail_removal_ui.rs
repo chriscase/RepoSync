@@ -1,16 +1,35 @@
 //! Static UI contract checks for #65 RS-16 disable vs remove vs remote deletion.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+fn repo_root() -> PathBuf {
+    let runtime = Path::new("/src");
+    if runtime.join("web-ui").is_dir() {
+        return runtime.to_path_buf();
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
 fn node_command() -> Command {
-    let bin = std::env::var("REPOSYNC_NODE_BIN").unwrap_or_else(|_| "node".into());
-    Command::new(bin)
+    if let Ok(bin) = std::env::var("REPOSYNC_NODE_BIN") {
+        return Command::new(bin);
+    }
+    for candidate in [
+        "/fixture/tmp/reposync-node",
+        "/usr/bin/nodejs",
+        "/usr/bin/node",
+    ] {
+        if Path::new(candidate).is_file() {
+            return Command::new(candidate);
+        }
+    }
+    Command::new("node")
 }
 
 #[test]
 fn branch_pair_delete_query_defaults_explicit_safe() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = repo_root();
     let script = r#"
 import { buildBranchPairDeleteQuery } from './web-ui/src/branchPairDeletion.ts';
 const empty = buildBranchPairDeleteQuery();
@@ -162,7 +181,7 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
 
 #[test]
 fn managed_removal_receipt_display_gate_and_roundtrip() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = repo_root();
     let script = r#"
 const store = new Map();
 globalThis.localStorage = {
