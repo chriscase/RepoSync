@@ -152,7 +152,7 @@
       "baseline": "NOT RUN",
       "candidate": "PARTIAL",
       "tier": "actual_engine",
-      "evidence": "Full SVN export versus Git tree is compared across addition, modification, and explicit deletion while unrelated top-level bytes survive. Isolated LFS import publishes a pointer. RS-C02 rename and content conflicts stop before SVN/Git apply with projected Git→SVN paths and idempotent conflict rows; persisted non-terminal conflict rows block apply (including resume_authorized SVN→Git push) even when live detection is empty after a Git force-push back. RS-C88 import copy confinement keeps planted parent symlinks, destination hardlinks, and export-present .gitattributes hardlink targets untouched. Open PRs #51 and #44 (404) were inspected; this row does not modify provenance/LFS CI scripts.",
+      "evidence": "Full SVN export versus Git tree is compared across addition, modification, and explicit deletion while unrelated top-level bytes survive. Isolated LFS import publishes a pointer. RS-C02 rename and content conflicts stop before SVN/Git apply with projected Git→SVN paths and idempotent conflict rows; persisted non-terminal conflict rows block apply (including resume_authorized SVN→Git push) even when live detection is empty after a Git force-push back or when Git stays at the handled tip with only an SVN-only edit pending; legacy NULL repo_id rows are attributed when provable and otherwise block with named row ids. RS-C88 import copy confinement keeps planted parent symlinks, destination hardlinks, and export-present .gitattributes hardlink targets untouched. Open PRs #51 and #44 (404) were inspected; this row does not modify provenance/LFS CI scripts.",
       "diagnostic_expected_baseline_failure": false
     },
     {

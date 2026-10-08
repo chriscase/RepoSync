@@ -9760,6 +9760,14 @@ async fn candidate_rsc02_git_rename_svn_edit_source_path_conflict() {
         "rename source conflict should persist as edit_delete"
     );
     assert_eq!(source_conflict.status, "detected");
+    assert_eq!(
+        conflicts
+            .iter()
+            .filter(|c| c.file_path == "old.txt")
+            .count(),
+        1,
+        "retry-stable conflict row for rename source old.txt"
+    );
     let after = pair.snapshot().await;
     assert_eq!(
         after.watermark, before.watermark,
@@ -13711,4 +13719,189 @@ async fn candidate_rsc02_unscoped_engine_blocks_on_persisted_conflict() {
     let after = pair.snapshot().await;
     assert_eq!(after.svn_rev, before.svn_rev);
     assert_eq!(after.remote_sha, before.remote_sha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_persisted_gate_blocks_svn_only_with_git_at_handled_tip() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit("baseline.txt", "handled tip\n", "Seed handled Git tip");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let handled_remote = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
+    let update = Command::new("svn")
+        .args(["update", pair.wc.to_str().unwrap(), "--non-interactive"])
+        .status()
+        .unwrap();
+    assert!(update.success(), "svn update failed");
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+         VALUES ('persisted-unrelated', 'unrelated-held.txt', 'content', 'detected', '2020-01-01T00:00:00Z', ?1)",
+            [&pair.repo_id],
+        )
+        .unwrap();
+    svn_commit_file(
+        &pair.wc,
+        "svn-only.txt",
+        "SVN-only pending edit\n",
+        "SVN-only edit while Git stays at handled tip",
+    );
+    let before = pair.snapshot().await;
+    assert_eq!(before.remote_sha, handled_remote);
+    let gated = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pair.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("persisted-gate isolation cycle must finish within bounded time");
+    match gated {
+        Err(SyncError::UnresolvableConflict { detail, .. }) => {
+            assert!(
+                detail.contains("persisted conflict row(s) block apply"),
+                "expected persisted-row gate refusal, got detail={detail:?}"
+            );
+        }
+        other => panic!(
+            "persisted gate must block SVN-only apply when unrelated row remains, got {other:?}"
+        ),
+    }
+    let after = pair.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev);
+    assert_eq!(after.remote_sha, handled_remote);
+    assert_eq!(after.watermark, before.watermark);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"RS_C02_PERSISTED_GATE_SVN_ONLY_HANDLED_TIP",
+            "handled_remote":handled_remote,
+            "svn_unchanged":after.svn_rev == before.svn_rev,
+            "remote_unchanged":after.remote_sha == handled_remote,
+            "persisted_gate_detail":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_legacy_null_conflict_attributed_on_single_repo() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+         VALUES ('legacy-null', 'orphan.txt', 'content', 'detected', '2020-01-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+    let before = pair.snapshot().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pair.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("cycle must finish within bounded time");
+    match result {
+        Err(SyncError::UnresolvableConflict { detail, .. }) => {
+            assert!(
+                detail.contains("persisted conflict row(s) block apply"),
+                "expected persisted gate, got {detail:?}"
+            );
+            assert!(
+                !detail.contains("unattributed legacy conflict row id(s)"),
+                "single-repo database must attribute NULL repo_id before gate, got {detail:?}"
+            );
+        }
+        other => panic!("attributed legacy row must still block its repository, got {other:?}"),
+    }
+    let repo_id: Option<String> = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT repo_id FROM conflicts WHERE id = 'legacy-null'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(repo_id.as_deref(), Some(pair.repo_id.as_str()));
+    let after = pair.snapshot().await;
+    assert_eq!(after.svn_rev, before.svn_rev);
+    assert_eq!(after.remote_sha, before.remote_sha);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_rsc02_ambiguous_null_repo_id_surfaces_row_ids() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    let now = chrono::Utc::now().to_rfc3339();
+    pair.engine
+        .db()
+        .insert_repository(&Repository {
+            id: "second-pair".into(),
+            name: "second pair".into(),
+            svn_url: pair.svn_repo_root.clone(),
+            svn_branch: String::new(),
+            svn_username: "fixture".into(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: pair.bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+         VALUES ('legacy-null', 'orphan.txt', 'content', 'detected', '2020-01-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pair.engine.run_sync_cycle(),
+    )
+    .await
+    .expect("cycle must finish within bounded time");
+    match result {
+        Err(SyncError::UnresolvableConflict { detail, .. }) => {
+            assert!(
+                detail.contains("id=legacy-null") && detail.contains("path=orphan.txt"),
+                "ambiguous NULL row must name id and path for operators, got {detail:?}"
+            );
+        }
+        other => panic!("NULL row with ambiguous ownership must block, got {other:?}"),
+    }
 }
