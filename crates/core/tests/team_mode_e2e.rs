@@ -12026,7 +12026,7 @@ async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() 
     use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
 
     let mut pair = QualifiedPair::new().await;
-    let handled = pair.developer_commit(
+    pair.developer_commit(
         "handled.txt",
         "ordinary baseline\n",
         "Establish applied outbound cursor",
@@ -12052,25 +12052,16 @@ async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() 
 
     bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
 
-    pair.engine
-        .db()
-        .conn()
-        .execute(
-            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
-            rusqlite::params![handled],
-        )
-        .unwrap();
-    pair.engine
-        .db()
-        .set_state(&format!("last_git_sha_pair"), &handled)
-        .unwrap();
-
-    pair.engine
-        .set_path_rules(vec!["blocked.txt".into()], vec![]);
+    let successor = pair.developer_commit(
+        "allow/work.txt",
+        "post-bump work\n",
+        "Ordinary work after echo generation bump",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
     assert_eq!(
         pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
         1,
-        "stale generation-1 receipt must not suppress the same Git SHA after bump"
+        "stale generation-1 receipt must not suppress a new commit after bump"
     );
     let svn_rev = SvnClient::new(&pair.svn_url, "", "")
         .info()
@@ -12079,14 +12070,15 @@ async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() 
         .latest_rev;
     let tree = svn_tree(&pair, svn_rev).await;
     assert_eq!(
-        tree.get("blocked.txt"),
-        Some(&b"filtered content\n".to_vec())
+        tree.get("allow/work.txt"),
+        Some(&b"post-bump work\n".to_vec())
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({
             "case":"ECHO_GENERATION_STALE_RECEIPT",
             "filtered":filtered,
+            "successor":successor,
             "svn_tree":tree_hashes(&tree)
         })
     );
@@ -12343,6 +12335,91 @@ async fn candidate_rs05_late_pair_bc_pending_isolation() {
             "pair_c":"import_baseline_pending",
             "global_svn_rev":12,
             "healthy_revision":healthy_rev
+        })
+    );
+}
+
+// Refs #63: stale generation-1 no-target receipt must not suppress echo for the
+// same Git SHA after a bump when inbound checkpoint rewinds behind emitted tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_generation_stale_receipt_same_sha_split_inbound_checkpoint() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
+
+    let mut pair = QualifiedPair::new().await;
+    let handled = pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Nonempty filtered Git commit",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    let receipt_key = format!("handled_git_no_target_pair_{filtered}");
+    assert!(pair.engine.db().get_state(&receipt_key).unwrap().is_some());
+
+    let (_, emitted_tip) = pair.engine.db().get_repo_watermark("pair").unwrap();
+    assert_eq!(emitted_tip, filtered);
+
+    bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
+
+    pair.engine
+        .db()
+        .set_state("last_git_sha_pair", &handled)
+        .unwrap();
+    let (_, table_tip) = pair.engine.db().get_repo_watermark("pair").unwrap();
+    assert_eq!(
+        table_tip, filtered,
+        "emitted tip must stay at the handled filtered SHA"
+    );
+    assert_eq!(
+        pair.engine.db().get_state("last_git_sha_pair").unwrap(),
+        Some(handled.clone()),
+        "inbound scoped checkpoint rewinds independently of repositories.last_git_sha"
+    );
+    assert_ne!(table_tip, handled);
+
+    pair.engine
+        .set_path_rules(vec!["blocked.txt".into()], vec![]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1,
+        "stale generation-1 receipt must not suppress the same Git SHA after bump"
+    );
+    let svn_rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let tree = svn_tree(&pair, svn_rev).await;
+    assert_eq!(
+        tree.get("blocked.txt"),
+        Some(&b"filtered content\n".to_vec())
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_GENERATION_STALE_RECEIPT_SAME_SHA",
+            "handled":handled,
+            "filtered":filtered,
+            "emitted_tip":table_tip,
+            "svn_tree":tree_hashes(&tree)
         })
     );
 }

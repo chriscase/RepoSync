@@ -316,6 +316,12 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "ECHO_GENERATION_STALE_RECEIPT_SAME_SHA",
+      "binary": "team_mode_e2e",
+      "test": "candidate_echo_generation_stale_receipt_same_sha_split_inbound_checkpoint",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "RS05_TEAM_SINGLE_IMPORT_NOOP",
       "binary": "team_mode_e2e",
       "test": "candidate_rs05_single_repo_import_then_noop_sync",
