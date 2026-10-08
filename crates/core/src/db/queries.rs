@@ -1160,6 +1160,42 @@ impl Database {
         Ok(count)
     }
 
+    /// Clear durable mappings for one repository and bump echo generation so
+    /// stale no-target receipts cannot satisfy checkpoint reads after reimport.
+    pub fn reset_repo_sync_mappings_for_reimport(
+        &self,
+        repo_id: &str,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            conn.execute(
+                "DELETE FROM sync_records WHERE repo_id = ?1",
+                params![repo_id],
+            )?;
+            conn.execute(
+                "DELETE FROM commit_map WHERE repo_id = ?1",
+                params![repo_id],
+            )?;
+            crate::echo_receipt_scope::bump_repo_echo_generation_tx(&conn, repo_id)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                info!(
+                    repo_id,
+                    "reset repo sync mappings and bumped echo generation"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     /// Count errors in the last 24 hours for a specific repository.
     pub fn count_errors_for_repo(&self, repo_id: &str) -> Result<i64, DatabaseError> {
         let conn = self.conn();
@@ -2709,9 +2745,16 @@ impl Database {
     /// watermarks, import_progress, etc.) while preserving repository config,
     /// users, sessions, and credentials.
     pub fn clear_sync_data(&self) -> Result<(), DatabaseError> {
+        let repo_ids: Vec<String> = self
+            .list_repositories()?
+            .into_iter()
+            .map(|repo| repo.id)
+            .collect();
         let conn = self.conn();
-        conn.execute_batch(
-            "DELETE FROM commit_map;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            conn.execute_batch(
+                "DELETE FROM commit_map;
              DELETE FROM sync_records;
              DELETE FROM audit_log;
              DELETE FROM conflicts;
@@ -2720,9 +2763,27 @@ impl Database {
              DELETE FROM import_progress;
              DELETE FROM sync_state;
              DELETE FROM kv_state WHERE key LIKE 'last_%' OR key LIKE 'sync_%';",
-        )?;
-        info!("cleared all sync data from database");
-        Ok(())
+            )?;
+            for repo_id in &repo_ids {
+                crate::echo_receipt_scope::bump_repo_echo_generation_tx(&conn, repo_id)?;
+            }
+            crate::echo_receipt_scope::bump_repo_echo_generation_tx(
+                &conn,
+                crate::db::personal_scope::PERSONAL_SCOPE_KEY,
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                info!("cleared all sync data from database");
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     // -- maintenance / retention -----------------------------------------------
@@ -3448,6 +3509,37 @@ mod tests {
 
         let count = db.increment_consecutive_errors("repo1").unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn reset_repo_sync_mappings_for_reimport_bumps_echo_generation() {
+        let db = setup_db();
+        create_test_repo(&db, "pair", "Team Pair");
+        let before = crate::echo_receipt_scope::repo_echo_generation(&db, "pair").unwrap();
+        db.reset_repo_sync_mappings_for_reimport("pair").unwrap();
+        assert_eq!(
+            crate::echo_receipt_scope::repo_echo_generation(&db, "pair").unwrap(),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn clear_sync_data_bumps_personal_echo_generation() {
+        let db = setup_db();
+        let before = crate::echo_receipt_scope::repo_echo_generation(
+            &db,
+            crate::db::personal_scope::PERSONAL_SCOPE_KEY,
+        )
+        .unwrap();
+        db.clear_sync_data().unwrap();
+        assert_eq!(
+            crate::echo_receipt_scope::repo_echo_generation(
+                &db,
+                crate::db::personal_scope::PERSONAL_SCOPE_KEY,
+            )
+            .unwrap(),
+            before + 1
+        );
     }
 
     #[test]
