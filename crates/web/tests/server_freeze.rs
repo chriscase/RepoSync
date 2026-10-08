@@ -8458,6 +8458,113 @@ async fn candidate_r65_managed_remove_remote_deletion_outcomes() {
     mock_handle.abort();
 }
 
+/// #65: a retry after remote delete succeeds must not issue another remote DELETE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_managed_remove_retry_skips_recorded_remote_delete() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let delete_hits = Arc::new(AtomicUsize::new(0));
+    let mock = axum::Router::new().route(
+        "/repos/org/parent/git/refs/heads/feature",
+        axum::routing::delete({
+            let delete_hits = delete_hits.clone();
+            move |_headers: axum::http::HeaderMap| {
+                let delete_hits = delete_hits.clone();
+                async move {
+                    delete_hits.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let mock_handle = tokio::spawn(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-retry-parent";
+    let child_id = "r65-retry-child";
+    let mut parent = fixture_branch_repo(parent_id, "Retry parent", None, "main", "trunk");
+    parent.git_api_url = format!("http://{mock_addr}");
+    parent.git_repo = "org/parent".into();
+    state.db.insert_repository(&parent).unwrap();
+    let mut child = fixture_branch_repo(
+        child_id,
+        "Retry child",
+        Some(parent_id),
+        "feature",
+        "branches/feature",
+    );
+    child.git_api_url = parent.git_api_url.clone();
+    child.git_repo = parent.git_repo.clone();
+    state.db.insert_repository(&child).unwrap();
+    state
+        .db
+        .set_state(&format!("secret_git_token_{child_id}"), "child-only-token")
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    let repos_root = data.join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let outside = tmp.path().join("retry-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let owned = repos_root.join(child_id);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &owned).unwrap();
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&owned).unwrap();
+        server.abort();
+        mock_handle.abort();
+        return;
+    }
+
+    let first = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    let first_status = first.status();
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    assert_eq!(first_status, reqwest::StatusCode::CONFLICT, "{first_body}");
+    assert_eq!(first_body["state"], "failed");
+    assert_eq!(first_body["remote_git"], "deleted");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert!(state.db.get_repository(child_id).unwrap().is_some());
+
+    std::fs::remove_file(&owned).unwrap();
+    std::fs::create_dir_all(owned.join("git-repo")).unwrap();
+    std::fs::write(owned.join("owned.txt"), "owned\n").unwrap();
+
+    let retry = client
+        .post(format!(
+            "{base}/api/repos/{child_id}/remove?explicit_remote_deletion_opts=true&delete_git=true&delete_svn=false"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status(),
+        reqwest::StatusCode::OK,
+        "{}",
+        retry.text().await.unwrap()
+    );
+    let retry_body: serde_json::Value = retry.json().await.unwrap();
+    assert_eq!(retry_body["state"], "completed");
+    assert_eq!(retry_body["remote_git"], "deleted");
+    assert_eq!(delete_hits.load(Ordering::SeqCst), 1);
+    assert!(state.db.get_repository(child_id).unwrap().is_none());
+
+    server.abort();
+    mock_handle.abort();
+}
+
 /// #65: remove → restore → enable → remove must start a new operation and finish removal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r65_remove_restore_enable_remove_cycle() {

@@ -918,14 +918,31 @@ async fn remove_repo(
         }
     };
 
-    use reposync_core::db::managed_remove::ManagedRemoveRemoteOutcome;
-    let mut remote_outcome = ManagedRemoveRemoteOutcome::untouched();
+    use reposync_core::db::managed_remove::{
+        remote_branch_delete_already_applied, ManagedRemoveRemoteOutcome,
+    };
+    let mut remote_outcome = ManagedRemoveRemoteOutcome {
+        remote_git: if operation.remote_git.is_empty() {
+            "untouched".into()
+        } else {
+            operation.remote_git.clone()
+        },
+        remote_svn: if operation.remote_svn.is_empty() {
+            "untouched".into()
+        } else {
+            operation.remote_svn.clone()
+        },
+    };
     if opts.explicit_remote_deletion_opts {
         let (delete_git, delete_svn) = remote_deletion_flags(
             opts.explicit_remote_deletion_opts,
             opts.delete_git,
             opts.delete_svn,
         );
+        let delete_git =
+            delete_git && !remote_branch_delete_already_applied(&remote_outcome.remote_git);
+        let delete_svn =
+            delete_svn && !remote_branch_delete_already_applied(&remote_outcome.remote_svn);
         if delete_git || delete_svn {
             let repo = state
                 .db
@@ -954,8 +971,12 @@ async fn remove_repo(
                     &state.db, &parent, &repo, delete_git, delete_svn,
                 )
                 .await;
-                remote_outcome.remote_git = deletion.remote_git;
-                remote_outcome.remote_svn = deletion.remote_svn;
+                if delete_git {
+                    remote_outcome.remote_git = deletion.remote_git;
+                }
+                if delete_svn {
+                    remote_outcome.remote_svn = deletion.remote_svn;
+                }
                 if remote_outcome.remote_git == "failed" || remote_outcome.remote_svn == "failed" {
                     let detail = if deletion.warnings.is_empty() {
                         "requested remote deletion failed".into()

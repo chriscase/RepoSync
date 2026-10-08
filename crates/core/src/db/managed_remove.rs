@@ -874,8 +874,95 @@ fn retire_managed_remove_completion_pointer(
     Ok(())
 }
 
-fn tombstone_synced_baseline(tombstone: &RemovalTombstone) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TombstoneBaselineRestore {
+    /// Tombstone cursors are proven and scoped SVN state is absent or matches.
+    Verified,
+    /// Tombstone columns disagree with a surviving scoped SVN cursor; do not overwrite kv.
+    SplitScopedSvnCursor,
+    /// Tombstone cursors are not proven; restore registration without adopting sync proof.
+    Pending,
+}
+
+fn tombstone_has_sync_cursor(tombstone: &RemovalTombstone) -> bool {
     tombstone.last_svn_rev > 0 && !tombstone.last_git_sha.is_empty()
+}
+
+fn scoped_svn_rev(tx: &Connection, repo_id: &str) -> Result<Option<i64>, DatabaseError> {
+    Ok(read_value(tx, &format!("last_svn_rev_{repo_id}"))?
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|rev| *rev > 0))
+}
+
+fn tombstone_baseline_proven(
+    tx: &Connection,
+    repo_id: &str,
+    svn_rev: i64,
+    git_sha: &str,
+) -> Result<bool, DatabaseError> {
+    let commit_map: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3",
+        params![repo_id, svn_rev, git_sha],
+        |row| row.get(0),
+    )?;
+    if commit_map > 0 {
+        return Ok(true);
+    }
+    let sync_records: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND status='applied'",
+        params![repo_id, svn_rev, git_sha],
+        |row| row.get(0),
+    )?;
+    if sync_records > 0 {
+        return Ok(true);
+    }
+    if let Some(latest_id) = read_value(tx, &format!("import_operation_v1:latest:{repo_id}"))? {
+        if let Some(raw) = read_value(tx, &format!("import_operation_v1:document:{latest_id}"))? {
+            let op: crate::db::import_operations::ImportOperation = serde_json::from_str(&raw)
+                .map_err(|error| {
+                    DatabaseError::Other(format!("invalid import operation document: {error}"))
+                })?;
+            if op.repo_id == repo_id
+                && op.state == crate::db::import_operations::ImportOperationState::Completed
+                && op.last_confirmed_svn_rev == Some(svn_rev)
+                && op.last_confirmed_git_sha.as_deref() == Some(git_sha)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn classify_tombstone_baseline_restore(
+    tx: &Connection,
+    repo_id: &str,
+    tombstone: &RemovalTombstone,
+) -> Result<TombstoneBaselineRestore, DatabaseError> {
+    if !tombstone_has_sync_cursor(tombstone) {
+        return Ok(TombstoneBaselineRestore::Pending);
+    }
+    let scoped = scoped_svn_rev(tx, repo_id)?;
+    if scoped.is_some_and(|rev| rev != tombstone.last_svn_rev) {
+        return Ok(TombstoneBaselineRestore::SplitScopedSvnCursor);
+    }
+    if tombstone_baseline_proven(tx, repo_id, tombstone.last_svn_rev, &tombstone.last_git_sha)? {
+        Ok(TombstoneBaselineRestore::Verified)
+    } else {
+        Ok(TombstoneBaselineRestore::Pending)
+    }
+}
+
+pub fn remote_branch_delete_already_applied(status: &str) -> bool {
+    status == "deleted"
+}
+
+fn merge_remote_branch_outcome(existing: &str, incoming: &str) -> String {
+    if remote_branch_delete_already_applied(existing) {
+        existing.to_string()
+    } else {
+        incoming.to_string()
+    }
 }
 
 fn store_op(conn: &Connection, op: &ManagedRemoveOperation) -> Result<(), DatabaseError> {
@@ -1189,8 +1276,8 @@ impl Database {
                 ));
             }
             if let Some(remote) = remote {
-                op.remote_git = remote.remote_git.clone();
-                op.remote_svn = remote.remote_svn.clone();
+                op.remote_git = merge_remote_branch_outcome(&op.remote_git, &remote.remote_git);
+                op.remote_svn = merge_remote_branch_outcome(&op.remote_svn, &remote.remote_svn);
             }
             op.state = ManagedRemoveState::Failed;
             op.outcome_detail = Some(detail.into());
@@ -1368,7 +1455,16 @@ impl Database {
                 ));
             }
             let now = Utc::now().to_rfc3339();
-            let re_adopt_sync = tombstone_synced_baseline(&tombstone);
+            let baseline_restore = classify_tombstone_baseline_restore(tx, repo_id, &tombstone)?;
+            let adopt_verified_baseline = baseline_restore == TombstoneBaselineRestore::Verified;
+            let (last_svn_rev, last_git_sha, last_sync_at) = match baseline_restore {
+                TombstoneBaselineRestore::Verified | TombstoneBaselineRestore::SplitScopedSvnCursor => (
+                    tombstone.last_svn_rev,
+                    tombstone.last_git_sha.clone(),
+                    tombstone.last_sync_at.clone(),
+                ),
+                TombstoneBaselineRestore::Pending => (0, String::new(), None),
+            };
             let restored = Repository {
                 id: tombstone.repo_id.clone(),
                 name: tombstone.name.clone(),
@@ -1392,21 +1488,9 @@ impl Database {
                     tombstone.created_at.clone()
                 },
                 updated_at: now.clone(),
-                last_svn_rev: if re_adopt_sync {
-                    tombstone.last_svn_rev
-                } else {
-                    0
-                },
-                last_git_sha: if re_adopt_sync {
-                    tombstone.last_git_sha.clone()
-                } else {
-                    String::new()
-                },
-                last_sync_at: if re_adopt_sync {
-                    tombstone.last_sync_at.clone()
-                } else {
-                    None
-                },
+                last_svn_rev,
+                last_git_sha,
+                last_sync_at,
                 sync_status: "idle".into(),
                 total_syncs: tombstone.total_syncs,
                 total_errors: tombstone.total_errors,
@@ -1450,7 +1534,7 @@ impl Database {
                 ],
             )?;
             restore_scoped_secrets_from_tombstone(tx, &enc_key, repo_id, &tombstone)?;
-            if re_adopt_sync {
+            if adopt_verified_baseline {
                 write_value(
                     tx,
                     &format!("last_svn_rev_{repo_id}"),
@@ -1463,7 +1547,7 @@ impl Database {
                 {
                     write_value(tx, &format!("last_git_sha_{repo_id}"), inbound)?;
                 }
-            } else {
+            } else if baseline_restore == TombstoneBaselineRestore::Pending {
                 for scoped_key in [
                     format!("last_git_sha_{repo_id}"),
                     format!("last_svn_rev_{repo_id}"),
@@ -2315,6 +2399,156 @@ mod tests {
     }
 
     #[test]
+    fn restore_split_scoped_svn_cursor_stays_quarantined() {
+        let db = setup();
+        let repo_id = "split-restore";
+        let mut split = repo(repo_id, "Split", None);
+        split.last_svn_rev = 2;
+        split.last_git_sha = SYNCED_GIT_SHA.into();
+        split.last_sync_at = Some("2026-01-02T00:00:00Z".into());
+        db.insert_repository(&split).unwrap();
+        db.set_state(&format!("last_svn_rev_{repo_id}"), "3")
+            .unwrap();
+        assert!(matches!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::ReconciliationRequired {
+                reason,
+                ..
+            } if reason == "conflicting_import_checkpoint"
+        ));
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (1, 'abc', 'svn_to_git', 't', 'a', 'b', ?1)",
+                [repo_id],
+            )
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        crate::managed_remove::remove_owned_repo_tree(tempfile::tempdir().unwrap().path(), repo_id)
+            .unwrap();
+        db.complete_managed_remove(
+            repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+
+        let RestoreAdvance::Restored { repo: restored } =
+            db.restore_managed_registration(repo_id).unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert_eq!(restored.last_svn_rev, 2);
+        assert_eq!(restored.last_git_sha, SYNCED_GIT_SHA);
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}"))
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+        assert!(matches!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::ReconciliationRequired {
+                reason,
+                ..
+            } if reason == "conflicting_import_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn restore_unproven_tombstone_cursor_does_not_adopt_baseline() {
+        let db = setup();
+        let repo_id = "unproven-restore";
+        let mut unproven = repo(repo_id, "Unproven", None);
+        unproven.last_svn_rev = 4;
+        unproven.last_git_sha = SYNCED_GIT_SHA.into();
+        db.insert_repository(&unproven).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (1, 'abc', 'svn_to_git', 't', 'a', 'b', ?1)",
+                [repo_id],
+            )
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        crate::managed_remove::remove_owned_repo_tree(tempfile::tempdir().unwrap().path(), repo_id)
+            .unwrap();
+        db.complete_managed_remove(
+            repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+
+        let RestoreAdvance::Restored { repo: restored } =
+            db.restore_managed_registration(repo_id).unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert_eq!(restored.last_svn_rev, 0);
+        assert!(restored.last_git_sha.is_empty());
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::Pending
+        );
+    }
+
+    #[test]
+    fn restore_missing_scoped_without_proof_stays_pending() {
+        let db = setup();
+        let repo_id = "missing-scoped";
+        let mut row = repo(repo_id, "Missing scoped", None);
+        row.last_svn_rev = 4;
+        row.last_git_sha = SYNCED_GIT_SHA.into();
+        db.insert_repository(&row).unwrap();
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
+            None
+        );
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        crate::managed_remove::remove_owned_repo_tree(tempfile::tempdir().unwrap().path(), repo_id)
+            .unwrap();
+        db.complete_managed_remove(
+            repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+
+        let RestoreAdvance::Restored { repo: restored } =
+            db.restore_managed_registration(repo_id).unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert_eq!(restored.last_svn_rev, 0);
+        assert!(restored.last_git_sha.is_empty());
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::Pending
+        );
+    }
+
+    #[test]
     fn remote_progress_survives_owned_cleanup_failure() {
         let db = setup();
         let repo_id = "remote-then-cleanup-fail";
@@ -2355,6 +2589,52 @@ mod tests {
         assert_eq!(failed.remote_git, "deleted");
         assert_eq!(failed.remote_svn, "untouched");
         assert!(db.get_repository(repo_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn retry_after_remote_deleted_does_not_downgrade_outcome() {
+        let db = setup();
+        let repo_id = "retry-remote-deleted";
+        let r = repo(repo_id, "Retry", None);
+        db.insert_repository(&r).unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        let remote = ManagedRemoveRemoteOutcome {
+            remote_git: "deleted".into(),
+            remote_svn: "untouched".into(),
+        };
+        db.record_managed_remove_remote_progress(repo_id, &operation.id, &remote)
+            .unwrap();
+        let failed = db
+            .fail_managed_remove_with_remote(
+                repo_id,
+                &operation.id,
+                "cleanup failed",
+                Some(&remote),
+            )
+            .unwrap();
+        assert_eq!(failed.remote_git, "deleted");
+
+        let RemovalAdvance::Cleanup { operation: retry } = db
+            .prepare_managed_remove(repo_id, "admin", "req-retry")
+            .unwrap()
+        else {
+            panic!("expected retry cleanup");
+        };
+        assert_eq!(retry.id, operation.id);
+        assert_eq!(retry.remote_git, "deleted");
+
+        let worse = ManagedRemoveRemoteOutcome {
+            remote_git: "failed".into(),
+            remote_svn: "untouched".into(),
+        };
+        let merged = db
+            .fail_managed_remove_with_remote(repo_id, &retry.id, "would downgrade", Some(&worse))
+            .unwrap();
+        assert_eq!(merged.remote_git, "deleted");
     }
 
     #[test]
