@@ -10,6 +10,7 @@ This is the smallest product slice of issue #65. It does **not** close #65 or #6
 | Explicit disable | `POST /api/repos/{id}/disable` | Same contract as legacy DELETE for new UI clients. Adds `preservation`, `remote_git`, `remote_svn`, and `managed_removal: false`. |
 | Managed removal | `POST /api/repos/{id}/remove` | Explicit and additive. Uses the v12 `kv_state` journal `managed_remove_v1:` (same storage family as #64 import and Git→SVN journals). Schema stays v12. |
 | Removal status | `GET /api/repos/{id}/removal` | Read-only state. Does not delete anything. Returns `operation_id`, `partial_cleanup` on failure/hold, and `recovery` tombstone metadata when present. |
+| Removal dependency preview | `GET /api/repos/{id}/removal/preview` | Read-only. Lists parent/child registrations, per-repo and global credentials (what would be deleted vs preserved), managed local path `repos/{id}`, sibling paths left intact, and other registrations sharing the same Git remote. When a managed removal is already active, HTTP status mirrors that operation (`202` while waiting, `409` on `reconciliation_required` or parent blocked) and includes `active_removal`. |
 | Branch-pair remote delete | `DELETE /api/repos/{id}/branch-pair` | Legacy callers omitting `delete_git` / `delete_svn` still default both to **true**. New UI sends `explicit_remote_deletion_opts=true` with explicit `delete_git` / `delete_svn` (default **false** when omitted). |
 
 Managed removal:
@@ -17,19 +18,20 @@ Managed removal:
 1. Records a durable operation and disables the row before any local delete.
 2. If a non-terminal import or Git→SVN commit is active, or either journal is `reconciliation_required`, it does **not** delete files or secrets. Imports are cancel-requested. The response is `cancelling` (HTTP 202) or `reconciliation_required` (HTTP 409), with `ok: false`.
 3. If this process still holds the repository busy lock, or in-memory import progress is non-terminal, cleanup waits the same way.
-4. Parent removal is refused while child registration rows exist. Children are not cascaded. A dependency preview is a later slice.
-5. After writers are quiet, cleanup deletes only `{data_dir}/repos/{id}` when that path is a direct real child of the managed root, plus the exact keys `secret_svn_password_{id}` and `secret_git_token_{id}`.
-6. On full success the repository row is removed from active listings, a tombstone is kept, and the response is `completed` with `ok: true`. Commit-map rows, audit rows, per-repo watermark keys, and remote Git/SVN history are kept.
-7. Symlink roots, traversal, and escapes fail the cleanup. `ok` stays false, `state` is `failed`, and the same POST retries. Repeated calls and a completed tombstone do not recreate the registration. Restore is **not** supported.
+4. Parent removal is refused while child registration rows exist (HTTP 409, `state: blocked`, full `dependency_preview`). Children are not cascaded.
+5. Child removal deletes only that registration's per-repo secret keys (`secret_svn_password_{id}`, `secret_git_token_{id}`) and `repos/{id}`; parent, sibling, and global credentials and trees are preserved.
+6. After writers are quiet, cleanup deletes only `{data_dir}/repos/{id}` when that path is a direct real child of the managed root, plus the exact per-repo secret keys above.
+7. On full success the repository row is removed from active listings, a tombstone is kept, and the response is `completed` with `ok: true`. Commit-map rows, audit rows, per-repo watermark keys, and remote Git/SVN history are kept.
+8. Symlink roots, traversal, and escapes fail the cleanup. `ok` stays false, `state` is `failed`, and the same POST retries. Repeated calls and a completed tombstone do not recreate the registration. Restore is **not** supported.
 
 `remote_git` and `remote_svn` in the removal response are `untouched`. This slice does not delete remote branches or SVN paths.
 
 ## Still later
 
-- Rich parent/child dependency preview (UI shows child count; API still refuses parent removal)
 - Optional authenticated remote Git-ref / SVN-path deletion beyond branch-pair delete
+- Full trash/restore product (tombstone metadata only today)
 - Closing #65
 
 ## Tests
 
-Named cases are in `docs/reliability/required-cases.json` under R02: `R02_LEGACY_DELETE`, `R02_MANAGED_REMOVE`, `R02_REMOVE_RETRY`, `R02_PATH_CONFINEMENT`, and `R02_JOURNAL_RETRY`, plus the existing `R02_R03_ROUTE` disable assertion.
+Named cases are in `docs/reliability/required-cases.json` under R02: `R02_LEGACY_DELETE`, `R02_MANAGED_REMOVE`, `R02_REMOVE_RETRY`, `R02_PATH_CONFINEMENT`, and `R02_JOURNAL_RETRY`, plus RS-16 / dependency cases `R65_*`, and the existing `R02_R03_ROUTE` disable assertion.

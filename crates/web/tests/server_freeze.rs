@@ -5352,12 +5352,20 @@ async fn candidate_r02_managed_remove_preserves_remotes_and_owned_local_only() {
         .send()
         .await
         .unwrap();
+    let blocked_status = blocked.status();
+    let blocked_body: serde_json::Value = blocked.json().await.unwrap();
     assert_eq!(
-        blocked.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "{}",
-        blocked.text().await.unwrap()
+        blocked_status,
+        reqwest::StatusCode::CONFLICT,
+        "{blocked_body}"
     );
+    assert_eq!(blocked_body["state"], "blocked");
+    assert_eq!(blocked_body["parent_removal_blocked"], true);
+    assert!(blocked_body["dependency_preview"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == child.id));
     assert!(owned.join("git-repo").join("owned.txt").exists());
     assert_eq!(remote_snapshot(&svn_repo, &git_bare), before);
     state
@@ -7641,12 +7649,13 @@ async fn candidate_r65_explicit_disable_matches_legacy_delete() {
     let (addr, state, server, _tmp) = build_test_server_full().await;
     let client = authed_client();
     let base = format!("http://{addr}");
-    let id = "r65-disable-root";
+    let explicit_id = "r65-disable-explicit";
+    let legacy_id = "r65-disable-legacy";
     state
         .db
         .insert_repository(&fixture_branch_repo(
-            id,
-            "Disable root",
+            explicit_id,
+            "Disable explicit",
             None,
             "main",
             "trunk",
@@ -7654,11 +7663,25 @@ async fn candidate_r65_explicit_disable_matches_legacy_delete() {
         .unwrap();
     state
         .db
-        .set_state(&format!("secret_svn_password_{id}"), "secret")
+        .insert_repository(&fixture_branch_repo(
+            legacy_id,
+            "Disable legacy",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{explicit_id}"), "secret")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{legacy_id}"), "secret")
         .unwrap();
 
     let disable = client
-        .post(format!("{base}/api/repos/{id}/disable"))
+        .post(format!("{base}/api/repos/{explicit_id}/disable"))
         .send()
         .await
         .unwrap();
@@ -7667,18 +7690,372 @@ async fn candidate_r65_explicit_disable_matches_legacy_delete() {
     assert_eq!(body["action"], "disable");
     assert_eq!(body["managed_removal"], false);
     assert_eq!(body["remote_git"], "untouched");
-    assert!(state.db.managed_removal(id).unwrap().is_none());
+    assert_eq!(body["enabled"], false);
+    assert!(
+        !state
+            .db
+            .get_repository(explicit_id)
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+
+    let legacy = client
+        .delete(format!("{base}/api/repos/{legacy_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), reqwest::StatusCode::OK);
+    let legacy_body: serde_json::Value = legacy.json().await.unwrap();
+    assert_eq!(legacy_body["action"], "disable");
+    assert_eq!(legacy_body["enabled"], false);
+    assert!(!state.db.get_repository(legacy_id).unwrap().unwrap().enabled);
+
     assert_eq!(
         state
             .db
-            .get_state(&format!("secret_svn_password_{id}"))
+            .get_repository(explicit_id)
+            .unwrap()
+            .unwrap()
+            .enabled,
+        state.db.get_repository(legacy_id).unwrap().unwrap().enabled
+    );
+    assert!(state.db.managed_removal(explicit_id).unwrap().is_none());
+    assert!(state.db.managed_removal(legacy_id).unwrap().is_none());
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("secret_svn_password_{explicit_id}"))
             .unwrap()
             .as_deref(),
         Some("secret")
     );
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
-        serde_json::json!({"case": "R65_EXPLICIT_DISABLE", "managed_journal": false})
+        serde_json::json!({
+            "case": "R65_EXPLICIT_DISABLE",
+            "managed_journal": false,
+            "enabled_matches_legacy_delete": true
+        })
+    );
+    server.abort();
+}
+
+/// #65 dependency preview: parent removal refused with structured preview (HTTP 409).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_removal_preview_parent_blocked_with_children() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-prev-parent";
+    let child_id = "r65-prev-child";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Preview parent",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_id,
+            "Preview child",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+
+    let preview = client
+        .get(format!("{base}/api/repos/{parent_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), reqwest::StatusCode::OK);
+    let preview_body: serde_json::Value = preview.json().await.unwrap();
+    assert_eq!(preview_body["action"], "removal_preview");
+    assert_eq!(
+        preview_body["dependency_preview"]["parent_removal_blocked"],
+        true
+    );
+    assert_eq!(
+        preview_body["dependency_preview"]["children"][0]["id"],
+        child_id
+    );
+
+    let remove = client
+        .post(format!("{base}/api/repos/{parent_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove.status(), reqwest::StatusCode::CONFLICT);
+    let remove_body: serde_json::Value = remove.json().await.unwrap();
+    assert_eq!(remove_body["state"], "blocked");
+    assert!(remove_body["dependency_preview"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == child_id));
+    assert!(state.db.get_repository(parent_id).unwrap().unwrap().enabled);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_REMOVAL_PREVIEW_PARENT", "http": 409, "preview": true})
+    );
+    server.abort();
+}
+
+/// #65: child removal must not delete a parent's per-repo credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_child_removal_preserves_parent_shared_credential() {
+    let (addr, state, server, tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-cred-parent";
+    let child_id = "r65-cred-child";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Cred parent",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_id,
+            "Cred child",
+            Some(parent_id),
+            "feature",
+            "branches/feature",
+        ))
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{parent_id}"), "shared-secret")
+        .unwrap();
+    state
+        .db
+        .set_state(&format!("secret_svn_password_{child_id}"), "shared-secret")
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    std::fs::create_dir_all(data.join("repos").join(parent_id)).unwrap();
+    std::fs::create_dir_all(data.join("repos").join(child_id)).unwrap();
+    std::fs::write(data.join("repos").join(parent_id).join("keep.txt"), "p\n").unwrap();
+    std::fs::write(data.join("repos").join(child_id).join("gone.txt"), "c\n").unwrap();
+
+    let removed = client
+        .post(format!("{base}/api/repos/{child_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::OK);
+    assert!(state.db.get_repository(child_id).unwrap().is_none());
+    assert!(state.db.get_repository(parent_id).unwrap().is_some());
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("secret_svn_password_{parent_id}"))
+            .unwrap()
+            .as_deref(),
+        Some("shared-secret")
+    );
+    assert!(state
+        .db
+        .get_state(&format!("secret_svn_password_{child_id}"))
+        .unwrap()
+        .is_none());
+    assert!(!data.join("repos").join(child_id).exists());
+    assert!(data.join("repos").join(parent_id).join("keep.txt").exists());
+
+    let child2_id = "r65-cred-child2";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child2_id,
+            "Cred child symlink",
+            Some(parent_id),
+            "feature2",
+            "branches/feature2",
+        ))
+        .unwrap();
+    let outside = tmp.path().join("outside-secret");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "safe\n").unwrap();
+    let _ = std::os::unix::fs::symlink(&outside, data.join("repos").join(child2_id));
+    let symlink_remove = client
+        .post(format!("{base}/api/repos/{child2_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(symlink_remove.status(), reqwest::StatusCode::CONFLICT);
+    assert!(state.db.get_repository(child2_id).unwrap().is_some());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "safe\n"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_CHILD_SHARED_CREDENTIAL", "parent_secret": "kept"})
+    );
+    server.abort();
+}
+
+/// #65: removing one child must not delete a sibling's owned local tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_child_removal_preserves_sibling_local_path() {
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let parent_id = "r65-sib-parent";
+    let child_a = "r65-sib-a";
+    let child_b = "r65-sib-b";
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            parent_id,
+            "Sibling parent",
+            None,
+            "main",
+            "trunk",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_a,
+            "Sibling A",
+            Some(parent_id),
+            "feature-a",
+            "branches/a",
+        ))
+        .unwrap();
+    state
+        .db
+        .insert_repository(&fixture_branch_repo(
+            child_b,
+            "Sibling B",
+            Some(parent_id),
+            "feature-b",
+            "branches/b",
+        ))
+        .unwrap();
+    let data = state.config.daemon.data_dir.clone();
+    for id in [parent_id, child_a, child_b] {
+        std::fs::create_dir_all(data.join("repos").join(id)).unwrap();
+        std::fs::write(
+            data.join("repos").join(id).join("data.txt"),
+            format!("{id}\n"),
+        )
+        .unwrap();
+    }
+
+    let removed = client
+        .post(format!("{base}/api/repos/{child_a}/remove"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), reqwest::StatusCode::OK);
+    assert!(!data.join("repos").join(child_a).exists());
+    assert_eq!(
+        std::fs::read_to_string(data.join("repos").join(child_b).join("data.txt")).unwrap(),
+        format!("{child_b}\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(data.join("repos").join(parent_id).join("data.txt")).unwrap(),
+        format!("{parent_id}\n")
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case": "R65_CHILD_SIBLING_PATH", "sibling_tree": "kept"})
+    );
+    server.abort();
+}
+
+/// #65: removal preview surfaces active managed removal as HTTP 202 or 409.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r65_removal_preview_reports_202_or_409_for_active_removal() {
+    use reposync_core::db::import_operations::ImportOperationState;
+
+    let (addr, state, server, _tmp) = build_test_server_full().await;
+    let client = authed_client();
+    let base = format!("http://{addr}");
+    let reconcile_id = "r65-preview-recon";
+    let cancelling_id = "r65-preview-cancel";
+    for (id, label) in [(reconcile_id, "Recon"), (cancelling_id, "Cancel")] {
+        state
+            .db
+            .insert_repository(&fixture_branch_repo(id, label, None, "main", "trunk"))
+            .unwrap();
+    }
+    state
+        .db
+        .create_import_operation(reconcile_id, "admin", "held-import", "fp")
+        .unwrap();
+    let active = state
+        .db
+        .active_import_operation(reconcile_id)
+        .unwrap()
+        .unwrap();
+    state
+        .db
+        .finish_import_operation(
+            reconcile_id,
+            &active.id,
+            ImportOperationState::ReconciliationRequired,
+            "fixture held import",
+        )
+        .unwrap();
+    state
+        .db
+        .create_import_operation(cancelling_id, "admin", "running-import", "fp2")
+        .unwrap();
+
+    client
+        .post(format!("{base}/api/repos/{reconcile_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base}/api/repos/{cancelling_id}/remove"))
+        .send()
+        .await
+        .unwrap();
+
+    let recon_preview = client
+        .get(format!("{base}/api/repos/{reconcile_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recon_preview.status(), reqwest::StatusCode::CONFLICT);
+    let recon_body: serde_json::Value = recon_preview.json().await.unwrap();
+    assert_eq!(
+        recon_body["active_removal"]["state"],
+        "reconciliation_required"
+    );
+    assert!(recon_body["dependency_preview"].is_object());
+
+    let cancel_preview = client
+        .get(format!("{base}/api/repos/{cancelling_id}/removal/preview"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel_preview.status(), reqwest::StatusCode::ACCEPTED);
+    let cancel_body: serde_json::Value = cancel_preview.json().await.unwrap();
+    assert_eq!(cancel_body["active_removal"]["state"], "cancelling");
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "R65_REMOVAL_PREVIEW_STATUS",
+            "reconciliation_http": 409,
+            "cancelling_http": 202
+        })
     );
     server.abort();
 }

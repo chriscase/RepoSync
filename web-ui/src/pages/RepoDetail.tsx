@@ -395,6 +395,14 @@ export default function RepoDetail() {
     },
   });
 
+  const removalPreviewQuery = useQuery({
+    queryKey: ['removal-preview', id],
+    queryFn: () => api.getRemovalDependencyPreview(id!),
+    enabled: !!id && isAdmin && showRemoveConfirm && !repo?.parent_id && detailLive,
+    retry: false,
+  });
+  const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
+
   const removalStatusQuery = useQuery<ManagedRemovalStatus | null>({
     queryKey: ['managed-removal', id],
     queryFn: () => api.getManagedRemoval(id!),
@@ -1788,9 +1796,70 @@ export default function RepoDetail() {
               Remove <span className="font-semibold text-gray-200">{repo.name}</span> from active listings and
               clean only RepoSync-owned local data. Remote Git and SVN history are not deleted. Restore is not supported.
             </p>
-            {(branchPairs?.length ?? 0) > 0 && (
-              <p className="text-sm text-amber-300 mb-4" data-testid="child-dependency-refusal-preview">
-                {branchPairs!.length} child branch pair(s) must be removed first; parent removal does not cascade.
+            {removalDependencyPreview && (
+              <div
+                className="text-sm text-gray-300 mb-4 space-y-2 border border-gray-600 rounded-lg p-3 bg-gray-900/40"
+                data-testid="managed-removal-dependency-preview"
+              >
+                {removalDependencyPreview.parent_removal_blocked && (
+                  <p className="text-amber-300" data-testid="child-dependency-refusal-preview">
+                    {removalDependencyPreview.block_reason}
+                  </p>
+                )}
+                {removalDependencyPreview.children.length > 0 && (
+                  <div>
+                    <p className="text-gray-400 font-medium">Child branch pairs</p>
+                    <ul className="list-disc list-inside text-gray-300">
+                      {removalDependencyPreview.children.map((child) => (
+                        <li key={child.id}>
+                          {child.name} ({child.git_branch} / {child.svn_branch})
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {removalDependencyPreview.credentials.length > 0 && (
+                  <div>
+                    <p className="text-gray-400 font-medium">Credentials</p>
+                    <ul className="list-disc list-inside text-gray-300 text-xs font-mono">
+                      {removalDependencyPreview.credentials.map((cred) => (
+                        <li key={cred.key}>
+                          {cred.key} — {cred.action}
+                          {cred.retained_for_repo_ids.length > 0
+                            ? ` (other registrations keep their own keys: ${cred.retained_for_repo_ids.join(', ')})`
+                            : ''}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <p className="text-gray-400 text-xs">
+                  Local path removed: <span className="font-mono text-gray-200">{removalDependencyPreview.managed_local_path}</span>
+                  {removalDependencyPreview.sibling_local_paths_preserved.length > 0 && (
+                    <>
+                      {' '}
+                      · preserved:{' '}
+                      {removalDependencyPreview.sibling_local_paths_preserved.join(', ')}
+                    </>
+                  )}
+                </p>
+                {removalDependencyPreview.shared_git_registrations.length > 0 && (
+                  <div>
+                    <p className="text-gray-400 font-medium">Shared remote registrations</p>
+                    <ul className="list-disc list-inside text-gray-300 text-xs">
+                      {removalDependencyPreview.shared_git_registrations.map((other) => (
+                        <li key={other.id}>
+                          {other.name} ({other.relationship})
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+            {removalPreviewQuery.isError && (
+              <p className="text-sm text-red-300 mb-4">
+                Could not load dependency preview: {removalPreviewQuery.error?.message}
               </p>
             )}
             {removeMutation.isError && (
@@ -1808,7 +1877,11 @@ export default function RepoDetail() {
               <button
                 data-testid="confirm-remove-from-reposync"
                 onClick={() => removeMutation.mutate()}
-                disabled={removeMutation.isPending || (branchPairs?.length ?? 0) > 0}
+                disabled={
+                  removeMutation.isPending
+                  || removalDependencyPreview?.parent_removal_blocked
+                  || (removalDependencyPreview == null && (branchPairs?.length ?? 0) > 0)
+                }
                 className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 {removeMutation.isPending ? 'Removing…' : 'Remove from RepoSync'}
