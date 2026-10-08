@@ -302,7 +302,7 @@ mod tests {
         let db = setup_db();
         bump_repo_echo_generation(&db, "pair").unwrap();
         db.set_state(
-            &format!("handled_svn_no_target_pair_3"),
+            "handled_svn_no_target_pair_3",
             &serde_json::json!({
                 "version": 1,
                 "repo_id": "pair",
