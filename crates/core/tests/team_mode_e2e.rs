@@ -13898,8 +13898,8 @@ async fn candidate_rsc02_ambiguous_null_repo_id_surfaces_row_ids() {
     match result {
         Err(SyncError::UnresolvableConflict { detail, .. }) => {
             assert!(
-                detail.contains("unattributed legacy conflict row id(s): legacy-null"),
-                "ambiguous NULL row must name id for operators, got {detail:?}"
+                detail.contains("id=legacy-null") && detail.contains("path=orphan.txt"),
+                "ambiguous NULL row must name id and path for operators, got {detail:?}"
             );
         }
         other => panic!("NULL row with ambiguous ownership must block, got {other:?}"),

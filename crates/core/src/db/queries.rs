@@ -379,6 +379,12 @@ impl Database {
         super::conflict_repo_attribution::unattributed_null_conflict_ids(&self.conn())
     }
 
+    pub fn unattributed_null_conflict_rows_blocking_apply(
+        &self,
+    ) -> Result<Vec<(String, String)>, DatabaseError> {
+        super::conflict_repo_attribution::unattributed_null_conflict_rows(&self.conn())
+    }
+
     pub fn count_conflicts_blocking_apply_for_repo(
         &self,
         repo_id: &str,

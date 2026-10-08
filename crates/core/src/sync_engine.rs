@@ -2440,9 +2440,9 @@ impl SyncEngine {
             .db
             .attribute_null_conflict_repo_ids()
             .map_err(SyncError::DatabaseError)?;
-        let unattributed = self
+        let unattributed_rows = self
             .db
-            .unattributed_null_conflict_ids_blocking_apply()
+            .unattributed_null_conflict_rows_blocking_apply()
             .map_err(SyncError::DatabaseError)?;
         let (count, file_path) = match self.effective_repo_id() {
             Some(rid) => {
@@ -2475,12 +2475,16 @@ impl SyncEngine {
         if count == 0 {
             return Ok(());
         }
-        let legacy_hint = if unattributed.is_empty() {
+        let legacy_hint = if unattributed_rows.is_empty() {
             String::new()
         } else {
+            let described = unattributed_rows
+                .iter()
+                .map(|(id, path)| format!("id={id} path={path}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "; unattributed legacy conflict row id(s): {} (set conflicts.repo_id for the owning repository or dismiss the row)",
-                unattributed.join(", ")
+                "; unattributed legacy conflict row(s): {described} (set conflicts.repo_id to the owning repository id or dismiss each row)"
             )
         };
         Err(SyncError::UnresolvableConflict {

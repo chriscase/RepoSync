@@ -1,7 +1,7 @@
 //! Backfill `conflicts.repo_id` for legacy NULL rows when ownership is certain.
 //!
 //! Rows that remain NULL still block every scoped engine; callers surface their
-//! ids in apply-gate errors so operators can dismiss or attribute them manually.
+//! ids and paths in apply-gate errors so operators can dismiss or attribute them.
 
 use rusqlite::{params, Connection};
 
@@ -11,18 +11,22 @@ const BLOCKING_STATUS_SQL: &str = "status NOT IN ('resolved', 'dismissed')";
 
 /// Run safe attribution for NULL `repo_id` conflict rows.
 ///
-/// Rules (each row is considered only while `repo_id IS NULL` and blocking):
-/// 1. Exactly one row in `repositories` → assign that id.
-/// 2. Exactly one distinct non-NULL `repo_id` among other conflicts with the same
-///    `file_path` → assign that id.
+/// The only certain case is exactly one row in `repositories`: all blocking NULL
+/// rows receive that id. Multi-repo databases never infer ownership from
+/// `file_path` or sibling rows (branch pairs share paths; deleted pairs leave
+/// orphan scoped siblings).
 ///
-/// Ambiguous or unknown rows are left NULL and continue to block all scoped engines.
+/// Idempotent: safe to call on every init and before each apply gate.
 pub fn attribute_null_conflict_repo_ids(conn: &Connection) -> Result<usize, DatabaseError> {
-    let repo_count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |r| r.get(0))?;
-    let mut attributed = 0usize;
-    if repo_count == 1 {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let repo_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count != 1 {
+            return Ok(0usize);
+        }
         let sole: String =
-            conn.query_row("SELECT id FROM repositories LIMIT 1", [], |r| r.get(0))?;
+            conn.query_row("SELECT id FROM repositories LIMIT 1", [], |row| row.get(0))?;
         let changed = conn.execute(
             &format!(
                 "UPDATE conflicts SET repo_id = ?1
@@ -30,46 +34,18 @@ pub fn attribute_null_conflict_repo_ids(conn: &Connection) -> Result<usize, Data
             ),
             params![sole],
         )?;
-        attributed += changed;
-        if changed > 0 {
-            return Ok(attributed);
+        Ok(changed)
+    })();
+    match result {
+        Ok(changed) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(changed)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
         }
     }
-
-    let null_ids: Vec<String> = conn
-        .prepare(&format!(
-            "SELECT id FROM conflicts
-                 WHERE repo_id IS NULL AND {BLOCKING_STATUS_SQL}
-                 ORDER BY created_at ASC"
-        ))?
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for id in null_ids {
-        let file_path: String = conn.query_row(
-            "SELECT file_path FROM conflicts WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
-        let owners: Vec<String> = conn
-            .prepare(&format!(
-                "SELECT DISTINCT repo_id FROM conflicts
-                     WHERE file_path = ?1 AND repo_id IS NOT NULL AND {BLOCKING_STATUS_SQL}"
-            ))?
-            .query_map(params![file_path], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        if owners.len() == 1 {
-            let changed = conn.execute(
-                "UPDATE conflicts SET repo_id = ?1 WHERE id = ?2 AND repo_id IS NULL",
-                params![owners[0], id],
-            )?;
-            attributed += changed;
-        }
-    }
-
-    Ok(attributed)
 }
 
 /// Blocking conflict row ids with `repo_id IS NULL` (legacy, unattributed).
@@ -84,6 +60,22 @@ pub fn unattributed_null_conflict_ids(conn: &Connection) -> Result<Vec<String>, 
         .filter_map(|r| r.ok())
         .collect();
     Ok(ids)
+}
+
+/// `(id, file_path)` for each unattributed blocking NULL row.
+pub fn unattributed_null_conflict_rows(
+    conn: &Connection,
+) -> Result<Vec<(String, String)>, DatabaseError> {
+    let rows: Vec<(String, String)> = conn
+        .prepare(&format!(
+            "SELECT id, file_path FROM conflicts
+                 WHERE repo_id IS NULL AND {BLOCKING_STATUS_SQL}
+                 ORDER BY created_at ASC"
+        ))?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -120,6 +112,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(db.attribute_null_conflict_repo_ids().unwrap(), 1);
+        assert_eq!(db.attribute_null_conflict_repo_ids().unwrap(), 0);
         let repo_id: Option<String> = db
             .conn()
             .query_row(
@@ -171,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn path_pair_attribution_when_unique_scoped_sibling() {
+    fn null_row_with_same_path_scoped_sibling_still_blocks_other_repos() {
         let db = setup_db();
         {
             let conn = db.conn();
@@ -185,7 +178,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(db.attribute_null_conflict_repo_ids().unwrap(), 1);
+        assert_eq!(db.attribute_null_conflict_repo_ids().unwrap(), 0);
         let repo_id: Option<String> = db
             .conn()
             .query_row(
@@ -194,14 +187,51 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(repo_id.as_deref(), Some("one"));
+        assert!(repo_id.is_none());
         assert_eq!(
             db.count_conflicts_blocking_apply_for_repo("two").unwrap(),
-            0
+            1
         );
         assert_eq!(
             db.count_conflicts_blocking_apply_for_repo("one").unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn null_row_with_orphan_sibling_from_deleted_repo_still_blocks_other_repos() {
+        let db = setup_db();
+        {
+            let conn = db.conn();
+            insert_repo(&conn, "one");
+            insert_repo(&conn, "two");
+            insert_repo(&conn, "removed");
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, status, created_at, repo_id)
+                 VALUES ('orphan-scoped', 'shared.txt', 'content', 'detected', '2020-01-01T00:00:00Z', 'removed'),
+                        ('legacy', 'shared.txt', 'content', 'detected', '2020-01-01T00:00:00Z', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        db.delete_repository("removed").unwrap();
+        assert_eq!(db.attribute_null_conflict_repo_ids().unwrap(), 0);
+        let repo_id: Option<String> = db
+            .conn()
+            .query_row(
+                "SELECT repo_id FROM conflicts WHERE id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(repo_id.is_none());
+        assert_eq!(
+            db.count_conflicts_blocking_apply_for_repo("one").unwrap(),
+            1
+        );
+        assert_eq!(
+            db.count_conflicts_blocking_apply_for_repo("two").unwrap(),
+            1
         );
     }
 }
