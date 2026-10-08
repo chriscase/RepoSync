@@ -70,3 +70,27 @@ fn import_copy_dest_hardlink_outside_untouched() {
         "copied"
     );
 }
+
+#[test]
+fn import_copy_gitattributes_hardlink_outside_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    let outside = tmp.path().join("outside-secret");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::write(&outside, "ORIGINAL-ATTRS").unwrap();
+    std::fs::write(src.join(".gitattributes"), "* text=auto\n").unwrap();
+    std::fs::write(src.join("readme.txt"), "hello").unwrap();
+    hard_link(&outside, dst.join(".gitattributes")).unwrap();
+
+    copy_tree_with_policy(&src, &dst, &noop_policy(), &test_db()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "ORIGINAL-ATTRS",
+        "export-present .gitattributes merge must not mutate a planted hardlink target"
+    );
+    let merged = std::fs::read_to_string(dst.join(".gitattributes")).unwrap();
+    assert_eq!(merged, "* text=auto\n");
+}
