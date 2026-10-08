@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use reposync_core::config::{AppConfig, IdentityConfig};
+use reposync_core::db::import_operations::{resolve_repo_import_baseline, RepoImportBaseline};
 use reposync_core::db::Database;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -8089,17 +8090,30 @@ async fn candidate_r65_restore_managed_registration() {
         .db
         .set_state(&format!("secret_git_token_{repo_id}"), "restore-token")
         .unwrap();
-    state
+    const SYNCED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    let import = state
         .db
-        .set_state(&format!("last_git_sha_{repo_id}"), "inbound-checkpoint")
+        .create_import_operation(repo_id, "admin", "imp", "fp")
         .unwrap();
     state
         .db
-        .conn()
-        .execute(
-            "UPDATE repositories SET last_git_sha=?1 WHERE id=?2",
-            rusqlite::params!["emitted-tip", repo_id],
-        )
+        .start_import_operation(repo_id, &import.id)
+        .unwrap();
+    state
+        .db
+        .note_import_local(repo_id, &import.id, 4, SYNCED_SHA, 1, 1)
+        .unwrap();
+    state
+        .db
+        .begin_import_publication(repo_id, &import.id, "refs/heads/main", SYNCED_SHA)
+        .unwrap();
+    state
+        .db
+        .confirm_import_publication(repo_id, &import.id, SYNCED_SHA)
+        .unwrap();
+    state
+        .db
+        .complete_import_operation(repo_id, &import.id, 4, SYNCED_SHA)
         .unwrap();
     state
         .db
@@ -8130,7 +8144,9 @@ async fn candidate_r65_restore_managed_registration() {
     assert_eq!(restore_body["state"], "restored");
     let repo = state.db.get_repository(repo_id).unwrap().unwrap();
     assert!(!repo.enabled);
+    assert_eq!(repo.last_svn_rev, 0);
     assert!(repo.last_git_sha.is_empty());
+    assert!(repo.last_sync_at.is_none());
     assert_eq!(
         state
             .db
@@ -8144,6 +8160,17 @@ async fn candidate_r65_restore_managed_registration() {
             .get_state(&format!("last_git_sha_{repo_id}"))
             .unwrap(),
         None
+    );
+    assert_eq!(
+        state
+            .db
+            .get_state(&format!("last_svn_rev_{repo_id}"))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        resolve_repo_import_baseline(&state.db, repo_id).unwrap(),
+        RepoImportBaseline::Pending
     );
     assert!(state.db.removal_tombstone(repo_id).unwrap().is_none());
 

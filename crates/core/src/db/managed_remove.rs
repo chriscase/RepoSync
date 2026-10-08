@@ -1343,7 +1343,9 @@ impl Database {
                     tombstone.created_at.clone()
                 },
                 updated_at: now.clone(),
-                last_svn_rev: tombstone.last_svn_rev,
+                // Sync cursors are quarantined on restore so import/scheduler can
+                // bootstrap again; tombstone watermarks remain audit-only.
+                last_svn_rev: 0,
                 last_git_sha: String::new(),
                 last_sync_at: None,
                 sync_status: "idle".into(),
@@ -1389,10 +1391,13 @@ impl Database {
                 ],
             )?;
             restore_scoped_secrets_from_tombstone(tx, &enc_key, repo_id, &tombstone)?;
-            tx.execute(
-                "DELETE FROM kv_state WHERE key=?1",
-                [format!("last_git_sha_{repo_id}")],
-            )?;
+            for scoped_key in [
+                format!("last_git_sha_{repo_id}"),
+                format!("last_svn_rev_{repo_id}"),
+            ] {
+                tx.execute("DELETE FROM kv_state WHERE key=?1", [scoped_key])?;
+            }
+            clear_repo_import_operation_journal(tx, repo_id)?;
             tx.execute(
                 "DELETE FROM kv_state WHERE key=?1",
                 [key("tombstone", repo_id)],
@@ -1407,6 +1412,39 @@ impl Database {
             Ok(RestoreAdvance::Restored { repo: restored })
         })
     }
+}
+
+/// Drop per-repo import journals so [`resolve_repo_import_baseline`] returns
+/// pending after a managed restore (completed imports are not replayable
+/// without matching repository checkpoints).
+fn clear_repo_import_operation_journal(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    const IMPORT_PREFIX: &str = "import_operation_v1:";
+    tx.execute(
+        "DELETE FROM kv_state WHERE key=?1 OR key=?2",
+        params![
+            format!("{IMPORT_PREFIX}active:{repo_id}"),
+            format!("{IMPORT_PREFIX}latest:{repo_id}"),
+        ],
+    )?;
+    let mut stmt = tx.prepare("SELECT key, value FROM kv_state WHERE key LIKE ?1")?;
+    let pattern = format!("{IMPORT_PREFIX}document:%");
+    let rows = stmt
+        .query_map([pattern], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+    for (document_key, raw) in rows {
+        let op: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+            DatabaseError::Other(format!("invalid import operation document: {error}"))
+        })?;
+        if op.get("repo_id").and_then(|value| value.as_str()) == Some(repo_id) {
+            tx.execute("DELETE FROM kv_state WHERE key=?1", [document_key])?;
+        }
+    }
+    Ok(())
 }
 
 fn require_active(
@@ -1439,8 +1477,12 @@ fn require_active(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::import_operations::ImportOperationState;
+    use crate::db::import_operations::{
+        resolve_repo_import_baseline, ImportOperationState, RepoImportBaseline,
+    };
     use crate::db::queries::CredentialChainState;
+
+    const SYNCED_GIT_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn setup() -> Database {
         let db = Database::in_memory().unwrap();
@@ -2033,6 +2075,98 @@ mod tests {
         assert_eq!(db.get_state("last_git_sha_sec-child").unwrap(), None);
         let tombstone = db.removal_tombstone("sec-child").unwrap();
         assert!(tombstone.is_none());
+    }
+
+    #[test]
+    fn restore_after_synced_registration_resets_import_checkpoints() {
+        let db = setup();
+        let repo_id = "synced-restore";
+        let mut synced = repo(repo_id, "Synced", None);
+        synced.last_svn_rev = 4;
+        synced.last_git_sha = SYNCED_GIT_SHA.into();
+        synced.last_sync_at = Some("2026-01-02T00:00:00Z".into());
+        db.insert_repository(&synced).unwrap();
+        let import = db
+            .create_import_operation(repo_id, "admin", "imp", "fp")
+            .unwrap();
+        db.start_import_operation(repo_id, &import.id).unwrap();
+        db.note_import_local(repo_id, &import.id, 4, SYNCED_GIT_SHA, 1, 1)
+            .unwrap();
+        db.begin_import_publication(
+            repo_id,
+            &import.id,
+            "refs/heads/main",
+            SYNCED_GIT_SHA,
+        )
+        .unwrap();
+        db.confirm_import_publication(repo_id, &import.id, SYNCED_GIT_SHA)
+            .unwrap();
+        db.complete_import_operation(repo_id, &import.id, 4, SYNCED_GIT_SHA)
+            .unwrap();
+        assert_eq!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::Verified {
+                svn_rev: 4,
+                git_sha: SYNCED_GIT_SHA.into(),
+            }
+        );
+        db.conn()
+            .execute(
+                "INSERT INTO commit_map (svn_rev, git_sha, direction, synced_at, svn_author, git_author, repo_id)
+                 VALUES (4, ?1, 'svn_to_git', 't', 'a', 'b', ?2)",
+                params![SYNCED_GIT_SHA, repo_id],
+            )
+            .unwrap();
+        let RemovalAdvance::Cleanup { operation } =
+            db.prepare_managed_remove(repo_id, "admin", "req").unwrap()
+        else {
+            panic!("expected cleanup");
+        };
+        crate::managed_remove::remove_owned_repo_tree(tempfile::tempdir().unwrap().path(), repo_id)
+            .unwrap();
+        db.complete_managed_remove(
+            repo_id,
+            &operation.id,
+            &ManagedRemoveRemoteOutcome::untouched(),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}"))
+                .unwrap()
+                .as_deref(),
+            Some("4")
+        );
+
+        let RestoreAdvance::Restored { repo: restored } =
+            db.restore_managed_registration(repo_id).unwrap()
+        else {
+            panic!("expected restore");
+        };
+        assert!(!restored.enabled);
+        assert_eq!(restored.last_svn_rev, 0);
+        assert!(restored.last_git_sha.is_empty());
+        assert!(restored.last_sync_at.is_none());
+        assert_eq!(
+            db.get_state(&format!("last_git_sha_{repo_id}")).unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::Pending
+        );
+        assert!(db.latest_import_operation(repo_id).unwrap().is_none());
+
+        let mut enabled = db.get_repository(repo_id).unwrap().unwrap();
+        enabled.enabled = true;
+        db.update_repository(&enabled).unwrap();
+        assert_eq!(
+            resolve_repo_import_baseline(&db, repo_id).unwrap(),
+            RepoImportBaseline::Pending
+        );
     }
 
     #[test]
