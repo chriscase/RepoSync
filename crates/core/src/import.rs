@@ -490,30 +490,66 @@ fn open_no_follow_write(dst_root: &Path, dst: &Path) -> Result<std::fs::File> {
 }
 
 fn open_no_follow_read(path: &Path) -> Result<std::fs::File> {
-    let meta = std::fs::symlink_metadata(path).with_context(|| {
-        format!(
-            "failed to stat {} without following before read",
-            path.display()
-        )
-    })?;
-    if meta.file_type().is_symlink() {
-        bail!(
-            "refusing to read through symlink at {}: path must be a regular file",
-            path.display()
-        );
-    }
-    if !meta.file_type().is_file() {
-        bail!("refusing to read non-regular file at {}", path.display());
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+
+        let path_c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains interior NUL byte",
+            )
+        })?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        let fd = unsafe { libc::open(path_c.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open {} without following", path.display()));
+        }
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(err).with_context(|| format!("failed to fstat {}", path.display()));
+        }
+        if (st.st_mode as libc::mode_t & libc::S_IFMT) != libc::S_IFREG {
+            unsafe {
+                libc::close(fd);
+            }
+            bail!("refusing to read non-regular file at {}", path.display());
+        }
+        let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if current >= 0 && (current & libc::O_NONBLOCK) != 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, current & !libc::O_NONBLOCK) };
+        }
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
-    opts.open(path)
-        .with_context(|| format!("failed to open {} without following", path.display()))
+    #[cfg(not(unix))]
+    {
+        let meta = std::fs::symlink_metadata(path).with_context(|| {
+            format!(
+                "failed to stat {} without following before read",
+                path.display()
+            )
+        })?;
+        if meta.file_type().is_symlink() {
+            bail!(
+                "refusing to read through symlink at {}: path must be a regular file",
+                path.display()
+            );
+        }
+        if !meta.file_type().is_file() {
+            bail!("refusing to read non-regular file at {}", path.display());
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        opts.open(path)
+            .with_context(|| format!("failed to open {} without following", path.display()))
+    }
 }
 
 fn file_mode(meta: &std::fs::Metadata) -> u32 {
@@ -729,17 +765,21 @@ fn openat_write_nofollow(
 static CONFINED_TEMP_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(unix, test))]
-static CONFINED_TEMP_GUARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CONFINED_TEMP_COPY_NAME_OVERRIDE: std::sync::Mutex<Option<std::ffi::OsString>> =
+    std::sync::Mutex::new(None);
 
-/// Peek the next confined temp name without consuming the counter (test-only).
+/// Force the next confined temp name (single test call only).
 #[cfg(all(unix, test))]
-fn confined_temp_copy_name_peek_for_test() -> std::ffi::OsString {
-    let seq = CONFINED_TEMP_COPY_COUNTER.load(Ordering::Relaxed);
-    std::ffi::OsString::from(format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq))
+fn set_confined_temp_copy_name_override_for_test(name: Option<std::ffi::OsString>) {
+    *CONFINED_TEMP_COPY_NAME_OVERRIDE.lock().unwrap() = name;
 }
 
 #[cfg(unix)]
 fn confined_temp_copy_name() -> std::ffi::OsString {
+    #[cfg(test)]
+    if let Some(name) = CONFINED_TEMP_COPY_NAME_OVERRIDE.lock().unwrap().take() {
+        return name;
+    }
     let seq = CONFINED_TEMP_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::ffi::OsString::from(format!(".reposync-copy-{}-{}.tmp", std::process::id(), seq))
 }
@@ -4870,15 +4910,15 @@ mod tests {
 
     #[test]
     fn confined_temp_guard_leaves_preexisting_temp_when_openat_excl_fails() {
-        let _serial = CONFINED_TEMP_GUARD_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("dest.txt"), "old").unwrap();
         let root = open_dir_nofollow(tmp.path()).unwrap();
 
-        let planted_name = confined_temp_copy_name_peek_for_test()
-            .to_string_lossy()
-            .to_string();
+        let planted_name = format!(".reposync-copy-{}-fixture.tmp", std::process::id());
         std::fs::write(tmp.path().join(&planted_name), "PLANTED-TEMP").unwrap();
+        set_confined_temp_copy_name_override_for_test(Some(std::ffi::OsString::from(
+            planted_name.clone(),
+        )));
 
         let mut reader = std::io::Cursor::new(b"new-bytes");
         let err = write_confined_via_temp_rename(
@@ -4905,12 +4945,25 @@ mod tests {
     fn import_root_gitattributes_fifo_rejected_without_blocking_read() {
         use std::os::unix::prelude::OsStrExt;
 
+        let fifo_dir = tempfile::tempdir().unwrap();
+        let fifo = fifo_dir.path().join("fifo.gitattributes");
+        let path_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(path_c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let err = open_no_follow_read(&fifo).unwrap_err();
+        let detail = format!("{err:#}");
+        assert!(
+            detail.contains("non-regular"),
+            "expected fail-closed fifo read via open_no_follow_read, got: {detail}"
+        );
+
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join(".gitattributes"), "* text=auto\n").unwrap();
         std::fs::write(src.path().join("readme.txt"), "hello").unwrap();
-        let fifo = dst.path().join(".gitattributes");
-        let path_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let fifo_dst = dst.path().join(".gitattributes");
+        let path_c = std::ffi::CString::new(fifo_dst.as_os_str().as_bytes()).unwrap();
         let rc = unsafe { libc::mkfifo(path_c.as_ptr(), 0o644) };
         assert_eq!(rc, 0, "mkfifo failed");
 

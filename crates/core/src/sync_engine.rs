@@ -55,7 +55,9 @@ use crate::history_inspect::{
 };
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
-use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+use crate::path_projection::{
+    path_is_projected, project_git_to_svn_changeset, GitToSvnInputChange,
+};
 use crate::pending_frontier::{pending_frontier_is_merge_dag, GitReplayContinuation};
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
@@ -184,6 +186,23 @@ pub struct SyncEngine {
     /// Fixture-only fault: truncate conflict coverage one commit short (debug builds).
     #[cfg(debug_assertions)]
     incomplete_conflict_coverage_test_fault: std::sync::Mutex<bool>,
+    /// Fixture-only: fail `get_file_content_at_commit` for one projected path.
+    #[cfg(debug_assertions)]
+    git_content_read_test_fault: std::sync::Mutex<Option<GitContentReadTestFault>>,
+    /// Fixture-only: paths whose blobs were read during Git→SVN apply.
+    #[cfg(debug_assertions)]
+    git_blob_reads_recorded: std::sync::Mutex<Vec<String>>,
+    #[cfg(debug_assertions)]
+    git_blob_read_recording_enabled: std::sync::Mutex<bool>,
+}
+
+/// Per-engine Git blob read fault (debug builds only).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone)]
+struct GitContentReadTestFault {
+    sha: String,
+    bridge: String,
+    path: String,
 }
 
 impl SyncEngine {
@@ -212,6 +231,12 @@ impl SyncEngine {
             pending_commit_cap_override: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             incomplete_conflict_coverage_test_fault: std::sync::Mutex::new(false),
+            #[cfg(debug_assertions)]
+            git_content_read_test_fault: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            git_blob_reads_recorded: std::sync::Mutex::new(Vec::new()),
+            #[cfg(debug_assertions)]
+            git_blob_read_recording_enabled: std::sync::Mutex::new(false),
         }
     }
 
@@ -230,6 +255,45 @@ impl SyncEngine {
     #[cfg(debug_assertions)]
     fn incomplete_conflict_coverage_test_fault_enabled(&self) -> bool {
         *self.incomplete_conflict_coverage_test_fault.lock().unwrap()
+    }
+
+    /// Record Git blob paths read during Git→SVN apply (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_git_blob_read_recording(&self, enabled: bool) {
+        *self.git_blob_read_recording_enabled.lock().unwrap() = enabled;
+        if enabled {
+            self.git_blob_reads_recorded.lock().unwrap().clear();
+        }
+    }
+
+    /// Paths recorded since recording was enabled (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn git_blob_reads_recorded(&self) -> Vec<String> {
+        self.git_blob_reads_recorded.lock().unwrap().clone()
+    }
+
+    /// Fail closed when reading one projected blob (fixture tests).
+    #[cfg(debug_assertions)]
+    pub fn set_git_content_read_test_fault(&self, sha: &str, bridge: &std::path::Path, path: &str) {
+        *self.git_content_read_test_fault.lock().unwrap() = Some(GitContentReadTestFault {
+            sha: sha.to_string(),
+            bridge: bridge.display().to_string(),
+            path: path.to_string(),
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn clear_git_content_read_test_fault(&self) {
+        *self.git_content_read_test_fault.lock().unwrap() = None;
+    }
+
+    #[cfg(debug_assertions)]
+    fn git_content_read_test_fault_matches(&self, sha: &str, bridge: &str, path: &str) -> bool {
+        self.git_content_read_test_fault
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|fault| fault.sha == sha && fault.bridge == bridge && fault.path == path)
     }
 
     fn replay_batch_cap(&self) -> Option<usize> {
@@ -328,7 +392,7 @@ impl SyncEngine {
     /// Returns statistics about what was synced, or an error if something
     /// went wrong. Conflicts that can be auto-merged are handled inline;
     /// conflicts that require manual resolution are recorded in the database
-    /// and the cycle still returns `Ok` (with the conflict count in stats).
+    /// and the cycle returns `UnresolvableConflict` before any SVN/Git apply.
     ///
     /// The sync lock is released via a drop guard so it is freed even if
     /// the cycle panics.
@@ -2519,21 +2583,20 @@ impl SyncEngine {
                         continue;
                     }
                     #[cfg(debug_assertions)]
-                    let fault = std::env::var("REPOSYNC_TEST_GIT_CONTENT_FAULT")
-                        .ok()
-                        .is_some_and(|value| {
-                            let bridge = git.repo_path().display().to_string();
-                            let parts: Vec<&str> = value.splitn(3, '|').collect();
-                            if parts.len() == 3 {
-                                parts[0] == change.sha
-                                    && parts[1] == bridge
-                                    && parts[2] == item.path
-                            } else {
-                                value == format!("{}|{}", change.sha, bridge)
-                            }
-                        });
+                    let bridge = git.repo_path().display().to_string();
                     #[cfg(debug_assertions)]
-                    let read = if fault {
+                    if *self.git_blob_read_recording_enabled.lock().unwrap() {
+                        self.git_blob_reads_recorded
+                            .lock()
+                            .unwrap()
+                            .push(item.path.clone());
+                    }
+                    #[cfg(debug_assertions)]
+                    let read = if self.git_content_read_test_fault_matches(
+                        &change.sha,
+                        &bridge,
+                        &item.path,
+                    ) {
                         Err(crate::errors::GitError::RefNotFound(item.path.clone()))
                     } else {
                         git.get_file_content_at_commit(&change.sha, &item.path)
@@ -3284,12 +3347,28 @@ impl SyncEngine {
                         } else {
                             raw.to_string()
                         };
+                        let map_copy_from = |raw_path: &str| -> Option<String> {
+                            let raw = raw_path.strip_prefix('/').unwrap_or(raw_path);
+                            if let Some(ref prefix) = trunk_prefix {
+                                raw.strip_prefix(prefix.as_str())
+                                    .map(|rest| rest.to_string())
+                                    .filter(|rest| !rest.is_empty())
+                            } else {
+                                Some(raw.to_string())
+                            }
+                        };
+                        let rename_from = p.copy_from_path.as_deref().and_then(map_copy_from);
+                        let action = if rename_from.is_some() {
+                            "R".to_string()
+                        } else {
+                            p.action.clone()
+                        };
                         Some(ChangedFile {
                             path: mapped_path,
-                            action: p.action.clone(),
+                            action,
                             content: None,
                             is_binary: false,
-                            rename_from: None,
+                            rename_from,
                         })
                     })
                     .collect(),
@@ -3692,6 +3771,90 @@ impl SyncEngine {
     // Conflict detection
     // -----------------------------------------------------------------------
 
+    fn svn_action_to_change_kind(action: &str, rename_from: Option<&str>) -> ChangeKind {
+        if let Some(from) = rename_from {
+            return ChangeKind::Renamed {
+                from: from.to_string(),
+            };
+        }
+        match action {
+            "A" => ChangeKind::Added,
+            "D" => ChangeKind::Deleted,
+            "M" => ChangeKind::Modified,
+            _ => ChangeKind::Modified,
+        }
+    }
+
+    fn git_file_changes_for_conflict_detection(
+        raw_inputs: &[GitToSvnInputChange],
+        projected_included: &[crate::path_projection::ProjectedGitToSvnChange],
+        allowed: &[String],
+        blocked: &[String],
+    ) -> Vec<FileChange> {
+        use std::collections::HashSet;
+
+        let mut in_scope_renames: HashSet<(String, String)> = HashSet::new();
+        for change in raw_inputs {
+            if change.action != "R" {
+                continue;
+            }
+            let Some(rename_from) = change.rename_from.as_ref() else {
+                continue;
+            };
+            if path_is_projected(rename_from, allowed, blocked)
+                && path_is_projected(&change.path, allowed, blocked)
+            {
+                in_scope_renames.insert((rename_from.clone(), change.path.clone()));
+            }
+        }
+
+        let mut git_file_changes = Vec::new();
+        for change in projected_included {
+            let path = change.path.trim_start_matches('/').to_string();
+            if change.action == "D"
+                && in_scope_renames
+                    .iter()
+                    .any(|(from, _)| from.as_str() == path.as_str())
+            {
+                continue;
+            }
+            if change.action == "A" {
+                if let Some((from, to)) = in_scope_renames
+                    .iter()
+                    .find(|(_, to)| to.as_str() == path.as_str())
+                    .map(|(from, to)| (from.clone(), to.clone()))
+                {
+                    git_file_changes.push(FileChange {
+                        path: to,
+                        change_kind: ChangeKind::Renamed { from },
+                        content: change
+                            .content
+                            .as_ref()
+                            .map(|bytes| String::from_utf8_lossy(bytes).to_string()),
+                        is_binary: false,
+                    });
+                    continue;
+                }
+            }
+            let change_kind = match change.action.as_str() {
+                "A" => ChangeKind::Added,
+                "D" => ChangeKind::Deleted,
+                "M" => ChangeKind::Modified,
+                _ => ChangeKind::Modified,
+            };
+            git_file_changes.push(FileChange {
+                path,
+                change_kind,
+                content: change
+                    .content
+                    .as_ref()
+                    .map(|bytes| String::from_utf8_lossy(bytes).to_string()),
+                is_binary: false,
+            });
+        }
+        git_file_changes
+    }
+
     fn detect_conflicts_internal(
         &self,
         svn_changes: &[SvnChangeSet],
@@ -3720,16 +3883,18 @@ impl SyncEngine {
         let svn_file_changes: Vec<FileChange> = svn_changes
             .iter()
             .flat_map(|cs| {
-                cs.changed_files.iter().map(|f| FileChange {
-                    path: strip_prefix(&f.path),
-                    change_kind: match f.action.as_str() {
-                        "A" => ChangeKind::Added,
-                        "D" => ChangeKind::Deleted,
-                        "M" => ChangeKind::Modified,
-                        _ => ChangeKind::Modified,
-                    },
-                    content: f.content.clone(),
-                    is_binary: f.is_binary,
+                cs.changed_files.iter().map(|f| {
+                    let path = strip_prefix(&f.path);
+                    let rename_from = f.rename_from.as_deref().map(strip_prefix);
+                    FileChange {
+                        path,
+                        change_kind: Self::svn_action_to_change_kind(
+                            f.action.as_str(),
+                            rename_from.as_deref(),
+                        ),
+                        content: f.content.clone(),
+                        is_binary: f.is_binary,
+                    }
                 })
             })
             .collect();
@@ -3747,29 +3912,19 @@ impl SyncEngine {
                 })
                 .collect();
             let projected = project_git_to_svn_changeset(
-                raw_inputs,
+                raw_inputs.clone(),
                 &self.allowed_paths,
                 &self.blocked_patterns,
             )
             .map_err(|err| {
                 SyncError::GitError(crate::errors::GitError::ApplyFailed(err.to_string()))
             })?;
-            for change in projected.included {
-                let change_kind = match change.action.as_str() {
-                    "A" => ChangeKind::Added,
-                    "D" => ChangeKind::Deleted,
-                    "M" => ChangeKind::Modified,
-                    _ => ChangeKind::Modified,
-                };
-                git_file_changes.push(FileChange {
-                    path: change.path.trim_start_matches('/').to_string(),
-                    change_kind,
-                    content: change
-                        .content
-                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string()),
-                    is_binary: false,
-                });
-            }
+            git_file_changes.extend(Self::git_file_changes_for_conflict_detection(
+                &raw_inputs,
+                &projected.included,
+                &self.allowed_paths,
+                &self.blocked_patterns,
+            ));
         }
 
         Ok(ConflictDetector::detect(
@@ -4632,5 +4787,56 @@ repo = "test/test-repo"
         assert!(!right.incomplete_conflict_coverage_test_fault_enabled());
         left.set_incomplete_conflict_coverage_test_fault(false);
         assert!(!left.incomplete_conflict_coverage_test_fault_enabled());
+    }
+
+    #[test]
+    fn git_file_changes_for_conflict_detection_keeps_in_scope_rename_identity() {
+        use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+
+        let raw = vec![GitToSvnInputChange {
+            action: "R".into(),
+            path: "team/new.txt".into(),
+            content: None,
+            rename_from: Some("team/old.txt".into()),
+        }];
+        let projected = project_git_to_svn_changeset(raw.clone(), &["team".into()], &[]).unwrap();
+        let git_changes = SyncEngine::git_file_changes_for_conflict_detection(
+            &raw,
+            &projected.included,
+            &["team".into()],
+            &[],
+        );
+        assert_eq!(git_changes.len(), 1);
+        assert_eq!(git_changes[0].path, "team/new.txt");
+        assert!(matches!(
+            git_changes[0].change_kind,
+            ChangeKind::Renamed { .. }
+        ));
+        assert!(
+            !git_changes.iter().any(|c| c.path == "team/old.txt"),
+            "rename source delete must not collapse to dual-delete"
+        );
+    }
+
+    #[test]
+    fn git_file_changes_for_conflict_detection_out_of_scope_dest_stays_delete_only() {
+        use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+
+        let raw = vec![GitToSvnInputChange {
+            action: "R".into(),
+            path: "team-other/new.txt".into(),
+            content: None,
+            rename_from: Some("team/old.txt".into()),
+        }];
+        let projected = project_git_to_svn_changeset(raw.clone(), &["team".into()], &[]).unwrap();
+        let git_changes = SyncEngine::git_file_changes_for_conflict_detection(
+            &raw,
+            &projected.included,
+            &["team".into()],
+            &[],
+        );
+        assert_eq!(git_changes.len(), 1);
+        assert_eq!(git_changes[0].path, "team/old.txt");
+        assert!(matches!(git_changes[0].change_kind, ChangeKind::Deleted));
     }
 }

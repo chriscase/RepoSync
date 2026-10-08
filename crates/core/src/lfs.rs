@@ -449,29 +449,7 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
             ".gitattributes contains interior NUL byte",
         )
     })?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let stat_rc = unsafe {
-        libc::fstatat(
-            root_owned.as_raw_fd(),
-            name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if stat_rc < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.kind() == std::io::ErrorKind::NotFound {
-            return Ok(String::new());
-        }
-        return Err(err);
-    }
-    if !gitattributes_stat_is_reg(&st) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "refusing to read non-regular root .gitattributes",
-        ));
-    }
-    let read_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let read_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
     let fd = unsafe {
         libc::openat(
             root_owned.as_raw_fd(),
@@ -481,7 +459,32 @@ fn read_gitattributes_existing_nofollow(repo_root: &Path) -> std::io::Result<Str
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error());
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(String::new());
+        }
+        return Err(err);
+    }
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(err);
+    }
+    if !gitattributes_stat_is_reg(&st) {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to read non-regular root .gitattributes",
+        ));
+    }
+    let current = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if current >= 0 && (current & libc::O_NONBLOCK) != 0 {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, current & !libc::O_NONBLOCK) };
     }
     let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
     let mut file = unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) };
