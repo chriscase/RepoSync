@@ -567,9 +567,15 @@ export const api = {
     return body;
   },
 
-  getManagedRemoval: async (id: string): Promise<ManagedRemovalStatus | null> => {
+  getManagedRemoval: async (
+    id: string,
+    operationId?: string,
+  ): Promise<ManagedRemovalStatus | null> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${id}/removal`, {
+    const params = operationId
+      ? `?operation_id=${encodeURIComponent(operationId)}`
+      : '';
+    const res = await fetch(`${API_BASE}/repos/${id}/removal${params}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (res.status === 404) {

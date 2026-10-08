@@ -977,7 +977,9 @@ async fn remove_repo(
                 if delete_svn {
                     remote_outcome.remote_svn = deletion.remote_svn;
                 }
-                if remote_outcome.remote_git == "failed" || remote_outcome.remote_svn == "failed" {
+                if (delete_git && remote_outcome.remote_git == "failed")
+                    || (delete_svn && remote_outcome.remote_svn == "failed")
+                {
                     let detail = if deletion.warnings.is_empty() {
                         "requested remote deletion failed".into()
                     } else {
@@ -1082,22 +1084,34 @@ async fn get_removal_preview(
     Ok((status, Json(body)).into_response())
 }
 
+#[derive(Deserialize)]
+struct ManagedRemovalStatusQuery {
+    operation_id: Option<String>,
+}
+
 async fn get_removal(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<ManagedRemovalStatusQuery>,
 ) -> Result<axum::response::Response, AppError> {
     validate_session(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
-    let Some(operation) = state
-        .db
-        .managed_removal(&id)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    else {
-        return Err(AppError::NotFound("managed removal not found".into()));
+    let operation = if let Some(operation_id) = query.operation_id.as_deref() {
+        state
+            .db
+            .managed_removal_operation(&id, operation_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("managed removal operation not found".into()))?
+    } else {
+        state
+            .db
+            .managed_removal(&id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("managed removal not found".into()))?
     };
     let listed = registration_listed(&state.db, &id)?;
     let (status, body) = removal_response(&state.db, &operation, listed)?;

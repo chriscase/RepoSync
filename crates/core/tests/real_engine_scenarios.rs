@@ -84,6 +84,7 @@ struct ImportCycleOracle {
     windows: Mutex<Vec<CycleWindow>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    active_cycles: Mutex<HashSet<String>>,
     finished_while_peer_in_flight: Mutex<HashSet<String>>,
 }
 
@@ -93,6 +94,7 @@ impl ImportCycleOracle {
             windows: Mutex::new(Vec::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            active_cycles: Mutex::new(HashSet::new()),
             finished_while_peer_in_flight: Mutex::new(HashSet::new()),
         }
     }
@@ -120,17 +122,27 @@ async fn run_import_with_lock_retry(
         if let Some(tracker) = oracle {
             let active = tracker.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             tracker.max_in_flight.fetch_max(active, Ordering::SeqCst);
+            tracker
+                .active_cycles
+                .lock()
+                .unwrap()
+                .insert(label.to_string());
         }
         let cycle_result = engine.run_sync_cycle().await;
         let cycle_end = Instant::now();
         if let Some(tracker) = oracle {
-            if matches!(&cycle_result, Ok(_)) && tracker.in_flight.load(Ordering::SeqCst) > 1 {
+            let peer_cycle_still_active = {
+                let active = tracker.active_cycles.lock().unwrap();
+                active.len() > 1
+            };
+            if matches!(&cycle_result, Ok(_)) && peer_cycle_still_active {
                 tracker
                     .finished_while_peer_in_flight
                     .lock()
                     .unwrap()
                     .insert(label.to_string());
             }
+            tracker.active_cycles.lock().unwrap().remove(label);
             tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
             tracker.windows.lock().unwrap().push(CycleWindow {
                 label: label.to_string(),
@@ -926,8 +938,10 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
         .unwrap()
         .is_empty();
     assert!(
-        peak_concurrent_import_cycles && import_cycle_windows_overlapped,
-        "concurrent svnserve imports must overlap in flight and in cycle windows"
+        peak_concurrent_import_cycles
+            && import_cycle_windows_overlapped
+            && at_least_one_import_finished_while_peer_in_flight,
+        "concurrent svnserve imports must overlap in flight and in cycle windows, and one import must finish while a peer cycle is still active"
     );
     let case_status = "PASS";
     let checkpoint_crossover = alpha_sha == beta_sha
@@ -1479,6 +1493,15 @@ async fn scenario_r16_svnserve_svn_remote_unreachable() {
     let before = fixture.checkpoint_snapshot();
     let bridge_before = get_head_sha(&fixture.repo.bridge);
     let mappings_before: i64 = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let svn_before = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
     let bad_url = "svn://127.0.0.1:1/unreachable";
     let db = setup_db(&fixture.db_path);
     let config = make_app_config(bad_url, fixture.tmp.path());
@@ -1498,9 +1521,19 @@ async fn scenario_r16_svnserve_svn_remote_unreachable() {
     let bridge_after = get_head_sha(&fixture.repo.bridge);
     let checkpoint_after = fixture.checkpoint_snapshot();
     let mappings_after = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let svn_after = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
     assert_eq!(bridge_after, bridge_before);
     assert_eq!(checkpoint_after, before);
     assert_eq!(mappings_after, mappings_before);
+    assert_eq!(svn_after, svn_before);
     emit_evidence(
         CASE_SVN_REMOTE,
         "PARTIAL",
@@ -1510,6 +1543,7 @@ async fn scenario_r16_svnserve_svn_remote_unreachable() {
             "transport_failure": true,
             "checkpoint_before_after": [before, checkpoint_after],
             "bridge_head_before_after": [bridge_before, bridge_after],
+            "svn_revision_before_after": [svn_before, svn_after],
             "mapping_count_before_after": [mappings_before, mappings_after],
             "note": "loopback svnserve fixture does not recreate remotes on failure",
         }),
@@ -1553,7 +1587,15 @@ async fn scenario_r01_svnserve_bidirectional_roundtrip() {
         rusqlite::params![fixture.repo.id, svn_rev_b],
         |row| row.get(0),
     ).unwrap();
+    assert_ne!(
+        svn_git_a, svn_git_b,
+        "each SVN revision must map to a distinct applied Git commit"
+    );
     assert_git_ancestor(&fixture.repo.bridge, &svn_git_a, &svn_git_b);
+    assert!(
+        git_path_missing(&fixture.repo.bridge, &svn_git_a, "roundtrip-b.txt"),
+        "first mapped git commit must not contain roundtrip-b.txt"
+    );
     for (revision, path, content, git_sha) in [
         (svn_rev_a, "roundtrip-a.txt", "svn leg a\n", &svn_git_a),
         (svn_rev_b, "roundtrip-b.txt", "svn leg b\n", &svn_git_b),
@@ -1659,6 +1701,15 @@ async fn scenario_r16_svnserve_svn_auth_denied() {
     let before = fixture.checkpoint_snapshot();
     let bridge_before = get_head_sha(&fixture.repo.bridge);
     let mappings_before = setup_db(&fixture.db_path).count_sync_records().unwrap();
+    let svn_before = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
     let db = setup_db(&fixture.db_path);
     db.set_state(
         &format!("secret_svn_password_{}", fixture.repo.id),
@@ -1676,6 +1727,16 @@ async fn scenario_r16_svnserve_svn_auth_denied() {
     assert_eq!(checkpoint_after, before);
     assert_eq!(bridge_after, bridge_before);
     assert_eq!(mappings_after, mappings_before);
+    let svn_after = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    )
+    .info()
+    .await
+    .unwrap()
+    .latest_rev;
+    assert_eq!(svn_after, svn_before);
     emit_evidence(
         CASE_SVN_AUTH,
         "PASS",
@@ -1683,6 +1744,7 @@ async fn scenario_r16_svnserve_svn_auth_denied() {
             "reason": "svn_authentication_failed",
             "checkpoint_before_after": [before, checkpoint_after],
             "bridge_head_before_after": [bridge_before, bridge_after],
+            "svn_revision_before_after": [svn_before, svn_after],
             "mapping_count_before_after": [mappings_before, mappings_after],
             "note": "real svnserve passwd-db denial via hot-reloaded scoped secret",
         }),

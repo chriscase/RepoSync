@@ -79,6 +79,24 @@ async function waitForHttp(url, label) {
   throw new Error(`Timed out waiting for ${label}: ${last}`);
 }
 
+function removalDependencyPreview(record) {
+  const parent = record.parent_id
+    ? { id: record.parent_id, name: record.parent_id }
+    : null;
+  return {
+    repo_id: record.id,
+    repo_name: record.name,
+    parent,
+    children: [],
+    parent_removal_blocked: false,
+    block_reason: null,
+    credentials: [],
+    managed_local_path: `repos/${record.id}`,
+    sibling_local_paths_preserved: [],
+    shared_git_registrations: [],
+  };
+}
+
 function repo(id, name, parent, gitBranch) {
   const now = '2026-01-01T00:00:00Z';
   return {
@@ -230,6 +248,19 @@ function startMock() {
     if (rest === '/branches') {
       const childrenOf = [...records.values()].filter((item) => item.parent_id === id && !deleted.has(item.id));
       send(200, childrenOf);
+      return;
+    }
+    if (rest === '/removal/preview' && req.method === 'GET') {
+      if (deleted.has(id) || !records.has(id)) {
+        send(404, { error: 'repository not found' });
+        return;
+      }
+      send(200, {
+        ok: true,
+        action: 'removal_preview',
+        dependency_preview: removalDependencyPreview(records.get(id)),
+        active_removal: null,
+      });
       return;
     }
     if (rest === '/credentials') {
