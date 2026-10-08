@@ -36,7 +36,11 @@ const CASE_SVN_AUTH: &str = "R16_SVNSERVE_SVN_AUTH_DENIED";
 const CASE_MISSING_BRANCH: &str = "R16_SVNSERVE_MISSING_GIT_BRANCH";
 const CASE_BIDIRECTIONAL: &str = "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP";
 const CASE_CREDENTIAL_ROTATION: &str = "R16_SVNSERVE_CREDENTIAL_ROTATION";
+const CASE_PARENT_CHILD_CHAIN_ROTATION: &str =
+    "R16_SVNSERVE_PARENT_CHILD_CREDENTIAL_CHAIN_ROTATION";
 const CASE_CONCURRENT_CREDENTIAL_RELOAD: &str = "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD";
+const CASE_PARENT_CHILD_CONCURRENT_RELOAD: &str =
+    "R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD";
 
 // ===========================================================================
 // Tooling and evidence helpers
@@ -1788,7 +1792,10 @@ async fn scenario_r16_svnserve_svn_auth_denied() {
     .unwrap();
     let result = engine.run_sync_cycle().await;
     assert!(
-        is_svn_auth_failure(result.as_ref().err().expect("sync must fail")),
+        is_svn_auth_failure(match result.as_ref() {
+            Err(error) => error,
+            Ok(_) => panic!("sync must fail"),
+        }),
         "wrong svnserve password must fail as authentication: {result:?}"
     );
     let checkpoint_after = fixture.checkpoint_snapshot();
@@ -1930,6 +1937,20 @@ async fn scenario_r16_svnserve_credential_rotation() {
     assert_eq!(stats.svn_to_git_count, 1);
     let after = fixture.checkpoint_snapshot();
     assert_ne!(after, before);
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.bridge.join("after-rotation.txt")).unwrap(),
+        "post rotation\n"
+    );
+    let rotation_rev = after.0;
+    let mapped_git_sha: String = db.conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
+        rusqlite::params![fixture.repo.id, rotation_rev],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        git_show_blob(&fixture.repo.bridge, &mapped_git_sha, "after-rotation.txt"),
+        "post rotation\n"
+    );
     emit_evidence(
         CASE_CREDENTIAL_ROTATION,
         "PASS",
@@ -1938,7 +1959,9 @@ async fn scenario_r16_svnserve_credential_rotation() {
             "new_password_accepted": true,
             "reopened_engine_sync_after_rotation": true,
             "checkpoint_before_after": [before, after],
-            "note": "real svnserve passwd-db rotation with scoped kv reload on new SyncEngine cycle",
+            "bridge_tree_after_rotation": true,
+            "svn_to_git_mapping_row": mapped_git_sha,
+            "note": "real svnserve passwd-db rotation with scoped kv reload on new SyncEngine cycle; bridge tree and sync_records mapping checked",
         }),
     );
 }
@@ -2017,9 +2040,9 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
         "credential_crossover": credential_crossover,
     });
 
-    let case_status = if alpha_result.is_err() || beta_result.is_err() {
-        "PARTIAL"
-    } else if !overlap_at_kv_rewrite.load(Ordering::SeqCst)
+    let case_status = if alpha_result.is_err()
+        || beta_result.is_err()
+        || !overlap_at_kv_rewrite.load(Ordering::SeqCst)
         || !kv_rewrite_during_overlap.load(Ordering::SeqCst)
         || !peak_concurrent
         || max_in_flight > 2
@@ -2077,11 +2100,30 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
         match reload_stats {
             Ok(stats) if stats.svn_to_git_count == 1 => {
                 assert_eq!(reopened.fixture_svn_password_marker(), rotated);
+                let post_rev = db.get_repo_watermark("repo_alpha").unwrap().0;
+                let post_reload_mapping: i64 = db.conn().query_row(
+                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'repo_alpha' AND direction = 'svn_to_git' AND svn_rev = ?1 AND status = 'applied'",
+                    rusqlite::params![post_rev],
+                    |row| row.get(0),
+                ).unwrap();
+                assert_eq!(
+                    git_show_blob(
+                        &alpha.bridge,
+                        &db.get_repo_watermark("repo_alpha").unwrap().1,
+                        "post-reload.txt",
+                    ),
+                    "after reload\n"
+                );
                 detail["in_flight_import_succeeded_with_pre_rewrite_credential"] =
                     serde_json::json!(true);
                 detail["post_overlap_cycle_reloaded_rotated_credential"] = serde_json::json!(true);
-                detail["post_reload_mapping"] = serde_json::json!(true);
-                "PASS"
+                detail["post_reload_mapping"] = serde_json::json!(post_reload_mapping == 1);
+                detail["post_reload_svn_rev"] = serde_json::json!(post_rev);
+                if post_reload_mapping == 1 {
+                    "PASS"
+                } else {
+                    "PARTIAL"
+                }
             }
             other => {
                 detail["post_overlap_cycle_reloaded_rotated_credential"] = serde_json::json!(false);
@@ -2112,6 +2154,427 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
     if alpha_result.is_err() || beta_result.is_err() {
         panic!(
             "concurrent credential reload imports failed: alpha={alpha_result:?} beta={beta_result:?}"
+        );
+    }
+}
+
+struct ParentChildChainFixture {
+    tmp: TempDir,
+    _daemon: SvnserveDaemon,
+    db_path: PathBuf,
+    svn_url: String,
+    username: String,
+    password: String,
+    parent_bridge: PathBuf,
+    child_bridge: PathBuf,
+    wc: PathBuf,
+    parent_id: String,
+    child_id: String,
+}
+
+impl ParentChildChainFixture {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let svn_root = tmp.path().join("svnserve-root");
+        std::fs::create_dir_all(&svn_root).unwrap();
+        let daemon = SvnserveDaemon::start(&svn_root);
+        let db_path = tmp.path().join("chain.db");
+        let db = setup_db(&db_path);
+        let parent_id = "repo_parent".to_string();
+        let child_id = "repo_child".to_string();
+        let user = "chainer";
+        let pass = "chain-secret-only";
+        let repo_dir = svn_root.join("repo_chain");
+        assert!(Command::new("svnadmin")
+            .args(["create", repo_dir.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        write_svnserve_auth(&repo_dir, user, pass);
+        let svn_url = daemon.repo_url("repo_chain");
+        let wc = tmp.path().join("wc");
+        svn_checkout(&svn_url, &wc, user, pass);
+        svn_commit_file(&wc, ".gitkeep", "", "Initial SVN anchor", user, pass);
+        svn_commit_file(
+            &wc,
+            "origin.txt",
+            "chain-origin\n",
+            "Verified SVN origin",
+            user,
+            pass,
+        );
+        let parent_bridge = tmp.path().join("parent_bridge");
+        let parent_bare = tmp.path().join("parent.git");
+        let git = setup_git_with_bare_origin(&parent_bridge, &parent_bare);
+        let parent_initial_git_sha = get_head_sha(&parent_bridge);
+        drop(git);
+        let child_bridge = tmp.path().join("child_bridge");
+        let child_bare = tmp.path().join("child.git");
+        let git = setup_git_with_bare_origin(&child_bridge, &child_bare);
+        let child_initial_git_sha = get_head_sha(&child_bridge);
+        drop(git);
+        let now = chrono::Utc::now().to_rfc3339();
+        db.set_state(&format!("secret_svn_password_{parent_id}"), pass)
+            .unwrap();
+        db.set_state(&format!("secret_git_token_{parent_id}"), "git-token-parent")
+            .unwrap();
+        db.set_state(&format!("secret_git_token_{child_id}"), "git-token-child")
+            .unwrap();
+        let parent_row = Repository {
+            id: parent_id.clone(),
+            name: parent_id.clone(),
+            svn_url: svn_url.clone(),
+            svn_branch: String::new(),
+            svn_username: user.into(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: parent_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_svn_rev: 1,
+            last_git_sha: parent_initial_git_sha.clone(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        };
+        let child_row = Repository {
+            id: child_id.clone(),
+            name: child_id.clone(),
+            svn_url: svn_url.clone(),
+            svn_branch: String::new(),
+            svn_username: user.into(),
+            git_provider: "local".into(),
+            git_api_url: String::new(),
+            git_repo: child_bare.to_string_lossy().to_string(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 5,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: true,
+            created_by: None,
+            parent_id: Some(parent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_svn_rev: 1,
+            last_git_sha: child_initial_git_sha.clone(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        };
+        db.insert_repository(&parent_row).unwrap();
+        db.insert_repository(&child_row).unwrap();
+        Self {
+            tmp,
+            _daemon: daemon,
+            db_path,
+            svn_url,
+            username: user.into(),
+            password: pass.into(),
+            parent_bridge,
+            child_bridge,
+            wc,
+            parent_id,
+            child_id,
+        }
+    }
+
+    fn make_engine(&self, repo_id: &str) -> SyncEngine {
+        let db = setup_db(&self.db_path);
+        let config = make_app_config(&self.svn_url, self.tmp.path());
+        let bridge = if repo_id == self.parent_id {
+            &self.parent_bridge
+        } else {
+            &self.child_bridge
+        };
+        let mut engine = SyncEngine::new(
+            config,
+            db,
+            SvnClient::new(&self.svn_url, &self.username, &self.password),
+            GitClient::new(bridge).unwrap(),
+            Arc::new(make_identity_mapper()),
+        );
+        engine.set_repo_id(repo_id.to_string());
+        engine
+    }
+}
+
+fn repo_teams_webhook(db: &Database, repo_id: &str) -> Option<String> {
+    db.get_repository(repo_id)
+        .unwrap()
+        .and_then(|row| row.teams_webhook_url)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r16_svnserve_parent_child_credential_chain_rotation() {
+    if !require_toolchain(CASE_PARENT_CHILD_CHAIN_ROTATION) {
+        return;
+    }
+    let fixture = ParentChildChainFixture::new();
+    let parent_engine = fixture.make_engine(&fixture.parent_id);
+    assert_eq!(
+        parent_engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    let db = setup_db(&fixture.db_path);
+    assert!(
+        db.get_state(&format!("secret_svn_password_{}", fixture.child_id))
+            .unwrap()
+            .is_none(),
+        "child must inherit parent svn secret via chain, not a seeded child key"
+    );
+    let child_engine = fixture.make_engine(&fixture.child_id);
+    assert_eq!(
+        child_engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    let before_child = db.get_repo_watermark(&fixture.child_id).unwrap();
+    let svn_root = fixture.tmp.path().join("svnserve-root");
+    let repo_dir = svnserve_repo_dir(&svn_root, "repo_chain");
+    let rotated = "chain-rotated-secret-only";
+    rotate_svnserve_password(&repo_dir, &fixture.username, rotated);
+    db.set_state(
+        &format!("secret_svn_password_{}", fixture.parent_id),
+        rotated,
+    )
+    .unwrap();
+    let old_client = SvnClient::new(&fixture.svn_url, &fixture.username, &fixture.password);
+    assert!(old_client.info().await.is_err());
+    let new_client = SvnClient::new(&fixture.svn_url, &fixture.username, rotated);
+    assert!(new_client.info().await.is_ok());
+    let _rev = svn_commit_file(
+        &fixture.wc,
+        "chain-after-rotation.txt",
+        "chain post rotation\n",
+        "SVN after parent-chain rotation",
+        &fixture.username,
+        rotated,
+    );
+    let reopened_child = fixture.make_engine(&fixture.child_id);
+    assert_eq!(
+        reopened_child.fixture_svn_password_marker(),
+        fixture.password,
+        "construction-time password until cycle reload"
+    );
+    let stats = reopened_child.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    assert_eq!(reopened_child.fixture_svn_password_marker(), rotated);
+    let after_child = db.get_repo_watermark(&fixture.child_id).unwrap();
+    assert_ne!(after_child, before_child);
+    let mapped_git_sha: String = db.conn().query_row(
+        "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'svn_to_git' AND svn_rev = ?2 AND status = 'applied'",
+        rusqlite::params![fixture.child_id, after_child.0],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        git_show_blob(
+            &fixture.child_bridge,
+            &mapped_git_sha,
+            "chain-after-rotation.txt"
+        ),
+        "chain post rotation\n"
+    );
+    emit_evidence(
+        CASE_PARENT_CHILD_CHAIN_ROTATION,
+        "PASS",
+        serde_json::json!({
+            "parent_secret_rotated": true,
+            "child_inherited_rotated_password": true,
+            "child_checkpoint_before_after": [before_child, after_child],
+            "bridge_tree_after_rotation": true,
+            "child_svn_to_git_mapping_row": mapped_git_sha,
+            "note": "keyless child reloads rotated parent scoped svn secret via credential chain on a new SyncEngine cycle",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
+    if !require_toolchain(CASE_PARENT_CHILD_CONCURRENT_RELOAD) {
+        return;
+    }
+    let fixture = DualRepoFixture::new();
+    let alpha = fixture.repos[0].clone();
+    let mut beta = fixture.repos[1].clone();
+    beta.svn_url = alpha.svn_url.clone();
+    beta.username = alpha.username.clone();
+    beta.password = alpha.password.clone();
+    let db = setup_db(&fixture.db_path);
+    let alpha_hook = "https://notify.invalid/repo-alpha-only";
+    let beta_hook = "https://notify.invalid/repo-beta-only";
+    let mut alpha_repo = db.get_repository("repo_alpha").unwrap().unwrap();
+    alpha_repo.teams_webhook_url = Some(alpha_hook.into());
+    db.update_repository(&alpha_repo).unwrap();
+    let mut beta_repo = db.get_repository("repo_beta").unwrap().unwrap();
+    beta_repo.parent_id = Some("repo_alpha".into());
+    beta_repo.svn_url = alpha.svn_url.clone();
+    beta_repo.svn_username = alpha.username.clone();
+    beta_repo.teams_webhook_url = Some(beta_hook.into());
+    db.update_repository(&beta_repo).unwrap();
+    db.conn()
+        .execute(
+            "DELETE FROM kv_state WHERE key = 'secret_svn_password_repo_beta'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        db.resolve_credential_chain("repo_beta", "secret_svn_password")
+            .as_deref(),
+        Some("alpha-secret-only")
+    );
+
+    let svn_root = fixture.tmp.path().join("svnserve-root");
+    let alpha_repo_dir = svnserve_repo_dir(&svn_root, &alpha.id);
+    let rotated = "alpha-chain-rotated-only";
+    let alpha_secret_before = db
+        .get_state("secret_svn_password_repo_alpha")
+        .unwrap()
+        .clone();
+    let ready = Arc::new(tokio::sync::Barrier::new(3));
+    let oracle = Arc::new(ImportCycleOracle::new());
+    let overlap_at_kv_rewrite = Arc::new(AtomicBool::new(false));
+    let kv_rewrite_during_overlap = Arc::new(AtomicBool::new(false));
+
+    let (alpha_result, beta_result, _) = tokio::join!(
+        async {
+            ready.wait().await;
+            let mut engine = fixture.make_engine(&alpha);
+            run_import_with_lock_retry(&mut engine, "repo_alpha", Some(&oracle)).await
+        },
+        async {
+            ready.wait().await;
+            let mut engine = fixture.make_engine(&beta);
+            run_import_with_lock_retry(&mut engine, "repo_beta", Some(&oracle)).await
+        },
+        async {
+            ready.wait().await;
+            let mut saw_overlap = false;
+            for _ in 0..400 {
+                if oracle.both_labels_in_flight("repo_alpha", "repo_beta") {
+                    saw_overlap = true;
+                    overlap_at_kv_rewrite.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            if saw_overlap {
+                setup_db(&fixture.db_path)
+                    .set_state("secret_svn_password_repo_alpha", "alpha-mid-overlap-marker")
+                    .unwrap();
+                kv_rewrite_during_overlap.store(true, Ordering::SeqCst);
+            }
+        }
+    );
+
+    let db = setup_db(&fixture.db_path);
+    let webhook_crossover = repo_teams_webhook(&db, "repo_alpha").as_deref() != Some(alpha_hook)
+        || repo_teams_webhook(&db, "repo_beta").as_deref() != Some(beta_hook);
+    let child_still_inherits_parent = db
+        .resolve_credential_chain("repo_beta", "secret_svn_password")
+        .as_deref()
+        == Some("alpha-mid-overlap-marker");
+
+    let max_in_flight = oracle.max_in_flight.load(Ordering::SeqCst);
+    let peak_concurrent = max_in_flight >= 2;
+    let case_status = if alpha_result.is_err()
+        || beta_result.is_err()
+        || !overlap_at_kv_rewrite.load(Ordering::SeqCst)
+        || !kv_rewrite_during_overlap.load(Ordering::SeqCst)
+        || !peak_concurrent
+        || max_in_flight > 2
+        || webhook_crossover
+    {
+        "PARTIAL"
+    } else {
+        rotate_svnserve_password(&alpha_repo_dir, &alpha.username, rotated);
+        db.set_state("secret_svn_password_repo_alpha", rotated)
+            .unwrap();
+        let child_engine = fixture.make_engine(&beta);
+        assert_eq!(
+            child_engine.fixture_svn_password_marker(),
+            beta.password,
+            "child import used construction-time inherited password"
+        );
+        assert_eq!(
+            db.resolve_credential_chain("repo_beta", "secret_svn_password")
+                .as_deref(),
+            Some(rotated),
+            "child chain must follow parent rotation after overlap"
+        );
+        let reopened_child = fixture.make_engine(&beta);
+        let _rev = svn_commit_file(
+            &fixture.tmp.path().join("repo_alpha_wc"),
+            "child-post-chain-reload.txt",
+            "child reload\n",
+            "SVN after parent/child chain reload",
+            &beta.username,
+            rotated,
+        );
+        match reopened_child.run_sync_cycle().await {
+            Ok(stats) if stats.svn_to_git_count == 1 => {
+                let post_rev = db.get_repo_watermark("repo_beta").unwrap().0;
+                let mapped: i64 = db.conn().query_row(
+                    "SELECT COUNT(*) FROM sync_records WHERE repo_id = 'repo_beta' AND direction = 'svn_to_git' AND svn_rev = ?1 AND status = 'applied'",
+                    rusqlite::params![post_rev],
+                    |row| row.get(0),
+                ).unwrap();
+                if mapped == 1 {
+                    "PASS"
+                } else {
+                    "PARTIAL"
+                }
+            }
+            _ => "PARTIAL",
+        }
+    };
+
+    emit_evidence(
+        CASE_PARENT_CHILD_CONCURRENT_RELOAD,
+        case_status,
+        serde_json::json!({
+            "overlap_at_kv_rewrite": overlap_at_kv_rewrite.load(Ordering::SeqCst),
+            "kv_rewrite_during_overlap": kv_rewrite_during_overlap.load(Ordering::SeqCst),
+            "peak_concurrent_import_cycles": peak_concurrent,
+            "max_in_flight": max_in_flight,
+            "teams_webhook_crossover": webhook_crossover,
+            "child_inherits_parent_mid_overlap": child_still_inherits_parent,
+            "alpha_secret_before": alpha_secret_before,
+            "beta_parent_id": "repo_alpha",
+            "note": "parent/child svn credential chain under concurrent reload; repository teams_webhook_url must not crossover during kv rewrite",
+        }),
+    );
+    if case_status == "PASS" {
+        return;
+    }
+    if alpha_result.is_err() || beta_result.is_err() {
+        panic!(
+            "parent/child concurrent reload imports failed: alpha={alpha_result:?} beta={beta_result:?}"
         );
     }
 }
