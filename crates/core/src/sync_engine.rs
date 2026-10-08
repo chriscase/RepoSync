@@ -39,6 +39,9 @@ use crate::db::team_cycle_mapping_operations::{
     TeamCycleMappingOperation, TeamCycleMappingOutcome, TeamCycleMappingState,
 };
 use crate::db::Database;
+use crate::echo_receipt_scope::{
+    handled_git_no_target_state_key, read_git_no_target_receipt, repo_echo_generation,
+};
 use crate::echo_suppression::{
     classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
     verify_no_target_receipt, EchoDisposition, NoTargetReceiptVerdict, TeamEchoContext,
@@ -55,6 +58,7 @@ use crate::history_inspect::{
 };
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
+use crate::pair_refresh::PAIR_GENERATION;
 use crate::path_projection::{
     path_is_projected, project_git_to_svn_changeset, GitToSvnInputChange,
 };
@@ -874,57 +878,70 @@ impl SyncEngine {
     }
 
     fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
-        let key = format!("handled_git_no_target_{}_{}", rid, sha);
-        let Some(raw) = self.db.get_state(&key).map_err(SyncError::DatabaseError)? else {
-            return Ok(false);
-        };
-        let receipt = serde_json::from_str::<serde_json::Value>(&raw).ok();
-        let Some(record) = receipt else {
-            return Err(self.record_history_block(
-                "unverified_no_target_receipt",
-                "no-target receipt is malformed; reconcile before replay",
-                Some(sha),
-                None,
-                None,
-                None,
-            ));
-        };
-        let projection = self.no_target_projection();
-        match verify_no_target_receipt(&record, rid, sha, &projection) {
-            NoTargetReceiptVerdict::Accepted => Ok(true),
-            NoTargetReceiptVerdict::RepoOrShaMismatch => Err(self.record_history_block(
-                "unverified_no_target_receipt",
-                "no-target receipt does not identify this repository and Git commit",
-                Some(sha),
-                None,
-                None,
-                None,
-            )),
-            NoTargetReceiptVerdict::ProjectionMismatch => {
-                let reason = if record["outcome"] == "empty_commit" {
-                    // Preserve the accepted legacy empty-commit rejection shape.
-                    "ambiguous_checkpoint"
-                } else {
-                    "receipt_policy_changed"
-                };
-                Err(self.record_history_block(
-                    reason,
-                    "no-target decision belongs to a different path policy; reconcile before writes",
+        if let Some(record) =
+            read_git_no_target_receipt(&self.db, rid, sha).map_err(SyncError::DatabaseError)?
+        {
+            let projection = self.no_target_projection();
+            return match verify_no_target_receipt(&record, rid, sha, &projection) {
+                NoTargetReceiptVerdict::Accepted => Ok(true),
+                NoTargetReceiptVerdict::RepoOrShaMismatch => Err(self.record_history_block(
+                    "unverified_no_target_receipt",
+                    "no-target receipt does not identify this repository and Git commit",
                     Some(sha),
                     None,
                     None,
                     None,
-                ))
-            }
-            NoTargetReceiptVerdict::UnverifiedOutcome => Err(self.record_history_block(
-                "unverified_no_target_receipt",
-                "no-target receipt lacks verified outcome evidence",
-                Some(sha),
-                None,
-                None,
-                None,
-            )),
+                )),
+                NoTargetReceiptVerdict::ProjectionMismatch => {
+                    let reason = if record["outcome"] == "empty_commit" {
+                        // Preserve the accepted legacy empty-commit rejection shape.
+                        "ambiguous_checkpoint"
+                    } else {
+                        "receipt_policy_changed"
+                    };
+                    Err(self.record_history_block(
+                        reason,
+                        "no-target decision belongs to a different path policy; reconcile before writes",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ))
+                }
+                NoTargetReceiptVerdict::UnverifiedOutcome => Err(self.record_history_block(
+                    "unverified_no_target_receipt",
+                    "no-target receipt lacks verified outcome evidence",
+                    Some(sha),
+                    None,
+                    None,
+                    None,
+                )),
+            };
         }
+        let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let legacy_key = format!("handled_git_no_target_{}_{}", rid, sha);
+        let canonical_key = handled_git_no_target_state_key(rid, generation, sha);
+        for key in [canonical_key.clone(), legacy_key.clone()] {
+            let Some(raw) = self.db.get_state(&key).map_err(SyncError::DatabaseError)? else {
+                continue;
+            };
+            if serde_json::from_str::<serde_json::Value>(&raw).is_ok() {
+                continue;
+            }
+            let malformed_blocks =
+                key == canonical_key || (generation == PAIR_GENERATION && key == legacy_key);
+            if malformed_blocks {
+                return Err(self.record_history_block(
+                    "unverified_no_target_receipt",
+                    "no-target receipt is malformed; reconcile before replay",
+                    Some(sha),
+                    None,
+                    None,
+                    None,
+                ));
+            }
+        }
+        Ok(false)
     }
 
     /// A clean working-copy status is not proof that a nonempty Git delta is
@@ -4553,6 +4570,53 @@ repo = "test/test-repo"
         assert!(!engine
             .should_skip_incoming_svn_revision(6, "no marker")
             .unwrap());
+    }
+
+    #[test]
+    fn checked_no_target_receipt_honors_active_generation_only() {
+        let engine = team_echo_engine("pair");
+        let sha = "c".repeat(40);
+        let projection = engine.no_target_projection();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": sha,
+            "outcome": "filtered",
+            "projection": projection,
+            "generation": 1,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_git_no_target_pair_{sha}"),
+                &receipt.to_string(),
+            )
+            .unwrap();
+        assert!(engine.checked_no_target_receipt("pair", &sha).unwrap());
+        crate::echo_receipt_scope::bump_repo_echo_generation(engine.db(), "pair").unwrap();
+        assert!(!engine.checked_no_target_receipt("pair", &sha).unwrap());
+    }
+
+    #[test]
+    fn checked_no_target_receipt_legacy_row_without_generation_field() {
+        let engine = team_echo_engine("pair");
+        let sha = "d".repeat(40);
+        let projection = engine.no_target_projection();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": sha,
+            "outcome": "filtered",
+            "projection": projection,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_git_no_target_pair_{sha}"),
+                &receipt.to_string(),
+            )
+            .unwrap();
+        assert!(engine.checked_no_target_receipt("pair", &sha).unwrap());
     }
 
     #[test]
