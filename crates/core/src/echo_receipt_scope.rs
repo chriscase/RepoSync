@@ -5,7 +5,8 @@
 //! written after a bump carry the active generation; older receipts cannot
 //! suppress or satisfy a later generation.
 
-use rusqlite::{Connection, OptionalExtension};
+use chrono::Utc;
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::Database;
 use crate::errors::DatabaseError;
@@ -39,14 +40,23 @@ pub fn repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, Databas
     }
 }
 
-/// Bump the echo generation after a reset/re-anchor so stale receipts fail closed.
-pub fn bump_repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, DatabaseError> {
-    let next = repo_echo_generation(db, repo_id)? + 1;
-    db.set_state(
-        &format!("{GENERATION_KV_PREFIX}{repo_id}"),
-        &next.to_string(),
+/// Bump the echo generation on an open connection (same transaction as reset).
+pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
+    let next = repo_echo_generation_tx(tx, repo_id)? + 1;
+    let key = format!("{GENERATION_KV_PREFIX}{repo_id}");
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![key, next.to_string(), now],
     )?;
     Ok(next)
+}
+
+/// Bump the echo generation after a reset/re-anchor so stale receipts fail closed.
+pub fn bump_repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, DatabaseError> {
+    let conn = db.conn();
+    bump_repo_echo_generation_tx(&conn, repo_id)
 }
 
 pub fn receipt_generation_accepted(record: &serde_json::Value, current_generation: i64) -> bool {
@@ -205,7 +215,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            verify_no_target_receipt(&loaded, "pair", &sha, "{}"),
+            verify_no_target_receipt(&loaded, "pair", &sha, "{}", generation),
             NoTargetReceiptVerdict::Accepted
         );
     }

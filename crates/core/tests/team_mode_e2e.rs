@@ -12015,3 +12015,215 @@ async fn candidate_rs11_startup_child_revocation_preserved() {
         })
     );
 }
+
+// Refs #63: generation-scoped no-target receipts must not suppress after a bump.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_generation_stale_receipt_does_not_suppress_after_bump() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
+
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Nonempty filtered Git commit",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    let receipt_key = format!("handled_git_no_target_pair_{filtered}");
+    assert!(pair.engine.db().get_state(&receipt_key).unwrap().is_some());
+
+    bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
+
+    let successor = pair.developer_commit(
+        "allow/work.txt",
+        "post-bump work\n",
+        "Ordinary work after echo generation bump",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1,
+        "stale generation-1 receipt must not suppress a new commit after bump"
+    );
+    let svn_rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let tree = svn_tree(&pair, svn_rev).await;
+    assert_eq!(
+        tree.get("allow/work.txt"),
+        Some(&b"post-bump work\n".to_vec())
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_GENERATION_STALE_RECEIPT",
+            "filtered":filtered,
+            "successor":successor,
+            "svn_tree":tree_hashes(&tree)
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_generation_reset_split_cursor_not_ambiguous() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
+
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let _filtered_gen1 = pair.developer_commit(
+        "blocked.txt",
+        "filtered generation one\n",
+        "Filtered Git commit generation one",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    git_cli(&pair.developer, &["pull", "--rebase", "origin", "main"]);
+    bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
+    let _filtered_gen2 = pair.developer_commit(
+        "blocked2.txt",
+        "filtered generation two\n",
+        "Filtered Git commit after generation bump",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0,
+        "generation-scoped no-target receipt must be written after bump"
+    );
+    svn_commit_file(
+        &pair.wc,
+        "allow/incoming.txt",
+        "svn side change\n",
+        "SVN change after split-prone no-target",
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().svn_to_git_count,
+        1,
+        "SVN->Git must apply after generation-scoped no-target receipt"
+    );
+    assert!(
+        pair.engine.run_sync_cycle().await.is_ok(),
+        "checkpoint must not stay ambiguous_checkpoint after split cursor"
+    );
+    git_cli(&pair.developer, &["pull", "--rebase", "origin", "main"]);
+
+    let allowed = pair.developer_commit(
+        "allow/work.txt",
+        "post-reset work\n",
+        "Ordinary work after reset and split",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let applied = pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count;
+    assert_eq!(applied, 1);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0,
+        "echo must not duplicate SVN commit for the same Git SHA"
+    );
+    let svn_rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let tree = svn_tree(&pair, svn_rev).await;
+    assert_eq!(
+        tree.get("allow/work.txt"),
+        Some(&b"post-reset work\n".to_vec())
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_GENERATION_RESET_SPLIT_CURSOR",
+            "allowed":allowed,
+            "svn_tree":tree_hashes(&tree)
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_generation_same_receipt_still_suppresses_echo() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Nonempty filtered Git commit",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0,
+        "same-generation no-target receipt must keep suppressing echo"
+    );
+    let svn_rev = SvnClient::new(&pair.svn_url, "", "")
+        .info()
+        .await
+        .unwrap()
+        .latest_rev;
+    let tree = svn_tree(&pair, svn_rev).await;
+    assert!(!tree.contains_key("blocked.txt"));
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_GENERATION_SAME_RECEIPT_SUPPRESSES",
+            "filtered":filtered,
+            "svn_tree":tree_hashes(&tree)
+        })
+    );
+}
