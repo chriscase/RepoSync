@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -127,6 +127,25 @@ impl PersonalSyncEngine {
             ..Default::default()
         };
 
+        // Prove and finalize any held Git→SVN journal before P/O/R/L inspection.
+        // Promotion uses SVN inspect-before-author (GitHub fallback only after proof).
+        if let Err(e) = self.promote_held_git_to_svn_before_history_inspect().await {
+            self.set_state(PersonalSyncState::Error);
+            error!(error = %e, "held personal git-to-svn promotion failed");
+            self.db
+                .insert_audit_log(
+                    "git_to_svn",
+                    Some("git_to_svn"),
+                    None,
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                    false,
+                )
+                .ok();
+            return Err(e);
+        }
+
         // Same P/O/R/L inspection as team Git→SVN, before any reset/replay.
         if let Err(e) = self.inspect_git_history() {
             self.set_state(PersonalSyncState::Error);
@@ -232,16 +251,30 @@ impl PersonalSyncEngine {
 
     /// Git → SVN sync phase (via merged PRs).
     async fn sync_git_to_svn(&self) -> Result<(u64, u64)> {
-        // First, detect merged PRs
-        let monitor = PrMonitor::new(&self.github_client, &self.db, &self.config);
-        let merged_prs = monitor.check_for_merged_prs().await?;
-
         let held_git_to_svn_needs_promotion = self
             .db
             .active_personal_svn_commit_operation()
-            .ok()
-            .flatten()
+            .context("failed to read active personal git-to-svn commit")?
             .is_some_and(|op| op.state == SvnCommitOperationState::ReconciliationRequired);
+
+        let monitor = PrMonitor::new(&self.github_client, &self.db, &self.config);
+        let merged_prs = if held_git_to_svn_needs_promotion {
+            match monitor.check_for_merged_prs().await {
+                Ok(prs) => prs,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "PR monitor failed while a held git-to-svn journal needs promotion; continuing with idle promotion only"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            monitor
+                .check_for_merged_prs()
+                .await
+                .context("failed to poll merged pull requests")?
+        };
 
         if merged_prs.is_empty() && !held_git_to_svn_needs_promotion {
             return Ok((0, 0));
@@ -280,6 +313,21 @@ impl PersonalSyncEngine {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         info!(from = %*state, to = %new_state, "state transition");
         *state = new_state;
+    }
+
+    async fn promote_held_git_to_svn_before_history_inspect(&self) -> Result<()> {
+        let syncer = GitToSvnSync::new(
+            self.svn_client.clone(),
+            (*self.github_client).clone(),
+            self.db.clone(),
+            &self.config,
+            self.svn_wc_path.clone(),
+            self.git_repo_path.clone(),
+        );
+        syncer
+            .promote_held_git_to_svn_reconciliation_if_proven()
+            .await?;
+        Ok(())
     }
 
     /// Inspect the configured Git branch against the last handled SHA before
