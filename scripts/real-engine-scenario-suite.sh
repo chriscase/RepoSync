@@ -17,6 +17,13 @@
 # Exit code: 0 only when suite overall is PASS (every scenario PASS or NOT RUN with
 # no PARTIAL rows). Exit 1 on FAIL, 2 when every scenario is NOT RUN, 3 when any
 # scenario is PARTIAL (including mixed PASS + PARTIAL).
+#
+# CI does not treat exit 3 as a red Build & Test by itself: after the suite runs,
+# `.github/workflows/ci.yml` calls `real-engine-scenario-report.py ci-gate` on the
+# emitted summary.json. Only PARTIAL rows listed in
+# docs/reliability/real-engine-ci-partial-allowlist.json are accepted; any FAIL,
+# NOT RUN, or other PARTIAL still fails the job. Self-test:
+#   python3 scripts/real-engine-scenario-report.py self-test
 # ============================================================================
 
 set -euo pipefail

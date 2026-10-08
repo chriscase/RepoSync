@@ -31,7 +31,10 @@ jobs:
         run: svn --version && svnadmin --version && git --version && git lfs version
 
       - name: Reliability #62 acceptance matrix
-        run: python3 scripts/reliability-acceptance-matrix.py --self-test && python3 scripts/reliability-acceptance-matrix.py --check --report
+        run: |
+          python3 scripts/reliability-acceptance-matrix.py --self-test
+          python3 scripts/reliability-acceptance-matrix.py --check --report
+          python3 scripts/real-engine-scenario-report.py self-test
 
       - name: Git operation request client
         run: python3 scripts/test_git_operation_request.py
@@ -55,7 +58,21 @@ jobs:
           GIT_COMMITTER_EMAIL: "test@example.com"
 
       - name: Real-engine svnserve scenario suite (#62)
-        run: scripts/real-engine-scenario-suite.sh
+        run: |
+          set +e
+          scripts/real-engine-scenario-suite.sh
+          suite_ec=$?
+          summary="$(ls -td artifacts/real-engine-scenarios/*/summary.json 2>/dev/null | head -1 || true)"
+          if [[ -z "$summary" ]]; then
+            echo "::error::real-engine suite did not emit summary.json"
+            exit "${suite_ec:-1}"
+          fi
+          set -e
+          python3 scripts/real-engine-scenario-report.py ci-gate "$summary"
+          case "$suite_ec" in
+            0|3) exit 0 ;;
+            *) exit "$suite_ec" ;;
+          esac
         env:
           GIT_AUTHOR_NAME: "Test User"
           GIT_AUTHOR_EMAIL: "test@example.com"
