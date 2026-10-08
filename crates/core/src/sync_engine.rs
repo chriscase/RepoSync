@@ -41,8 +41,7 @@ use crate::db::team_cycle_mapping_operations::{
 use crate::db::Database;
 use crate::echo_receipt_scope::{
     collect_git_no_target_receipts_for_sha, handled_git_no_target_state_key,
-    read_git_no_target_receipt, read_git_no_target_receipt_any_generation, repo_echo_generation,
-    stored_git_no_target_receipt_exists,
+    read_git_no_target_receipt, repo_echo_generation, stored_git_no_target_receipt_exists,
 };
 use crate::echo_suppression::{
     classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
@@ -950,37 +949,6 @@ impl SyncEngine {
                 if column.as_deref() == Some(kv_sha.as_str())
                     && !self.proved_scoped_inbound_git_checkpoint(rid, &kv_sha)?
                 {
-                    let outbound_history: i64 = {
-                        let conn = self.db.conn();
-                        conn.query_row(
-                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
-                            [rid],
-                            |row| row.get(0),
-                        )
-                        .map_err(crate::errors::DatabaseError::from)?
-                    };
-                    let mut stale_identifies_frontier = false;
-                    if outbound_history > 0 {
-                        if let Some(record) =
-                            read_git_no_target_receipt_any_generation(&self.db, rid, &kv_sha)
-                                .map_err(SyncError::DatabaseError)?
-                        {
-                            let projection = self.no_target_projection();
-                            let generation = repo_echo_generation(&self.db, rid)
-                                .map_err(SyncError::DatabaseError)?;
-                            stale_identifies_frontier = verify_no_target_receipt(
-                                &record,
-                                rid,
-                                &kv_sha,
-                                &projection,
-                                generation,
-                            )
-                                == NoTargetReceiptVerdict::StaleGeneration;
-                        }
-                    }
-                    if stale_identifies_frontier {
-                        return Ok(Some(kv_sha));
-                    }
                     return Err(self.record_history_block(
                         "ambiguous_checkpoint",
                         "legacy Git cursor lacks scoped provenance for this repository",
@@ -5416,6 +5384,134 @@ repo = "test/test-repo"
         engine
             .db()
             .set_state("last_git_sha_pair", &frontier)
+            .unwrap();
+        assert!(matches!(
+            engine.team_git_checkpoint(),
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn team_git_checkpoint_rejects_bogus_unified_receipt_with_outbound_history() {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+        use uuid::Uuid;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let repo_path = engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let handled = git_fixture_commit(&repo_path, "handled.txt", "h\n", "handled H");
+        let child = git_fixture_commit(&repo_path, "child.txt", "n\n", "no-target N");
+        let now = chrono::Utc::now();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: Uuid::new_v4().to_string(),
+                repo_id: Some("pair".into()),
+                svn_revision: None,
+                git_hash: Some(handled.clone()),
+                direction: SyncDirection::GitToSvn,
+                author: "dev".into(),
+                message: "handled outbound".into(),
+                timestamp: now,
+                synced_at: now,
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": child,
+            "outcome": "bogus",
+            "projection": "not-the-policy",
+            "generation": 99,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_git_no_target_pair_{child}"),
+                &receipt.to_string(),
+            )
+            .unwrap();
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&child],
+            )
+            .unwrap();
+        engine.db().set_state("last_git_sha_pair", &child).unwrap();
+        assert!(matches!(
+            engine.team_git_checkpoint(),
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
+        ));
+    }
+
+    #[test]
+    fn team_git_checkpoint_rejects_stale_filtered_receipt_unified_after_generation_bump() {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+        use uuid::Uuid;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let repo_path = engine
+            .git_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .repo_path()
+            .to_path_buf();
+        let handled = git_fixture_commit(&repo_path, "handled.txt", "h\n", "handled H");
+        let filtered = git_fixture_commit(&repo_path, "blocked.txt", "b\n", "filtered N");
+        let now = chrono::Utc::now();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: Uuid::new_v4().to_string(),
+                repo_id: Some("pair".into()),
+                svn_revision: None,
+                git_hash: Some(handled.clone()),
+                direction: SyncDirection::GitToSvn,
+                author: "dev".into(),
+                message: "handled outbound".into(),
+                timestamp: now,
+                synced_at: now,
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        let receipt = serde_json::json!({
+            "version": 1,
+            "repo_id": "pair",
+            "git_sha": filtered,
+            "outcome": "filtered",
+            "projection": engine.no_target_projection(),
+            "generation": 1,
+        });
+        engine
+            .db()
+            .set_state(
+                &format!("handled_git_no_target_pair_{filtered}"),
+                &receipt.to_string(),
+            )
+            .unwrap();
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+                [&filtered],
+            )
+            .unwrap();
+        engine
+            .db()
+            .set_state("last_git_sha_pair", &filtered)
+            .unwrap();
+        crate::echo_receipt_scope::bump_repo_echo_generation(engine.db(), "pair").unwrap();
+        engine
+            .db()
+            .set_state("last_git_sha_pair", &filtered)
             .unwrap();
         assert!(matches!(
             engine.team_git_checkpoint(),

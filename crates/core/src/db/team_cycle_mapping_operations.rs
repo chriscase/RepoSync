@@ -208,21 +208,6 @@ fn advance_git_with_receipt_tx(
         [repo_id],
         |row| row.get(0),
     )?;
-    let column_before: String = tx.query_row(
-        "SELECT last_git_sha FROM repositories WHERE id = ?1",
-        [repo_id],
-        |row| row.get(0),
-    )?;
-    let scoped_kv: Option<String> = tx
-        .query_row(
-            "SELECT value FROM kv_state WHERE key = ?1",
-            [format!("last_git_sha_{}", repo_id)],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let unified_cursors = scoped_kv
-        .as_deref()
-        .is_some_and(|kv| !column_before.is_empty() && kv == column_before);
     let updated = tx.execute(
         "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
         params![git_sha, repo_id],
@@ -232,12 +217,16 @@ fn advance_git_with_receipt_tx(
             "team cycle mapping lost its repository registration".into(),
         ));
     }
-    if outbound_applied == 0 || unified_cursors {
-        write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
-    }
     let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
     let mut receipt = receipt;
     crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+    let projection = receipt["projection"].as_str().unwrap_or("");
+    let receipt_proves_kv = crate::echo_suppression::verify_no_target_receipt(
+        &receipt, repo_id, git_sha, projection, generation,
+    ) == crate::echo_suppression::NoTargetReceiptVerdict::Accepted;
+    if outbound_applied == 0 || receipt_proves_kv {
+        write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
+    }
     let receipt_key =
         crate::echo_receipt_scope::handled_git_no_target_state_key(repo_id, generation, git_sha);
     write_value(tx, &receipt_key, &receipt.to_string())?;

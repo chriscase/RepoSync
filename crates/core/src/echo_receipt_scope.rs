@@ -41,6 +41,53 @@ pub fn repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, Databas
     }
 }
 
+/// When a generation bump follows a unified no-target cursor, restore the scoped
+/// KV copy to the last applied outbound Git SHA so stale receipts cannot admit P.
+fn split_unified_git_cursor_to_outbound_kv_tx(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    let column: String = tx.query_row(
+        "SELECT last_git_sha FROM repositories WHERE id = ?1",
+        [repo_id],
+        |row| row.get(0),
+    )?;
+    if column.is_empty() {
+        return Ok(());
+    }
+    let kv_key = format!("last_git_sha_{}", repo_id);
+    let kv: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [&kv_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if kv.as_deref() != Some(column.as_str()) {
+        return Ok(());
+    }
+    let handled: Option<String> = tx
+        .query_row(
+            "SELECT git_sha FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied' ORDER BY rowid DESC LIMIT 1",
+            [repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(handled) = handled else {
+        return Ok(());
+    };
+    if handled == column {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![kv_key, handled, now],
+    )?;
+    Ok(())
+}
+
 /// Bump the echo generation on an open connection (same transaction as reset).
 pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
     let next = repo_echo_generation_tx(tx, repo_id)? + 1;
@@ -51,6 +98,7 @@ pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i6
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![key, next.to_string(), now],
     )?;
+    split_unified_git_cursor_to_outbound_kv_tx(tx, repo_id)?;
     Ok(next)
 }
 

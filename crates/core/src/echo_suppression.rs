@@ -79,20 +79,19 @@ pub(crate) fn verify_no_target_receipt(
     projection: &str,
     current_generation: i64,
 ) -> NoTargetReceiptVerdict {
-    if !receipt_generation_accepted(record, current_generation) {
-        return NoTargetReceiptVerdict::StaleGeneration;
-    }
     if record["repo_id"] != repo_id || record["git_sha"] != sha || !is_full_git_oid(sha) {
         return NoTargetReceiptVerdict::RepoOrShaMismatch;
     }
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
     }
-    if git_no_target_outcome_is_verified(record) {
-        NoTargetReceiptVerdict::Accepted
-    } else {
-        NoTargetReceiptVerdict::UnverifiedOutcome
+    if !git_no_target_outcome_is_verified(record) {
+        return NoTargetReceiptVerdict::UnverifiedOutcome;
     }
+    if !receipt_generation_accepted(record, current_generation) {
+        return NoTargetReceiptVerdict::StaleGeneration;
+    }
+    NoTargetReceiptVerdict::Accepted
 }
 
 /// Validate an SVN no-target receipt with the same scoping the admission writer binds.
@@ -103,9 +102,6 @@ pub(crate) fn verify_svn_no_target_receipt(
     projection: &str,
     current_generation: i64,
 ) -> NoTargetReceiptVerdict {
-    if !receipt_generation_accepted(record, current_generation) {
-        return NoTargetReceiptVerdict::StaleGeneration;
-    }
     if record["repo_id"] != repo_id
         || record["svn_revision"].as_i64() != Some(svn_rev)
         || svn_rev <= 0
@@ -115,11 +111,13 @@ pub(crate) fn verify_svn_no_target_receipt(
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
     }
-    if svn_no_target_outcome_is_verified(record) {
-        NoTargetReceiptVerdict::Accepted
-    } else {
-        NoTargetReceiptVerdict::UnverifiedOutcome
+    if !svn_no_target_outcome_is_verified(record) {
+        return NoTargetReceiptVerdict::UnverifiedOutcome;
     }
+    if !receipt_generation_accepted(record, current_generation) {
+        return NoTargetReceiptVerdict::StaleGeneration;
+    }
+    NoTargetReceiptVerdict::Accepted
 }
 
 pub(crate) fn git_no_target_outcome_is_verified(record: &serde_json::Value) -> bool {

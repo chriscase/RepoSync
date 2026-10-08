@@ -13243,3 +13243,132 @@ async fn candidate_echo_shape1_column_only_unproved_blocks_sync_cycle_bounded() 
         })
     );
 }
+
+// Refs #63: stale or bogus unified receipts must not admit team_git_checkpoint P.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_unified_bogus_no_target_receipt_ambiguous_checkpoint() {
+    if !svn_available() {
+        return;
+    }
+    let pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let handled = pair
+        .engine
+        .db()
+        .get_state("last_git_sha_pair")
+        .unwrap()
+        .unwrap();
+    let child = pair.developer_commit(
+        "blocked.txt",
+        "bogus probe\n",
+        "Unified bogus receipt probe",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let bogus = serde_json::json!({
+        "version": 1,
+        "repo_id": "pair",
+        "git_sha": child,
+        "outcome": "bogus",
+        "projection": "not-the-policy",
+        "generation": 99,
+    });
+    pair.engine
+        .db()
+        .set_state(
+            &format!("handled_git_no_target_pair_{child}"),
+            &bogus.to_string(),
+        )
+        .unwrap();
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&child],
+        )
+        .unwrap();
+    pair.engine
+        .db()
+        .set_state("last_git_sha_pair", &child)
+        .unwrap();
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "bogus unified receipt must not admit checkpoint: {result:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_UNIFIED_BOGUS_RECEIPT",
+            "handled":handled,
+            "child":child,
+            "blocked":"ambiguous_checkpoint"
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_unified_stale_filtered_receipt_after_bump_ambiguous_checkpoint() {
+    if !svn_available() {
+        return;
+    }
+    use reposync_core::echo_receipt_scope::bump_repo_echo_generation;
+
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit(
+        "handled.txt",
+        "ordinary baseline\n",
+        "Establish applied outbound cursor",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let filtered = pair.developer_commit(
+        "blocked.txt",
+        "filtered content\n",
+        "Filtered before generation bump",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    bump_repo_echo_generation(pair.engine.db(), "pair").unwrap();
+    pair.engine
+        .db()
+        .set_state("last_git_sha_pair", &filtered)
+        .unwrap();
+    pair.engine
+        .db()
+        .conn()
+        .execute(
+            "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
+            [&filtered],
+        )
+        .unwrap();
+    let result = pair.engine.run_sync_cycle().await;
+    assert!(
+        matches!(result, Err(SyncError::HistoryBlocked { ref reason, .. }) if reason == "ambiguous_checkpoint"),
+        "stale generation-1 filtered receipt on unified cursor must block: {result:?}"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_UNIFIED_STALE_FILTERED_AFTER_BUMP",
+            "filtered":filtered,
+            "blocked":"ambiguous_checkpoint"
+        })
+    );
+}
