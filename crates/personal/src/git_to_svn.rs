@@ -1177,24 +1177,37 @@ impl GitToSvnSync {
         if op.state != SvnCommitOperationState::ReconciliationRequired {
             return Ok(None);
         }
-        let git_author = match git_author_override {
-            Some(name) => name.to_string(),
-            None => {
-                let git_client = GitClient::new(&self.git_repo_path)
-                    .context("failed to open git repo for held commit author")?;
-                git_client
-                    .commit_author_name(&op.source_git_sha)
-                    .context("failed to resolve git author for held personal git-to-svn commit")?
-            }
-        };
-        self.finalize_held_personal_git_to_svn_if_proven(op, &git_author)
+        self.finalize_held_personal_git_to_svn_if_proven(op, git_author_override)
             .await
+    }
+
+    async fn resolve_git_author_for_held_commit(
+        &self,
+        op: &SvnCommitOperation,
+        git_author_override: Option<&str>,
+    ) -> Result<String> {
+        if let Some(name) = git_author_override {
+            return Ok(name.to_string());
+        }
+        if let Ok(git_client) = GitClient::new(&self.git_repo_path) {
+            if let Ok(name) = git_client.commit_author_name(&op.source_git_sha) {
+                if !name.is_empty() {
+                    return Ok(name);
+                }
+            }
+        }
+        let detail = self
+            .github
+            .get_commit(&self.github_repo, &op.source_git_sha)
+            .await
+            .context("failed to resolve git author for held personal git-to-svn commit")?;
+        Ok(detail.commit.author.name)
     }
 
     async fn finalize_held_personal_git_to_svn_if_proven(
         &self,
         op: &SvnCommitOperation,
-        git_author: &str,
+        git_author_override: Option<&str>,
     ) -> Result<Option<i64>> {
         if op.state != SvnCommitOperationState::ReconciliationRequired {
             return Ok(None);
@@ -1204,13 +1217,16 @@ impl GitToSvnSync {
             SvnCommitInspect::UniqueMatch {
                 svn_rev, svn_tree, ..
             } => {
+                let git_author = self
+                    .resolve_git_author_for_held_commit(op, git_author_override)
+                    .await?;
                 self.db
                     .finalize_personal_verified_git_to_svn_commit(
                         PERSONAL_REPO_ID,
                         &op.id,
                         svn_rev,
                         &svn_tree,
-                        git_author,
+                        &git_author,
                     )
                     .with_context(|| {
                         format!(
