@@ -366,6 +366,8 @@ def run_baseline(binaries):
 
 
 def main():
+    os.environ.setdefault("REPOSYNC_NODE_BIN", "/usr/bin/nodejs")
+    os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     mode = sys.argv[1]
     assert mode in ("diagnostics", "candidate", "all", "baseline"), mode
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"

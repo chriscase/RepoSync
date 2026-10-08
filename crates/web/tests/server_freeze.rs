@@ -4202,7 +4202,8 @@ mod import_reconciliation_tests {
             fixture.state.db.get_repo_watermark(&fixture.id).unwrap().0,
             0
         );
-        let mappings = fixture.state.db.list_commit_map(100).unwrap().len();
+        let expected_map_rows =
+            fixture.state.db.list_commit_map(100).unwrap().len() + op.pending_commit_maps.len();
         let fixture = fixture.restart().await;
         fixture.trace_remote_inspection();
         let (code, result) = fixture.reconcile().await;
@@ -4216,7 +4217,7 @@ mod import_reconciliation_tests {
         assert_eq!(fixture.svn_head(), svn_before);
         assert_eq!(
             fixture.state.db.list_commit_map(100).unwrap().len(),
-            mappings
+            expected_map_rows
         );
         assert_eq!(
             fixture.state.db.get_repo_watermark(&fixture.id).unwrap(),

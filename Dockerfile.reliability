@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git git-lfs subversion libssl3 ca-certificates nodejs && rm -rf /var/lib/apt/lists/* \
     && if ! command -v node >/dev/null; then ln -sf /usr/bin/nodejs /usr/local/bin/node; fi
 ENV PATH="/usr/local/bin:/usr/bin:/bin"
+ENV REPOSYNC_NODE_BIN=/usr/bin/nodejs
 # Web UI contract tests resolve web-ui via compile-time CARGO_MANIFEST_DIR (/src/crates/web).
 COPY --from=build /src/web-ui /src/web-ui
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
