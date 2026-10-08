@@ -977,7 +977,9 @@ async fn remove_repo(
                 if delete_svn {
                     remote_outcome.remote_svn = deletion.remote_svn;
                 }
-                if remote_outcome.remote_git == "failed" || remote_outcome.remote_svn == "failed" {
+                if (delete_git && remote_outcome.remote_git == "failed")
+                    || (delete_svn && remote_outcome.remote_svn == "failed")
+                {
                     let detail = if deletion.warnings.is_empty() {
                         "requested remote deletion failed".into()
                     } else {
