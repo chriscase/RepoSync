@@ -9,6 +9,7 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::db::Database;
+use crate::echo_suppression::{verify_no_target_receipt, NoTargetReceiptVerdict};
 use crate::errors::DatabaseError;
 use crate::pair_refresh::PAIR_GENERATION;
 
@@ -121,24 +122,21 @@ pub fn read_git_no_target_receipt(
     Ok(None)
 }
 
-/// Whether any generation-scoped or legacy Git no-target receipt exists for `git_sha`.
+/// Whether a generation-accepted, admission-scoped Git no-target receipt exists for `git_sha`.
 pub fn stored_git_no_target_receipt_exists(
     db: &Database,
     repo_id: &str,
     git_sha: &str,
+    projection: &str,
 ) -> Result<bool, DatabaseError> {
-    let legacy = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
-    if db.get_state(&legacy)?.is_some() {
-        return Ok(true);
-    }
+    let Some(record) = read_git_no_target_receipt(db, repo_id, git_sha)? else {
+        return Ok(false);
+    };
     let generation = repo_echo_generation(db, repo_id)?;
-    for gen in 1..=generation {
-        let key = handled_git_no_target_state_key(repo_id, gen, git_sha);
-        if db.get_state(&key)?.is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(
+        verify_no_target_receipt(&record, repo_id, git_sha, projection, generation)
+            == NoTargetReceiptVerdict::Accepted,
+    )
 }
 
 /// Resolve a stored SVN no-target receipt for the active generation.
@@ -244,6 +242,18 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_bytes_are_not_valid_stored_receipt() {
+        let db = setup_db();
+        let sha = "d".repeat(40);
+        db.set_state(&format!("handled_git_no_target_pair_{sha}"), "not-json")
+            .unwrap();
+        assert!(
+            !stored_git_no_target_receipt_exists(&db, "pair", &sha, "{}").unwrap(),
+            "arbitrary legacy kv bytes must not count as a verified no-target receipt"
         );
     }
 

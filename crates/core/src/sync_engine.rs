@@ -687,6 +687,7 @@ impl SyncEngine {
                         &self.db,
                         rid,
                         column.as_deref().unwrap(),
+                        &self.no_target_projection(),
                     )
                     .map_err(SyncError::DatabaseError)?;
                 if (emitted > 0 || column_git_no_target_tip)

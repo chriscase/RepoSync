@@ -7332,6 +7332,14 @@ async fn test_team_mode_marker_without_receipt_applies_once() {
         "receipt-backed echo must not apply twice"
     );
     assert_eq!(svn_youngest(&fixture.svn_url), svn_before + 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_MARKER_FORGED",
+            "sha":sha,
+            "svn_revision":svn_before + 1
+        })
+    );
 }
 
 // ===========================================================================
@@ -12420,6 +12428,406 @@ async fn candidate_echo_generation_stale_receipt_same_sha_split_inbound_checkpoi
             "filtered":filtered,
             "emitted_tip":table_tip,
             "svn_tree":tree_hashes(&tree)
+        })
+    );
+}
+
+// Refs #63: duplicate / edited echo markers must not skip without a receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_marker_duplicate_git_trailer_applies_without_receipt() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new_with_repo_id("echo-dup-git").await;
+    svn_commit_file(
+        &fixture.wc,
+        "dup-seed.txt",
+        "seed\n",
+        "SVN seed for duplicate marker",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    git_cli(&fixture.developer, &["pull", "--rebase", "origin", "main"]);
+    let svn_after_first = svn_youngest(&fixture.svn_url);
+    let echoed_sha = get_head_sha(&fixture.bridge);
+
+    let duplicated_message = get_git_commit_message(&fixture.bridge, 0);
+    assert!(
+        duplicated_message.contains("[reposync]"),
+        "SVN→Git bridge commit must carry the sync marker in the message"
+    );
+    let second = fixture.developer_commit_tree(
+        &[("second.txt", Some("second body\n"))],
+        &duplicated_message,
+    );
+    assert_ne!(echoed_sha, second);
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1,
+        "duplicated marker text on a new SHA must apply once without a receipt"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        0,
+        "receipt-backed echo must not apply twice"
+    );
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_after_first + 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_MARKER_DUPLICATE",
+            "echoed_sha":echoed_sha,
+            "second":second,
+            "svn_revision":svn_after_first + 1
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_marker_edited_svn_trailer_applies_without_receipt() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+
+    let fixture = QualifiedPair::new_with_repo_id("echo-edit-svn").await;
+    svn_commit_file(
+        &fixture.wc,
+        "seed2.txt",
+        "seed\n",
+        "SVN before forged trailer",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        0,
+        "receipt-backed SVN→Git echo must not replay"
+    );
+    let svn_after_echo = svn_youngest(&fixture.svn_url);
+    let forged_message =
+        "New SVN work\n\n[reposync] synced from Git aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    svn_commit_file(&fixture.wc, "forged.txt", "forged body\n", forged_message);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1,
+        "edited/forged SVN marker without receipt must still import once"
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        0
+    );
+    assert_eq!(svn_youngest(&fixture.svn_url), svn_after_echo + 1);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_MARKER_EDITED",
+            "svn_revision":svn_after_echo + 1
+        })
+    );
+}
+
+// Refs #63: identity change must invalidate generation-scoped receipts (reimport path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_identity_reimport_bumps_stale_no_target_receipt() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    use reposync_core::echo_receipt_scope::repo_echo_generation;
+
+    let mut pair = QualifiedPair::new().await;
+    let repo_id = pair.repo_id.clone();
+    pair.developer_commit("handled.txt", "baseline\n", "Establish outbound cursor");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    pair.engine.set_path_rules(vec!["allow/".into()], vec![]);
+    let filtered = pair.developer_commit("blocked.txt", "filtered\n", "Filtered before reimport");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    let receipt_key = format!("handled_git_no_target_{repo_id}_{filtered}");
+    assert!(pair.engine.db().get_state(&receipt_key).unwrap().is_some());
+
+    let generation_before = repo_echo_generation(pair.engine.db(), &repo_id).unwrap();
+    pair.engine
+        .db()
+        .reset_repo_sync_mappings_for_reimport(&repo_id)
+        .unwrap();
+    let generation_after = repo_echo_generation(pair.engine.db(), &repo_id).unwrap();
+    assert_eq!(generation_after, generation_before + 1);
+
+    let mapping_rows: i64 = pair
+        .engine
+        .db()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1",
+            [&repo_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        mapping_rows, 0,
+        "reimport reset must clear durable mapping receipts before identity reuse"
+    );
+
+    let successor = pair.developer_commit(
+        "allow/work.txt",
+        "post-reimport work\n",
+        "Ordinary work after reimport reset bump",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let engine = reopen_pair(&pair);
+    use reposync_core::echo_suppression::{
+        classify_incoming_git_commit, EchoDisposition, TeamEchoContext,
+    };
+    let projection = serde_json::json!({
+        "allowed_paths": ["allow/"],
+        "blocked_patterns": []
+    })
+    .to_string();
+    let ctx = TeamEchoContext {
+        db: engine.db(),
+        repo_id: &repo_id,
+        no_target_projection: &projection,
+    };
+    assert_eq!(
+        classify_incoming_git_commit(&ctx, &filtered, "no marker")
+            .unwrap()
+            .unwrap(),
+        EchoDisposition::ApplyGenuine,
+        "generation-bumped stale no-target receipt must not suppress filtered SHA"
+    );
+    assert_eq!(
+        classify_incoming_git_commit(&ctx, &successor, "no marker")
+            .unwrap()
+            .unwrap(),
+        EchoDisposition::ApplyGenuine
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_IDENTITY_REIMPORT_RESET",
+            "filtered":filtered,
+            "successor":successor,
+            "generation_before":generation_before,
+            "generation_after":generation_after,
+            "sync_records_cleared":true
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_identity_svn_uuid_auto_bump_not_implemented() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    use reposync_core::echo_receipt_scope::repo_echo_generation;
+
+    let fixture = QualifiedPair::new_with_repo_id("echo-uuid").await;
+    let repo_id = fixture.repo_id.clone();
+    svn_commit_file(&fixture.wc, "uuid-a.txt", "repo A\n", "SVN on repo A");
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    let generation_before = repo_echo_generation(fixture.engine.db(), &repo_id).unwrap();
+    let svn_repo_path = fixture.tmp.path().join("svn_repo");
+    let uuid_a = Command::new("svnlook")
+        .args(["uuid", svn_repo_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(uuid_a.status.success());
+
+    let new_root = fixture.tmp.path().join("svn_repo_b");
+    std::fs::create_dir_all(&new_root).unwrap();
+    let svn_url_b = create_svn_repo(&new_root);
+    let uuid_b = Command::new("svnlook")
+        .args(["uuid", new_root.join("svn_repo").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(uuid_b.status.success());
+    assert_ne!(
+        String::from_utf8_lossy(&uuid_a.stdout).trim(),
+        String::from_utf8_lossy(&uuid_b.stdout).trim()
+    );
+
+    let mut row = fixture
+        .engine
+        .db()
+        .get_repository(&repo_id)
+        .unwrap()
+        .expect("repository row");
+    row.svn_url = svn_url_b.clone();
+    fixture.engine.db().update_repository(&row).unwrap();
+
+    let generation_after_url_swap = repo_echo_generation(fixture.engine.db(), &repo_id).unwrap();
+    assert_eq!(
+        generation_after_url_swap, generation_before,
+        "automatic UUID-change detection must not bump echo generation yet"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_IDENTITY_SVN_UUID_AUTO",
+            "status":"NOT_IMPLEMENTED",
+            "generation_before":generation_before,
+            "generation_after_url_swap":generation_after_url_swap,
+            "uuid_a":String::from_utf8_lossy(&uuid_a.stdout).trim(),
+            "uuid_b":String::from_utf8_lossy(&uuid_b.stdout).trim()
+        })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_echo_identity_path_recreation_stale_svn_receipt_not_valid() {
+    if !svn_available() {
+        eprintln!("SKIP: svn/svnadmin not available");
+        return;
+    }
+    use reposync_core::echo_receipt_scope::{
+        bump_repo_echo_generation, handled_svn_no_target_state_key,
+    };
+
+    let fixture = QualifiedPair::new_with_repo_id("echo-path").await;
+    let repo_id = fixture.repo_id.clone();
+    let path = "incarn.txt";
+    svn_commit_file(
+        &fixture.wc,
+        path,
+        "first incarnation\n",
+        "Add incarnation file",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1
+    );
+    svn_delete_file(&fixture.wc, path, "Delete incarnation file");
+    svn_commit_file(
+        &fixture.wc,
+        path,
+        "second incarnation\n",
+        "Recreate same path",
+    );
+    let recreated_rev = svn_youngest(&fixture.svn_url);
+    let imported = fixture
+        .engine
+        .run_sync_cycle()
+        .await
+        .unwrap()
+        .svn_to_git_count;
+    assert!(
+        imported >= 1,
+        "path delete/recreate must still import as new SVN work (got {imported})"
+    );
+    let tree = svn_tree(&fixture, recreated_rev).await;
+    assert_eq!(
+        tree.get(path),
+        Some(&b"second incarnation\n".to_vec()),
+        "recreated path must reach Git via SVN→Git"
+    );
+
+    let stale_rev = recreated_rev - 1;
+    let generation = bump_repo_echo_generation(fixture.engine.db(), &repo_id).unwrap();
+    let stale_key = handled_svn_no_target_state_key(&repo_id, generation - 1, stale_rev);
+    fixture
+        .engine
+        .db()
+        .set_state(
+            &stale_key,
+            &serde_json::json!({
+                "version": 1,
+                "repo_id": repo_id,
+                "svn_revision": stale_rev,
+                "outcome": "filtered",
+                "projection": "{}",
+                "generation": generation - 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    svn_commit_file(
+        &fixture.wc,
+        "after-bump.txt",
+        "post bump\n",
+        "SVN after path-incarnation bump",
+    );
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .svn_to_git_count,
+        1,
+        "stale generation SVN no-target receipt must not suppress after bump"
+    );
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"ECHO_IDENTITY_PATH_RECREATION",
+            "recreated_rev":recreated_rev,
+            "generation":generation,
+            "automatic_path_incarnation_bump":"NOT_IMPLEMENTED"
         })
     );
 }
