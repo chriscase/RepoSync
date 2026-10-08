@@ -1085,7 +1085,7 @@
     {"id":"R06_EXISTING_TARGET_NOT_EQUIVALENT", "binary":"server_freeze", "test":"candidate_r06_existing_target_not_equivalent", "tier":"candidate_regression"},
     {"id":"R06_NO_ACTIVE_ON_PARTIAL", "binary":"server_freeze", "test":"candidate_r06_no_active_on_partial", "tier":"candidate_regression"},
     {"id":"R06_LATE_PAIR_PUBLISH_REPLAY", "binary":"server_freeze", "test":"candidate_r06_late_pair_publish_replays_git", "tier":"candidate_regression"},
-    {"id":"R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE", "binary":"replay_publish_67", "test":"https_validate_preflight_refuses_missing_and_revoked_tokens_quickly", "tier":"candidate_regression"},
+    {"id":"R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE", "binary":"server_freeze", "test":"candidate_r06_late_pair_publish_https_refuse_before_svn", "tier":"candidate_regression"},
     {"id":"R13_PREVIEW_PINS_INPUTS", "binary":"server_freeze", "test":"candidate_r13_preview_pins_inputs", "tier":"candidate_regression"},
     {"id":"R13_PENDING_BOTH_SIDES", "binary":"server_freeze", "test":"candidate_r13_pending_both_sides", "tier":"candidate_regression"},
     {"id":"R13_EXECUTE_REFUSED", "binary":"server_freeze", "test":"candidate_r13_execute_refused", "tier":"candidate_regression"},

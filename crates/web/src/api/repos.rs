@@ -1547,22 +1547,19 @@ async fn start_repo_import(
     } else {
         // A missing/unreachable target must never be replaced with a fresh
         // local repository. Supervise the clone and its descendants.
-        let authenticated_url = match (
-            git_token.as_deref(),
-            clone_url.strip_prefix("https://"),
-            clone_url.strip_prefix("http://"),
-        ) {
-            (Some(token), Some(rest), _) => format!("https://x-access-token:{token}@{rest}"),
-            (Some(token), _, Some(rest)) => format!("http://x-access-token:{token}@{rest}"),
-            _ => clone_url.clone(),
-        };
         let mut clone = tokio::process::Command::new("git");
         clone
             .arg("clone")
             .arg("--")
-            .arg(&authenticated_url)
-            .arg(&git_repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0");
+            .arg(&clone_url)
+            .arg(&git_repo_path);
+        if let Some(token) = git_token.as_deref().filter(|t| !t.is_empty()) {
+            for (key, value) in reposync_core::git::subprocess_auth::git_http_auth_env(token) {
+                clone.env(key, value);
+            }
+        } else {
+            clone.env("GIT_TERMINAL_PROMPT", "0");
+        }
         let signal = progress.read().await.cancel_signal.clone();
         let output =
             reposync_core::process::run(clone, std::time::Duration::from_secs(300), Some(&signal))

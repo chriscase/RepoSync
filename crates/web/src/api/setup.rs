@@ -1433,27 +1433,22 @@ async fn reset_and_reimport(
     std::fs::create_dir_all(&git_repo_path)
         .map_err(|e| AppError::Internal(format!("mkdir failed: {}", e)))?;
     let branch = &config.github.default_branch;
-    let clone_url = format!(
-        "https://x-access-token:{}@{}",
-        git_token,
-        config.github.clone_url().trim_start_matches("https://")
-    );
+    let clean_remote_url = config.github.clone_url();
 
-    // git init + empty commit + force push
-    let init_cmds = [
-        vec!["init", "--initial-branch", branch],
-        vec![
+    // git init + empty commit + force push (credentials via env, never in argv)
+    let init_cmds: [&[&str]; 3] = [
+        &["init", "--initial-branch", branch],
+        &[
             "commit",
             "--allow-empty",
             "-m",
             "Reset for full SVN reimport",
         ],
-        vec!["remote", "add", "origin", &clone_url],
-        vec!["push", "--force", "origin", branch],
+        &["remote", "add", "origin", clean_remote_url.as_str()],
     ];
     for args in &init_cmds {
         let output = std::process::Command::new("git")
-            .args(args)
+            .args(*args)
             .current_dir(&git_repo_path)
             .output()
             .map_err(|e| AppError::Internal(format!("git {} failed: {}", args[0], e)))?;
@@ -1466,13 +1461,35 @@ async fn reset_and_reimport(
                     .current_dir(&git_repo_path)
                     .output();
             } else {
-                let msg = format!("git {} failed: {}", args[0], stderr);
+                let msg = format!(
+                    "git {} failed: {}",
+                    args[0],
+                    reposync_core::errors::redact_vcs_error_detail(&stderr)
+                );
                 let mut p = state.import_progress.write().await;
                 p.phase = ImportPhase::Failed;
                 p.push_log(format!("[error] {}", msg));
                 return Ok(action_response(false, msg, None));
             }
         }
+    }
+    let mut push = std::process::Command::new("git");
+    push.args(["push", "--force", "origin", branch])
+        .current_dir(&git_repo_path);
+    reposync_core::git::subprocess_auth::apply_git_http_auth(&mut push, &git_token);
+    let push_output = push
+        .output()
+        .map_err(|e| AppError::Internal(format!("git push failed: {}", e)))?;
+    if !push_output.status.success() {
+        let stderr = String::from_utf8_lossy(&push_output.stderr);
+        let msg = format!(
+            "git push failed: {}",
+            reposync_core::errors::redact_vcs_error_detail(&stderr)
+        );
+        let mut p = state.import_progress.write().await;
+        p.phase = ImportPhase::Failed;
+        p.push_log(format!("[error] {}", msg));
+        return Ok(action_response(false, msg, None));
     }
     info!("force-pushed empty commit to remote");
 

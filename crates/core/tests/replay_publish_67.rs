@@ -513,6 +513,7 @@ async fn candidate_r06_late_pair_publish_resumes_after_replay_hook() {
         LatePairPublishTestHook {
             fail_replay_once: true,
             abort_after_svn_copy_before_journal: false,
+            ..Default::default()
         },
     );
     let first = publish_with_timeout(&fx, &child_id, "req-replay-1")
@@ -550,6 +551,7 @@ async fn candidate_r06_late_pair_publish_resumes_after_svn_copy_hook() {
         LatePairPublishTestHook {
             fail_replay_once: false,
             abort_after_svn_copy_before_journal: true,
+            ..Default::default()
         },
     );
     let first = publish_with_timeout(&fx, &child_id, "req-svn-1")
@@ -578,6 +580,9 @@ async fn candidate_r06_late_pair_publish_resumes_after_svn_copy_hook() {
     .await;
     assert!(probe.exists);
 
+    let mut plan_resume = fx.plan.clone();
+    plan_resume.proposed_svn_copy_source_revision = None;
+
     let second = publish_admitted_late_pair(
         &fx.db,
         &fx.config,
@@ -586,7 +591,7 @@ async fn candidate_r06_late_pair_publish_resumes_after_svn_copy_hook() {
         },
         &fx.parent,
         &fx.request,
-        &fx.plan,
+        &plan_resume,
         &probe,
         &child_id,
         "fixture",
@@ -609,6 +614,7 @@ async fn candidate_r06_late_pair_publish_refuses_fingerprint_mismatch() {
         LatePairPublishTestHook {
             fail_replay_once: false,
             abort_after_svn_copy_before_journal: true,
+            ..Default::default()
         },
     );
     publish_with_timeout(&fx, &child_id, "req-fp-1")
@@ -636,4 +642,85 @@ async fn candidate_r06_late_pair_publish_refuses_fingerprint_mismatch() {
     .await
     .unwrap_err();
     assert_eq!(err.reason, "publish_fingerprint_mismatch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_resumes_after_mid_replay_failure() {
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
+    let child_id = "child-mid-replay".to_string();
+    set_late_pair_publish_test_hook(
+        &fx.parent_id,
+        LatePairPublishTestHook {
+            fail_replay_after_commits: 1,
+            ..Default::default()
+        },
+    );
+    let first = publish_with_timeout(&fx, &child_id, "req-mid-1")
+        .await
+        .unwrap_err();
+    clear_late_pair_publish_test_hook(&fx.parent_id);
+    assert_eq!(first.reason, "replay_failed");
+    let op = fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .expect("journal");
+    assert_eq!(op.state, LatePairPublishState::ReplayInProgress);
+
+    let second = publish_with_timeout(&fx, &child_id, "req-mid-2")
+        .await
+        .expect("resume after mid-replay failure");
+    assert!(second.published);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_resumes_after_svn_copy_error() {
+    assert!(svn_available());
+    let fx = build_publish_fixture().await;
+    let _guard = replay_publish_67_guard().await;
+    let child_id = "child-svn-err".to_string();
+    set_late_pair_publish_test_hook(
+        &fx.parent_id,
+        LatePairPublishTestHook {
+            fail_svn_copy_once: true,
+            ..Default::default()
+        },
+    );
+    let first = publish_with_timeout(&fx, &child_id, "req-svn-err-1")
+        .await
+        .unwrap_err();
+    clear_late_pair_publish_test_hook(&fx.parent_id);
+    assert_eq!(first.reason, "svn_copy_failed");
+    let op = fx
+        .db
+        .latest_late_pair_publish_operation(&fx.parent_id)
+        .unwrap()
+        .expect("journal");
+    assert_eq!(op.state, LatePairPublishState::SvnCopyPending);
+
+    assert!(
+        !Command::new("svn")
+            .args(["info", &fx.target_url])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "failed copy must not create the branch"
+    );
+
+    let second = publish_with_timeout(&fx, &child_id, "req-svn-err-2")
+        .await
+        .expect("retry after svn copy error");
+    assert!(second.published);
+    assert!(
+        Command::new("svn")
+            .args(["info", &fx.target_url])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "retry must create the branch exactly once"
+    );
 }
