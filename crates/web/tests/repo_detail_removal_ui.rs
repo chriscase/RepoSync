@@ -114,6 +114,15 @@ fn repo_detail_ui_distinguishes_pause_disable_and_managed_remove() {
         "Branch pair remove confirm must load child dependency preview"
     );
     assert!(
+        src.contains("branch-removal-preview-unavailable"),
+        "Branch pair remove must show proceed-without-preview when preview fails"
+    );
+    let managed_src = include_str!("../../../web-ui/src/managedRemoval.ts");
+    assert!(
+        managed_src.contains("removalDependencyPreviewConfirmReady"),
+        "Preview gate must allow confirm after failed preview fetch"
+    );
+    assert!(
         src.contains("trackedRemovalOperationId"),
         "Managed removal status must be keyed by operation id"
     );
@@ -156,7 +165,12 @@ import {
   readManagedRemovalReceipt,
   shouldDisplayManagedRemovalReceipt,
   clearManagedRemovalReceipt,
+  removalDependencyPreviewConfirmReady,
 } from './web-ui/src/managedRemoval.ts';
+
+if (removalDependencyPreviewConfirmReady({ isLoading: true, isFetching: false, isError: false, dependencyPreview: null })) process.exit(8);
+if (!removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: true, dependencyPreview: null })) process.exit(9);
+if (!removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: false, dependencyPreview: { repo_id: 'x', repo_name: 'x', parent: null, children: [], parent_removal_blocked: false, block_reason: null, credentials: [], managed_local_path: 'p', sibling_local_paths_preserved: [], shared_git_registrations: [] } })) process.exit(10);
 
 if (shouldDisplayManagedRemovalReceipt(null)) process.exit(2);
 if (shouldDisplayManagedRemovalReceipt({ repoId: '', operationId: 'op', state: 'completed', message: '' })) process.exit(3);

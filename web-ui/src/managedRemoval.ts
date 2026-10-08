@@ -53,6 +53,22 @@ export function managedRemovalNeedsPoll(state: string | undefined): boolean {
   return !!state && !managedRemovalIsTerminal(state);
 }
 
+/** Confirm is gated on preview fetch finishing; a failed preview still allows proceed with warning UI. */
+export function removalDependencyPreviewConfirmReady(args: {
+  isLoading: boolean;
+  isFetching: boolean;
+  isError: boolean;
+  dependencyPreview?: RemovalDependencyPreview | null;
+}): boolean {
+  if (args.isLoading || args.isFetching) {
+    return false;
+  }
+  if (args.dependencyPreview) {
+    return true;
+  }
+  return args.isError;
+}
+
 export function managedRemovalStateLabel(state: string | undefined): string {
   switch (`${state ?? ''}`.toLowerCase()) {
     case 'cancelling':

@@ -21,6 +21,7 @@ import {
   managedRemovalNeedsPoll,
   managedRemovalReceiptFromStatus,
   managedRemovalStatusFromReceipt,
+  removalDependencyPreviewConfirmReady,
   persistManagedRemovalReceipt,
   readManagedRemovalReceipt,
   clearManagedRemovalReceipt,
@@ -436,10 +437,12 @@ export default function RepoDetail() {
     retry: false,
   });
   const branchPairDependencyPreview = branchPairPreviewQuery.data?.dependency_preview;
-  const branchPairPreviewReady = !!branchPairDependencyPreview
-    && !branchPairPreviewQuery.isLoading
-    && !branchPairPreviewQuery.isFetching
-    && !branchPairPreviewQuery.isError;
+  const branchPairPreviewReady = removalDependencyPreviewConfirmReady({
+    isLoading: branchPairPreviewQuery.isLoading,
+    isFetching: branchPairPreviewQuery.isFetching,
+    isError: branchPairPreviewQuery.isError,
+    dependencyPreview: branchPairDependencyPreview,
+  });
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
 
   const trackedRemovalOperationId =
@@ -477,10 +480,12 @@ export default function RepoDetail() {
   })();
 
   const childRemovalConfirm = !!(removalSubject?.parent_id);
-  const removalPreviewReady = !!removalDependencyPreview
-    && !removalPreviewQuery.isLoading
-    && !removalPreviewQuery.isFetching
-    && !removalPreviewQuery.isError;
+  const removalPreviewReady = removalDependencyPreviewConfirmReady({
+    isLoading: removalPreviewQuery.isLoading,
+    isFetching: removalPreviewQuery.isFetching,
+    isError: removalPreviewQuery.isError,
+    dependencyPreview: removalDependencyPreview,
+  });
   const removalConfirmLabel = childRemovalConfirm ? 'Remove branch pair' : 'Remove from RepoSync';
 
   const auditEntries = auditLog?.entries ?? [];
@@ -1846,6 +1851,13 @@ export default function RepoDetail() {
                   <p data-testid="branch-removal-preview-error">
                     Could not load dependency preview: {branchPairPreviewQuery.error?.message}
                   </p>
+                  <p
+                    className="text-amber-200 text-xs"
+                    data-testid="branch-removal-preview-unavailable"
+                  >
+                    Dependency preview is unavailable. You can still remove this branch pair from
+                    RepoSync; remote deletion stays opt-in below and defaults to off.
+                  </p>
                   <button
                     type="button"
                     data-testid="branch-removal-preview-retry"
@@ -2002,6 +2014,10 @@ export default function RepoDetail() {
               <div className="text-sm text-red-300 mb-4 space-y-2">
                 <p data-testid="removal-preview-error">
                   Could not load dependency preview: {removalPreviewQuery.error?.message}
+                </p>
+                <p className="text-amber-200 text-xs" data-testid="removal-preview-unavailable">
+                  Dependency preview is unavailable. Confirm only if you accept proceeding without
+                  shared-credential and child-dependency metadata from the server.
                 </p>
                 <button
                   type="button"
