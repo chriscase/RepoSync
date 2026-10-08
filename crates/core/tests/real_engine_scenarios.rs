@@ -2054,9 +2054,7 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
         || max_in_flight > 2
     {
         "PARTIAL"
-    } else {
-        let alpha_stats = alpha_result.as_ref().unwrap();
-        let beta_stats = beta_result.as_ref().unwrap();
+    } else if let (Ok(alpha_stats), Ok(beta_stats)) = (&alpha_result, &beta_result) {
         assert_eq!(alpha_stats.svn_to_git_count, 1);
         assert_eq!(beta_stats.svn_to_git_count, 1);
         assert_eq!(
@@ -2137,6 +2135,8 @@ async fn scenario_r17_svnserve_concurrent_credential_reload() {
                 "PARTIAL"
             }
         }
+    } else {
+        "PARTIAL"
     };
 
     if case_status == "PARTIAL" {
@@ -2587,39 +2587,22 @@ async fn scenario_r17_svnserve_parent_child_concurrent_credential_reload() {
     }
 }
 
-/// Arms the debug-only `REPOSYNC_TEST_SVN_APPLY_FAULT` hook scoped to one SVN revision
-/// and bridge path (real `git apply` runs; stdin patch bytes are invalid for that rev only).
-struct RealEngineApplyFaultGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<String>,
+/// Arms the debug-only per-engine SVN apply fault (real `git apply` runs; stdin patch
+/// bytes are invalid for that revision on this engine only).
+struct RealEngineApplyFaultGuard<'a> {
+    engine: &'a SyncEngine,
 }
 
-impl RealEngineApplyFaultGuard {
-    fn arm(revision: i64, bridge: &Path) -> Self {
-        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let lock = ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        let previous = std::env::var("REPOSYNC_TEST_SVN_APPLY_FAULT").ok();
-        std::env::set_var(
-            "REPOSYNC_TEST_SVN_APPLY_FAULT",
-            format!("{}|{}", revision, bridge.display()),
-        );
-        Self {
-            _lock: lock,
-            previous,
-        }
+impl<'a> RealEngineApplyFaultGuard<'a> {
+    fn arm(engine: &'a SyncEngine, revision: i64, bridge: &Path) -> Self {
+        engine.set_svn_apply_test_fault(revision, bridge);
+        Self { engine }
     }
 }
 
-impl Drop for RealEngineApplyFaultGuard {
+impl Drop for RealEngineApplyFaultGuard<'_> {
     fn drop(&mut self) {
-        if let Some(value) = self.previous.take() {
-            std::env::set_var("REPOSYNC_TEST_SVN_APPLY_FAULT", value);
-        } else {
-            std::env::remove_var("REPOSYNC_TEST_SVN_APPLY_FAULT");
-        }
+        self.engine.clear_svn_apply_test_fault();
     }
 }
 
@@ -2659,7 +2642,7 @@ async fn run_svnserve_failed_apply_on_real_svnserve(retry: bool) {
         &fixture.repo.password,
     );
     assert_eq!((failed, later), (before.0 + 2, before.0 + 3));
-    let fault = RealEngineApplyFaultGuard::arm(failed, &fixture.repo.bridge);
+    let fault = RealEngineApplyFaultGuard::arm(&engine, failed, &fixture.repo.bridge);
     let blocked = engine.run_sync_cycle().await;
     let apply_failed = matches!(
         &blocked,
@@ -3053,9 +3036,18 @@ async fn scenario_r17_svnserve_notification_isolation() {
     };
     let per_repo_sync_counters = alpha_row.total_syncs >= 1 && beta_row.total_syncs >= 1;
     let webhook_fields_persist = !webhook_crossover;
+    let confinement_ok = webhook_fields_persist && !sync_status_crossover && audit_crossover == 0;
+    let notification_delivery_observed = false;
+    let case_status = if !confinement_ok {
+        "FAIL"
+    } else if notification_delivery_observed {
+        "PASS"
+    } else {
+        "PARTIAL"
+    };
     emit_evidence(
         CASE_NOTIFICATION_ISOLATION,
-        "PARTIAL",
+        case_status,
         serde_json::json!({
             "teams_webhook_crossover": webhook_crossover,
             "sync_status_crossover": sync_status_crossover,
@@ -3065,7 +3057,8 @@ async fn scenario_r17_svnserve_notification_isolation() {
             "beta_total_syncs": beta_row.total_syncs,
             "imports_ok": imports_ok,
             "webhook_fields_persist": webhook_fields_persist,
-            "notification_delivery_observed": false,
+            "confinement_ok": confinement_ok,
+            "notification_delivery_observed": notification_delivery_observed,
             "note": "SyncEngine does not read per-repo teams_webhook_url or invoke Notifier on svnserve cycles; webhook URL persistence and sync_status/audit confinement only",
         }),
     );
