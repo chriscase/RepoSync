@@ -5844,6 +5844,7 @@ async fn test_personal_engine_promotes_held_git_to_svn_when_pr_monitor_fails() {
     let svn_wc = tmp.path().join("svn-wc");
     svn_checkout(&svn_url, &svn_wc);
     svn_commit_file(&svn_wc, "seed.txt", "seed\n", "SVN seed");
+    let svn_before = svn_youngest(&svn_url);
 
     let git_work = tmp.path().join("git_work");
     let bare = tmp.path().join("origin.git");
@@ -5902,6 +5903,11 @@ async fn test_personal_engine_promotes_held_git_to_svn_when_pr_monitor_fails() {
         .await
         .expect("held promotion must proceed when PR monitor RPC fails");
     assert!(db_arc.is_personal_git_sha_synced(&git_sha).unwrap());
+    assert_eq!(
+        svn_youngest(&svn_url),
+        svn_before + 1,
+        "held promotion must write exactly one SVN revision when pulls API returns 503"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5988,6 +5994,13 @@ async fn test_personal_engine_promotes_held_git_to_svn_via_run_cycle_with_missin
             "unexpected run_cycle error after promotion: {text}"
         );
     }
+    let mapping = db_arc
+        .list_commit_map(10)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.git_sha == git_sha)
+        .expect("commit_map row after held promotion");
+    assert_eq!(mapping.git_author, "GitHub Named Author");
 }
 
 #[tokio::test]
