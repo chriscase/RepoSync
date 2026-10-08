@@ -3,6 +3,7 @@
 //! Provides a [`Database`] handle with WAL-mode journaling, automatic schema
 //! migrations, and query helpers for every table used by the sync engine.
 
+pub mod conflict_repo_attribution;
 pub mod credential_seeding;
 pub mod git_push_operations;
 pub mod import_operations;
@@ -102,6 +103,7 @@ impl Database {
         info!("initializing database schema");
         let conn = self.conn();
         schema::run_migrations(&conn)?;
+        conflict_repo_attribution::attribute_null_conflict_repo_ids(&conn)?;
         debug!("database schema is up to date");
         Ok(())
     }

@@ -1763,17 +1763,72 @@ fn remove_stale_inner(src: &Path, dst: &Path, at_root: bool) -> Result<()> {
 /// Returns `true` when the entry was reconciled (export copy left in place,
 /// replaced with engine LFS lines, or removed as non-engine). Returns `false`
 /// when the path is a directory and ordinary stale-remove should run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NofollowEntryKind {
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+}
+
+#[cfg(unix)]
+fn nofollow_kind_from_stat(st: &libc::stat) -> NofollowEntryKind {
+    let kind = (st.st_mode as libc::mode_t) & libc::S_IFMT;
+    NofollowEntryKind {
+        is_dir: kind == libc::S_IFDIR,
+        is_file: kind == libc::S_IFREG,
+        is_symlink: kind == libc::S_IFLNK,
+    }
+}
+
+/// Stat a single name under `dir` via `fstatat` (destination tree).
+fn fstatat_entry_kind(dir: &Path, name: &str) -> Result<NofollowEntryKind> {
+    #[cfg(unix)]
+    {
+        let dir_fd = open_dir_nofollow(dir).with_context(|| {
+            format!(
+                "failed to open directory for fstatat {}: {}",
+                name,
+                dir.display()
+            )
+        })?;
+        let st = fstatat_nofollow(&dir_fd, OsStr::new(name)).with_context(|| {
+            format!(
+                "failed to fstat {} without following under {}",
+                name,
+                dir.display()
+            )
+        })?;
+        Ok(nofollow_kind_from_stat(&st))
+    }
+    #[cfg(not(unix))]
+    {
+        let path = dir.join(name);
+        let meta = std::fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "failed to stat {} without following: {}",
+                name,
+                path.display()
+            )
+        })?;
+        Ok(NofollowEntryKind {
+            is_dir: meta.is_dir(),
+            is_file: meta.is_file(),
+            is_symlink: meta.file_type().is_symlink(),
+        })
+    }
+}
+
 fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Path) -> Result<bool> {
-    let dst_meta = std::fs::symlink_metadata(dst_path).with_context(|| {
+    let dst_kind = fstatat_entry_kind(dst_root, ".gitattributes").with_context(|| {
         format!(
             "failed to stat .gitattributes without following: {}",
             dst_path.display()
         )
     })?;
-    if dst_meta.is_dir() {
+    if dst_kind.is_dir {
         return Ok(false);
     }
-    if !dst_meta.file_type().is_file() && !dst_meta.file_type().is_symlink() {
+    if !dst_kind.is_file && !dst_kind.is_symlink {
         bail!(
             "refusing to reconcile non-regular root .gitattributes at {}",
             dst_path.display()
@@ -1802,8 +1857,8 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
             );
         }
         if src_meta.file_type().is_file() {
-            let dest_was_symlink = dst_meta.file_type().is_symlink();
-            let dest_body = if dst_meta.file_type().is_file() {
+            let dest_was_symlink = dst_kind.is_symlink;
+            let dest_body = if dst_kind.is_file {
                 Some(read_regular_file_no_follow(dst_path).with_context(|| {
                     format!(
                         "failed to read destination .gitattributes: {}",

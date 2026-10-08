@@ -366,6 +366,19 @@ impl Database {
     ///
     /// Only `resolved` and `dismissed` rows allow apply; every other stored
     /// status (including `deferred`) keeps the repository held.
+    /// Backfill NULL `conflicts.repo_id` when ownership is provable (see
+    /// [`super::conflict_repo_attribution`]).
+    pub fn attribute_null_conflict_repo_ids(&self) -> Result<usize, DatabaseError> {
+        super::conflict_repo_attribution::attribute_null_conflict_repo_ids(&self.conn())
+    }
+
+    /// Legacy NULL `repo_id` rows that still block scoped engines.
+    pub fn unattributed_null_conflict_ids_blocking_apply(
+        &self,
+    ) -> Result<Vec<String>, DatabaseError> {
+        super::conflict_repo_attribution::unattributed_null_conflict_ids(&self.conn())
+    }
+
     pub fn count_conflicts_blocking_apply_for_repo(
         &self,
         repo_id: &str,

@@ -625,6 +625,9 @@
         "RS_C02_CONTENT_CONFLICT_STOP",
         "RS_C02_PERSISTED_GATE_FORCE_PUSH_BACK",
         "RS_C02_RESUME_BLOCKED_BY_PERSISTED_CONFLICT",
+        "RS_C02_PERSISTED_GATE_SVN_ONLY_HANDLED_TIP",
+        "RS_C02_NULL_REPO_ID_SINGLE_REPO_ATTRIBUTION",
+        "RS_C02_NULL_REPO_ID_AMBIGUOUS_SURFACES_IDS",
         "RS_C88_IMPORT_COPY_PARENT_SYMLINK",
         "RS_C88_IMPORT_COPY_DEST_HARDLINK",
         "RS_C88_IMPORT_COPY_GITATTRIBUTES_HARDLINK"
@@ -633,7 +636,7 @@
         "Broader path-policy and monorepo projection cases remain #52/#60",
         "Do not infer unimplemented monorepo support from these fixtures"
       ],
-      "evidence": "Full SVN export versus Git tree is compared across addition, modification, and explicit deletion while unrelated top-level bytes survive. Isolated LFS import publishes a pointer. RS-C02 rename and content conflicts stop before SVN/Git apply with projected Git→SVN paths and idempotent conflict rows; persisted non-terminal conflict rows block apply (including resume_authorized SVN→Git push) even when live detection is empty after a Git force-push back. RS-C88 import copy confinement keeps planted parent symlinks, destination hardlinks, and export-present .gitattributes hardlink targets untouched. Open PRs #51 and #44 (404) were inspected; this row does not modify provenance/LFS CI scripts.",
+      "evidence": "Full SVN export versus Git tree is compared across addition, modification, and explicit deletion while unrelated top-level bytes survive. Isolated LFS import publishes a pointer. RS-C02 rename and content conflicts stop before SVN/Git apply with projected Git→SVN paths and idempotent conflict rows; persisted non-terminal conflict rows block apply (including resume_authorized SVN→Git push) even when live detection is empty after a Git force-push back or when Git stays at the handled tip with only an SVN-only edit pending; legacy NULL repo_id rows are attributed when provable and otherwise block with named row ids. RS-C88 import copy confinement keeps planted parent symlinks, destination hardlinks, and export-present .gitattributes hardlink targets untouched. Open PRs #51 and #44 (404) were inspected; this row does not modify provenance/LFS CI scripts.",
       "diagnostic_expected_baseline_failure": false
     },
     {

@@ -27,9 +27,15 @@ back to the pre-divergence tip while only the SVN edit remains pending); the
 persisted row still blocks until resolved or dismissed even when live detection
 is empty.
 
-Scoped engines count rows for their `repo_id` **and** rows with `repo_id IS
-NULL` so legacy conflict rows cannot be bypassed. Cycles with no repository id
-on the engine consult **all** blocking rows before apply (CLI `sync now` path).
+Scoped engines count rows for their `repo_id` **and** unattributed rows with
+`repo_id IS NULL` so legacy conflict rows cannot be bypassed. On database init
+and before each apply gate, `attribute_null_conflict_repo_ids` backfills NULL
+`repo_id` when ownership is certain: exactly one configured repository, or
+exactly one distinct non-NULL `repo_id` among other conflicts on the same
+`file_path`. Rows that remain NULL still block every scoped engine; apply
+refusal names their ids and tells operators to set `conflicts.repo_id` or
+dismiss the row. Cycles with no repository id on the engine consult **all**
+blocking rows before apply (CLI `sync now` path).
 
 ## Conflict upsert integrity
 
