@@ -35,7 +35,9 @@
         "R01_NO_TARGET_STAGE_FAILURE",
         "R01_VERIFIED_NO_DELTA",
         "R01_REPRESENTED_CONTENT",
-        "R01_TARGET_MISMATCH"
+        "R01_TARGET_MISMATCH",
+        "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT",
+        "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN"
       ],
       "open": [
         "Personal-mode ordinary round-trip is not in this catalog",
@@ -482,7 +484,9 @@
       ],
       "supporting_case_ids": [
         "64B_REMOTE_MISSING",
-        "64B_INSPECTION_FAILURE"
+        "64B_INSPECTION_FAILURE",
+        "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
+        "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
       ],
       "open": [
         "Credential-rotation and persistent-auth lifecycle remain open",
