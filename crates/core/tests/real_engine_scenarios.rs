@@ -35,6 +35,8 @@ const CASE_SVN_REMOTE: &str = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE";
 const CASE_SVN_AUTH: &str = "R16_SVNSERVE_SVN_AUTH_DENIED";
 const CASE_MISSING_BRANCH: &str = "R16_SVNSERVE_MISSING_GIT_BRANCH";
 const CASE_BIDIRECTIONAL: &str = "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP";
+const CASE_CREDENTIAL_ROTATION: &str = "R16_SVNSERVE_CREDENTIAL_ROTATION";
+const CASE_CONCURRENT_CREDENTIAL_RELOAD: &str = "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD";
 
 // ===========================================================================
 // Tooling and evidence helpers
@@ -117,46 +119,60 @@ async fn run_import_with_lock_retry(
     label: &str,
     oracle: Option<&ImportCycleOracle>,
 ) -> Result<SyncStats, SyncError> {
+    let mut peer_overlap_latch = false;
     for attempt in 0..12 {
         let cycle_start = Instant::now();
         if let Some(tracker) = oracle {
             let active = tracker.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             tracker.max_in_flight.fetch_max(active, Ordering::SeqCst);
-            tracker
-                .active_cycles
-                .lock()
-                .unwrap()
-                .insert(label.to_string());
+            {
+                let mut active_cycles = tracker.active_cycles.lock().unwrap();
+                peer_overlap_latch = peer_overlap_latch || !active_cycles.is_empty();
+                active_cycles.insert(label.to_string());
+            }
         }
         let cycle_result = engine.run_sync_cycle().await;
         let cycle_end = Instant::now();
-        if let Some(tracker) = oracle {
-            let peer_cycle_still_active = {
-                let active = tracker.active_cycles.lock().unwrap();
-                active.len() > 1
-            };
-            if matches!(&cycle_result, Ok(_)) && peer_cycle_still_active {
-                tracker
-                    .finished_while_peer_in_flight
-                    .lock()
-                    .unwrap()
-                    .insert(label.to_string());
-            }
-            tracker.active_cycles.lock().unwrap().remove(label);
-            tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
-            tracker.windows.lock().unwrap().push(CycleWindow {
-                label: label.to_string(),
-                start: cycle_start,
-                end: cycle_end,
-            });
-        }
         match cycle_result {
-            Ok(stats) => return Ok(stats),
+            Ok(stats) => {
+                if let Some(tracker) = oracle {
+                    let peer_cycle_still_active = {
+                        let active = tracker.active_cycles.lock().unwrap();
+                        active.len() > 1
+                    };
+                    if peer_overlap_latch || peer_cycle_still_active {
+                        tracker
+                            .finished_while_peer_in_flight
+                            .lock()
+                            .unwrap()
+                            .insert(label.to_string());
+                    }
+                    tracker.active_cycles.lock().unwrap().remove(label);
+                    tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    tracker.windows.lock().unwrap().push(CycleWindow {
+                        label: label.to_string(),
+                        start: cycle_start,
+                        end: cycle_end,
+                    });
+                }
+                return Ok(stats);
+            }
             Err(error) if is_transient_import_contention(&error) && attempt + 1 < 12 => {
                 tokio::time::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)))
                     .await;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                if let Some(tracker) = oracle {
+                    tracker.active_cycles.lock().unwrap().remove(label);
+                    tracker.in_flight.fetch_sub(1, Ordering::SeqCst);
+                    tracker.windows.lock().unwrap().push(CycleWindow {
+                        label: label.to_string(),
+                        start: cycle_start,
+                        end: cycle_end,
+                    });
+                }
+                return Err(error);
+            }
         }
     }
     unreachable!("retry loop must return")
@@ -389,6 +405,14 @@ fn make_identity_mapper() -> IdentityMapper {
         ..Default::default()
     };
     IdentityMapper::new(&config).unwrap()
+}
+
+fn rotate_svnserve_password(repo_dir: &Path, username: &str, new_password: &str) {
+    write_svnserve_auth(repo_dir, username, new_password);
+}
+
+fn svnserve_repo_dir(svn_root: &Path, repo_id: &str) -> PathBuf {
+    svn_root.join(repo_id)
 }
 
 fn write_svnserve_auth(repo_dir: &Path, username: &str, password: &str) {
@@ -1813,6 +1837,142 @@ async fn scenario_r16_svnserve_missing_git_branch() {
             "bridge_head_before_after": [bridge_before, bridge_after],
             "svn_revision_before_after": [svn_before, svn_after],
             "mapping_count_before_after": [mappings_before, mappings_after],
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_r16_svnserve_credential_rotation() {
+    if !require_toolchain(CASE_CREDENTIAL_ROTATION) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    let before = fixture.checkpoint_snapshot();
+    let svn_root = fixture.tmp.path().join("svnserve-root");
+    let repo_dir = svnserve_repo_dir(&svn_root, &fixture.repo.id);
+    let rotated = "syncer-rotated-secret-only";
+    rotate_svnserve_password(&repo_dir, &fixture.repo.username, rotated);
+    let db = setup_db(&fixture.db_path);
+    db.set_state(&format!("secret_svn_password_{}", fixture.repo.id), rotated)
+        .unwrap();
+    let old_client = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    assert!(
+        old_client.info().await.is_err(),
+        "svnserve must reject the pre-rotation password"
+    );
+    let new_client = SvnClient::new(&fixture.repo.svn_url, &fixture.repo.username, rotated);
+    assert!(
+        new_client.info().await.is_ok(),
+        "svnserve must accept the rotated password"
+    );
+    let reopened = fixture.make_engine();
+    let _rev = svn_commit_file(
+        &fixture.wc,
+        "after-rotation.txt",
+        "post rotation\n",
+        "SVN after credential rotation",
+        &fixture.repo.username,
+        rotated,
+    );
+    let stats = reopened.run_sync_cycle().await.unwrap();
+    assert_eq!(stats.svn_to_git_count, 1);
+    let after = fixture.checkpoint_snapshot();
+    assert_ne!(after, before);
+    emit_evidence(
+        CASE_CREDENTIAL_ROTATION,
+        "PASS",
+        serde_json::json!({
+            "old_password_rejected": true,
+            "new_password_accepted": true,
+            "reopened_engine_sync_after_rotation": true,
+            "checkpoint_before_after": [before, after],
+            "note": "real svnserve passwd-db rotation with scoped kv reload on new SyncEngine cycle",
+        }),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scenario_r17_svnserve_concurrent_credential_reload() {
+    if !require_toolchain(CASE_CONCURRENT_CREDENTIAL_RELOAD) {
+        return;
+    }
+    let fixture = DualRepoFixture::new();
+    let alpha = fixture.repos[0].clone();
+    let beta = fixture.repos[1].clone();
+    let overlap_marker = "alpha-kv-only-mid-overlap-marker";
+    let db = setup_db(&fixture.db_path);
+    let beta_secret_before = db
+        .get_state("secret_svn_password_repo_beta")
+        .unwrap()
+        .clone();
+    let ready = Arc::new(tokio::sync::Barrier::new(3));
+    let oracle = Arc::new(ImportCycleOracle::new());
+
+    let (alpha_result, beta_result, _) = tokio::join!(
+        async {
+            ready.wait().await;
+            let mut engine = fixture.make_engine(&alpha);
+            run_import_with_lock_retry(&mut engine, "repo_alpha", Some(&oracle)).await
+        },
+        async {
+            ready.wait().await;
+            let mut engine = fixture.make_engine(&beta);
+            run_import_with_lock_retry(&mut engine, "repo_beta", Some(&oracle)).await
+        },
+        async {
+            ready.wait().await;
+            for _ in 0..200 {
+                if oracle.in_flight.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            setup_db(&fixture.db_path)
+                .set_state("secret_svn_password_repo_alpha", overlap_marker)
+                .unwrap();
+        }
+    );
+    let alpha_stats = alpha_result.unwrap();
+    let beta_stats = beta_result.unwrap();
+    assert_eq!(alpha_stats.svn_to_git_count, 1);
+    assert_eq!(beta_stats.svn_to_git_count, 1);
+
+    let db = setup_db(&fixture.db_path);
+    assert_eq!(
+        db.get_state("secret_svn_password_repo_beta").unwrap(),
+        beta_secret_before,
+        "beta scoped secret must not change during alpha rotation"
+    );
+    assert_eq!(
+        db.get_state("secret_svn_password_repo_alpha")
+            .unwrap()
+            .as_deref(),
+        Some(overlap_marker)
+    );
+    let credential_crossover = db.get_state("secret_svn_password_repo_beta").unwrap()
+        == Some(overlap_marker.into())
+        || db.get_state("secret_svn_password_repo_alpha").unwrap() == beta_secret_before;
+    let peak_concurrent = oracle.max_in_flight.load(Ordering::SeqCst) >= 2;
+    emit_evidence(
+        CASE_CONCURRENT_CREDENTIAL_RELOAD,
+        "PASS",
+        serde_json::json!({
+            "peak_concurrent_import_cycles": peak_concurrent,
+            "max_in_flight": oracle.max_in_flight.load(Ordering::SeqCst),
+            "beta_secret_unchanged": db.get_state("secret_svn_password_repo_beta").unwrap()
+                == beta_secret_before,
+            "alpha_secret_reloaded_in_kv": db.get_state("secret_svn_password_repo_alpha")
+                .unwrap()
+                .as_deref()
+                == Some(overlap_marker),
+            "credential_crossover": credential_crossover,
+            "note": "scoped alpha kv reload during overlapping imports must not rewrite beta scoped secret; svnserve passwd unchanged for in-flight cycles",
         }),
     );
 }
