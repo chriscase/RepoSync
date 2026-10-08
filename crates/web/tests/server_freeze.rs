@@ -6644,11 +6644,80 @@ async fn candidate_r06_existing_target_not_equivalent() {
     server.abort();
 }
 
-/// R06: explicit publish is refused; no scheduler-active child.
+/// R06: publish replays pending Git commits and activates the child pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r06_late_pair_publish_replays_git() {
+    let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
+    let feature_tip = push_feature_commits(tmp.path(), &bare, 2);
+    let svn_repo = tmp.path().join("svn-repo");
+    let before = svn_youngest(&svn_repo);
+    let client = authed_client();
+    let response = client
+        .post(format!("http://{addr}/api/repos/{id}/branches"))
+        .json(&serde_json::json!({
+            "svn_branch":"branches/feature",
+            "git_branch":"feature",
+            "skip_import":false,
+            "dry_run":false,
+            "preview":false
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let plan: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "{plan}");
+    assert_eq!(plan["mode"], "published");
+    assert_eq!(plan["published"], true);
+    assert_eq!(plan["scheduler_active"], true);
+    assert_eq!(plan["git_tip"], feature_tip);
+    assert_eq!(plan["pending_git"]["count"], 2);
+    let children = state.db.list_child_repositories(&id).unwrap();
+    assert_eq!(children.len(), 1);
+    assert!(children[0].enabled);
+    assert!(svn_youngest(&svn_repo) > before);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R06_LATE_PAIR_PUBLISH_REPLAY",
+            "pending_git":2,
+            "child_enabled":true,
+            "svn_advanced":true
+        })
+    );
+    server.abort();
+}
+
+/// R06: publish is refused when the SVN target already exists (no scheduler-active child).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_r06_no_active_on_partial() {
+    use std::process::Command;
     let (addr, state, server, tmp, id, bare) = snapshot_imported_parent().await;
     let _ = push_feature_commits(tmp.path(), &bare, 1);
+    let svn_url = format!("file://{}", tmp.path().join("svn-repo").display());
+    assert!(Command::new("svn")
+        .args([
+            "mkdir",
+            &format!("{svn_url}/branches"),
+            "-m",
+            "branches",
+            "--non-interactive"
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("svn")
+        .args([
+            "copy",
+            &format!("{svn_url}/trunk"),
+            &format!("{svn_url}/branches/feature"),
+            "-m",
+            "existing target",
+            "--non-interactive",
+        ])
+        .status()
+        .unwrap()
+        .success());
     let client = authed_client();
     let response = client
         .post(format!("http://{addr}/api/repos/{id}/branches"))
@@ -6669,13 +6738,10 @@ async fn candidate_r06_no_active_on_partial() {
         body["error"]
             .as_str()
             .unwrap_or("")
-            .contains("publish_not_implemented"),
+            .contains("existing_svn_target_blocks_publish"),
         "{body}"
     );
     assert!(state.db.list_child_repositories(&id).unwrap().is_empty());
-    let parent = state.db.get_repository(&id).unwrap().unwrap();
-    assert!(parent.enabled);
-    assert_ne!(parent.sync_status, "reconciling");
     eprintln!(
         "RELIABILITY_EVIDENCE {}",
         serde_json::json!({

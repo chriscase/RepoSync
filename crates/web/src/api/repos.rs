@@ -28,6 +28,7 @@ use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress, Imp
 use reposync_core::late_pair::{
     collect_verified_mappings, evaluate_admission, probe_svn_target, LatePairRequest,
 };
+use reposync_core::late_pair_publish::{publish_admitted_late_pair, PublishCredentials};
 use reposync_core::pair_refresh::{
     analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
     format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
@@ -3173,21 +3174,76 @@ async fn create_branch_pair(
     };
 
     attach_svn_probe(&parent, db, &mut plan).await;
-    if body.auto_create_svn_branch.unwrap_or(true) || body.auto_create_git_branch.unwrap_or(true) {
-        plan.unknowns.push(
-            "auto_create_svn_branch / auto_create_git_branch are ignored in this preview slice; no remote refs are created".into(),
+
+    if dry_run {
+        if body.auto_create_svn_branch.unwrap_or(true)
+            || body.auto_create_git_branch.unwrap_or(true)
+        {
+            plan.unknowns.push(
+                "auto_create_svn_branch / auto_create_git_branch are ignored in preview; publish copies SVN at the verified baseline revision".into(),
+            );
+        }
+        info!(
+            parent_id = %parent.id,
+            git_branch = %git_branch,
+            svn_branch = %svn_branch,
+            git_tip = ?plan.git_tip,
+            baseline = ?plan.svn_source_revision,
+            "late-pair preview admitted; no child row or remote mutation"
         );
+        return Ok(Json(serde_json::to_value(&plan).map_err(|e| {
+            AppError::Internal(format!("serialization error: {}", e))
+        })?));
     }
+
+    if plan.existing_svn_target.exists {
+        return Err(AppError::BadRequest(
+            "existing_svn_target_blocks_publish: SVN target already exists and is not equivalent; reconcile is not implemented in this slice"
+                .into(),
+        ));
+    }
+
+    let svn_password = db
+        .resolve_credential_chain(&parent.id, "secret_svn_password")
+        .unwrap_or_default();
+    let git_token = db
+        .resolve_credential_chain(&parent.id, "secret_git_token")
+        .unwrap_or_default();
+    let identity_config = reposync_core::config::IdentityConfig::default();
+    let identity_mapper = IdentityMapper::new(&identity_config)
+        .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {e}")))?;
+    let child_id = Uuid::new_v4().to_string();
+    let request_id = Uuid::new_v4().to_string();
+    let probe = plan.existing_svn_target.clone();
+    let published = publish_admitted_late_pair(
+        db,
+        &state.config,
+        &PublishCredentials {
+            svn_password,
+            git_token: Some(git_token),
+        },
+        &parent,
+        &request,
+        &plan,
+        &probe,
+        &child_id,
+        &_user_id,
+        &request_id,
+        &Arc::new(identity_mapper),
+    )
+    .await
+    .map_err(|refuse| AppError::BadRequest(refuse.error_message()))?;
+
     info!(
         parent_id = %parent.id,
+        child_id = %child_id,
         git_branch = %git_branch,
         svn_branch = %svn_branch,
-        git_tip = ?plan.git_tip,
-        baseline = ?plan.svn_source_revision,
-        "late-pair preview admitted; no child row or remote mutation"
+        git_tip = ?published.git_tip,
+        "late-pair publish completed with baseline replay"
     );
 
-    Ok(Json(serde_json::to_value(&plan).map_err(|e| {
+    Ok(Json(serde_json::to_value(&published).map_err(|e| {
         AppError::Internal(format!("serialization error: {}", e))
     })?))
 }
