@@ -214,7 +214,7 @@ def run_self_test() -> None:
     allowed = load_ci_partial_allowlist(allowlist_path)
     git_id = "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE"
     svn_id = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE"
-    assert git_id in allowed and svn_id in allowed
+    assert allowed == {git_id, svn_id}, (allowed, git_id, svn_id)
     expected_ids = load_expected_real_engine_case_ids()
     assert len(expected_ids) >= 8
 
@@ -281,6 +281,16 @@ def run_self_test() -> None:
                 row["status"] = "NOT RUN"
         code, errs = ci_gate(write_summary(tmp, not_run, "NOT RUN"), allowlist_path)
         assert code != 0 and errs, (code, errs)
+
+    ci_yml = ROOT / ".github/workflows/ci.yml"
+    ci_text = ci_yml.read_text(encoding="utf-8")
+    missing_block = 'if [[ -z "$summary" ]]; then'
+    assert missing_block in ci_text, "ci.yml must guard missing real-engine summary"
+    start = ci_text.index(missing_block)
+    end = ci_text.index("fi", start)
+    missing_branch = ci_text[start : end + 2]
+    assert "exit 1" in missing_branch, missing_branch
+    assert 'exit "${suite_ec' not in missing_branch, missing_branch
 
     print("SELF-TEST: real-engine ci-gate PASS")
 
