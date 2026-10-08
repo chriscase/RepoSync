@@ -9,7 +9,10 @@ use tracing::{debug, warn};
 use crate::db::git_push_operations::GitPushOperationState;
 use crate::db::svn_commit_operations::SvnCommitOperationState;
 use crate::db::Database;
-use crate::echo_receipt_scope::{read_git_no_target_receipt, read_svn_no_target_receipt};
+use crate::echo_receipt_scope::{
+    read_git_no_target_receipt, read_svn_no_target_receipt, receipt_generation_accepted,
+    repo_echo_generation,
+};
 use crate::errors::{DatabaseError, SyncError};
 use crate::history_inspect::is_full_git_oid;
 
@@ -41,6 +44,7 @@ pub(crate) enum NoTargetReceiptVerdict {
     RepoOrShaMismatch,
     ProjectionMismatch,
     UnverifiedOutcome,
+    StaleGeneration,
 }
 
 /// Validate a Git no-target receipt with the same scoping the admission writer binds.
@@ -49,7 +53,11 @@ pub(crate) fn verify_no_target_receipt(
     repo_id: &str,
     sha: &str,
     projection: &str,
+    current_generation: i64,
 ) -> NoTargetReceiptVerdict {
+    if !receipt_generation_accepted(record, current_generation) {
+        return NoTargetReceiptVerdict::StaleGeneration;
+    }
     if record["repo_id"] != repo_id || record["git_sha"] != sha || !is_full_git_oid(sha) {
         return NoTargetReceiptVerdict::RepoOrShaMismatch;
     }
@@ -332,10 +340,14 @@ fn verified_git_no_target_receipt(
     let Some(record) = read_git_no_target_receipt(ctx.db, ctx.repo_id, sha)? else {
         return Ok(false);
     };
-    Ok(
-        verify_no_target_receipt(&record, ctx.repo_id, sha, ctx.no_target_projection)
-            == NoTargetReceiptVerdict::Accepted,
-    )
+    let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
+    Ok(verify_no_target_receipt(
+        &record,
+        ctx.repo_id,
+        sha,
+        ctx.no_target_projection,
+        generation,
+    ) == NoTargetReceiptVerdict::Accepted)
 }
 
 fn running_journal_claims_pending_git_echo(
@@ -415,7 +427,8 @@ fn verified_git_no_target_receipt_personal(
         let Some(record) = read_git_no_target_receipt(ctx.db, repo_id, sha)? else {
             continue;
         };
-        if verify_no_target_receipt(&record, repo_id, sha, ctx.no_target_projection)
+        let generation = repo_echo_generation(ctx.db, repo_id)?;
+        if verify_no_target_receipt(&record, repo_id, sha, ctx.no_target_projection, generation)
             == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
