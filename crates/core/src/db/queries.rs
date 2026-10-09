@@ -1441,12 +1441,9 @@ impl Database {
             }
         }
 
-        // Clean up kv_state credential entries for this repo
-        let cred_pattern = format!("%_{}", repo_id);
-        let _ = conn.execute(
-            "DELETE FROM kv_state WHERE key LIKE ?1",
-            params![cred_pattern],
-        );
+        for cred_key in super::managed_remove::owned_secret_keys(repo_id) {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", params![cred_key])?;
+        }
 
         // Delete the repository row itself
         conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;

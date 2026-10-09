@@ -284,14 +284,11 @@ pub fn resolve_repo_import_baseline(
     }
 
     let scoped_svn_key = format!("last_svn_rev_{repo_id}");
-    let scoped_git_key = format!("last_git_sha_{repo_id}");
     let scoped_svn = db
-        .get_state(&scoped_svn_key)?
+        .get_state(&format!("last_svn_rev_{repo_id}"))?
         .and_then(|value| value.parse::<i64>().ok());
-    let has_scoped_git = db
-        .get_state(&scoped_git_key)?
-        .filter(|value| !value.is_empty())
-        .is_some();
+    let has_scoped_git =
+        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?.is_some();
     let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
 
     // Team sync checkpoints columns plus scoped `last_svn_rev_<repo>` without always
@@ -991,7 +988,8 @@ impl Database {
             )?;
             if checkpoint != 0 || !checkpoint_sha.is_empty() || last_sync_at.is_some()
                 || read_value(tx, &format!("last_svn_rev_{repo_id}"))?.is_some_and(|v| v != "0")
-                || read_value(tx, &format!("last_git_sha_{repo_id}"))?.is_some_and(|v| !v.is_empty()) {
+                || crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
+                    .is_some() {
                 return Err(DatabaseError::Other("repository checkpoint changed during held import".into()));
             }
             let svn_rev = op.last_local_svn_rev.ok_or_else(|| DatabaseError::Other("missing local import revision".into()))?;

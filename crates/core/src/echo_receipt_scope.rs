@@ -257,6 +257,37 @@ pub fn read_git_no_target_receipt(
     let (scope, generation, legacy_authoritative) = {
         let conn = db.conn();
         let scope = scope_token_for_repo(&conn, repo_id)?;
+        let managed_scoped = managed_repo_requires_scoped_receipts(&conn, repo_id)?;
+        let legacy_authoritative_for_malformed = legacy_repo_id_kv_authoritative(&conn)?;
+        if managed_scoped && !legacy_authoritative_for_malformed {
+            let glob = format!("handled_git_no_target_{scope}_*");
+            let scoped_keys = crate::db::repo_scope_identity::list_kv_keys_glob(&conn, &glob)?;
+            for key in scoped_keys {
+                let owned = key.strip_prefix(&format!("handled_git_no_target_{scope}_"));
+                if owned.is_none() {
+                    continue;
+                }
+                let tail = owned.unwrap();
+                let matches_sha =
+                    tail == git_sha || tail.rsplit_once('_').is_some_and(|(_, sha)| sha == git_sha);
+                if !matches_sha {
+                    continue;
+                }
+                let raw: Option<String> = conn
+                    .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let Some(raw) = raw else {
+                    continue;
+                };
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    return Err(DatabaseError::Other(
+                        "malformed scoped no-target receipt".into(),
+                    ));
+                }
+            }
+        }
         let generation = repo_echo_generation_tx(&conn, repo_id)?;
         let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
         (scope, generation, legacy_authoritative)
@@ -357,8 +388,15 @@ pub fn stored_git_no_target_receipt_exists(
     git_sha: &str,
     projection: &str,
 ) -> Result<bool, DatabaseError> {
-    let Some(record) = read_git_no_target_receipt(db, repo_id, git_sha)? else {
-        return Ok(false);
+    let record = match read_git_no_target_receipt(db, repo_id, git_sha) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(false),
+        Err(DatabaseError::Other(message))
+            if message.contains("malformed scoped no-target receipt") =>
+        {
+            return Ok(false);
+        }
+        Err(other) => return Err(other),
     };
     let generation = repo_echo_generation(db, repo_id)?;
     let scope = repository_scope_uuid(&db.conn(), repo_id).ok();
@@ -467,28 +505,46 @@ pub fn inbound_git_checkpoint_mirror_conflict(
 }
 
 /// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
+pub fn read_scoped_last_git_sha_kv_tx(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let scope = scope_token_for_repo(tx, repo_id)?;
+    let legacy_authoritative = legacy_repo_id_kv_authoritative(tx)?;
+    let scoped: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [last_git_sha_kv_key(&scope)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .filter(|value: &String| !value.is_empty());
+    if scoped.is_some() {
+        return Ok(scoped);
+    }
+    if legacy_authoritative
+        && !crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+            tx, repo_id, repo_id,
+        )?
+    {
+        return Ok(tx
+            .query_row(
+                "SELECT value FROM kv_state WHERE key = ?1",
+                [legacy_last_git_sha_kv_key(repo_id)],
+                |row| row.get(0),
+            )
+            .optional()?
+            .filter(|value: &String| !value.is_empty()));
+    }
+    Ok(None)
+}
+
+/// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
 pub fn read_scoped_last_git_sha_kv(
     db: &Database,
     repo_id: &str,
 ) -> Result<Option<String>, DatabaseError> {
-    let (scope, legacy_authoritative) = {
-        let conn = db.conn();
-        let scope = scope_token_for_repo(&conn, repo_id)?;
-        let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
-        (scope, legacy_authoritative)
-    };
-    let scoped = db
-        .get_state(&last_git_sha_kv_key(&scope))?
-        .filter(|value| !value.is_empty());
-    if scoped.is_some() {
-        return Ok(scoped);
-    }
-    if legacy_authoritative {
-        return Ok(db
-            .get_state(&legacy_last_git_sha_kv_key(repo_id))?
-            .filter(|value| !value.is_empty()));
-    }
-    Ok(None)
+    read_scoped_last_git_sha_kv_tx(&db.conn(), repo_id)
 }
 
 /// Persist the Git→SVN inbound handled checkpoint (UUID-scoped KV + repo-id mirror).

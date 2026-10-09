@@ -1386,6 +1386,33 @@ impl SyncEngine {
     }
 
     fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
+        let legacy_authoritative =
+            crate::db::repo_scope_identity::legacy_repo_id_kv_authoritative(&self.db.conn())
+                .map_err(SyncError::DatabaseError)?;
+        if !legacy_authoritative {
+            let generation =
+                repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+            let scope =
+                crate::db::repo_scope_identity::repository_scope_token(&self.db.conn(), rid)
+                    .map_err(SyncError::DatabaseError)?;
+            let canonical_key = handled_git_no_target_state_key(&scope, generation, sha);
+            if let Some(raw) = self
+                .db
+                .get_state(&canonical_key)
+                .map_err(SyncError::DatabaseError)?
+            {
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    return Err(self.record_history_block(
+                        "unverified_no_target_receipt",
+                        "no-target receipt is malformed; reconcile before replay",
+                        Some(sha),
+                        None,
+                        None,
+                        None,
+                    ));
+                }
+            }
+        }
         if let Some(record) =
             read_git_no_target_receipt(&self.db, rid, sha).map_err(SyncError::DatabaseError)?
         {

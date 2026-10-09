@@ -382,7 +382,7 @@ fn git_remote_identity_nonempty(repo: &Repository) -> bool {
     !repo.git_api_url.trim().is_empty() && !repo.git_repo.trim().is_empty()
 }
 
-fn owned_secret_keys(repo_id: &str) -> [String; 2] {
+pub(crate) fn owned_secret_keys(repo_id: &str) -> [String; 2] {
     [
         format!("secret_svn_password_{repo_id}"),
         format!("secret_git_token_{repo_id}"),

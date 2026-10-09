@@ -15,14 +15,6 @@ const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads"
 const HANDLED_GIT_NO_TARGET_PREFIX: &str = "handled_git_no_target_";
 const HANDLED_SVN_NO_TARGET_PREFIX: &str = "handled_svn_no_target_";
 
-/// Parsed tail of a handled_*_no_target KV key (scope token is exact, not prefix-matched).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedNoTargetReceiptKey {
-    scope_token: String,
-    generation: i64,
-    checkpoint: String,
-}
-
 fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -31,75 +23,163 @@ fn is_svn_rev_token(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
 }
 
-fn parse_handled_git_no_target_key(key: &str) -> Option<ParsedNoTargetReceiptKey> {
-    let body = key.strip_prefix(HANDLED_GIT_NO_TARGET_PREFIX)?;
-    let (mid, sha) = body.rsplit_once('_')?;
-    if !is_full_git_sha(sha) {
+fn anchored_git_receipt_suffix(suffix: &str) -> Option<(i64, String)> {
+    if is_full_git_sha(suffix) {
+        return Some((crate::pair_refresh::PAIR_GENERATION, suffix.to_string()));
+    }
+    let rest = suffix.strip_prefix('g')?;
+    let (gen_digits, sha) = rest.split_once('_')?;
+    if gen_digits.is_empty()
+        || !gen_digits.chars().all(|c| c.is_ascii_digit())
+        || !is_full_git_sha(sha)
+    {
         return None;
     }
-    if let Some((scope_token, gen_part)) = mid.rsplit_once('_') {
-        if let Some(gen_digits) = gen_part.strip_prefix('g') {
-            if gen_digits.chars().all(|c| c.is_ascii_digit()) && !gen_digits.is_empty() {
-                let generation = gen_digits.parse().ok()?;
-                return Some(ParsedNoTargetReceiptKey {
-                    scope_token: scope_token.to_string(),
-                    generation,
-                    checkpoint: sha.to_string(),
-                });
-            }
-        }
-    }
-    Some(ParsedNoTargetReceiptKey {
-        scope_token: mid.to_string(),
-        generation: crate::pair_refresh::PAIR_GENERATION,
-        checkpoint: sha.to_string(),
-    })
+    let generation = gen_digits.parse().ok()?;
+    Some((generation, sha.to_string()))
 }
 
-fn parse_handled_svn_no_target_key(key: &str) -> Option<ParsedNoTargetReceiptKey> {
-    let body = key.strip_prefix(HANDLED_SVN_NO_TARGET_PREFIX)?;
-    let (mid, rev) = body.rsplit_once('_')?;
-    if !is_svn_rev_token(rev) {
+fn anchored_svn_receipt_suffix(suffix: &str) -> Option<(i64, String)> {
+    if is_svn_rev_token(suffix) {
+        return Some((crate::pair_refresh::PAIR_GENERATION, suffix.to_string()));
+    }
+    let rest = suffix.strip_prefix('g')?;
+    let (gen_digits, rev) = rest.split_once('_')?;
+    if gen_digits.is_empty()
+        || !gen_digits.chars().all(|c| c.is_ascii_digit())
+        || !is_svn_rev_token(rev)
+    {
         return None;
     }
-    if let Some((scope_token, gen_part)) = mid.rsplit_once('_') {
-        if let Some(gen_digits) = gen_part.strip_prefix('g') {
-            if gen_digits.chars().all(|c| c.is_ascii_digit()) && !gen_digits.is_empty() {
-                let generation = gen_digits.parse().ok()?;
-                return Some(ParsedNoTargetReceiptKey {
-                    scope_token: scope_token.to_string(),
-                    generation,
-                    checkpoint: rev.to_string(),
-                });
-            }
+    let generation = gen_digits.parse().ok()?;
+    Some((generation, rev.to_string()))
+}
+
+fn legacy_no_target_key_unambiguous_for_human_id(
+    conn: &Connection,
+    key: &str,
+    repo_id: &str,
+    git: bool,
+) -> Result<bool, DatabaseError> {
+    if !legacy_no_target_key_owned_by_human_id(key, repo_id, git) {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare("SELECT id FROM repositories WHERE id != ?1")?;
+    let longer_ids = stmt
+        .query_map([repo_id], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .filter(|other| other.starts_with(&format!("{repo_id}_")))
+        .collect::<Vec<_>>();
+    for other in longer_ids {
+        if legacy_no_target_key_owned_by_human_id(key, &other, git) {
+            return Ok(false);
         }
     }
-    Some(ParsedNoTargetReceiptKey {
-        scope_token: mid.to_string(),
-        generation: crate::pair_refresh::PAIR_GENERATION,
-        checkpoint: rev.to_string(),
-    })
+    Ok(true)
 }
 
 fn legacy_no_target_key_owned_by_human_id(key: &str, repo_id: &str, git: bool) -> bool {
-    let parsed = if git {
-        parse_handled_git_no_target_key(key)
+    let prefix = if git {
+        format!("{HANDLED_GIT_NO_TARGET_PREFIX}{repo_id}_")
     } else {
-        parse_handled_svn_no_target_key(key)
+        format!("{HANDLED_SVN_NO_TARGET_PREFIX}{repo_id}_")
     };
-    parsed.is_some_and(|p| p.scope_token == repo_id)
+    if !key.starts_with(&prefix) {
+        return false;
+    }
+    let suffix = key.strip_prefix(&prefix).unwrap_or("");
+    if git {
+        anchored_git_receipt_suffix(suffix).is_some()
+    } else {
+        anchored_svn_receipt_suffix(suffix).is_some()
+    }
 }
 
 fn no_target_key_owned_by_scope_uuid(key: &str, scope_uuid: &str, git: bool) -> bool {
-    let parsed = if git {
-        parse_handled_git_no_target_key(key)
+    let prefix = if git {
+        format!("{HANDLED_GIT_NO_TARGET_PREFIX}{scope_uuid}_")
     } else {
-        parse_handled_svn_no_target_key(key)
+        format!("{HANDLED_SVN_NO_TARGET_PREFIX}{scope_uuid}_")
     };
-    parsed.is_some_and(|p| p.scope_token == scope_uuid)
+    if !key.starts_with(&prefix) {
+        return false;
+    }
+    let suffix = key.strip_prefix(&prefix).unwrap_or("");
+    if git {
+        anchored_git_receipt_suffix(suffix).is_some()
+    } else {
+        anchored_svn_receipt_suffix(suffix).is_some()
+    }
 }
 
-fn list_kv_keys_glob(conn: &Connection, glob: &str) -> Result<Vec<String>, DatabaseError> {
+/// Human `repositories.id` must not collide with another row's durable `scope_uuid`.
+pub(crate) fn human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+    conn: &Connection,
+    human_id: &str,
+    owning_repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    let conflict: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM repositories WHERE id != ?1 AND scope_uuid = ?2)",
+        params![owning_repo_id, human_id],
+        |row| row.get(0),
+    )?;
+    Ok(conflict)
+}
+
+fn legacy_human_checkpoint_kv_safe_to_touch(
+    conn: &Connection,
+    human_id: &str,
+    owning_repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    Ok(!human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+        conn,
+        human_id,
+        owning_repo_id,
+    )?)
+}
+
+fn receipt_payload_proves_human_repo(value: &str, repo_id: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(record) => record.get("repo_id").and_then(|v| v.as_str()) == Some(repo_id),
+        Err(_) => false,
+    }
+}
+
+fn receipt_payload_proves_scope_repo(value: &str, repo_id: &str, scope_uuid: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(record) => {
+            record.get("repo_id").and_then(|v| v.as_str()) == Some(repo_id)
+                && record.get("scope_uuid").and_then(|v| v.as_str()) == Some(scope_uuid)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Reject human ids that cannot be distinguished from UUID scope tokens or generation suffixes.
+pub fn validate_human_repository_id(repo_id: &str) -> Result<(), DatabaseError> {
+    crate::managed_remove::validate_repo_id(repo_id).map_err(|error| {
+        DatabaseError::Other(format!("invalid repository id: {}", error.message))
+    })?;
+    if uuid::Uuid::parse_str(repo_id).is_ok() {
+        return Err(DatabaseError::Other(
+            "repository id must not be UUID-shaped; use scope_uuid for durable identity".into(),
+        ));
+    }
+    if let Some((_, gen_digits)) = repo_id.rsplit_once("_g") {
+        if !gen_digits.is_empty() && gen_digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(DatabaseError::Other(
+                "repository id must not end with _g<digits>; that collides with receipt key encoding"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn list_kv_keys_glob(
+    conn: &Connection,
+    glob: &str,
+) -> Result<Vec<String>, DatabaseError> {
     let mut stmt = conn.prepare("SELECT key FROM kv_state WHERE key GLOB ?1")?;
     let keys = stmt
         .query_map([glob], |row| row.get(0))?
@@ -108,11 +188,12 @@ fn list_kv_keys_glob(conn: &Connection, glob: &str) -> Result<Vec<String>, Datab
     Ok(keys)
 }
 
-fn legacy_receipt_payload_matches_repo(value: &str, repo_id: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(value) {
-        Ok(record) => record.get("repo_id").and_then(|v| v.as_str()) == Some(repo_id),
-        Err(_) => false,
-    }
+fn kv_payload_for_key(conn: &Connection, key: &str) -> Result<Option<String>, DatabaseError> {
+    Ok(conn
+        .query_row("SELECT value FROM kv_state WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
 }
 
 /// True when any no-target receipt KV key is owned by this repository (exact scope token).
@@ -129,16 +210,33 @@ pub fn repository_has_stored_no_target_receipt_kv(
     };
     let legacy_authoritative = legacy_repo_id_kv_authoritative(conn)?;
     for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
+        let Some(value) = kv_payload_for_key(conn, &key)? else {
+            continue;
+        };
         if no_target_key_owned_by_scope_uuid(&key, &scope, true)
-            || (legacy_authoritative && legacy_no_target_key_owned_by_human_id(&key, repo_id, true))
+            && receipt_payload_proves_scope_repo(&value, repo_id, &scope)
+        {
+            return Ok(true);
+        }
+        if legacy_authoritative
+            && legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, true)?
+            && receipt_payload_proves_human_repo(&value, repo_id)
         {
             return Ok(true);
         }
     }
     for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
+        let Some(value) = kv_payload_for_key(conn, &key)? else {
+            continue;
+        };
         if no_target_key_owned_by_scope_uuid(&key, &scope, false)
-            || (legacy_authoritative
-                && legacy_no_target_key_owned_by_human_id(&key, repo_id, false))
+            && receipt_payload_proves_scope_repo(&value, repo_id, &scope)
+        {
+            return Ok(true);
+        }
+        if legacy_authoritative
+            && legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, false)?
+            && receipt_payload_proves_human_repo(&value, repo_id)
         {
             return Ok(true);
         }
@@ -211,6 +309,11 @@ pub fn repository_scope_uuid(conn: &Connection, repo_id: &str) -> Result<String,
 
 pub fn new_scope_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Human repository id for new registrations (never UUID-shaped; scope uses [`new_scope_uuid`]).
+pub fn new_human_repository_id() -> String {
+    format!("repo-{}", uuid::Uuid::new_v4())
 }
 
 pub fn last_git_sha_kv_key(scope_uuid: &str) -> String {
@@ -319,16 +422,29 @@ pub fn purge_repository_scope_kv(
     scope_uuid: Option<&str>,
 ) -> Result<(), DatabaseError> {
     for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
-        let delete = legacy_no_target_key_owned_by_human_id(&key, repo_id, true)
-            || scope_uuid.is_some_and(|scope| no_target_key_owned_by_scope_uuid(&key, scope, true));
+        let Some(value) = kv_payload_for_key(conn, &key)? else {
+            continue;
+        };
+        let delete = scope_uuid.is_some_and(|scope| {
+            no_target_key_owned_by_scope_uuid(&key, scope, true)
+                && receipt_payload_proves_scope_repo(&value, repo_id, scope)
+        }) || (legacy_no_target_key_unambiguous_for_human_id(
+            conn, &key, repo_id, true,
+        )? && receipt_payload_proves_human_repo(&value, repo_id));
         if delete {
             conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
         }
     }
     for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
-        let delete = legacy_no_target_key_owned_by_human_id(&key, repo_id, false)
-            || scope_uuid
-                .is_some_and(|scope| no_target_key_owned_by_scope_uuid(&key, scope, false));
+        let Some(value) = kv_payload_for_key(conn, &key)? else {
+            continue;
+        };
+        let delete = scope_uuid.is_some_and(|scope| {
+            no_target_key_owned_by_scope_uuid(&key, scope, false)
+                && receipt_payload_proves_scope_repo(&value, repo_id, scope)
+        }) || (legacy_no_target_key_unambiguous_for_human_id(
+            conn, &key, repo_id, false,
+        )? && receipt_payload_proves_human_repo(&value, repo_id));
         if delete {
             conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
         }
@@ -342,13 +458,15 @@ pub fn purge_repository_scope_kv(
             conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
         }
     }
-    for key in [
-        legacy_last_git_sha_kv_key(repo_id),
-        legacy_repo_echo_generation_kv_key(repo_id),
-        legacy_team_history_block_kv_key(repo_id),
-        format!("last_svn_rev_{repo_id}"),
-    ] {
-        conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+    if legacy_human_checkpoint_kv_safe_to_touch(conn, repo_id, repo_id)? {
+        for key in [
+            legacy_last_git_sha_kv_key(repo_id),
+            legacy_repo_echo_generation_kv_key(repo_id),
+            legacy_team_history_block_kv_key(repo_id),
+            format!("last_svn_rev_{repo_id}"),
+        ] {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
     }
     Ok(())
 }
@@ -358,7 +476,7 @@ fn quarantine_unscoped_legacy_receipts(
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
     for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
-        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, true) {
+        if !legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, true)? {
             continue;
         }
         let value: Option<String> = conn
@@ -366,19 +484,23 @@ fn quarantine_unscoped_legacy_receipts(
                 row.get(0)
             })
             .optional()?;
-        let quarantine = match value {
-            None => true,
-            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|record| record.get("scope_uuid").cloned())
-                .is_none(),
+        let Some(raw) = value else {
+            continue;
         };
-        if quarantine {
-            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        if !receipt_payload_proves_human_repo(&raw, repo_id) {
+            continue;
         }
+        let has_scope_uuid = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|record| record.get("scope_uuid").cloned())
+            .is_some();
+        if has_scope_uuid {
+            continue;
+        }
+        // Unscoped legacy receipts with proven human ownership are left for v13 migration.
     }
     for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
-        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, false) {
+        if !legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, false)? {
             continue;
         }
         let value: Option<String> = conn
@@ -386,15 +508,18 @@ fn quarantine_unscoped_legacy_receipts(
                 row.get(0)
             })
             .optional()?;
-        let quarantine = match value {
-            None => true,
-            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-                .ok()
-                .and_then(|record| record.get("scope_uuid").cloned())
-                .is_none(),
+        let Some(raw) = value else {
+            continue;
         };
-        if quarantine {
-            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        if !receipt_payload_proves_human_repo(&raw, repo_id) {
+            continue;
+        }
+        let has_scope_uuid = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|record| record.get("scope_uuid").cloned())
+            .is_some();
+        if has_scope_uuid {
+            continue;
         }
     }
     Ok(())
@@ -441,24 +566,26 @@ pub(crate) fn migrate_legacy_kv_for_repo(
     repo_id: &str,
     scope_uuid: &str,
 ) -> Result<(), DatabaseError> {
-    copy_kv_if_absent(
-        conn,
-        &legacy_last_git_sha_kv_key(repo_id),
-        &last_git_sha_kv_key(scope_uuid),
-    )?;
-    copy_kv_if_absent(
-        conn,
-        &legacy_repo_echo_generation_kv_key(repo_id),
-        &repo_echo_generation_kv_key(scope_uuid),
-    )?;
-    copy_kv_if_absent(
-        conn,
-        &legacy_team_history_block_kv_key(repo_id),
-        &team_history_block_kv_key(scope_uuid),
-    )?;
+    if legacy_human_checkpoint_kv_safe_to_touch(conn, repo_id, repo_id)? {
+        copy_kv_if_absent(
+            conn,
+            &legacy_last_git_sha_kv_key(repo_id),
+            &last_git_sha_kv_key(scope_uuid),
+        )?;
+        copy_kv_if_absent(
+            conn,
+            &legacy_repo_echo_generation_kv_key(repo_id),
+            &repo_echo_generation_kv_key(scope_uuid),
+        )?;
+        copy_kv_if_absent(
+            conn,
+            &legacy_team_history_block_kv_key(repo_id),
+            &team_history_block_kv_key(scope_uuid),
+        )?;
+    }
 
     for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
-        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, true) {
+        if !legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, true)? {
             continue;
         }
         let (value, updated_at): (String, String) = conn.query_row(
@@ -466,16 +593,18 @@ pub(crate) fn migrate_legacy_kv_for_repo(
             [&key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if !legacy_receipt_payload_matches_repo(&value, repo_id) {
+        if !receipt_payload_proves_human_repo(&value, repo_id) {
             continue;
         }
-        let Some(parsed) = parse_handled_git_no_target_key(&key) else {
+        let prefix = format!("{HANDLED_GIT_NO_TARGET_PREFIX}{repo_id}_");
+        let suffix = key.strip_prefix(&prefix).unwrap_or("");
+        let Some((generation, checkpoint)) = anchored_git_receipt_suffix(suffix) else {
             continue;
         };
         let scoped_key = crate::echo_receipt_scope::handled_git_no_target_state_key(
             scope_uuid,
-            parsed.generation,
-            &parsed.checkpoint,
+            generation,
+            &checkpoint,
         );
         copy_kv_if_absent(conn, &key, &scoped_key)?;
         if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&value) {
@@ -487,7 +616,7 @@ pub(crate) fn migrate_legacy_kv_for_repo(
         }
     }
     for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
-        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, false) {
+        if !legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, false)? {
             continue;
         }
         let (value, updated_at): (String, String) = conn.query_row(
@@ -495,17 +624,17 @@ pub(crate) fn migrate_legacy_kv_for_repo(
             [&key],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if !legacy_receipt_payload_matches_repo(&value, repo_id) {
+        if !receipt_payload_proves_human_repo(&value, repo_id) {
             continue;
         }
-        let Some(parsed) = parse_handled_svn_no_target_key(&key) else {
+        let prefix = format!("{HANDLED_SVN_NO_TARGET_PREFIX}{repo_id}_");
+        let suffix = key.strip_prefix(&prefix).unwrap_or("");
+        let Some((generation, checkpoint)) = anchored_svn_receipt_suffix(suffix) else {
             continue;
         };
-        let svn_rev = parsed.checkpoint.parse::<i64>().unwrap_or(0);
+        let svn_rev = checkpoint.parse::<i64>().unwrap_or(0);
         let scoped_key = crate::echo_receipt_scope::handled_svn_no_target_state_key(
-            scope_uuid,
-            parsed.generation,
-            svn_rev,
+            scope_uuid, generation, svn_rev,
         );
         copy_kv_if_absent(conn, &key, &scoped_key)?;
         if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&value) {

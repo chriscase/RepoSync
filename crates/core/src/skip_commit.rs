@@ -177,8 +177,7 @@ fn stored_cursor(db: &Database, repo_id: &str) -> Result<String, DatabaseError> 
     let repo = db
         .get_repository(repo_id)?
         .ok_or_else(|| DatabaseError::Other("repository not found".into()))?;
-    let kv = db
-        .get_state(&format!("last_git_sha_{}", repo_id))?
+    let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?
         .filter(|value| !value.is_empty());
     let column = repo.last_git_sha.clone();
     match (column.is_empty(), kv) {
