@@ -251,6 +251,57 @@ fn legacy_handled_git_no_target_state_key(repo_id: &str, generation: i64, git_sh
     handled_git_no_target_state_key(repo_id, generation, git_sha)
 }
 
+/// Drop corrupt scoped receipt bytes when the human-id mirror already holds a
+/// valid JSON receipt for the same SHA (admin restore path). Direct readers that
+/// must fail closed on corrupt scoped bytes call `read_git_no_target_receipt`
+/// without this repair.
+pub fn quarantine_corrupt_scoped_git_no_target_if_legacy_recovered(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<(), DatabaseError> {
+    if legacy_repo_id_kv_authoritative(&db.conn())? {
+        return Ok(());
+    }
+    let conn = db.conn();
+    let scope = scope_token_for_repo(&conn, repo_id)?;
+    let legacy_key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+    let legacy_ok = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [legacy_key.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some();
+    if !legacy_ok {
+        return Ok(());
+    }
+    let glob = format!("handled_git_no_target_{scope}_*");
+    for key in crate::db::repo_scope_identity::list_kv_keys_glob(&conn, &glob)? {
+        let tail = key.strip_prefix(&format!("handled_git_no_target_{scope}_"));
+        let Some(tail) = tail else { continue };
+        let matches_sha =
+            tail == git_sha || tail.rsplit_once('_').is_some_and(|(_, sha)| sha == git_sha);
+        if !matches_sha {
+            continue;
+        }
+        let raw: Option<String> = conn
+            .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if raw
+            .as_ref()
+            .is_some_and(|value| serde_json::from_str::<serde_json::Value>(value).is_err())
+        {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a stored Git no-target receipt for the active generation, including
 /// the legacy generation-1 key shape.
 pub fn read_git_no_target_receipt(
@@ -264,6 +315,7 @@ pub fn read_git_no_target_receipt(
         let managed_scoped = managed_repo_requires_scoped_receipts(&conn, repo_id)?;
         let legacy_authoritative_for_malformed = legacy_repo_id_kv_authoritative(&conn)?;
         if managed_scoped && !legacy_authoritative_for_malformed {
+            let mut corrupt_scoped_receipt = false;
             let glob = format!("handled_git_no_target_{scope}_*");
             let scoped_keys = crate::db::repo_scope_identity::list_kv_keys_glob(&conn, &glob)?;
             for key in scoped_keys {
@@ -286,8 +338,14 @@ pub fn read_git_no_target_receipt(
                     continue;
                 };
                 if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    corrupt_scoped_receipt = true;
                     continue;
                 }
+            }
+            if corrupt_scoped_receipt {
+                return Err(DatabaseError::Other(
+                    "malformed scoped no-target receipt".into(),
+                ));
             }
         }
         let generation = repo_echo_generation_tx(&conn, repo_id)?;

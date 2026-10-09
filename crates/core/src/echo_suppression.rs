@@ -380,6 +380,11 @@ fn verified_git_no_target_receipt(
     ctx: &TeamEchoContext<'_>,
     sha: &str,
 ) -> Result<bool, DatabaseError> {
+    crate::echo_receipt_scope::quarantine_corrupt_scoped_git_no_target_if_legacy_recovered(
+        ctx.db,
+        ctx.repo_id,
+        sha,
+    )?;
     let Some(record) = read_git_no_target_receipt(ctx.db, ctx.repo_id, sha)? else {
         return Ok(false);
     };

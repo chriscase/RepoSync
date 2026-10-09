@@ -1515,6 +1515,10 @@ impl SyncEngine {
                 }
             }
         }
+        crate::echo_receipt_scope::quarantine_corrupt_scoped_git_no_target_if_legacy_recovered(
+            &self.db, rid, sha,
+        )
+        .map_err(SyncError::DatabaseError)?;
         if let Some(record) =
             read_git_no_target_receipt(&self.db, rid, sha).map_err(SyncError::DatabaseError)?
         {
