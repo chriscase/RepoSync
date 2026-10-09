@@ -43,11 +43,7 @@ fn receipt_admits_for_repo(
     if record.get("scope_uuid").is_some() {
         return Ok(receipt_scope_uuid_matches(record, scope));
     }
-    if legacy_authoritative {
-        return Ok(true);
-    }
-    // Unscoped human-id receipts apply only before the managed row exists (late pair).
-    Ok(!managed_repo_requires_scoped_receipts(tx, repo_id)?)
+    Ok(legacy_authoritative)
 }
 
 fn scope_token_for_repo(tx: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
@@ -491,6 +487,14 @@ pub fn legacy_git_no_target_mirror_blocks(
 }
 
 /// True when UUID-scoped and repo-id inbound checkpoint mirrors disagree.
+fn kv_state_value(conn: &Connection, key: &str) -> Result<Option<String>, DatabaseError> {
+    conn.query_row("SELECT value FROM kv_state WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(DatabaseError::from)
+}
+
 pub fn inbound_git_checkpoint_mirror_conflict(
     db: &Database,
     repo_id: &str,
@@ -500,11 +504,9 @@ pub fn inbound_git_checkpoint_mirror_conflict(
         return Ok(false);
     }
     let scope = scope_token_for_repo(&conn, repo_id)?;
-    let scoped = db
-        .get_state(&last_git_sha_kv_key(&scope))?
-        .filter(|value| !value.is_empty());
-    let legacy = db
-        .get_state(&legacy_last_git_sha_kv_key(repo_id))?
+    let scoped =
+        kv_state_value(&conn, &last_git_sha_kv_key(&scope))?.filter(|value| !value.is_empty());
+    let legacy = kv_state_value(&conn, &legacy_last_git_sha_kv_key(repo_id))?
         .filter(|value| !value.is_empty());
     if scoped.is_some() && legacy.is_some() && scoped != legacy {
         return Ok(true);
