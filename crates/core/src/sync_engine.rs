@@ -747,13 +747,9 @@ impl SyncEngine {
         {
             return Ok(false);
         }
-        let origin_configured = sync_git_command_output(
-            &repo_path,
-            &["remote", "get-url", "origin"],
-            timeout,
-            None,
-        )
-        .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
+        let origin_configured =
+            sync_git_command_output(&repo_path, &["remote", "get-url", "origin"], timeout, None)
+                .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
         if !origin_configured {
             return Ok(true);
         }
@@ -831,9 +827,12 @@ impl SyncEngine {
             format!("refs/remotes/origin/{}", branch),
             format!("origin/{}", branch),
         ] {
-            if let Some(output) =
-                sync_git_command_output(repo_path, &["rev-parse", "--verify", &refname], timeout, None)
-            {
+            if let Some(output) = sync_git_command_output(
+                repo_path,
+                &["rev-parse", "--verify", &refname],
+                timeout,
+                None,
+            ) {
                 if output.status.success() {
                     let tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if is_full_git_oid(&tip) {
