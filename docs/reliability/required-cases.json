@@ -890,7 +890,7 @@
     {
       "id": "STARTUP_V12",
       "binary": "startup_schema",
-      "test": "ordinary_startup_stays_v12",
+      "test": "ordinary_startup_stays_v13",
       "tier": "candidate_regression"
     },
     {

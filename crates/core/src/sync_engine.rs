@@ -867,7 +867,9 @@ impl SyncEngine {
             // when the old cursor copies happen to agree. Check every present
             // copy before choosing between equal, split, or KV-only shapes.
             if let Some(ref sha) = column {
-                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)? {
+                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)?
+                    && !self.proved_svn_emitted_column_git_sha(rid, sha)?
+                {
                     return Err(self.record_history_block(
                         "ambiguous_checkpoint",
                         "stale no-target receipt conflicts with repository Git checkpoint",
