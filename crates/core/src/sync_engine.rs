@@ -774,7 +774,11 @@ impl SyncEngine {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
             (git.repo_path().to_path_buf(), git.stored_http_auth_token())
         };
-        let timeout = Duration::from_secs(45);
+        let timeout = if cfg!(test) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(45)
+        };
         let spec = format!("{}^{{commit}}", sha);
         if sync_git_command_output(
             &repo_path,
