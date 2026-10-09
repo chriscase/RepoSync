@@ -1064,6 +1064,13 @@ impl SyncEngine {
                                     Some(emitted_tip),
                                 ));
                             }
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let _ = crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                                &self.db.conn(),
+                                rid,
+                                emitted_tip,
+                                &now,
+                            );
                         }
                         let baseline_sha = baseline_sha.unwrap();
                         let baseline_revision = baseline_revision.unwrap();

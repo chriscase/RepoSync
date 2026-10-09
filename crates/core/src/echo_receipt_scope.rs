@@ -507,18 +507,30 @@ pub fn inbound_git_checkpoint_mirror_conflict(
     if !managed_repo_requires_scoped_receipts(&conn, repo_id)? {
         return Ok(false);
     }
-    if !legacy_repo_id_kv_authoritative(&conn)? {
-        // Explicit-only legacy reads: orphan human-id mirrors may disagree with the
-        // emitted column or scoped inbound cursor without blocking replay.
-        return Ok(false);
-    }
+    let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
     let scope = scope_token_for_repo(&conn, repo_id)?;
     let scoped =
         kv_state_value(&conn, &last_git_sha_kv_key(&scope))?.filter(|value| !value.is_empty());
     let legacy = kv_state_value(&conn, &legacy_last_git_sha_kv_key(repo_id))?
         .filter(|value| !value.is_empty());
-    if scoped.is_some() && legacy.is_some() && scoped != legacy {
+    if legacy_authoritative && scoped.is_some() && legacy.is_some() && scoped != legacy {
         return Ok(true);
+    }
+    if !legacy_authoritative {
+        if scoped.is_none() {
+            let column: Option<String> = conn
+                .query_row(
+                    "SELECT last_git_sha FROM repositories WHERE id = ?1",
+                    [repo_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .filter(|value: &String| !value.is_empty());
+            if legacy.is_some() && column.is_some() && legacy.as_deref() != column.as_deref() {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
     }
     let column: Option<String> = conn
         .query_row(
