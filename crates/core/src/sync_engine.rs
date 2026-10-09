@@ -1025,6 +1025,31 @@ impl SyncEngine {
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
+                            let legacy_seed_bootstrap = {
+                                let conn = self.db.conn();
+                                let legacy = conn
+                                    .query_row(
+                                        "SELECT value FROM kv_state WHERE key = ?1",
+                                        [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
+                                            rid
+                                        )],
+                                        |row| row.get::<_, String>(0),
+                                    )
+                                    .optional()
+                                    .map_err(crate::errors::DatabaseError::from)?
+                                    .filter(|value| !value.is_empty());
+                                legacy.as_deref() == Some(emitted_tip.as_str())
+                            };
+                            if !legacy_seed_bootstrap {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "missing durable handled Git baseline for absent repository cursor",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ));
+                            }
                             let column_svn_rev: i64 = {
                                 let conn = self.db.conn();
                                 conn.query_row(
@@ -1307,6 +1332,20 @@ impl SyncEngine {
                 generation,
                 scope.as_deref(),
             ) {
+                if record.get("outcome").and_then(|value| value.as_str()) == Some("filtered") {
+                    let outbound: i64 = {
+                        let conn = self.db.conn();
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+                            [rid],
+                            |row| row.get(0),
+                        )
+                        .map_err(crate::errors::DatabaseError::from)?
+                    };
+                    if outbound > 0 {
+                        continue;
+                    }
+                }
                 return Ok(true);
             }
         }
@@ -1456,14 +1495,23 @@ impl SyncEngine {
                 .map_err(SyncError::DatabaseError)?
             {
                 if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
-                    return Err(self.record_history_block(
-                        "unverified_no_target_receipt",
-                        "no-target receipt is malformed; reconcile before replay",
-                        Some(sha),
-                        None,
-                        None,
-                        None,
-                    ));
+                    let legacy_key = format!("handled_git_no_target_{}_{}", rid, sha);
+                    let legacy_ok = self
+                        .db
+                        .get_state(&legacy_key)
+                        .map_err(SyncError::DatabaseError)?
+                        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                        .is_some();
+                    if !legacy_ok {
+                        return Err(self.record_history_block(
+                            "unverified_no_target_receipt",
+                            "no-target receipt is malformed; reconcile before replay",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
                 }
             }
         }

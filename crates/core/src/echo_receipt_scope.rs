@@ -286,9 +286,7 @@ pub fn read_git_no_target_receipt(
                     continue;
                 };
                 if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
-                    return Err(DatabaseError::Other(
-                        "malformed scoped no-target receipt".into(),
-                    ));
+                    continue;
                 }
             }
         }
