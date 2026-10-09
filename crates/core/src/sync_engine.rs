@@ -770,13 +770,14 @@ impl SyncEngine {
         if !is_full_git_oid(sha) {
             return Ok(false);
         }
-        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-        let repo_path = git.repo_path();
-        let http_token = git.stored_http_auth_token();
+        let (repo_path, http_token) = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            (git.repo_path().to_path_buf(), git.stored_http_auth_token())
+        };
         let timeout = Duration::from_secs(45);
         let spec = format!("{}^{{commit}}", sha);
         if sync_git_command_output(
-            repo_path,
+            &repo_path,
             &["cat-file", "-e", &spec],
             timeout,
             http_token.clone(),
@@ -785,13 +786,24 @@ impl SyncEngine {
         {
             return Ok(false);
         }
+        let origin_probe = Duration::from_secs(5);
+        let origin_configured = sync_git_command_output(
+            &repo_path,
+            &["remote", "get-url", "origin"],
+            origin_probe,
+            None,
+        )
+        .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
+        if !origin_configured {
+            return Ok(true);
+        }
         let branch = &self.config.github.default_branch;
-        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout, http_token.as_deref()) {
+        if advertised_remote_tip_is_sha(&repo_path, branch, sha, timeout, http_token.as_deref()) {
             return Ok(false);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
         let fetched = sync_git_command_output(
-            repo_path,
+            &repo_path,
             &[
                 "fetch",
                 "--no-tags",
@@ -805,7 +817,7 @@ impl SyncEngine {
         .is_some_and(|output| output.status.success());
         let present = fetched
             && sync_git_command_output(
-                repo_path,
+                &repo_path,
                 &["cat-file", "-e", &spec],
                 timeout,
                 http_token.clone(),
@@ -813,7 +825,7 @@ impl SyncEngine {
             .is_some_and(|output| output.status.success());
         if present {
             let _ = sync_git_command_output(
-                repo_path,
+                &repo_path,
                 &["update-ref", "-d", &probe_ref],
                 timeout,
                 http_token,

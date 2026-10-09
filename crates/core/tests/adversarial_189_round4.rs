@@ -226,8 +226,12 @@ fn new_sole_repository_must_not_reenable_legacy_authority_after_v13_latch() {
     migrate_v13_scope_uuid(&db.conn()).unwrap();
     assert_eq!(
         db.get_state(LEGACY_READS_FLAG).unwrap(),
-        Some("1".into()),
-        "sole repo at v13 migration may read legacy KV during transition"
+        Some("0".into()),
+        "sole migrate_v13 without legacy human-id KV must leave legacy reads latched off"
+    );
+    assert!(
+        !legacy_repo_id_kv_authoritative(&db.conn()).unwrap(),
+        "explicit-only legacy authority must stay off when the flag is zero"
     );
     db.hard_delete_repository("legacy").unwrap();
     assert_eq!(
