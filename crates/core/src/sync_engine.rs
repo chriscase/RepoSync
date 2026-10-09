@@ -5097,6 +5097,36 @@ repo = "test/test-repo"
         team_echo_engine_with_git_dir(repo_id).0
     }
 
+    fn scoped_last_git_sha_key(engine: &SyncEngine, repo_id: &str) -> String {
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&engine.db().conn(), repo_id)
+                .unwrap();
+        crate::db::repo_scope_identity::last_git_sha_kv_key(&scope)
+    }
+
+    fn set_scoped_last_git_sha_kv(engine: &SyncEngine, repo_id: &str, sha: &str) {
+        engine
+            .db()
+            .set_state(&scoped_last_git_sha_key(engine, repo_id), sha)
+            .unwrap();
+    }
+
+    fn set_unified_inbound_git_cursor(engine: &SyncEngine, repo_id: &str, sha: &str) {
+        set_scoped_last_git_sha_kv(engine, repo_id, sha);
+        engine
+            .db()
+            .set_state(&format!("last_git_sha_{repo_id}"), sha)
+            .unwrap();
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
+                rusqlite::params![sha, repo_id],
+            )
+            .unwrap();
+    }
+
     fn store_git_no_target_receipt_for_tests(
         engine: &SyncEngine,
         repo_id: &str,
@@ -5510,10 +5540,7 @@ repo = "test/test-repo"
                 status: SyncRecordStatus::Applied,
             })
             .unwrap();
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &kv_sha)
-            .unwrap();
+        set_scoped_last_git_sha_kv(&engine, "pair", &kv_sha);
         engine
             .db()
             .conn()
@@ -5538,18 +5565,7 @@ repo = "test/test-repo"
             .repo_path()
             .to_path_buf();
         let forged = git_fixture_commit(&repo_path, "x.txt", "x\n", "unproven");
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &forged)
-            .unwrap();
-        engine
-            .db()
-            .conn()
-            .execute(
-                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
-                [&forged],
-            )
-            .unwrap();
+        set_unified_inbound_git_cursor(&engine, "pair", &forged);
         assert!(matches!(
             engine.team_git_checkpoint(),
             Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
@@ -5585,6 +5601,14 @@ repo = "test/test-repo"
                 synced_at: now,
                 status: SyncRecordStatus::Applied,
             })
+            .unwrap();
+        engine
+            .db()
+            .conn()
+            .execute(
+                "DELETE FROM kv_state WHERE key = ?1",
+                [scoped_last_git_sha_key(&engine, "pair")],
+            )
             .unwrap();
         engine
             .db()
@@ -5645,8 +5669,10 @@ repo = "test/test-repo"
             .unwrap();
         engine
             .db()
-            .set_state("last_git_sha_pair", &unproved)
+            .conn()
+            .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
             .unwrap();
+        set_scoped_last_git_sha_kv(&engine, "pair", &unproved);
         assert!(matches!(
             engine.team_git_checkpoint(),
             Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
@@ -5894,10 +5920,7 @@ repo = "test/test-repo"
                 [&imported],
             )
             .unwrap();
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &imported)
-            .unwrap();
+        set_unified_inbound_git_cursor(&engine, "pair", &imported);
         engine
             .db()
             .insert_sync_record(&SyncRecord {

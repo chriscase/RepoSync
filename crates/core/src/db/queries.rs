@@ -1412,24 +1412,6 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN TRANSACTION")?;
 
-        let scope_uuid: Option<String> = conn
-            .query_row(
-                &format!(
-                    "SELECT {} FROM repositories WHERE id = ?1",
-                    crate::db::repo_scope_identity::SCOPE_UUID_COLUMN
-                ),
-                [repo_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten()
-            .filter(|value| !value.is_empty());
-        crate::db::repo_scope_identity::purge_repository_scope_kv(
-            &conn,
-            repo_id,
-            scope_uuid.as_deref(),
-        )?;
-
         let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
         for table in &tables_with_repo_id {
             let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
@@ -1445,15 +1427,7 @@ impl Database {
             conn.execute("DELETE FROM kv_state WHERE key = ?1", params![cred_key])?;
         }
 
-        // Delete the repository row itself
-        conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
-
-        let repo_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-        if repo_count == 0 {
-            crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(&conn)?;
-        }
-        crate::db::repo_scope_identity::sweep_unowned_legacy_no_target_receipts(&conn)?;
+        crate::db::repo_scope_identity::delete_repository_registration_row(&conn, repo_id)?;
 
         conn.execute_batch("COMMIT")?;
         info!(repo_id, "hard-deleted repository and all associated data");
@@ -2927,13 +2901,7 @@ impl Database {
 
     pub fn delete_repository(&self, id: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        let changed = conn.execute("DELETE FROM repositories WHERE id = ?1", params![id])?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "repository".into(),
-                id: id.into(),
-            });
-        }
+        crate::db::repo_scope_identity::delete_repository_registration_row(&conn, id)?;
         debug!(id, "deleted repository");
         Ok(())
     }

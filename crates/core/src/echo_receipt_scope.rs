@@ -491,17 +491,32 @@ pub fn inbound_git_checkpoint_mirror_conflict(
     db: &Database,
     repo_id: &str,
 ) -> Result<bool, DatabaseError> {
-    let scope = {
-        let conn = db.conn();
-        scope_token_for_repo(&conn, repo_id)?
-    };
+    let conn = db.conn();
+    if !managed_repo_requires_scoped_receipts(&conn, repo_id)? {
+        return Ok(false);
+    }
+    let scope = scope_token_for_repo(&conn, repo_id)?;
     let scoped = db
         .get_state(&last_git_sha_kv_key(&scope))?
         .filter(|value| !value.is_empty());
     let legacy = db
         .get_state(&legacy_last_git_sha_kv_key(repo_id))?
         .filter(|value| !value.is_empty());
-    Ok(scoped.is_some() && legacy.is_some() && scoped != legacy)
+    if scoped.is_some() && legacy.is_some() && scoped != legacy {
+        return Ok(true);
+    }
+    let column: Option<String> = conn
+        .query_row(
+            "SELECT last_git_sha FROM repositories WHERE id = ?1",
+            [repo_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|value: &String| !value.is_empty());
+    if legacy.is_some() && column.is_some() && legacy.as_deref() != column.as_deref() {
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
@@ -561,12 +576,14 @@ pub fn write_scoped_last_git_sha_kv(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![kv_key, git_sha, updated_at],
     )?;
-    let legacy_key = legacy_last_git_sha_kv_key(repo_id);
-    tx.execute(
-        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        params![legacy_key, git_sha, updated_at],
-    )?;
+    if legacy_repo_id_kv_authoritative(tx)? {
+        let legacy_key = legacy_last_git_sha_kv_key(repo_id);
+        tx.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![legacy_key, git_sha, updated_at],
+        )?;
+    }
     Ok(())
 }
 

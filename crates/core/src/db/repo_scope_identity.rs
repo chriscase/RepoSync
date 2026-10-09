@@ -11,6 +11,7 @@ use crate::errors::DatabaseError;
 pub const SCOPE_UUID_COLUMN: &str = "scope_uuid";
 
 const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads";
+const V13_SCOPE_UUID_MIGRATION_DONE_KEY: &str = "reposync_v13_scope_uuid_migration_done";
 
 const HANDLED_GIT_NO_TARGET_PREFIX: &str = "handled_git_no_target_";
 const HANDLED_SVN_NO_TARGET_PREFIX: &str = "handled_svn_no_target_";
@@ -343,9 +344,8 @@ pub fn legacy_team_history_block_kv_key(repo_id: &str) -> String {
     format!("team_history_block_{repo_id}")
 }
 
-/// Legacy repo-id KV may be read only when v13 migration explicitly enabled it (`"1"`),
-/// or before any repository row exists (pre-registration). Once revoked (`"0"`), the latch
-/// never re-opens; later `insert_repository` must not migrate or re-enable legacy reads.
+/// Legacy repo-id KV may be read only when v13 migration explicitly stored `"1"`.
+/// Unset and `"0"` are never authoritative. Once revoked (`"0"`), the latch never re-opens.
 pub fn legacy_repo_id_kv_authoritative(conn: &Connection) -> Result<bool, DatabaseError> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
     let flag: Option<String> = conn
@@ -370,12 +370,27 @@ pub fn legacy_repo_id_kv_authoritative(conn: &Connection) -> Result<bool, Databa
         sweep_unowned_legacy_no_target_receipts(conn)?;
         return Ok(false);
     }
-    match flag.as_deref() {
-        Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        Some(_) => Ok(false),
-        None => Ok(count == 0 || count == 1),
+    Ok(flag.as_deref() == Some("1"))
+}
+
+fn receipt_payload_claims_live_repository(value: &str, repos: &[(String, Option<String>)]) -> bool {
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(value) else {
+        return false;
+    };
+    if let Some(repo_id) = record.get("repo_id").and_then(|v| v.as_str()) {
+        if repos.iter().any(|(id, _)| id == repo_id) {
+            return true;
+        }
     }
+    if let Some(scope) = record.get("scope_uuid").and_then(|v| v.as_str()) {
+        if repos
+            .iter()
+            .any(|(_, su)| su.as_deref().is_some_and(|s| s == scope))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn legacy_receipt_has_live_adopter(
@@ -395,20 +410,125 @@ fn legacy_receipt_has_live_adopter(
         })?
         .filter_map(|r| r.ok())
         .collect::<Vec<_>>();
-    for (repo_id, scope_uuid) in repos {
-        if let Some(scope) = scope_uuid.filter(|s| !s.is_empty()) {
-            if no_target_key_owned_by_scope_uuid(key, &scope, git) {
-                // Live scope token owns the key namespace; readers fail closed on corrupt payloads.
+    if receipt_payload_claims_live_repository(&value, &repos) {
+        return Ok(true);
+    }
+    for (repo_id, scope_uuid) in &repos {
+        if let Some(scope) = scope_uuid.as_ref().filter(|s| !s.is_empty()) {
+            if no_target_key_owned_by_scope_uuid(key, scope, git) {
                 return Ok(true);
             }
         }
-        if legacy_no_target_key_unambiguous_for_human_id(conn, key, &repo_id, git)?
-            && receipt_payload_proves_human_repo(&value, &repo_id)
+        if legacy_no_target_key_unambiguous_for_human_id(conn, key, repo_id, git)?
+            && receipt_payload_proves_human_repo(&value, repo_id)
         {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn repository_has_legacy_human_kv(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+    if legacy_human_checkpoint_kv_safe_to_touch(conn, repo_id, repo_id)? {
+        for key in [
+            legacy_last_git_sha_kv_key(repo_id),
+            legacy_repo_echo_generation_kv_key(repo_id),
+            legacy_team_history_block_kv_key(repo_id),
+            format!("last_svn_rev_{repo_id}"),
+        ] {
+            if kv_payload_for_key(conn, &key)?.is_some() {
+                return Ok(true);
+            }
+        }
+    }
+    for key in list_kv_keys_glob(conn, &format!("handled_git_no_target_{repo_id}_*"))? {
+        if !legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, true)? {
+            continue;
+        }
+        let Some(value) = kv_payload_for_key(conn, &key)? else {
+            continue;
+        };
+        if receipt_payload_proves_human_repo(&value, repo_id) {
+            return Ok(true);
+        }
+    }
+    for key in list_kv_keys_glob(conn, &format!("handled_svn_no_target_{repo_id}_*"))? {
+        if !legacy_no_target_key_unambiguous_for_human_id(conn, &key, repo_id, false)? {
+            continue;
+        }
+        let Some(value) = kv_payload_for_key(conn, &key)? else {
+            continue;
+        };
+        if receipt_payload_proves_human_repo(&value, repo_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn purge_repository_kv_before_row_delete(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    let scope_uuid: Option<String> = conn
+        .query_row(
+            &format!("SELECT {SCOPE_UUID_COLUMN} FROM repositories WHERE id = ?1"),
+            [repo_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+        .filter(|value| !value.is_empty());
+    purge_repository_scope_kv(conn, repo_id, scope_uuid.as_deref())?;
+    Ok(())
+}
+
+pub(crate) fn after_repository_row_deleted(conn: &Connection) -> Result<(), DatabaseError> {
+    let repo_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    if repo_count == 0 {
+        revoke_legacy_repo_id_kv_reads(conn)?;
+    }
+    sweep_unowned_legacy_no_target_receipts(conn)?;
+    Ok(())
+}
+
+/// Shared registration removal: purge scoped/legacy KV, delete the row, latch/sweep.
+pub(crate) fn delete_repository_registration_row(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    purge_repository_kv_before_row_delete(conn, repo_id)?;
+    let changed = conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
+    if changed == 0 {
+        return Err(DatabaseError::NotFound {
+            entity: "repository".into(),
+            id: repo_id.into(),
+        });
+    }
+    after_repository_row_deleted(conn)?;
+    Ok(())
+}
+
+fn v13_scope_uuid_migration_already_done(conn: &Connection) -> Result<bool, DatabaseError> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [V13_SCOPE_UUID_MIGRATION_DONE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value == "1"))
+}
+
+fn mark_v13_scope_uuid_migration_done(conn: &Connection) -> Result<(), DatabaseError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, '1', ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![V13_SCOPE_UUID_MIGRATION_DONE_KEY, now],
+    )?;
+    Ok(())
 }
 
 fn quarantine_kv_key(conn: &Connection, key: &str) -> Result<(), DatabaseError> {
@@ -725,11 +845,19 @@ pub(crate) fn migrate_legacy_kv_for_repo(
 
 /// v13: assign `scope_uuid` to every repository and migrate legacy scoped KV when safe.
 pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
+    let migration_done = v13_scope_uuid_migration_already_done(conn)?;
     let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
     let repo_ids: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
+
+    let enable_legacy_reads = if migration_done {
+        false
+    } else {
+        repo_ids.len() == 1 && repository_has_legacy_human_kv(conn, &repo_ids[0])?
+    };
+
     for repo_id in &repo_ids {
         let existing: Option<String> = conn
             .query_row(
@@ -753,14 +881,17 @@ pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
         };
         migrate_legacy_kv_for_repo(conn, repo_id, &scope_uuid)?;
     }
-    if repo_ids.len() == 1 {
-        write_legacy_repo_id_kv_reads_flag(conn, true)?;
-    } else if repo_ids.len() > 1 {
-        write_legacy_repo_id_kv_reads_flag(conn, false)?;
-        for repo_id in &repo_ids {
-            quarantine_unscoped_legacy_receipts(conn, repo_id)?;
+
+    if !migration_done {
+        write_legacy_repo_id_kv_reads_flag(conn, enable_legacy_reads)?;
+        if repo_ids.len() > 1 {
+            for repo_id in &repo_ids {
+                quarantine_unscoped_legacy_receipts(conn, repo_id)?;
+            }
         }
+        mark_v13_scope_uuid_migration_done(conn)?;
     }
+
     sweep_unowned_legacy_no_target_receipts(conn)?;
     Ok(())
 }

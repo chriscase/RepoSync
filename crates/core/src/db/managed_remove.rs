@@ -1401,10 +1401,16 @@ impl Database {
                 tx.execute("DELETE FROM kv_state WHERE key=?1", [&secret_key])?;
                 tx.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&secret_key])?;
             }
+            let scoped_svn_rev_at_removal = scoped_svn_rev(tx, repo_id)?;
+            crate::db::repo_scope_identity::purge_repository_kv_before_row_delete(tx, repo_id)?;
             if tx.execute("DELETE FROM repositories WHERE id=?1", [repo_id])? != 1 {
                 return Err(DatabaseError::Other(
                     "registration row was not removed".into(),
                 ));
+            }
+            crate::db::repo_scope_identity::after_repository_row_deleted(tx)?;
+            if let Some(rev) = scoped_svn_rev_at_removal {
+                write_value(tx, &format!("last_svn_rev_{repo_id}"), &rev.to_string())?;
             }
             op.state = ManagedRemoveState::Completed;
             op.restore_supported = true;
@@ -2348,7 +2354,7 @@ mod tests {
             Some("4")
         );
         assert_eq!(
-            db.get_state(&format!("last_git_sha_{repo_id}"))
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, repo_id)
                 .unwrap()
                 .as_deref(),
             Some("inboundcheckpoint0123456789abcdef0123456789")
