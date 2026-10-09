@@ -980,3 +980,221 @@ fn clean_path_inspect_fetched_history_authenticates_http_git() {
         &admission.remote_tip
     ));
 }
+
+/// Late-pair `replay_pending_git` builds a clean `SyncEngine` and admits history
+/// through `inspect_team_history` / `stored_http_auth_token` before replay writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replay_pending_git_inspect_team_history_http_auth() {
+    use reposync_core::errors::SyncError;
+    use reposync_core::git::apply_git_credential_chain_state;
+    use reposync_core::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+    use std::io::{BufRead, BufReader};
+
+    const TOKEN: &str = "reposync-replay-pending-git-http-token";
+    const CHILD_ID: &str = "child-http-replay";
+
+    let tmp = TempDir::new().unwrap();
+    let bare = tmp.path().join("repo.git");
+    git_cmd(tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+    let seed = tmp.path().join("seed");
+    std::fs::create_dir(&seed).unwrap();
+    git_cmd(&seed, &["init", "-b", "main"]);
+    std::fs::write(seed.join("seed.txt"), "seed\n").unwrap();
+    git_cmd(&seed, &["add", "seed.txt"]);
+    git_cmd(&seed, &["commit", "-m", "seed"]);
+    git_cmd(&seed, &["push", bare.to_str().unwrap(), "main"]);
+    git_cmd(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let checkpoint = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&seed)
+        .output()
+        .unwrap();
+    let checkpoint = String::from_utf8_lossy(&checkpoint.stdout)
+        .trim()
+        .to_string();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/git_http_auth_server.py");
+    let mut server = Command::new("python3");
+    server
+        .arg(script)
+        .env("GIT_PROJECT_ROOT", tmp.path())
+        .env("GIT_HTTP_PORT", port.to_string())
+        .env("GIT_TEST_TOKEN", TOKEN)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = server.spawn().expect("spawn git http-auth server");
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    assert!(rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .contains("listening"));
+    struct ServerGuard(std::process::Child);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _guard = ServerGuard(child);
+
+    let bridge = tmp.path().join("bridge");
+    assert!(Command::new("git")
+        .args([
+            "clone",
+            "-b",
+            "main",
+            bare.to_str().unwrap(),
+            bridge.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let remote_url = format!("http://127.0.0.1:{port}/repo.git");
+    git_cmd(&bridge, &["remote", "set-url", "origin", &remote_url]);
+    git_cmd(&bridge, &["config", "credential.helper", ""]);
+
+    let svn_repo = tmp.path().join("svn");
+    assert!(Command::new("svnadmin")
+        .args(["create", svn_repo.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let svn_url = format!("file://{}", svn_repo.display());
+    assert!(Command::new("svn")
+        .args(["mkdir", &format!("{svn_url}/trunk"), "-m", "trunk"])
+        .status()
+        .unwrap()
+        .success());
+
+    let db_path = tmp.path().join("reposync.db");
+    let db = Database::new(&db_path).unwrap();
+    db.initialize().unwrap();
+    let now = Utc::now();
+    db.insert_repository(&Repository {
+        id: CHILD_ID.into(),
+        name: "Child".into(),
+        svn_url: svn_url.clone(),
+        svn_branch: "trunk".into(),
+        svn_username: String::new(),
+        git_provider: "local".into(),
+        git_api_url: format!("http://127.0.0.1:{port}"),
+        git_repo: "local/repo".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 5,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: true,
+        created_by: None,
+        parent_id: Some("parent".into()),
+        created_at: now.to_rfc3339(),
+        updated_at: now.to_rfc3339(),
+        last_svn_rev: 1,
+        last_git_sha: checkpoint.clone(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    db.insert_sync_record(&SyncRecord {
+        id: "import-map".into(),
+        repo_id: Some(CHILD_ID.into()),
+        svn_revision: Some(1),
+        git_hash: Some(checkpoint.clone()),
+        direction: SyncDirection::SvnToGit,
+        author: "svn".into(),
+        message: "import".into(),
+        timestamp: now,
+        synced_at: now,
+        status: SyncRecordStatus::Applied,
+    })
+    .unwrap();
+    db.set_state(&format!("last_git_sha_{CHILD_ID}"), &checkpoint)
+        .unwrap();
+    let baseline = serde_json::json!({
+        "version": 1,
+        "repo_id": CHILD_ID,
+        "git_sha": checkpoint,
+        "svn_rev": 1,
+        "projection": "{}",
+    });
+    db.set_state(
+        &format!("handled_git_baseline_{CHILD_ID}"),
+        &baseline.to_string(),
+    )
+    .unwrap();
+
+    let config = app_config(tmp.path(), &svn_url);
+    let identity = Arc::new(IdentityMapper::new(&IdentityConfig::default()).unwrap());
+    let svn_trunk = format!("{svn_url}/trunk");
+
+    let git_client_denied = GitClient::new(&bridge).unwrap();
+    assert!(git_client_denied.stored_http_auth_token().is_none());
+    let db_denied = Database::new(&db_path).unwrap();
+    db_denied
+        .set_state(&format!("secret_git_token_{CHILD_ID}"), "")
+        .unwrap();
+    let mut engine_denied = SyncEngine::new(
+        app_config(tmp.path(), &svn_url),
+        db_denied,
+        SvnClient::new(&svn_trunk, "", ""),
+        git_client_denied,
+        identity.clone(),
+    );
+    engine_denied.set_repo_id(CHILD_ID.into());
+    engine_denied.set_git_credential_apply_clean(true);
+    let denied = engine_denied.run_sync_cycle().await;
+    assert!(
+        matches!(
+            &denied,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "remote_auth_failed"
+        ),
+        "missing replay token must fail closed on HTTP inspect: {denied:?}"
+    );
+
+    db.set_state(&format!("secret_git_token_{CHILD_ID}"), TOKEN)
+        .unwrap();
+    let git_client = GitClient::new(&bridge).unwrap();
+    let token_state = db.resolve_credential_chain_state(CHILD_ID, "secret_git_token");
+    apply_git_credential_chain_state(&git_client, "origin", &token_state).unwrap();
+    assert_eq!(git_client.stored_http_auth_token().as_deref(), Some(TOKEN));
+
+    let mut engine = SyncEngine::new(
+        config,
+        db,
+        SvnClient::new(&svn_trunk, "", ""),
+        git_client,
+        identity,
+    );
+    engine.set_repo_id(CHILD_ID.into());
+    engine.set_git_credential_apply_clean(true);
+    let authed = engine.run_sync_cycle().await;
+    assert!(
+        !matches!(
+            &authed,
+            Err(SyncError::HistoryBlocked {
+                reason,
+                ..
+            }) if reason == "remote_auth_failed"
+        ),
+        "replay engine must authenticate HTTP inspect: {authed:?}"
+    );
+}

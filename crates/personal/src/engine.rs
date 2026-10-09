@@ -14,9 +14,10 @@ use tracing::{error, info, warn};
 use reposync_core::db::personal_scope::personal_scope_key;
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
+use reposync_core::git::apply_config_remote_git_credentials;
 use reposync_core::git::client::GitClient;
 use reposync_core::git::github::GitHubClient;
-use reposync_core::history_inspect::inspect_personal_history;
+use reposync_core::history_inspect::inspect_personal_history_with_http_auth;
 use reposync_core::models::PersonalSyncStats;
 use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
@@ -333,18 +334,22 @@ impl PersonalSyncEngine {
     /// Inspect the configured Git branch against the last handled SHA before
     /// SVN→Git or Git→SVN writes. Webhook `forced` is not consulted here.
     fn inspect_git_history(&self) -> Result<()> {
-        let git_path = {
+        let (git_path, http_auth_token) = {
             let git = self
                 .git_client
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            git.repo_path().to_path_buf()
+            if git.stored_http_auth_token().is_none() {
+                apply_config_remote_git_credentials(&git, self.config.github.token.as_deref())?;
+            }
+            (git.repo_path().to_path_buf(), git.stored_http_auth_token())
         };
-        inspect_personal_history(
+        inspect_personal_history_with_http_auth(
             &self.db,
             &git_path,
             &self.config.github.default_branch,
             personal_scope_key(),
+            http_auth_token.as_deref(),
         )
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))

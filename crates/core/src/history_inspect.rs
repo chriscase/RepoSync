@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::db::Database;
 use crate::errors::{DatabaseError, SyncError};
+use crate::git::GitClient;
 
 /// Rewrite of already-handled Git cursor (P→R ancestry failure).
 pub const DURABLE_HISTORY_REASON: &str = "non_fast_forward";
@@ -531,6 +532,24 @@ fn personal_checkpoint_ancestry(
     }
 }
 
+fn resolve_personal_history_http_auth(
+    db: &Database,
+    git_path: &Path,
+    scope_id: &str,
+    http_auth_token: Option<&str>,
+) -> Option<String> {
+    if let Some(token) = http_auth_token.filter(|value| !value.is_empty()) {
+        return Some(token.to_string());
+    }
+    if let Ok(git) = GitClient::new(git_path) {
+        if let Some(token) = git.stored_http_auth_token() {
+            return Some(token);
+        }
+    }
+    db.resolve_credential_chain_state(scope_id, "secret_git_token")
+        .value
+}
+
 fn block_personal_history(
     db: &Database,
     key: &str,
@@ -550,12 +569,14 @@ fn block_personal_history(
 /// Missing origin, missing checkpoint, or conflicting checkpoint provenance
 /// fail closed before SVN writes. Initial import owns initialization and does
 /// not call this gate. A durable rewrite block still refuses writes after
-/// restart.
-pub fn inspect_personal_history(
+/// restart. HTTP(S) auth is taken from `http_auth_token`, the workdir sidecar
+/// written by [`GitClient`], or the scoped `secret_git_token` credential chain.
+pub fn inspect_personal_history_with_http_auth(
     db: &Database,
     git_path: &Path,
     branch: &str,
     scope_id: &str,
+    http_auth_token: Option<&str>,
 ) -> Result<Option<HistoryInspectAdmission>, SyncError> {
     let key = history_block_key(Some(scope_id));
     if scope_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
@@ -644,10 +665,26 @@ pub fn inspect_personal_history(
             Some(&checkpoint),
         );
     }
-    match inspect_fetched_history(git_path, branch, Some(checkpoint.clone()), None) {
+    let http_auth_token =
+        resolve_personal_history_http_auth(db, git_path, scope_id, http_auth_token);
+    match inspect_fetched_history(
+        git_path,
+        branch,
+        Some(checkpoint.clone()),
+        http_auth_token.as_deref(),
+    ) {
         Ok(admission) => Ok(Some(admission)),
         Err(reject) => block_personal_history(db, &key, scope_id, reject, Some(&checkpoint)),
     }
+}
+
+pub fn inspect_personal_history(
+    db: &Database,
+    git_path: &Path,
+    branch: &str,
+    scope_id: &str,
+) -> Result<Option<HistoryInspectAdmission>, SyncError> {
+    inspect_personal_history_with_http_auth(db, git_path, branch, scope_id, None)
 }
 
 #[cfg(test)]

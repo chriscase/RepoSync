@@ -43,6 +43,11 @@ pub async fn run_start(config: &PersonalConfig, foreground: bool) -> Result<()> 
 
     let git_repo_path = data_dir.join("git-repo");
     let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
+    reposync_core::git::apply_config_remote_git_credentials(
+        &git_client,
+        config.github.token.as_deref(),
+    )
+    .context("failed to apply git credentials to existing repository")?;
 
     let github_token = config.github.token.as_deref().unwrap_or("");
     let github_client =

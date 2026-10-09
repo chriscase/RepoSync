@@ -42,7 +42,13 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     // Git repository
     let git_repo_path = data_dir.join("git-repo");
     let git_client = if git_repo_path.exists() {
-        GitClient::new(&git_repo_path).context("failed to open git repository")?
+        let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
+        reposync_core::git::apply_config_remote_git_credentials(
+            &git_client,
+            config.github.token.as_deref(),
+        )
+        .context("failed to apply git credentials to existing repository")?;
+        git_client
     } else {
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         let remote_url = config.github.clone_url();

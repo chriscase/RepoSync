@@ -196,7 +196,13 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
     // Set up Git repository.
     let git_repo_path = data_dir.join("git-repo");
     let git_client = if git_repo_path.exists() {
-        GitClient::new(&git_repo_path).context("failed to open git repository")?
+        let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
+        reposync_core::git::apply_config_remote_git_credentials(
+            &git_client,
+            config.github.token.as_deref(),
+        )
+        .context("failed to apply git credentials to existing repository")?;
+        git_client
     } else {
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         let remote_url = config.github.clone_url();
@@ -327,7 +333,13 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     // Initialize Git repo for import.
     let git_repo_path = data_dir.join("git-repo");
     let git_client = if git_repo_path.exists() {
-        GitClient::new(&git_repo_path).context("failed to open git repository")?
+        let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
+        reposync_core::git::apply_config_remote_git_credentials(
+            &git_client,
+            config.github.token.as_deref(),
+        )
+        .context("failed to apply git credentials to existing repository")?;
+        git_client
     } else {
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         // For import, try to clone first; if repo doesn't exist yet, init locally

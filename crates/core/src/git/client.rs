@@ -12,6 +12,39 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::errors::GitError;
 
+/// Sidecar file under the git directory (never in `config`); holds HTTP auth for clean remotes.
+const CLEAN_HTTP_TOKEN_REL: &str = "reposync/clean-http-token";
+
+fn load_clean_http_auth_token(repo: &Repository) -> Option<String> {
+    let path = repo.path().join(CLEAN_HTTP_TOKEN_REL);
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn persist_clean_http_auth_token(repo: &Repository, token: &str) -> Result<(), GitError> {
+    let dir = repo.path().join("reposync");
+    std::fs::create_dir_all(&dir).map_err(GitError::IoError)?;
+    let path = dir.join("clean-http-token");
+    std::fs::write(&path, token).map_err(GitError::IoError)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(GitError::IoError)?;
+    }
+    Ok(())
+}
+
+fn clear_clean_http_auth_token_file(repo: &Repository) -> Result<(), GitError> {
+    let path = repo.path().join(CLEAN_HTTP_TOKEN_REL);
+    if path.is_file() {
+        std::fs::remove_file(path).map_err(GitError::IoError)?;
+    }
+    Ok(())
+}
+
 /// High-level Git client wrapping a `git2::Repository`.
 pub struct GitClient {
     repo: Repository,
@@ -61,10 +94,11 @@ impl GitClient {
         info!(path = %path.display(), "opening git repository");
         let repo = Repository::open(path)
             .map_err(|_| GitError::RepositoryNotFound(path.display().to_string()))?;
+        let http_auth_token = load_clean_http_auth_token(&repo);
         Ok(Self {
             repo,
             repo_path: path.to_path_buf(),
-            http_auth_token: RefCell::new(None),
+            http_auth_token: RefCell::new(http_auth_token),
         })
     }
 
@@ -113,6 +147,9 @@ impl GitClient {
             http_auth_token: RefCell::new(token.map(str::to_string)),
         };
         client.migrate_remote_url_clean("origin")?;
+        if let Some(tok) = client.http_auth_token.borrow().as_deref() {
+            persist_clean_http_auth_token(&client.repo, tok)?;
+        }
         Ok(client)
     }
 
@@ -231,6 +268,7 @@ impl GitClient {
         self.migrate_remote_url_clean(remote_name)?;
         if let Some(tok) = token {
             *self.http_auth_token.borrow_mut() = Some(tok.to_string());
+            persist_clean_http_auth_token(&self.repo, tok)?;
         }
         Ok(())
     }
@@ -270,6 +308,7 @@ impl GitClient {
     pub fn clear_remote_credentials(&self, remote_name: &str) -> Result<(), GitError> {
         self.migrate_remote_url_clean(remote_name)?;
         self.http_auth_token.borrow_mut().take();
+        clear_clean_http_auth_token_file(&self.repo)?;
         Ok(())
     }
 

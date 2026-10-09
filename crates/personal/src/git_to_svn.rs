@@ -25,7 +25,7 @@ use reposync_core::echo_suppression::{
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
-use reposync_core::history_inspect::inspect_personal_history;
+use reposync_core::history_inspect::inspect_personal_history_with_http_auth;
 use reposync_core::path_projection::{
     project_git_to_svn_changeset, svn_path_identity, GitToSvnInputChange,
     ProjectedGitToSvnChangeset,
@@ -75,6 +75,7 @@ pub struct GitToSvnSync {
     default_branch: String,
     svn_author: String,
     svn_url: String,
+    http_auth_token: Option<String>,
 }
 
 impl GitToSvnSync {
@@ -111,7 +112,21 @@ impl GitToSvnSync {
             default_branch: config.github.default_branch.clone(),
             svn_author: config.developer.svn_username.clone(),
             svn_url: config.svn.url.clone(),
+            http_auth_token: config.github.token.clone(),
         }
+    }
+
+    fn personal_history_http_auth(&self) -> Option<String> {
+        if let Some(token) = self
+            .http_auth_token
+            .as_ref()
+            .filter(|value| !value.is_empty())
+        {
+            return Some(token.clone());
+        }
+        GitClient::new(&self.git_repo_path)
+            .ok()
+            .and_then(|git| git.stored_http_auth_token())
     }
 
     /// Ensure the SVN working copy directory exists and is properly checked out.
@@ -172,11 +187,13 @@ impl GitToSvnSync {
     ///
     /// Returns a summary of what was synced.
     fn ensure_personal_history_admitted(&self) -> Result<()> {
-        inspect_personal_history(
+        let http_auth_token = self.personal_history_http_auth();
+        inspect_personal_history_with_http_auth(
             &self.db,
             &self.git_repo_path,
             &self.default_branch,
             PERSONAL_REPO_ID,
+            http_auth_token.as_deref(),
         )
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
