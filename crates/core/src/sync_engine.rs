@@ -231,16 +231,18 @@ fn sync_git_command_output(
     repo_path: &Path,
     args: &[&str],
     timeout: Duration,
+    http_auth_token: Option<String>,
 ) -> Option<std::process::Output> {
     let repo_path = repo_path.to_path_buf();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(&repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = crate::git::subprocess_auth::git_cli_output(
+            &repo_path,
+            &arg_refs,
+            http_auth_token.as_deref(),
+        );
         let _ = tx.send(output);
     });
     match rx.recv_timeout(timeout) {
@@ -254,6 +256,7 @@ fn advertised_remote_tip_is_sha(
     branch: &str,
     sha: &str,
     timeout: Duration,
+    http_auth_token: Option<&str>,
 ) -> bool {
     let remote_branch = format!("refs/heads/{}", branch);
     let output = match sync_git_command_output(
@@ -266,6 +269,7 @@ fn advertised_remote_tip_is_sha(
             &remote_branch,
         ],
         timeout,
+        http_auth_token.map(str::to_string),
     ) {
         Some(output) => output,
         None => return false,
@@ -756,15 +760,21 @@ impl SyncEngine {
         }
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
         let repo_path = git.repo_path();
+        let http_token = git.stored_http_auth_token();
         let timeout = Duration::from_secs(45);
         let spec = format!("{}^{{commit}}", sha);
-        if sync_git_command_output(repo_path, &["cat-file", "-e", &spec], timeout)
-            .is_some_and(|output| output.status.success())
+        if sync_git_command_output(
+            repo_path,
+            &["cat-file", "-e", &spec],
+            timeout,
+            http_token.clone(),
+        )
+        .is_some_and(|output| output.status.success())
         {
             return Ok(false);
         }
         let branch = &self.config.github.default_branch;
-        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout) {
+        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout, http_token.as_deref()) {
             return Ok(false);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
@@ -778,13 +788,24 @@ impl SyncEngine {
                 &format!("{}:{}", sha, probe_ref),
             ],
             timeout,
+            http_token.clone(),
         )
         .is_some_and(|output| output.status.success());
         let present = fetched
-            && sync_git_command_output(repo_path, &["cat-file", "-e", &spec], timeout)
-                .is_some_and(|output| output.status.success());
+            && sync_git_command_output(
+                repo_path,
+                &["cat-file", "-e", &spec],
+                timeout,
+                http_token.clone(),
+            )
+            .is_some_and(|output| output.status.success());
         if present {
-            let _ = sync_git_command_output(repo_path, &["update-ref", "-d", &probe_ref], timeout);
+            let _ = sync_git_command_output(
+                repo_path,
+                &["update-ref", "-d", &probe_ref],
+                timeout,
+                http_token,
+            );
             return Ok(false);
         }
         Ok(true)
@@ -1637,10 +1658,12 @@ impl SyncEngine {
             .git_client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let http_token = git.stored_http_auth_token();
         match inspect_fetched_history(
             git.repo_path(),
             &self.config.github.default_branch,
             p.clone(),
+            http_token.as_deref(),
         ) {
             Ok(admission) => Ok(TeamHistoryAdmission {
                 checkpoint: admission.checkpoint,

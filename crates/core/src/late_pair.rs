@@ -6,7 +6,7 @@
 //! branches, write checkpoints, mutate remotes, or activate the scheduler.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde::Serialize;
 
@@ -114,12 +114,8 @@ pub struct LatePairRequest {
     pub dry_run: bool,
 }
 
-fn git(workdir: &Path, args: &[&str]) -> std::io::Result<Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+fn git(workdir: &Path, args: &[&str], http_auth_token: Option<&str>) -> std::io::Result<Output> {
+    crate::git::subprocess_auth::git_cli_output(workdir, args, http_auth_token)
 }
 
 fn stdout_trim(output: &Output) -> String {
@@ -188,7 +184,11 @@ pub fn collect_verified_mappings(
 }
 
 /// Fetch `branch` into the late-pair inspect ref without checkout or reset.
-pub fn resolve_candidate_tip(workdir: &Path, branch: &str) -> Result<String, LatePairRefusal> {
+pub fn resolve_candidate_tip(
+    workdir: &Path,
+    branch: &str,
+    http_auth_token: Option<&str>,
+) -> Result<String, LatePairRefusal> {
     if !workdir.join(".git").exists() && !workdir.join("HEAD").exists() {
         return Err(LatePairRefusal {
             reason: "missing_git_objects".into(),
@@ -207,6 +207,7 @@ pub fn resolve_candidate_tip(workdir: &Path, branch: &str) -> Result<String, Lat
             "origin",
             &fetch_refspec,
         ],
+        http_auth_token,
     );
     let inspect = git(
         workdir,
@@ -215,6 +216,7 @@ pub fn resolve_candidate_tip(workdir: &Path, branch: &str) -> Result<String, Lat
             "--verify",
             &format!("{INSPECT_REF}^{{commit}}"),
         ],
+        None,
     );
     if inspect
         .as_ref()
@@ -229,6 +231,7 @@ pub fn resolve_candidate_tip(workdir: &Path, branch: &str) -> Result<String, Lat
             "--verify",
             &format!("refs/heads/{branch}^{{commit}}"),
         ],
+        None,
     );
     if local
         .as_ref()
@@ -256,6 +259,7 @@ fn is_ancestor(workdir: &Path, ancestor: &str, descendant: &str) -> Result<bool,
     match git(
         workdir,
         &["merge-base", "--is-ancestor", ancestor, descendant],
+        None,
     ) {
         Ok(output) if output.status.code() == Some(0) => Ok(true),
         Ok(output) if output.status.code() == Some(1) => Ok(false),
@@ -274,7 +278,7 @@ fn pending_git(
 ) -> Result<PendingGitWork, LatePairRefusal> {
     let range = format!("{baseline}..{tip}");
     let count_out =
-        git(workdir, &["rev-list", "--count", &range]).map_err(|_| LatePairRefusal {
+        git(workdir, &["rev-list", "--count", &range], None).map_err(|_| LatePairRefusal {
             reason: "selection_command_failed".into(),
             detail: "pending Git commits could not be counted".into(),
             plan: None,
@@ -293,14 +297,16 @@ fn pending_git(
             detail: "pending Git count was invalid".into(),
             plan: None,
         })?;
-    let summary_out =
-        git(workdir, &["rev-list", "--reverse", "--format=%s", &range]).map_err(|_| {
-            LatePairRefusal {
-                reason: "selection_command_failed".into(),
-                detail: "pending Git subjects could not be listed".into(),
-                plan: None,
-            }
-        })?;
+    let summary_out = git(
+        workdir,
+        &["rev-list", "--reverse", "--format=%s", &range],
+        None,
+    )
+    .map_err(|_| LatePairRefusal {
+        reason: "selection_command_failed".into(),
+        detail: "pending Git subjects could not be listed".into(),
+        plan: None,
+    })?;
     let mut summary = Vec::new();
     if summary_out.status.success() {
         for line in String::from_utf8_lossy(&summary_out.stdout).lines() {
@@ -375,6 +381,7 @@ pub fn evaluate_admission(
     git_workdir: Option<&Path>,
     provider_tip: Option<&str>,
     request: &LatePairRequest,
+    git_http_token: Option<&str>,
 ) -> Result<LatePairPlan, LatePairRefusal> {
     let mut plan = skeleton_plan(request);
 
@@ -391,7 +398,7 @@ pub fn evaluate_admission(
     }
 
     let tip = if let Some(workdir) = git_workdir {
-        match resolve_candidate_tip(workdir, &request.git_branch) {
+        match resolve_candidate_tip(workdir, &request.git_branch, git_http_token) {
             Ok(sha) => sha,
             Err(mut refuse) => {
                 if let Some(provider) = provider_tip.filter(|sha| is_full_git_oid(sha)) {
@@ -619,6 +626,7 @@ pub async fn probe_svn_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use crate::db::Database;
     use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
     use chrono::Utc;
@@ -687,7 +695,8 @@ mod tests {
             svn_revision: 2,
             evidence: "applied_sync_record".into(),
         }];
-        let plan = evaluate_admission(&mappings, Some(&work), None, &request(false, true)).unwrap();
+        let plan =
+            evaluate_admission(&mappings, Some(&work), None, &request(false, true), None).unwrap();
         assert!(plan.admitted);
         assert!(!plan.published);
         assert!(!plan.scheduler_active);
@@ -720,8 +729,8 @@ mod tests {
             svn_revision: 2,
             evidence: "applied_sync_record".into(),
         }];
-        let err =
-            evaluate_admission(&mappings, Some(&work), None, &request(false, true)).unwrap_err();
+        let err = evaluate_admission(&mappings, Some(&work), None, &request(false, true), None)
+            .unwrap_err();
         assert_eq!(err.reason, "unrelated_git_first");
     }
 
@@ -739,8 +748,8 @@ mod tests {
             svn_revision: 2,
             evidence: "snapshot_import_confirmed".into(),
         }];
-        let err =
-            evaluate_admission(&mappings, Some(&work), None, &request(true, true)).unwrap_err();
+        let err = evaluate_admission(&mappings, Some(&work), None, &request(true, true), None)
+            .unwrap_err();
         assert_eq!(err.reason, "unsafe_skip_import");
         assert!(!err.plan.as_ref().unwrap().skip_import_applied);
         assert!(!err.plan.as_ref().unwrap().scheduler_active);
@@ -762,7 +771,8 @@ mod tests {
             svn_revision: 4,
             evidence: "snapshot_import_confirmed".into(),
         }];
-        let plan = evaluate_admission(&mappings, Some(&work), None, &request(false, true)).unwrap();
+        let plan =
+            evaluate_admission(&mappings, Some(&work), None, &request(false, true), None).unwrap();
         assert_eq!(plan.verified_baseline.unwrap().git_sha, base);
         assert_eq!(plan.pending_git.count, 1);
         assert_eq!(plan.svn_source_revision, Some(4));
@@ -780,7 +790,7 @@ mod tests {
             evidence: "import_confirmed".into(),
         }];
         let plan =
-            evaluate_admission(&mappings, Some(&work), None, &request(false, false)).unwrap();
+            evaluate_admission(&mappings, Some(&work), None, &request(false, false), None).unwrap();
         assert_eq!(plan.mode, "publish_pending");
         assert!(!plan.published);
         assert!(!plan.scheduler_active);
@@ -809,8 +819,8 @@ mod tests {
             svn_revision: 2,
             evidence: "applied_sync_record".into(),
         }];
-        let err =
-            evaluate_admission(&mappings, Some(&work), None, &request(false, true)).unwrap_err();
+        let err = evaluate_admission(&mappings, Some(&work), None, &request(false, true), None)
+            .unwrap_err();
         assert_eq!(err.reason, "unrelated_git_first");
     }
 

@@ -5,7 +5,6 @@
 //! watermarks at the Git tip.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
@@ -419,17 +418,6 @@ async fn verify_existing_svn_target_matches_copy_intent(
     })
 }
 
-fn git_env(
-    workdir: &Path,
-    args: &[&str],
-    token: Option<&str>,
-) -> std::io::Result<std::process::Output> {
-    let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(workdir);
-    crate::git::subprocess_auth::apply_git_http_auth_optional(&mut cmd, token);
-    cmd.output()
-}
-
 fn ensure_child_git_workdir(
     data_dir: &Path,
     child_id: &str,
@@ -463,7 +451,7 @@ fn ensure_child_git_workdir(
             plan: None,
         }
     })?;
-    let fetch = git_env(
+    let fetch = crate::git::subprocess_auth::git_cli_output(
         &git_repo_path,
         &[
             "fetch",
@@ -485,7 +473,7 @@ fn ensure_child_git_workdir(
             plan: None,
         });
     }
-    let checkout = git_env(
+    let checkout = crate::git::subprocess_auth::git_cli_output(
         &git_repo_path,
         &["checkout", "-B", git_branch, git_branch],
         None,

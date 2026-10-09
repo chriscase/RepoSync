@@ -3157,7 +3157,17 @@ async fn create_branch_pair(
         }
     }
 
-    let admission = evaluate_admission(&mappings, workdir, provider_tip.as_deref(), &request);
+    let git_http_token = db
+        .resolve_credential_chain(&parent.id, "secret_git_token")
+        .unwrap_or_default();
+    let git_http_token = (!git_http_token.is_empty()).then_some(git_http_token.as_str());
+    let admission = evaluate_admission(
+        &mappings,
+        workdir,
+        provider_tip.as_deref(),
+        &request,
+        git_http_token,
+    );
     let mut plan = match admission {
         Ok(plan) => plan,
         Err(refuse) => {
@@ -3377,6 +3387,14 @@ async fn preview_pair_refresh(
     let parent_dir = pair_refresh_git_dir(&state, &parent.id);
     let pair_dir = pair_refresh_git_dir(&state, &pair.id);
     let same_remote = pair.git_repo == parent.git_repo && pair.git_api_url == parent.git_api_url;
+    let parent_git_token = db
+        .resolve_credential_chain(&parent.id, "secret_git_token")
+        .unwrap_or_default();
+    let pair_git_token = db
+        .resolve_credential_chain(&pair.id, "secret_git_token")
+        .unwrap_or_default();
+    let parent_git_token = (!parent_git_token.is_empty()).then_some(parent_git_token.as_str());
+    let pair_git_token = (!pair_git_token.is_empty()).then_some(pair_git_token.as_str());
     let facts = analyze_git_preview(
         GitLayout {
             parent_dir: parent_dir.as_deref(),
@@ -3387,6 +3405,10 @@ async fn preview_pair_refresh(
         &parent_mappings,
         &pair.git_branch,
         &parent.git_branch,
+        reposync_core::pair_refresh::GitPreviewAuth {
+            parent_token: parent_git_token,
+            pair_token: pair_git_token,
+        },
     );
 
     let parent_password = db

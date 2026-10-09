@@ -171,6 +171,11 @@ impl GitClient {
         &self.repo_path
     }
 
+    /// HTTP(S) token held for Git CLI subprocess auth (not embedded in remote URLs on clean paths).
+    pub fn stored_http_auth_token(&self) -> Option<String> {
+        self.http_auth_token.borrow().clone()
+    }
+
     /// Get the current HEAD commit SHA.
     pub fn head_sha(&self) -> Result<String, GitError> {
         let head = self.repo.head().map_err(GitError::from)?;

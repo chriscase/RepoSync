@@ -1,8 +1,42 @@
 //! HTTP(S) Git CLI authentication without embedding tokens in argv.
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 
 use base64::Engine;
+
+/// Git subcommands that contact a remote (must use [`apply_git_http_auth_optional`] when a token exists).
+pub const GIT_REMOTE_CLI_SUBCOMMANDS: &[&str] = &["clone", "ls-remote", "fetch", "push", "pull"];
+
+/// First non-option argument to `git` (the subcommand), if any.
+pub fn git_cli_subcommand<'a>(args: &'a [&'a str]) -> Option<&'a str> {
+    args.iter().find(|arg| !arg.starts_with('-')).copied()
+}
+
+fn is_remote_git_cli_subcommand(args: &[&str]) -> bool {
+    git_cli_subcommand(args).is_some_and(|sub| GIT_REMOTE_CLI_SUBCOMMANDS.contains(&sub))
+}
+
+/// Build `git` with auth env for remote subcommands; local commands get `GIT_TERMINAL_PROMPT=0` only.
+pub fn build_git_cli_command(workdir: &Path, args: &[&str], token: Option<&str>) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(workdir);
+    if is_remote_git_cli_subcommand(args) {
+        apply_git_http_auth_optional(&mut cmd, token);
+    } else {
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+    }
+    cmd
+}
+
+/// Run `git` in `workdir`, applying HTTP auth for remote subcommands when `token` is set.
+pub fn git_cli_output(
+    workdir: &Path,
+    args: &[&str],
+    token: Option<&str>,
+) -> std::io::Result<Output> {
+    build_git_cli_command(workdir, args, token).output()
+}
 
 /// Environment entries for `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`.
 pub fn git_http_auth_env(token: &str) -> Vec<(String, String)> {
@@ -109,6 +143,22 @@ mod tests {
         apply_git_http_auth_optional(&mut fetch, Some(TOKEN));
         assert!(command_env_has_git_http_auth(&fetch, TOKEN));
         assert!(!command_args_contain_secret(&fetch, TOKEN));
+    }
+
+    #[test]
+    fn git_cli_command_applies_auth_only_for_remote_subcommands() {
+        let dir = std::env::temp_dir();
+        let remote = build_git_cli_command(dir.as_path(), &["ls-remote", "origin"], Some(TOKEN));
+        assert!(command_env_has_git_http_auth(&remote, TOKEN));
+        let local = build_git_cli_command(dir.as_path(), &["rev-parse", "HEAD"], Some(TOKEN));
+        assert!(!command_env_has_git_http_auth(&local, TOKEN));
+        assert_eq!(
+            local
+                .get_envs()
+                .find(|(k, _)| *k == "GIT_TERMINAL_PROMPT")
+                .and_then(|(_, v)| v.map(|s| s.to_string_lossy().to_string())),
+            Some("0".into())
+        );
     }
 
     #[test]

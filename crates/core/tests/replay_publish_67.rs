@@ -223,7 +223,7 @@ async fn build_publish_fixture() -> PublishFixture {
         dry_run: false,
     };
     let mappings = collect_verified_mappings(&db, &parent_id).unwrap();
-    let plan = evaluate_admission(&mappings, Some(&parent_git), None, &request).unwrap();
+    let plan = evaluate_admission(&mappings, Some(&parent_git), None, &request, None).unwrap();
     assert_eq!(plan.pending_git.count, 2);
 
     let parent = db.get_repository(&parent_id).unwrap().unwrap();
@@ -814,4 +814,169 @@ async fn candidate_r06_late_pair_publish_resumes_after_svn_copy_error() {
             .success(),
         "retry must create the branch exactly once"
     );
+}
+
+/// Team replay with `set_git_credential_apply_clean(true)` runs `inspect_fetched_history`
+/// before push; this exercises the same authenticated `git ls-remote` / `git fetch` path
+/// against a real HTTP smart server (not `file://`).
+#[test]
+fn clean_path_inspect_fetched_history_authenticates_http_git() {
+    if !cfg!(target_os = "linux") {
+        eprintln!(
+            "skip clean_path_inspect_fetched_history_authenticates_http_git: \
+             git http-backend smart HTTP fixture runs on Linux CI only"
+        );
+        return;
+    }
+
+    const TOKEN: &str = "reposync-http-git-integration-token";
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().expect("port").port();
+    drop(listener);
+
+    let tmp = TempDir::new().unwrap();
+    let http_root = tmp.path().join("http-root");
+    std::fs::create_dir_all(&http_root).unwrap();
+    let bare = http_root.join("repo.git");
+    git_cmd(tmp.path(), &["init", "--bare", bare.to_str().unwrap()]);
+
+    let seed_work = tmp.path().join("seed-work");
+    std::fs::create_dir_all(&seed_work).unwrap();
+    git_cmd(&seed_work, &["init", "-b", "main"]);
+    git_cmd(
+        &seed_work,
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    std::fs::write(seed_work.join("README.md"), "seed\n").unwrap();
+    git_cmd(&seed_work, &["add", "README.md"]);
+    git_cmd(&seed_work, &["commit", "-m", "seed"]);
+    git_cmd(&seed_work, &["push", "-u", "origin", "main"]);
+    git_cmd(
+        tmp.path(),
+        &[
+            "-C",
+            bare.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+    );
+    let checkpoint = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&seed_work)
+        .output()
+        .unwrap();
+    let checkpoint = String::from_utf8_lossy(&checkpoint.stdout)
+        .trim()
+        .to_string();
+
+    let bridge = tmp.path().join("bridge");
+    assert!(Command::new("git")
+        .args([
+            "clone",
+            "-b",
+            "main",
+            bare.to_str().unwrap(),
+            bridge.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let remote_url = format!("http://127.0.0.1:{port}/repo.git");
+    git_cmd(&bridge, &["remote", "set-url", "origin", &remote_url]);
+    git_cmd(&bridge, &["checkout", "main"]);
+
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/git_http_auth_server.py");
+    assert!(
+        script.exists(),
+        "missing fixture script {}",
+        script.display()
+    );
+
+    let mut server = Command::new("python3");
+    server
+        .arg(script)
+        .env("GIT_PROJECT_ROOT", &http_root)
+        .env("GIT_HTTP_PORT", port.to_string())
+        .env("GIT_TEST_TOKEN", TOKEN)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = server.spawn().expect("spawn git http-auth server");
+    let mut saw_listen = false;
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let mut buf = [0u8; 256];
+        for _ in 0..50 {
+            if out.read(&mut buf).unwrap_or(0) > 0 {
+                let text = String::from_utf8_lossy(&buf);
+                if text.contains("listening") {
+                    saw_listen = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    assert!(saw_listen, "git http-auth server did not start");
+
+    struct ServerGuard(std::process::Child);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _guard = ServerGuard(child);
+
+    let git_client = GitClient::new(&bridge).unwrap();
+    let state = reposync_core::db::queries::CredentialChainState::resolved(TOKEN.to_string());
+    reposync_core::git::apply_git_credential_chain_state(&git_client, "origin", &state).unwrap();
+
+    let origin_url = Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(&bridge)
+        .output()
+        .unwrap();
+    let origin_url = String::from_utf8_lossy(&origin_url.stdout);
+    assert!(
+        !origin_url.contains(TOKEN),
+        "remote URL must stay token-free: {origin_url}"
+    );
+    assert!(
+        !origin_url.contains("x-access-token"),
+        "remote URL must stay token-free: {origin_url}"
+    );
+
+    let ls_cmd = reposync_core::git::build_git_cli_command(
+        &bridge,
+        &["ls-remote", "--exit-code", "origin", "refs/heads/main"],
+        Some(TOKEN),
+    );
+    assert!(
+        !reposync_core::git::command_args_contain_secret(&ls_cmd, TOKEN),
+        "ls-remote argv must not embed token"
+    );
+
+    let denied = reposync_core::history_inspect::inspect_fetched_history(
+        &bridge,
+        "main",
+        Some(checkpoint.clone()),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(denied.reason, "remote_auth_failed");
+
+    let admission = reposync_core::history_inspect::inspect_fetched_history(
+        &bridge,
+        "main",
+        Some(checkpoint),
+        Some(TOKEN),
+    )
+    .expect("authenticated inspect must succeed against HTTP origin");
+    assert!(reposync_core::history_inspect::is_full_git_oid(
+        &admission.remote_tip
+    ));
 }
