@@ -22,7 +22,7 @@ use reposync_core::db::import_operations::{
     import_target_fingerprint, resolve_repo_import_baseline, ImportOperation, ImportOperationState,
 };
 use reposync_core::db::Database;
-use reposync_core::errors::DatabaseError;
+use reposync_core::errors::{redact_vcs_error_detail, DatabaseError};
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
@@ -327,7 +327,7 @@ async fn test_svn_connection(
                     .to_string();
                 Ok(Json(TestConnectionResponse {
                     ok: false,
-                    message: msg,
+                    message: redact_vcs_error_detail(&msg),
                 }))
             }
         }
@@ -1155,7 +1155,8 @@ async fn spawn_import_task(
         GitClient::clone_repo(&clone_url, &git_repo_path, config_git_token.as_deref()).map_err(
             |e| {
                 AppError::BadRequest(format!(
-                    "Git target could not be cloned; import held for inspection: {e}"
+                    "Git target could not be cloned; import held for inspection: {}",
+                    redact_vcs_error_detail(&e.to_string())
                 ))
             },
         )?

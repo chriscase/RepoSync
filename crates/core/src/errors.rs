@@ -187,8 +187,8 @@ pub fn sanitize_error_message(msg: &str) -> String {
         }
     }
 
-    // Redact GitHub tokens (ghp_, gho_, github_pat_)
-    for prefix in &["ghp_", "gho_", "github_pat_"] {
+    // Redact GitHub tokens (ghp_, gho_, ghs_, ghu_, ghr_, github_pat_)
+    for prefix in &["ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_"] {
         while let Some(start) = result.find(prefix) {
             let token_end = result[start..]
                 .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -198,13 +198,60 @@ pub fn sanitize_error_message(msg: &str) -> String {
         }
     }
 
+    result = redact_authorization_headers(&result);
     redact_url_userinfo(&result)
 }
 
-/// Redact userinfo (`user:pass@`) from `http://` and `https://` URLs.
+fn redact_authorization_headers(msg: &str) -> String {
+    let mut result = msg.to_string();
+    for marker in [
+        "Authorization: Basic ",
+        "Authorization: Bearer ",
+        "authorization: basic ",
+        "authorization: bearer ",
+    ] {
+        let mut search_from = 0;
+        while let Some(pos) = result[search_from..].find(marker) {
+            let start = search_from + pos + marker.len();
+            let end = result[start..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+                .map(|i| start + i)
+                .unwrap_or(result.len());
+            result.replace_range(start..end, "[REDACTED]");
+            search_from = start + "[REDACTED]".len();
+        }
+    }
+    result
+}
+
+fn userinfo_should_redact(userinfo: &str) -> bool {
+    if userinfo.starts_with("x-access-token:") || userinfo.contains("[REDACTED]") {
+        return false;
+    }
+    let decoded = userinfo.replace("%3A", ":").replace("%3a", ":");
+    if decoded.contains(':') || decoded.contains("oauth2") {
+        return true;
+    }
+    for prefix in [
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "ghr_",
+        "github_pat_",
+        "x-access-token",
+    ] {
+        if decoded.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Redact userinfo (`user:pass@`) from remote URLs in error text.
 pub fn redact_url_userinfo(msg: &str) -> String {
     let mut result = msg.to_string();
-    for scheme in ["https://", "http://"] {
+    for scheme in ["https://", "http://", "svn+ssh://", "svn://", "ssh://"] {
         let mut search_from = 0;
         while let Some(pos) = result[search_from..].find(scheme) {
             let start = search_from + pos + scheme.len();
@@ -213,11 +260,7 @@ pub fn redact_url_userinfo(msg: &str) -> String {
             let authority = &rest[..end_host];
             if let Some(at) = authority.find('@') {
                 let userinfo = &authority[..at];
-                if userinfo.starts_with("x-access-token:") || userinfo.contains("[REDACTED]") {
-                    search_from = start + end_host;
-                    continue;
-                }
-                if userinfo.contains(':') || userinfo.contains("oauth2") {
+                if userinfo_should_redact(userinfo) {
                     let redacted = format!("{scheme}[REDACTED]@");
                     result.replace_range(search_from + pos..start + at + 1, &redacted);
                     search_from = search_from + pos + redacted.len();
@@ -723,5 +766,52 @@ mod tests {
         let result = sanitize_error_message(msg);
         assert!(!result.contains("ghp_AAA"));
         assert!(!result.contains("gho_BBB"));
+    }
+
+    #[test]
+    fn test_sanitize_ghs_token() {
+        let msg = "bad ghs_ABC123DEF";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghs_ABC123DEF"));
+    }
+
+    #[test]
+    fn test_sanitize_svn_ssh_userinfo() {
+        let msg = "svn: E170001: svn+ssh://user:secret@svn.example/repo";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("secret"));
+        assert!(result.contains("svn+ssh://[REDACTED]@"));
+    }
+
+    #[test]
+    fn test_sanitize_https_user_only_token_user() {
+        let msg = "fatal: https://ghp_onlyuser@github.com/o/r.git";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghp_onlyuser"));
+        assert!(
+            result.contains("https://[REDACTED]@") || result.contains("https://[REDACTED_TOKEN]@")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_percent_encoded_colon_userinfo() {
+        let msg = "err https://x-access-token%3Aghp_embedded@host/x";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghp_embedded"));
+    }
+
+    #[test]
+    fn test_sanitize_authorization_basic_header() {
+        let msg = "HTTP 401 Authorization: Basic dXNlcjpzZWNyZXQ= failed";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("dXNlcjpzZWNyZXQ"));
+        assert!(result.contains("Authorization: Basic [REDACTED]"));
+    }
+
+    #[test]
+    fn test_sanitize_authorization_bearer_header() {
+        let msg = "denied Authorization: Bearer ghu_leaked_token extra";
+        let result = sanitize_error_message(msg);
+        assert!(!result.contains("ghu_leaked_token"));
     }
 }

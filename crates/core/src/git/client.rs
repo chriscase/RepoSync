@@ -1,8 +1,12 @@
 //! Local Git repository operations via `git2`.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use git2::{BranchType, IndexAddOption, Oid, Repository, Signature};
+use git2::{
+    build::RepoBuilder, BranchType, Cred, CredentialType, FetchOptions, IndexAddOption, Oid,
+    RemoteCallbacks, Repository, Signature,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -12,6 +16,8 @@ use crate::errors::GitError;
 pub struct GitClient {
     repo: Repository,
     repo_path: PathBuf,
+    /// HTTP(S) token for git CLI / libgit2 callbacks (never written into `.git/config`).
+    http_auth_token: RefCell<Option<String>>,
 }
 
 /// Information about a single Git commit.
@@ -58,6 +64,7 @@ impl GitClient {
         Ok(Self {
             repo,
             repo_path: path.to_path_buf(),
+            http_auth_token: RefCell::new(None),
         })
     }
 
@@ -69,35 +76,71 @@ impl GitClient {
         Ok(Self {
             repo,
             repo_path: path.to_path_buf(),
+            http_auth_token: RefCell::new(None),
         })
     }
 
     /// Clone a remote repository to `path`.
     ///
-    /// If a token is provided and the URL is HTTP(S), the token is embedded
-    /// directly in the URL (`x-access-token:<token>@host`) for maximum
-    /// compatibility with servers like Gitea that don't work well with
-    /// libgit2's credential callback.
+    /// HTTP(S) tokens are supplied via libgit2 credential callbacks; the stored
+    /// `remote.origin.url` remains the clean URL without embedded credentials.
     #[instrument(skip(token), fields(url = %url, path = %path.display()))]
     pub fn clone_repo(url: &str, path: &Path, token: Option<&str>) -> Result<Self, GitError> {
         info!("cloning git repository");
-        let clone_url = match token {
-            Some(tok) if url.starts_with("https://") => {
-                let rest = url.strip_prefix("https://").unwrap();
-                format!("https://x-access-token:{}@{}", tok, rest)
-            }
-            Some(tok) if url.starts_with("http://") => {
-                let rest = url.strip_prefix("http://").unwrap();
-                format!("http://x-access-token:{}@{}", tok, rest)
-            }
-            _ => url.to_string(),
-        };
-        let repo = Repository::clone(&clone_url, path)?;
+        let clean_url = Self::strip_http_credentials(url).unwrap_or_else(|| url.to_string());
+        let mut builder = RepoBuilder::new();
+        if let Some(tok) =
+            token.filter(|_| clean_url.starts_with("https://") || clean_url.starts_with("http://"))
+        {
+            let tok = tok.to_string();
+            let mut callbacks = RemoteCallbacks::new();
+            callbacks.credentials(move |_url, _username_from_url, allowed| {
+                if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
+                    Cred::userpass_plaintext("x-access-token", &tok)
+                } else {
+                    Err(git2::Error::from_str("unsupported git credential type"))
+                }
+            });
+            let mut fetch_options = FetchOptions::new();
+            fetch_options.remote_callbacks(callbacks);
+            builder.fetch_options(fetch_options);
+        }
+        let repo = builder.clone(&clean_url, path)?;
         info!("clone completed");
-        Ok(Self {
+        let client = Self {
             repo,
             repo_path: path.to_path_buf(),
-        })
+            http_auth_token: RefCell::new(token.map(str::to_string)),
+        };
+        client.migrate_remote_url_clean("origin")?;
+        Ok(client)
+    }
+
+    fn migrate_remote_url_clean(&self, remote_name: &str) -> Result<(), GitError> {
+        let remote = self.repo.find_remote(remote_name)?;
+        let Some(url) = remote.url() else {
+            return Ok(());
+        };
+        if let Some(clean_url) = Self::strip_http_credentials(url) {
+            if url != clean_url {
+                info!("stripping embedded credentials from remote URL");
+                self.repo.remote_set_url(remote_name, &clean_url)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_http_token(&self, explicit: Option<&str>) -> Option<String> {
+        explicit
+            .map(str::to_string)
+            .or_else(|| self.http_auth_token.borrow().clone())
+    }
+
+    fn apply_cli_http_auth(&self, cmd: &mut std::process::Command, token: Option<&str>) {
+        super::subprocess_auth::apply_git_http_auth_optional(
+            cmd,
+            self.resolve_http_token(token).as_deref(),
+        );
     }
 
     /// Ensure the local HEAD points at `refs/heads/<branch>`. Useful after
@@ -126,6 +169,11 @@ impl GitClient {
 
     pub fn repo_path(&self) -> &Path {
         &self.repo_path
+    }
+
+    /// HTTP(S) token held for Git CLI subprocess auth (not embedded in remote URLs on clean paths).
+    pub fn stored_http_auth_token(&self) -> Option<String> {
+        self.http_auth_token.borrow().clone()
     }
 
     /// Get the current HEAD commit SHA.
@@ -171,20 +219,29 @@ impl GitClient {
         Some(format!("{scheme}{hostpath}"))
     }
 
-    /// Ensure the origin remote URL contains embedded credentials for HTTP(S) remotes.
+    /// Keep the remote URL clean and store HTTP(S) tokens for CLI/callback auth.
     ///
-    /// libgit2's credential callback doesn't work reliably with all Git servers
-    /// (e.g. Gitea). Embedding `x-access-token:<token>` in the URL is the most
-    /// portable approach and mirrors what CI/CD systems do.
+    /// Strips legacy credentialed URLs. Absence of `token` means "no new token",
+    /// not revoke — use [`Self::clear_remote_credentials`].
     pub fn ensure_remote_credentials(
         &self,
         remote_name: &str,
         token: Option<&str>,
     ) -> Result<(), GitError> {
+        self.migrate_remote_url_clean(remote_name)?;
+        if let Some(tok) = token {
+            *self.http_auth_token.borrow_mut() = Some(tok.to_string());
+        }
+        Ok(())
+    }
+
+    /// Embed HTTP(S) credentials in the remote URL (scheduler/sync reload path).
+    pub fn ensure_remote_credentials_embedded(
+        &self,
+        remote_name: &str,
+        token: Option<&str>,
+    ) -> Result<(), GitError> {
         let Some(tok) = token else {
-            // Absence means "no new token to embed", not "revoke". Callers that
-            // need to strip userinfo must use [`Self::clear_remote_credentials`]
-            // or [`apply_git_credential_chain_state`] after resolving chain state.
             return Ok(());
         };
         let remote = self.repo.find_remote(remote_name)?;
@@ -194,7 +251,6 @@ impl GitClient {
         let Some(clean_url) = Self::strip_http_credentials(url) else {
             return Ok(());
         };
-
         let new_url = if let Some(hostpath) = clean_url.strip_prefix("https://") {
             format!("https://x-access-token:{tok}@{hostpath}")
         } else if let Some(hostpath) = clean_url.strip_prefix("http://") {
@@ -202,47 +258,35 @@ impl GitClient {
         } else {
             return Ok(());
         };
-
         if url != new_url {
             info!("updating remote URL to embed fresh credentials");
             self.repo.remote_set_url(remote_name, &new_url)?;
         }
+        *self.http_auth_token.borrow_mut() = Some(tok.to_string());
         Ok(())
     }
 
     /// Remove embedded HTTP(S) credentials from a remote URL.
     pub fn clear_remote_credentials(&self, remote_name: &str) -> Result<(), GitError> {
-        let remote = self.repo.find_remote(remote_name)?;
-        let Some(url) = remote.url() else {
-            return Ok(());
-        };
-        let Some(clean_url) = Self::strip_http_credentials(url) else {
-            return Ok(());
-        };
-        if url != clean_url {
-            info!("clearing embedded remote credentials");
-            self.repo.remote_set_url(remote_name, &clean_url)?;
-        }
+        self.migrate_remote_url_clean(remote_name)?;
+        self.http_auth_token.borrow_mut().take();
         Ok(())
     }
 
     /// Fetch from a named remote with a 5-minute timeout.
     #[instrument(skip(self, token))]
     pub fn fetch(&self, remote_name: &str, token: Option<&str>) -> Result<(), GitError> {
-        let _ = token; // credentials embedded in remote URL by ensure_remote_credentials
         info!(remote = remote_name, "fetching via git CLI");
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
 
         // Use git CLI for fetch — libgit2's HTTP client fails with 403 on
         // GitHub Enterprise in some configurations, and doesn't support LFS
-        // filter smudge on fetched refs. The CLI uses the credentials
-        // embedded in the remote URL (set via ensure_remote_credentials).
-        let output = std::process::Command::new("git")
-            .args(["fetch", remote_name, "--prune", "--quiet"])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::IoError)?;
+        // filter smudge on fetched refs. HTTP(S) auth uses GIT_CONFIG env only.
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["fetch", remote_name, "--prune", "--quiet"])
+            .current_dir(repo_path);
+        self.apply_cli_http_auth(&mut cmd, token);
+        let output = cmd.output().map_err(GitError::IoError)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -459,9 +503,8 @@ impl GitClient {
 
     /// Push a local branch to a remote.
     ///
-    /// Authentication is always driven by the credentials embedded in the
-    /// remote URL via [`Self::ensure_remote_credentials`]. Callers must
-    /// ensure the remote URL has fresh credentials before invoking push.
+    /// HTTP(S) authentication uses the token stored by
+    /// [`Self::ensure_remote_credentials`] (never URL userinfo).
     #[instrument(skip(self))]
     pub fn push(&self, remote_name: &str, branch: &str) -> Result<(), GitError> {
         self.push_impl(remote_name, branch, false)
@@ -505,15 +548,13 @@ impl GitClient {
         args.push(remote_name);
         args.push(branch);
 
-        let output = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(|e| {
-                error!(error = %e, "failed to spawn git push process");
-                GitError::IoError(e)
-            })?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(&args).current_dir(repo_path);
+        self.apply_cli_http_auth(&mut cmd, None);
+        let output = cmd.output().map_err(|e| {
+            error!(error = %e, "failed to spawn git push process");
+            GitError::IoError(e)
+        })?;
 
         let elapsed = start.elapsed();
 
@@ -563,12 +604,11 @@ impl GitClient {
     pub fn ls_remote_ref(&self, remote: &str, branch: &str) -> Result<Option<String>, GitError> {
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
         let ref_name = format!("refs/heads/{branch}");
-        let output = std::process::Command::new("git")
-            .args(["ls-remote", "--exit-code", remote, &ref_name])
-            .current_dir(repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .map_err(GitError::IoError)?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["ls-remote", "--exit-code", remote, &ref_name])
+            .current_dir(repo_path);
+        self.apply_cli_http_auth(&mut cmd, None);
+        let output = cmd.output().map_err(GitError::IoError)?;
         if output.status.code() == Some(2) {
             return Ok(None);
         }

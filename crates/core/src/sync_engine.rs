@@ -179,6 +179,8 @@ pub struct SyncEngine {
     started_at: chrono::DateTime<Utc>,
     /// Optional repo ID for per-repo credential and watermark keys.
     repo_id: Option<String>,
+    /// When true, git credential reload keeps a clean remote URL (late-pair replay).
+    git_credential_apply_clean: AtomicBool,
     /// LFS threshold in bytes. Files larger than this are tracked via Git LFS.
     /// 0 means LFS is disabled.
     lfs_threshold_bytes: u64,
@@ -229,16 +231,18 @@ fn sync_git_command_output(
     repo_path: &Path,
     args: &[&str],
     timeout: Duration,
+    http_auth_token: Option<String>,
 ) -> Option<std::process::Output> {
     let repo_path = repo_path.to_path_buf();
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let output = Command::new("git")
-            .args(&args)
-            .current_dir(&repo_path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = crate::git::subprocess_auth::git_cli_output(
+            &repo_path,
+            &arg_refs,
+            http_auth_token.as_deref(),
+        );
         let _ = tx.send(output);
     });
     match rx.recv_timeout(timeout) {
@@ -252,6 +256,7 @@ fn advertised_remote_tip_is_sha(
     branch: &str,
     sha: &str,
     timeout: Duration,
+    http_auth_token: Option<&str>,
 ) -> bool {
     let remote_branch = format!("refs/heads/{}", branch);
     let output = match sync_git_command_output(
@@ -264,6 +269,7 @@ fn advertised_remote_tip_is_sha(
             &remote_branch,
         ],
         timeout,
+        http_auth_token.map(str::to_string),
     ) {
         Some(output) => output,
         None => return false,
@@ -303,6 +309,7 @@ impl SyncEngine {
             running: Arc::new(AtomicBool::new(false)),
             started_at: Utc::now(),
             repo_id: None,
+            git_credential_apply_clean: AtomicBool::new(false),
             lfs_threshold_bytes: 0,
             allowed_paths: Vec::new(),
             blocked_patterns: Vec::new(),
@@ -429,6 +436,13 @@ impl SyncEngine {
     /// Set the repository ID for per-repo credential and watermark keys.
     pub fn set_repo_id(&mut self, id: String) {
         self.repo_id = Some(id);
+    }
+
+    /// Late-pair publish replay: reload git tokens without embedding them in
+    /// `remote.origin.url` (scheduler sync continues to use URL embed).
+    pub fn set_git_credential_apply_clean(&self, clean: bool) {
+        self.git_credential_apply_clean
+            .store(clean, Ordering::Release);
     }
 
     /// Set the LFS threshold in bytes. Files larger than this will be
@@ -746,15 +760,21 @@ impl SyncEngine {
         }
         let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
         let repo_path = git.repo_path();
+        let http_token = git.stored_http_auth_token();
         let timeout = Duration::from_secs(45);
         let spec = format!("{}^{{commit}}", sha);
-        if sync_git_command_output(repo_path, &["cat-file", "-e", &spec], timeout)
-            .is_some_and(|output| output.status.success())
+        if sync_git_command_output(
+            repo_path,
+            &["cat-file", "-e", &spec],
+            timeout,
+            http_token.clone(),
+        )
+        .is_some_and(|output| output.status.success())
         {
             return Ok(false);
         }
         let branch = &self.config.github.default_branch;
-        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout) {
+        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout, http_token.as_deref()) {
             return Ok(false);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
@@ -768,13 +788,24 @@ impl SyncEngine {
                 &format!("{}:{}", sha, probe_ref),
             ],
             timeout,
+            http_token.clone(),
         )
         .is_some_and(|output| output.status.success());
         let present = fetched
-            && sync_git_command_output(repo_path, &["cat-file", "-e", &spec], timeout)
-                .is_some_and(|output| output.status.success());
+            && sync_git_command_output(
+                repo_path,
+                &["cat-file", "-e", &spec],
+                timeout,
+                http_token.clone(),
+            )
+            .is_some_and(|output| output.status.success());
         if present {
-            let _ = sync_git_command_output(repo_path, &["update-ref", "-d", &probe_ref], timeout);
+            let _ = sync_git_command_output(
+                repo_path,
+                &["update-ref", "-d", &probe_ref],
+                timeout,
+                http_token,
+            );
             return Ok(false);
         }
         Ok(true)
@@ -1627,10 +1658,12 @@ impl SyncEngine {
             .git_client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let http_token = git.stored_http_auth_token();
         match inspect_fetched_history(
             git.repo_path(),
             &self.config.github.default_branch,
             p.clone(),
+            http_token.as_deref(),
         ) {
             Ok(admission) => Ok(TeamHistoryAdmission {
                 checkpoint: admission.checkpoint,
@@ -4484,7 +4517,12 @@ impl SyncEngine {
         };
         {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-            match crate::git::apply_git_credential_chain_state(&git, "origin", &git_state) {
+            let apply = if self.git_credential_apply_clean.load(Ordering::Acquire) {
+                crate::git::apply_git_credential_chain_state(&git, "origin", &git_state)
+            } else {
+                crate::git::apply_git_credential_chain_state_for_sync(&git, "origin", &git_state)
+            };
+            match apply {
                 Ok(()) if git_state.value.is_some() => {
                     debug!("reloaded Git token from database");
                 }
