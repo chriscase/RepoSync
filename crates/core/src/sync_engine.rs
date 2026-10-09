@@ -754,12 +754,8 @@ impl SyncEngine {
             return Ok(true);
         }
         if Some(sha)
-            == Self::local_remote_branch_tip_sha(
-                &repo_path,
-                &self.config.github.default_branch,
-                http_token.as_deref(),
-            )
-            .as_deref()
+            == Self::local_remote_branch_tip_sha(&repo_path, &self.config.github.default_branch)
+                .as_deref()
         {
             return Ok(false);
         }
@@ -811,11 +807,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    fn local_remote_branch_tip_sha(
-        repo_path: &Path,
-        branch: &str,
-        http_auth_token: Option<&str>,
-    ) -> Option<String> {
+    fn refresh_origin_branch_tip(repo_path: &Path, branch: &str, http_auth_token: Option<&str>) {
         let timeout = Duration::from_secs(5);
         let _ = sync_git_command_output(
             repo_path,
@@ -823,6 +815,10 @@ impl SyncEngine {
             timeout,
             http_auth_token.map(str::to_string),
         );
+    }
+
+    fn local_remote_branch_tip_sha(repo_path: &Path, branch: &str) -> Option<String> {
+        let timeout = Duration::from_secs(5);
         for refname in [
             format!("refs/remotes/origin/{}", branch),
             format!("origin/{}", branch),
@@ -867,11 +863,7 @@ impl SyncEngine {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 (git.repo_path().to_path_buf(), git.stored_http_auth_token())
             };
-            let remote_tip = Self::local_remote_branch_tip_sha(
-                &bridge_repo_path,
-                &self.config.github.default_branch,
-                http_token.as_deref(),
-            );
+            let branch = self.config.github.default_branch.clone();
             let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
             if crate::echo_receipt_scope::inbound_git_checkpoint_mirror_conflict(&self.db, rid)
@@ -899,16 +891,23 @@ impl SyncEngine {
                 if kv.as_deref() == Some(sha.as_str())
                     && self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)?
                     && !self.proved_svn_emitted_column_git_sha(rid, sha)?
-                    && remote_tip.as_deref() == Some(sha.as_str())
                 {
-                    return Err(self.record_history_block(
-                        "ambiguous_checkpoint",
-                        "stale no-target receipt conflicts with repository Git checkpoint",
-                        Some(sha),
-                        None,
-                        None,
-                        kv.as_deref(),
-                    ));
+                    Self::refresh_origin_branch_tip(
+                        &bridge_repo_path,
+                        &branch,
+                        http_token.as_deref(),
+                    );
+                    let remote_tip = Self::local_remote_branch_tip_sha(&bridge_repo_path, &branch);
+                    if remote_tip.as_deref() == Some(sha.as_str()) {
+                        return Err(self.record_history_block(
+                            "ambiguous_checkpoint",
+                            "stale no-target receipt conflicts with repository Git checkpoint",
+                            Some(sha),
+                            None,
+                            None,
+                            kv.as_deref(),
+                        ));
+                    }
                 }
                 self.checked_no_target_receipt(rid, sha)?;
             }
@@ -993,16 +992,24 @@ impl SyncEngine {
                             };
                             if legacy_mirror.as_deref() == Some(column_sha)
                                 && column_stale_receipt_only
-                                && remote_tip.as_deref() == Some(column_sha)
                             {
-                                return Err(self.record_history_block(
-                                    "ambiguous_checkpoint",
-                                    "stale no-target receipt conflicts with repository Git checkpoint",
-                                    Some(column_sha),
-                                    None,
-                                    None,
-                                    kv.as_deref(),
-                                ));
+                                Self::refresh_origin_branch_tip(
+                                    &bridge_repo_path,
+                                    &branch,
+                                    http_token.as_deref(),
+                                );
+                                let remote_tip =
+                                    Self::local_remote_branch_tip_sha(&bridge_repo_path, &branch);
+                                if remote_tip.as_deref() == Some(column_sha) {
+                                    return Err(self.record_history_block(
+                                        "ambiguous_checkpoint",
+                                        "stale no-target receipt conflicts with repository Git checkpoint",
+                                        Some(column_sha),
+                                        None,
+                                        None,
+                                        kv.as_deref(),
+                                    ));
+                                }
                             }
                             return Ok(kv);
                         }
