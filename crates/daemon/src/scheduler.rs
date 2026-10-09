@@ -770,7 +770,7 @@ impl Scheduler {
             };
 
             // Ensure remote has credentials embedded (or cleared on revocation).
-            reposync_core::git::apply_git_credential_chain_state(
+            reposync_core::git::apply_git_credential_chain_state_for_sync(
                 &git_client,
                 "origin",
                 &git_token_state,

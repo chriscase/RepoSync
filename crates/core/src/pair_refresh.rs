@@ -5,7 +5,7 @@
 //! refused. Published Git commits and SVN revisions are not rewritten.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -358,12 +358,28 @@ pub struct GitLayout<'a> {
     pub same_remote: bool,
 }
 
+/// Optional HTTP(S) tokens for Git CLI preview fetches (never embedded in argv).
+pub struct GitPreviewAuth<'a> {
+    pub parent_token: Option<&'a str>,
+    pub pair_token: Option<&'a str>,
+}
+
+impl<'a> GitPreviewAuth<'a> {
+    pub fn none() -> Self {
+        Self {
+            parent_token: None,
+            pair_token: None,
+        }
+    }
+}
+
 pub fn analyze_git_preview(
     layout: GitLayout<'_>,
     pair_mappings: &[VerifiedMapping],
     parent_mappings: &[VerifiedMapping],
     pair_branch: &str,
     parent_branch: &str,
+    auth: GitPreviewAuth<'_>,
 ) -> GitPreviewFacts {
     let mut notes = Vec::new();
     let (parent_dir, pair_dir) = if layout.same_remote {
@@ -376,8 +392,13 @@ pub fn analyze_git_preview(
         );
         (layout.parent_dir, layout.pair_dir)
     };
-    let parent = observe_dir(parent_dir, parent_branch, PARENT_INSPECT_REF);
-    let pair = observe_dir(pair_dir, pair_branch, PAIR_INSPECT_REF);
+    let parent = observe_dir(
+        parent_dir,
+        parent_branch,
+        PARENT_INSPECT_REF,
+        auth.parent_token,
+    );
+    let pair = observe_dir(pair_dir, pair_branch, PAIR_INSPECT_REF, auth.pair_token);
     if !parent.note.is_empty() {
         notes.push(parent.note.clone());
     }
@@ -414,9 +435,16 @@ pub fn analyze_git_preview(
     }
 }
 
-fn observe_dir(dir: Option<&Path>, branch: &str, inspect_ref: &str) -> GitObservation {
+fn observe_dir(
+    dir: Option<&Path>,
+    branch: &str,
+    inspect_ref: &str,
+    http_auth_token: Option<&str>,
+) -> GitObservation {
     match dir {
-        Some(dir) if git_dir_exists(dir) => observe_branch(dir, branch, inspect_ref),
+        Some(dir) if git_dir_exists(dir) => {
+            observe_branch(dir, branch, inspect_ref, http_auth_token)
+        }
         _ => GitObservation::missing(format!("no Git clone to inspect '{branch}'")),
     }
 }
@@ -866,12 +894,8 @@ fn git_dir_exists(path: &Path) -> bool {
     path.join(".git").exists() || path.join("HEAD").exists()
 }
 
-fn git(workdir: &Path, args: &[&str]) -> std::io::Result<Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
+fn git(workdir: &Path, args: &[&str], http_auth_token: Option<&str>) -> std::io::Result<Output> {
+    crate::git::subprocess_auth::git_cli_output(workdir, args, http_auth_token)
 }
 
 fn stdout_trim(output: &Output) -> String {
@@ -886,6 +910,7 @@ pub fn is_ancestor(workdir: &Path, ancestor: &str, descendant: &str) -> Option<b
     let output = git(
         workdir,
         &["merge-base", "--is-ancestor", ancestor, descendant],
+        None,
     )
     .ok()?;
     match output.status.code() {
@@ -908,6 +933,7 @@ fn commits_ahead(workdir: &Path, ancestor: &str, descendant: &str) -> Option<Com
             "--reverse",
             &format!("{ancestor}..{descendant}"),
         ],
+        None,
     )
     .ok()?;
     if !output.status.success() {
@@ -944,7 +970,7 @@ fn exclude_inherited(workdir: &Path, shas: &[String], other_tip: &str) -> Option
 }
 
 fn rev_parse(workdir: &Path, rev: &str) -> Option<String> {
-    let output = git(workdir, &["rev-parse", "--verify", rev]).ok()?;
+    let output = git(workdir, &["rev-parse", "--verify", rev], None).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -952,9 +978,14 @@ fn rev_parse(workdir: &Path, rev: &str) -> Option<String> {
     is_full_git_oid(&text).then_some(text)
 }
 
-pub fn observe_branch(workdir: &Path, branch: &str, inspect_ref: &str) -> GitObservation {
+pub fn observe_branch(
+    workdir: &Path,
+    branch: &str,
+    inspect_ref: &str,
+    http_auth_token: Option<&str>,
+) -> GitObservation {
     let mut obs = GitObservation::missing(String::new());
-    let valid = git(workdir, &["check-ref-format", "--branch", branch])
+    let valid = git(workdir, &["check-ref-format", "--branch", branch], None)
         .ok()
         .is_some_and(|output| output.status.success());
     if !valid {
@@ -972,6 +1003,7 @@ pub fn observe_branch(workdir: &Path, branch: &str, inspect_ref: &str) -> GitObs
             "origin",
             &spec,
         ],
+        http_auth_token,
     ) {
         Ok(output) if output.status.success() => {
             obs.remote_tip = rev_parse(workdir, &format!("{inspect_ref}^{{commit}}"));
@@ -1287,11 +1319,11 @@ mod tests {
         git_ok(&work, &["checkout", "main"]);
         git_ok(&work, &["branch", "-D", "feature"]);
         let head = rev_parse(&work, "HEAD").unwrap();
-        let obs = observe_branch(&work, "feature", PAIR_INSPECT_REF);
+        let obs = observe_branch(&work, "feature", PAIR_INSPECT_REF, None);
         assert_eq!(obs.remote_tip.as_deref().map(is_full_git_oid), Some(true));
         assert!(obs.local_tip.is_none());
         assert_eq!(rev_parse(&work, "HEAD").unwrap(), head);
-        let status = git(&work, &["status", "--porcelain"]).unwrap();
+        let status = git(&work, &["status", "--porcelain"], None).unwrap();
         assert!(stdout_trim(&status).is_empty());
         assert!(rev_parse(&work, "refs/heads/feature").is_none());
     }

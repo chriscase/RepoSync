@@ -5,7 +5,6 @@
 //! watermarks at the Git tip.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
@@ -419,14 +418,6 @@ async fn verify_existing_svn_target_matches_copy_intent(
     })
 }
 
-fn git_env(workdir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-}
-
 fn ensure_child_git_workdir(
     data_dir: &Path,
     child_id: &str,
@@ -460,7 +451,7 @@ fn ensure_child_git_workdir(
             plan: None,
         }
     })?;
-    let fetch = git_env(
+    let fetch = crate::git::subprocess_auth::git_cli_output(
         &git_repo_path,
         &[
             "fetch",
@@ -468,6 +459,7 @@ fn ensure_child_git_workdir(
             "origin",
             &format!("refs/heads/{git_branch}:refs/heads/{git_branch}"),
         ],
+        token,
     )
     .map_err(|e| LatePairPublishRefusal {
         reason: "git_workdir_failed".into(),
@@ -481,14 +473,16 @@ fn ensure_child_git_workdir(
             plan: None,
         });
     }
-    let checkout =
-        git_env(&git_repo_path, &["checkout", "-B", git_branch, git_branch]).map_err(|e| {
-            LatePairPublishRefusal {
-                reason: "git_workdir_failed".into(),
-                detail: format!("git checkout failed: {e}"),
-                plan: None,
-            }
-        })?;
+    let checkout = crate::git::subprocess_auth::git_cli_output(
+        &git_repo_path,
+        &["checkout", "-B", git_branch, git_branch],
+        None,
+    )
+    .map_err(|e| LatePairPublishRefusal {
+        reason: "git_workdir_failed".into(),
+        detail: format!("git checkout failed: {e}"),
+        plan: None,
+    })?;
     if !checkout.status.success() {
         return Err(LatePairPublishRefusal {
             reason: "git_workdir_failed".into(),
@@ -672,6 +666,7 @@ async fn replay_pending_git(
         identity.clone(),
     );
     engine.set_repo_id(child.id.clone());
+    engine.set_git_credential_apply_clean(true);
 
     let mut replayed = Vec::new();
     let fail_after = child
@@ -1103,12 +1098,28 @@ pub async fn publish_admitted_late_pair(
         op = db.update_late_pair_publish_operation(op).map_err(db_err)?;
     }
 
-    db.finalize_late_pair_publish_enabling_child(&parent.id, &op.id, &effective_child_id, &git_tip)
+    let finalized = db
+        .finalize_late_pair_publish_enabling_child(
+            &parent.id,
+            &op.id,
+            &effective_child_id,
+            &git_tip,
+        )
         .map_err(|e| LatePairPublishRefusal {
             reason: "finalize_failed".into(),
             detail: redact_vcs_error_detail(&e.to_string()),
             plan: Some(Box::new(plan.clone())),
         })?;
+    if finalized.state != LatePairPublishState::Completed {
+        return Err(LatePairPublishRefusal {
+            reason: "finalize_refused".into(),
+            detail: finalized
+                .outcome_detail
+                .clone()
+                .unwrap_or_else(|| "late-pair publish finalize refused".into()),
+            plan: Some(Box::new(plan.clone())),
+        });
+    }
 
     Ok(LatePairPlan {
         mode: "published".into(),

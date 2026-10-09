@@ -294,10 +294,36 @@ fn finalize_late_pair_publish_op_in_tx(
         ));
     }
     if let Some((child_id, git_tip)) = enable_child {
-        tx.execute(
+        if super::managed_remove::new_work_blocked(tx, child_id)? {
+            op.state = LatePairPublishState::ReconciliationRequired;
+            op.outcome_detail =
+                Some("child repository removal blocks late-pair publish finalize".into());
+            op.updated_at = Utc::now().to_rfc3339();
+            write_op(tx, &op)?;
+            tx.execute(
+                "DELETE FROM kv_state WHERE key=?1 AND value=?2",
+                params![key("active", parent_repo_id), op_id],
+            )?;
+            return Ok(op);
+        }
+        let changed = tx.execute(
             "UPDATE repositories SET enabled = 1, sync_status = 'idle', last_git_sha = ?1, updated_at = ?2 WHERE id = ?3",
             params![git_tip, Utc::now().to_rfc3339(), child_id],
         )?;
+        if changed != 1 {
+            op.state = LatePairPublishState::ReconciliationRequired;
+            op.outcome_detail = Some(
+                "child repository row missing or unchanged during late-pair publish finalize"
+                    .into(),
+            );
+            op.updated_at = Utc::now().to_rfc3339();
+            write_op(tx, &op)?;
+            tx.execute(
+                "DELETE FROM kv_state WHERE key=?1 AND value=?2",
+                params![key("active", parent_repo_id), op_id],
+            )?;
+            return Ok(op);
+        }
     }
     op.state = LatePairPublishState::Completed;
     op.updated_at = Utc::now().to_rfc3339();
@@ -307,4 +333,144 @@ fn finalize_late_pair_publish_op_in_tx(
         params![key("active", parent_repo_id), op_id],
     )?;
     Ok(op)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn insert_parent_child(db: &Database, child_id: &str, enabled: bool) {
+        let now = Utc::now().to_rfc3339();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors,parent_id)
+                 VALUES ('parent','p','file:///svn','trunk','','local','','r','main','team',5,0,0,1,?1,?1,2,'base','idle',0,0,NULL),
+                        (?2,'c','file:///svn','branches/f','','local','','r','feature','team',5,0,0,?3,?1,?1,2,'base','idle',0,0,'parent')",
+                params![now, child_id, enabled as i32],
+            )
+            .unwrap();
+    }
+
+    fn replay_in_progress_op(child_id: &str) -> LatePairPublishOperation {
+        let now = Utc::now().to_rfc3339();
+        LatePairPublishOperation {
+            version: 1,
+            id: "op-finalize".into(),
+            parent_repo_id: "parent".into(),
+            child_repo_id: Some(child_id.into()),
+            operation_type: "late_pair_publish".into(),
+            initiator_id: "i".into(),
+            request_id: "r".into(),
+            target_fingerprint: "fp".into(),
+            created_at: now.clone(),
+            updated_at: now,
+            state: LatePairPublishState::ReplayInProgress,
+            policy_version: "late_pair_publish_v1".into(),
+            git_branch: "feature".into(),
+            svn_branch: "branches/f".into(),
+            pinned_git_tip: "tipsha".into(),
+            baseline_git_sha: "base".into(),
+            baseline_svn_rev: 2,
+            svn_copy_source_rev: 2,
+            svn_copy_source_path: Some("trunk".into()),
+            svn_branch_head_rev: Some(3),
+            replayed_git_shas: vec!["sha1".into()],
+            outcome_detail: None,
+        }
+    }
+
+    fn seed_active_op(db: &Database, op: &LatePairPublishOperation) {
+        let conn = db.conn();
+        write_op(&conn, op).unwrap();
+        write_value(&conn, &key("active", "parent"), &op.id).unwrap();
+        write_value(&conn, &key("latest", "parent"), &op.id).unwrap();
+    }
+
+    fn child_enabled(db: &Database, child_id: &str) -> bool {
+        db.conn()
+            .query_row(
+                "SELECT enabled FROM repositories WHERE id=?1",
+                [child_id],
+                |r| r.get::<_, i32>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    fn tombstone_child(db: &Database, child_id: &str) {
+        let conn = db.conn();
+        write_value(
+            &conn,
+            &format!("managed_remove_v1:tombstone:{child_id}"),
+            "{}",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn finalize_enables_child_and_completes_journal() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let child_id = "child-ok";
+        insert_parent_child(&db, child_id, false);
+        let op = replay_in_progress_op(child_id);
+        seed_active_op(&db, &op);
+
+        let done = db
+            .finalize_late_pair_publish_enabling_child("parent", &op.id, child_id, "tipsha")
+            .unwrap();
+        assert_eq!(done.state, LatePairPublishState::Completed);
+        assert!(child_enabled(&db, child_id));
+        assert!(db
+            .latest_late_pair_publish_operation("parent")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn finalize_refuses_tombstoned_child_without_enabling() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let child_id = "child-tomb";
+        insert_parent_child(&db, child_id, false);
+        tombstone_child(&db, child_id);
+        let op = replay_in_progress_op(child_id);
+        seed_active_op(&db, &op);
+
+        let held = db
+            .finalize_late_pair_publish_enabling_child("parent", &op.id, child_id, "tipsha")
+            .unwrap();
+        assert_eq!(held.state, LatePairPublishState::ReconciliationRequired);
+        assert!(!child_enabled(&db, child_id));
+        let loaded = db
+            .get_late_pair_publish_operation("parent", &op.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.state, LatePairPublishState::ReconciliationRequired);
+        assert_ne!(loaded.state, LatePairPublishState::Completed);
+    }
+
+    #[test]
+    fn finalize_refuses_when_child_row_deleted() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let child_id = "child-gone";
+        insert_parent_child(&db, child_id, false);
+        let op = replay_in_progress_op(child_id);
+        seed_active_op(&db, &op);
+        db.conn()
+            .execute("DELETE FROM repositories WHERE id=?1", [child_id])
+            .unwrap();
+
+        let held = db
+            .finalize_late_pair_publish_enabling_child("parent", &op.id, child_id, "tipsha")
+            .unwrap();
+        assert_eq!(held.state, LatePairPublishState::ReconciliationRequired);
+        let loaded = db
+            .get_late_pair_publish_operation("parent", &op.id)
+            .unwrap()
+            .unwrap();
+        assert_ne!(loaded.state, LatePairPublishState::Completed);
+    }
 }

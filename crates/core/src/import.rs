@@ -2082,6 +2082,7 @@ struct PublicationTarget<'a> {
     branch: &'a str,
     sha: &'a str,
     force: bool,
+    push_token: Option<&'a str>,
 }
 
 fn without_http_credentials(url: &str) -> String {
@@ -2172,13 +2173,14 @@ pub struct ImportReconcileResult {
 pub async fn fresh_import_remote_ref(
     workdir: &Path,
     reference: &str,
+    push_token: Option<&str>,
 ) -> Result<Option<String>, &'static str> {
     let mut inspect = crate::process::import_git_command()
         .map_err(|_| "remote inspection command unavailable")?;
     inspect
         .args(["ls-remote", "--exit-code", "origin", reference])
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .current_dir(workdir);
+    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(&mut inspect, push_token);
     let output = crate::process::run(inspect, Duration::from_secs(60), None)
         .await
         .map_err(|_| "remote inspection failed or timed out")?;
@@ -2342,7 +2344,9 @@ pub async fn apply_import_reconciliation(
             });
         }
     };
-    let observed = match fresh_import_remote_ref(git_workdir, &reference).await {
+    let git_token_state = db.resolve_credential_chain_state(&repo.id, "secret_git_token");
+    let push_token = git_token_state.value.as_deref().filter(|t| !t.is_empty());
+    let observed = match fresh_import_remote_ref(git_workdir, &reference, push_token).await {
         Ok(Some(sha)) => sha,
         Ok(None) => {
             let operation = db.note_import_reconciliation_reason(
@@ -2459,6 +2463,7 @@ async fn publish_checked(
         branch,
         sha,
         force,
+        push_token,
     } = target;
     if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
         return Err("cancelled before publication".into());
@@ -2470,10 +2475,8 @@ async fn publish_checked(
     if force {
         push.arg(format!("--force-with-lease=refs/heads/{branch}:"));
     }
-    push.arg(remote)
-        .arg(branch)
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0");
+    push.arg(remote).arg(branch).current_dir(workdir);
+    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(&mut push, push_token);
     let output = crate::process::run(push, Duration::from_secs(300), cancel)
         .await
         .map_err(|e| format!("Git push outcome uncertain: {e}"))?;
@@ -2508,8 +2511,8 @@ async fn publish_checked(
             remote,
             &format!("refs/heads/{branch}"),
         ])
-        .current_dir(workdir)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .current_dir(workdir);
+    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(&mut inspect, push_token);
     let observed = crate::process::run(inspect, Duration::from_secs(60), None)
         .await
         .map_err(|e| format!("published ref could not be verified: {e}"))?;
@@ -2854,6 +2857,7 @@ pub async fn run_snapshot_import(
                 // remote ref is absent. The empty-target gate already
                 // refused an existing branch before the worker started.
                 force: true,
+                push_token: import_config.push_token.as_deref(),
             },
             cancel_signal.as_ref(),
         )
@@ -3527,6 +3531,7 @@ pub async fn run_full_import(
                                 branch: &import_config.branch,
                                 sha: &sha,
                                 force,
+                                push_token: import_config.push_token.as_deref(),
                             },
                             cancel_signal.as_ref(),
                         )
@@ -3559,6 +3564,7 @@ pub async fn run_full_import(
                         let branch = import_config.branch.clone();
                         let force = is_first_push;
                         let rp = repo_path.clone();
+                        let push_token = import_config.push_token.clone();
 
                         // Heartbeat task: log "still pushing..." every 30s
                         let hb_progress = progress.clone();
@@ -3597,11 +3603,13 @@ pub async fn run_full_import(
                         args.push(remote.clone());
                         args.push(branch.clone());
 
-                        let output = std::process::Command::new("git")
-                            .args(&args)
-                            .current_dir(&rp)
-                            .env("GIT_TERMINAL_PROMPT", "0")
-                            .output();
+                        let mut cmd = std::process::Command::new("git");
+                        cmd.args(&args).current_dir(&rp);
+                        crate::git::subprocess_auth::apply_git_http_auth_optional(
+                            &mut cmd,
+                            push_token.as_deref(),
+                        );
+                        let output = cmd.output();
 
                         let elapsed = start.elapsed();
 
@@ -3762,6 +3770,7 @@ pub async fn run_full_import(
                     branch: &import_config.branch,
                     sha: &sha,
                     force,
+                    push_token: import_config.push_token.as_deref(),
                 },
                 cancel_signal.as_ref(),
             )
@@ -3802,6 +3811,7 @@ pub async fn run_full_import(
                 let branch = import_config.branch.clone();
                 let force = is_first_push;
                 let rp = repo_path.clone();
+                let push_token = import_config.push_token.clone();
 
                 let push_result = tokio::task::spawn_blocking(move || {
                     let mut args = vec!["push".to_string(), "--progress".to_string()];
@@ -3810,11 +3820,13 @@ pub async fn run_full_import(
                     }
                     args.push(remote);
                     args.push(branch);
-                    let output = std::process::Command::new("git")
-                        .args(&args)
-                        .current_dir(&rp)
-                        .env("GIT_TERMINAL_PROMPT", "0")
-                        .output();
+                    let mut cmd = std::process::Command::new("git");
+                    cmd.args(&args).current_dir(&rp);
+                    crate::git::subprocess_auth::apply_git_http_auth_optional(
+                        &mut cmd,
+                        push_token.as_deref(),
+                    );
+                    let output = cmd.output();
                     match output {
                         Ok(out) if out.status.success() => {
                             Ok(String::from_utf8_lossy(&out.stderr).to_string())
@@ -3977,6 +3989,7 @@ async fn async_git_push(
     remote: &str,
     branch: &str,
     force: bool,
+    push_token: Option<&str>,
     progress: &Arc<RwLock<ImportProgress>>,
     ws_broadcast: &Option<tokio::sync::broadcast::Sender<String>>,
 ) -> Result<()> {
@@ -4000,14 +4013,14 @@ async fn async_git_push(
         "async git push starting"
     );
 
-    let mut child = Command::new("git")
+    let mut child = Command::new("git");
+    child
         .args(&args)
         .current_dir(repo_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn git push")?;
+        .stderr(std::process::Stdio::piped());
+    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(&mut child, push_token);
+    let mut child = child.spawn().context("failed to spawn git push")?;
 
     // Stream stderr (where git push progress goes) into the import log
     let stderr = child.stderr.take();

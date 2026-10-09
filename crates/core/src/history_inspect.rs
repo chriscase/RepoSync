@@ -186,6 +186,7 @@ pub fn inspect_fetched_history(
     path: &Path,
     branch: &str,
     p: Option<String>,
+    http_auth_token: Option<&str>,
 ) -> Result<HistoryInspectAdmission, HistoryInspectReject> {
     let run = |args: &[&str]| -> std::io::Result<Output> {
         #[cfg(debug_assertions)]
@@ -209,11 +210,7 @@ pub fn inspect_fetched_history(
             }
             _ => (),
         }
-        Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
+        crate::git::subprocess_auth::git_cli_output(path, args, http_auth_token)
     };
     let mut o: Option<String> = None;
     let mut r: Option<String> = None;
@@ -678,7 +675,7 @@ pub fn inspect_personal_history(
             Some(&checkpoint),
         );
     }
-    match inspect_fetched_history(git_path, branch, Some(checkpoint.clone())) {
+    match inspect_fetched_history(git_path, branch, Some(checkpoint.clone()), None) {
         Ok(admission) => Ok(Some(admission)),
         Err(reject) => block_personal_history(db, &key, scope_id, reject, Some(&checkpoint)),
     }
