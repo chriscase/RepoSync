@@ -1448,6 +1448,13 @@ impl Database {
         // Delete the repository row itself
         conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
 
+        let repo_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count == 0 {
+            crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(&conn)?;
+        }
+        crate::db::repo_scope_identity::sweep_unowned_legacy_no_target_receipts(&conn)?;
+
         conn.execute_batch("COMMIT")?;
         info!(repo_id, "hard-deleted repository and all associated data");
         Ok(())
@@ -2509,13 +2516,6 @@ impl Database {
             conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
         if repo_count > 1 {
             crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(&conn)?;
-        } else if repo_count == 1 {
-            crate::db::repo_scope_identity::set_legacy_repo_id_kv_reads_enabled(&conn, true)?;
-            crate::db::repo_scope_identity::migrate_legacy_kv_for_repo(
-                &conn,
-                &repo.id,
-                &scope_uuid,
-            )?;
         }
         debug!(id = %repo.id, name = %repo.name, "inserted repository");
         Ok(())

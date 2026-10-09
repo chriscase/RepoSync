@@ -586,14 +586,12 @@ pub fn write_git_no_target_receipt_kv(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![scoped_key, receipt, updated_at],
     )?;
-    if legacy_repo_id_kv_authoritative(tx)? {
-        let legacy_key = handled_git_no_target_state_key(repo_id, generation, git_sha);
-        tx.execute(
-            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![legacy_key, receipt, updated_at],
-        )?;
-    }
+    let legacy_key = handled_git_no_target_state_key(repo_id, generation, git_sha);
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![legacy_key, receipt, updated_at],
+    )?;
     Ok(())
 }
 

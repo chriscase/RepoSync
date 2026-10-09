@@ -5063,6 +5063,7 @@ mod tests {
                 [repo_id],
             )
             .unwrap();
+        crate::db::repo_scope_identity::migrate_v13_scope_uuid(&db.conn()).unwrap();
         let config: AppConfig = toml::from_str(
             r#"
 [daemon]

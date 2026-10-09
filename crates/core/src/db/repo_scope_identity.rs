@@ -15,6 +15,9 @@ const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads"
 const HANDLED_GIT_NO_TARGET_PREFIX: &str = "handled_git_no_target_";
 const HANDLED_SVN_NO_TARGET_PREFIX: &str = "handled_svn_no_target_";
 
+/// Inert KV namespace for legacy receipt keys with no live adopter (never read or migrated).
+const QUARANTINED_KV_PREFIX: &str = "reposync_v13_quarantined:";
+
 fn is_full_git_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -340,9 +343,9 @@ pub fn legacy_team_history_block_kv_key(repo_id: &str) -> String {
     format!("team_history_block_{repo_id}")
 }
 
-/// Legacy repo-id KV may be read only when v13 migration bound it for a sole repository,
-/// or before any repository row exists (pre-registration callers). Live row count must
-/// never flip an explicit multi-repo revoke (`"0"`) back to authoritative.
+/// Legacy repo-id KV may be read only when v13 migration explicitly enabled it (`"1"`),
+/// or before any repository row exists (pre-registration). Once revoked (`"0"`), the latch
+/// never re-opens; later `insert_repository` must not migrate or re-enable legacy reads.
 pub fn legacy_repo_id_kv_authoritative(conn: &Connection) -> Result<bool, DatabaseError> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
     let flag: Option<String> = conn
@@ -364,37 +367,109 @@ pub fn legacy_repo_id_kv_authoritative(conn: &Connection) -> Result<bool, Databa
                 quarantine_unscoped_legacy_receipts(conn, repo_id)?;
             }
         }
+        sweep_unowned_legacy_no_target_receipts(conn)?;
         return Ok(false);
     }
     match flag.as_deref() {
         Some("1") => Ok(true),
         Some("0") => Ok(false),
         Some(_) => Ok(false),
-        None => match count {
-            0 => Ok(true),
-            1 => {
-                ensure_sole_repository_legacy_kv_bound(conn)?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        },
+        None => Ok(count == 0 || count == 1),
     }
 }
 
-/// Bind legacy repo-id KV to the sole repository's `scope_uuid` once (durable flag absent).
-fn ensure_sole_repository_legacy_kv_bound(conn: &Connection) -> Result<(), DatabaseError> {
-    let repo_id: String = conn.query_row(
-        "SELECT id FROM repositories ORDER BY id LIMIT 1",
-        [],
-        |row| row.get(0),
+fn legacy_receipt_has_live_adopter(
+    conn: &Connection,
+    key: &str,
+    git: bool,
+) -> Result<bool, DatabaseError> {
+    let Some(value) = kv_payload_for_key(conn, key)? else {
+        return Ok(false);
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, {SCOPE_UUID_COLUMN} FROM repositories ORDER BY id"
+    ))?;
+    let repos = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
+    for (repo_id, scope_uuid) in repos {
+        if let Some(scope) = scope_uuid.filter(|s| !s.is_empty()) {
+            if no_target_key_owned_by_scope_uuid(key, &scope, git) {
+                // Live scope token owns the key namespace; readers fail closed on corrupt payloads.
+                return Ok(true);
+            }
+        }
+        if legacy_no_target_key_unambiguous_for_human_id(conn, key, &repo_id, git)?
+            && receipt_payload_proves_human_repo(&value, &repo_id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn quarantine_kv_key(conn: &Connection, key: &str) -> Result<(), DatabaseError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT value, updated_at FROM kv_state WHERE key = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((value, updated_at)) = row else {
+        return Ok(());
+    };
+    let quarantined = format!("{QUARANTINED_KV_PREFIX}{key}");
+    conn.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![quarantined, value, updated_at],
     )?;
-    let scope_uuid = repository_scope_uuid(conn, &repo_id)?;
-    migrate_legacy_kv_for_repo(conn, &repo_id, &scope_uuid)?;
-    set_legacy_repo_id_kv_reads_enabled(conn, true)?;
+    conn.execute("DELETE FROM kv_state WHERE key = ?1", [key])?;
+    Ok(())
+}
+
+/// Move legacy no-target receipt keys with no live unambiguous adopter into inert storage.
+pub(crate) fn sweep_unowned_legacy_no_target_receipts(
+    conn: &Connection,
+) -> Result<(), DatabaseError> {
+    for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
+        if !legacy_receipt_has_live_adopter(conn, &key, true)? {
+            quarantine_kv_key(conn, &key)?;
+        }
+    }
+    for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
+        if !legacy_receipt_has_live_adopter(conn, &key, false)? {
+            quarantine_kv_key(conn, &key)?;
+        }
+    }
     Ok(())
 }
 
 pub fn set_legacy_repo_id_kv_reads_enabled(
+    conn: &Connection,
+    enabled: bool,
+) -> Result<(), DatabaseError> {
+    if enabled {
+        let latched_off: bool = conn
+            .query_row(
+                "SELECT value FROM kv_state WHERE key = ?1",
+                [LEGACY_REPO_ID_KV_READS_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|value| value == "0");
+        if latched_off {
+            return Ok(());
+        }
+    }
+    write_legacy_repo_id_kv_reads_flag(conn, enabled)
+}
+
+fn write_legacy_repo_id_kv_reads_flag(
     conn: &Connection,
     enabled: bool,
 ) -> Result<(), DatabaseError> {
@@ -679,13 +754,14 @@ pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
         migrate_legacy_kv_for_repo(conn, repo_id, &scope_uuid)?;
     }
     if repo_ids.len() == 1 {
-        set_legacy_repo_id_kv_reads_enabled(conn, true)?;
+        write_legacy_repo_id_kv_reads_flag(conn, true)?;
     } else if repo_ids.len() > 1 {
-        set_legacy_repo_id_kv_reads_enabled(conn, false)?;
+        write_legacy_repo_id_kv_reads_flag(conn, false)?;
         for repo_id in &repo_ids {
             quarantine_unscoped_legacy_receipts(conn, repo_id)?;
         }
     }
+    sweep_unowned_legacy_no_target_receipts(conn)?;
     Ok(())
 }
 
