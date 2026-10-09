@@ -1005,34 +1005,65 @@ impl SyncEngine {
                     if emitted > 0 {
                         // A retained first row is not a baseline: maintenance
                         // may already have deleted earlier applied rows.
-                        let baseline = self
+                        let mut baseline = self
                             .db
                             .get_state(&format!("handled_git_baseline_{}", rid))
                             .map_err(SyncError::DatabaseError)?
                             .and_then(|value| {
                                 serde_json::from_str::<serde_json::Value>(&value).ok()
                             });
-                        let baseline_sha = baseline
+                        let mut baseline_sha = baseline
                             .as_ref()
                             .and_then(|record| record["git_sha"].as_str());
-                        let baseline_revision = baseline
+                        let mut baseline_revision = baseline
                             .as_ref()
                             .and_then(|record| record["svn_rev"].as_i64());
-                        let baseline_valid = baseline.as_ref().is_some_and(|record| {
+                        let mut baseline_valid = baseline.as_ref().is_some_and(|record| {
                             record["version"] == 1
                                 && record["repo_id"] == rid
                                 && record["projection"] == self.no_target_projection()
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
-                            return Err(self.record_history_block(
-                                "ambiguous_checkpoint",
-                                "missing durable handled Git baseline for absent repository cursor",
-                                None,
-                                None,
-                                None,
-                                Some(emitted_tip),
-                            ));
+                            let column_svn_rev: i64 = {
+                                let conn = self.db.conn();
+                                conn.query_row(
+                                    "SELECT last_svn_rev FROM repositories WHERE id = ?1",
+                                    [rid],
+                                    |row| row.get(0),
+                                )
+                                .map_err(crate::errors::DatabaseError::from)?
+                            };
+                            let _ = self.materialize_git_baseline(emitted_tip, column_svn_rev);
+                            baseline = self
+                                .db
+                                .get_state(&format!("handled_git_baseline_{}", rid))
+                                .map_err(SyncError::DatabaseError)?
+                                .and_then(|value| {
+                                    serde_json::from_str::<serde_json::Value>(&value).ok()
+                                });
+                            baseline_sha = baseline
+                                .as_ref()
+                                .and_then(|record| record["git_sha"].as_str());
+                            baseline_revision = baseline
+                                .as_ref()
+                                .and_then(|record| record["svn_rev"].as_i64());
+                            baseline_valid = baseline.as_ref().is_some_and(|record| {
+                                record["version"] == 1
+                                    && record["repo_id"] == rid
+                                    && record["projection"] == self.no_target_projection()
+                            }) && baseline_sha.is_some_and(is_full_git_oid)
+                                && baseline_revision.is_some_and(|rev| rev > 0);
+                            if !baseline_valid {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "missing durable handled Git baseline for absent repository cursor",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ));
+                            }
                         }
                         let baseline_sha = baseline_sha.unwrap();
                         let baseline_revision = baseline_revision.unwrap();

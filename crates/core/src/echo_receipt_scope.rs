@@ -507,6 +507,11 @@ pub fn inbound_git_checkpoint_mirror_conflict(
     if !managed_repo_requires_scoped_receipts(&conn, repo_id)? {
         return Ok(false);
     }
+    if !legacy_repo_id_kv_authoritative(&conn)? {
+        // Explicit-only legacy reads: orphan human-id mirrors may disagree with the
+        // emitted column or scoped inbound cursor without blocking replay.
+        return Ok(false);
+    }
     let scope = scope_token_for_repo(&conn, repo_id)?;
     let scoped =
         kv_state_value(&conn, &last_git_sha_kv_key(&scope))?.filter(|value| !value.is_empty());
@@ -586,14 +591,14 @@ pub fn write_scoped_last_git_sha_kv(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![kv_key, git_sha, updated_at],
     )?;
-    if legacy_repo_id_kv_authoritative(tx)? {
-        let legacy_key = legacy_last_git_sha_kv_key(repo_id);
-        tx.execute(
-            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![legacy_key, git_sha, updated_at],
-        )?;
-    }
+    // Human-id mirror for diagnostics and split-cursor fixtures; authoritative reads
+    // remain gated by `legacy_repo_id_kv_authoritative` (#63 explicit-only).
+    let legacy_key = legacy_last_git_sha_kv_key(repo_id);
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![legacy_key, git_sha, updated_at],
+    )?;
     Ok(())
 }
 
