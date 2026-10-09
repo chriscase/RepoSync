@@ -43,8 +43,11 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     let git_repo_path = data_dir.join("git-repo");
     let git_client = if git_repo_path.exists() {
         let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
-        reposync_core::git::apply_config_remote_git_credentials(
+        reposync_core::git::sync_git_http_auth_from_resolution(
             &git_client,
+            &git_repo_path,
+            &db,
+            reposync_core::db::personal_scope::personal_scope_key(),
             config.github.token.as_deref(),
         )
         .context("failed to apply git credentials to existing repository")?;

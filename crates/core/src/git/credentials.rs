@@ -1,12 +1,78 @@
 //! Git remote credential application from managed credential-chain state.
 
+use std::path::Path;
+
 use tracing::{debug, warn};
 
 use crate::db::queries::CredentialChainState;
 use crate::db::Database;
 use crate::errors::GitError;
 
+use super::startup_handoff;
 use super::GitClient;
+
+/// Resolve HTTP(S) git token: scoped chain first, then optional config token.
+pub fn resolve_git_http_auth_token(
+    db: &Database,
+    scope_id: &str,
+    config_token: Option<&str>,
+) -> Option<String> {
+    let state = db.resolve_credential_chain_state(scope_id, "secret_git_token");
+    if state.explicitly_revoked {
+        return None;
+    }
+    if let Some(tok) = state.value.filter(|value| !value.is_empty()) {
+        return Some(tok);
+    }
+    config_token
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Like [`resolve_git_http_auth_token`] plus same-process startup `clone_repo` handoff.
+pub fn resolve_git_http_auth_token_for_workdir(
+    db: &Database,
+    scope_id: &str,
+    config_token: Option<&str>,
+    workdir: &Path,
+) -> Option<String> {
+    resolve_git_http_auth_token(db, scope_id, config_token)
+        .or_else(|| startup_handoff::peek_startup_http_auth(workdir))
+}
+
+/// Apply the current chain/config/handoff resolution to a clean-path [`GitClient`].
+pub fn sync_git_http_auth_from_resolution(
+    git: &GitClient,
+    workdir: &Path,
+    db: &Database,
+    scope_id: &str,
+    config_token: Option<&str>,
+) -> Result<(), GitError> {
+    let has_origin = git.repo().find_remote("origin").is_ok();
+    let chain_state = db.resolve_credential_chain_state(scope_id, "secret_git_token");
+    if chain_state.explicitly_revoked {
+        if has_origin {
+            git.clear_http_auth_memory("origin")?;
+        } else {
+            git.clear_in_memory_http_auth("origin")?;
+        }
+        return Ok(());
+    }
+    let token = resolve_git_http_auth_token_for_workdir(db, scope_id, config_token, workdir);
+    if let Some(tok) = token.as_deref() {
+        if has_origin {
+            git.ensure_remote_credentials("origin", Some(tok))?;
+        } else {
+            git.set_in_memory_http_auth(tok);
+            startup_handoff::remember_startup_http_auth(workdir, tok);
+        }
+    } else if has_origin {
+        git.clear_http_auth_memory("origin")?;
+    } else {
+        git.clear_in_memory_http_auth("origin")?;
+    }
+    Ok(())
+}
 
 /// Apply a resolved credential-chain state to an HTTP(S) remote.
 ///
@@ -23,7 +89,7 @@ pub fn apply_git_credential_chain_state(
     } else if let Some(tok) = state.value.as_deref() {
         git.ensure_remote_credentials(remote_name, Some(tok))
     } else {
-        Ok(())
+        git.clear_in_memory_http_auth(remote_name)
     }
 }
 
@@ -54,10 +120,10 @@ pub fn apply_config_remote_git_credentials(
     git: &GitClient,
     config_token: Option<&str>,
 ) -> Result<(), GitError> {
-    if let Some(tok) = config_token {
+    if let Some(tok) = config_token.filter(|value| !value.is_empty()) {
         git.ensure_remote_credentials("origin", Some(tok))
     } else {
-        Ok(())
+        git.clear_in_memory_http_auth("origin")
     }
 }
 
@@ -91,6 +157,7 @@ pub fn apply_managed_git_credentials(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -196,6 +263,64 @@ mod tests {
         assert!(!after.contains("x-access-token:"));
         assert!(!config.contains(secret));
         assert_eq!(after, clean);
+    }
+
+    #[test]
+    fn resolve_prefers_chain_over_config_token() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("secret_git_token_scope", "chain-token")
+            .unwrap();
+        let resolved = resolve_git_http_auth_token(&db, "scope", Some("config-token"));
+        assert_eq!(resolved.as_deref(), Some("chain-token"));
+    }
+
+    #[test]
+    fn resolve_chain_rotation_changes_token() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("secret_git_token_scope", "token-a").unwrap();
+        assert_eq!(
+            resolve_git_http_auth_token(&db, "scope", None).as_deref(),
+            Some("token-a")
+        );
+        db.set_state("secret_git_token_scope", "token-b").unwrap();
+        assert_eq!(
+            resolve_git_http_auth_token(&db, "scope", None).as_deref(),
+            Some("token-b")
+        );
+    }
+
+    #[test]
+    fn resolve_revoked_chain_ignores_config_fallback() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("secret_git_token_scope", "").unwrap();
+        assert!(resolve_git_http_auth_token(&db, "scope", Some("config-token")).is_none());
+    }
+
+    #[test]
+    fn sync_from_resolution_clears_stale_memory_when_chain_revoked() {
+        let tmp = TempDir::new().unwrap();
+        let bare = tmp.path().join("bare.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let work = tmp.path().join("work");
+        std::process::Command::new("git")
+            .args(["clone", bare.to_str().unwrap(), work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let git = GitClient::new(&work).unwrap();
+        git.ensure_remote_credentials("origin", Some("stale-token"))
+            .unwrap();
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("secret_git_token_scope", "").unwrap();
+        sync_git_http_auth_from_resolution(&git, &work, &db, "scope", Some("config-token"))
+            .unwrap();
+        assert!(git.stored_http_auth_token().is_none());
     }
 
     #[test]

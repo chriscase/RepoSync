@@ -117,16 +117,16 @@ impl GitToSvnSync {
     }
 
     fn personal_history_http_auth(&self) -> Option<String> {
-        if let Some(token) = self
+        let config_token = self
             .http_auth_token
-            .as_ref()
-            .filter(|value| !value.is_empty())
-        {
-            return Some(token.clone());
-        }
-        GitClient::new(&self.git_repo_path)
-            .ok()
-            .and_then(|git| git.stored_http_auth_token())
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        reposync_core::git::resolve_git_http_auth_token_for_workdir(
+            &self.db,
+            PERSONAL_REPO_ID,
+            config_token,
+            &self.git_repo_path,
+        )
     }
 
     /// Ensure the SVN working copy directory exists and is properly checked out.
@@ -194,6 +194,7 @@ impl GitToSvnSync {
             &self.default_branch,
             PERSONAL_REPO_ID,
             http_auth_token.as_deref(),
+            self.http_auth_token.as_deref(),
         )
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))

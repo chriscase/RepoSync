@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::db::Database;
 use crate::errors::{DatabaseError, SyncError};
-use crate::git::GitClient;
+use crate::git::resolve_git_http_auth_token_for_workdir;
 
 /// Rewrite of already-handled Git cursor (P→R ancestry failure).
 pub const DURABLE_HISTORY_REASON: &str = "non_fast_forward";
@@ -537,17 +537,12 @@ fn resolve_personal_history_http_auth(
     git_path: &Path,
     scope_id: &str,
     http_auth_token: Option<&str>,
+    config_token: Option<&str>,
 ) -> Option<String> {
     if let Some(token) = http_auth_token.filter(|value| !value.is_empty()) {
         return Some(token.to_string());
     }
-    if let Ok(git) = GitClient::new(git_path) {
-        if let Some(token) = git.stored_http_auth_token() {
-            return Some(token);
-        }
-    }
-    db.resolve_credential_chain_state(scope_id, "secret_git_token")
-        .value
+    resolve_git_http_auth_token_for_workdir(db, scope_id, config_token, git_path)
 }
 
 fn block_personal_history(
@@ -569,14 +564,15 @@ fn block_personal_history(
 /// Missing origin, missing checkpoint, or conflicting checkpoint provenance
 /// fail closed before SVN writes. Initial import owns initialization and does
 /// not call this gate. A durable rewrite block still refuses writes after
-/// restart. HTTP(S) auth is taken from `http_auth_token`, the workdir sidecar
-/// written by [`GitClient`], or the scoped `secret_git_token` credential chain.
+/// restart. HTTP(S) auth is taken from `http_auth_token`, the scoped
+/// `secret_git_token` chain, config token, or same-process startup clone handoff.
 pub fn inspect_personal_history_with_http_auth(
     db: &Database,
     git_path: &Path,
     branch: &str,
     scope_id: &str,
     http_auth_token: Option<&str>,
+    config_token: Option<&str>,
 ) -> Result<Option<HistoryInspectAdmission>, SyncError> {
     let key = history_block_key(Some(scope_id));
     if scope_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
@@ -666,7 +662,7 @@ pub fn inspect_personal_history_with_http_auth(
         );
     }
     let http_auth_token =
-        resolve_personal_history_http_auth(db, git_path, scope_id, http_auth_token);
+        resolve_personal_history_http_auth(db, git_path, scope_id, http_auth_token, config_token);
     match inspect_fetched_history(
         git_path,
         branch,
@@ -684,7 +680,7 @@ pub fn inspect_personal_history(
     branch: &str,
     scope_id: &str,
 ) -> Result<Option<HistoryInspectAdmission>, SyncError> {
-    inspect_personal_history_with_http_auth(db, git_path, branch, scope_id, None)
+    inspect_personal_history_with_http_auth(db, git_path, branch, scope_id, None, None)
 }
 
 #[cfg(test)]
