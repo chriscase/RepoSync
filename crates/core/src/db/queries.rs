@@ -1412,6 +1412,24 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN TRANSACTION")?;
 
+        let scope_uuid: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM repositories WHERE id = ?1",
+                    crate::db::repo_scope_identity::SCOPE_UUID_COLUMN
+                ),
+                [repo_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .filter(|value| !value.is_empty());
+        crate::db::repo_scope_identity::purge_repository_scope_kv(
+            &conn,
+            repo_id,
+            scope_uuid.as_deref(),
+        )?;
+
         let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
         for table in &tables_with_repo_id {
             let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
@@ -2490,6 +2508,18 @@ impl Database {
                 scope_uuid,
             ],
         )?;
+        let repo_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count > 1 {
+            crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(&conn)?;
+        } else if repo_count == 1 {
+            crate::db::repo_scope_identity::set_legacy_repo_id_kv_reads_enabled(&conn, true)?;
+            crate::db::repo_scope_identity::migrate_legacy_kv_for_repo(
+                &conn,
+                &repo.id,
+                &scope_uuid,
+            )?;
+        }
         debug!(id = %repo.id, name = %repo.name, "inserted repository");
         Ok(())
     }

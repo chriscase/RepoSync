@@ -10,8 +10,8 @@ use crate::errors::DatabaseError;
 
 pub const SCOPE_UUID_COLUMN: &str = "scope_uuid";
 
-/// Load the durable scope UUID for a managed repository row, assigning one lazily
-/// when legacy rows predate v13.
+const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads";
+
 /// Scope token for KV/receipt keys: durable `scope_uuid` when the repository row
 /// exists, otherwise the caller-supplied id (late pair bootstrap before registration).
 pub fn repository_scope_token(conn: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
@@ -103,10 +103,186 @@ pub fn legacy_team_history_block_kv_key(repo_id: &str) -> String {
     format!("team_history_block_{repo_id}")
 }
 
-/// Legacy repo-id KV may be read only when at most one managed repository exists.
+/// Legacy repo-id KV may be read only when v13 migration bound it for a sole repository,
+/// or before any repository row exists (pre-registration callers). Live row count must
+/// never flip an explicit multi-repo revoke (`"0"`) back to authoritative.
 pub fn legacy_repo_id_kv_authoritative(conn: &Connection) -> Result<bool, DatabaseError> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-    Ok(count <= 1)
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    let flag: Option<String> = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [LEGACY_REPO_ID_KV_READS_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if count > 1 {
+        if flag.as_deref() != Some("0") {
+            revoke_legacy_repo_id_kv_reads(conn)?;
+            let mut stmt = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+            let repo_ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for repo_id in &repo_ids {
+                quarantine_unscoped_legacy_receipts(conn, repo_id)?;
+            }
+        }
+        return Ok(false);
+    }
+    match flag.as_deref() {
+        Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(_) => Ok(false),
+        None => match count {
+            0 => Ok(true),
+            1 => {
+                ensure_sole_repository_legacy_kv_bound(conn)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        },
+    }
+}
+
+/// Bind legacy repo-id KV to the sole repository's `scope_uuid` once (durable flag absent).
+fn ensure_sole_repository_legacy_kv_bound(conn: &Connection) -> Result<(), DatabaseError> {
+    let repo_id: String = conn.query_row(
+        "SELECT id FROM repositories ORDER BY id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let scope_uuid = repository_scope_uuid(conn, &repo_id)?;
+    migrate_legacy_kv_for_repo(conn, &repo_id, &scope_uuid)?;
+    set_legacy_repo_id_kv_reads_enabled(conn, true)?;
+    Ok(())
+}
+
+pub fn set_legacy_repo_id_kv_reads_enabled(
+    conn: &Connection,
+    enabled: bool,
+) -> Result<(), DatabaseError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![
+            LEGACY_REPO_ID_KV_READS_KEY,
+            if enabled { "1" } else { "0" },
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn revoke_legacy_repo_id_kv_reads(conn: &Connection) -> Result<(), DatabaseError> {
+    set_legacy_repo_id_kv_reads_enabled(conn, false)
+}
+
+/// Remove durable echo/checkpoint KV for one repository (legacy + UUID scoped).
+pub fn purge_repository_scope_kv(
+    conn: &Connection,
+    repo_id: &str,
+    scope_uuid: Option<&str>,
+) -> Result<(), DatabaseError> {
+    let patterns = legacy_scoped_kv_delete_patterns(repo_id, scope_uuid);
+    for pattern in patterns {
+        conn.execute(
+            "DELETE FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'",
+            [&pattern],
+        )?;
+    }
+    if let Some(scope) = scope_uuid {
+        for key in [
+            last_git_sha_kv_key(scope),
+            repo_echo_generation_kv_key(scope),
+            team_history_block_kv_key(scope),
+        ] {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
+    }
+    for key in [
+        legacy_last_git_sha_kv_key(repo_id),
+        legacy_repo_echo_generation_kv_key(repo_id),
+        legacy_team_history_block_kv_key(repo_id),
+        format!("last_svn_rev_{repo_id}"),
+    ] {
+        conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+    }
+    Ok(())
+}
+
+fn legacy_scoped_kv_delete_patterns(repo_id: &str, scope_uuid: Option<&str>) -> Vec<String> {
+    let mut patterns = vec![
+        legacy_git_no_target_like_pattern(repo_id),
+        legacy_svn_no_target_like_pattern(repo_id),
+        format!("handled_git_no_target_{}%", escape_like_literal(repo_id)),
+        format!("handled_svn_no_target_{}%", escape_like_literal(repo_id)),
+    ];
+    if let Some(scope) = scope_uuid {
+        patterns.push(format!(
+            "handled_git_no_target_{}%",
+            escape_like_literal(scope)
+        ));
+        patterns.push(format!(
+            "handled_svn_no_target_{}%",
+            escape_like_literal(scope)
+        ));
+    }
+    patterns
+}
+
+fn quarantine_unscoped_legacy_receipts(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    let git_like = legacy_git_no_target_like_pattern(repo_id);
+    let svn_like = legacy_svn_no_target_like_pattern(repo_id);
+    let mut stmt = conn.prepare("SELECT key, value FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
+    let git_keys: Vec<String> = stmt
+        .query_map([&git_like], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for key in git_keys {
+        let value: Option<String> = conn
+            .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let quarantine = match value {
+            None => true,
+            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|record| record.get("scope_uuid").cloned())
+                .is_none(),
+        };
+        if quarantine {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
+    }
+    let mut stmt = conn.prepare("SELECT key, value FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
+    let svn_keys: Vec<String> = stmt
+        .query_map([&svn_like], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for key in svn_keys {
+        let value: Option<String> = conn
+            .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let quarantine = match value {
+            None => true,
+            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|record| record.get("scope_uuid").cloned())
+                .is_none(),
+        };
+        if quarantine {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
+    }
+    Ok(())
 }
 
 pub fn receipt_scope_uuid_matches(record: &serde_json::Value, scope_uuid: &str) -> bool {
@@ -160,7 +336,7 @@ fn copy_kv_if_absent(conn: &Connection, from_key: &str, to_key: &str) -> Result<
     Ok(())
 }
 
-fn migrate_legacy_kv_for_repo(
+pub(crate) fn migrate_legacy_kv_for_repo(
     conn: &Connection,
     repo_id: &str,
     scope_uuid: &str,
@@ -235,11 +411,11 @@ pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
         .query_map([], |row| row.get(0))?
         .filter_map(|r| r.ok())
         .collect();
-    for repo_id in repo_ids {
+    for repo_id in &repo_ids {
         let existing: Option<String> = conn
             .query_row(
                 &format!("SELECT {SCOPE_UUID_COLUMN} FROM repositories WHERE id = ?1"),
-                [&repo_id],
+                [repo_id.as_str()],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
@@ -252,11 +428,19 @@ pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
                 &format!(
                     "UPDATE repositories SET {SCOPE_UUID_COLUMN} = ?1 WHERE id = ?2 AND ({SCOPE_UUID_COLUMN} IS NULL OR {SCOPE_UUID_COLUMN} = '')"
                 ),
-                params![scope_uuid, repo_id],
+                params![scope_uuid, repo_id.as_str()],
             )?;
             scope_uuid
         };
-        migrate_legacy_kv_for_repo(conn, &repo_id, &scope_uuid)?;
+        migrate_legacy_kv_for_repo(conn, repo_id, &scope_uuid)?;
+    }
+    if repo_ids.len() == 1 {
+        set_legacy_repo_id_kv_reads_enabled(conn, true)?;
+    } else if repo_ids.len() > 1 {
+        set_legacy_repo_id_kv_reads_enabled(conn, false)?;
+        for repo_id in &repo_ids {
+            quarantine_unscoped_legacy_receipts(conn, repo_id)?;
+        }
     }
     Ok(())
 }
@@ -300,6 +484,32 @@ mod tests {
         let before = repository_scope_uuid(&conn, "legacy").unwrap();
         migrate_v13_scope_uuid(&conn).unwrap();
         assert_eq!(repository_scope_uuid(&conn, "legacy").unwrap(), before);
+    }
+
+    #[test]
+    fn hard_delete_purges_legacy_receipt_suffix_keys() {
+        let db = crate::db::Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        insert_repo(&db.conn(), "pair");
+        let sha = "f".repeat(40);
+        db.set_state(
+            &format!("handled_git_no_target_pair_{sha}"),
+            &serde_json::json!({
+                "version": 1,
+                "repo_id": "pair",
+                "git_sha": sha,
+                "outcome": "filtered",
+                "projection": "{}",
+                "generation": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        db.hard_delete_repository("pair").unwrap();
+        assert!(db
+            .get_state(&format!("handled_git_no_target_pair_{sha}"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
