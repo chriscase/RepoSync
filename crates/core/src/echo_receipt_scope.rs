@@ -43,7 +43,11 @@ fn receipt_admits_for_repo(
     if record.get("scope_uuid").is_some() {
         return Ok(receipt_scope_uuid_matches(record, scope));
     }
-    Ok(legacy_authoritative)
+    if legacy_authoritative {
+        return Ok(true);
+    }
+    // Unscoped human-id receipts apply only before the managed row exists (late pair).
+    Ok(!managed_repo_requires_scoped_receipts(tx, repo_id)?)
 }
 
 fn scope_token_for_repo(tx: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
