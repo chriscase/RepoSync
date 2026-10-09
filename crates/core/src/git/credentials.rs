@@ -36,6 +36,11 @@ pub fn resolve_git_http_auth_token_for_workdir(
     config_token: Option<&str>,
     workdir: &Path,
 ) -> Option<String> {
+    let chain_state = db.resolve_credential_chain_state(scope_id, "secret_git_token");
+    if chain_state.explicitly_revoked {
+        startup_handoff::forget_startup_http_auth(workdir);
+        return None;
+    }
     resolve_git_http_auth_token(db, scope_id, config_token)
         .or_else(|| startup_handoff::peek_startup_http_auth(workdir))
 }
@@ -51,6 +56,7 @@ pub fn sync_git_http_auth_from_resolution(
     let has_origin = git.repo().find_remote("origin").is_ok();
     let chain_state = db.resolve_credential_chain_state(scope_id, "secret_git_token");
     if chain_state.explicitly_revoked {
+        startup_handoff::forget_startup_http_auth(workdir);
         if has_origin {
             git.clear_http_auth_memory("origin")?;
         } else {
@@ -297,6 +303,43 @@ mod tests {
         db.initialize().unwrap();
         db.set_state("secret_git_token_scope", "").unwrap();
         assert!(resolve_git_http_auth_token(&db, "scope", Some("config-token")).is_none());
+    }
+
+    #[test]
+    fn resolve_revoked_chain_clears_startup_handoff() {
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        startup_handoff::remember_startup_http_auth(&work, "handoff-token");
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("secret_git_token_scope", "").unwrap();
+        assert!(
+            resolve_git_http_auth_token_for_workdir(&db, "scope", Some("config-token"), &work)
+                .is_none()
+        );
+        assert!(startup_handoff::peek_startup_http_auth(&work).is_none());
+    }
+
+    #[test]
+    fn resolve_revoked_chain_beats_clone_handoff_and_config_token() {
+        let tmp = TempDir::new().unwrap();
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Same-process handoff recorded by HTTPS `clone_repo` with a config token.
+        startup_handoff::remember_startup_http_auth(&dest, "clone-token");
+        assert_eq!(
+            startup_handoff::peek_startup_http_auth(&dest).as_deref(),
+            Some("clone-token")
+        );
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.set_state("secret_git_token_scope", "").unwrap();
+        assert!(
+            resolve_git_http_auth_token_for_workdir(&db, "scope", Some("clone-token"), &dest)
+                .is_none()
+        );
+        assert!(startup_handoff::peek_startup_http_auth(&dest).is_none());
     }
 
     #[test]

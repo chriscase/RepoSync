@@ -7,6 +7,11 @@ description = "Core library for RepoSync bidirectional SVN/Git synchronization"
 
 [features]
 reliability-fixture = []
+test-support = []
+
+[[test]]
+name = "replay_publish_67"
+required-features = ["test-support"]
 
 [dependencies]
 tokio = { workspace = true }

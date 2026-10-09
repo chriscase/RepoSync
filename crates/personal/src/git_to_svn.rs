@@ -2170,4 +2170,31 @@ M       Cargo.toml
         assert!(fired, "path-scoped fixture must fire for that working copy");
         assert!(!other, "path-scoped fixture must not fire for other copies");
     }
+
+    #[test]
+    fn git_to_svn_personal_history_http_auth_honors_chain_revocation() {
+        use reposync_core::db::Database;
+        use reposync_core::git::startup_handoff;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        std::fs::create_dir_all(&git_work).unwrap();
+        startup_handoff::remember_startup_http_auth(&git_work, "handoff-token");
+
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let chain_key = format!("secret_git_token_{}", PERSONAL_REPO_ID);
+        db.set_state(&chain_key, "").unwrap();
+
+        let config_token = Some("stale-config-token");
+        let resolved = reposync_core::git::resolve_git_http_auth_token_for_workdir(
+            &db,
+            PERSONAL_REPO_ID,
+            config_token,
+            &git_work,
+        );
+        assert!(resolved.is_none());
+        assert!(startup_handoff::peek_startup_http_auth(&git_work).is_none());
+    }
 }

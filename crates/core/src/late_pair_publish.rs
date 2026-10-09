@@ -1144,6 +1144,8 @@ pub async fn publish_admitted_late_pair(
 }
 
 /// Integration-test entry point for the production late-pair Git replay loop.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn replay_pending_git_for_integration_test(
     app_config: &AppConfig,
