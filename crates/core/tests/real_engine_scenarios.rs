@@ -424,6 +424,19 @@ fn setup_db(path: &Path) -> Database {
     db
 }
 
+fn scoped_inbound_git_checkpoint(db: &Database, repo_id: &str) -> Option<String> {
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
+        .ok()
+        .flatten()
+        .filter(|value| !value.is_empty())
+}
+
+fn scoped_inbound_git_checkpoint_kv_key(db: &Database, repo_id: &str) -> String {
+    let scope = reposync_core::db::repo_scope_identity::repository_scope_uuid(&db.conn(), repo_id)
+        .expect("managed repository scope_uuid");
+    reposync_core::db::repo_scope_identity::last_git_sha_kv_key(&scope)
+}
+
 fn make_app_config(svn_url: &str, data_dir: &Path) -> AppConfig {
     let toml_str = format!(
         r#"
@@ -1027,8 +1040,8 @@ async fn scenario_r17_svnserve_concurrent_overlap() {
     let checkpoint_crossover = alpha_sha == beta_sha
         || matches!(
             (
-                db.get_state("last_git_sha_repo_alpha").unwrap(),
-                db.get_state("last_git_sha_repo_beta").unwrap(),
+                scoped_inbound_git_checkpoint(&db, "repo_alpha"),
+                scoped_inbound_git_checkpoint(&db, "repo_beta"),
             ),
             (Some(a), Some(b)) if a == b
         );
@@ -1090,18 +1103,17 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
 
     let beta_before = db.get_repo_watermark("repo_beta").unwrap();
     let alpha_before = db.get_repo_watermark("repo_alpha").unwrap();
-    let alpha_inbound_before = db
-        .get_state("last_git_sha_repo_alpha")
-        .unwrap()
-        .expect("Git-to-SVN cycle must write inbound checkpoint kv");
-    let beta_inbound_before = db
-        .get_state("last_git_sha_repo_beta")
-        .unwrap()
-        .expect("Git-to-SVN cycle must write inbound checkpoint kv");
+    let alpha_inbound_before = scoped_inbound_git_checkpoint(&db, "repo_alpha")
+        .expect("Git-to-SVN cycle must write scoped inbound checkpoint kv");
+    let beta_inbound_before = scoped_inbound_git_checkpoint(&db, "repo_beta")
+        .expect("Git-to-SVN cycle must write scoped inbound checkpoint kv");
     assert_ne!(alpha_inbound_before, beta_inbound_before);
     let tampered_inbound = "cccccccccccccccccccccccccccccccccccccccc";
-    db.set_state("last_git_sha_repo_alpha", tampered_inbound)
-        .unwrap();
+    db.set_state(
+        &scoped_inbound_git_checkpoint_kv_key(&db, "repo_alpha"),
+        tampered_inbound,
+    )
+    .unwrap();
     assert_eq!(
         db.get_repo_watermark("repo_alpha").unwrap(),
         alpha_before,
@@ -1113,7 +1125,7 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
     assert_eq!(beta_cycle.svn_to_git_count, 0);
     assert_eq!(db.get_repo_watermark("repo_beta").unwrap(), beta_before);
     assert_eq!(
-        db.get_state("last_git_sha_repo_beta").unwrap(),
+        scoped_inbound_git_checkpoint(&db, "repo_beta"),
         Some(beta_inbound_before.clone())
     );
 
@@ -1156,10 +1168,10 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
     assert_ne!(alpha_before.1, beta_before.1);
 
     let beta_still_healthy = db.get_repo_watermark("repo_beta").unwrap() == beta_before
-        && db.get_state("last_git_sha_repo_beta").unwrap() == Some(beta_inbound_before.clone())
+        && scoped_inbound_git_checkpoint(&db, "repo_beta") == Some(beta_inbound_before.clone())
         && beta_cycle.svn_to_git_count == 0
         && beta_cycle.git_to_svn_count == 0;
-    let global_cursor_not_borrowed = db.get_state("last_git_sha_repo_beta").unwrap()
+    let global_cursor_not_borrowed = scoped_inbound_git_checkpoint(&db, "repo_beta")
         != Some(tampered_inbound.to_string())
         && db.get_repo_watermark("repo_beta").unwrap() == beta_before;
 
@@ -1172,7 +1184,7 @@ async fn scenario_r17_svnserve_checkpoint_isolation() {
             "beta_watermark_before": beta_before,
             "beta_inbound_before": beta_inbound_before,
             "beta_watermark_after": db.get_repo_watermark("repo_beta").unwrap(),
-            "beta_inbound_after": db.get_state("last_git_sha_repo_beta").unwrap(),
+            "beta_inbound_after": scoped_inbound_git_checkpoint(&db, "repo_beta"),
             "alpha_watermark_after": alpha_after,
             "alpha_blocked_after_tamper": true,
             "alpha_emitted_tip_unchanged": alpha_after == alpha_before,
