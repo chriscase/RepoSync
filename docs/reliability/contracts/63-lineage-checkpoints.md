@@ -92,6 +92,33 @@ the live row does not prove repository continuity.
   pre-v13 single-repository databases during migration; v13 migration binds
   legacy rows to the original UUID or leaves them quarantined.
 
+### Exact ownership for legacy scoped KV (v13 migration and delete)
+
+Human `repositories.id` and durable `scope_uuid` must never be conflated when
+matching KV key names. SQL `LIKE` with a repo-id prefix is unsafe: unescaped `_`
+acts as a single-character wildcard, and prefix matching cannot prove that a
+longer id (for example `pair2` or `pair_child`) belongs to a shorter id
+(`pair`).
+
+**Rule:** migrate, quarantine, or delete a legacy no-target receipt key only when
+**exact ownership** is proven:
+
+1. Parse the key as `handled_{git|svn}_no_target_<scope_token>_<suffix>` where
+   `<suffix>` is validated (40-character Git SHA, or `g<generation>_` plus SHA /
+   numeric SVN revision) so `<scope_token>` is unambiguous.
+2. Treat the key as owned by a human repository only when `<scope_token>` equals
+   that repository’s `id` exactly (not a prefix or LIKE match).
+3. When the JSON payload includes `repo_id`, it must equal that same repository
+   `id`; otherwise leave the key unchanged (fail closed).
+4. On hard delete, remove UUID-scoped receipt keys only when `<scope_token>`
+   equals that row’s `scope_uuid` exactly, plus the fixed legacy keys
+   (`last_git_sha_<id>`, and so on). Never delete through a bare
+   `handled_*_no_target_<prefix>%` pattern.
+
+Namespace-wide scans may use `GLOB` on the fixed literal prefix
+(`handled_git_no_target_*`); per-repo actions always filter with the exact-parse
+rules above.
+
 ## Current v12/v13 compatibility (must keep working)
 
 Operational authority today is the bounded table in [design.md](../design.md):

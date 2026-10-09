@@ -12,6 +12,140 @@ pub const SCOPE_UUID_COLUMN: &str = "scope_uuid";
 
 const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads";
 
+const HANDLED_GIT_NO_TARGET_PREFIX: &str = "handled_git_no_target_";
+const HANDLED_SVN_NO_TARGET_PREFIX: &str = "handled_svn_no_target_";
+
+/// Parsed tail of a handled_*_no_target KV key (scope token is exact, not prefix-matched).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedNoTargetReceiptKey {
+    scope_token: String,
+    generation: i64,
+    checkpoint: String,
+}
+
+fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_svn_rev_token(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
+
+fn parse_handled_git_no_target_key(key: &str) -> Option<ParsedNoTargetReceiptKey> {
+    let body = key.strip_prefix(HANDLED_GIT_NO_TARGET_PREFIX)?;
+    let (mid, sha) = body.rsplit_once('_')?;
+    if !is_full_git_sha(sha) {
+        return None;
+    }
+    if let Some((scope_token, gen_part)) = mid.rsplit_once('_') {
+        if let Some(gen_digits) = gen_part.strip_prefix('g') {
+            if gen_digits.chars().all(|c| c.is_ascii_digit()) && !gen_digits.is_empty() {
+                let generation = gen_digits.parse().ok()?;
+                return Some(ParsedNoTargetReceiptKey {
+                    scope_token: scope_token.to_string(),
+                    generation,
+                    checkpoint: sha.to_string(),
+                });
+            }
+        }
+    }
+    Some(ParsedNoTargetReceiptKey {
+        scope_token: mid.to_string(),
+        generation: crate::pair_refresh::PAIR_GENERATION,
+        checkpoint: sha.to_string(),
+    })
+}
+
+fn parse_handled_svn_no_target_key(key: &str) -> Option<ParsedNoTargetReceiptKey> {
+    let body = key.strip_prefix(HANDLED_SVN_NO_TARGET_PREFIX)?;
+    let (mid, rev) = body.rsplit_once('_')?;
+    if !is_svn_rev_token(rev) {
+        return None;
+    }
+    if let Some((scope_token, gen_part)) = mid.rsplit_once('_') {
+        if let Some(gen_digits) = gen_part.strip_prefix('g') {
+            if gen_digits.chars().all(|c| c.is_ascii_digit()) && !gen_digits.is_empty() {
+                let generation = gen_digits.parse().ok()?;
+                return Some(ParsedNoTargetReceiptKey {
+                    scope_token: scope_token.to_string(),
+                    generation,
+                    checkpoint: rev.to_string(),
+                });
+            }
+        }
+    }
+    Some(ParsedNoTargetReceiptKey {
+        scope_token: mid.to_string(),
+        generation: crate::pair_refresh::PAIR_GENERATION,
+        checkpoint: rev.to_string(),
+    })
+}
+
+fn legacy_no_target_key_owned_by_human_id(key: &str, repo_id: &str, git: bool) -> bool {
+    let parsed = if git {
+        parse_handled_git_no_target_key(key)
+    } else {
+        parse_handled_svn_no_target_key(key)
+    };
+    parsed.is_some_and(|p| p.scope_token == repo_id)
+}
+
+fn no_target_key_owned_by_scope_uuid(key: &str, scope_uuid: &str, git: bool) -> bool {
+    let parsed = if git {
+        parse_handled_git_no_target_key(key)
+    } else {
+        parse_handled_svn_no_target_key(key)
+    };
+    parsed.is_some_and(|p| p.scope_token == scope_uuid)
+}
+
+fn list_kv_keys_glob(conn: &Connection, glob: &str) -> Result<Vec<String>, DatabaseError> {
+    let mut stmt = conn.prepare("SELECT key FROM kv_state WHERE key GLOB ?1")?;
+    let keys = stmt
+        .query_map([glob], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(keys)
+}
+
+fn legacy_receipt_payload_matches_repo(value: &str, repo_id: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(record) => record.get("repo_id").and_then(|v| v.as_str()) == Some(repo_id),
+        Err(_) => false,
+    }
+}
+
+/// True when any no-target receipt KV key is owned by this repository (exact scope token).
+pub fn repository_has_stored_no_target_receipt_kv(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    let scope = match repository_scope_uuid(conn, repo_id) {
+        Ok(scope) => scope,
+        Err(DatabaseError::NotFound { entity, .. }) if entity == "repository" => {
+            repo_id.to_string()
+        }
+        Err(other) => return Err(other),
+    };
+    let legacy_authoritative = legacy_repo_id_kv_authoritative(conn)?;
+    for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
+        if no_target_key_owned_by_scope_uuid(&key, &scope, true)
+            || (legacy_authoritative && legacy_no_target_key_owned_by_human_id(&key, repo_id, true))
+        {
+            return Ok(true);
+        }
+    }
+    for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
+        if no_target_key_owned_by_scope_uuid(&key, &scope, false)
+            || (legacy_authoritative
+                && legacy_no_target_key_owned_by_human_id(&key, repo_id, false))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Scope token for KV/receipt keys: durable `scope_uuid` when the repository row
 /// exists, otherwise the caller-supplied id (late pair bootstrap before registration).
 pub fn repository_scope_token(conn: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
@@ -184,12 +318,20 @@ pub fn purge_repository_scope_kv(
     repo_id: &str,
     scope_uuid: Option<&str>,
 ) -> Result<(), DatabaseError> {
-    let patterns = legacy_scoped_kv_delete_patterns(repo_id, scope_uuid);
-    for pattern in patterns {
-        conn.execute(
-            "DELETE FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'",
-            [&pattern],
-        )?;
+    for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
+        let delete = legacy_no_target_key_owned_by_human_id(&key, repo_id, true)
+            || scope_uuid.is_some_and(|scope| no_target_key_owned_by_scope_uuid(&key, scope, true));
+        if delete {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
+    }
+    for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
+        let delete = legacy_no_target_key_owned_by_human_id(&key, repo_id, false)
+            || scope_uuid
+                .is_some_and(|scope| no_target_key_owned_by_scope_uuid(&key, scope, false));
+        if delete {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
     }
     if let Some(scope) = scope_uuid {
         for key in [
@@ -211,38 +353,14 @@ pub fn purge_repository_scope_kv(
     Ok(())
 }
 
-fn legacy_scoped_kv_delete_patterns(repo_id: &str, scope_uuid: Option<&str>) -> Vec<String> {
-    let mut patterns = vec![
-        legacy_git_no_target_like_pattern(repo_id),
-        legacy_svn_no_target_like_pattern(repo_id),
-        format!("handled_git_no_target_{}%", escape_like_literal(repo_id)),
-        format!("handled_svn_no_target_{}%", escape_like_literal(repo_id)),
-    ];
-    if let Some(scope) = scope_uuid {
-        patterns.push(format!(
-            "handled_git_no_target_{}%",
-            escape_like_literal(scope)
-        ));
-        patterns.push(format!(
-            "handled_svn_no_target_{}%",
-            escape_like_literal(scope)
-        ));
-    }
-    patterns
-}
-
 fn quarantine_unscoped_legacy_receipts(
     conn: &Connection,
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
-    let git_like = legacy_git_no_target_like_pattern(repo_id);
-    let svn_like = legacy_svn_no_target_like_pattern(repo_id);
-    let mut stmt = conn.prepare("SELECT key, value FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
-    let git_keys: Vec<String> = stmt
-        .query_map([&git_like], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    for key in git_keys {
+    for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
+        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, true) {
+            continue;
+        }
         let value: Option<String> = conn
             .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
                 row.get(0)
@@ -259,12 +377,10 @@ fn quarantine_unscoped_legacy_receipts(
             conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
         }
     }
-    let mut stmt = conn.prepare("SELECT key, value FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
-    let svn_keys: Vec<String> = stmt
-        .query_map([&svn_like], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    for key in svn_keys {
+    for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
+        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, false) {
+            continue;
+        }
         let value: Option<String> = conn
             .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
                 row.get(0)
@@ -295,21 +411,6 @@ pub fn attach_scope_uuid_to_receipt(receipt: &mut serde_json::Value, scope_uuid:
     if let Some(obj) = receipt.as_object_mut() {
         obj.insert("scope_uuid".into(), scope_uuid.into());
     }
-}
-
-fn escape_like_literal(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
-fn legacy_git_no_target_like_pattern(repo_id: &str) -> String {
-    format!("handled_git_no_target_{}_%", escape_like_literal(repo_id))
-}
-
-fn legacy_svn_no_target_like_pattern(repo_id: &str) -> String {
-    format!("handled_svn_no_target_{}_%", escape_like_literal(repo_id))
 }
 
 fn copy_kv_if_absent(conn: &Connection, from_key: &str, to_key: &str) -> Result<(), DatabaseError> {
@@ -356,21 +457,26 @@ pub(crate) fn migrate_legacy_kv_for_repo(
         &team_history_block_kv_key(scope_uuid),
     )?;
 
-    let git_like = legacy_git_no_target_like_pattern(repo_id);
-    let svn_like = legacy_svn_no_target_like_pattern(repo_id);
-    let git_prefix = format!("handled_git_no_target_{repo_id}_");
-    let svn_prefix = format!("handled_svn_no_target_{repo_id}_");
-    let mut stmt =
-        conn.prepare("SELECT key, value, updated_at FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
-    let git_rows: Vec<(String, String, String)> = stmt
-        .query_map([&git_like], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    for (key, value, updated_at) in git_rows {
-        let suffix = key.strip_prefix(&git_prefix).unwrap_or("");
-        let scoped_key = format!("handled_git_no_target_{scope_uuid}_{suffix}");
+    for key in list_kv_keys_glob(conn, "handled_git_no_target_*")? {
+        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, true) {
+            continue;
+        }
+        let (value, updated_at): (String, String) = conn.query_row(
+            "SELECT value, updated_at FROM kv_state WHERE key = ?1",
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !legacy_receipt_payload_matches_repo(&value, repo_id) {
+            continue;
+        }
+        let Some(parsed) = parse_handled_git_no_target_key(&key) else {
+            continue;
+        };
+        let scoped_key = crate::echo_receipt_scope::handled_git_no_target_state_key(
+            scope_uuid,
+            parsed.generation,
+            &parsed.checkpoint,
+        );
         copy_kv_if_absent(conn, &key, &scoped_key)?;
         if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&value) {
             attach_scope_uuid_to_receipt(&mut record, scope_uuid);
@@ -380,17 +486,27 @@ pub(crate) fn migrate_legacy_kv_for_repo(
             )?;
         }
     }
-    let mut stmt =
-        conn.prepare("SELECT key, value, updated_at FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
-    let svn_rows: Vec<(String, String, String)> = stmt
-        .query_map([&svn_like], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    for (key, value, updated_at) in svn_rows {
-        let suffix = key.strip_prefix(&svn_prefix).unwrap_or("");
-        let scoped_key = format!("handled_svn_no_target_{scope_uuid}_{suffix}");
+    for key in list_kv_keys_glob(conn, "handled_svn_no_target_*")? {
+        if !legacy_no_target_key_owned_by_human_id(&key, repo_id, false) {
+            continue;
+        }
+        let (value, updated_at): (String, String) = conn.query_row(
+            "SELECT value, updated_at FROM kv_state WHERE key = ?1",
+            [&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !legacy_receipt_payload_matches_repo(&value, repo_id) {
+            continue;
+        }
+        let Some(parsed) = parse_handled_svn_no_target_key(&key) else {
+            continue;
+        };
+        let svn_rev = parsed.checkpoint.parse::<i64>().unwrap_or(0);
+        let scoped_key = crate::echo_receipt_scope::handled_svn_no_target_state_key(
+            scope_uuid,
+            parsed.generation,
+            svn_rev,
+        );
         copy_kv_if_absent(conn, &key, &scoped_key)?;
         if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&value) {
             attach_scope_uuid_to_receipt(&mut record, scope_uuid);

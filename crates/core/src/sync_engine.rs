@@ -1309,45 +1309,11 @@ impl SyncEngine {
     }
 
     fn repo_has_stored_no_target_receipt_kv(&self, rid: &str) -> Result<bool, SyncError> {
-        let (scope, legacy_authoritative) = {
-            let conn = self.db.conn();
-            let scope = match crate::db::repo_scope_identity::repository_scope_uuid(&conn, rid) {
-                Ok(scope) => scope,
-                Err(crate::errors::DatabaseError::NotFound { entity, .. })
-                    if entity == "repository" =>
-                {
-                    rid.to_string()
-                }
-                Err(error) => return Err(SyncError::DatabaseError(error)),
-            };
-            let legacy_authoritative =
-                crate::db::repo_scope_identity::legacy_repo_id_kv_authoritative(&conn)
-                    .map_err(SyncError::DatabaseError)?;
-            (scope, legacy_authoritative)
-        };
-        let git_like = format!("handled_git_no_target_{}_%", scope);
-        let svn_like = format!("handled_svn_no_target_{}_%", scope);
-        let legacy_git_like = format!("handled_git_no_target_{}_%", rid);
-        let legacy_svn_like = format!("handled_svn_no_target_{}_%", rid);
-        let count: i64 = {
-            let conn = self.db.conn();
-            if legacy_authoritative {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM kv_state WHERE key LIKE ?1 OR key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4",
-                    rusqlite::params![git_like, svn_like, legacy_git_like, legacy_svn_like],
-                    |row| row.get(0),
-                )
-                .map_err(crate::errors::DatabaseError::from)?
-            } else {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM kv_state WHERE key LIKE ?1 OR key LIKE ?2",
-                    rusqlite::params![git_like, svn_like],
-                    |row| row.get(0),
-                )
-                .map_err(crate::errors::DatabaseError::from)?
-            }
-        };
-        Ok(count > 0)
+        crate::db::repo_scope_identity::repository_has_stored_no_target_receipt_kv(
+            &self.db.conn(),
+            rid,
+        )
+        .map_err(SyncError::DatabaseError)
     }
 
     /// Inbound Git checkpoint P must be backed by applied outbound work for this
