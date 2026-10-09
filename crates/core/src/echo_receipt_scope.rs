@@ -38,9 +38,7 @@ fn receipt_admits_for_repo(
         return Ok(false);
     }
     if managed_repo_requires_scoped_receipts(tx, repo_id)? {
-        return Ok(
-            record.get("scope_uuid").is_some() && receipt_scope_uuid_matches(record, scope),
-        );
+        return Ok(record.get("scope_uuid").is_some() && receipt_scope_uuid_matches(record, scope));
     }
     if record.get("scope_uuid").is_some() {
         return Ok(receipt_scope_uuid_matches(record, scope));
