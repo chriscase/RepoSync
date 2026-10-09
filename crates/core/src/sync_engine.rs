@@ -824,7 +824,7 @@ impl SyncEngine {
                 .filter(|url| !url.is_empty());
         if origin_url
             .as_deref()
-            .is_some_and(|url| url.starts_with("file://"))
+            .is_none_or(|url| url.starts_with("file://"))
         {
             return;
         }
