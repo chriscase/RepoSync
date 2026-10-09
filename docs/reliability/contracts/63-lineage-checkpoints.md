@@ -58,6 +58,18 @@ fingerprints sufficient to verify an external effect.
 
 ## Operational v13 scope identity (shipped slice)
 
+### Verified repository UUID vs human repository id
+
+| Concept | Role | Continuity |
+| --- | --- | --- |
+| **`scope_uuid`** | Durable repository identity for echo receipts, generations, inbound Git checkpoints, and history blocks | Survives only while the repository row exists; a new row gets a new UUID |
+| **`repositories.id`** | Human-chosen label for config, UI, and `sync_records.repo_id` | May be reused after delete + re-register; **must never** be treated as proof that scoped KV/receipt state from an earlier row still applies |
+
+Admission and checkpoint logic bind evidence to **`scope_uuid`**. A receipt or
+cursor key that matches only the human `id` (or omits `scope_uuid` on a managed
+row) is unverified. Matching `repo_id` in JSON without the same `scope_uuid` as
+the live row does not prove repository continuity.
+
 - Each managed repository row carries an immutable `scope_uuid` assigned at
   registration (v13 backfill for existing rows). The human-chosen repository
   `id` is a label only: matching `id` after delete + re-register does **not**

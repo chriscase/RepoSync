@@ -107,8 +107,7 @@ pub fn legacy_team_history_block_kv_key(repo_id: &str) -> String {
 /// or before any repository row exists (pre-registration callers). Live row count must
 /// never flip an explicit multi-repo revoke (`"0"`) back to authoritative.
 pub fn legacy_repo_id_kv_authoritative(conn: &Connection) -> Result<bool, DatabaseError> {
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
     let flag: Option<String> = conn
         .query_row(
             "SELECT value FROM kv_state WHERE key = ?1",

@@ -55,12 +55,18 @@ pub(crate) fn stale_generation_receipt_proves_emitted_git_column(
     repo_id: &str,
     column_sha: &str,
     current_generation: i64,
+    expected_scope_uuid: Option<&str>,
 ) -> bool {
     if record["repo_id"] != repo_id
         || record["git_sha"] != column_sha
         || !is_full_git_oid(column_sha)
     {
         return false;
+    }
+    if let Some(expected) = expected_scope_uuid {
+        if record.get("scope_uuid").and_then(|value| value.as_str()) != Some(expected) {
+            return false;
+        }
     }
     if receipt_generation_accepted(record, current_generation) {
         return false;
@@ -78,9 +84,16 @@ pub(crate) fn verify_no_target_receipt(
     sha: &str,
     projection: &str,
     current_generation: i64,
+    expected_scope_uuid: Option<&str>,
 ) -> NoTargetReceiptVerdict {
     if record["repo_id"] != repo_id || record["git_sha"] != sha || !is_full_git_oid(sha) {
         return NoTargetReceiptVerdict::RepoOrShaMismatch;
+    }
+    if let Some(expected) = expected_scope_uuid {
+        match record.get("scope_uuid").and_then(|value| value.as_str()) {
+            Some(found) if found == expected => {}
+            _ => return NoTargetReceiptVerdict::UnverifiedOutcome,
+        }
     }
     if record["projection"] != projection {
         return NoTargetReceiptVerdict::ProjectionMismatch;
@@ -371,12 +384,15 @@ fn verified_git_no_target_receipt(
         return Ok(false);
     };
     let generation = repo_echo_generation(ctx.db, ctx.repo_id)?;
+    let scope =
+        crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), ctx.repo_id).ok();
     Ok(verify_no_target_receipt(
         &record,
         ctx.repo_id,
         sha,
         ctx.no_target_projection,
         generation,
+        scope.as_deref(),
     ) == NoTargetReceiptVerdict::Accepted)
 }
 
@@ -464,8 +480,16 @@ fn verified_git_no_target_receipt_personal(
             continue;
         };
         let generation = repo_echo_generation(ctx.db, repo_id)?;
-        if verify_no_target_receipt(&record, repo_id, sha, ctx.no_target_projection, generation)
-            == NoTargetReceiptVerdict::Accepted
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&ctx.db.conn(), repo_id).ok();
+        if verify_no_target_receipt(
+            &record,
+            repo_id,
+            sha,
+            ctx.no_target_projection,
+            generation,
+            scope.as_deref(),
+        ) == NoTargetReceiptVerdict::Accepted
         {
             return Ok(true);
         }

@@ -48,7 +48,8 @@ use crate::echo_receipt_scope::{
     read_git_no_target_receipt, repo_echo_generation, stored_git_no_target_receipt_exists,
 };
 use crate::echo_suppression::{
-    classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
+    classify_incoming_git_commit, classify_incoming_svn_revision,
+    git_no_target_outcome_is_verified, personal_mode_marker_echo,
     stale_generation_receipt_proves_emitted_git_column, verify_no_target_receipt, EchoDisposition,
     NoTargetReceiptVerdict, TeamEchoContext, SYNC_MARKER,
 };
@@ -866,9 +867,29 @@ impl SyncEngine {
             // when the old cursor copies happen to agree. Check every present
             // copy before choosing between equal, split, or KV-only shapes.
             if let Some(ref sha) = column {
+                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)? {
+                    return Err(self.record_history_block(
+                        "ambiguous_checkpoint",
+                        "stale no-target receipt conflicts with repository Git checkpoint",
+                        Some(sha),
+                        None,
+                        None,
+                        kv.as_deref(),
+                    ));
+                }
                 self.checked_no_target_receipt(rid, sha)?;
             }
             let kv_no_target = if let Some(ref sha) = kv {
+                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)? {
+                    return Err(self.record_history_block(
+                        "ambiguous_checkpoint",
+                        "stale no-target receipt conflicts with repository Git checkpoint",
+                        Some(sha),
+                        None,
+                        None,
+                        column.as_deref(),
+                    ));
+                }
                 self.checked_no_target_receipt(rid, sha)?
             } else {
                 false
@@ -1084,6 +1105,16 @@ impl SyncEngine {
                         None,
                     ));
                 }
+                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, &kv_sha)? {
+                    return Err(self.record_history_block(
+                        "ambiguous_checkpoint",
+                        "stale no-target receipt conflicts with repository Git checkpoint",
+                        Some(&kv_sha),
+                        None,
+                        None,
+                        column.as_deref(),
+                    ));
+                }
                 if column.is_none()
                     && !self.proved_scoped_inbound_git_checkpoint(rid, &kv_sha)?
                     && !self.repo_scoped_install_bootstrap_eligible(rid)?
@@ -1201,12 +1232,50 @@ impl SyncEngine {
             return Ok(true);
         }
         let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
         for record in collect_git_no_target_receipts_for_sha(&self.db, rid, column_sha)
             .map_err(SyncError::DatabaseError)?
         {
             if stale_generation_receipt_proves_emitted_git_column(
-                &record, rid, column_sha, generation,
+                &record,
+                rid,
+                column_sha,
+                generation,
+                scope.as_deref(),
             ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// True when a prior-generation verified no-target receipt still exists for `sha`.
+    fn checkpoint_sha_has_stale_verified_no_target_receipt(
+        &self,
+        rid: &str,
+        sha: &str,
+    ) -> Result<bool, SyncError> {
+        if !is_full_git_oid(sha) {
+            return Ok(false);
+        }
+        let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
+        for record in collect_git_no_target_receipts_for_sha(&self.db, rid, sha)
+            .map_err(SyncError::DatabaseError)?
+        {
+            if record["git_sha"] != sha {
+                continue;
+            }
+            if let Some(expected) = scope.as_deref() {
+                if record.get("scope_uuid").and_then(|value| value.as_str()) != Some(expected) {
+                    continue;
+                }
+            }
+            if !crate::echo_receipt_scope::receipt_generation_accepted(&record, generation)
+                && git_no_target_outcome_is_verified(&record)
+            {
                 return Ok(true);
             }
         }
@@ -1324,8 +1393,16 @@ impl SyncEngine {
         for record in collect_git_no_target_receipts_for_sha(&self.db, rid, sha)
             .map_err(SyncError::DatabaseError)?
         {
-            if verify_no_target_receipt(&record, rid, sha, &projection, generation)
-                == NoTargetReceiptVerdict::Accepted
+            let scope =
+                crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
+            if verify_no_target_receipt(
+                &record,
+                rid,
+                sha,
+                &projection,
+                generation,
+                scope.as_deref(),
+            ) == NoTargetReceiptVerdict::Accepted
             {
                 return Ok(true);
             }
@@ -1340,7 +1417,16 @@ impl SyncEngine {
             let projection = self.no_target_projection();
             let generation =
                 repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
-            return match verify_no_target_receipt(&record, rid, sha, &projection, generation) {
+            let scope =
+                crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
+            return match verify_no_target_receipt(
+                &record,
+                rid,
+                sha,
+                &projection,
+                generation,
+                scope.as_deref(),
+            ) {
                 NoTargetReceiptVerdict::Accepted => {
                     if crate::echo_receipt_scope::legacy_git_no_target_mirror_blocks(
                         &self.db,

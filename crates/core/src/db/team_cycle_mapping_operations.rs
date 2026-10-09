@@ -227,7 +227,12 @@ fn advance_git_with_receipt_tx(
     crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
     let projection = receipt["projection"].as_str().unwrap_or("");
     let receipt_proves_kv = crate::echo_suppression::verify_no_target_receipt(
-        &receipt, repo_id, git_sha, projection, generation,
+        &receipt,
+        repo_id,
+        git_sha,
+        projection,
+        generation,
+        Some(&scope),
     ) == crate::echo_suppression::NoTargetReceiptVerdict::Accepted;
     if receipt_proves_kv {
         let now = chrono::Utc::now().to_rfc3339();

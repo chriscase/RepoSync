@@ -361,10 +361,15 @@ pub fn stored_git_no_target_receipt_exists(
         return Ok(false);
     };
     let generation = repo_echo_generation(db, repo_id)?;
-    Ok(
-        verify_no_target_receipt(&record, repo_id, git_sha, projection, generation)
-            == NoTargetReceiptVerdict::Accepted,
-    )
+    let scope = repository_scope_uuid(&db.conn(), repo_id).ok();
+    Ok(verify_no_target_receipt(
+        &record,
+        repo_id,
+        git_sha,
+        projection,
+        generation,
+        scope.as_deref(),
+    ) == NoTargetReceiptVerdict::Accepted)
 }
 
 /// Resolve a stored SVN no-target receipt for the active generation.
@@ -427,10 +432,20 @@ pub fn legacy_git_no_target_mirror_blocks(
     let Ok(record) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return Ok(true);
     };
-    Ok(
-        verify_no_target_receipt(&record, repo_id, git_sha, projection, generation)
-            != NoTargetReceiptVerdict::Accepted,
-    )
+    if record.get("scope_uuid").is_none() {
+        return Ok(true);
+    }
+    if !receipt_scope_uuid_matches(&record, &scope) {
+        return Ok(true);
+    }
+    Ok(verify_no_target_receipt(
+        &record,
+        repo_id,
+        git_sha,
+        projection,
+        generation,
+        Some(&scope),
+    ) != NoTargetReceiptVerdict::Accepted)
 }
 
 /// True when UUID-scoped and repo-id inbound checkpoint mirrors disagree.
@@ -734,7 +749,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            verify_no_target_receipt(&loaded, "pair", &sha, "{}", generation),
+            verify_no_target_receipt(&loaded, "pair", &sha, "{}", generation, Some(&scope),),
             NoTargetReceiptVerdict::Accepted
         );
     }
