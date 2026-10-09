@@ -5241,9 +5241,7 @@ repo = "test/test-repo"
 
     #[test]
     fn team_git_checkpoint_split_cursor_reads_generation_scoped_receipt() {
-        use crate::echo_receipt_scope::{
-            attach_generation_to_receipt,
-        };
+        use crate::echo_receipt_scope::attach_generation_to_receipt;
         use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
         use uuid::Uuid;
 
