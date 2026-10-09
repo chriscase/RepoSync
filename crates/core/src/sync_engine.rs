@@ -252,45 +252,6 @@ fn sync_git_command_output(
     }
 }
 
-fn advertised_remote_tip_is_sha(
-    repo_path: &Path,
-    branch: &str,
-    sha: &str,
-    timeout: Duration,
-    http_auth_token: Option<&str>,
-) -> bool {
-    let remote_branch = format!("refs/heads/{}", branch);
-    let output = match sync_git_command_output(
-        repo_path,
-        &[
-            "ls-remote",
-            "--exit-code",
-            "--heads",
-            "origin",
-            &remote_branch,
-        ],
-        timeout,
-        http_auth_token.map(str::to_string),
-    ) {
-        Some(output) => output,
-        None => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let advertised_text = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = advertised_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    if lines.len() != 1 {
-        return false;
-    }
-    let advertised_sha = lines[0].split_whitespace().next().unwrap_or("");
-    is_full_git_oid(advertised_sha) && lines[0].ends_with(&remote_branch) && advertised_sha == sha
-}
-
 impl SyncEngine {
     /// Create a new sync engine with all required dependencies.
     pub fn new(
@@ -774,11 +735,7 @@ impl SyncEngine {
             let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
             (git.repo_path().to_path_buf(), git.stored_http_auth_token())
         };
-        let timeout = if cfg!(test) {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(45)
-        };
+        let timeout = Duration::from_secs(5);
         let spec = format!("{}^{{commit}}", sha);
         if sync_git_command_output(
             &repo_path,
@@ -790,19 +747,24 @@ impl SyncEngine {
         {
             return Ok(false);
         }
-        let origin_probe = Duration::from_secs(5);
         let origin_configured = sync_git_command_output(
             &repo_path,
             &["remote", "get-url", "origin"],
-            origin_probe,
+            timeout,
             None,
         )
         .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
         if !origin_configured {
             return Ok(true);
         }
-        let branch = &self.config.github.default_branch;
-        if advertised_remote_tip_is_sha(&repo_path, branch, sha, timeout, http_token.as_deref()) {
+        if Some(sha)
+            == Self::local_remote_branch_tip_sha(
+                &repo_path,
+                &self.config.github.default_branch,
+                http_token.as_deref(),
+            )
+            .as_deref()
+        {
             return Ok(false);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
@@ -853,6 +815,39 @@ impl SyncEngine {
         Ok(())
     }
 
+    fn local_remote_branch_tip_sha(
+        repo_path: &Path,
+        branch: &str,
+        http_auth_token: Option<&str>,
+    ) -> Option<String> {
+        let timeout = Duration::from_secs(5);
+        let _ = sync_git_command_output(
+            repo_path,
+            &["fetch", "--quiet", "--no-tags", "origin", branch],
+            timeout,
+            http_auth_token.map(str::to_string),
+        );
+        for refname in [
+            format!("refs/remotes/origin/{}", branch),
+            format!("origin/{}", branch),
+        ] {
+            if let Some(output) =
+                sync_git_command_output(repo_path, &["rev-parse", "--verify", &refname], timeout, None)
+            {
+                if output.status.success() {
+                    let tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if is_full_git_oid(&tip) {
+                        return Some(tip);
+                    }
+                }
+            }
+        }
+        sync_git_command_output(repo_path, &["rev-parse", "HEAD"], timeout, None)
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|tip| is_full_git_oid(tip))
+    }
+
     /// Read a repository-owned legacy Git cursor without borrowing another
     /// pair's global maximum. A missing or conflicting cursor is not a new
     /// baseline. The schema transition remains #63.
@@ -869,6 +864,15 @@ impl SyncEngine {
                 .map_err(crate::errors::DatabaseError::from)?
             };
             let column = column.filter(|value| !value.is_empty());
+            let (bridge_repo_path, http_token) = {
+                let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                (git.repo_path().to_path_buf(), git.stored_http_auth_token())
+            };
+            let remote_tip = Self::local_remote_branch_tip_sha(
+                &bridge_repo_path,
+                &self.config.github.default_branch,
+                http_token.as_deref(),
+            );
             let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
             if crate::echo_receipt_scope::inbound_git_checkpoint_mirror_conflict(&self.db, rid)
@@ -890,8 +894,13 @@ impl SyncEngine {
             // when the old cursor copies happen to agree. Check every present
             // copy before choosing between equal, split, or KV-only shapes.
             if let Some(ref sha) = column {
-                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)?
+                // Stale-generation receipts on a split cursor (column emitted tip vs
+                // scoped inbound KV) are reconciled below. Only a unified copy may
+                // be blocked here without proving the emitted column SHA.
+                if kv.as_deref() == Some(sha.as_str())
+                    && self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)?
                     && !self.proved_svn_emitted_column_git_sha(rid, sha)?
+                    && remote_tip.as_deref() == Some(sha.as_str())
                 {
                     return Err(self.record_history_block(
                         "ambiguous_checkpoint",
@@ -949,8 +958,12 @@ impl SyncEngine {
                     || kv_no_target;
                 let column_sha = column.as_deref().unwrap();
                 let column_emit_proved = self.proved_svn_emitted_column_git_sha(rid, column_sha)?;
+                let column_stale_receipt_only =
+                    self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, column_sha)?;
+                let column_tip_accepted =
+                    column_emit_proved || (column_stale_receipt_only && !column_emit_proved);
                 if kv_handled_proved
-                    && column_emit_proved
+                    && column_tip_accepted
                     && is_full_git_oid(column_sha)
                     && is_full_git_oid(kv.as_deref().unwrap())
                 {
@@ -965,7 +978,35 @@ impl SyncEngine {
                         .current_dir(git.repo_path())
                         .output();
                     match ancestry {
-                        Ok(output) if output.status.code() == Some(0) => return Ok(kv),
+                        Ok(output) if output.status.code() == Some(0) => {
+                            let legacy_mirror: Option<String> = {
+                                let conn = self.db.conn();
+                                conn.query_row(
+                                    "SELECT value FROM kv_state WHERE key = ?1",
+                                    [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
+                                        rid,
+                                    )],
+                                    |row| row.get(0),
+                                )
+                                .optional()
+                                .map_err(crate::errors::DatabaseError::from)?
+                                .filter(|value: &String| !value.is_empty())
+                            };
+                            if legacy_mirror.as_deref() == Some(column_sha)
+                                && column_stale_receipt_only
+                                && remote_tip.as_deref() == Some(column_sha)
+                            {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "stale no-target receipt conflicts with repository Git checkpoint",
+                                    Some(column_sha),
+                                    None,
+                                    None,
+                                    kv.as_deref(),
+                                ));
+                            }
+                            return Ok(kv);
+                        }
                         Ok(output) if output.status.code() == Some(1) => (),
                         _ => {
                             return Err(self.record_history_block(
