@@ -626,12 +626,12 @@ pub async fn probe_svn_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
     use crate::db::Database;
     use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
     use chrono::Utc;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn git_env<'a>(dir: &'a Path, args: &'a [&'a str]) -> std::process::Output {
