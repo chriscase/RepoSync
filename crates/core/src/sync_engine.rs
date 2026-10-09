@@ -847,6 +847,18 @@ impl SyncEngine {
             let column = column.filter(|value| !value.is_empty());
             let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
+            if crate::echo_receipt_scope::inbound_git_checkpoint_mirror_conflict(&self.db, rid)
+                .map_err(SyncError::DatabaseError)?
+            {
+                return Err(self.record_history_block(
+                    "ambiguous_checkpoint",
+                    "repository inbound checkpoint mirrors disagree",
+                    column.as_deref(),
+                    None,
+                    None,
+                    kv.as_deref(),
+                ));
+            }
             if let Some(ref sha) = column {
                 self.reject_missing_checkpoint_object(sha)?;
             }
@@ -1219,18 +1231,43 @@ impl SyncEngine {
     }
 
     fn repo_has_stored_no_target_receipt_kv(&self, rid: &str) -> Result<bool, SyncError> {
-        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid)
-            .map_err(SyncError::DatabaseError)?;
+        let (scope, legacy_authoritative) = {
+            let conn = self.db.conn();
+            let scope = match crate::db::repo_scope_identity::repository_scope_uuid(&conn, rid) {
+                Ok(scope) => scope,
+                Err(crate::errors::DatabaseError::NotFound { entity, .. })
+                    if entity == "repository" =>
+                {
+                    rid.to_string()
+                }
+                Err(error) => return Err(SyncError::DatabaseError(error)),
+            };
+            let legacy_authoritative =
+                crate::db::repo_scope_identity::legacy_repo_id_kv_authoritative(&conn)
+                    .map_err(SyncError::DatabaseError)?;
+            (scope, legacy_authoritative)
+        };
         let git_like = format!("handled_git_no_target_{}_%", scope);
         let svn_like = format!("handled_svn_no_target_{}_%", scope);
+        let legacy_git_like = format!("handled_git_no_target_{}_%", rid);
+        let legacy_svn_like = format!("handled_svn_no_target_{}_%", rid);
         let count: i64 = {
             let conn = self.db.conn();
-            conn.query_row(
-                "SELECT COUNT(*) FROM kv_state WHERE key LIKE ?1 OR key LIKE ?2",
-                rusqlite::params![git_like, svn_like],
-                |row| row.get(0),
-            )
-            .map_err(crate::errors::DatabaseError::from)?
+            if legacy_authoritative {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM kv_state WHERE key LIKE ?1 OR key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4",
+                    rusqlite::params![git_like, svn_like, legacy_git_like, legacy_svn_like],
+                    |row| row.get(0),
+                )
+                .map_err(crate::errors::DatabaseError::from)?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM kv_state WHERE key LIKE ?1 OR key LIKE ?2",
+                    rusqlite::params![git_like, svn_like],
+                    |row| row.get(0),
+                )
+                .map_err(crate::errors::DatabaseError::from)?
+            }
         };
         Ok(count > 0)
     }
@@ -1304,7 +1341,27 @@ impl SyncEngine {
             let generation =
                 repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
             return match verify_no_target_receipt(&record, rid, sha, &projection, generation) {
-                NoTargetReceiptVerdict::Accepted => Ok(true),
+                NoTargetReceiptVerdict::Accepted => {
+                    if crate::echo_receipt_scope::legacy_git_no_target_mirror_blocks(
+                        &self.db,
+                        rid,
+                        sha,
+                        &projection,
+                        generation,
+                    )
+                    .map_err(SyncError::DatabaseError)?
+                    {
+                        return Err(self.record_history_block(
+                            "unverified_no_target_receipt",
+                            "no-target receipt lacks verified outcome evidence",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    Ok(true)
+                }
                 NoTargetReceiptVerdict::StaleGeneration => Ok(false),
                 NoTargetReceiptVerdict::RepoOrShaMismatch => Err(self.record_history_block(
                     "unverified_no_target_receipt",
@@ -1341,7 +1398,7 @@ impl SyncEngine {
             };
         }
         let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
-        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid)
+        let scope = crate::db::repo_scope_identity::repository_scope_token(&self.db.conn(), rid)
             .map_err(SyncError::DatabaseError)?;
         let legacy_key = format!("handled_git_no_target_{}_{}", rid, sha);
         let canonical_key = handled_git_no_target_state_key(&scope, generation, sha);
@@ -4944,6 +5001,29 @@ repo = "test/test-repo"
         team_echo_engine_with_git_dir(repo_id).0
     }
 
+    fn store_git_no_target_receipt_for_tests(
+        engine: &SyncEngine,
+        repo_id: &str,
+        git_sha: &str,
+        receipt: serde_json::Value,
+    ) {
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&engine.db().conn(), repo_id)
+                .unwrap();
+        let mut receipt = receipt;
+        crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
+        let generation = receipt
+            .get("generation")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(crate::pair_refresh::PAIR_GENERATION);
+        let scoped_key =
+            crate::echo_receipt_scope::handled_git_no_target_state_key(&scope, generation, git_sha);
+        let legacy_key = format!("handled_git_no_target_{repo_id}_{git_sha}");
+        let raw = receipt.to_string();
+        engine.db().set_state(&scoped_key, &raw).unwrap();
+        engine.db().set_state(&legacy_key, &raw).unwrap();
+    }
+
     fn begin_running_svn_to_git_push(db: &Database, repo_id: &str, git_sha: &str) {
         let fingerprint = git_push_target_fingerprint(repo_id, "origin", "main");
         db.begin_svn_to_git_push(GitPushIntent {
@@ -5113,13 +5193,7 @@ repo = "test/test-repo"
             "projection": projection,
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{sha}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &sha, receipt);
         assert!(engine.checked_no_target_receipt("pair", &sha).unwrap());
         crate::echo_receipt_scope::bump_repo_echo_generation(engine.db(), "pair").unwrap();
         assert!(!engine.checked_no_target_receipt("pair", &sha).unwrap());
@@ -5199,17 +5273,15 @@ repo = "test/test-repo"
             "projection": projection,
         });
         attach_generation_to_receipt(&mut receipt, generation);
-        engine
-            .db()
-            .set_state(
-                &handled_git_no_target_state_key("pair", generation, &kv_sha),
-                &receipt.to_string(),
-            )
-            .unwrap();
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &kv_sha)
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &kv_sha, receipt);
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &engine.db().conn(),
+            "pair",
+            &kv_sha,
+            &now,
+        )
+        .unwrap();
         engine
             .db()
             .conn()
@@ -5263,13 +5335,7 @@ repo = "test/test-repo"
             "projection": projection,
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{kv_sha}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &kv_sha, receipt);
         engine
             .db()
             .reset_repo_sync_mappings_for_reimport("pair")
@@ -5330,13 +5396,7 @@ repo = "test/test-repo"
             "projection": engine.no_target_projection(),
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{column_sha}"),
-                &weak_receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &column_sha, weak_receipt);
         engine
             .db()
             .reset_repo_sync_mappings_for_reimport("pair")
@@ -5580,13 +5640,7 @@ repo = "test/test-repo"
             "projection": engine.no_target_projection(),
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{frontier}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &frontier, receipt);
         engine
             .db()
             .reset_repo_sync_mappings_for_reimport("pair")
@@ -5647,13 +5701,7 @@ repo = "test/test-repo"
             "projection": "not-the-policy",
             "generation": 99,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{child}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &child, receipt);
         engine
             .db()
             .conn()
@@ -5707,13 +5755,7 @@ repo = "test/test-repo"
             "projection": engine.no_target_projection(),
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{filtered}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &filtered, receipt);
         engine
             .db()
             .conn()
@@ -5909,13 +5951,7 @@ repo = "test/test-repo"
             "outcome": "filtered",
             "projection": projection,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{sha}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &sha, receipt);
         assert!(engine.checked_no_target_receipt("pair", &sha).unwrap());
     }
 
@@ -5924,17 +5960,25 @@ repo = "test/test-repo"
         let engine = team_echo_engine("pair");
         let svn_rev = 9_i64;
         let projection = engine.no_target_projection();
-        let receipt = serde_json::json!({
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&engine.db().conn(), "pair")
+                .unwrap();
+        let mut receipt = serde_json::json!({
             "version": 1,
             "repo_id": "pair",
             "svn_revision": svn_rev,
             "outcome": "no_git_content",
             "projection": projection,
         });
+        crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
         engine
             .db()
             .set_state(
-                &format!("handled_svn_no_target_pair_{svn_rev}"),
+                &crate::echo_receipt_scope::handled_svn_no_target_state_key(
+                    &scope,
+                    crate::pair_refresh::PAIR_GENERATION,
+                    svn_rev,
+                ),
                 &receipt.to_string(),
             )
             .unwrap();

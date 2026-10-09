@@ -505,12 +505,18 @@ fn apply_baseline_watermarks(
     baseline_git_sha: &str,
     svn_rev: i64,
 ) -> Result<(), LatePairPublishRefusal> {
-    db.set_state(&format!("last_git_sha_{child_id}"), baseline_git_sha)
-        .map_err(|e| LatePairPublishRefusal {
-            reason: "watermark_failed".into(),
-            detail: format!("failed to set scoped git watermark: {e}"),
-            plan: None,
-        })?;
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &db.conn(),
+        child_id,
+        baseline_git_sha,
+        &now,
+    )
+    .map_err(|e| LatePairPublishRefusal {
+        reason: "watermark_failed".into(),
+        detail: format!("failed to set scoped git watermark: {e}"),
+        plan: None,
+    })?;
     db.set_state(&format!("last_svn_rev_{child_id}"), &svn_rev.to_string())
         .map_err(|e| LatePairPublishRefusal {
             reason: "watermark_failed".into(),

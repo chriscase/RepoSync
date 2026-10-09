@@ -12,6 +12,18 @@ pub const SCOPE_UUID_COLUMN: &str = "scope_uuid";
 
 /// Load the durable scope UUID for a managed repository row, assigning one lazily
 /// when legacy rows predate v13.
+/// Scope token for KV/receipt keys: durable `scope_uuid` when the repository row
+/// exists, otherwise the caller-supplied id (late pair bootstrap before registration).
+pub fn repository_scope_token(conn: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
+    match repository_scope_uuid(conn, repo_id) {
+        Ok(scope) => Ok(scope),
+        Err(DatabaseError::NotFound { entity, .. }) if entity == "repository" => {
+            Ok(repo_id.to_string())
+        }
+        Err(other) => Err(other),
+    }
+}
+
 pub fn repository_scope_uuid(conn: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
     let row_exists: bool = conn
         .query_row(
@@ -110,6 +122,21 @@ pub fn attach_scope_uuid_to_receipt(receipt: &mut serde_json::Value, scope_uuid:
     }
 }
 
+fn escape_like_literal(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn legacy_git_no_target_like_pattern(repo_id: &str) -> String {
+    format!("handled_git_no_target_{}_%", escape_like_literal(repo_id))
+}
+
+fn legacy_svn_no_target_like_pattern(repo_id: &str) -> String {
+    format!("handled_svn_no_target_{}_%", escape_like_literal(repo_id))
+}
+
 fn copy_kv_if_absent(conn: &Connection, from_key: &str, to_key: &str) -> Result<(), DatabaseError> {
     if from_key == to_key {
         return Ok(());
@@ -154,11 +181,14 @@ fn migrate_legacy_kv_for_repo(
         &team_history_block_kv_key(scope_uuid),
     )?;
 
+    let git_like = legacy_git_no_target_like_pattern(repo_id);
+    let svn_like = legacy_svn_no_target_like_pattern(repo_id);
     let git_prefix = format!("handled_git_no_target_{repo_id}_");
     let svn_prefix = format!("handled_svn_no_target_{repo_id}_");
-    let mut stmt = conn.prepare("SELECT key, value, updated_at FROM kv_state WHERE key LIKE ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT key, value, updated_at FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
     let git_rows: Vec<(String, String, String)> = stmt
-        .query_map([&git_prefix], |row| {
+        .query_map([&git_like], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .filter_map(|r| r.ok())
@@ -175,9 +205,10 @@ fn migrate_legacy_kv_for_repo(
             )?;
         }
     }
-    let mut stmt = conn.prepare("SELECT key, value, updated_at FROM kv_state WHERE key LIKE ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT key, value, updated_at FROM kv_state WHERE key LIKE ?1 ESCAPE '\\'")?;
     let svn_rows: Vec<(String, String, String)> = stmt
-        .query_map([&svn_prefix], |row| {
+        .query_map([&svn_like], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .filter_map(|r| r.ok())
@@ -309,6 +340,119 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             EchoDisposition::ApplyGenuine
+        );
+    }
+
+    #[test]
+    fn v13_migration_escapes_wildcard_repo_id_in_receipt_prefix() {
+        let conn = setup_conn();
+        let wild = "wild%_id";
+        let scope_uuid = new_scope_uuid();
+        conn.execute(
+            "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_at, updated_at, last_svn_rev, last_git_sha, sync_status, total_syncs, total_errors, consecutive_errors, scope_uuid)
+             VALUES (?1, ?1, 'file:///x', '', '', 'local', '', '', 'main', 'team', 5, 0, 0, 1, 't', 't', 0, '', 'idle', 0, 0, 0, ?2)",
+            params![wild, scope_uuid],
+        )
+        .unwrap();
+        let sha = "d".repeat(40);
+        let decoy_sha = "e".repeat(40);
+        conn.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, 't')",
+            params![
+                format!("handled_git_no_target_{wild}_{sha}"),
+                serde_json::json!({
+                    "version": 1,
+                    "repo_id": wild,
+                    "git_sha": sha,
+                    "outcome": "filtered",
+                    "projection": "{}",
+                    "generation": 1,
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, 't')",
+            params![
+                format!("handled_git_no_target_{wild}x_{decoy_sha}"),
+                serde_json::json!({
+                    "version": 1,
+                    "repo_id": "wild%x",
+                    "git_sha": decoy_sha,
+                    "outcome": "filtered",
+                    "projection": "{}",
+                    "generation": 1,
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+        migrate_v13_scope_uuid(&conn).unwrap();
+        let scope = repository_scope_uuid(&conn, wild).unwrap();
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM kv_state WHERE key = ?1",
+                params![handled_git_no_target_state_key(&scope, 1, &sha)],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                > 0,
+            "expected receipt migrated under scope_uuid key"
+        );
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM kv_state WHERE key = ?1",
+                params![handled_git_no_target_state_key(&scope, 1, &decoy_sha)],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 0,
+            "LIKE migration must not pick up keys from a different repo id prefix"
+        );
+    }
+
+    #[test]
+    fn write_scoped_inbound_checkpoint_does_not_block() {
+        let db = crate::db::Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        insert_repo(&db.conn(), "pair");
+        let before = "b".repeat(40);
+        let after = "a".repeat(40);
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&db.conn(), "pair", &before, "t")
+            .unwrap();
+        use crate::db::svn_commit_operations::{IntendedPath, SvnCommitIntent};
+        let op = db
+            .begin_git_to_svn_commit(SvnCommitIntent {
+                repo_id: "pair",
+                initiator_id: "worker",
+                request_id: "req",
+                target_fingerprint: "fp",
+                source_git_sha: &after,
+                source_git_parent: Some(&before),
+                source_git_tree: "tree",
+                target_svn_uuid: "uuid",
+                target_svn_path: "file:///fixture/trunk",
+                target_svn_root_url: "file:///fixture",
+                target_svn_branch_path: "trunk",
+                pre_write_svn_rev: 2,
+                pre_write_svn_tree: "pre",
+                projection: "{}",
+                intended_changed_paths: vec![IntendedPath {
+                    action: "A".into(),
+                    path: "a.txt".into(),
+                    content_sha256: Some("d".repeat(64)),
+                }],
+                intended_svn_tree: "post",
+                author: "fixture",
+                source_message: "fixture change",
+            })
+            .unwrap();
+        db.confirm_git_to_svn_commit("pair", &op.id, 3, "post")
+            .unwrap();
+        assert_eq!(
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair").unwrap(),
+            Some(after),
         );
     }
 

@@ -59,12 +59,26 @@ fingerprints sufficient to verify an external effect.
 ## Operational v13 scope identity (shipped slice)
 
 - Each managed repository row carries an immutable `scope_uuid` assigned at
-  registration (v13 backfill for existing rows).
-- Echo generation, Git checkpoint KV, no-target receipts, and durable history
-  blocks key off `scope_uuid`, not the human `id`, so delete + re-register cannot
-  reuse stale scoped state.
-- Legacy repo-id KV/receipts without `scope_uuid` remain authoritative only when
-  at most one repository row exists; otherwise they are ignored.
+  registration (v13 backfill for existing rows). The human-chosen repository
+  `id` is a label only: matching `id` after delete + re-register does **not**
+  prove continuity of repository identity. Authority always follows
+  `scope_uuid` (and generation-scoped receipts bound to that UUID).
+- Git→SVN **inbound** handled checkpoints live in UUID-scoped KV
+  (`last_git_sha_<scope_uuid>`). A repo-id mirror (`last_git_sha_<id>`) may
+  exist for operators and isolation tests; when both are present they must
+  agree or sync blocks with `ambiguous_checkpoint`.
+- `repositories.last_git_sha` remains the SVN-emitted Git tip (split cursor);
+  it is not interchangeable with the inbound checkpoint KV.
+- Echo generation, no-target receipts, and durable history blocks key off
+  `scope_uuid`, not the human `id`, so delete + re-register cannot reuse stale
+  scoped state.
+- Managed repositories with a `scope_uuid` accept no-target receipts only when
+  the receipt JSON carries the same `scope_uuid`. Legacy repo-id receipts
+  without `scope_uuid` are never authoritative for those rows, even after other
+  repository rows are removed.
+- Legacy repo-id KV/receipts without `scope_uuid` may be read only for
+  pre-v13 single-repository databases during migration; v13 migration binds
+  legacy rows to the original UUID or leaves them quarantined.
 
 ## Current v12/v13 compatibility (must keep working)
 

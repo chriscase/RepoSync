@@ -1567,7 +1567,13 @@ impl Database {
                     .as_ref()
                     .filter(|value| !value.is_empty())
                 {
-                    write_value(tx, &format!("last_git_sha_{repo_id}"), inbound)?;
+                    let now = chrono::Utc::now().to_rfc3339();
+                    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                        tx,
+                        repo_id,
+                        inbound,
+                        &now,
+                    )?;
                 }
             } else if baseline_restore == TombstoneBaselineRestore::Pending {
                 for scoped_key in [

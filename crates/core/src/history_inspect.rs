@@ -31,7 +31,7 @@ pub fn history_block_key(repo_id: Option<&str>) -> String {
 
 /// Durable history block key scoped by repository `scope_uuid` when available.
 pub fn history_block_key_for_repo(db: &Database, repo_id: &str) -> Result<String, DatabaseError> {
-    let scope = crate::db::repo_scope_identity::repository_scope_uuid(&db.conn(), repo_id)?;
+    let scope = crate::db::repo_scope_identity::repository_scope_token(&db.conn(), repo_id)?;
     Ok(crate::db::repo_scope_identity::team_history_block_kv_key(
         &scope,
     ))

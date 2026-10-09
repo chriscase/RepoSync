@@ -492,7 +492,8 @@ fn complete_import_tx(
         ));
     }
     write_value(tx, &format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())?;
-    write_value(tx, &format!("last_git_sha_{repo_id}"), sha)?;
+    let now = Utc::now().to_rfc3339();
+    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, repo_id, sha, &now)?;
     op.state = ImportOperationState::Completed;
     op.updated_at = Utc::now().to_rfc3339();
     write_value(

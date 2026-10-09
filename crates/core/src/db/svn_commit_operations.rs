@@ -229,10 +229,11 @@ fn finalize_tx(
                 "git-to-svn commit lost its repository registration".into(),
             ));
         }
-        write_value(
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
             tx,
-            &format!("last_git_sha_{}", op.repo_id),
+            &op.repo_id,
             &op.source_git_sha,
+            &now,
         )?;
         if Database::repo_writes_global_git_watermark(tx, &op.repo_id)? {
             write_value(tx, "last_git_hash", &op.source_git_sha)?;
