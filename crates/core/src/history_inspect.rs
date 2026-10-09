@@ -15,6 +15,8 @@ use serde_json::Value;
 
 use crate::db::Database;
 use crate::errors::{DatabaseError, SyncError};
+use crate::git::resolve_git_http_auth_token_for_workdir;
+use crate::git::startup_handoff;
 
 /// Rewrite of already-handled Git cursor (P→R ancestry failure).
 pub const DURABLE_HISTORY_REASON: &str = "non_fast_forward";
@@ -531,6 +533,24 @@ fn personal_checkpoint_ancestry(
     }
 }
 
+fn resolve_personal_history_http_auth(
+    db: &Database,
+    git_path: &Path,
+    scope_id: &str,
+    http_auth_token: Option<&str>,
+    config_token: Option<&str>,
+) -> Option<String> {
+    let chain_state = db.resolve_credential_chain_state(scope_id, "secret_git_token");
+    if chain_state.explicitly_revoked {
+        startup_handoff::forget_startup_http_auth(git_path);
+        return None;
+    }
+    if let Some(token) = http_auth_token.filter(|value| !value.is_empty()) {
+        return Some(token.to_string());
+    }
+    resolve_git_http_auth_token_for_workdir(db, scope_id, config_token, git_path)
+}
+
 fn block_personal_history(
     db: &Database,
     key: &str,
@@ -550,12 +570,15 @@ fn block_personal_history(
 /// Missing origin, missing checkpoint, or conflicting checkpoint provenance
 /// fail closed before SVN writes. Initial import owns initialization and does
 /// not call this gate. A durable rewrite block still refuses writes after
-/// restart.
-pub fn inspect_personal_history(
+/// restart. HTTP(S) auth is taken from `http_auth_token`, the scoped
+/// `secret_git_token` chain, config token, or same-process startup clone handoff.
+pub fn inspect_personal_history_with_http_auth(
     db: &Database,
     git_path: &Path,
     branch: &str,
     scope_id: &str,
+    http_auth_token: Option<&str>,
+    config_token: Option<&str>,
 ) -> Result<Option<HistoryInspectAdmission>, SyncError> {
     let key = history_block_key(Some(scope_id));
     if scope_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
@@ -644,10 +667,26 @@ pub fn inspect_personal_history(
             Some(&checkpoint),
         );
     }
-    match inspect_fetched_history(git_path, branch, Some(checkpoint.clone()), None) {
+    let http_auth_token =
+        resolve_personal_history_http_auth(db, git_path, scope_id, http_auth_token, config_token);
+    match inspect_fetched_history(
+        git_path,
+        branch,
+        Some(checkpoint.clone()),
+        http_auth_token.as_deref(),
+    ) {
         Ok(admission) => Ok(Some(admission)),
         Err(reject) => block_personal_history(db, &key, scope_id, reject, Some(&checkpoint)),
     }
+}
+
+pub fn inspect_personal_history(
+    db: &Database,
+    git_path: &Path,
+    branch: &str,
+    scope_id: &str,
+) -> Result<Option<HistoryInspectAdmission>, SyncError> {
+    inspect_personal_history_with_http_auth(db, git_path, branch, scope_id, None, None)
 }
 
 #[cfg(test)]
@@ -1093,5 +1132,31 @@ mod tests {
             .expect("origin and checkpoint require inspection");
         assert_eq!(admission.checkpoint, handled);
         assert_eq!(admission.remote_tip, handled);
+    }
+
+    #[test]
+    fn personal_history_auth_revocation_beats_handoff_and_stale_tokens() {
+        use crate::db::personal_scope::PERSONAL_SCOPE_KEY;
+        use crate::git::startup_handoff;
+
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        std::fs::create_dir_all(&git_work).unwrap();
+        startup_handoff::remember_startup_http_auth(&git_work, "handoff-token");
+
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let chain_key = format!("secret_git_token_{}", PERSONAL_SCOPE_KEY);
+        db.set_state(&chain_key, "").unwrap();
+
+        assert!(resolve_personal_history_http_auth(
+            &db,
+            &git_work,
+            PERSONAL_SCOPE_KEY,
+            Some("stale-caller-token"),
+            Some("stale-config-token"),
+        )
+        .is_none());
+        assert!(startup_handoff::peek_startup_http_auth(&git_work).is_none());
     }
 }
