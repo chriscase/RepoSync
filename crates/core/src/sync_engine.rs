@@ -747,10 +747,12 @@ impl SyncEngine {
         {
             return Ok(false);
         }
-        let origin_configured =
+        let origin_url =
             sync_git_command_output(&repo_path, &["remote", "get-url", "origin"], timeout, None)
-                .is_some_and(|output| output.status.success() && !output.stdout.is_empty());
-        if !origin_configured {
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|url| !url.is_empty());
+        if origin_url.is_none() {
             return Ok(true);
         }
         if Some(sha)
@@ -758,6 +760,12 @@ impl SyncEngine {
                 .as_deref()
         {
             return Ok(false);
+        }
+        if origin_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://"))
+        {
+            return Ok(true);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
         let fetched = sync_git_command_output(
@@ -809,6 +817,17 @@ impl SyncEngine {
 
     fn refresh_origin_branch_tip(repo_path: &Path, branch: &str, http_auth_token: Option<&str>) {
         let timeout = Duration::from_secs(5);
+        let origin_url =
+            sync_git_command_output(repo_path, &["remote", "get-url", "origin"], timeout, None)
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|url| !url.is_empty());
+        if origin_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://"))
+        {
+            return;
+        }
         let _ = sync_git_command_output(
             repo_path,
             &["fetch", "--quiet", "--no-tags", "origin", branch],
