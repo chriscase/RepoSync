@@ -59,8 +59,13 @@ fn set_repo_git_checkpoint_kv(db: &Database, repo_id: &str, sha: &str) {
 }
 
 fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
-    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
+    if let Some(value) = reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
         .expect("read inbound git sha kv")
+    {
+        return Some(value);
+    }
+    db.get_state(&reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key(repo_id))
+        .expect("read legacy inbound git sha kv")
 }
 
 fn clear_inbound_git_sha_kv(db: &Database, repo_id: &str) {
