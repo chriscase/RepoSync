@@ -341,6 +341,9 @@ pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
 /// until the engine is ready to migrate scoped KV without losing import cursors.
 /// Multi-repository v12 databases still migrate during `initialize`.
 fn defer_v13_migration_until_engine(conn: &Connection) -> Result<bool, DatabaseError> {
+    if !connection_is_file_backed(conn)? {
+        return Ok(false);
+    }
     if get_schema_version(conn)? != 12 {
         return Ok(false);
     }
@@ -364,6 +367,17 @@ fn defer_v13_migration_until_engine(conn: &Connection) -> Result<bool, DatabaseE
         |row| row.get(0),
     )?;
     Ok(has_legacy)
+}
+
+/// Deferred v13 applies only to real on-disk legacy installs (R01), not in-memory
+/// adversarial replays that downgrade schema and call `initialize()` again.
+fn connection_is_file_backed(conn: &Connection) -> Result<bool, DatabaseError> {
+    let main_file: String = conn.query_row(
+        "SELECT COALESCE(file, '') FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!main_file.is_empty() && main_file != ":memory:")
 }
 
 fn repositories_table_has_scope_uuid_column(conn: &Connection) -> Result<bool, DatabaseError> {
