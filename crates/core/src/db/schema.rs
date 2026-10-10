@@ -313,16 +313,22 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 /// SQLite transaction. A newer `user_version` than [`CURRENT_SCHEMA_VERSION`]
 /// is refused before any migration write.
 pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
+    run_migrations_up_to(conn, CURRENT_SCHEMA_VERSION)
+}
+
+/// Apply registered migrations through `target_version` (capped at [`CURRENT_SCHEMA_VERSION`]).
+pub fn run_migrations_up_to(conn: &Connection, target_version: u32) -> Result<(), DatabaseError> {
     let current_version = get_schema_version(conn)?;
+    let capped_target = target_version.min(CURRENT_SCHEMA_VERSION);
     info!(
         current_version,
-        target_version = CURRENT_SCHEMA_VERSION,
+        target_version = capped_target,
         "checking database migrations"
     );
     refuse_future_schema(current_version)?;
 
     for &(version, description, sql) in MIGRATIONS {
-        if version > CURRENT_SCHEMA_VERSION {
+        if version > capped_target {
             continue;
         }
         if version > current_version {
