@@ -1427,27 +1427,29 @@ impl Database {
     /// Hard-delete a repository and all associated data from all tables.
     /// Used for branch pair cleanup. Wraps all deletes in a transaction.
     pub fn hard_delete_repository(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        conn.execute_batch("BEGIN TRANSACTION")?;
-
-        let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
-        for table in &tables_with_repo_id {
-            let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
-            match conn.execute(&sql, params![repo_id]) {
-                Ok(n) => debug!(table, repo_id, count = n, "deleted records"),
-                Err(e) => {
-                    debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping")
+        {
+            let conn = self.conn();
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
+        }
+        self.transaction(|conn| {
+            let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
+            for table in &tables_with_repo_id {
+                let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
+                match conn.execute(&sql, params![repo_id]) {
+                    Ok(n) => debug!(table, repo_id, count = n, "deleted records"),
+                    Err(e) => {
+                        debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping")
+                    }
                 }
             }
-        }
 
-        for cred_key in super::managed_remove::owned_secret_keys(repo_id) {
-            conn.execute("DELETE FROM kv_state WHERE key = ?1", params![cred_key])?;
-        }
+            for cred_key in super::managed_remove::owned_secret_keys(repo_id) {
+                conn.execute("DELETE FROM kv_state WHERE key = ?1", params![cred_key])?;
+            }
 
-        crate::db::repo_scope_identity::delete_repository_registration_row(&conn, repo_id)?;
-
-        conn.execute_batch("COMMIT")?;
+            crate::db::repo_scope_identity::delete_repository_registration_row(conn, repo_id)?;
+            Ok(())
+        })?;
         info!(repo_id, "hard-deleted repository and all associated data");
         Ok(())
     }
@@ -2918,8 +2920,14 @@ impl Database {
     }
 
     pub fn delete_repository(&self, id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        crate::db::repo_scope_identity::delete_repository_registration_row(&conn, id)?;
+        {
+            let conn = self.conn();
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
+        }
+        self.transaction(|conn| {
+            crate::db::repo_scope_identity::delete_repository_registration_row(conn, id)?;
+            Ok(())
+        })?;
         debug!(id, "deleted repository");
         Ok(())
     }

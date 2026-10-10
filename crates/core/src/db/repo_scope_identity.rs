@@ -496,6 +496,14 @@ pub(crate) fn after_repository_row_deleted(conn: &Connection) -> Result<(), Data
     Ok(())
 }
 
+/// Scope-identity schema must be current before any registration removal touches scoped KV.
+pub(crate) fn ensure_repository_removal_ready(conn: &Connection) -> Result<(), DatabaseError> {
+    if super::schema::v13_migration_deferred_for_engine(conn)? {
+        super::schema::ensure_v13_migration(conn)?;
+    }
+    Ok(())
+}
+
 /// Shared registration removal: purge scoped/legacy KV, delete the row, latch/sweep.
 pub(crate) fn delete_repository_registration_row(
     conn: &Connection,

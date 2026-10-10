@@ -1321,6 +1321,10 @@ impl Database {
         let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
             DatabaseError::Other(format!("encryption key unavailable: {error}"))
         })?;
+        {
+            let conn = self.conn();
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
+        }
         self.transaction(|tx| {
             let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
             let inbound_last_git_sha = read_value(tx, &format!("last_git_sha_{repo_id}"))?;

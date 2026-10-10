@@ -346,6 +346,11 @@ pub fn run_migrations_up_to(conn: &Connection, target_version: u32) -> Result<()
 /// `Database::initialize` on an old on-disk file preserves `user_version` 12
 /// until the engine is ready to migrate scoped KV without losing import cursors.
 /// Multi-repository v12 databases still migrate during `initialize`.
+/// True when operational v13 was skipped at `initialize` for a lone legacy file install.
+pub(crate) fn v13_migration_deferred_for_engine(conn: &Connection) -> Result<bool, DatabaseError> {
+    defer_v13_migration_until_engine(conn)
+}
+
 fn defer_v13_migration_until_engine(conn: &Connection) -> Result<bool, DatabaseError> {
     if !connection_is_file_backed(conn)? {
         return Ok(false);

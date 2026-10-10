@@ -669,14 +669,14 @@ pub fn write_scoped_last_git_sha_kv(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![kv_key, git_sha, updated_at],
     )?;
-    // Human-id mirror for diagnostics and split-cursor fixtures; authoritative reads
-    // remain gated by `legacy_repo_id_kv_authoritative` (#63 explicit-only).
-    let legacy_key = legacy_last_git_sha_kv_key(repo_id);
-    tx.execute(
-        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        params![legacy_key, git_sha, updated_at],
-    )?;
+    if legacy_repo_id_kv_authoritative(tx)? {
+        let legacy_key = legacy_last_git_sha_kv_key(repo_id);
+        tx.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![legacy_key, git_sha, updated_at],
+        )?;
+    }
     Ok(())
 }
 
@@ -880,6 +880,8 @@ mod tests {
                 "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
                 [&filtered],
             )
+            .unwrap();
+        crate::db::repo_scope_identity::set_legacy_repo_id_kv_reads_enabled(&db.conn(), true)
             .unwrap();
         write_scoped_last_git_sha_kv(&db.conn(), "pair", &filtered, &now).unwrap();
         assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
