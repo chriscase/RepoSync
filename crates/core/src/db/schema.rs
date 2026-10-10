@@ -293,11 +293,19 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
         ALTER TABLE repositories ADD COLUMN teams_webhook_url TEXT;
         "#,
     ),
+    (
+        13,
+        "durable repository scope_uuid for echo/checkpoint keys",
+        r#"
+        ALTER TABLE repositories ADD COLUMN scope_uuid TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_scope_uuid ON repositories(scope_uuid);
+        "#,
+    ),
 ];
 
-/// Operational schema version for ordinary startup. Candidate v13/v14 SQL is
+/// Operational schema version for ordinary startup. Candidate v14+ SQL is
 /// not registered here and must not be applied by [`run_migrations`].
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 
 /// Run all pending migrations against `conn`.
 ///
@@ -305,24 +313,112 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 /// SQLite transaction. A newer `user_version` than [`CURRENT_SCHEMA_VERSION`]
 /// is refused before any migration write.
 pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
+    run_migrations_up_to(conn, CURRENT_SCHEMA_VERSION)
+}
+
+/// Apply registered migrations through `target_version` (capped at [`CURRENT_SCHEMA_VERSION`]).
+pub fn run_migrations_up_to(conn: &Connection, target_version: u32) -> Result<(), DatabaseError> {
     let current_version = get_schema_version(conn)?;
+    let capped_target = target_version.min(CURRENT_SCHEMA_VERSION);
     info!(
         current_version,
-        target_version = CURRENT_SCHEMA_VERSION,
+        target_version = capped_target,
         "checking database migrations"
     );
     refuse_future_schema(current_version)?;
 
     for &(version, description, sql) in MIGRATIONS {
-        if version > CURRENT_SCHEMA_VERSION {
+        if version > capped_target {
             continue;
         }
         if version > current_version {
+            if version == 13 && defer_v13_migration_until_engine(conn)? {
+                continue;
+            }
             apply_one_migration(conn, version, description, sql)?;
         }
     }
 
     Ok(())
+}
+
+/// v13 backfill runs at first sync-engine cycle for lone legacy v12 installs so
+/// `Database::initialize` on an old on-disk file preserves `user_version` 12
+/// until the engine is ready to migrate scoped KV without losing import cursors.
+/// Multi-repository v12 databases still migrate during `initialize`.
+/// True when operational v13 was skipped at `initialize` for a lone legacy file install.
+pub(crate) fn v13_migration_deferred_for_engine(conn: &Connection) -> Result<bool, DatabaseError> {
+    defer_v13_migration_until_engine(conn)
+}
+
+fn defer_v13_migration_until_engine(conn: &Connection) -> Result<bool, DatabaseError> {
+    if !connection_is_file_backed(conn)? {
+        return Ok(false);
+    }
+    if get_schema_version(conn)? != 12 {
+        return Ok(false);
+    }
+    let repo_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    if repo_count != 1 {
+        return Ok(false);
+    }
+    if repositories_table_has_scope_uuid_column(conn)? {
+        return Ok(false);
+    }
+    let repo_id: String = conn.query_row(
+        "SELECT id FROM repositories ORDER BY id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_key = super::repo_scope_identity::legacy_last_git_sha_kv_key(&repo_id);
+    let has_legacy: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key = ?1)",
+        [legacy_key.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(has_legacy)
+}
+
+/// Deferred v13 applies only to real on-disk legacy installs (R01), not in-memory
+/// adversarial replays that downgrade schema and call `initialize()` again.
+fn connection_is_file_backed(conn: &Connection) -> Result<bool, DatabaseError> {
+    let main_file: String = conn.query_row(
+        "SELECT COALESCE(file, '') FROM pragma_database_list WHERE name = 'main'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(!main_file.is_empty() && main_file != ":memory:")
+}
+
+fn repositories_table_has_scope_uuid_column(conn: &Connection) -> Result<bool, DatabaseError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('repositories') WHERE name = 'scope_uuid'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+/// Apply the v13 repository-scope migration when startup deferred it for a legacy install.
+pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
+    if get_schema_version(conn)? >= 13 {
+        return Ok(());
+    }
+    if get_schema_version(conn)? < 12 {
+        return Err(DatabaseError::MigrationFailed {
+            version: 13,
+            detail: "database must reach schema version 12 before v13 upgrade".into(),
+        });
+    }
+    let migration = MIGRATIONS
+        .iter()
+        .find(|(version, _, _)| *version == 13)
+        .expect("v13 migration must be registered");
+    let (version, description, sql) = migration;
+    apply_one_migration(conn, *version, description, sql)
 }
 
 /// Refuse a schema written by a newer executable.
@@ -355,6 +451,14 @@ fn apply_one_migration(
             version,
             detail: e.to_string(),
         })?;
+    if version == 13 {
+        super::repo_scope_identity::migrate_v13_scope_uuid(&tx).map_err(|e| {
+            DatabaseError::MigrationFailed {
+                version,
+                detail: e.to_string(),
+            }
+        })?;
+    }
     set_schema_version(&tx, version).map_err(|e| DatabaseError::MigrationFailed {
         version,
         detail: e.to_string(),

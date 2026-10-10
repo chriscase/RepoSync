@@ -184,11 +184,19 @@ fn advance_svn_with_receipt_tx(
     }
     advance_svn_only_tx(tx, repo_id, svn_rev)?;
     let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
+    let scope = crate::db::repo_scope_identity::repository_scope_uuid(tx, repo_id)?;
     let mut receipt = receipt;
     crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+    crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
     let receipt_key =
-        crate::echo_receipt_scope::handled_svn_no_target_state_key(repo_id, generation, svn_rev);
+        crate::echo_receipt_scope::handled_svn_no_target_state_key(&scope, generation, svn_rev);
     write_value(tx, &receipt_key, &receipt.to_string())?;
+    if crate::db::repo_scope_identity::legacy_repo_id_kv_authoritative(tx)? {
+        let legacy_key = crate::echo_receipt_scope::handled_svn_no_target_state_key(
+            repo_id, generation, svn_rev,
+        );
+        write_value(tx, &legacy_key, &receipt.to_string())?;
+    }
     Ok(())
 }
 
@@ -213,18 +221,31 @@ fn advance_git_with_receipt_tx(
         ));
     }
     let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
+    let scope = crate::db::repo_scope_identity::repository_scope_uuid(tx, repo_id)?;
     let mut receipt = receipt;
     crate::echo_receipt_scope::attach_generation_to_receipt(&mut receipt, generation);
+    crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
     let projection = receipt["projection"].as_str().unwrap_or("");
     let receipt_proves_kv = crate::echo_suppression::verify_no_target_receipt(
-        &receipt, repo_id, git_sha, projection, generation,
+        &receipt,
+        repo_id,
+        git_sha,
+        projection,
+        generation,
+        Some(&scope),
     ) == crate::echo_suppression::NoTargetReceiptVerdict::Accepted;
     if receipt_proves_kv {
-        write_value(tx, &format!("last_git_sha_{}", repo_id), git_sha)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, repo_id, git_sha, &now)?;
     }
-    let receipt_key =
-        crate::echo_receipt_scope::handled_git_no_target_state_key(repo_id, generation, git_sha);
-    write_value(tx, &receipt_key, &receipt.to_string())?;
+    crate::echo_receipt_scope::write_git_no_target_receipt_kv(
+        tx,
+        repo_id,
+        generation,
+        git_sha,
+        &receipt.to_string(),
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
     Ok(())
 }
 
@@ -565,7 +586,8 @@ mod tests {
                 ["a".repeat(40)],
             )
             .unwrap();
-        let inbound_git_before = db.get_state("last_git_sha_pair").unwrap();
+        let inbound_git_before =
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair").unwrap();
         let fingerprint = team_cycle_mapping_fingerprint("pair", "unfiltered");
         let op = db
             .begin_team_cycle_mapping(TeamCycleMappingIntent {
@@ -595,11 +617,9 @@ mod tests {
             db.get_state("last_svn_rev_pair").unwrap().as_deref(),
             Some("2")
         );
-        let receipt_raw = db
-            .get_state("handled_svn_no_target_pair_2")
+        let receipt = crate::echo_receipt_scope::read_svn_no_target_receipt(&db, "pair", 2)
             .unwrap()
             .unwrap();
-        let receipt = serde_json::from_str::<serde_json::Value>(&receipt_raw).unwrap();
         assert_eq!(
             verify_svn_no_target_receipt(&receipt, "pair", 2, "unfiltered", 1),
             NoTargetReceiptVerdict::Accepted
@@ -623,7 +643,7 @@ mod tests {
             .unwrap();
         assert_eq!(emitted_tip, "a".repeat(40));
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap(),
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair").unwrap(),
             inbound_git_before,
             "svn no-target must not move inbound git cursor"
         );
@@ -671,13 +691,14 @@ mod tests {
             "managed team git no-target must not write global last_git_hash"
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair")
+                .unwrap()
+                .as_deref(),
             Some(git_sha.as_str())
         );
-        let receipt = db
-            .get_state(&format!("handled_git_no_target_pair_{}", git_sha))
+        let receipt = crate::echo_receipt_scope::read_git_no_target_receipt(&db, "pair", &git_sha)
             .unwrap()
             .unwrap();
-        assert!(receipt.contains("filtered"));
+        assert_eq!(receipt["outcome"], "filtered");
     }
 }

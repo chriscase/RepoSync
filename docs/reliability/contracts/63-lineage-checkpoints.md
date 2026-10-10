@@ -1,7 +1,8 @@
 # #63 contract: canonical lineage, directional checkpoints, non-destructive migration
 
-**Status:** design/contract for review. No DDL, reader activation, or installer
-change ships in this PR. Normal startup remains SQLite `user_version=12`.
+**Status:** design/contract for review. Operational startup is SQLite
+`user_version=13` with durable `repositories.scope_uuid` for echo/receipt/checkpoint
+KV scope. Candidate v14 pair-generation tables remain fixture-only.
 
 **Depends on:** #62 catalog (`docs/reliability/acceptance-matrix.json`).
 **Coordinates with:** #54 nullable `commit_map.git_sha`; do not introduce a
@@ -55,7 +56,70 @@ A no-target row has a reason, policy snapshot, and NULL target as appropriate.
 NULL is not “missing row.” Preserve source/target parents/trees or stable
 fingerprints sufficient to verify an external effect.
 
-## Current v12 compatibility (must keep working)
+## Operational v13 scope identity (shipped slice)
+
+### Verified repository UUID vs human repository id
+
+| Concept | Role | Continuity |
+| --- | --- | --- |
+| **`scope_uuid`** | Durable repository identity for echo receipts, generations, inbound Git checkpoints, and history blocks | Survives only while the repository row exists; a new row gets a new UUID |
+| **`repositories.id`** | Human-chosen label for config, UI, and `sync_records.repo_id` | May be reused after delete + re-register; **must never** be treated as proof that scoped KV/receipt state from an earlier row still applies |
+
+Admission and checkpoint logic bind evidence to **`scope_uuid`**. A receipt or
+cursor key that matches only the human `id` (or omits `scope_uuid` on a managed
+row) is unverified. Matching `repo_id` in JSON without the same `scope_uuid` as
+the live row does not prove repository continuity.
+
+- Each managed repository row carries an immutable `scope_uuid` assigned at
+  registration (v13 backfill for existing rows). The human-chosen repository
+  `id` is a label only: matching `id` after delete + re-register does **not**
+  prove continuity of repository identity. Authority always follows
+  `scope_uuid` (and generation-scoped receipts bound to that UUID).
+- Git→SVN **inbound** handled checkpoints live in UUID-scoped KV
+  (`last_git_sha_<scope_uuid>`). A repo-id mirror (`last_git_sha_<id>`) may
+  exist for operators and isolation tests; when both are present they must
+  agree or sync blocks with `ambiguous_checkpoint`.
+- `repositories.last_git_sha` remains the SVN-emitted Git tip (split cursor);
+  it is not interchangeable with the inbound checkpoint KV.
+- Echo generation, no-target receipts, and durable history blocks key off
+  `scope_uuid`, not the human `id`, so delete + re-register cannot reuse stale
+  scoped state.
+- Managed repositories with a `scope_uuid` accept no-target receipts only when
+  the receipt JSON carries the same `scope_uuid`. Legacy repo-id receipts
+  without `scope_uuid` are never authoritative for those rows, even after other
+  repository rows are removed.
+- Legacy repo-id KV/receipts without `scope_uuid` may be read only for
+  pre-v13 single-repository databases during migration; v13 migration binds
+  legacy rows to the original UUID or leaves them quarantined.
+
+### Exact ownership for legacy scoped KV (v13 migration and delete)
+
+Human `repositories.id` and durable `scope_uuid` must never be conflated when
+matching KV key names. SQL `LIKE` with a repo-id prefix is unsafe: unescaped `_`
+acts as a single-character wildcard, and prefix matching cannot prove that a
+longer id (for example `pair2` or `pair_child`) belongs to a shorter id
+(`pair`).
+
+**Rule:** migrate, quarantine, or delete a legacy no-target receipt key only when
+**exact ownership** is proven:
+
+1. Parse the key as `handled_{git|svn}_no_target_<scope_token>_<suffix>` where
+   `<suffix>` is validated (40-character Git SHA, or `g<generation>_` plus SHA /
+   numeric SVN revision) so `<scope_token>` is unambiguous.
+2. Treat the key as owned by a human repository only when `<scope_token>` equals
+   that repository’s `id` exactly (not a prefix or LIKE match).
+3. When the JSON payload includes `repo_id`, it must equal that same repository
+   `id`; otherwise leave the key unchanged (fail closed).
+4. On hard delete, remove UUID-scoped receipt keys only when `<scope_token>`
+   equals that row’s `scope_uuid` exactly, plus the fixed legacy keys
+   (`last_git_sha_<id>`, and so on). Never delete through a bare
+   `handled_*_no_target_<prefix>%` pattern.
+
+Namespace-wide scans may use `GLOB` on the fixed literal prefix
+(`handled_git_no_target_*`); per-repo actions always filter with the exact-parse
+rules above.
+
+## Current v12/v13 compatibility (must keep working)
 
 Operational authority today is the bounded table in [design.md](../design.md):
 
@@ -111,7 +175,8 @@ is unacceptable.
 
 ## Smallest next implementation slice (after this review)
 
-Do **not** activate v13/v14. Ordinary startup remains `user_version=12`.
+Do **not** activate candidate v14 tables. Ordinary startup remains
+`user_version=13` with scoped KV only (no `pair_lineages` activation).
 
 The three items below are the reviewed implementation slice. Candidate tables,
 operational typed readers, and installer wiring stay later.

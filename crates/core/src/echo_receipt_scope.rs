@@ -1,66 +1,121 @@
 //! Generation-scoped echo receipt keys and validation (#63).
 //!
-//! Until pair-generation tables are activated, each repository uses a monotonic
-//! `repo_echo_generation_<repo_id>` kv counter (defaulting to 1). Receipts
-//! written after a bump carry the active generation; older receipts cannot
-//! suppress or satisfy a later generation.
+//! Echo receipts, generations, and checkpoint KV keys are scoped by durable
+//! `repositories.scope_uuid`, not the human repository id.
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::db::repo_scope_identity::{
+    attach_scope_uuid_to_receipt, last_git_sha_kv_key, legacy_last_git_sha_kv_key,
+    legacy_repo_echo_generation_kv_key, legacy_repo_id_kv_authoritative,
+    receipt_scope_uuid_matches, repo_echo_generation_kv_key, repository_scope_uuid,
+};
 use crate::db::Database;
 use crate::echo_suppression::{verify_no_target_receipt, NoTargetReceiptVerdict};
 use crate::errors::DatabaseError;
 use crate::pair_refresh::PAIR_GENERATION;
 
-const GENERATION_KV_PREFIX: &str = "repo_echo_generation_";
+/// True when the managed repository row carries a durable `scope_uuid` (v13+).
+fn managed_repo_requires_scoped_receipts(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    if repo_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
+        return Ok(false);
+    }
+    Ok(repository_scope_uuid(tx, repo_id).is_ok())
+}
+
+fn receipt_admits_for_repo(
+    tx: &Connection,
+    repo_id: &str,
+    scope: &str,
+    record: &serde_json::Value,
+    legacy_authoritative: bool,
+) -> Result<bool, DatabaseError> {
+    if record.get("repo_id").and_then(|v| v.as_str()) != Some(repo_id) {
+        return Ok(false);
+    }
+    if managed_repo_requires_scoped_receipts(tx, repo_id)? {
+        return Ok(record.get("scope_uuid").is_some() && receipt_scope_uuid_matches(record, scope));
+    }
+    if record.get("scope_uuid").is_some() {
+        return Ok(receipt_scope_uuid_matches(record, scope));
+    }
+    if legacy_authoritative {
+        return Ok(true);
+    }
+    // Unscoped human-id receipts apply only before the managed row exists (late pair).
+    Ok(!managed_repo_requires_scoped_receipts(tx, repo_id)?)
+}
+
+fn scope_token_for_repo(tx: &Connection, repo_id: &str) -> Result<String, DatabaseError> {
+    if repo_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
+        return Ok(repo_id.to_string());
+    }
+    match repository_scope_uuid(tx, repo_id) {
+        Ok(scope) => Ok(scope),
+        Err(DatabaseError::NotFound { entity, .. }) if entity == "repository" => {
+            Ok(repo_id.to_string())
+        }
+        Err(other) => Err(other),
+    }
+}
 
 /// Active echo-suppression generation for a managed repository scope.
 pub fn repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
-    let key = format!("{GENERATION_KV_PREFIX}{repo_id}");
+    let scope = scope_token_for_repo(tx, repo_id)?;
+    let key = repo_echo_generation_kv_key(&scope);
     let raw: Option<String> = tx
         .query_row("SELECT value FROM kv_state WHERE key = ?1", [key], |r| {
             r.get(0)
         })
         .optional()?;
-    match raw {
-        Some(value) => value
+    if let Some(value) = raw {
+        return value
             .parse::<i64>()
-            .map_err(|_| DatabaseError::Other("invalid repo echo generation".into())),
-        None => Ok(PAIR_GENERATION),
+            .map_err(|_| DatabaseError::Other("invalid repo echo generation".into()));
     }
+    if legacy_repo_id_kv_authoritative(tx)? {
+        let legacy_key = legacy_repo_echo_generation_kv_key(repo_id);
+        let legacy: Option<String> = tx
+            .query_row(
+                "SELECT value FROM kv_state WHERE key = ?1",
+                [legacy_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(value) = legacy {
+            return value
+                .parse::<i64>()
+                .map_err(|_| DatabaseError::Other("invalid repo echo generation".into()));
+        }
+    }
+    Ok(PAIR_GENERATION)
 }
 
 pub fn repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, DatabaseError> {
-    let key = format!("{GENERATION_KV_PREFIX}{repo_id}");
-    match db.get_state(&key)? {
-        Some(raw) => raw
-            .parse::<i64>()
-            .map_err(|_| DatabaseError::Other("invalid repo echo generation".into())),
-        None => Ok(PAIR_GENERATION),
-    }
+    repo_echo_generation_tx(&db.conn(), repo_id)
 }
 
 #[cfg(test)]
-static TEST_FORCE_SPLIT_FAIL: AtomicBool = AtomicBool::new(false);
-
-#[cfg(test)]
-pub(crate) fn test_force_next_split_fail() {
-    TEST_FORCE_SPLIT_FAIL.store(true, Ordering::SeqCst);
+pub(crate) fn test_force_next_split_fail(db: &Database) {
+    db.test_force_next_echo_split_fail();
 }
 
 /// When a generation bump follows a unified no-target cursor, restore the scoped
 /// KV copy to the last applied outbound Git SHA so stale receipts cannot admit P.
 fn split_unified_git_cursor_to_outbound_kv_tx(
+    #[allow(unused_variables)] db: Option<&Database>,
     tx: &Connection,
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
     #[cfg(test)]
-    if TEST_FORCE_SPLIT_FAIL.swap(false, Ordering::SeqCst) {
+    if db.is_some_and(|database| database.take_test_force_echo_split_fail()) {
         return Err(DatabaseError::Other("test forced split failure".into()));
     }
+    let scope = scope_token_for_repo(tx, repo_id)?;
     let column: Option<String> = tx
         .query_row(
             "SELECT last_git_sha FROM repositories WHERE id = ?1",
@@ -73,7 +128,7 @@ fn split_unified_git_cursor_to_outbound_kv_tx(
         return Ok(());
     }
     let column = column.unwrap();
-    let kv_key = format!("last_git_sha_{}", repo_id);
+    let kv_key = last_git_sha_kv_key(&scope);
     let kv: Option<String> = tx
         .query_row(
             "SELECT value FROM kv_state WHERE key = ?1",
@@ -103,20 +158,33 @@ fn split_unified_git_cursor_to_outbound_kv_tx(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![kv_key, handled, now],
     )?;
+    if legacy_repo_id_kv_authoritative(tx)? {
+        let legacy_key = legacy_last_git_sha_kv_key(repo_id);
+        tx.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![legacy_key, handled, now],
+        )?;
+    }
     Ok(())
 }
 
 /// Bump the echo generation on an open connection (same transaction as reset).
-pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i64, DatabaseError> {
+pub fn bump_repo_echo_generation_tx(
+    db: Option<&Database>,
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<i64, DatabaseError> {
     let next = repo_echo_generation_tx(tx, repo_id)? + 1;
-    let key = format!("{GENERATION_KV_PREFIX}{repo_id}");
+    let scope = scope_token_for_repo(tx, repo_id)?;
+    let key = repo_echo_generation_kv_key(&scope);
     let now = Utc::now().to_rfc3339();
     tx.execute(
         "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![key, next.to_string(), now],
     )?;
-    split_unified_git_cursor_to_outbound_kv_tx(tx, repo_id)?;
+    split_unified_git_cursor_to_outbound_kv_tx(db, tx, repo_id)?;
     Ok(next)
 }
 
@@ -124,12 +192,15 @@ pub fn bump_repo_echo_generation_tx(tx: &Connection, repo_id: &str) -> Result<i6
 pub fn bump_repo_echo_generation(db: &Database, repo_id: &str) -> Result<i64, DatabaseError> {
     let conn = db.conn();
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = bump_repo_echo_generation_tx(&conn, repo_id);
+    let result = bump_repo_echo_generation_tx(Some(db), &conn, repo_id);
     match result {
-        Ok(next) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(next)
-        }
+        Ok(next) => match conn.execute_batch("COMMIT") {
+            Ok(()) => Ok(next),
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(DatabaseError::from(error))
+            }
+        },
         Err(error) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(error)
@@ -150,26 +221,85 @@ pub fn attach_generation_to_receipt(receipt: &mut serde_json::Value, generation:
     }
 }
 
-pub fn handled_git_no_target_state_key(repo_id: &str, generation: i64, git_sha: &str) -> String {
+pub fn handled_git_no_target_state_key(
+    scope_token: &str,
+    generation: i64,
+    git_sha: &str,
+) -> String {
     if generation == PAIR_GENERATION {
-        format!("handled_git_no_target_{}_{}", repo_id, git_sha)
+        format!("handled_git_no_target_{}_{}", scope_token, git_sha)
     } else {
         format!(
             "handled_git_no_target_{}_g{}_{}",
-            repo_id, generation, git_sha
+            scope_token, generation, git_sha
         )
     }
 }
 
-pub fn handled_svn_no_target_state_key(repo_id: &str, generation: i64, svn_rev: i64) -> String {
+pub fn handled_svn_no_target_state_key(scope_token: &str, generation: i64, svn_rev: i64) -> String {
     if generation == PAIR_GENERATION {
-        format!("handled_svn_no_target_{}_{}", repo_id, svn_rev)
+        format!("handled_svn_no_target_{}_{}", scope_token, svn_rev)
     } else {
         format!(
             "handled_svn_no_target_{}_g{}_{}",
-            repo_id, generation, svn_rev
+            scope_token, generation, svn_rev
         )
     }
+}
+
+fn legacy_handled_git_no_target_state_key(repo_id: &str, generation: i64, git_sha: &str) -> String {
+    handled_git_no_target_state_key(repo_id, generation, git_sha)
+}
+
+/// Drop corrupt scoped receipt bytes when the human-id mirror already holds a
+/// valid JSON receipt for the same SHA (admin restore path). Direct readers that
+/// must fail closed on corrupt scoped bytes call `read_git_no_target_receipt`
+/// without this repair.
+pub fn quarantine_corrupt_scoped_git_no_target_if_legacy_recovered(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+) -> Result<(), DatabaseError> {
+    if legacy_repo_id_kv_authoritative(&db.conn())? {
+        return Ok(());
+    }
+    let conn = db.conn();
+    let scope = scope_token_for_repo(&conn, repo_id)?;
+    let legacy_key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+    let legacy_ok = conn
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [legacy_key.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some();
+    if !legacy_ok {
+        return Ok(());
+    }
+    let glob = format!("handled_git_no_target_{scope}_*");
+    for key in crate::db::repo_scope_identity::list_kv_keys_glob(&conn, &glob)? {
+        let tail = key.strip_prefix(&format!("handled_git_no_target_{scope}_"));
+        let Some(tail) = tail else { continue };
+        let matches_sha =
+            tail == git_sha || tail.rsplit_once('_').is_some_and(|(_, sha)| sha == git_sha);
+        if !matches_sha {
+            continue;
+        }
+        let raw: Option<String> = conn
+            .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if raw
+            .as_ref()
+            .is_some_and(|value| serde_json::from_str::<serde_json::Value>(value).is_err())
+        {
+            conn.execute("DELETE FROM kv_state WHERE key = ?1", [&key])?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a stored Git no-target receipt for the active generation, including
@@ -179,11 +309,62 @@ pub fn read_git_no_target_receipt(
     repo_id: &str,
     git_sha: &str,
 ) -> Result<Option<serde_json::Value>, DatabaseError> {
-    let generation = repo_echo_generation(db, repo_id)?;
-    let keys = [
-        handled_git_no_target_state_key(repo_id, generation, git_sha),
-        format!("handled_git_no_target_{}_{}", repo_id, git_sha),
-    ];
+    let (scope, generation, legacy_authoritative) = {
+        let conn = db.conn();
+        let scope = scope_token_for_repo(&conn, repo_id)?;
+        let managed_scoped = managed_repo_requires_scoped_receipts(&conn, repo_id)?;
+        let legacy_authoritative_for_malformed = legacy_repo_id_kv_authoritative(&conn)?;
+        if managed_scoped && !legacy_authoritative_for_malformed {
+            let mut corrupt_scoped_receipt = false;
+            let glob = format!("handled_git_no_target_{scope}_*");
+            let scoped_keys = crate::db::repo_scope_identity::list_kv_keys_glob(&conn, &glob)?;
+            for key in scoped_keys {
+                let owned = key.strip_prefix(&format!("handled_git_no_target_{scope}_"));
+                if owned.is_none() {
+                    continue;
+                }
+                let tail = owned.unwrap();
+                let matches_sha =
+                    tail == git_sha || tail.rsplit_once('_').is_some_and(|(_, sha)| sha == git_sha);
+                if !matches_sha {
+                    continue;
+                }
+                let raw: Option<String> = conn
+                    .query_row("SELECT value FROM kv_state WHERE key = ?1", [&key], |row| {
+                        row.get(0)
+                    })
+                    .optional()?;
+                let Some(raw) = raw else {
+                    continue;
+                };
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    corrupt_scoped_receipt = true;
+                    continue;
+                }
+            }
+            if corrupt_scoped_receipt {
+                return Err(DatabaseError::Other(
+                    "malformed scoped no-target receipt".into(),
+                ));
+            }
+        }
+        let generation = repo_echo_generation_tx(&conn, repo_id)?;
+        let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
+        (scope, generation, legacy_authoritative)
+    };
+    let keys = if legacy_authoritative {
+        [
+            format!("handled_git_no_target_{}_{}", repo_id, git_sha),
+            legacy_handled_git_no_target_state_key(repo_id, generation, git_sha),
+            handled_git_no_target_state_key(&scope, generation, git_sha),
+        ]
+    } else {
+        [
+            handled_git_no_target_state_key(&scope, generation, git_sha),
+            legacy_handled_git_no_target_state_key(repo_id, generation, git_sha),
+            format!("handled_git_no_target_{}_{}", repo_id, git_sha),
+        ]
+    };
     for key in keys {
         let Some(raw) = db.get_state(&key)? else {
             continue;
@@ -192,6 +373,9 @@ pub fn read_git_no_target_receipt(
         let Some(record) = receipt else {
             continue;
         };
+        if !receipt_admits_for_repo(&db.conn(), repo_id, &scope, &record, legacy_authoritative)? {
+            continue;
+        }
         if receipt_generation_accepted(&record, generation) {
             return Ok(Some(record));
         }
@@ -218,11 +402,25 @@ pub fn collect_git_no_target_receipts_for_sha(
     repo_id: &str,
     git_sha: &str,
 ) -> Result<Vec<serde_json::Value>, DatabaseError> {
-    let generation = repo_echo_generation(db, repo_id)?;
+    let (scope, generation, legacy_authoritative) = {
+        let conn = db.conn();
+        let scope = scope_token_for_repo(&conn, repo_id)?;
+        let generation = repo_echo_generation_tx(&conn, repo_id)?;
+        let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
+        (scope, generation, legacy_authoritative)
+    };
     let mut keys = Vec::new();
+    keys.push(legacy_handled_git_no_target_state_key(
+        repo_id,
+        PAIR_GENERATION,
+        git_sha,
+    ));
     keys.push(format!("handled_git_no_target_{}_{}", repo_id, git_sha));
     for gen in 1..=generation {
-        keys.push(handled_git_no_target_state_key(repo_id, gen, git_sha));
+        keys.push(handled_git_no_target_state_key(&scope, gen, git_sha));
+        keys.push(legacy_handled_git_no_target_state_key(
+            repo_id, gen, git_sha,
+        ));
     }
     let mut records = Vec::new();
     for key in keys {
@@ -232,9 +430,13 @@ pub fn collect_git_no_target_receipts_for_sha(
         let Ok(record) = serde_json::from_str::<serde_json::Value>(&raw) else {
             continue;
         };
-        if record["repo_id"] == repo_id && record["git_sha"] == git_sha {
-            records.push(record);
+        if record["repo_id"] != repo_id || record["git_sha"] != git_sha {
+            continue;
         }
+        if !receipt_admits_for_repo(&db.conn(), repo_id, &scope, &record, legacy_authoritative)? {
+            continue;
+        }
+        records.push(record);
     }
     Ok(records)
 }
@@ -246,14 +448,26 @@ pub fn stored_git_no_target_receipt_exists(
     git_sha: &str,
     projection: &str,
 ) -> Result<bool, DatabaseError> {
-    let Some(record) = read_git_no_target_receipt(db, repo_id, git_sha)? else {
-        return Ok(false);
+    let record = match read_git_no_target_receipt(db, repo_id, git_sha) {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(false),
+        Err(DatabaseError::Other(message))
+            if message.contains("malformed scoped no-target receipt") =>
+        {
+            return Ok(false);
+        }
+        Err(other) => return Err(other),
     };
     let generation = repo_echo_generation(db, repo_id)?;
-    Ok(
-        verify_no_target_receipt(&record, repo_id, git_sha, projection, generation)
-            == NoTargetReceiptVerdict::Accepted,
-    )
+    let scope = repository_scope_uuid(&db.conn(), repo_id).ok();
+    Ok(verify_no_target_receipt(
+        &record,
+        repo_id,
+        git_sha,
+        projection,
+        generation,
+        scope.as_deref(),
+    ) == NoTargetReceiptVerdict::Accepted)
 }
 
 /// Resolve a stored SVN no-target receipt for the active generation.
@@ -262,8 +476,15 @@ pub fn read_svn_no_target_receipt(
     repo_id: &str,
     svn_rev: i64,
 ) -> Result<Option<serde_json::Value>, DatabaseError> {
-    let generation = repo_echo_generation(db, repo_id)?;
+    let (scope, generation, legacy_authoritative) = {
+        let conn = db.conn();
+        let scope = scope_token_for_repo(&conn, repo_id)?;
+        let generation = repo_echo_generation_tx(&conn, repo_id)?;
+        let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
+        (scope, generation, legacy_authoritative)
+    };
     let keys = [
+        handled_svn_no_target_state_key(&scope, generation, svn_rev),
         handled_svn_no_target_state_key(repo_id, generation, svn_rev),
         format!("handled_svn_no_target_{}_{}", repo_id, svn_rev),
     ];
@@ -275,11 +496,268 @@ pub fn read_svn_no_target_receipt(
         let Some(record) = receipt else {
             continue;
         };
+        if !receipt_admits_for_repo(&db.conn(), repo_id, &scope, &record, legacy_authoritative)? {
+            continue;
+        }
         if receipt_generation_accepted(&record, generation) {
             return Ok(Some(record));
         }
     }
     Ok(None)
+}
+
+/// When a repo-id mirror receipt exists for a scoped repository, it must verify
+/// for the same generation or checkpoint logic treats the mirror as tampered.
+pub fn legacy_git_no_target_mirror_blocks(
+    db: &Database,
+    repo_id: &str,
+    git_sha: &str,
+    projection: &str,
+    generation: i64,
+) -> Result<bool, DatabaseError> {
+    if !managed_repo_requires_scoped_receipts(&db.conn(), repo_id)? {
+        return Ok(false);
+    }
+    let scope = scope_token_for_repo(&db.conn(), repo_id)?;
+    let canonical_key = handled_git_no_target_state_key(&scope, generation, git_sha);
+    if db.get_state(&canonical_key)?.is_none() {
+        return Ok(false);
+    }
+    let legacy_key = format!("handled_git_no_target_{}_{}", repo_id, git_sha);
+    let Some(raw) = db.get_state(&legacy_key)? else {
+        return Ok(false);
+    };
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(true);
+    };
+    if record.get("scope_uuid").is_none() {
+        return Ok(true);
+    }
+    if !receipt_scope_uuid_matches(&record, &scope) {
+        return Ok(true);
+    }
+    Ok(verify_no_target_receipt(
+        &record,
+        repo_id,
+        git_sha,
+        projection,
+        generation,
+        Some(&scope),
+    ) != NoTargetReceiptVerdict::Accepted)
+}
+
+/// True when UUID-scoped and repo-id inbound checkpoint mirrors disagree.
+fn kv_state_value(conn: &Connection, key: &str) -> Result<Option<String>, DatabaseError> {
+    conn.query_row("SELECT value FROM kv_state WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
+    .optional()
+    .map_err(DatabaseError::from)
+}
+
+pub fn inbound_git_checkpoint_mirror_conflict(
+    db: &Database,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    let conn = db.conn();
+    if !managed_repo_requires_scoped_receipts(&conn, repo_id)? {
+        return Ok(false);
+    }
+    let legacy_authoritative = legacy_repo_id_kv_authoritative(&conn)?;
+    let scope = scope_token_for_repo(&conn, repo_id)?;
+    let scoped =
+        kv_state_value(&conn, &last_git_sha_kv_key(&scope))?.filter(|value| !value.is_empty());
+    let legacy = kv_state_value(&conn, &legacy_last_git_sha_kv_key(repo_id))?
+        .filter(|value| !value.is_empty());
+    if legacy_authoritative && scoped.is_some() && legacy.is_some() && scoped != legacy {
+        return Ok(true);
+    }
+    if !legacy_authoritative {
+        if scoped.is_none() {
+            let column: Option<String> = conn
+                .query_row(
+                    "SELECT last_git_sha FROM repositories WHERE id = ?1",
+                    [repo_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .filter(|value: &String| !value.is_empty());
+            if legacy.is_some() && column.is_some() && legacy.as_deref() != column.as_deref() {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    let column: Option<String> = conn
+        .query_row(
+            "SELECT last_git_sha FROM repositories WHERE id = ?1",
+            [repo_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|value: &String| !value.is_empty());
+    if legacy.is_none() || column.is_none() {
+        return Ok(false);
+    }
+    let legacy_sha = legacy.as_deref().unwrap();
+    let column_sha = column.as_deref().unwrap();
+    if legacy_sha == column_sha {
+        return Ok(false);
+    }
+    // Legacy-authoritative installs may keep the repo-id/scoped inbound KV on the
+    // handled Git→SVN frontier while the repository column tracks an SVN-emitted tip.
+    if scoped.as_deref() == Some(legacy_sha) {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
+/// Inbound Git checkpoint for team split-cursor reconciliation: scoped KV first,
+/// then the human `last_git_sha_<repo_id>` copy when present (old installs may
+/// keep handled inbound only on the legacy key until v13 backfill runs).
+pub fn read_team_inbound_git_checkpoint_kv_tx(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    if let Some(value) = read_scoped_last_git_sha_kv_tx(tx, repo_id)? {
+        return Ok(Some(value));
+    }
+    Ok(tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [legacy_last_git_sha_kv_key(repo_id)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .filter(|value: &String| !value.is_empty()))
+}
+
+pub fn read_team_inbound_git_checkpoint_kv(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    read_team_inbound_git_checkpoint_kv_tx(&db.conn(), repo_id)
+}
+
+fn legacy_inbound_git_sha_mirror_enabled(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
+    if legacy_repo_id_kv_authoritative(tx)? {
+        return Ok(true);
+    }
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key = ?1 AND value != '')",
+        [legacy_last_git_sha_kv_key(repo_id)],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+pub fn read_scoped_last_git_sha_kv_tx(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    let scope = scope_token_for_repo(tx, repo_id)?;
+    let legacy_authoritative = legacy_repo_id_kv_authoritative(tx)?;
+    let scoped: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key = ?1",
+            [last_git_sha_kv_key(&scope)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .filter(|value: &String| !value.is_empty());
+    if scoped.is_some() {
+        return Ok(scoped);
+    }
+    if legacy_authoritative
+        && !crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+            tx, repo_id, repo_id,
+        )?
+    {
+        return Ok(tx
+            .query_row(
+                "SELECT value FROM kv_state WHERE key = ?1",
+                [legacy_last_git_sha_kv_key(repo_id)],
+                |row| row.get(0),
+            )
+            .optional()?
+            .filter(|value: &String| !value.is_empty()));
+    }
+    Ok(None)
+}
+
+/// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
+pub fn read_scoped_last_git_sha_kv(
+    db: &Database,
+    repo_id: &str,
+) -> Result<Option<String>, DatabaseError> {
+    read_scoped_last_git_sha_kv_tx(&db.conn(), repo_id)
+}
+
+/// Persist the Git→SVN inbound handled checkpoint (UUID-scoped KV + repo-id mirror).
+pub fn write_scoped_last_git_sha_kv(
+    tx: &Connection,
+    repo_id: &str,
+    git_sha: &str,
+    updated_at: &str,
+) -> Result<(), DatabaseError> {
+    let scope = scope_token_for_repo(tx, repo_id)?;
+    let kv_key = last_git_sha_kv_key(&scope);
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![kv_key, git_sha, updated_at],
+    )?;
+    if legacy_inbound_git_sha_mirror_enabled(tx, repo_id)? {
+        let legacy_key = legacy_last_git_sha_kv_key(repo_id);
+        tx.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![legacy_key, git_sha, updated_at],
+        )?;
+    }
+    Ok(())
+}
+
+/// Persist a Git no-target receipt under scoped (and optional legacy) keys.
+pub fn write_git_no_target_receipt_kv(
+    tx: &Connection,
+    repo_id: &str,
+    generation: i64,
+    git_sha: &str,
+    receipt: &str,
+    updated_at: &str,
+) -> Result<(), DatabaseError> {
+    let scope = scope_token_for_repo(tx, repo_id)?;
+    let scoped_key = handled_git_no_target_state_key(&scope, generation, git_sha);
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![scoped_key, receipt, updated_at],
+    )?;
+    let legacy_key = handled_git_no_target_state_key(repo_id, generation, git_sha);
+    tx.execute(
+        "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![legacy_key, receipt, updated_at],
+    )?;
+    Ok(())
+}
+
+pub fn attach_scope_to_new_receipt(
+    db: &Database,
+    repo_id: &str,
+    receipt: &mut serde_json::Value,
+) -> Result<(), DatabaseError> {
+    if repo_id == crate::db::personal_scope::PERSONAL_SCOPE_KEY {
+        return Ok(());
+    }
+    let scope = repository_scope_uuid(&db.conn(), repo_id)?;
+    attach_scope_uuid_to_receipt(receipt, &scope);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -297,15 +775,29 @@ mod tests {
         db
     }
 
+    fn insert_pair_repo(db: &Database) {
+        let scope = crate::db::repo_scope_identity::new_scope_uuid();
+        db.conn()
+            .execute(
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_at, updated_at, last_svn_rev, last_git_sha, sync_status, total_syncs, total_errors, consecutive_errors, scope_uuid)
+                 VALUES ('pair', 'pair', '', '', '', 'local', '', '', 'main', 'team', 5, 0, 0, 1, 't', 't', 0, '', 'idle', 0, 0, 0, ?1)",
+                [scope],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn stale_generation_receipt_does_not_suppress() {
         let db = setup_db();
+        insert_pair_repo(&db);
+        let scope = repository_scope_uuid(&db.conn(), "pair").unwrap();
         let sha = "a".repeat(40);
         db.set_state(
-            &format!("handled_git_no_target_pair_{sha}"),
+            &handled_git_no_target_state_key(&scope, 1, &sha),
             &serde_json::json!({
                 "version": 1,
                 "repo_id": "pair",
+                "scope_uuid": scope,
                 "git_sha": sha,
                 "outcome": "filtered",
                 "projection": "{}",
@@ -331,6 +823,7 @@ mod tests {
     #[test]
     fn fieldless_legacy_receipt_rejected_at_generation_two() {
         let db = setup_db();
+        insert_pair_repo(&db);
         let sha = "c".repeat(40);
         db.set_state(
             &format!("handled_git_no_target_pair_{sha}"),
@@ -365,9 +858,14 @@ mod tests {
     #[test]
     fn malformed_legacy_bytes_are_not_valid_stored_receipt() {
         let db = setup_db();
+        insert_pair_repo(&db);
+        let scope = repository_scope_uuid(&db.conn(), "pair").unwrap();
         let sha = "d".repeat(40);
-        db.set_state(&format!("handled_git_no_target_pair_{sha}"), "not-json")
-            .unwrap();
+        db.set_state(
+            &handled_git_no_target_state_key(&scope, 1, &sha),
+            "not-json",
+        )
+        .unwrap();
         assert!(
             !stored_git_no_target_receipt_exists(&db, "pair", &sha, "{}").unwrap(),
             "arbitrary legacy kv bytes must not count as a verified no-target receipt"
@@ -377,12 +875,15 @@ mod tests {
     #[test]
     fn stale_generation_svn_receipt_is_not_read() {
         let db = setup_db();
+        insert_pair_repo(&db);
+        let scope = repository_scope_uuid(&db.conn(), "pair").unwrap();
         bump_repo_echo_generation(&db, "pair").unwrap();
         db.set_state(
-            "handled_svn_no_target_pair_3",
+            &handled_svn_no_target_state_key(&scope, 1, 3),
             &serde_json::json!({
                 "version": 1,
                 "repo_id": "pair",
+                "scope_uuid": scope,
                 "svn_revision": 3,
                 "outcome": "no_git_content",
                 "projection": "{}",
@@ -401,9 +902,9 @@ mod tests {
         let db = setup_db();
         db.conn()
             .execute(
-                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_api_url, git_repo, git_branch, enabled, created_at, updated_at, last_svn_rev, last_git_sha)
-                 VALUES ('pair', 'pair', '', '', '', '', '', '', 1, 't', 't', 0, '')",
-                [],
+                "INSERT INTO repositories (id, name, svn_url, svn_branch, svn_username, git_api_url, git_repo, git_branch, enabled, created_at, updated_at, last_svn_rev, last_git_sha, scope_uuid)
+                 VALUES ('pair', 'pair', '', '', '', '', '', '', 1, 't', 't', 0, '', ?1)",
+                [crate::db::repo_scope_identity::new_scope_uuid()],
             )
             .unwrap();
         let handled = "b".repeat(40);
@@ -422,9 +923,11 @@ mod tests {
                 [&filtered],
             )
             .unwrap();
-        db.set_state("last_git_sha_pair", &filtered).unwrap();
+        crate::db::repo_scope_identity::set_legacy_repo_id_kv_reads_enabled(&db.conn(), true)
+            .unwrap();
+        write_scoped_last_git_sha_kv(&db.conn(), "pair", &filtered, &now).unwrap();
         assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
-        test_force_next_split_fail();
+        test_force_next_split_fail(&db);
         assert!(bump_repo_echo_generation(&db, "pair").is_err());
         assert_eq!(repo_echo_generation(&db, "pair").unwrap(), 1);
     }
@@ -432,18 +935,21 @@ mod tests {
     #[test]
     fn active_generation_receipt_suppresses() {
         let db = setup_db();
+        insert_pair_repo(&db);
+        let scope = repository_scope_uuid(&db.conn(), "pair").unwrap();
         let sha = "b".repeat(40);
         let generation = repo_echo_generation(&db, "pair").unwrap();
         let mut receipt = serde_json::json!({
             "version": 1,
             "repo_id": "pair",
+            "scope_uuid": scope,
             "git_sha": sha,
             "outcome": "filtered",
             "projection": "{}",
         });
         attach_generation_to_receipt(&mut receipt, generation);
         db.set_state(
-            &handled_git_no_target_state_key("pair", generation, &sha),
+            &handled_git_no_target_state_key(&scope, generation, &sha),
             &receipt.to_string(),
         )
         .unwrap();
@@ -451,7 +957,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            verify_no_target_receipt(&loaded, "pair", &sha, "{}", generation),
+            verify_no_target_receipt(&loaded, "pair", &sha, "{}", generation, Some(&scope),),
             NoTargetReceiptVerdict::Accepted
         );
     }

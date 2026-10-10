@@ -47,7 +47,8 @@ use crate::echo_receipt_scope::{
     read_git_no_target_receipt, repo_echo_generation, stored_git_no_target_receipt_exists,
 };
 use crate::echo_suppression::{
-    classify_incoming_git_commit, classify_incoming_svn_revision, personal_mode_marker_echo,
+    classify_incoming_git_commit, classify_incoming_svn_revision,
+    git_no_target_outcome_is_verified, personal_mode_marker_echo,
     stale_generation_receipt_proves_emitted_git_column, verify_no_target_receipt, EchoDisposition,
     NoTargetReceiptVerdict, TeamEchoContext, SYNC_MARKER,
 };
@@ -251,45 +252,6 @@ fn sync_git_command_output(
     }
 }
 
-fn advertised_remote_tip_is_sha(
-    repo_path: &Path,
-    branch: &str,
-    sha: &str,
-    timeout: Duration,
-    http_auth_token: Option<&str>,
-) -> bool {
-    let remote_branch = format!("refs/heads/{}", branch);
-    let output = match sync_git_command_output(
-        repo_path,
-        &[
-            "ls-remote",
-            "--exit-code",
-            "--heads",
-            "origin",
-            &remote_branch,
-        ],
-        timeout,
-        http_auth_token.map(str::to_string),
-    ) {
-        Some(output) => output,
-        None => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let advertised_text = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = advertised_text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    if lines.len() != 1 {
-        return false;
-    }
-    let advertised_sha = lines[0].split_whitespace().next().unwrap_or("");
-    is_full_git_oid(advertised_sha) && lines[0].ends_with(&remote_branch) && advertised_sha == sha
-}
-
 impl SyncEngine {
     /// Create a new sync engine with all required dependencies.
     pub fn new(
@@ -470,7 +432,14 @@ impl SyncEngine {
     /// Uses per-repo key if repo_id is set, otherwise global key.
     fn git_sha_key(&self) -> String {
         match &self.repo_id {
-            Some(rid) if !rid.is_empty() => format!("last_git_sha_{}", rid),
+            Some(rid) if !rid.is_empty() => {
+                if let Ok(scope) =
+                    crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid)
+                {
+                    return crate::db::repo_scope_identity::last_git_sha_kv_key(&scope);
+                }
+                format!("last_git_sha_{}", rid)
+            }
             _ => "last_git_hash".to_string(),
         }
     }
@@ -546,6 +515,10 @@ impl SyncEngine {
 
         // Hot-reload credentials from DB (changed via Setup Wizard).
         self.reload_credentials();
+
+        self.db
+            .ensure_repository_scope_schema_upgrade()
+            .map_err(SyncError::DatabaseError)?;
 
         let mut stats = SyncStats {
             started_at: Utc::now().to_rfc3339(),
@@ -720,7 +693,11 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
 
     fn history_block_key(&self) -> String {
-        history_block_key(self.effective_repo_id())
+        match self.effective_repo_id() {
+            Some(rid) => crate::history_inspect::history_block_key_for_repo(&self.db, rid)
+                .unwrap_or_else(|_| history_block_key(Some(rid))),
+            None => history_block_key(None),
+        }
     }
 
     fn record_history_block(
@@ -758,13 +735,14 @@ impl SyncEngine {
         if !is_full_git_oid(sha) {
             return Ok(false);
         }
-        let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-        let repo_path = git.repo_path();
-        let http_token = git.stored_http_auth_token();
-        let timeout = Duration::from_secs(45);
+        let (repo_path, http_token) = {
+            let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+            (git.repo_path().to_path_buf(), git.stored_http_auth_token())
+        };
+        let timeout = Duration::from_secs(5);
         let spec = format!("{}^{{commit}}", sha);
         if sync_git_command_output(
-            repo_path,
+            &repo_path,
             &["cat-file", "-e", &spec],
             timeout,
             http_token.clone(),
@@ -773,13 +751,29 @@ impl SyncEngine {
         {
             return Ok(false);
         }
-        let branch = &self.config.github.default_branch;
-        if advertised_remote_tip_is_sha(repo_path, branch, sha, timeout, http_token.as_deref()) {
+        let origin_url =
+            sync_git_command_output(&repo_path, &["remote", "get-url", "origin"], timeout, None)
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|url| !url.is_empty());
+        if origin_url.is_none() {
+            return Ok(true);
+        }
+        if Some(sha)
+            == Self::local_remote_branch_tip_sha(&repo_path, &self.config.github.default_branch)
+                .as_deref()
+        {
             return Ok(false);
+        }
+        if origin_url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("file://"))
+        {
+            return Ok(true);
         }
         let probe_ref = format!("refs/reposync/checkpoint-missing-probe/{}", &sha[..8]);
         let fetched = sync_git_command_output(
-            repo_path,
+            &repo_path,
             &[
                 "fetch",
                 "--no-tags",
@@ -793,7 +787,7 @@ impl SyncEngine {
         .is_some_and(|output| output.status.success());
         let present = fetched
             && sync_git_command_output(
-                repo_path,
+                &repo_path,
                 &["cat-file", "-e", &spec],
                 timeout,
                 http_token.clone(),
@@ -801,7 +795,7 @@ impl SyncEngine {
             .is_some_and(|output| output.status.success());
         if present {
             let _ = sync_git_command_output(
-                repo_path,
+                &repo_path,
                 &["update-ref", "-d", &probe_ref],
                 timeout,
                 http_token,
@@ -825,6 +819,53 @@ impl SyncEngine {
         Ok(())
     }
 
+    fn refresh_origin_branch_tip(repo_path: &Path, branch: &str, http_auth_token: Option<&str>) {
+        let timeout = Duration::from_secs(5);
+        let origin_url =
+            sync_git_command_output(repo_path, &["remote", "get-url", "origin"], timeout, None)
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|url| !url.is_empty());
+        if origin_url
+            .as_deref()
+            .is_none_or(|url| url.starts_with("file://"))
+        {
+            return;
+        }
+        let _ = sync_git_command_output(
+            repo_path,
+            &["fetch", "--quiet", "--no-tags", "origin", branch],
+            timeout,
+            http_auth_token.map(str::to_string),
+        );
+    }
+
+    fn local_remote_branch_tip_sha(repo_path: &Path, branch: &str) -> Option<String> {
+        let timeout = Duration::from_secs(5);
+        for refname in [
+            format!("refs/remotes/origin/{}", branch),
+            format!("origin/{}", branch),
+        ] {
+            if let Some(output) = sync_git_command_output(
+                repo_path,
+                &["rev-parse", "--verify", &refname],
+                timeout,
+                None,
+            ) {
+                if output.status.success() {
+                    let tip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if is_full_git_oid(&tip) {
+                        return Some(tip);
+                    }
+                }
+            }
+        }
+        sync_git_command_output(repo_path, &["rev-parse", "HEAD"], timeout, None)
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|tip| is_full_git_oid(tip))
+    }
+
     /// Read a repository-owned legacy Git cursor without borrowing another
     /// pair's global maximum. A missing or conflicting cursor is not a new
     /// baseline. The schema transition remains #63.
@@ -841,11 +882,25 @@ impl SyncEngine {
                 .map_err(crate::errors::DatabaseError::from)?
             };
             let column = column.filter(|value| !value.is_empty());
-            let kv = self
-                .db
-                .get_state(&format!("last_git_sha_{}", rid))
+            let (bridge_repo_path, http_token) = {
+                let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                (git.repo_path().to_path_buf(), git.stored_http_auth_token())
+            };
+            let branch = self.config.github.default_branch.clone();
+            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
+                .map_err(SyncError::DatabaseError)?;
+            if crate::echo_receipt_scope::inbound_git_checkpoint_mirror_conflict(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?
-                .filter(|value| !value.is_empty());
+            {
+                return Err(self.record_history_block(
+                    "ambiguous_checkpoint",
+                    "repository inbound checkpoint mirrors disagree",
+                    column.as_deref(),
+                    None,
+                    None,
+                    kv.as_deref(),
+                ));
+            }
             if let Some(ref sha) = column {
                 self.reject_missing_checkpoint_object(sha)?;
             }
@@ -853,9 +908,43 @@ impl SyncEngine {
             // when the old cursor copies happen to agree. Check every present
             // copy before choosing between equal, split, or KV-only shapes.
             if let Some(ref sha) = column {
+                // Stale-generation receipts on a split cursor (column emitted tip vs
+                // scoped inbound KV) are reconciled below. Only a unified copy may
+                // be blocked here without proving the emitted column SHA.
+                if kv.as_deref() == Some(sha.as_str())
+                    && self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)?
+                    && !self.proved_svn_emitted_column_git_sha(rid, sha)?
+                {
+                    Self::refresh_origin_branch_tip(
+                        &bridge_repo_path,
+                        &branch,
+                        http_token.as_deref(),
+                    );
+                    let remote_tip = Self::local_remote_branch_tip_sha(&bridge_repo_path, &branch);
+                    if remote_tip.as_deref() == Some(sha.as_str()) {
+                        return Err(self.record_history_block(
+                            "ambiguous_checkpoint",
+                            "stale no-target receipt conflicts with repository Git checkpoint",
+                            Some(sha),
+                            None,
+                            None,
+                            kv.as_deref(),
+                        ));
+                    }
+                }
                 self.checked_no_target_receipt(rid, sha)?;
             }
             let kv_no_target = if let Some(ref sha) = kv {
+                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, sha)? {
+                    return Err(self.record_history_block(
+                        "ambiguous_checkpoint",
+                        "stale no-target receipt conflicts with repository Git checkpoint",
+                        Some(sha),
+                        None,
+                        None,
+                        column.as_deref(),
+                    ));
+                }
                 self.checked_no_target_receipt(rid, sha)?
             } else {
                 false
@@ -890,8 +979,12 @@ impl SyncEngine {
                     || kv_no_target;
                 let column_sha = column.as_deref().unwrap();
                 let column_emit_proved = self.proved_svn_emitted_column_git_sha(rid, column_sha)?;
+                let column_stale_receipt_only =
+                    self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, column_sha)?;
+                let column_tip_accepted =
+                    column_emit_proved || (column_stale_receipt_only && !column_emit_proved);
                 if kv_handled_proved
-                    && column_emit_proved
+                    && column_tip_accepted
                     && is_full_git_oid(column_sha)
                     && is_full_git_oid(kv.as_deref().unwrap())
                 {
@@ -906,7 +999,43 @@ impl SyncEngine {
                         .current_dir(git.repo_path())
                         .output();
                     match ancestry {
-                        Ok(output) if output.status.code() == Some(0) => return Ok(kv),
+                        Ok(output) if output.status.code() == Some(0) => {
+                            let legacy_mirror: Option<String> = {
+                                let conn = self.db.conn();
+                                conn.query_row(
+                                    "SELECT value FROM kv_state WHERE key = ?1",
+                                    [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
+                                        rid,
+                                    )],
+                                    |row| row.get(0),
+                                )
+                                .optional()
+                                .map_err(crate::errors::DatabaseError::from)?
+                                .filter(|value: &String| !value.is_empty())
+                            };
+                            if legacy_mirror.as_deref() == Some(column_sha)
+                                && column_stale_receipt_only
+                            {
+                                Self::refresh_origin_branch_tip(
+                                    &bridge_repo_path,
+                                    &branch,
+                                    http_token.as_deref(),
+                                );
+                                let remote_tip =
+                                    Self::local_remote_branch_tip_sha(&bridge_repo_path, &branch);
+                                if remote_tip.as_deref() == Some(column_sha) {
+                                    return Err(self.record_history_block(
+                                        "ambiguous_checkpoint",
+                                        "stale no-target receipt conflicts with repository Git checkpoint",
+                                        Some(column_sha),
+                                        None,
+                                        None,
+                                        kv.as_deref(),
+                                    ));
+                                }
+                            }
+                            return Ok(kv);
+                        }
                         Ok(output) if output.status.code() == Some(1) => (),
                         _ => {
                             return Err(self.record_history_block(
@@ -946,34 +1075,97 @@ impl SyncEngine {
                     if emitted > 0 {
                         // A retained first row is not a baseline: maintenance
                         // may already have deleted earlier applied rows.
-                        let baseline = self
+                        let mut baseline = self
                             .db
                             .get_state(&format!("handled_git_baseline_{}", rid))
                             .map_err(SyncError::DatabaseError)?
                             .and_then(|value| {
                                 serde_json::from_str::<serde_json::Value>(&value).ok()
                             });
-                        let baseline_sha = baseline
+                        let mut baseline_sha = baseline
                             .as_ref()
                             .and_then(|record| record["git_sha"].as_str());
-                        let baseline_revision = baseline
+                        let mut baseline_revision = baseline
                             .as_ref()
                             .and_then(|record| record["svn_rev"].as_i64());
-                        let baseline_valid = baseline.as_ref().is_some_and(|record| {
+                        let mut baseline_valid = baseline.as_ref().is_some_and(|record| {
                             record["version"] == 1
                                 && record["repo_id"] == rid
                                 && record["projection"] == self.no_target_projection()
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
-                            return Err(self.record_history_block(
-                                "ambiguous_checkpoint",
-                                "missing durable handled Git baseline for absent repository cursor",
-                                None,
-                                None,
-                                None,
-                                Some(emitted_tip),
-                            ));
+                            let legacy_seed_bootstrap = {
+                                let conn = self.db.conn();
+                                let legacy = conn
+                                    .query_row(
+                                        "SELECT value FROM kv_state WHERE key = ?1",
+                                        [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
+                                            rid
+                                        )],
+                                        |row| row.get::<_, String>(0),
+                                    )
+                                    .optional()
+                                    .map_err(crate::errors::DatabaseError::from)?
+                                    .filter(|value| !value.is_empty());
+                                legacy.as_deref() == Some(emitted_tip.as_str())
+                            };
+                            if !legacy_seed_bootstrap {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "missing durable handled Git baseline for absent repository cursor",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ));
+                            }
+                            let column_svn_rev: i64 = {
+                                let conn = self.db.conn();
+                                conn.query_row(
+                                    "SELECT last_svn_rev FROM repositories WHERE id = ?1",
+                                    [rid],
+                                    |row| row.get(0),
+                                )
+                                .map_err(crate::errors::DatabaseError::from)?
+                            };
+                            let _ = self.materialize_git_baseline(emitted_tip, column_svn_rev);
+                            baseline = self
+                                .db
+                                .get_state(&format!("handled_git_baseline_{}", rid))
+                                .map_err(SyncError::DatabaseError)?
+                                .and_then(|value| {
+                                    serde_json::from_str::<serde_json::Value>(&value).ok()
+                                });
+                            baseline_sha = baseline
+                                .as_ref()
+                                .and_then(|record| record["git_sha"].as_str());
+                            baseline_revision = baseline
+                                .as_ref()
+                                .and_then(|record| record["svn_rev"].as_i64());
+                            baseline_valid = baseline.as_ref().is_some_and(|record| {
+                                record["version"] == 1
+                                    && record["repo_id"] == rid
+                                    && record["projection"] == self.no_target_projection()
+                            }) && baseline_sha.is_some_and(is_full_git_oid)
+                                && baseline_revision.is_some_and(|rev| rev > 0);
+                            if !baseline_valid {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "missing durable handled Git baseline for absent repository cursor",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ));
+                            }
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let _ = crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                                &self.db.conn(),
+                                rid,
+                                emitted_tip,
+                                &now,
+                            );
                         }
                         let baseline_sha = baseline_sha.unwrap();
                         let baseline_revision = baseline_revision.unwrap();
@@ -1069,6 +1261,16 @@ impl SyncEngine {
                         None,
                         None,
                         None,
+                    ));
+                }
+                if self.checkpoint_sha_has_stale_verified_no_target_receipt(rid, &kv_sha)? {
+                    return Err(self.record_history_block(
+                        "ambiguous_checkpoint",
+                        "stale no-target receipt conflicts with repository Git checkpoint",
+                        Some(&kv_sha),
+                        None,
+                        None,
+                        column.as_deref(),
                     ));
                 }
                 if column.is_none()
@@ -1188,12 +1390,64 @@ impl SyncEngine {
             return Ok(true);
         }
         let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
         for record in collect_git_no_target_receipts_for_sha(&self.db, rid, column_sha)
             .map_err(SyncError::DatabaseError)?
         {
             if stale_generation_receipt_proves_emitted_git_column(
-                &record, rid, column_sha, generation,
+                &record,
+                rid,
+                column_sha,
+                generation,
+                scope.as_deref(),
             ) {
+                if record.get("outcome").and_then(|value| value.as_str()) == Some("filtered") {
+                    let outbound: i64 = {
+                        let conn = self.db.conn();
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM sync_records WHERE repo_id = ?1 AND direction = 'git_to_svn' AND status = 'applied'",
+                            [rid],
+                            |row| row.get(0),
+                        )
+                        .map_err(crate::errors::DatabaseError::from)?
+                    };
+                    if outbound > 0 {
+                        continue;
+                    }
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// True when a prior-generation verified no-target receipt still exists for `sha`.
+    fn checkpoint_sha_has_stale_verified_no_target_receipt(
+        &self,
+        rid: &str,
+        sha: &str,
+    ) -> Result<bool, SyncError> {
+        if !is_full_git_oid(sha) {
+            return Ok(false);
+        }
+        let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
+        for record in collect_git_no_target_receipts_for_sha(&self.db, rid, sha)
+            .map_err(SyncError::DatabaseError)?
+        {
+            if record["git_sha"] != sha {
+                continue;
+            }
+            if let Some(expected) = scope.as_deref() {
+                if record.get("scope_uuid").and_then(|value| value.as_str()) != Some(expected) {
+                    continue;
+                }
+            }
+            if !crate::echo_receipt_scope::receipt_generation_accepted(&record, generation)
+                && git_no_target_outcome_is_verified(&record)
+            {
                 return Ok(true);
             }
         }
@@ -1218,18 +1472,11 @@ impl SyncEngine {
     }
 
     fn repo_has_stored_no_target_receipt_kv(&self, rid: &str) -> Result<bool, SyncError> {
-        let git_like = format!("handled_git_no_target_{}_%", rid);
-        let svn_like = format!("handled_svn_no_target_{}_%", rid);
-        let count: i64 = {
-            let conn = self.db.conn();
-            conn.query_row(
-                "SELECT COUNT(*) FROM kv_state WHERE key LIKE ?1 OR key LIKE ?2",
-                rusqlite::params![git_like, svn_like],
-                |row| row.get(0),
-            )
-            .map_err(crate::errors::DatabaseError::from)?
-        };
-        Ok(count > 0)
+        crate::db::repo_scope_identity::repository_has_stored_no_target_receipt_kv(
+            &self.db.conn(),
+            rid,
+        )
+        .map_err(SyncError::DatabaseError)
     }
 
     /// Inbound Git checkpoint P must be backed by applied outbound work for this
@@ -1284,8 +1531,16 @@ impl SyncEngine {
         for record in collect_git_no_target_receipts_for_sha(&self.db, rid, sha)
             .map_err(SyncError::DatabaseError)?
         {
-            if verify_no_target_receipt(&record, rid, sha, &projection, generation)
-                == NoTargetReceiptVerdict::Accepted
+            let scope =
+                crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
+            if verify_no_target_receipt(
+                &record,
+                rid,
+                sha,
+                &projection,
+                generation,
+                scope.as_deref(),
+            ) == NoTargetReceiptVerdict::Accepted
             {
                 return Ok(true);
             }
@@ -1294,14 +1549,83 @@ impl SyncEngine {
     }
 
     fn checked_no_target_receipt(&self, rid: &str, sha: &str) -> Result<bool, SyncError> {
+        let legacy_authoritative =
+            crate::db::repo_scope_identity::legacy_repo_id_kv_authoritative(&self.db.conn())
+                .map_err(SyncError::DatabaseError)?;
+        if !legacy_authoritative {
+            let generation =
+                repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+            let scope =
+                crate::db::repo_scope_identity::repository_scope_token(&self.db.conn(), rid)
+                    .map_err(SyncError::DatabaseError)?;
+            let canonical_key = handled_git_no_target_state_key(&scope, generation, sha);
+            if let Some(raw) = self
+                .db
+                .get_state(&canonical_key)
+                .map_err(SyncError::DatabaseError)?
+            {
+                if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                    let legacy_key = format!("handled_git_no_target_{}_{}", rid, sha);
+                    let legacy_ok = self
+                        .db
+                        .get_state(&legacy_key)
+                        .map_err(SyncError::DatabaseError)?
+                        .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                        .is_some();
+                    if !legacy_ok {
+                        return Err(self.record_history_block(
+                            "unverified_no_target_receipt",
+                            "no-target receipt is malformed; reconcile before replay",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+        crate::echo_receipt_scope::quarantine_corrupt_scoped_git_no_target_if_legacy_recovered(
+            &self.db, rid, sha,
+        )
+        .map_err(SyncError::DatabaseError)?;
         if let Some(record) =
             read_git_no_target_receipt(&self.db, rid, sha).map_err(SyncError::DatabaseError)?
         {
             let projection = self.no_target_projection();
             let generation =
                 repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
-            return match verify_no_target_receipt(&record, rid, sha, &projection, generation) {
-                NoTargetReceiptVerdict::Accepted => Ok(true),
+            let scope =
+                crate::db::repo_scope_identity::repository_scope_uuid(&self.db.conn(), rid).ok();
+            return match verify_no_target_receipt(
+                &record,
+                rid,
+                sha,
+                &projection,
+                generation,
+                scope.as_deref(),
+            ) {
+                NoTargetReceiptVerdict::Accepted => {
+                    if crate::echo_receipt_scope::legacy_git_no_target_mirror_blocks(
+                        &self.db,
+                        rid,
+                        sha,
+                        &projection,
+                        generation,
+                    )
+                    .map_err(SyncError::DatabaseError)?
+                    {
+                        return Err(self.record_history_block(
+                            "unverified_no_target_receipt",
+                            "no-target receipt lacks verified outcome evidence",
+                            Some(sha),
+                            None,
+                            None,
+                            None,
+                        ));
+                    }
+                    Ok(true)
+                }
                 NoTargetReceiptVerdict::StaleGeneration => Ok(false),
                 NoTargetReceiptVerdict::RepoOrShaMismatch => Err(self.record_history_block(
                     "unverified_no_target_receipt",
@@ -1338,8 +1662,10 @@ impl SyncEngine {
             };
         }
         let generation = repo_echo_generation(&self.db, rid).map_err(SyncError::DatabaseError)?;
+        let scope = crate::db::repo_scope_identity::repository_scope_token(&self.db.conn(), rid)
+            .map_err(SyncError::DatabaseError)?;
         let legacy_key = format!("handled_git_no_target_{}_{}", rid, sha);
-        let canonical_key = handled_git_no_target_state_key(rid, generation, sha);
+        let canonical_key = handled_git_no_target_state_key(&scope, generation, sha);
         for key in [canonical_key.clone(), legacy_key.clone()] {
             let Some(raw) = self.db.get_state(&key).map_err(SyncError::DatabaseError)? else {
                 continue;
@@ -1653,6 +1979,12 @@ impl SyncEngine {
     /// This runs before SVN legacy adoption or any checkout reset.
     fn inspect_team_history(&self) -> Result<TeamHistoryAdmission, SyncError> {
         enforce_durable_history_block(&self.db, &self.history_block_key())?;
+        if let Some(rid) = self.effective_repo_id() {
+            let legacy = history_block_key(Some(rid));
+            if legacy != self.history_block_key() {
+                enforce_durable_history_block(&self.db, &legacy)?;
+            }
+        }
         let p = self.team_git_checkpoint()?;
         let git = self
             .git_client
@@ -1728,9 +2060,7 @@ impl SyncEngine {
                 .db
                 .get_repo_watermark(rid)
                 .map_err(SyncError::DatabaseError)?;
-            let kv = self
-                .db
-                .get_state(&format!("last_git_sha_{}", rid))
+            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
             if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
                 self.materialize_git_baseline(&column, revision)?;
@@ -2517,7 +2847,7 @@ impl SyncEngine {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "; unattributed legacy conflict row(s): {described} (set conflicts.repo_id to the owning repository id or dismiss each row)"
+                "; unattributed legacy conflict row id(s): {described} (set conflicts.repo_id to the owning repository id or dismiss each row)"
             )
         };
         Err(SyncError::UnresolvableConflict {
@@ -4909,6 +5239,7 @@ mod tests {
                 [repo_id],
             )
             .unwrap();
+        crate::db::repo_scope_identity::migrate_v13_scope_uuid(&db.conn()).unwrap();
         let config: AppConfig = toml::from_str(
             r#"
 [daemon]
@@ -4940,6 +5271,59 @@ repo = "test/test-repo"
 
     fn team_echo_engine(repo_id: &str) -> SyncEngine {
         team_echo_engine_with_git_dir(repo_id).0
+    }
+
+    fn scoped_last_git_sha_key(engine: &SyncEngine, repo_id: &str) -> String {
+        engine
+            .db()
+            .scoped_last_git_sha_kv_key_for_repo(repo_id)
+            .unwrap()
+    }
+
+    fn set_scoped_last_git_sha_kv(engine: &SyncEngine, repo_id: &str, sha: &str) {
+        engine
+            .db()
+            .set_state(&scoped_last_git_sha_key(engine, repo_id), sha)
+            .unwrap();
+    }
+
+    fn set_unified_inbound_git_cursor(engine: &SyncEngine, repo_id: &str, sha: &str) {
+        set_scoped_last_git_sha_kv(engine, repo_id, sha);
+        engine
+            .db()
+            .set_state(&format!("last_git_sha_{repo_id}"), sha)
+            .unwrap();
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha = ?1 WHERE id = ?2",
+                rusqlite::params![sha, repo_id],
+            )
+            .unwrap();
+    }
+
+    fn store_git_no_target_receipt_for_tests(
+        engine: &SyncEngine,
+        repo_id: &str,
+        git_sha: &str,
+        receipt: serde_json::Value,
+    ) {
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&engine.db().conn(), repo_id)
+                .unwrap();
+        let mut receipt = receipt;
+        crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
+        let generation = receipt
+            .get("generation")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(crate::pair_refresh::PAIR_GENERATION);
+        let scoped_key =
+            crate::echo_receipt_scope::handled_git_no_target_state_key(&scope, generation, git_sha);
+        let legacy_key = format!("handled_git_no_target_{repo_id}_{git_sha}");
+        let raw = receipt.to_string();
+        engine.db().set_state(&scoped_key, &raw).unwrap();
+        engine.db().set_state(&legacy_key, &raw).unwrap();
     }
 
     fn begin_running_svn_to_git_push(db: &Database, repo_id: &str, git_sha: &str) {
@@ -5111,13 +5495,7 @@ repo = "test/test-repo"
             "projection": projection,
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{sha}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &sha, receipt);
         assert!(engine.checked_no_target_receipt("pair", &sha).unwrap());
         crate::echo_receipt_scope::bump_repo_echo_generation(engine.db(), "pair").unwrap();
         assert!(!engine.checked_no_target_receipt("pair", &sha).unwrap());
@@ -5165,9 +5543,7 @@ repo = "test/test-repo"
 
     #[test]
     fn team_git_checkpoint_split_cursor_reads_generation_scoped_receipt() {
-        use crate::echo_receipt_scope::{
-            attach_generation_to_receipt, handled_git_no_target_state_key,
-        };
+        use crate::echo_receipt_scope::attach_generation_to_receipt;
         use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
         use uuid::Uuid;
 
@@ -5197,17 +5573,15 @@ repo = "test/test-repo"
             "projection": projection,
         });
         attach_generation_to_receipt(&mut receipt, generation);
-        engine
-            .db()
-            .set_state(
-                &handled_git_no_target_state_key("pair", generation, &kv_sha),
-                &receipt.to_string(),
-            )
-            .unwrap();
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &kv_sha)
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &kv_sha, receipt);
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &engine.db().conn(),
+            "pair",
+            &kv_sha,
+            &now,
+        )
+        .unwrap();
         engine
             .db()
             .conn()
@@ -5261,13 +5635,7 @@ repo = "test/test-repo"
             "projection": projection,
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{kv_sha}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &kv_sha, receipt);
         engine
             .db()
             .reset_repo_sync_mappings_for_reimport("pair")
@@ -5328,13 +5696,7 @@ repo = "test/test-repo"
             "projection": engine.no_target_projection(),
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{column_sha}"),
-                &weak_receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &column_sha, weak_receipt);
         engine
             .db()
             .reset_repo_sync_mappings_for_reimport("pair")
@@ -5354,10 +5716,7 @@ repo = "test/test-repo"
                 status: SyncRecordStatus::Applied,
             })
             .unwrap();
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &kv_sha)
-            .unwrap();
+        set_scoped_last_git_sha_kv(&engine, "pair", &kv_sha);
         engine
             .db()
             .conn()
@@ -5382,18 +5741,7 @@ repo = "test/test-repo"
             .repo_path()
             .to_path_buf();
         let forged = git_fixture_commit(&repo_path, "x.txt", "x\n", "unproven");
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &forged)
-            .unwrap();
-        engine
-            .db()
-            .conn()
-            .execute(
-                "UPDATE repositories SET last_git_sha = ?1 WHERE id = 'pair'",
-                [&forged],
-            )
-            .unwrap();
+        set_unified_inbound_git_cursor(&engine, "pair", &forged);
         assert!(matches!(
             engine.team_git_checkpoint(),
             Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
@@ -5429,6 +5777,10 @@ repo = "test/test-repo"
                 synced_at: now,
                 status: SyncRecordStatus::Applied,
             })
+            .unwrap();
+        engine
+            .db()
+            .delete_kv_state(&scoped_last_git_sha_key(&engine, "pair"))
             .unwrap();
         engine
             .db()
@@ -5489,8 +5841,10 @@ repo = "test/test-repo"
             .unwrap();
         engine
             .db()
-            .set_state("last_git_sha_pair", &unproved)
+            .conn()
+            .execute("DELETE FROM kv_state WHERE key = 'last_git_sha_pair'", [])
             .unwrap();
+        set_scoped_last_git_sha_kv(&engine, "pair", &unproved);
         assert!(matches!(
             engine.team_git_checkpoint(),
             Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
@@ -5578,13 +5932,7 @@ repo = "test/test-repo"
             "projection": engine.no_target_projection(),
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{frontier}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &frontier, receipt);
         engine
             .db()
             .reset_repo_sync_mappings_for_reimport("pair")
@@ -5645,13 +5993,7 @@ repo = "test/test-repo"
             "projection": "not-the-policy",
             "generation": 99,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{child}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &child, receipt);
         engine
             .db()
             .conn()
@@ -5705,13 +6047,7 @@ repo = "test/test-repo"
             "projection": engine.no_target_projection(),
             "generation": 1,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{filtered}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &filtered, receipt);
         engine
             .db()
             .conn()
@@ -5756,10 +6092,7 @@ repo = "test/test-repo"
                 [&imported],
             )
             .unwrap();
-        engine
-            .db()
-            .set_state(&format!("last_git_sha_{}", "pair"), &imported)
-            .unwrap();
+        set_unified_inbound_git_cursor(&engine, "pair", &imported);
         engine
             .db()
             .insert_sync_record(&SyncRecord {
@@ -5907,13 +6240,7 @@ repo = "test/test-repo"
             "outcome": "filtered",
             "projection": projection,
         });
-        engine
-            .db()
-            .set_state(
-                &format!("handled_git_no_target_pair_{sha}"),
-                &receipt.to_string(),
-            )
-            .unwrap();
+        store_git_no_target_receipt_for_tests(&engine, "pair", &sha, receipt);
         assert!(engine.checked_no_target_receipt("pair", &sha).unwrap());
     }
 
@@ -5922,17 +6249,25 @@ repo = "test/test-repo"
         let engine = team_echo_engine("pair");
         let svn_rev = 9_i64;
         let projection = engine.no_target_projection();
-        let receipt = serde_json::json!({
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&engine.db().conn(), "pair")
+                .unwrap();
+        let mut receipt = serde_json::json!({
             "version": 1,
             "repo_id": "pair",
             "svn_revision": svn_rev,
             "outcome": "no_git_content",
             "projection": projection,
         });
+        crate::db::repo_scope_identity::attach_scope_uuid_to_receipt(&mut receipt, &scope);
         engine
             .db()
             .set_state(
-                &format!("handled_svn_no_target_pair_{svn_rev}"),
+                &crate::echo_receipt_scope::handled_svn_no_target_state_key(
+                    &scope,
+                    crate::pair_refresh::PAIR_GENERATION,
+                    svn_rev,
+                ),
                 &receipt.to_string(),
             )
             .unwrap();
