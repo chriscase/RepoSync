@@ -845,7 +845,14 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_state("last_git_sha_pair", inbound_cursor).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &db.conn(),
+            "pair",
+            inbound_cursor,
+            &now,
+        )
+        .unwrap();
         let op = db.begin_svn_to_git_push(sample_intent()).unwrap();
         assert_eq!(op.state, GitPushOperationState::Running);
         let held = db
