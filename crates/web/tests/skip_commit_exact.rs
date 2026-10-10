@@ -143,7 +143,10 @@ fn snapshot_watermarks(db: &Database, repo_id: &str) -> WatermarkSnapshot {
         last_git_sha: repo.last_git_sha,
         consecutive_errors: repo.consecutive_errors,
         sync_status: repo.sync_status,
-        kv_last_git_sha: db.get_state(&format!("last_git_sha_{repo_id}")).unwrap(),
+        kv_last_git_sha: reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(
+            db, repo_id,
+        )
+        .unwrap(),
         kv_last_svn_rev: db.get_state(&format!("last_svn_rev_{repo_id}")).unwrap(),
         kv_last_git_hash: db.get_state("last_git_hash").unwrap(),
     }
@@ -160,8 +163,14 @@ fn assert_watermarks_unchanged(before: &WatermarkSnapshot, after: &WatermarkSnap
 }
 
 fn seed_pinned_watermarks(db: &Database, repo_id: &str, git_sha: &str) {
-    db.set_state(&format!("last_git_sha_{repo_id}"), git_sha)
-        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &db.conn(),
+        repo_id,
+        git_sha,
+        &now,
+    )
+    .unwrap();
     db.set_state(&format!("last_svn_rev_{repo_id}"), "4")
         .unwrap();
     db.set_state("last_git_hash", git_sha).unwrap();
