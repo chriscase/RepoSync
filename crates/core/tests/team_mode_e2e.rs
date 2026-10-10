@@ -59,13 +59,8 @@ fn set_repo_git_checkpoint_kv(db: &Database, repo_id: &str, sha: &str) {
 }
 
 fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
-    if let Some(value) = reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
-        .expect("read inbound git sha kv")
-    {
-        return Some(value);
-    }
-    db.get_state(&reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key(repo_id))
-        .expect("read legacy inbound git sha kv")
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
+        .expect("read scoped inbound git sha kv")
 }
 
 fn clear_inbound_git_sha_kv(db: &Database, repo_id: &str) {
@@ -2100,7 +2095,10 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
     assert_eq!((old_schema, new_schema), (12, 12));
     let old_repo = db.get_repository("pair").unwrap().unwrap();
     assert_eq!(old_repo.last_git_sha, old_tip);
-    assert_eq!(inbound_git_sha_kv(&db, "pair"), Some(old_tip.clone()));
+    assert_eq!(
+        db.get_state("last_git_sha_pair").unwrap(),
+        Some(old_tip.clone())
+    );
     assert_eq!(
         db.get_state("secret_svn_password_pair").unwrap().as_deref(),
         Some("fixture-only-svn-secret")
@@ -2199,7 +2197,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         (svn_only_rev, emitted.clone())
     );
     assert_eq!(
-        inbound_git_sha_kv(engine.db(), "pair"),
+        engine.db().get_state("last_git_sha_pair").unwrap(),
         Some(old_tip.clone())
     );
     assert_eq!(
@@ -2282,7 +2280,7 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         [&outgoing_sha], |row| row.get(0)).unwrap();
     assert_eq!(outgoing_map, 1);
     assert_eq!(
-        inbound_git_sha_kv(reopened.db(), "pair"),
+        reopened.db().get_state("last_git_sha_pair").unwrap(),
         Some(outgoing_sha.clone())
     );
     assert_eq!(
@@ -5833,13 +5831,6 @@ async fn candidate_rs05_fetch_git_changes_missing_scoped_one_repo_other_syncs() 
         .unwrap();
     seed_svn_to_git_baseline(&shared_db, "blocked", blocked_svn_rev, &blocked_head);
     clear_inbound_git_sha_kv(&shared_db, "blocked");
-    shared_db
-        .conn()
-        .execute(
-            "DELETE FROM kv_state WHERE key = 'last_svn_rev_blocked'",
-            [],
-        )
-        .unwrap();
     shared_db
         .conn()
         .execute(

@@ -887,7 +887,7 @@ impl SyncEngine {
                 (git.repo_path().to_path_buf(), git.stored_http_auth_token())
             };
             let branch = self.config.github.default_branch.clone();
-            let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
+            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
             if crate::echo_receipt_scope::inbound_git_checkpoint_mirror_conflict(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?
@@ -2060,7 +2060,7 @@ impl SyncEngine {
                 .db
                 .get_repo_watermark(rid)
                 .map_err(SyncError::DatabaseError)?;
-            let kv = crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&self.db, rid)
+            let kv = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&self.db, rid)
                 .map_err(SyncError::DatabaseError)?;
             if column == admission.checkpoint && kv.as_deref() == Some(column.as_str()) {
                 self.materialize_git_baseline(&column, revision)?;

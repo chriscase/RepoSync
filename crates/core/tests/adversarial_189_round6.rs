@@ -131,3 +131,29 @@ fn scoped_last_git_sha_kv_skips_human_mirror_unless_legacy_reads_latched() {
         Some(sha)
     );
 }
+
+#[test]
+fn scoped_last_git_sha_kv_mirrors_existing_legacy_inbound_without_latch() {
+    let db = Database::in_memory().unwrap();
+    db.initialize().unwrap();
+    let scope = reposync_core::db::repo_scope_identity::new_scope_uuid();
+    db.conn().execute(
+        "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha,scope_uuid)
+         VALUES ('pair','pair','file:///fixture','trunk','','','','main',1,'t','t',0,'',?1)",
+        rusqlite::params![scope],
+    )
+    .unwrap();
+    let handled = "c".repeat(40);
+    let emitted = "d".repeat(40);
+    db.set_state(&legacy_last_git_sha_kv_key("pair"), &handled)
+        .unwrap();
+    write_scoped_last_git_sha_kv(&db.conn(), "pair", &emitted, "t").unwrap();
+    assert_eq!(
+        read_scoped_last_git_sha_kv(&db, "pair").unwrap(),
+        Some(emitted.clone())
+    );
+    assert_eq!(
+        db.get_state(&legacy_last_git_sha_kv_key("pair")).unwrap(),
+        Some(emitted)
+    );
+}

@@ -875,8 +875,13 @@ pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
 
     let enable_legacy_reads = if migration_done {
         false
+    } else if repo_ids.len() == 1 {
+        let repo_id = &repo_ids[0];
+        let legacy_inbound = kv_payload_for_key(conn, &legacy_last_git_sha_kv_key(repo_id))?
+            .is_some_and(|value| !value.is_empty());
+        repository_has_legacy_human_kv(conn, repo_id)? || legacy_inbound
     } else {
-        repo_ids.len() == 1 && repository_has_legacy_human_kv(conn, &repo_ids[0])?
+        false
     };
 
     for repo_id in &repo_ids {

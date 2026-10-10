@@ -334,7 +334,17 @@ pub fn resolve_repo_import_baseline(
         });
     }
 
-    if has_scoped_svn || has_scoped_git {
+    if has_scoped_git {
+        return Ok(RepoImportBaseline::ReconciliationRequired {
+            reason: "orphan_scoped_import_checkpoint".into(),
+            detail: "per-repo import cursors exist without a finalized repository checkpoint"
+                .into(),
+        });
+    }
+    if has_scoped_svn {
+        if repo.last_svn_rev > 0 && repo.last_git_sha.is_empty() {
+            return Ok(RepoImportBaseline::Pending);
+        }
         return Ok(RepoImportBaseline::ReconciliationRequired {
             reason: "orphan_scoped_import_checkpoint".into(),
             detail: "per-repo import cursors exist without a finalized repository checkpoint"
@@ -2007,6 +2017,22 @@ mod tests {
                 ..
             } if reason == "orphan_scoped_import_checkpoint"
         ));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_pending_when_svn_scoped_without_git_checkpoint() {
+        let (_dir, db, _workdir) = open_repo("blocked-git");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=3, last_git_sha='' WHERE id='blocked-git'",
+                [],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_blocked-git", "3").unwrap();
+        assert_eq!(
+            resolve_repo_import_baseline(&db, "blocked-git").unwrap(),
+            RepoImportBaseline::Pending
+        );
     }
 
     #[test]
