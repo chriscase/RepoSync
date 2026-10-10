@@ -891,7 +891,9 @@ mod tests {
             (3, emitted_tip.into())
         );
         assert_eq!(
-            db.get_state("last_git_sha_pair").unwrap().as_deref(),
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, "pair")
+                .unwrap()
+                .as_deref(),
             Some(inbound_cursor),
             "svn-to-git finalize must preserve scoped inbound git cursor kv"
         );
