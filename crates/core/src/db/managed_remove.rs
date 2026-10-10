@@ -1327,7 +1327,9 @@ impl Database {
         }
         self.transaction(|tx| {
             let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
-            let inbound_last_git_sha = read_value(tx, &format!("last_git_sha_{repo_id}"))?;
+            let inbound_last_git_sha =
+                crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
+                    .filter(|value| !value.is_empty());
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
@@ -2300,9 +2302,13 @@ mod tests {
                 params!["2026-01-02T00:00:00Z", repo_id],
             )
             .unwrap();
-        db.set_state(
-            &format!("last_git_sha_{repo_id}"),
-            "inboundcheckpoint0123456789abcdef0123456789",
+        let inbound_checkpoint = "inboundcheckpoint0123456789abcdef0123456789";
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &db.conn(),
+            repo_id,
+            inbound_checkpoint,
+            &now,
         )
         .unwrap();
         assert_eq!(
@@ -2361,7 +2367,7 @@ mod tests {
             crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, repo_id)
                 .unwrap()
                 .as_deref(),
-            Some("inboundcheckpoint0123456789abcdef0123456789")
+            Some(inbound_checkpoint)
         );
         assert_eq!(
             resolve_repo_import_baseline(&db, repo_id).unwrap(),
