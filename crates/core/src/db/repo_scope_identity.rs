@@ -428,7 +428,10 @@ fn legacy_receipt_has_live_adopter(
     Ok(false)
 }
 
-fn repository_has_legacy_human_kv(conn: &Connection, repo_id: &str) -> Result<bool, DatabaseError> {
+pub(crate) fn repository_has_legacy_human_kv(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<bool, DatabaseError> {
     if legacy_human_checkpoint_kv_safe_to_touch(conn, repo_id, repo_id)? {
         for key in [
             legacy_last_git_sha_kv_key(repo_id),

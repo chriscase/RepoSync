@@ -336,15 +336,45 @@ pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-/// v13 backfill runs at first sync-engine cycle for existing v12 installs so
+/// v13 backfill runs at first sync-engine cycle for lone legacy v12 installs so
 /// `Database::initialize` on an old on-disk file preserves `user_version` 12
 /// until the engine is ready to migrate scoped KV without losing import cursors.
+/// Multi-repository v12 databases still migrate during `initialize`.
 fn defer_v13_migration_until_engine(conn: &Connection) -> Result<bool, DatabaseError> {
     if get_schema_version(conn)? != 12 {
         return Ok(false);
     }
-    let repos: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-    Ok(repos > 0)
+    let repo_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    if repo_count != 1 {
+        return Ok(false);
+    }
+    if repositories_table_has_scope_uuid_column(conn)? {
+        return Ok(false);
+    }
+    let repo_id: String = conn.query_row(
+        "SELECT id FROM repositories ORDER BY id LIMIT 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let legacy_key = super::repo_scope_identity::legacy_last_git_sha_kv_key(&repo_id);
+    let has_legacy: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key = ?1)",
+        [legacy_key.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(has_legacy)
+}
+
+fn repositories_table_has_scope_uuid_column(conn: &Connection) -> Result<bool, DatabaseError> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('repositories') WHERE name = 'scope_uuid'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
 }
 
 /// Apply the v13 repository-scope migration when startup deferred it for a legacy install.
