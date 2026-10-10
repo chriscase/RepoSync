@@ -1243,6 +1243,24 @@ impl Database {
         Ok(())
     }
 
+    /// Remove a `kv_state` row. Prefer this over holding a raw `conn()` guard while
+    /// computing scoped keys (the connection mutex is not re-entrant).
+    pub fn delete_kv_state(&self, key: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// UUID-scoped inbound Git checkpoint KV key for a managed repository row.
+    pub fn scoped_last_git_sha_kv_key_for_repo(
+        &self,
+        repo_id: &str,
+    ) -> Result<String, DatabaseError> {
+        let conn = self.conn();
+        let scope = crate::db::repo_scope_identity::repository_scope_token(&conn, repo_id)?;
+        Ok(crate::db::repo_scope_identity::last_git_sha_kv_key(&scope))
+    }
+
     // -- sync_records -------------------------------------------------------
 
     /// Insert a sync record.

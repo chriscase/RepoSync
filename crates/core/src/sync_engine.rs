@@ -5270,10 +5270,10 @@ repo = "test/test-repo"
     }
 
     fn scoped_last_git_sha_key(engine: &SyncEngine, repo_id: &str) -> String {
-        let scope =
-            crate::db::repo_scope_identity::repository_scope_uuid(&engine.db().conn(), repo_id)
-                .unwrap();
-        crate::db::repo_scope_identity::last_git_sha_kv_key(&scope)
+        engine
+            .db()
+            .scoped_last_git_sha_kv_key_for_repo(repo_id)
+            .unwrap()
     }
 
     fn set_scoped_last_git_sha_kv(engine: &SyncEngine, repo_id: &str, sha: &str) {
@@ -5776,11 +5776,7 @@ repo = "test/test-repo"
             .unwrap();
         engine
             .db()
-            .conn()
-            .execute(
-                "DELETE FROM kv_state WHERE key = ?1",
-                [scoped_last_git_sha_key(&engine, "pair")],
-            )
+            .delete_kv_state(&scoped_last_git_sha_key(&engine, "pair"))
             .unwrap();
         engine
             .db()
