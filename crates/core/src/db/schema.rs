@@ -326,11 +326,44 @@ pub fn run_migrations(conn: &Connection) -> Result<(), DatabaseError> {
             continue;
         }
         if version > current_version {
+            if version == 13 && defer_v13_migration_until_engine(conn)? {
+                continue;
+            }
             apply_one_migration(conn, version, description, sql)?;
         }
     }
 
     Ok(())
+}
+
+/// v13 backfill runs at first sync-engine cycle for existing v12 installs so
+/// `Database::initialize` on an old on-disk file preserves `user_version` 12
+/// until the engine is ready to migrate scoped KV without losing import cursors.
+fn defer_v13_migration_until_engine(conn: &Connection) -> Result<bool, DatabaseError> {
+    if get_schema_version(conn)? != 12 {
+        return Ok(false);
+    }
+    let repos: i64 = conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    Ok(repos > 0)
+}
+
+/// Apply the v13 repository-scope migration when startup deferred it for a legacy install.
+pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
+    if get_schema_version(conn)? >= 13 {
+        return Ok(());
+    }
+    if get_schema_version(conn)? < 12 {
+        return Err(DatabaseError::MigrationFailed {
+            version: 13,
+            detail: "database must reach schema version 12 before v13 upgrade".into(),
+        });
+    }
+    let migration = MIGRATIONS
+        .iter()
+        .find(|(version, _, _)| *version == 13)
+        .expect("v13 migration must be registered");
+    let (version, description, sql) = migration;
+    apply_one_migration(conn, *version, description, sql)
 }
 
 /// Refuse a schema written by a newer executable.

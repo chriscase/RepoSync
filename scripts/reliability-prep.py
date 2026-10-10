@@ -24,6 +24,9 @@ for line in source.read_text().splitlines():
     target = destination / Path(executable).name
     shutil.copy2(executable, target)
     manifest[name] = target.name
+    # Cargo names lib-test binaries with underscores; manifest cases use crate names.
+    if name == "reposync_core":
+        manifest["reposync-core"] = target.name
 if not manifest:
     raise SystemExit("no Rust test executables were produced")
 (destination / "binaries.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")

@@ -129,6 +129,12 @@ impl Database {
         Ok(())
     }
 
+    /// Upgrade deferred v13 scope identity for legacy v12 installs (see [`schema::ensure_v13_migration`]).
+    pub fn ensure_repository_scope_schema_upgrade(&self) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        schema::ensure_v13_migration(&conn)
+    }
+
     /// Ordinary daemon writer startup: exclusive `reposync.lock` owner, durable
     /// writer-fence lease, then v12 init.
     ///

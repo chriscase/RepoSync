@@ -516,6 +516,10 @@ impl SyncEngine {
         // Hot-reload credentials from DB (changed via Setup Wizard).
         self.reload_credentials();
 
+        self.db
+            .ensure_repository_scope_schema_upgrade()
+            .map_err(SyncError::DatabaseError)?;
+
         let mut stats = SyncStats {
             started_at: Utc::now().to_rfc3339(),
             ..Default::default()

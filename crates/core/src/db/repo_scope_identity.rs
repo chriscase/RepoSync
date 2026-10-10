@@ -733,7 +733,12 @@ pub fn attach_scope_uuid_to_receipt(receipt: &mut serde_json::Value, scope_uuid:
     }
 }
 
-fn copy_kv_if_absent(conn: &Connection, from_key: &str, to_key: &str) -> Result<(), DatabaseError> {
+fn copy_kv_if_absent(
+    conn: &Connection,
+    from_key: &str,
+    to_key: &str,
+    remove_source: bool,
+) -> Result<(), DatabaseError> {
     if from_key == to_key {
         return Ok(());
     }
@@ -750,7 +755,7 @@ fn copy_kv_if_absent(conn: &Connection, from_key: &str, to_key: &str) -> Result<
          SELECT ?1, value, updated_at FROM kv_state WHERE key = ?2",
         params![to_key, from_key],
     )?;
-    if migrated > 0 {
+    if migrated > 0 && remove_source {
         conn.execute("DELETE FROM kv_state WHERE key = ?1", [from_key])?;
     }
     Ok(())
@@ -760,22 +765,27 @@ pub(crate) fn migrate_legacy_kv_for_repo(
     conn: &Connection,
     repo_id: &str,
     scope_uuid: &str,
+    preserve_legacy_checkpoint_mirrors: bool,
 ) -> Result<(), DatabaseError> {
+    let remove_legacy_checkpoint = !preserve_legacy_checkpoint_mirrors;
     if legacy_human_checkpoint_kv_safe_to_touch(conn, repo_id, repo_id)? {
         copy_kv_if_absent(
             conn,
             &legacy_last_git_sha_kv_key(repo_id),
             &last_git_sha_kv_key(scope_uuid),
+            remove_legacy_checkpoint,
         )?;
         copy_kv_if_absent(
             conn,
             &legacy_repo_echo_generation_kv_key(repo_id),
             &repo_echo_generation_kv_key(scope_uuid),
+            remove_legacy_checkpoint,
         )?;
         copy_kv_if_absent(
             conn,
             &legacy_team_history_block_kv_key(repo_id),
             &team_history_block_kv_key(scope_uuid),
+            remove_legacy_checkpoint,
         )?;
     }
 
@@ -801,7 +811,7 @@ pub(crate) fn migrate_legacy_kv_for_repo(
             generation,
             &checkpoint,
         );
-        copy_kv_if_absent(conn, &key, &scoped_key)?;
+        copy_kv_if_absent(conn, &key, &scoped_key, true)?;
         if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&value) {
             attach_scope_uuid_to_receipt(&mut record, scope_uuid);
             conn.execute(
@@ -831,7 +841,7 @@ pub(crate) fn migrate_legacy_kv_for_repo(
         let scoped_key = crate::echo_receipt_scope::handled_svn_no_target_state_key(
             scope_uuid, generation, svn_rev,
         );
-        copy_kv_if_absent(conn, &key, &scoped_key)?;
+        copy_kv_if_absent(conn, &key, &scoped_key, true)?;
         if let Ok(mut record) = serde_json::from_str::<serde_json::Value>(&value) {
             attach_scope_uuid_to_receipt(&mut record, scope_uuid);
             conn.execute(
@@ -879,7 +889,7 @@ pub fn migrate_v13_scope_uuid(conn: &Connection) -> Result<(), DatabaseError> {
             )?;
             scope_uuid
         };
-        migrate_legacy_kv_for_repo(conn, repo_id, &scope_uuid)?;
+        migrate_legacy_kv_for_repo(conn, repo_id, &scope_uuid, enable_legacy_reads)?;
     }
 
     if !migration_done {

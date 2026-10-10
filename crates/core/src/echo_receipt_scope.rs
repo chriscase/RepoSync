@@ -596,10 +596,20 @@ pub fn inbound_git_checkpoint_mirror_conflict(
         )
         .optional()?
         .filter(|value: &String| !value.is_empty());
-    if legacy.is_some() && column.is_some() && legacy.as_deref() != column.as_deref() {
-        return Ok(true);
+    if legacy.is_none() || column.is_none() {
+        return Ok(false);
     }
-    Ok(false)
+    let legacy_sha = legacy.as_deref().unwrap();
+    let column_sha = column.as_deref().unwrap();
+    if legacy_sha == column_sha {
+        return Ok(false);
+    }
+    // Legacy-authoritative installs may keep the repo-id/scoped inbound KV on the
+    // handled Git→SVN frontier while the repository column tracks an SVN-emitted tip.
+    if scoped.as_deref() == Some(legacy_sha) {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
