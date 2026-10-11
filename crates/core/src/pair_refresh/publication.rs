@@ -70,7 +70,7 @@ fn pinned_remote<'repo>(
     checked_anonymous_remote(repo, remote_url)
 }
 
-fn checked_anonymous_remote<'repo>(
+pub(super) fn checked_anonymous_remote<'repo>(
     repo: &'repo Repository,
     remote_url: &str,
 ) -> Result<git2::Remote<'repo>, GitError> {
@@ -98,7 +98,7 @@ pub fn require_pinned_push_endpoint_with_policy(
     Ok(())
 }
 
-fn no_credentials() -> RemoteCallbacks<'static> {
+pub(super) fn no_credentials() -> RemoteCallbacks<'static> {
     let mut callbacks = RemoteCallbacks::new();
     callbacks.credentials(|_, _, _| {
         Err(git2::Error::from_str(

@@ -152,6 +152,12 @@ fn svn_url(source: &Source) -> Result<String, DatabaseError> {
         || url.fragment().is_some()
         || url.as_str() != raw
         || raw.contains('%')
+        || url.path().split('/').skip(1).any(|segment| {
+            matches!(segment, "" | "." | "..")
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
         || raw
             .bytes()
             .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
@@ -212,6 +218,28 @@ pub(crate) fn capture_execution_configuration(
     }
     let child_registration = capture_refresh_registration(tx, child_id)?;
     let parent_registration = capture_refresh_registration(tx, parent_id)?;
+    let mut history_keys = crate::db::personal_scope::personal_history_block_keys().to_vec();
+    history_keys.push(crate::history_inspect::history_block_key(None));
+    for registration in [&child_registration, &parent_registration] {
+        history_keys.push(crate::db::repo_scope_identity::team_history_block_kv_key(
+            &registration.scope_uuid,
+        ));
+        history_keys.push(crate::history_inspect::history_block_key(Some(
+            &registration.repo_id,
+        )));
+    }
+    for key in history_keys {
+        let raw: Option<String> = tx
+            .query_row("SELECT value FROM kv_state WHERE key=?1", [&key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if raw.is_some_and(|raw| !raw.is_empty()) {
+            // A refresh may not clear or reinterpret retained history
+            // reconciliation, including malformed/transient evidence.
+            return Err(refused("history inspection must be quiet before refresh"));
+        }
+    }
     for registration in [&child_registration, &parent_registration] {
         if !crate::history_inspect::is_full_git_oid(&registration.last_git_sha)
             || registration.last_svn_rev < 1

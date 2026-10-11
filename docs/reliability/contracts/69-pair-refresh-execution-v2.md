@@ -341,6 +341,20 @@ with the ordinary CLI, refusal with missing or incorrect refresh passwords,
 success with the explicit password, and unchanged ambient cache contents. This
 is authentication evidence; full publication/recovery proof remains below.
 
+Registered SVN paths use nonempty ASCII segments containing letters, digits,
+'.', '_' and '-'. Trailing slashes, empty segments and peg syntax refuse before
+distinctness is checked. A real local SVN control confirms that the rejected
+trailing-slash and repeated-slash forms otherwise name the same node.
+Any retained child, parent, legacy, global or Personal history block also refuses
+source capture, admission and the first publication intent without clearing it.
+
+The read-only Git source observer downloads both registered checkpoint branches
+into a private repository without updating refs or FETCH_HEAD. Each authenticated
+advertisement must contain both exact checkpoint tips. The parent and child use
+their separately resolved credentials through the pinned HTTPS transport. This
+proves Git inputs only; fresh remote revalidation, SVN evidence and authenticated
+execution approval are still required before publication.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary
