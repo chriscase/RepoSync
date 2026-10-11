@@ -25,6 +25,24 @@ pub struct SvnCopyProof {
     pub inspected_revision: i64,
 }
 
+/// Complete location and revision pins for the two-path lineage proof. These
+/// fields are part of the later execution approval, including both clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SvnRefreshLineagePins {
+    pub child: SvnLineagePins,
+    pub repository_root_url: String,
+    pub child_url: String,
+    pub parent_url: String,
+    pub parent_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SvnRefreshLineageProof {
+    pub pins: SvnRefreshLineagePins,
+    pub child_copy: SvnCopyProof,
+    pub parent_originating_revision: i64,
+}
+
 fn refused(detail: &str) -> SvnError {
     SvnError::LineageRefused {
         reason: "unproved_pair_refresh_svn_lineage".into(),
@@ -45,7 +63,8 @@ fn canonical_path(path: &str) -> bool {
 }
 
 fn affects_path(changed: &str, target: &str) -> bool {
-    changed == target
+    changed == "/"
+        || changed == target
         || target
             .strip_prefix(changed)
             .is_some_and(|suffix| suffix.starts_with('/'))
@@ -128,4 +147,96 @@ pub async fn inspect_svn_copy_origin(
         return Err(refused("history did not stop at the originating copy"));
     }
     Ok(origin)
+}
+
+/// Prove that the configured parent at the child's copy-from revision remains
+/// the same path incarnation through the mapped baseline and pinned source tip.
+/// Content changes beneath the parent are allowed; replacing or renaming the
+/// parent or an enclosing directory after the copy source is refused.
+pub async fn inspect_svn_refresh_lineage(
+    child_client: &SvnClient,
+    parent_client: &SvnClient,
+    pins: &SvnRefreshLineagePins,
+) -> Result<SvnRefreshLineageProof, SvnError> {
+    let root = reqwest::Url::parse(&pins.repository_root_url)
+        .map_err(|_| refused("invalid pinned repository root URL"))?;
+    if pins.repository_root_url.ends_with('/')
+        || !root.username().is_empty()
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || pins.parent_revision < pins.child.parent_baseline_revision
+        || child_client.url() != pins.child_url
+        || parent_client.url() != pins.parent_url
+        || pins.child_url != format!("{}{}", pins.repository_root_url, pins.child.child_path)
+        || pins.parent_url != format!("{}{}", pins.repository_root_url, pins.child.parent_path)
+    {
+        return Err(refused(
+            "lineage clients or revision range differ from approval",
+        ));
+    }
+    let child_copy = inspect_svn_copy_origin(child_client, &pins.child).await?;
+    let child_info = child_client.info_at_rev(pins.child.child_revision).await?;
+    if child_info.root_url != pins.repository_root_url || child_info.url != pins.child_url {
+        return Err(refused("child repository location differs from approval"));
+    }
+    for revision in [
+        child_copy.copy_from_revision,
+        pins.child.parent_baseline_revision,
+        pins.parent_revision,
+    ] {
+        let info = parent_client.info_at_rev(revision).await?;
+        if info.uuid != pins.child.repository_uuid
+            || info.root_url != pins.repository_root_url
+            || info.url != pins.parent_url
+            || info.latest_rev != revision
+        {
+            return Err(refused(
+                "parent UUID or pegged location differs from approval",
+            ));
+        }
+    }
+    let history = parent_client
+        .copy_history_at_rev(pins.parent_revision)
+        .await?;
+    let mut previous_revision = None;
+    let mut originating_revision = None;
+    for entry in &history {
+        if entry.revision < 1
+            || entry.revision > pins.parent_revision
+            || previous_revision.is_some_and(|previous| entry.revision >= previous)
+        {
+            return Err(refused("parent history is incomplete or unordered"));
+        }
+        previous_revision = Some(entry.revision);
+        for change in &entry.changed_paths {
+            if !affects_path(&change.path, &pins.child.parent_path) {
+                continue;
+            }
+            match change.action.as_str() {
+                "M" if change.copy_from_path.is_none() && change.copy_from_rev.is_none() => {}
+                "A" if entry.revision <= child_copy.copy_from_revision => {
+                    if originating_revision.is_some_and(|revision| revision != entry.revision) {
+                        return Err(refused("multiple parent path origins"));
+                    }
+                    originating_revision = Some(entry.revision);
+                }
+                _ => {
+                    return Err(refused(
+                        "parent path incarnation changed after the copy source",
+                    ))
+                }
+            }
+        }
+    }
+    let parent_originating_revision =
+        originating_revision.ok_or_else(|| refused("parent path origin not found"))?;
+    if history.last().map(|entry| entry.revision) != Some(parent_originating_revision) {
+        return Err(refused("parent history did not stop at its path origin"));
+    }
+    Ok(SvnRefreshLineageProof {
+        pins: pins.clone(),
+        child_copy,
+        parent_originating_revision,
+    })
 }

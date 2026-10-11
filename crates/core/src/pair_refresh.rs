@@ -15,6 +15,7 @@ use crate::late_pair::VerifiedMapping;
 
 mod http_transport;
 pub mod lineage;
+pub mod preparation;
 pub mod publication;
 
 /// Policy identity pinned into every preview from this slice.
