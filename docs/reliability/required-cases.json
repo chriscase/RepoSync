@@ -310,6 +310,24 @@
       "tier": "candidate_regression"
     },
     {
+      "id": "RS63_SCOPE_UUID_REREGISTER",
+      "binary": "reposync-core",
+      "test": "db::repo_scope_identity::tests::delete_reregister_same_id_old_receipt_does_not_suppress",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_SCOPE_UUID_MIGRATION_IDEMPOTENT",
+      "binary": "reposync-core",
+      "test": "db::repo_scope_identity::tests::migration_backfill_is_idempotent",
+      "tier": "candidate_regression"
+    },
+    {
+      "id": "RS63_LEGACY_RECEIPT_NOT_AUTHORITATIVE",
+      "binary": "reposync-core",
+      "test": "db::repo_scope_identity::tests::legacy_receipt_without_scope_uuid_is_not_authoritative",
+      "tier": "candidate_regression"
+    },
+    {
       "id": "ECHO_GENERATION_STALE_RECEIPT",
       "binary": "team_mode_e2e",
       "test": "candidate_echo_generation_stale_receipt_does_not_suppress_after_bump",
@@ -872,7 +890,7 @@
     {
       "id": "STARTUP_V12",
       "binary": "startup_schema",
-      "test": "ordinary_startup_stays_v12",
+      "test": "ordinary_startup_stays_v13",
       "tier": "candidate_regression"
     },
     {

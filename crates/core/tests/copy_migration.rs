@@ -24,8 +24,8 @@ fn fixture(ids: &[i64], delete: &[i64]) -> (TempDir, std::path::PathBuf, std::pa
     fs::write(source.join("config.toml"), "synthetic configuration\n").unwrap();
     {
         let db = Database::new(source.join("reposync.db")).unwrap();
-        db.initialize().unwrap();
         let c = db.conn();
+        reposync_core::db::schema::run_migrations_up_to(&c, 12).unwrap();
         c.execute("INSERT INTO repositories(id,name,svn_url,created_at,updated_at,enabled) VALUES('synthetic','synthetic','unqualified','t','t',0)",[]).unwrap();
         for id in ids {
             c.execute("INSERT INTO commit_map(id,svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id) VALUES(?1,?1,'sha','svn_to_git','original-timestamp','original-author','original-git-author','orphan-legacy')",[id]).unwrap();
