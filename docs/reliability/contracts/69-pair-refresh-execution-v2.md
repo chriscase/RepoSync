@@ -166,6 +166,20 @@ entrances, authenticated execution and complete real-engine recovery evidence
 remain unfinished. These conservative retained windows must not be cleared
 merely because time passed or a new daemon acquired a lease.
 
+Direct full and snapshot imports now admit a writer window before progress,
+LFS or working-tree preparation. Managed publication retains its import journal;
+legacy full import marks global publication uncertainty before invoking a push.
+A failed legacy batch stops without a blind retry. Successful batches and the
+final result require an independent exact-ref read before global checkpoints
+or window completion. Both legacy checkpoint values are written atomically,
+and a managed installation refuses those global values without a partial write.
+Active Personal config journals, including legacy names, exclude refresh admission
+before setup clone preparation. Scoped import-baseline backfill checks a hold
+in its mutation transaction rather than repairing drift during a held refresh.
+Automatic reconciliation also retains a window before local/credential observation
+and mapping/checkpoint confirmation. These caller controls do not replace the
+unfinished authenticated refresh execution and real-engine crash proof.
+
 Conflict resolution, deferred status and resolved-content storage now check the
 conflict's persisted repository owner in the same transaction as the write.
 NULL, empty or personal legacy attribution uses global exclusion; unrelated

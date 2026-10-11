@@ -811,6 +811,11 @@ impl Database {
                 require_no_pair_refresh_hold(tx, Some(id))?;
                 require_other_journals_quiet(tx, id)?;
             }
+            // Legacy config imports share global checkpoints and prepare a
+            // global Git workdir before their engine worker starts.
+            for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+                require_other_journals_quiet(tx, id)?;
+            }
             for pin in [&pins.child, &pins.parent] {
                 super::ordinary_writer_windows::require_quiet_for_refresh(
                     tx,

@@ -54,7 +54,7 @@ fn personal_repo_ids_for_read(db: &Database) -> Result<Vec<&'static str>, Databa
 ///
 /// Legacy journals keyed under `personal` must keep blocking replay even when a
 /// managed repository already owns that id and legacy receipt reads are off.
-fn personal_repo_ids_for_journal_read() -> [&'static str; 2] {
+pub(crate) fn personal_repo_ids_for_journal_read() -> [&'static str; 2] {
     [PERSONAL_SCOPE_KEY, LEGACY_PERSONAL_REPO_ID]
 }
 

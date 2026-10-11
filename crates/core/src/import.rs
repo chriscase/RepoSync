@@ -2531,6 +2531,43 @@ async fn publish_checked(
     Ok(())
 }
 
+/// Legacy imports lack a publication journal. Before releasing their writer
+/// window or advancing a global cursor, independently read the exact final ref.
+async fn verify_legacy_import_tip(
+    workdir: &Path,
+    config: &ImportConfig,
+    expected_sha: &str,
+) -> Result<()> {
+    if !crate::history_inspect::is_full_git_oid(expected_sha) {
+        bail!("legacy import lacks an exact final Git tip");
+    }
+    let reference = format!("refs/heads/{}", config.branch);
+    let mut inspect = tokio::process::Command::new("git");
+    inspect
+        .args([
+            "ls-remote",
+            "--exit-code",
+            "--",
+            &config.remote_name,
+            &reference,
+        ])
+        .current_dir(workdir);
+    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(
+        &mut inspect,
+        config.push_token.as_deref(),
+    );
+    let observed = crate::process::run(inspect, Duration::from_secs(60), None)
+        .await
+        .context("legacy import publication could not be verified; writer window retained")?;
+    if !observed.status.success()
+        || std::str::from_utf8(&observed.stdout).ok().map(str::trim)
+            != Some(format!("{expected_sha}\t{reference}").as_str())
+    {
+        bail!("legacy import final remote ref differs or is unavailable; writer window retained");
+    }
+    Ok(())
+}
+
 async fn import_cli_commit(
     workdir: &Path,
     message: &str,
@@ -2685,6 +2722,14 @@ pub async fn run_snapshot_import(
         operation_id,
         cancel_signal,
     } = run_state;
+
+    let writer_window = db
+        .begin_ordinary_writer_window(if operation_id.is_some() {
+            repo_id.as_deref()
+        } else {
+            None
+        })
+        .context("snapshot import writer admission refused")?;
 
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let mut p = progress.write().await;
@@ -2889,6 +2934,9 @@ pub async fn run_snapshot_import(
     // `complete_import_operation` succeeds. Emitting completed here would
     // claim success if finalization then fails.
 
+    writer_window
+        .finish()
+        .context("snapshot import writer completion refused")?;
     Ok(ImportOutcome::Completed {
         commits: 1,
         svn_rev: pin.operative_rev,
@@ -2902,9 +2950,19 @@ fn persist_legacy_personal_import_watermarks(
     last_svn_rev: i64,
     git_sha: &str,
 ) -> Result<(), crate::errors::DatabaseError> {
-    db.set_watermark("svn_rev", &last_svn_rev.to_string())?;
-    db.set_legacy_import_git_sha_watermark(git_sha)?;
-    Ok(())
+    db.transaction(|tx| {
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        crate::writer_fence::require_current(tx)?;
+        let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM repositories)", [], |row| row.get(0))?;
+        if managed {
+            return Err(DatabaseError::Other("refusing global git_sha watermark while repositories table is non-empty".into()));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        for (source, value) in [("svn_rev", last_svn_rev.to_string()), ("git_sha", git_sha.to_owned())] {
+            tx.execute("INSERT INTO watermarks(source,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![source,value,now])?;
+        }
+        Ok(())
+    })
 }
 
 pub async fn run_full_import(
@@ -2923,6 +2981,15 @@ pub async fn run_full_import(
         operation_id,
         cancel_signal,
     } = run_state;
+
+    let writer_window = db
+        .begin_ordinary_writer_window(if operation_id.is_some() {
+            repo_id.as_deref()
+        } else {
+            None
+        })
+        .context("full import writer admission refused")?;
+    let mut legacy_publication_possible = false;
 
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let mut p = progress.write().await;
@@ -3568,6 +3635,9 @@ pub async fn run_full_import(
                         let rp = repo_path.clone();
                         let push_token = import_config.push_token.clone();
 
+                        writer_window.mark_unjournalled_publication_possible()?;
+                        legacy_publication_possible = true;
+
                         // Heartbeat task: log "still pushing..." every 30s
                         let hb_progress = progress.clone();
                         let hb_ws = ws_broadcast.clone();
@@ -3639,6 +3709,12 @@ pub async fn run_full_import(
 
                         match push_result {
                             Ok(Ok(stderr)) => {
+                                let tip = {
+                                    let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
+                                    git.get_head_sha()
+                                        .context("missing pushed legacy batch tip")?
+                                };
+                                verify_legacy_import_tip(&repo_path, import_config, &tip).await?;
                                 // Log any git push output (remote warnings, etc.)
                                 for line in stderr.lines() {
                                     let trimmed = line.trim();
@@ -3677,13 +3753,20 @@ pub async fn run_full_import(
                                 .await;
                             }
                             Ok(Err(e)) => {
-                                let msg =
-                                    format!("[warn] Batch push failed (will retry at end): {}", e);
+                                let msg = format!("[warn] Batch push outcome uncertain: {}", e);
                                 log(&progress, &ws_broadcast, msg).await;
+                                return Ok(ImportOutcome::ReconciliationRequired {
+                                    commits: count,
+                                    reason: "legacy Git publication outcome uncertain; writer window retained".into(),
+                                });
                             }
                             Err(e) => {
                                 let msg = format!("[warn] Batch push task panicked: {}", e);
                                 log(&progress, &ws_broadcast, msg).await;
+                                return Ok(ImportOutcome::ReconciliationRequired {
+                                    commits: count,
+                                    reason: "legacy Git publication outcome uncertain; writer window retained".into(),
+                                });
                             }
                         }
                     }
@@ -3785,7 +3868,9 @@ pub async fn run_full_import(
             }
             progress.write().await.batches_pushed += 1;
         } else {
-            let max_retries = 3;
+            // A possible unjournalled publication is not retry permission.
+            // Retain the window for observation rather than repeating a push.
+            let max_retries = 1;
             let mut push_success = false;
 
             for attempt in 1..=max_retries {
@@ -3815,6 +3900,8 @@ pub async fn run_full_import(
                 let rp = repo_path.clone();
                 let push_token = import_config.push_token.clone();
 
+                writer_window.mark_unjournalled_publication_possible()?;
+                legacy_publication_possible = true;
                 let push_result = tokio::task::spawn_blocking(move || {
                     let mut args = vec!["push".to_string(), "--progress".to_string()];
                     if force {
@@ -3916,6 +4003,13 @@ pub async fn run_full_import(
         let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
         git.get_head_sha().context("missing final Git import tip")?
     };
+    if legacy_publication_possible {
+        let repo_path = {
+            let git = git_client.lock().unwrap_or_else(|p| p.into_inner());
+            git.repo_workdir()
+        };
+        verify_legacy_import_tip(&repo_path, import_config, &sha).await?;
+    }
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let all_confirmed = match (&repo_id, &operation_id) {
             (Some(repo), Some(op_id)) => db.get_import_operation(repo, op_id)?.is_some_and(|op| {
@@ -3954,6 +4048,9 @@ pub async fn run_full_import(
         revisions = log_entries.len(),
         "full import completed"
     );
+    writer_window
+        .finish()
+        .context("full import writer completion refused")?;
     Ok(ImportOutcome::Completed {
         commits: count,
         svn_rev: last_rev,

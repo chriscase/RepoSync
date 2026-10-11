@@ -96,6 +96,9 @@ pub async fn reconcile_held_external_writes(
     svn: &SvnClient,
     git_workdir: Option<&Path>,
 ) -> Result<AutoReconcileResult, DatabaseError> {
+    // Reconciliation can update local credentials, correspondences and cursors.
+    // Keep refresh excluded before opening a workdir or observing a journal.
+    let writer_window = db.begin_ordinary_writer_window(Some(&repo.id))?;
     let mut result = AutoReconcileResult::default();
 
     if let Some(op) = db.active_import_operation(&repo.id)? {
@@ -220,5 +223,6 @@ pub async fn reconcile_held_external_writes(
         }
     }
 
+    writer_window.finish()?;
     Ok(result)
 }

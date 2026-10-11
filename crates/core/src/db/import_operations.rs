@@ -310,6 +310,9 @@ pub fn resolve_repo_import_baseline(
                 kv_state_value_tx(tx, &scoped_svn_key)?.and_then(|value| value.parse::<i64>().ok());
             let has_scoped_svn = scoped_svn_rev.is_some_and(|rev| rev > 0);
             if !has_scoped_svn {
+                super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                    tx, repo_id,
+                )?;
                 let now = Utc::now().to_rfc3339();
                 tx.execute(
                     "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
