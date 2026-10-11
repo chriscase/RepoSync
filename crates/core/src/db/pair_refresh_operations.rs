@@ -407,6 +407,16 @@ pub fn require_no_pair_refresh_hold(
     Ok(())
 }
 
+/// Existing personal-mode journals have no managed registration identity and
+/// must be treated as global writers for refresh exclusion.
+pub fn require_no_pair_refresh_hold_for_writer(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    let scope = (repo_id != super::personal_scope::PERSONAL_SCOPE_KEY).then_some(repo_id);
+    require_no_pair_refresh_hold(tx, scope)
+}
+
 fn require_pins_current(tx: &Connection, pins: &RefreshJobPins) -> Result<(), DatabaseError> {
     for pin in [&pins.child, &pins.parent] {
         if capture_refresh_registration(tx, &pin.repo_id)? != *pin {

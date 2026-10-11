@@ -103,6 +103,13 @@ fn parse(raw: &str) -> Result<LatePairPublishOperation, DatabaseError> {
 }
 
 fn write_op(tx: &Connection, op: &LatePairPublishOperation) -> Result<(), DatabaseError> {
+    super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+        tx,
+        &op.parent_repo_id,
+    )?;
+    if let Some(child) = &op.child_repo_id {
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, child)?;
+    }
     write_value(
         tx,
         &key("document", &op.id),
@@ -147,6 +154,10 @@ impl Database {
         policy_version: &str,
     ) -> Result<LatePairPublishOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                parent_repo_id,
+            )?;
             crate::writer_fence::require_current(tx)?;
             if super::managed_remove::new_work_blocked(tx, parent_repo_id)? {
                 return Err(DatabaseError::Other(
@@ -254,6 +265,10 @@ impl Database {
         op_id: &str,
     ) -> Result<LatePairPublishOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                parent_repo_id,
+            )?;
             crate::writer_fence::require_current(tx)?;
             finalize_late_pair_publish_op_in_tx(tx, parent_repo_id, op_id, None)
         })
@@ -268,6 +283,10 @@ impl Database {
         git_tip: &str,
     ) -> Result<LatePairPublishOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                parent_repo_id,
+            )?;
             crate::writer_fence::require_current(tx)?;
             finalize_late_pair_publish_op_in_tx(
                 tx,
@@ -294,6 +313,7 @@ fn finalize_late_pair_publish_op_in_tx(
         ));
     }
     if let Some((child_id, git_tip)) = enable_child {
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, child_id)?;
         if super::managed_remove::new_work_blocked(tx, child_id)? {
             op.state = LatePairPublishState::ReconciliationRequired;
             op.outcome_detail =

@@ -402,6 +402,10 @@ impl Database {
         intent: TeamCycleMappingIntent<'_>,
     ) -> Result<TeamCycleMappingOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                tx,
+                intent.repo_id,
+            )?;
             let active = key("active", intent.repo_id);
             if read_value(tx, &active)?.is_some() {
                 return Err(DatabaseError::Other(
@@ -474,6 +478,7 @@ impl Database {
         observed_proof: Option<serde_json::Value>,
     ) -> Result<TeamCycleMappingOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive team cycle mapping operation".into(),
@@ -501,6 +506,7 @@ impl Database {
         F: FnOnce(&mut TeamCycleMappingOperation) -> Result<(), DatabaseError>,
     {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
             if read_value(tx, &key("active", repo_id))?.as_deref() != Some(op_id) {
                 return Err(DatabaseError::Other(
                     "stale or inactive team cycle mapping operation".into(),

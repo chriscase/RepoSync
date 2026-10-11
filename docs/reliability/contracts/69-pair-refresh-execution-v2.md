@@ -92,9 +92,18 @@ all child cursor copies, marks completion and releases both holds; a database
 failure rolls back all these changes. Completed request lookup is idempotent.
 Parent state and both echo generations remain unchanged. Journal receipt storage
 is not independent remote verification, API approval, or credential admission.
-Writer-entrance integration, the authenticated publication/recovery caller and
-real production SyncEngine proof remain prerequisites; no execution endpoint is
-enabled by this storage component.
+The existing import, Git push, SVN commit, team mapping, late-pair publication
+and managed removal admission transactions now check these holds before mutation.
+Their persisted resume/confirmation/finalization paths also check holds in the
+same transaction; late-pair updates cover parent and named child scopes. Legacy
+disable checks and updates in one transaction. Personal journals are treated as
+global writer scopes, and corrupt refresh evidence blocks unrelated admission.
+Two-connection import/refresh admission permits one owner; unrelated registered
+imports remain available. These are journal boundaries, not complete external
+writer exclusion. Scheduler/direct engine/import working-tree and publication
+entrances, configuration/credential/conflict/skip mutations, the authenticated
+publication/recovery caller and real production SyncEngine proof remain
+prerequisites. No execution endpoint is enabled by these components.
 
 ## Preparation and correspondence
 
