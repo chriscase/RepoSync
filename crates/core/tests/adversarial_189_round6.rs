@@ -3,8 +3,10 @@
 use reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key;
 use reposync_core::db::{schema, Database};
 use reposync_core::echo_receipt_scope::{
-    read_scoped_last_git_sha_kv, write_scoped_last_git_sha_kv,
+    read_scoped_last_git_sha_kv, read_team_inbound_git_checkpoint_kv,
+    write_scoped_last_git_sha_kv,
 };
+use reposync_core::db::repo_scope_identity::last_git_sha_kv_key;
 use reposync_core::errors::DatabaseError;
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
@@ -133,7 +135,7 @@ fn scoped_last_git_sha_kv_skips_human_mirror_unless_legacy_reads_latched() {
 }
 
 #[test]
-fn scoped_last_git_sha_kv_mirrors_existing_legacy_inbound_without_latch() {
+fn scoped_last_git_sha_kv_does_not_mirror_existing_legacy_inbound_without_latch() {
     let db = Database::in_memory().unwrap();
     db.initialize().unwrap();
     let scope = reposync_core::db::repo_scope_identity::new_scope_uuid();
@@ -154,6 +156,32 @@ fn scoped_last_git_sha_kv_mirrors_existing_legacy_inbound_without_latch() {
     );
     assert_eq!(
         db.get_state(&legacy_last_git_sha_kv_key("pair")).unwrap(),
-        Some(emitted)
+        Some(handled)
+    );
+}
+
+#[test]
+fn team_inbound_git_checkpoint_refuses_legacy_human_key_without_latch() {
+    let db = Database::in_memory().unwrap();
+    db.initialize().unwrap();
+    let scope_a = reposync_core::db::repo_scope_identity::new_scope_uuid();
+    let scope_b = reposync_core::db::repo_scope_identity::new_scope_uuid();
+    db.conn().execute(
+        "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha,scope_uuid)
+         VALUES ('a','a','file:///fixture','trunk','','','','main',1,'t','t',0,'',?1),
+                ('b','b','file:///fixture','trunk','','','','main',1,'t','t',0,'',?2)",
+        params![scope_a, scope_b],
+    )
+    .unwrap();
+    let stale = "e".repeat(40);
+    db.set_state(&legacy_last_git_sha_kv_key("a"), &stale).unwrap();
+    assert_eq!(
+        db.get_state("reposync_v13_legacy_repo_id_kv_reads").unwrap(),
+        Some("0".to_string())
+    );
+    assert_eq!(read_team_inbound_git_checkpoint_kv(&db, "a").unwrap(), None);
+    assert_eq!(
+        db.get_state(&last_git_sha_kv_key(&scope_a)).unwrap(),
+        None
     );
 }

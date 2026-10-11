@@ -612,25 +612,14 @@ pub fn inbound_git_checkpoint_mirror_conflict(
     Ok(true)
 }
 
-/// Read the Git→SVN inbound handled checkpoint (UUID-scoped KV).
-/// Inbound Git checkpoint for team split-cursor reconciliation: scoped KV first,
-/// then the human `last_git_sha_<repo_id>` copy when present (old installs may
-/// keep handled inbound only on the legacy key until v13 backfill runs).
+/// Inbound Git checkpoint for team split-cursor reconciliation (same rules as
+/// [`read_scoped_last_git_sha_kv_tx`]: scoped KV, then legacy human key only when
+/// `reposync_v13_legacy_repo_id_kv_reads` is latched and the key does not collide).
 pub fn read_team_inbound_git_checkpoint_kv_tx(
     tx: &Connection,
     repo_id: &str,
 ) -> Result<Option<String>, DatabaseError> {
-    if let Some(value) = read_scoped_last_git_sha_kv_tx(tx, repo_id)? {
-        return Ok(Some(value));
-    }
-    Ok(tx
-        .query_row(
-            "SELECT value FROM kv_state WHERE key = ?1",
-            [legacy_last_git_sha_kv_key(repo_id)],
-            |row| row.get(0),
-        )
-        .optional()?
-        .filter(|value: &String| !value.is_empty()))
+    read_scoped_last_git_sha_kv_tx(tx, repo_id)
 }
 
 pub fn read_team_inbound_git_checkpoint_kv(
@@ -638,21 +627,6 @@ pub fn read_team_inbound_git_checkpoint_kv(
     repo_id: &str,
 ) -> Result<Option<String>, DatabaseError> {
     read_team_inbound_git_checkpoint_kv_tx(&db.conn(), repo_id)
-}
-
-fn legacy_inbound_git_sha_mirror_enabled(
-    tx: &Connection,
-    repo_id: &str,
-) -> Result<bool, DatabaseError> {
-    if legacy_repo_id_kv_authoritative(tx)? {
-        return Ok(true);
-    }
-    let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key = ?1 AND value != '')",
-        [legacy_last_git_sha_kv_key(repo_id)],
-        |row| row.get(0),
-    )?;
-    Ok(exists)
 }
 
 pub fn read_scoped_last_git_sha_kv_tx(
@@ -711,7 +685,7 @@ pub fn write_scoped_last_git_sha_kv(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![kv_key, git_sha, updated_at],
     )?;
-    if legacy_inbound_git_sha_mirror_enabled(tx, repo_id)? {
+    if legacy_repo_id_kv_authoritative(tx)? {
         let legacy_key = legacy_last_git_sha_kv_key(repo_id);
         tx.execute(
             "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)

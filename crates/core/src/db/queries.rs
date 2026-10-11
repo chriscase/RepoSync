@@ -1435,12 +1435,8 @@ impl Database {
             let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
             for table in &tables_with_repo_id {
                 let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
-                match conn.execute(&sql, params![repo_id]) {
-                    Ok(n) => debug!(table, repo_id, count = n, "deleted records"),
-                    Err(e) => {
-                        debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping")
-                    }
-                }
+                let n = conn.execute(&sql, params![repo_id])?;
+                debug!(table, repo_id, count = n, "deleted records");
             }
 
             for cred_key in super::managed_remove::owned_secret_keys(repo_id) {
