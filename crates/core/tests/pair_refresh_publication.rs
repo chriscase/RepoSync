@@ -2,22 +2,82 @@
 
 #![cfg(unix)]
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use git2::{Oid, Repository, Signature};
 use reposync_core::pair_refresh::publication::{
     publish_pinned_child, require_pinned_push_endpoint, require_pinned_push_transport,
 };
 
-struct Daemon(Child);
+struct Daemon {
+    stopped: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Daemon {
+    fn start(listener: TcpListener, root: PathBuf) -> Self {
+        listener.set_nonblocking(true).unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let worker = std::thread::spawn(move || {
+            let mut children: Vec<Child> = Vec::new();
+            while !worker_stopped.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let output: OwnedFd = stream.try_clone().unwrap().into();
+                        let input: OwnedFd = stream.into();
+                        // Keep the reserved listener for the entire fixture.
+                        // Each connection runs real Git's smart protocol with
+                        // the same receive-pack hooks and old-tip checks.
+                        let child = Command::new("git")
+                            .args([
+                                "daemon",
+                                "--inetd",
+                                "--export-all",
+                                "--enable=receive-pack",
+                                &format!("--base-path={}", root.display()),
+                            ])
+                            .arg(&root)
+                            .stdin(Stdio::from(input))
+                            .stdout(Stdio::from(output))
+                            .stderr(Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        children.push(child);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture listener failed: {error}"),
+                }
+                children.retain_mut(|child| child.try_wait().unwrap().is_none());
+            }
+            for mut child in children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        });
+        Self {
+            stopped,
+            worker: Some(worker),
+        }
+    }
+}
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        self.stopped.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -68,36 +128,7 @@ impl Fixture {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let mut daemon = Daemon(
-            Command::new("git")
-                .args([
-                    "daemon",
-                    "--reuseaddr",
-                    "--export-all",
-                    "--enable=receive-pack",
-                    "--listen=127.0.0.1",
-                    &format!("--port={port}"),
-                    &format!("--base-path={}", temp.path().display()),
-                ])
-                .arg(temp.path())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let started = Instant::now();
-        loop {
-            assert!(daemon.0.try_wait().unwrap().is_none(), "git daemon exited");
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                break;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "git daemon not ready"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let daemon = Daemon::start(listener, temp.path().to_owned());
         Self {
             _daemon: daemon,
             source,
@@ -322,5 +353,65 @@ fn replace_reference_refuses_before_publication() {
         )
         .unwrap();
     assert!(fixture.publish().is_err());
+    assert_eq!(fixture.tip(), fixture.child);
+}
+
+#[test]
+fn concurrent_fixtures_keep_unique_live_listeners() {
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let fixture = Fixture::new();
+                barrier.wait();
+                assert_eq!(fixture.publish().unwrap(), fixture.prepared);
+                assert_eq!(fixture.tip(), fixture.prepared);
+                fixture.url.clone()
+            })
+        })
+        .collect();
+    let urls: std::collections::HashSet<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    assert_eq!(urls.len(), 8);
+}
+
+#[test]
+fn linked_worktree_common_grafts_refuse_before_publication() {
+    let fixture = Fixture::new();
+    let linked_path = fixture._temp.path().join("linked-worktree");
+    let output = Command::new("git")
+        .arg(format!("--git-dir={}", fixture.source.path().display()))
+        .args(["worktree", "add", "--detach"])
+        .arg(&linked_path)
+        .arg(fixture.prepared.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let linked = Repository::open(linked_path).unwrap();
+    assert!(linked.is_worktree());
+    std::fs::create_dir_all(fixture.source.path().join("info")).unwrap();
+    std::fs::write(
+        fixture.source.path().join("info/grafts"),
+        format!("{} {}\n", fixture.child, fixture.parent),
+    )
+    .unwrap();
+    assert!(!linked.path().join("info/grafts").exists());
+    assert!(reposync_core::pair_refresh::publication::require_complete_git_graph(&linked).is_err());
+    assert!(publish_pinned_child(
+        &linked,
+        &fixture.url,
+        "child",
+        fixture.child,
+        fixture.prepared,
+        None
+    )
+    .is_err());
     assert_eq!(fixture.tip(), fixture.child);
 }

@@ -78,7 +78,8 @@ Prepare an unreferenced Git commit with exactly two parents: the pinned child
 tip first, pinned parent tip second. Its tree is exactly the verified parent
 tree for this clean-child case. Its operation marker and signature timestamp are
 pinned so the same preparation inputs reproduce the same SHA. Preparation
-updates no HEAD or branch. Refuse shallow boundaries, grafts and replace refs.
+updates no HEAD or branch. Refuse shallow boundaries, grafts, replace refs and
+linked worktrees; the operation owns its repository.
 Scan incoming parent history and unchanged input trees for unsupported content.
 
 Prepare a normal SVN merge over `(parent_baseline_revision, parent_revision]`
@@ -105,10 +106,13 @@ must reject a move after advertisement. Require the accepted update receipt and
 fresh remote result. No force update, rebase or remote reset is a recovery tool.
 
 The original Git-only primitive remains Git-only. An approval must explicitly
-select `smart_http_v1` for HTTP(S). Effective fetch/push URL rewrites are refused
-before connecting. HTTP uses a fixed upstream endpoint through an operation-local
+select `smart_http_v1` for HTTPS. Cleartext HTTP is refused. The approved URL must
+already be canonical, with no empty or dot path segments. Effective fetch/push
+URL rewrites are refused before connecting. HTTPS uses a fixed upstream endpoint
+through an operation-local
 loopback bridge because shipping libgit2's redirect setting permits some
-same-host redirects. The upstream client rejects every redirect and performs
+same-host redirects. The upstream client rejects every redirect, ignores
+inherited proxy configuration and performs
 ordinary certificate and hostname verification. Only that pinned client receives
 the explicitly resolved HTTP token; libgit2 receives no credential helper, agent
 or token fallback. SSH, file, local and scp transports remain unsupported.

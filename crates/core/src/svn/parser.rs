@@ -75,6 +75,31 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
     fn named(node: roxmltree::Node<'_, '_>, name: &str) -> bool {
         node.is_element() && node.tag_name().namespace().is_none() && node.tag_name().name() == name
     }
+    fn attributes(node: roxmltree::Node<'_, '_>, allowed: &[&str]) -> Result<(), SvnError> {
+        if node.attributes().any(|attribute| {
+            attribute.namespace().is_some() || !allowed.contains(&attribute.name())
+        }) {
+            return Err(malformed(
+                "unsupported or namespaced copy-history attribute",
+            ));
+        }
+        Ok(())
+    }
+    fn attribute<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+        node.attributes()
+            .find(|attribute| attribute.namespace().is_none() && attribute.name() == name)
+            .map(|attribute| attribute.value())
+    }
+    fn canonical_history_path(path: &str) -> bool {
+        path == "/"
+            || (path.starts_with('/')
+                && path.trim() == path
+                && !path.chars().any(char::is_control)
+                && path
+                    .split('/')
+                    .skip(1)
+                    .all(|part| !matches!(part, "" | "." | "..")))
+    }
     fn text(node: roxmltree::Node<'_, '_>) -> Result<String, SvnError> {
         if node.children().any(|child| child.is_element()) {
             return Err(malformed("nested element in copy-history text"));
@@ -92,7 +117,10 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
             .collect();
         match nodes.as_slice() {
             [] => Ok(String::new()),
-            [node] => text(*node),
+            [node] => {
+                attributes(*node, &[])?;
+                text(*node)
+            }
             _ => Err(malformed("duplicate copy-history field")),
         }
     }
@@ -102,6 +130,7 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
     if !named(root, "log") {
         return Err(malformed("copy history requires a log root"));
     }
+    attributes(root, &[])?;
     let mut entries = Vec::new();
     for entry in root.children().filter(|child| child.is_element()) {
         if !named(entry, "logentry")
@@ -116,8 +145,8 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
         {
             return Err(malformed("unsupported copy-history entry"));
         }
-        let revision = entry
-            .attribute("revision")
+        attributes(entry, &["revision"])?;
+        let revision = attribute(entry, "revision")
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|revision| *revision > 0)
             .ok_or_else(|| malformed("missing or invalid copy-history revision"))?;
@@ -128,30 +157,46 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
         let [paths] = paths.as_slice() else {
             return Err(malformed("missing or duplicate verbose paths"));
         };
+        attributes(*paths, &[])?;
         let mut changed_paths = Vec::new();
         for path in paths.children().filter(|child| child.is_element()) {
             if !named(path, "path") {
                 return Err(malformed("unparsed changed-path element"));
             }
-            let action = path
-                .attribute("action")
+            attributes(
+                path,
+                &[
+                    "action",
+                    "copyfrom-path",
+                    "copyfrom-rev",
+                    "kind",
+                    "text-mods",
+                    "prop-mods",
+                ],
+            )?;
+            let action = attribute(path, "action")
                 .filter(|value| matches!(*value, "A" | "M" | "D" | "R"))
                 .ok_or_else(|| malformed("missing or invalid changed-path action"))?;
-            let copy_from_path = path.attribute("copyfrom-path").map(str::to_owned);
-            let copy_from_rev = path
-                .attribute("copyfrom-rev")
+            let copy_from_path = attribute(path, "copyfrom-path").map(str::to_owned);
+            let copy_from_rev = attribute(path, "copyfrom-rev")
                 .map(|value| {
                     value
                         .parse::<i64>()
                         .map_err(|_| malformed("invalid copy-from revision"))
                 })
                 .transpose()?;
-            if copy_from_path.is_some() != copy_from_rev.is_some() {
-                return Err(malformed("incomplete copy-from attributes"));
+            if copy_from_path.is_some() != copy_from_rev.is_some()
+                || copy_from_path
+                    .as_deref()
+                    .is_some_and(|path| !canonical_history_path(path))
+                || copy_from_rev.is_some_and(|revision| revision < 0)
+                || (copy_from_path.is_some() && !matches!(action, "A" | "R"))
+            {
+                return Err(malformed("incomplete or invalid copy-from attributes"));
             }
             let path = text(path)?;
-            if path.is_empty() || !path.starts_with('/') {
-                return Err(malformed("empty or non-absolute changed path"));
+            if !canonical_history_path(&path) {
+                return Err(malformed("ambiguous or non-absolute changed path"));
             }
             changed_paths.push(SvnChangedPath {
                 action: action.into(),

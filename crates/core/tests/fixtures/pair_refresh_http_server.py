@@ -32,6 +32,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.backend()
 
+    def do_CONNECT(self):
+        with open(args.request_log, 'a', encoding='utf-8') as log:
+            log.write(json.dumps({'method': self.command, 'path': self.path}) + '\n')
+        self.send_error(502, 'fixture proxy refuses CONNECT')
+        self.close_connection = True
+
     def backend(self):
         with open(args.request_log, 'a', encoding='utf-8') as log:
             log.write(json.dumps({'method': self.command, 'path': self.path}) + '\n')
