@@ -396,8 +396,19 @@ fn require_baseline_provenance(
 ) -> Result<(), DatabaseError> {
     let lineage = &pins.svn.pins.lineage;
     let baseline = lineage.pins.child.parent_baseline_revision;
-    let Some(previous_mergeinfo) = &pins.svn.pins.previous_mergeinfo else {
-        return if lineage.child_copy.copy_from_revision == baseline {
+    let mut candidates = operations.iter().filter(|op| {
+        op.phase == PairRefreshPhase::Completed
+            && op.pins.child.scope_uuid == pins.child.scope_uuid
+            && (op.pins.git.prepared_sha == pins.child.last_git_sha
+                || op
+                    .svn_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.revision == pins.child.last_svn_rev))
+    });
+    let Some(prior) = candidates.next() else {
+        return if pins.svn.pins.previous_mergeinfo.is_none()
+            && lineage.child_copy.copy_from_revision == baseline
+        {
             Ok(())
         } else {
             Err(refused(
@@ -405,18 +416,6 @@ fn require_baseline_provenance(
             ))
         };
     };
-    let mut candidates = operations.iter().filter(|op| {
-        op.phase == PairRefreshPhase::Completed
-            && op.pins.child.scope_uuid == pins.child.scope_uuid
-            && op.pins.git.prepared_sha == pins.child.last_git_sha
-            && op
-                .svn_receipt
-                .as_ref()
-                .is_some_and(|receipt| receipt.revision == pins.child.last_svn_rev)
-    });
-    let prior = candidates
-        .next()
-        .ok_or_else(|| refused("prior mergeinfo lacks a completed child receipt"))?;
     if candidates.next().is_some() {
         return Err(refused("ambiguous completed child receipt"));
     }
@@ -424,6 +423,13 @@ fn require_baseline_provenance(
         .svn_receipt
         .as_ref()
         .ok_or_else(|| refused("completed child receipt is missing"))?;
+    if prior.pins.git.prepared_sha != pins.child.last_git_sha
+        || receipt.revision != pins.child.last_svn_rev
+    {
+        return Err(refused(
+            "child checkpoints partially match a completed receipt",
+        ));
+    }
     let same_registration = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
         a.repo_id == b.repo_id
             && a.scope_uuid == b.scope_uuid
@@ -439,7 +445,7 @@ fn require_baseline_provenance(
         || pins.git.pins.parent_baseline_tip != prior.pins.parent.last_git_sha
         || baseline != prior.pins.parent.last_svn_rev
         || pins.svn.pins.baseline_git_tree != receipt.git_tree
-        || previous_mergeinfo != &receipt.mergeinfo
+        || pins.svn.pins.previous_mergeinfo.as_ref() != Some(&receipt.mergeinfo)
         || lineage.child_copy != expected_copy
         || lineage.parent_originating_revision != prior_lineage.parent_originating_revision
         || lineage.pins.repository_root_url != prior_lineage.pins.repository_root_url
@@ -503,7 +509,21 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
             "unknown journal version, orphan or missing hold/request pointer",
         ));
     }
+    let mut completed_receipts = std::collections::BTreeSet::new();
     for op in &operations {
+        if op.phase == PairRefreshPhase::Completed {
+            let receipt = op
+                .svn_receipt
+                .as_ref()
+                .ok_or_else(|| refused("completed child receipt is missing"))?;
+            if !completed_receipts.insert((
+                &op.pins.child.scope_uuid,
+                &op.pins.git.prepared_sha,
+                receipt.revision,
+            )) {
+                return Err(refused("duplicate completed child receipt"));
+            }
+        }
         require_baseline_provenance(&op.pins, &operations)?;
     }
     Ok(operations)

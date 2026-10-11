@@ -499,6 +499,22 @@ impl SyncEngine {
     /// The sync lock is released via a drop guard so it is freed even if
     /// the cycle panics.
     pub async fn run_sync_cycle(&self) -> Result<SyncStats, SyncError> {
+        self.run_sync_cycle_in_window(None).await
+    }
+
+    /// Consume the scheduler's admitted preparation window so mutable prep and
+    /// the cycle share one continuous durable owner, without reacquisition.
+    pub async fn run_sync_cycle_with_writer_window(
+        &self,
+        window: crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<SyncStats, SyncError> {
+        self.run_sync_cycle_in_window(Some(window)).await
+    }
+
+    async fn run_sync_cycle_in_window(
+        &self,
+        supplied_window: Option<crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>>,
+    ) -> Result<SyncStats, SyncError> {
         // Acquire the sync lock.
         if self
             .running
@@ -515,10 +531,18 @@ impl SyncEngine {
 
         // Admit before credential reload, schema changes or working-tree work.
         // Refresh admission checks this durable window in its own transaction.
-        let writer_window = self
-            .db
-            .begin_ordinary_writer_window(self.effective_repo_id())
-            .map_err(SyncError::DatabaseError)?;
+        let writer_window = match supplied_window {
+            Some(window) => {
+                window
+                    .require_engine_scope(&self.db, self.effective_repo_id())
+                    .map_err(SyncError::DatabaseError)?;
+                window
+            }
+            None => self
+                .db
+                .begin_ordinary_writer_window(self.effective_repo_id())
+                .map_err(SyncError::DatabaseError)?,
+        };
 
         // Hot-reload credentials from DB (changed via Setup Wizard).
         self.reload_credentials();

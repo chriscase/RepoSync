@@ -60,7 +60,7 @@ pub struct Scheduler {
     stats: Arc<SchedulerStats>,
     import_progress: Arc<RwLock<ImportProgress>>,
     /// Database connection for listing repos and reading credentials.
-    db: Database,
+    db: Arc<Database>,
     /// Global config (for data_dir, identity, etc.).
     app_config: AppConfig,
     /// Handles for in-flight sync tasks, for graceful shutdown.
@@ -89,7 +89,7 @@ impl Scheduler {
             ws_broadcast,
             stats: Arc::new(SchedulerStats::new()),
             import_progress,
-            db,
+            db: Arc::new(db),
             app_config,
             sync_handles: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             cached_identity_mapper: std::sync::OnceLock::new(),
@@ -662,6 +662,16 @@ impl Scheduler {
                 }
             };
 
+            // Retain durable exclusion before credentials, clone, checkout or
+            // HEAD preparation, then move this same capability into the worker.
+            let writer_window = match reposync_core::db::ordinary_writer_windows::begin_shared_ordinary_writer_window(self.db.clone(), Some(&repo_id)) {
+                Ok(window) => window,
+                Err(error) => {
+                    debug!(repo_name=%repo_name,%error,"refusing sync preparation: durable writer exclusion");
+                    continue;
+                }
+            };
+
             // Read credentials from kv_state.
             // Chain: repo_id → parent → grandparent → … → global
             let svn_password = self
@@ -864,7 +874,9 @@ impl Scheduler {
                 // Move the busy guard into the task so it's released when
                 // the cycle finishes (including on panic).
                 let _busy_guard = busy_guard;
-                let result = engine.run_sync_cycle().await;
+                let result = engine
+                    .run_sync_cycle_with_writer_window(writer_window)
+                    .await;
 
                 // Access the engine's DB for circuit breaker updates
                 let engine_db = engine.db();
@@ -1565,3 +1577,7 @@ mod cancellation_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler/pair_refresh_tests.rs"]
+mod pair_refresh_tests;

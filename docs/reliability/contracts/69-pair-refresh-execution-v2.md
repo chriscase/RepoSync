@@ -85,6 +85,10 @@ must match the new baseline. Caller-supplied prior mergeinfo is insufficient.
 The complete stored journal validates this provenance chain on every read;
 missing or ambiguous earlier receipts refuse. This storage evidence does not
 replace fresh remote observation or ordinary-engine proof of the next advance.
+Omitting prior mergeinfo cannot return to the original copy baseline once a
+completed receipt matches either child checkpoint. Both checkpoints must match
+one exact receipt and every prior-baseline binding must agree. Duplicate completed
+receipts for one child SHA/revision refuse on read even without a later job.
 All competing active pointers refuse admission; a latest operation without an active pointer
 must still deserialize completely and report completed state. Missing, foreign,
 corrupt or uncertain prior documents refuse.
@@ -147,9 +151,14 @@ An ordinary SyncEngine cycle now admits a durable writer window before loading
 credentials, migrating identity, or modifying a working tree. Refresh admission
 and window admission exclude each other transactionally for either registered
 identity; a global cycle excludes every refresh. A borrowed window spans the
-whole cycle. Normal completion releases it. Drop releases only preparation
+whole cycle. The per-repository scheduler admits a shared window before credentials,
+clone, HEAD or checkout preparation and moves that same non-cloneable capability
+into the engine worker. The engine refuses a different scope or database,
+including a copied journal, and refuses uncertain publication before loading
+credentials. Normal completion releases it. Drop releases only preparation
 owned by the same writer epoch; global push/commit intent is marked before the
-command and is retained after an uncertain outcome. Abrupt process exit retains
+command and is retained after an uncertain outcome. Retaining uncertain evidence
+on drop is read-only and does not renew a lease. Abrupt process exit retains
 every window. Unknown, corrupt or contradictory window documents refuse
 admission. Managed publication still requires its existing journal in addition
 to the window. Operator recovery of stale windows, other working-tree writer

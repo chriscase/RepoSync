@@ -4,6 +4,7 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::{pair_refresh_operations::require_no_pair_refresh_hold, Database};
@@ -106,9 +107,38 @@ pub fn require_quiet_for_refresh(
 /// releases only a still-preparing window. Possible legacy publication survives
 /// failure/cancellation/drop, and abrupt process exit preserves every window.
 pub struct OrdinaryWriterWindow<'db> {
-    db: &'db Database,
+    db: WindowDatabase<'db>,
     admitted: Document,
     completed: bool,
+}
+
+enum WindowDatabase<'db> {
+    Borrowed(&'db Database),
+    Shared(Arc<Database>),
+}
+
+impl std::ops::Deref for WindowDatabase<'_> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        match self {
+            Self::Borrowed(db) => db,
+            Self::Shared(db) => db,
+        }
+    }
+}
+
+/// A scheduler owns this capability across local preparation and task handoff.
+/// Sharing the connection does not clone the capability or admit another run.
+pub fn begin_shared_ordinary_writer_window(
+    db: Arc<Database>,
+    repo_id: Option<&str>,
+) -> Result<OrdinaryWriterWindow<'static>, DatabaseError> {
+    let admitted = db.admit_ordinary_writer_window(repo_id)?;
+    Ok(OrdinaryWriterWindow {
+        db: WindowDatabase::Shared(db),
+        admitted,
+        completed: false,
+    })
 }
 
 impl Database {
@@ -116,9 +146,21 @@ impl Database {
         &self,
         repo_id: Option<&str>,
     ) -> Result<OrdinaryWriterWindow<'_>, DatabaseError> {
+        let admitted = self.admit_ordinary_writer_window(repo_id)?;
+        Ok(OrdinaryWriterWindow {
+            db: WindowDatabase::Borrowed(self),
+            admitted,
+            completed: false,
+        })
+    }
+
+    fn admit_ordinary_writer_window(
+        &self,
+        repo_id: Option<&str>,
+    ) -> Result<Document, DatabaseError> {
         let repo_id =
             repo_id.filter(|id| !id.is_empty() && *id != super::personal_scope::PERSONAL_SCOPE_KEY);
-        let admitted=self.transaction(|tx| {
+        self.transaction(|tx| {
             require_no_pair_refresh_hold(tx,repo_id)?;
             let writer_epoch=crate::writer_fence::ordinary_current_epoch(tx)?;
             // Legacy engine migrations happen after admission. A human scope
@@ -135,16 +177,48 @@ impl Database {
             // Validate newly emitted evidence before committing it too.
             documents(tx)?;
             Ok(doc)
-        })?;
-        Ok(OrdinaryWriterWindow {
-            db: self,
-            admitted,
-            completed: false,
         })
     }
 }
 
 impl OrdinaryWriterWindow<'_> {
+    pub(crate) fn require_engine_scope(
+        &self,
+        db: &Database,
+        repo_id: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let repo_id =
+            repo_id.filter(|id| !id.is_empty() && *id != super::personal_scope::PERSONAL_SCOPE_KEY);
+        if self.admitted.repo_id.as_deref() != repo_id {
+            return Err(refused("window handoff targets another engine scope"));
+        }
+        // A copied database can contain identical journal bytes and an epoch.
+        // It is still not the storage whose window this capability releases.
+        if !std::ptr::eq::<Database>(&*self.db, db) {
+            let admitted_path = self.db.conn().path().map(std::path::PathBuf::from);
+            let engine_path = db.conn().path().map(std::path::PathBuf::from);
+            let same_file = admitted_path
+                .zip(engine_path)
+                .and_then(|(a, b)| {
+                    Some((
+                        std::fs::canonicalize(a).ok()?,
+                        std::fs::canonicalize(b).ok()?,
+                    ))
+                })
+                .is_some_and(|(a, b)| a == b);
+            if !same_file {
+                return Err(refused("window handoff targets another database"));
+            }
+        }
+        db.transaction(|tx| {
+            let doc = self.owned(tx)?;
+            if doc.phase != Phase::Preparing {
+                return Err(refused("window already has uncertain publication"));
+            }
+            require_no_pair_refresh_hold(tx, repo_id)
+        })
+    }
+
     fn owned(&self, tx: &Connection) -> Result<Document, DatabaseError> {
         if crate::writer_fence::ordinary_current_epoch(tx)? != self.admitted.writer_epoch {
             return Err(refused("writer epoch changed during the run"));
@@ -202,8 +276,14 @@ impl Drop for OrdinaryWriterWindow<'_> {
             return;
         }
         let result = self.db.transaction(|tx| {
-            let doc = self.owned(tx)?;
+            // Retaining uncertainty is read-only: it needs neither a lease
+            // renewal nor authority to release the durable window.
+            let doc = documents(tx)?
+                .into_iter()
+                .find(|doc| doc.id == self.admitted.id)
+                .ok_or_else(|| refused("durable window disappeared"))?;
             if doc.phase == Phase::Preparing {
+                self.owned(tx)?;
                 self.release(tx)?;
             }
             Ok(())
