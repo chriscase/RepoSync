@@ -330,6 +330,22 @@ pub fn require_current(tx: &Connection) -> Result<(), DatabaseError> {
     Ok(())
 }
 
+/// Require an enrolled current daemon writer for a new pair-refresh job.
+/// The ordinary journal compatibility behavior when no lease exists is not an
+/// admission fence for a coordinated write to two registered repositories.
+pub fn require_owned_current(tx: &Connection) -> Result<u64, DatabaseError> {
+    let lease = read_lease(tx)?.ok_or_else(|| {
+        DatabaseError::WriterFenced("pair refresh requires an enrolled writer lease".into())
+    })?;
+    if lease.epoch == 0 || lease.holder_pid == 0 || lease.holder_host.is_empty() {
+        return Err(DatabaseError::WriterFenced(
+            "pair refresh requires a valid writer lease".into(),
+        ));
+    }
+    require_current(tx)?;
+    Ok(lease.epoch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

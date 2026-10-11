@@ -51,3 +51,31 @@ pub fn try_acquire(repo_id: &str) -> Option<BusyGuard> {
 pub fn is_busy(repo_id: &str) -> bool {
     set().lock().map(|g| g.contains(repo_id)).unwrap_or(false)
 }
+
+/// Own both repository working slots in deterministic ID order. Partial
+/// acquisition releases its first slot before reporting contention.
+pub struct PairBusyGuard {
+    guards: [BusyGuard; 2],
+}
+
+impl PairBusyGuard {
+    pub(crate) fn owns_pair(&self, first: &str, second: &str) -> bool {
+        first != second
+            && self.guards.iter().any(|guard| guard.repo_id == first)
+            && self.guards.iter().any(|guard| guard.repo_id == second)
+    }
+}
+
+pub fn try_acquire_pair(first: &str, second: &str) -> Option<PairBusyGuard> {
+    if first.is_empty() || second.is_empty() || first == second {
+        return None;
+    }
+    let (first, second) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    Some(PairBusyGuard {
+        guards: [try_acquire(first)?, try_acquire(second)?],
+    })
+}

@@ -25,7 +25,7 @@ pub fn require_pinned_push_transport(remote_url: &str) -> Result<(), GitError> {
     require_transport(remote_url, PinnedPushPolicy::GitProtocolV1)
 }
 
-pub(super) fn canonical_url(remote_url: &str) -> Result<reqwest::Url, GitError> {
+pub(crate) fn canonical_url(remote_url: &str) -> Result<reqwest::Url, GitError> {
     let parsed = reqwest::Url::parse(remote_url).map_err(|_| {
         git2::Error::from_str("pair refresh requires an explicit smart transport URL")
     })?;

@@ -9,6 +9,7 @@ pub mod git_push_operations;
 pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod managed_remove;
+pub mod pair_refresh_operations;
 pub mod personal_scope;
 pub mod queries;
 pub mod repo_scope_identity;

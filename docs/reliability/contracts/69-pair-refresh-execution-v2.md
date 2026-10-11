@@ -5,9 +5,10 @@ Refs #69. #69 stays open.
 This contract describes the next execution policy. Implementation is in progress.
 The existing v1 preview and its execution refusal remain active. Standalone
 publication, lineage, Git and SVN preparation components do not authorize execution.
-The endpoint, durable operation, SVN publication, recovery and real-engine evidence
-below must be implemented and independently reviewed before this policy is
-enabled. The reviewed durable identity dependency must land on main first.
+The endpoint, complete writer exclusion, SVN publication, recovery and real-engine
+evidence below must be implemented and independently reviewed before this policy
+is enabled. Reviewed durable identity landed on main at af394285869bdffa5f156c651cd1104027832749;
+the writer branch integrates it through a main merge.
 
 ## Supported operation boundary
 
@@ -65,6 +66,35 @@ resolution and skip-commit. A global engine without a repository ID refuses
 while any refresh hold exists. Unknown or corrupt hold data fails closed.
 Process exit, a failed HTTP request or a dropped busy guard does not release an
 uncertain durable hold.
+
+The standalone journal now enrolls both durable scope holds and an initiator/request
+identity in one transaction under an enrolled current writer lease. Admission
+requires a capability owning both process busy slots; acquisition sorts repository
+IDs and releases partial acquisition on contention. Registration snapshots bind
+the UUID, configuration, echo counter, column checkpoints and both scoped cursor
+copies. Missing identities are refused rather than synthesized. All competing
+active pointers refuse admission; a latest operation without an active pointer
+must still deserialize completely and report completed state. Missing, foreign,
+corrupt or uncertain prior documents refuse.
+
+Publication phases are prepared, SVN intent, SVN observed, Git intent and Git
+observed. Intent cannot be repeated as a retry. Receipt shape must match the
+stored operation identity, result and revision evidence. An uncertainty diagnostic
+preserves the phase and both holds; an independently observed exact receipt may
+advance its pending intent phase without repeating a write. Drift or invalid
+proof preserves uncertainty. Cancellation is permitted only before any publication
+intent and without uncertainty. Process guard drop and database reopen preserve
+both durable holds. Unknown versions, duplicate ownership, orphan documents,
+missing pointers or noncanonical documents fail closed even for unrelated writers.
+
+The final storage transaction creates the applied child correspondence, updates
+all child cursor copies, marks completion and releases both holds; a database
+failure rolls back all these changes. Completed request lookup is idempotent.
+Parent state and both echo generations remain unchanged. Journal receipt storage
+is not independent remote verification, API approval, or credential admission.
+Writer-entrance integration, the authenticated publication/recovery caller and
+real production SyncEngine proof remain prerequisites; no execution endpoint is
+enabled by this storage component.
 
 ## Preparation and correspondence
 
