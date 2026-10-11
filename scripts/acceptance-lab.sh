@@ -713,6 +713,7 @@ prepare_images() {
   fi
   if [ "${ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD:-}" != "1" ] && [ "$scope" != "fixtures" ]; then
     build_one "$REPOSYNC_IMAGE" "$LAB_DIR/docker/Dockerfile.reposync" "$REPO_ROOT" \
+      --build-context "labfiles=${LAB_DIR}/docker" \
       --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" \
       --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
       --build-arg "NODE_IMAGE=${NODE_IMAGE}"

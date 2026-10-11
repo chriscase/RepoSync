@@ -79,7 +79,7 @@ Until those steps have a recorded run id and report, Cursor Cloud is not qualifi
 
 GitHub registers `workflow_dispatch` from the workflow file on the default branch. Until this file is on the default branch, a dispatched run is unavailable. The pull request run is the smoke path. This lab does not merge in order to enable dispatch.
 
-The daemon image is built in one job and loaded in the browser job (`ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD=1`). The real-engine job runs only for a dispatched `full` or `soak`, and it does not join the lab Compose network. Evidence upload is limited to the run's `publish/` directory after scrub and scan. A failed scan withholds the bundle.
+The daemon image is built in one job and loaded in the browser job (`ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD=1`). The entrypoint is passed as its own Docker build context. The root `.dockerignore` on main omits `tests/`, so a copy from the repository context cannot see that file. The real-engine job runs only for a dispatched `full` or `soak`, and it does not join the lab Compose network. Evidence upload is limited to the run's `publish/` directory after scrub and scan. A failed scan withholds the bundle.
 
 `GITHUB_TOKEN` for this workflow is `contents: read`. That checks out the repository. The artifact upload action obtains its own Actions runtime token. This workflow does not grant `actions: write`. It does not write repository contents, open or merge pull requests, or close issues.
 

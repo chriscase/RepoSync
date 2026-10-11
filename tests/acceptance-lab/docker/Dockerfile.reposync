@@ -42,7 +42,9 @@ COPY --from=rust /src/target/release/reposync /usr/local/bin/reposync
 COPY --from=ui /ui/dist /usr/local/bin/static
 COPY --from=rust /tmp/cargo-metadata.json /usr/local/share/acceptance-lab/cargo-metadata.json
 COPY --from=rust /tmp/rustc-version.txt /usr/local/share/acceptance-lab/rustc-version.txt
-COPY tests/acceptance-lab/docker/reposync-entrypoint.sh /usr/local/bin/lab-entrypoint.sh
+# Main's root .dockerignore omits tests/. The launcher passes this directory
+# as the labfiles build context so the entrypoint is still in the image.
+COPY --from=labfiles reposync-entrypoint.sh /usr/local/bin/lab-entrypoint.sh
 RUN chmod 755 /usr/local/bin/lab-entrypoint.sh /usr/local/bin/reposync-daemon /usr/local/bin/reposync \
     && test -f /usr/local/bin/static/index.html
 USER root
