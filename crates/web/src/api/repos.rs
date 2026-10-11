@@ -38,9 +38,7 @@ use reposync_core::pair_refresh::{
     format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
     RefreshObservations, RefreshOperation,
 };
-use reposync_core::skip_commit::{
-    build_skip_context, execute_exact_skip, reason as skip_reason, SkipCommitRequest,
-};
+use reposync_core::skip_commit::{build_skip_context, reason as skip_reason, SkipCommitRequest};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
@@ -4095,6 +4093,11 @@ async fn skip_commit(
 
     let db = &state.db;
     reject_held_import(db, &id)?;
+    let _busy = reposync_core::busy::try_acquire(&id)
+        .ok_or_else(|| AppError::Conflict("repository is busy".into()))?;
+    let writer_window = db
+        .begin_ordinary_writer_window(Some(&id))
+        .map_err(|error| AppError::Conflict(error.to_string()))?;
     let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
@@ -4125,8 +4128,16 @@ async fn skip_commit(
         })
         .ok();
 
-    let outcome = execute_exact_skip(db, &id, &workdir, &remote_tip, bridge_tip.as_deref(), &body)
-        .map_err(|refuse| AppError::Conflict(refuse.message()))?;
+    let outcome = reposync_core::skip_commit::execute_exact_skip_with_writer_window(
+        db,
+        &id,
+        &workdir,
+        &remote_tip,
+        bridge_tip.as_deref(),
+        &body,
+        writer_window,
+    )
+    .map_err(|refuse| AppError::Conflict(refuse.message()))?;
 
     let _ = db.reset_consecutive_errors(&id);
     let _ = db.conn().execute(

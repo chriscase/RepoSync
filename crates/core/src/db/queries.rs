@@ -315,51 +315,55 @@ impl Database {
     ) -> Result<String, DatabaseError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+        self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
              base_content, svn_rev, git_sha, status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'detected', ?9)",
-            params![
-                id,
-                file_path,
-                conflict_type,
-                svn_content,
-                git_content,
-                base_content,
-                svn_rev,
-                git_sha,
-                now
-            ],
-        )?;
-        debug!(id = %id, file_path, conflict_type, "inserted conflict");
-        Ok(id)
+                params![
+                    id,
+                    file_path,
+                    conflict_type,
+                    svn_content,
+                    git_content,
+                    base_content,
+                    svn_rev,
+                    git_sha,
+                    now
+                ],
+            )?;
+            debug!(id = %id, file_path, conflict_type, "inserted conflict");
+            Ok(id)
+        })
     }
 
     /// Insert a conflict from a model struct.
     pub fn insert_conflict(&self, conflict: &models::Conflict) -> Result<String, DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+        self.transaction(|conn| {
+            Self::require_conflict_scope_refresh_quiet(conn, conflict.repo_id.as_deref())?;
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
              base_content, svn_rev, git_sha, status, created_at, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                conflict.id,
-                conflict.file_path,
-                conflict.conflict_type,
-                conflict.svn_content,
-                conflict.git_content,
-                conflict.base_content,
-                conflict.svn_revision,
-                conflict.git_hash,
-                conflict.status,
-                now,
-                conflict.repo_id
-            ],
-        )?;
-        debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
-        Ok(conflict.id.clone())
+                params![
+                    conflict.id,
+                    conflict.file_path,
+                    conflict.conflict_type,
+                    conflict.svn_content,
+                    conflict.git_content,
+                    conflict.base_content,
+                    conflict.svn_revision,
+                    conflict.git_hash,
+                    conflict.status,
+                    now,
+                    conflict.repo_id
+                ],
+            )?;
+            debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
+            Ok(conflict.id.clone())
+        })
     }
 
     /// Conflict statuses that must block SVN/Git apply in team mode.
@@ -464,6 +468,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            Self::require_conflict_scope_refresh_quiet(&conn, conflict.repo_id.as_deref())?;
             let existing: Option<(String, String)> = conn
                 .query_row(
                     "SELECT id, status FROM conflicts
@@ -849,7 +854,17 @@ impl Database {
             })
             .optional()?
             .flatten();
-        match repo.as_deref().filter(|id| !id.is_empty()) {
+        Self::require_conflict_scope_refresh_quiet(conn, repo.as_deref())
+    }
+
+    fn require_conflict_scope_refresh_quiet(
+        conn: &rusqlite::Connection,
+        repo_id: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        // Historical Personal conflict rows used the literal "personal". They
+        // lack a managed registration identity, so conservatively exclude every
+        // held scope rather than treating that label as an unrelated repository.
+        match repo_id.filter(|id| !id.is_empty() && *id != "personal") {
             Some(id) => {
                 super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(conn, id)
             }
@@ -981,13 +996,8 @@ impl Database {
         tx: &rusqlite::Connection,
         sha: &str,
     ) -> Result<(), DatabaseError> {
-        let repo_count: i64 =
-            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-        if repo_count > 0 {
-            return Err(DatabaseError::Other(
-                "refusing global git_sha watermark while repositories table is non-empty".into(),
-            ));
-        }
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        Self::require_legacy_import_watermarks_available_tx(tx)?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
@@ -999,6 +1009,26 @@ impl Database {
             value = sha,
             "set watermark in transaction"
         );
+        Ok(())
+    }
+
+    /// Refuse a known checkpoint incompatibility before a legacy import can
+    /// publish. Recheck inside checkpoint storage to account for later drift.
+    pub fn require_legacy_import_watermarks_available(&self) -> Result<(), DatabaseError> {
+        self.transaction(Self::require_legacy_import_watermarks_available_tx)
+    }
+
+    pub(crate) fn require_legacy_import_watermarks_available_tx(
+        tx: &rusqlite::Connection,
+    ) -> Result<(), DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        let repo_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count > 0 {
+            return Err(DatabaseError::Other(
+                "refusing global git_sha watermark while repositories table is non-empty".into(),
+            ));
+        }
         Ok(())
     }
 

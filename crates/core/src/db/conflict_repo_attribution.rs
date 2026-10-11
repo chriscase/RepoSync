@@ -25,6 +25,7 @@ pub fn attribute_null_conflict_repo_ids(conn: &Connection) -> Result<usize, Data
         if repo_count != 1 {
             return Ok(0usize);
         }
+        super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
         let sole: String =
             conn.query_row("SELECT id FROM repositories LIMIT 1", [], |row| row.get(0))?;
         let changed = conn.execute(

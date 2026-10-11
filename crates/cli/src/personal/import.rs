@@ -26,6 +26,11 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     // Initialize database
     let db_path = data_dir.join("personal.db");
     let db = Database::new(&db_path).context("failed to initialize database")?;
+    let writer_window = db
+        .begin_personal_startup_writer_window()
+        .context("Personal import startup writer admission refused")?;
+    db.require_legacy_import_watermarks_available()
+        .context("Personal import startup checkpoint admission refused")?;
 
     // SVN client
     let svn_client = SvnClient::new(
@@ -94,7 +99,9 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     spinner.set_message(format!("Importing ({} mode)...", mode));
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let count = importer.import(import_mode).await?;
+    let count = importer
+        .import_with_writer_window(import_mode, writer_window)
+        .await?;
 
     spinner.finish_and_clear();
 

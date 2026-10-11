@@ -2538,24 +2538,99 @@ async fn verify_legacy_import_tip(
     config: &ImportConfig,
     expected_sha: &str,
 ) -> Result<()> {
+    verify_legacy_import_publication_tip(
+        workdir,
+        &config.remote_name,
+        &config.branch,
+        config.push_token.as_deref(),
+        expected_sha,
+    )
+    .await
+}
+
+/// Explicit publication ref and resolved authentication. No credential fallback
+/// is performed by the observer; these values are not logged or serialized.
+pub struct LegacyImportRef<'a> {
+    pub workdir: &'a Path,
+    pub remote: &'a str,
+    pub branch: &'a str,
+    pub token: Option<&'a str>,
+    pub sha: &'a str,
+}
+
+/// Verify the remote before atomically recording the Personal snapshot and
+/// clearing publication uncertainty. The window binds the storage database.
+pub async fn confirm_personal_snapshot_import_publication(
+    window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    publication: LegacyImportRef<'_>,
+    svn_revision: i64,
+    svn_author: &str,
+    git_author: &str,
+) -> Result<()> {
+    verify_legacy_import_publication_tip(
+        publication.workdir,
+        publication.remote,
+        publication.branch,
+        publication.token,
+        publication.sha,
+    )
+    .await?;
+    window
+        .confirm_unjournalled_import_checkpoint(|tx| {
+            crate::db::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+            crate::db::personal_scope::checkpoint_personal_svn_to_git_import_tx(
+                tx,
+                crate::db::personal_scope::PERSONAL_SCOPE_KEY,
+                svn_revision,
+                publication.sha,
+                svn_author,
+                git_author,
+                "svn_rev",
+                true,
+            )?;
+            Database::set_legacy_import_git_sha_watermark_tx(tx, publication.sha)
+        })
+        .context("verified Personal snapshot checkpoint refused; writer window retained")
+}
+
+/// Confirm the exact full-import ref and both global tail checkpoints together.
+pub async fn confirm_personal_full_import_publication(
+    window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    publication: LegacyImportRef<'_>,
+    svn_revision: i64,
+) -> Result<()> {
+    verify_legacy_import_publication_tip(
+        publication.workdir,
+        publication.remote,
+        publication.branch,
+        publication.token,
+        publication.sha,
+    )
+    .await?;
+    window
+        .confirm_unjournalled_import_checkpoint(|tx| {
+            persist_legacy_personal_import_watermarks_tx(tx, svn_revision, publication.sha)
+        })
+        .context("verified Personal full-import checkpoint refused; writer window retained")
+}
+
+/// Independent exact-ref proof shared with the Personal initial importer.
+pub async fn verify_legacy_import_publication_tip(
+    workdir: &Path,
+    remote: &str,
+    branch: &str,
+    token: Option<&str>,
+    expected_sha: &str,
+) -> Result<()> {
     if !crate::history_inspect::is_full_git_oid(expected_sha) {
         bail!("legacy import lacks an exact final Git tip");
     }
-    let reference = format!("refs/heads/{}", config.branch);
+    let reference = format!("refs/heads/{}", branch);
     let mut inspect = tokio::process::Command::new("git");
     inspect
-        .args([
-            "ls-remote",
-            "--exit-code",
-            "--",
-            &config.remote_name,
-            &reference,
-        ])
+        .args(["ls-remote", "--exit-code", "--", remote, &reference])
         .current_dir(workdir);
-    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(
-        &mut inspect,
-        config.push_token.as_deref(),
-    );
+    crate::git::subprocess_auth::apply_git_http_auth_tokio_optional(&mut inspect, token);
     let observed = crate::process::run(inspect, Duration::from_secs(60), None)
         .await
         .context("legacy import publication could not be verified; writer window retained")?;
@@ -2950,19 +3025,24 @@ fn persist_legacy_personal_import_watermarks(
     last_svn_rev: i64,
     git_sha: &str,
 ) -> Result<(), crate::errors::DatabaseError> {
-    db.transaction(|tx| {
-        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
-        crate::writer_fence::require_current(tx)?;
-        let managed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM repositories)", [], |row| row.get(0))?;
-        if managed {
-            return Err(DatabaseError::Other("refusing global git_sha watermark while repositories table is non-empty".into()));
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        for (source, value) in [("svn_rev", last_svn_rev.to_string()), ("git_sha", git_sha.to_owned())] {
-            tx.execute("INSERT INTO watermarks(source,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![source,value,now])?;
-        }
-        Ok(())
-    })
+    db.transaction(|tx| persist_legacy_personal_import_watermarks_tx(tx, last_svn_rev, git_sha))
+}
+
+fn persist_legacy_personal_import_watermarks_tx(
+    tx: &rusqlite::Connection,
+    last_svn_rev: i64,
+    git_sha: &str,
+) -> Result<(), crate::errors::DatabaseError> {
+    crate::writer_fence::require_current(tx)?;
+    Database::require_legacy_import_watermarks_available_tx(tx)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    for (source, value) in [
+        ("svn_rev", last_svn_rev.to_string()),
+        ("git_sha", git_sha.to_owned()),
+    ] {
+        tx.execute("INSERT INTO watermarks(source,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![source,value,now])?;
+    }
+    Ok(())
 }
 
 pub async fn run_full_import(
@@ -2989,7 +3069,11 @@ pub async fn run_full_import(
             None
         })
         .context("full import writer admission refused")?;
+    if operation_id.is_none() {
+        db.require_legacy_import_watermarks_available()?;
+    }
     let mut legacy_publication_possible = false;
+    let mut legacy_confirmed_sha: Option<String> = None;
 
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let mut p = progress.write().await;
@@ -3635,8 +3719,8 @@ pub async fn run_full_import(
                         let rp = repo_path.clone();
                         let push_token = import_config.push_token.clone();
 
+                        db.require_legacy_import_watermarks_available()?;
                         writer_window.mark_unjournalled_publication_possible()?;
-                        legacy_publication_possible = true;
 
                         // Heartbeat task: log "still pushing..." every 30s
                         let hb_progress = progress.clone();
@@ -3715,6 +3799,10 @@ pub async fn run_full_import(
                                         .context("missing pushed legacy batch tip")?
                                 };
                                 verify_legacy_import_tip(&repo_path, import_config, &tip).await?;
+                                writer_window.confirm_unjournalled_import_checkpoint(|tx| {
+                                    persist_legacy_personal_import_watermarks_tx(tx, rev, &tip)
+                                })?;
+                                legacy_confirmed_sha = Some(tip);
                                 // Log any git push output (remote warnings, etc.)
                                 for line in stderr.lines() {
                                     let trimmed = line.trim();
@@ -3755,18 +3843,12 @@ pub async fn run_full_import(
                             Ok(Err(e)) => {
                                 let msg = format!("[warn] Batch push outcome uncertain: {}", e);
                                 log(&progress, &ws_broadcast, msg).await;
-                                return Ok(ImportOutcome::ReconciliationRequired {
-                                    commits: count,
-                                    reason: "legacy Git publication outcome uncertain; writer window retained".into(),
-                                });
+                                bail!("legacy Git publication outcome uncertain; writer window retained");
                             }
                             Err(e) => {
                                 let msg = format!("[warn] Batch push task panicked: {}", e);
                                 log(&progress, &ws_broadcast, msg).await;
-                                return Ok(ImportOutcome::ReconciliationRequired {
-                                    commits: count,
-                                    reason: "legacy Git publication outcome uncertain; writer window retained".into(),
-                                });
+                                bail!("legacy Git publication outcome uncertain; writer window retained");
                             }
                         }
                     }
@@ -3900,6 +3982,7 @@ pub async fn run_full_import(
                 let rp = repo_path.clone();
                 let push_token = import_config.push_token.clone();
 
+                db.require_legacy_import_watermarks_available()?;
                 writer_window.mark_unjournalled_publication_possible()?;
                 legacy_publication_possible = true;
                 let push_result = tokio::task::spawn_blocking(move || {
@@ -4009,6 +4092,10 @@ pub async fn run_full_import(
             git.repo_workdir()
         };
         verify_legacy_import_tip(&repo_path, import_config, &sha).await?;
+        writer_window.confirm_unjournalled_import_checkpoint(|tx| {
+            persist_legacy_personal_import_watermarks_tx(tx, last_rev, &sha)
+        })?;
+        legacy_confirmed_sha = Some(sha.clone());
     }
     if stop_requested(&progress, cancel_signal.as_ref()).await {
         let all_confirmed = match (&repo_id, &operation_id) {
@@ -4017,7 +4104,7 @@ pub async fn run_full_import(
                     && op.last_confirmed_git_sha.as_deref() == Some(sha.as_str())
                     && op.intended_git_sha.is_none()
             }),
-            _ => false,
+            _ => legacy_confirmed_sha.as_deref() == Some(sha.as_str()),
         };
         if !all_confirmed {
             return Ok(ImportOutcome::Cancelled { commits: count });

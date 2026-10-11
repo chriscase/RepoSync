@@ -365,24 +365,6 @@ impl Scheduler {
                 }
             };
 
-            let svn_password = self
-                .db
-                .resolve_credential_chain(&repo.id, "secret_svn_password");
-            let svn_url = if repo.svn_branch.is_empty() {
-                repo.svn_url.clone()
-            } else {
-                format!(
-                    "{}/{}",
-                    repo.svn_url.trim_end_matches('/'),
-                    repo.svn_branch.trim_start_matches('/')
-                )
-            };
-            let svn_client = SvnClient::new(
-                &svn_url,
-                &repo.svn_username,
-                svn_password.as_deref().unwrap_or(""),
-            );
-
             let git_repo_path = self
                 .app_config
                 .daemon
@@ -391,10 +373,9 @@ impl Scheduler {
                 .join(&repo.id)
                 .join("git-repo");
 
-            let reconciled = reposync_core::auto_reconcile::reconcile_held_external_writes(
+            let reconciled = reposync_core::auto_reconcile::reconcile_held_external_writes_with_resolved_credentials(
                 &self.db,
                 &repo,
-                &svn_client,
                 Some(git_repo_path.as_path()),
             )
             .await;

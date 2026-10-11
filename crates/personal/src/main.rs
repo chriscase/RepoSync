@@ -8,7 +8,6 @@ mod commit_format;
 mod daemon;
 mod engine;
 mod git_to_svn;
-mod initial_import;
 mod pr_monitor;
 mod scheduler;
 mod signals;
@@ -31,7 +30,7 @@ use reposync_core::personal_config::PersonalConfig;
 use reposync_core::svn::SvnClient;
 
 use crate::engine::PersonalSyncEngine;
-use crate::initial_import::{ImportMode, InitialImport};
+use reposync_personal::initial_import::{ImportMode, InitialImport};
 
 /// RepoSync Personal Branch Mode — individual SVN↔Git sync daemon.
 #[derive(Parser)]
@@ -185,6 +184,9 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
     // Initialize database.
     let db_path = data_dir.join("personal.db");
     let db = Database::new(&db_path).context("failed to initialize database")?;
+    let writer_window = db
+        .begin_personal_startup_writer_window()
+        .context("Personal sync startup writer admission refused")?;
 
     // Create SVN client.
     let svn_client = SvnClient::new(
@@ -221,6 +223,9 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
     let github_client =
         GitHubClient::new(&config.github.api_url, github_token, GitProvider::default());
 
+    writer_window
+        .finish_preparation()
+        .context("Personal sync startup writer completion refused")?;
     let engine = PersonalSyncEngine::new(config.clone(), db, svn_client, git_client, github_client);
     Ok((engine, config))
 }
@@ -323,6 +328,11 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     // Initialize database.
     let db_path = data_dir.join("personal.db");
     let db = Database::new(&db_path).context("failed to initialize database")?;
+    let writer_window = db
+        .begin_personal_startup_writer_window()
+        .context("Personal import startup writer admission refused")?;
+    db.require_legacy_import_watermarks_available()
+        .context("Personal import startup checkpoint admission refused")?;
 
     // Create SVN client.
     let svn_client = SvnClient::new(
@@ -366,7 +376,8 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     };
     let git_client = std::sync::Arc::new(std::sync::Mutex::new(git_client));
 
-    let commit_format = crate::commit_format::CommitFormatter::new(&config.commit_format);
+    let commit_format =
+        reposync_personal::commit_format::CommitFormatter::new(&config.commit_format);
 
     let importer = InitialImport {
         svn_client: &svn_client,
@@ -377,7 +388,9 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
         formatter: &commit_format,
     };
 
-    let count = importer.import(mode).await?;
+    let count = importer
+        .import_with_writer_window(mode, writer_window)
+        .await?;
     println!("✓ Import complete! {} commits created.", count);
     Ok(())
 }

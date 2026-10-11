@@ -642,6 +642,48 @@ fn require_pins_current(tx: &Connection, pins: &RefreshJobPins) -> Result<(), Da
     Ok(())
 }
 
+fn require_credentials_current(
+    tx: &Connection,
+    pins: &RefreshJobPins,
+) -> Result<super::pair_refresh_credentials::RefreshCredentials, DatabaseError> {
+    use subtle::ConstantTimeEq;
+    let credentials = super::pair_refresh_credentials::resolve_refresh_credentials(
+        tx,
+        &pins.child.repo_id,
+        &pins.parent.repo_id,
+    )?;
+    if !bool::from(
+        credentials
+            .context_digest()
+            .as_bytes()
+            .ct_eq(pins.credential_context_digest.as_bytes()),
+    ) {
+        return Err(refused("credential context differs from approval"));
+    }
+    Ok(credentials)
+}
+
+fn require_execution_conflicts_quiet(
+    tx: &Connection,
+    pins: &RefreshJobPins,
+) -> Result<(), DatabaseError> {
+    let blocking: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conflicts WHERE status NOT IN ('resolved','dismissed') AND
+         (repo_id IS NULL OR repo_id='' OR repo_id=?1 OR repo_id=?2 OR repo_id=?3 OR repo_id=?4))",
+        params![
+            pins.child.repo_id,
+            pins.parent.repo_id,
+            super::personal_scope::PERSONAL_SCOPE_KEY,
+            super::personal_scope::LEGACY_PERSONAL_REPO_ID
+        ],
+        |row| row.get(0),
+    )?;
+    if blocking {
+        return Err(refused("unresolved conflict prevents execution"));
+    }
+    Ok(())
+}
+
 fn require_other_journals_quiet(tx: &Connection, repo_id: &str) -> Result<(), DatabaseError> {
     for prefix in [
         "import_operation_v1",
@@ -776,9 +818,39 @@ impl Database {
         pins: RefreshJobPins,
         busy: &crate::busy::PairBusyGuard,
     ) -> Result<PairRefreshOperation, DatabaseError> {
+        self.admit_pair_refresh_guarded(initiator, request, approved_digest, pins, busy, false)
+    }
+
+    /// The execution caller must authenticate the initiator and independently
+    /// prove live remote pins. This variant also resolves revocation and binds
+    /// current credential context inside the transaction creating both holds.
+    pub fn admit_pair_refresh_with_current_credentials(
+        &self,
+        initiator: &str,
+        request: &str,
+        approved_digest: &str,
+        pins: RefreshJobPins,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<PairRefreshOperation, DatabaseError> {
+        self.admit_pair_refresh_guarded(initiator, request, approved_digest, pins, busy, true)
+    }
+
+    fn admit_pair_refresh_guarded(
+        &self,
+        initiator: &str,
+        request: &str,
+        approved_digest: &str,
+        pins: RefreshJobPins,
+        busy: &crate::busy::PairBusyGuard,
+        current_credentials: bool,
+    ) -> Result<PairRefreshOperation, DatabaseError> {
         self.transaction(|tx| {
             let epoch = crate::writer_fence::require_owned_current(tx)?;
             pins.validate()?;
+            if current_credentials {
+                require_credentials_current(tx, &pins)?;
+                require_execution_conflicts_quiet(tx, &pins)?;
+            }
             if !busy.owns_pair(&pins.child.repo_id, &pins.parent.repo_id) {
                 return Err(refused("admission does not own both process busy slots"));
             }
@@ -849,6 +921,40 @@ impl Database {
                 write(tx, &key("hold", scope), &op.id.to_string())?;
             }
             Ok(op)
+        })
+    }
+
+    /// Revalidate local inputs and resolve fresh credentials before each remote
+    /// observation/publication. New daemon epochs can observe a retained job;
+    /// its intent phase never becomes permission to repeat an uncertain write.
+    /// The caller still must check live SVN/Git evidence before the next intent.
+    pub fn require_current_pair_refresh_execution(
+        &self,
+        id: Uuid,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<super::pair_refresh_credentials::RefreshCredentials, DatabaseError> {
+        self.transaction(|tx| {
+            crate::writer_fence::require_owned_current(tx)?;
+            let op = owned_operation(tx, id)?;
+            if !op.phase.holds_scopes()
+                || !busy.owns_pair(&op.pins.child.repo_id, &op.pins.parent.repo_id)
+            {
+                return Err(refused("execution does not own both held process scopes"));
+            }
+            require_pins_current(tx, &op.pins)?;
+            require_execution_conflicts_quiet(tx, &op.pins)?;
+            for pin in [&op.pins.child, &op.pins.parent] {
+                require_other_journals_quiet(tx, &pin.repo_id)?;
+                super::ordinary_writer_windows::require_quiet_for_refresh(
+                    tx,
+                    &pin.repo_id,
+                    &pin.scope_uuid,
+                )?;
+            }
+            for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+                require_other_journals_quiet(tx, id)?;
+            }
+            require_credentials_current(tx, &op.pins)
         })
     }
 

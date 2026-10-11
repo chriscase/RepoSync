@@ -180,6 +180,30 @@ Automatic reconciliation also retains a window before local/credential observati
 and mapping/checkpoint confirmation. These caller controls do not replace the
 unfinished authenticated refresh execution and real-engine crash proof.
 
+The latest corrections refuse known legacy checkpoint incompatibility before a
+push. Each independently observed legacy batch and both checkpoints transition
+atomically from possible publication back to preparation; later cancellation can
+release preparation while retaining the last confirmed cursors. A failed batch
+returns an error and retains uncertainty rather than claiming a managed
+reconciliation operation exists. Personal initial import holds the same global
+window across startup clone and both import modes, before LFS, GitHub API or
+checkout work. Personal checkpoint transactions honor refresh holds. Empty
+first-run storage may be initialized before admission; existing storage must
+admit its window before initialization or conflict attribution. Scheduler
+reconciliation acquires exclusion before constructing its credential-resolved
+SVN client. These corrections are local and await independent review.
+
+Strict refresh credential snapshots resolve the complete child/parent ancestry
+and global defaults inside one read transaction, reject explicit revocation and
+malformed identity/storage, and bind values and timestamps with a keyed digest.
+They never create an encryption key or fall back to legacy/config credentials.
+Credential-checked journal admission and continuation recheck this digest and
+unresolved conflicts under the journal's transaction and busy capability. These
+are caller primitives; authenticated API admission and remote observation remain
+unfinished. Conflict insertion/upsert and exact-skip execution now honor holds;
+the web skip caller carries one window from credential resolution into the core
+operation. Historical Personal conflict labels use global exclusion.
+
 Conflict resolution, deferred status and resolved-content storage now check the
 conflict's persisted repository owner in the same transaction as the write.
 NULL, empty or personal legacy attribution uses global exclusion; unrelated

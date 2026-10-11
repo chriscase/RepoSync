@@ -142,6 +142,26 @@ pub fn begin_shared_ordinary_writer_window(
 }
 
 impl Database {
+    /// Personal startup needs storage before clone, while existing storage must
+    /// refuse a held writer before migrations or conflict attribution can run.
+    /// Only an empty database may be initialized before admission.
+    pub fn begin_personal_startup_writer_window(
+        &self,
+    ) -> Result<OrdinaryWriterWindow<'_>, DatabaseError> {
+        let has_storage: bool = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_storage {
+            self.initialize()?;
+        }
+        let window = self.begin_ordinary_writer_window(None)?;
+        self.initialize()?;
+        window.require_engine_scope(self, None)?;
+        Ok(window)
+    }
+
     pub fn begin_ordinary_writer_window(
         &self,
         repo_id: Option<&str>,
@@ -182,7 +202,10 @@ impl Database {
 }
 
 impl OrdinaryWriterWindow<'_> {
-    pub(crate) fn require_engine_scope(
+    /// Validate a preparation handoff before resolving credentials or touching
+    /// a checkout. The capability remains bound to its original storage, scope,
+    /// writer epoch and durable preparation phase.
+    pub fn require_engine_scope(
         &self,
         db: &Database,
         repo_id: Option<&str>,
@@ -259,7 +282,20 @@ impl OrdinaryWriterWindow<'_> {
         Ok(())
     }
 
-    /// Only a completed normal cycle can release possible legacy publication.
+    /// Release local preparation only. Possible publication cannot be released
+    /// through the public capability without a verified checkpoint transition.
+    pub fn finish_preparation(mut self) -> Result<(), DatabaseError> {
+        self.db.transaction(|tx| {
+            if self.owned(tx)?.phase != Phase::Preparing {
+                return Err(refused("publication still requires a verified checkpoint"));
+            }
+            self.release(tx)
+        })?;
+        self.completed = true;
+        Ok(())
+    }
+
+    /// Only a completed normal core cycle can release possible publication.
     pub(crate) fn finish(mut self) -> Result<(), DatabaseError> {
         self.db.transaction(|tx| {
             self.owned(tx)?;
@@ -267,6 +303,26 @@ impl OrdinaryWriterWindow<'_> {
         })?;
         self.completed = true;
         Ok(())
+    }
+
+    /// Import's independently verified batch and its global checkpoints become
+    /// confirmed together. Later cancellation can release preparation without
+    /// losing the last confirmed publication or adopting unpublished local work.
+    pub(crate) fn confirm_unjournalled_import_checkpoint(
+        &self,
+        checkpoint: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
+    ) -> Result<(), DatabaseError> {
+        self.db.transaction(|tx| {
+            let mut doc = self.owned(tx)?;
+            if doc.repo_id.is_some() || doc.phase != Phase::UnjournalledPublicationPossible {
+                return Err(refused(
+                    "no global import publication requires confirmation",
+                ));
+            }
+            checkpoint(tx)?;
+            doc.phase = Phase::Preparing;
+            store(tx, &doc)
+        })
     }
 }
 

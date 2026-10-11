@@ -314,6 +314,7 @@ impl Database {
         svn_watermark_key: &str,
     ) -> Result<(), DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
             checkpoint_personal_svn_to_git_import_tx(
                 tx,
                 PERSONAL_SCOPE_KEY,
@@ -338,6 +339,7 @@ impl Database {
         git_author: &str,
     ) -> Result<(), DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
             checkpoint_personal_svn_to_git_import_tx(
                 tx,
                 PERSONAL_SCOPE_KEY,
@@ -358,6 +360,7 @@ impl Database {
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
             let now = Utc::now().to_rfc3339();
             tx.execute(
                 "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
@@ -387,7 +390,7 @@ fn personal_svn_to_git_mapping_exists(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn checkpoint_personal_svn_to_git_import_tx(
+pub(crate) fn checkpoint_personal_svn_to_git_import_tx(
     tx: &Connection,
     repo_id: &str,
     svn_rev: i64,
