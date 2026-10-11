@@ -1091,7 +1091,8 @@ impl SyncEngine {
                         let mut baseline_valid = baseline.as_ref().is_some_and(|record| {
                             record["version"] == 1
                                 && record["repo_id"] == rid
-                                && self.handled_git_baseline_projection_matches(&record["projection"])
+                                && self
+                                    .handled_git_baseline_projection_matches(&record["projection"])
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
@@ -1146,7 +1147,9 @@ impl SyncEngine {
                             baseline_valid = baseline.as_ref().is_some_and(|record| {
                                 record["version"] == 1
                                     && record["repo_id"] == rid
-                                    && self.handled_git_baseline_projection_matches(&record["projection"])
+                                    && self.handled_git_baseline_projection_matches(
+                                        &record["projection"],
+                                    )
                             }) && baseline_sha.is_some_and(is_full_git_oid)
                                 && baseline_revision.is_some_and(|rev| rev > 0);
                             if !baseline_valid {
