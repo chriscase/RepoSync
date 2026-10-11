@@ -205,9 +205,14 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
         )?;
         git_client
     } else {
+        let token = reposync_core::git::resolve_git_http_auth_token_for_clone(
+            &db,
+            reposync_core::db::personal_scope::personal_scope_key(),
+            config.github.token.as_deref(),
+        )?;
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         let remote_url = config.github.clone_url();
-        GitClient::clone_repo(&remote_url, &git_repo_path, config.github.token.as_deref())
+        GitClient::clone_repo(&remote_url, &git_repo_path, token.as_deref())
             .context("failed to clone git repository")?
     };
 
@@ -343,10 +348,15 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
         )?;
         git_client
     } else {
+        let token = reposync_core::git::resolve_git_http_auth_token_for_clone(
+            &db,
+            reposync_core::db::personal_scope::personal_scope_key(),
+            config.github.token.as_deref(),
+        )?;
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         // For import, try to clone first; if repo doesn't exist yet, init locally
         let remote_url = config.github.clone_url();
-        match GitClient::clone_repo(&remote_url, &git_repo_path, config.github.token.as_deref()) {
+        match GitClient::clone_repo(&remote_url, &git_repo_path, token.as_deref()) {
             Ok(client) => client,
             Err(_) => {
                 // Repo might not exist yet (auto-create will handle it)

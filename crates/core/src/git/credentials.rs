@@ -11,6 +11,27 @@ use crate::errors::GitError;
 use super::startup_handoff;
 use super::GitClient;
 
+/// Resolve fresh-clone credentials before attempting Git I/O or init fallback.
+///
+/// Unlike a chain miss (which may clone anonymously), explicit revocation must
+/// stop startup. Returning `None` would permit a public clone and later push
+/// through ambient credentials. A fresh clone never inherits a startup handoff.
+pub fn resolve_git_http_auth_token_for_clone(
+    db: &Database,
+    scope_id: &str,
+    config_token: Option<&str>,
+) -> Result<Option<String>, GitError> {
+    let state = db.resolve_credential_chain_state(scope_id, "secret_git_token");
+    if state.explicitly_revoked {
+        return Err(GitError::CredentialsRevoked);
+    }
+    Ok(state.value.filter(|value| !value.is_empty()).or_else(|| {
+        config_token
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }))
+}
+
 /// Resolve HTTP(S) git token: scoped chain first, then optional config token.
 pub fn resolve_git_http_auth_token(
     db: &Database,

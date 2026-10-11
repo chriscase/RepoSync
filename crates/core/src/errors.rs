@@ -110,6 +110,10 @@ impl SvnError {
 /// Errors from local Git (git2) operations.
 #[derive(Debug, Error)]
 pub enum GitError {
+    /// An explicit managed-chain revocation forbids starting a clone.
+    #[error("git credentials explicitly revoked; refusing fresh clone")]
+    CredentialsRevoked,
+
     /// The repository path does not exist or is not a git repo.
     #[error("git repository not found at '{0}'")]
     RepositoryNotFound(String),
@@ -158,7 +162,7 @@ impl GitError {
                     || detail.contains("exceeds GitHub")
                     || detail.contains("GH001")
             }
-            GitError::UnsupportedHistory { .. } => true,
+            GitError::UnsupportedHistory { .. } | GitError::CredentialsRevoked => true,
             _ => false,
         }
     }
