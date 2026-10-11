@@ -1852,6 +1852,7 @@ dependencies = [
  "reposync-core",
  "reqwest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
