@@ -605,6 +605,17 @@ fn write_legacy_repo_id_kv_reads_flag(
     conn: &Connection,
     enabled: bool,
 ) -> Result<(), DatabaseError> {
+    if conn.is_autocommit() {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        write_legacy_repo_id_kv_reads_flag(&tx, enabled)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    super::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+        conn,
+        LEGACY_REPO_ID_KV_READS_KEY,
+    )?;
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)

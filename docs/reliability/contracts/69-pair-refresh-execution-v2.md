@@ -97,6 +97,10 @@ failure rolls back all these changes. Completed request lookup is idempotent.
 Both `commit_map` and `sync_records` are written. Contradictory child mapping
 rows with the result revision or SHA refuse; an exact prior child commit-map
 row is preserved without another insert. Parent rows are not adopted.
+Unscoped legacy rows with either result coordinate also refuse completion;
+equivalent-looking legacy evidence is not assigned to the child. Stored lineage
+documents require canonical root/path bindings, positive and consistent revision
+ranges, and complete copy-origin evidence before any journal transition.
 Parent state and both echo generations remain unchanged. Journal receipt storage
 is not independent remote verification, API approval, or credential admission.
 The existing import, Git push, SVN commit, team mapping, late-pair publication
@@ -122,6 +126,28 @@ publication capabilities; deliberate fault injection can still corrupt evidence
 and current-pin checks refuse that drift. Full production entrances must retain
 exclusion through local working-tree and external publication work before
 execution is enabled.
+
+Managed-removal completion, restore and deletion now check holds before creating
+an encryption key or applying the deferred identity migration. Both actions are
+inside the same immediate transaction as the requested mutation. Late-pair
+updates also check the persisted operation owner and active-pointer owners;
+rewriting incoming parent or child fields cannot conceal a held owner. Global
+watermark and legacy-authority changes check all holds, including writes reached
+through an unrelated non-team registration.
+
+An ordinary SyncEngine cycle now admits a durable writer window before loading
+credentials, migrating identity, or modifying a working tree. Refresh admission
+and window admission exclude each other transactionally for either registered
+identity; a global cycle excludes every refresh. A borrowed window spans the
+whole cycle. Normal completion releases it. Drop releases only preparation
+owned by the same writer epoch; global push/commit intent is marked before the
+command and is retained after an uncertain outcome. Abrupt process exit retains
+every window. Unknown, corrupt or contradictory window documents refuse
+admission. Managed publication still requires its existing journal in addition
+to the window. Operator recovery of stale windows, other working-tree writer
+entrances, authenticated execution and complete real-engine recovery evidence
+remain unfinished. These conservative retained windows must not be cleared
+merely because time passed or a new daemon acquired a lease.
 
 ## Preparation and correspondence
 

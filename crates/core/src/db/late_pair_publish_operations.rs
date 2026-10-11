@@ -103,6 +103,40 @@ fn parse(raw: &str) -> Result<LatePairPublishOperation, DatabaseError> {
 }
 
 fn write_op(tx: &Connection, op: &LatePairPublishOperation) -> Result<(), DatabaseError> {
+    if let Some(raw) = read_value(tx, &key("document", &op.id))? {
+        let stored = parse(&raw)?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+            tx,
+            &stored.parent_repo_id,
+        )?;
+        if let Some(child) = &stored.child_repo_id {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, child)?;
+        }
+        if stored.id != op.id || stored.parent_repo_id != op.parent_repo_id {
+            return Err(DatabaseError::Other(
+                "late-pair operation ownership changed".into(),
+            ));
+        }
+    }
+    let active_prefix = key("active", "");
+    let mut query =
+        tx.prepare("SELECT key FROM kv_state WHERE substr(key,1,?1)=?2 AND value=?3")?;
+    let pointers = query
+        .query_map(params![active_prefix.len(), active_prefix, op.id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for pointer in pointers {
+        let owner = pointer
+            .strip_prefix(&active_prefix)
+            .ok_or_else(|| DatabaseError::Other("invalid late-pair active pointer".into()))?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, owner)?;
+        if owner != op.parent_repo_id {
+            return Err(DatabaseError::Other(
+                "late-pair active pointer has different ownership".into(),
+            ));
+        }
+    }
     super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
         tx,
         &op.parent_repo_id,

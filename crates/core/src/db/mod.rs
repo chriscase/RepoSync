@@ -9,6 +9,7 @@ pub mod git_push_operations;
 pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod managed_remove;
+pub mod ordinary_writer_windows;
 pub mod pair_refresh_operations;
 pub mod personal_scope;
 pub mod queries;
@@ -187,8 +188,26 @@ impl Database {
     where
         F: FnOnce(&Connection) -> Result<T, DatabaseError>,
     {
+        self.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred, f)
+    }
+
+    pub(crate) fn immediate_transaction<F, T>(&self, f: F) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(&Connection) -> Result<T, DatabaseError>,
+    {
+        self.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate, f)
+    }
+
+    fn transaction_with_behavior<F, T>(
+        &self,
+        behavior: rusqlite::TransactionBehavior,
+        f: F,
+    ) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(&Connection) -> Result<T, DatabaseError>,
+    {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(behavior)?;
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result)

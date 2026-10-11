@@ -62,6 +62,48 @@ fn canonical_path(path: &str) -> bool {
         })
 }
 
+/// Structural validation for durable evidence. This does not replace fresh
+/// remote inspection, but contradictory or missing evidence cannot hold scopes.
+pub(crate) fn validate_stored_refresh_proof(
+    proof: &SvnRefreshLineageProof,
+) -> Result<(), SvnError> {
+    let pins = &proof.pins;
+    let child = &pins.child;
+    let copy = &proof.child_copy;
+    let root = reqwest::Url::parse(&pins.repository_root_url)
+        .map_err(|_| refused("invalid pinned repository root URL"))?;
+    if child.repository_uuid.is_empty()
+        || !canonical_path(&child.child_path)
+        || !canonical_path(&child.parent_path)
+        || child.child_path == child.parent_path
+        || child.child_mapping_revision < 1
+        || child.child_mapping_revision > child.child_revision
+        || child.parent_baseline_revision < 1
+        || pins.parent_revision < child.parent_baseline_revision
+        || copy.repository_uuid != child.repository_uuid
+        || copy.child_path != child.child_path
+        || copy.parent_path != child.parent_path
+        || copy.copy_from_revision < 1
+        || copy.copy_from_revision > child.parent_baseline_revision
+        || copy.created_revision <= copy.copy_from_revision
+        || copy.created_revision > child.child_mapping_revision
+        || copy.inspected_revision != child.child_revision
+        || proof.parent_originating_revision < 1
+        || proof.parent_originating_revision > copy.copy_from_revision
+        || pins.repository_root_url.ends_with('/')
+        || root.as_str() != pins.repository_root_url
+        || !root.username().is_empty()
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || pins.child_url != format!("{}{}", pins.repository_root_url, child.child_path)
+        || pins.parent_url != format!("{}{}", pins.repository_root_url, child.parent_path)
+    {
+        return Err(refused("invalid or contradictory stored lineage proof"));
+    }
+    Ok(())
+}
+
 fn affects_path(changed: &str, target: &str) -> bool {
     changed == "/"
         || changed == target

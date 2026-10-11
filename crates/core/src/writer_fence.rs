@@ -346,6 +346,13 @@ pub fn require_owned_current(tx: &Connection) -> Result<u64, DatabaseError> {
     Ok(lease.epoch)
 }
 
+/// Preserve ordinary-writer no-lease compatibility while binding an in-flight
+/// capability to the lease epoch whenever this database is enrolled.
+pub fn ordinary_current_epoch(tx: &Connection) -> Result<Option<u64>, DatabaseError> {
+    require_current(tx)?;
+    Ok(read_lease(tx)?.map(|lease| lease.epoch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

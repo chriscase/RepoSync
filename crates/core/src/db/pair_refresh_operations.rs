@@ -174,6 +174,8 @@ impl RefreshJobPins {
     }
 
     fn validate(&self) -> Result<(), DatabaseError> {
+        crate::pair_refresh::lineage::validate_stored_refresh_proof(&self.svn.pins.lineage)
+            .map_err(|_| refused("missing or contradictory stored lineage proof"))?;
         let child = &self.child;
         let parent = &self.parent;
         let svn = &self.svn.pins.lineage.pins;
@@ -707,6 +709,13 @@ impl Database {
                 require_no_pair_refresh_hold(tx, Some(id))?;
                 require_other_journals_quiet(tx, id)?;
             }
+            for pin in [&pins.child, &pins.parent] {
+                super::ordinary_writer_windows::require_quiet_for_refresh(
+                    tx,
+                    &pin.repo_id,
+                    &pin.scope_uuid,
+                )?;
+            }
             let now = Utc::now().to_rfc3339();
             let op = PairRefreshOperation {
                 version: 2,
@@ -877,9 +886,9 @@ impl Database {
             let receipt = op.svn_receipt.as_ref().ok_or_else(|| refused("missing SVN receipt"))?;
             let child = &op.pins.child;
             let sha = &op.pins.git.prepared_sha;
-            let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_records WHERE repo_id=?1 AND (git_sha=?2 OR svn_rev=?3))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
+            let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_records WHERE (repo_id=?1 OR repo_id IS NULL OR repo_id='') AND (git_sha=?2 OR svn_rev=?3))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
             if conflict { return Err(refused("publication already has correspondence outside this job")); }
-            let conflicting_map: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commit_map WHERE repo_id=?1 AND (git_sha=?2 OR svn_rev=?3) AND NOT (git_sha=?2 AND svn_rev=?3 AND direction='git_to_svn'))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
+            let conflicting_map: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commit_map WHERE (git_sha=?2 OR svn_rev=?3) AND ((repo_id=?1 AND NOT (git_sha=?2 AND svn_rev=?3 AND direction='git_to_svn')) OR repo_id IS NULL OR repo_id=''))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
             if conflicting_map { return Err(refused("publication has contradictory commit correspondence")); }
             let now = Utc::now().to_rfc3339();
             tx.execute("INSERT INTO commit_map(repo_id,svn_rev,git_sha,direction,synced_at,svn_author,git_author) SELECT ?1,?2,?3,'git_to_svn',?4,'RepoSync','RepoSync' WHERE NOT EXISTS(SELECT 1 FROM commit_map WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='git_to_svn')", params![child.repo_id, receipt.revision, sha, now])?;

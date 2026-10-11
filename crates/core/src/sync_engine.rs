@@ -513,6 +513,13 @@ impl SyncEngine {
         // RAII guard that clears the running flag on drop (even on panic).
         let _guard = SyncLockGuard(self.running.clone());
 
+        // Admit before credential reload, schema changes or working-tree work.
+        // Refresh admission checks this durable window in its own transaction.
+        let writer_window = self
+            .db
+            .begin_ordinary_writer_window(self.effective_repo_id())
+            .map_err(SyncError::DatabaseError)?;
+
         // Hot-reload credentials from DB (changed via Setup Wizard).
         self.reload_credentials();
 
@@ -528,7 +535,7 @@ impl SyncEngine {
         // Store the sync state (per-repo for managed pairs, global otherwise).
         let _ = self.persist_sync_state("detecting");
 
-        let result = self.do_sync_cycle(&mut stats).await;
+        let result = self.do_sync_cycle(&mut stats, &writer_window).await;
 
         // Record completion
         let (final_state, details) = match &result {
@@ -579,6 +586,7 @@ impl SyncEngine {
 
         if result.is_ok() {
             let _ = clear_transient_history_block(&self.db, &self.history_block_key());
+            writer_window.finish().map_err(SyncError::DatabaseError)?;
         }
 
         // Lock is released by _guard drop (happens here at scope end).
@@ -2025,7 +2033,11 @@ impl SyncEngine {
         }
     }
 
-    async fn do_sync_cycle(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
+    async fn do_sync_cycle(
+        &self,
+        stats: &mut SyncStats,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<(), SyncError> {
         if let Some(rid) = self.effective_repo_id() {
             if let Some(op) = self
                 .db
@@ -2169,7 +2181,7 @@ impl SyncEngine {
 
         // 3. Apply SVN -> Git.
         let _ = self.persist_sync_state("applying");
-        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count)
+        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count, writer_window)
             .await?;
 
         // The exact remote Git tip had no pending commits before this SVN
@@ -2190,7 +2202,11 @@ impl SyncEngine {
 
         // 4. Apply Git -> SVN.
         stats.git_to_svn_count = self
-            .sync_git_to_svn(&git_fetch.replay_batch, batch_continuation.as_ref())
+            .sync_git_to_svn(
+                &git_fetch.replay_batch,
+                batch_continuation.as_ref(),
+                writer_window,
+            )
             .await?;
 
         // Collect commit details for notifications (max 10 commits)
@@ -2258,6 +2274,7 @@ impl SyncEngine {
         &self,
         svn_changes: &[SvnChangeSet],
         applied: &mut usize,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
     ) -> Result<(), SyncError> {
         let resume_svn_rev = if let Some(rid) = self.effective_repo_id() {
             match self
@@ -2633,6 +2650,9 @@ impl SyncEngine {
                 }
             }
 
+            writer_window
+                .mark_unjournalled_publication_possible()
+                .map_err(SyncError::DatabaseError)?;
             let push_result = tokio::task::block_in_place(|| {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 git.push(&remote, &branch).map_err(SyncError::GitError)
@@ -3301,6 +3321,7 @@ impl SyncEngine {
         &self,
         git_changes: &[GitChangeSet],
         batch_continuation: Option<&GitReplayBatchContinuation>,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
     ) -> Result<usize, SyncError> {
         let mut count = 0;
         let resume_sha = if let Some(rid) = self.effective_repo_id() {
@@ -3849,6 +3870,9 @@ impl SyncEngine {
                     &change.sha[..8.min(change.sha.len())]
                 ),
             };
+            writer_window
+                .mark_unjournalled_publication_possible()
+                .map_err(SyncError::DatabaseError)?;
             let mut svn_commit_result = svn
                 .commit(svn_wc_dir.path(), &commit_message, &svn_username)
                 .await;
