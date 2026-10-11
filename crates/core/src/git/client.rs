@@ -12,6 +12,16 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::errors::GitError;
 
+/// Legacy plaintext sidecar from earlier builds (must not be used for auth).
+const LEGACY_CLEAN_HTTP_TOKEN_REL: &str = "reposync/clean-http-token";
+
+fn purge_legacy_clean_http_token_sidecar(repo: &Repository) {
+    let path = repo.path().join(LEGACY_CLEAN_HTTP_TOKEN_REL);
+    if path.is_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// High-level Git client wrapping a `git2::Repository`.
 pub struct GitClient {
     repo: Repository,
@@ -61,6 +71,7 @@ impl GitClient {
         info!(path = %path.display(), "opening git repository");
         let repo = Repository::open(path)
             .map_err(|_| GitError::RepositoryNotFound(path.display().to_string()))?;
+        purge_legacy_clean_http_token_sidecar(&repo);
         Ok(Self {
             repo,
             repo_path: path.to_path_buf(),
@@ -113,6 +124,11 @@ impl GitClient {
             http_auth_token: RefCell::new(token.map(str::to_string)),
         };
         client.migrate_remote_url_clean("origin")?;
+        if let Some(tok) =
+            token.filter(|_| clean_url.starts_with("https://") || clean_url.starts_with("http://"))
+        {
+            super::startup_handoff::remember_startup_http_auth(path, tok);
+        }
         Ok(client)
     }
 
@@ -231,6 +247,11 @@ impl GitClient {
         self.migrate_remote_url_clean(remote_name)?;
         if let Some(tok) = token {
             *self.http_auth_token.borrow_mut() = Some(tok.to_string());
+            if let Some(workdir) = self.repo.workdir() {
+                super::startup_handoff::remember_startup_http_auth(workdir, tok);
+            } else {
+                super::startup_handoff::remember_startup_http_auth(&self.repo_path, tok);
+            }
         }
         Ok(())
     }
@@ -266,11 +287,34 @@ impl GitClient {
         Ok(())
     }
 
+    /// Store HTTP(S) auth in memory only (no remote mutation).
+    pub fn set_in_memory_http_auth(&self, token: &str) {
+        *self.http_auth_token.borrow_mut() = Some(token.to_string());
+    }
+
+    /// Drop in-memory HTTP auth and startup handoff without changing remotes.
+    pub fn clear_in_memory_http_auth(&self, _remote_name: &str) -> Result<(), GitError> {
+        self.http_auth_token.borrow_mut().take();
+        let workdir = self
+            .repo
+            .workdir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.repo_path.clone());
+        super::startup_handoff::forget_startup_http_auth(&workdir);
+        purge_legacy_clean_http_token_sidecar(&self.repo);
+        Ok(())
+    }
+
+    /// Clear in-memory HTTP auth and strip legacy credentialed remote URLs.
+    pub fn clear_http_auth_memory(&self, remote_name: &str) -> Result<(), GitError> {
+        self.clear_in_memory_http_auth(remote_name)?;
+        self.migrate_remote_url_clean(remote_name)?;
+        Ok(())
+    }
+
     /// Remove embedded HTTP(S) credentials from a remote URL.
     pub fn clear_remote_credentials(&self, remote_name: &str) -> Result<(), GitError> {
-        self.migrate_remote_url_clean(remote_name)?;
-        self.http_auth_token.borrow_mut().take();
-        Ok(())
+        self.clear_http_auth_memory(remote_name)
     }
 
     /// Fetch from a named remote with a 5-minute timeout.
@@ -1059,6 +1103,23 @@ fn git_commit_info(commit: &git2::Commit<'_>) -> GitCommitInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn open_repo_purges_legacy_clean_http_token_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let work = tmp.path().join("work");
+        std::process::Command::new("git")
+            .args(["init", work.to_str().unwrap()])
+            .status()
+            .unwrap();
+        let sidecar = work.join(".git").join("reposync").join("clean-http-token");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, "legacy-plaintext-token").unwrap();
+        assert!(sidecar.is_file());
+        GitClient::new(&work).unwrap();
+        assert!(!sidecar.is_file());
+    }
 
     #[test]
     fn test_init_and_commit() {

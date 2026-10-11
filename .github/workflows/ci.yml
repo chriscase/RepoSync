@@ -48,6 +48,9 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Build core release
+        run: cargo build --locked -p reposync-core --release
+
       - name: Test
         run: cargo test --workspace
         env:

@@ -83,13 +83,13 @@ pub fn set_late_pair_publish_test_hook(_parent_repo_id: &str, _hook: LatePairPub
 pub fn clear_late_pair_publish_test_hook(_parent_repo_id: &str) {}
 
 /// Debug-only: refusal stashed by a test hook when returning `Ok` avoids async-drop hangs.
-pub fn take_pending_publish_refusal(parent_repo_id: &str) -> Option<LatePairPublishRefusal> {
+pub fn take_pending_publish_refusal(_parent_repo_id: &str) -> Option<LatePairPublishRefusal> {
     #[cfg(debug_assertions)]
     {
         return PENDING_PUBLISH_REFUSALS
             .lock()
             .unwrap()
-            .remove(parent_repo_id);
+            .remove(_parent_repo_id);
     }
     #[cfg(not(debug_assertions))]
     {
@@ -104,6 +104,10 @@ fn stash_pending_publish_refusal(parent_repo_id: &str, refusal: LatePairPublishR
         .unwrap()
         .insert(parent_repo_id.to_string(), refusal);
 }
+
+// Release builds disable the test hooks and keep no pending refusal stash.
+#[cfg(not(debug_assertions))]
+fn stash_pending_publish_refusal(_parent_repo_id: &str, _refusal: LatePairPublishRefusal) {}
 
 fn refused_publish_plan_stub(
     plan: &LatePairPlan,
@@ -141,11 +145,11 @@ fn refused_publish_plan_stub(
     }
 }
 
-fn take_fail_replay_once(parent_repo_id: &str) -> bool {
+fn take_fail_replay_once(_parent_repo_id: &str) -> bool {
     #[cfg(debug_assertions)]
     {
         let mut hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
-        if let Some(hook) = hooks.get_mut(parent_repo_id) {
+        if let Some(hook) = hooks.get_mut(_parent_repo_id) {
             if hook.fail_replay_once {
                 hook.fail_replay_once = false;
                 return true;
@@ -155,11 +159,11 @@ fn take_fail_replay_once(parent_repo_id: &str) -> bool {
     false
 }
 
-fn take_fail_svn_copy_once(parent_repo_id: &str) -> bool {
+fn take_fail_svn_copy_once(_parent_repo_id: &str) -> bool {
     #[cfg(debug_assertions)]
     {
         let mut hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
-        if let Some(hook) = hooks.get_mut(parent_repo_id) {
+        if let Some(hook) = hooks.get_mut(_parent_repo_id) {
             if hook.fail_svn_copy_once {
                 hook.fail_svn_copy_once = false;
                 return true;
@@ -169,22 +173,22 @@ fn take_fail_svn_copy_once(parent_repo_id: &str) -> bool {
     false
 }
 
-fn replay_fail_after_commits(parent_repo_id: &str) -> u32 {
+fn replay_fail_after_commits(_parent_repo_id: &str) -> u32 {
     #[cfg(debug_assertions)]
     {
         let hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
-        if let Some(hook) = hooks.get(parent_repo_id) {
+        if let Some(hook) = hooks.get(_parent_repo_id) {
             return hook.fail_replay_after_commits;
         }
     }
     0
 }
 
-fn take_abort_after_svn_copy(parent_repo_id: &str) -> bool {
+fn take_abort_after_svn_copy(_parent_repo_id: &str) -> bool {
     #[cfg(debug_assertions)]
     {
         let mut hooks = PUBLISH_TEST_HOOKS.lock().unwrap();
-        if let Some(hook) = hooks.get_mut(parent_repo_id) {
+        if let Some(hook) = hooks.get_mut(_parent_repo_id) {
             if hook.abort_after_svn_copy_before_journal {
                 hook.abort_after_svn_copy_before_journal = false;
                 return true;
@@ -644,8 +648,8 @@ async fn replay_pending_git(
         detail: e.to_string(),
         plan: None,
     })?;
-    let token_state = db.resolve_credential_chain_state(&child.id, "secret_git_token");
-    apply_git_credential_chain_state(&git_client, "origin", &token_state).ok();
+    crate::git::sync_git_http_auth_from_resolution(&git_client, git_workdir, db, &child.id, None)
+        .ok();
     let mut repo_config = app_config.clone();
     repo_config.svn.trunk_path = String::new();
     repo_config.svn.layout = crate::config::SvnLayout::Custom;
@@ -1150,6 +1154,33 @@ pub async fn publish_admitted_late_pair(
         skip_import_applied: false,
         skip_import_note: plan.skip_import_note.clone(),
     })
+}
+
+/// Integration-test entry point for the production late-pair Git replay loop.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn replay_pending_git_for_integration_test(
+    app_config: &AppConfig,
+    db: &Database,
+    child: &Repository,
+    git_workdir: &std::path::Path,
+    svn_password: &str,
+    identity: &Arc<IdentityMapper>,
+    pinned_tip: &str,
+    baseline_git_sha: &str,
+) -> Result<Vec<String>, LatePairPublishRefusal> {
+    replay_pending_git(
+        app_config,
+        db,
+        child,
+        git_workdir,
+        svn_password,
+        identity,
+        pinned_tip,
+        baseline_git_sha,
+    )
+    .await
 }
 
 #[cfg(test)]
