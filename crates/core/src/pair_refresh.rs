@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use crate::history_inspect::is_full_git_oid;
 use crate::late_pair::VerifiedMapping;
 
+pub mod lineage;
+pub mod publication;
+
 /// Policy identity pinned into every preview from this slice.
 pub const POLICY_VERSION: &str = "pair_refresh_preview_v1";
 /// Single existing registration until #63 generation tables exist.

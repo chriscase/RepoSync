@@ -143,6 +143,38 @@ impl SvnClient {
         parse_svn_log(&output)
     }
 
+    /// Complete history of the selected path incarnation, stopping at its
+    /// originating copy rather than following an older source path. No fixed
+    /// revision window or limit may truncate the origin used for approval.
+    pub async fn copy_history_at_rev(
+        &self,
+        peg_revision: i64,
+    ) -> Result<Vec<SvnLogEntry>, SvnError> {
+        if peg_revision < 1 {
+            return Err(SvnError::RevisionNotFound(peg_revision));
+        }
+        let range = format!("{peg_revision}:1");
+        let target = format!("{}@{peg_revision}", self.url);
+        let output = self
+            .run_svn(&[
+                "log",
+                "--xml",
+                "--verbose",
+                "--stop-on-copy",
+                "-r",
+                &range,
+                &target,
+            ])
+            .await?;
+        let entries = parse_svn_log(&output)?;
+        if output.matches("<logentry").count() != entries.len() {
+            return Err(SvnError::XmlParseError(
+                "incomplete branch copy history".into(),
+            ));
+        }
+        Ok(entries)
+    }
+
     #[instrument(skip(self), fields(url = %self.url, rev))]
     pub async fn diff(&self, rev: i64) -> Result<Vec<SvnDiffEntry>, SvnError> {
         if rev < 1 {
