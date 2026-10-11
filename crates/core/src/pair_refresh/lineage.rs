@@ -26,7 +26,10 @@ pub struct SvnCopyProof {
 }
 
 fn refused(detail: &str) -> SvnError {
-    SvnError::XmlParseError(format!("unproved pair refresh SVN lineage: {detail}"))
+    SvnError::LineageRefused {
+        reason: "unproved_pair_refresh_svn_lineage".into(),
+        detail: detail.into(),
+    }
 }
 
 fn canonical_path(path: &str) -> bool {

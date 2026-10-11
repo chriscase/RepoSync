@@ -282,3 +282,45 @@ fn configured_push_url_rewrite_cannot_bypass_transport_admission() {
     assert!(fixture.publish().is_err());
     assert_eq!(fixture.tip(), fixture.child);
 }
+
+#[test]
+fn shallow_history_refuses_before_publication() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.source.path().join("shallow"),
+        format!("{}\n", fixture.child),
+    )
+    .unwrap();
+    assert!(fixture.source.is_shallow());
+    assert!(fixture.publish().is_err());
+    assert_eq!(fixture.tip(), fixture.child);
+}
+
+#[test]
+fn graft_metadata_refuses_before_publication() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(fixture.source.path().join("info")).unwrap();
+    std::fs::write(
+        fixture.source.path().join("info/grafts"),
+        format!("{} {}\n", fixture.child, fixture.parent),
+    )
+    .unwrap();
+    assert!(fixture.publish().is_err());
+    assert_eq!(fixture.tip(), fixture.child);
+}
+
+#[test]
+fn replace_reference_refuses_before_publication() {
+    let fixture = Fixture::new();
+    fixture
+        .source
+        .reference(
+            &format!("refs/replace/{}", fixture.child),
+            fixture.parent,
+            false,
+            "fixture graph overlay",
+        )
+        .unwrap();
+    assert!(fixture.publish().is_err());
+    assert_eq!(fixture.tip(), fixture.child);
+}

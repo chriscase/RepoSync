@@ -65,6 +65,115 @@ pub fn parse_svn_last_changed_revision(xml: &str) -> Result<i64, SvnError> {
         .ok_or_else(|| SvnError::XmlParseError("missing commit revision in svn info".into()))
 }
 
+/// Parse the complete verbose history used as a publication precondition. The
+/// ordinary log parser is intentionally tolerant; a proof must not drop an
+/// unclosed or otherwise unparsed changed path.
+pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
+    fn malformed(detail: impl Into<String>) -> SvnError {
+        SvnError::XmlParseError(detail.into())
+    }
+    fn named(node: roxmltree::Node<'_, '_>, name: &str) -> bool {
+        node.is_element() && node.tag_name().namespace().is_none() && node.tag_name().name() == name
+    }
+    fn text(node: roxmltree::Node<'_, '_>) -> Result<String, SvnError> {
+        if node.children().any(|child| child.is_element()) {
+            return Err(malformed("nested element in copy-history text"));
+        }
+        Ok(node
+            .children()
+            .filter(|child| child.is_text())
+            .filter_map(|child| child.text())
+            .collect())
+    }
+    fn field(entry: roxmltree::Node<'_, '_>, name: &str) -> Result<String, SvnError> {
+        let nodes: Vec<_> = entry
+            .children()
+            .filter(|child| named(*child, name))
+            .collect();
+        match nodes.as_slice() {
+            [] => Ok(String::new()),
+            [node] => text(*node),
+            _ => Err(malformed("duplicate copy-history field")),
+        }
+    }
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|error| malformed(format!("invalid copy-history XML: {error}")))?;
+    let root = document.root_element();
+    if !named(root, "log") {
+        return Err(malformed("copy history requires a log root"));
+    }
+    let mut entries = Vec::new();
+    for entry in root.children().filter(|child| child.is_element()) {
+        if !named(entry, "logentry")
+            || entry
+                .children()
+                .filter(|child| child.is_element())
+                .any(|child| {
+                    !["author", "date", "msg", "paths"]
+                        .iter()
+                        .any(|name| named(child, name))
+                })
+        {
+            return Err(malformed("unsupported copy-history entry"));
+        }
+        let revision = entry
+            .attribute("revision")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|revision| *revision > 0)
+            .ok_or_else(|| malformed("missing or invalid copy-history revision"))?;
+        let paths: Vec<_> = entry
+            .children()
+            .filter(|child| named(*child, "paths"))
+            .collect();
+        let [paths] = paths.as_slice() else {
+            return Err(malformed("missing or duplicate verbose paths"));
+        };
+        let mut changed_paths = Vec::new();
+        for path in paths.children().filter(|child| child.is_element()) {
+            if !named(path, "path") {
+                return Err(malformed("unparsed changed-path element"));
+            }
+            let action = path
+                .attribute("action")
+                .filter(|value| matches!(*value, "A" | "M" | "D" | "R"))
+                .ok_or_else(|| malformed("missing or invalid changed-path action"))?;
+            let copy_from_path = path.attribute("copyfrom-path").map(str::to_owned);
+            let copy_from_rev = path
+                .attribute("copyfrom-rev")
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| malformed("invalid copy-from revision"))
+                })
+                .transpose()?;
+            if copy_from_path.is_some() != copy_from_rev.is_some() {
+                return Err(malformed("incomplete copy-from attributes"));
+            }
+            let path = text(path)?;
+            if path.is_empty() || !path.starts_with('/') {
+                return Err(malformed("empty or non-absolute changed path"));
+            }
+            changed_paths.push(SvnChangedPath {
+                action: action.into(),
+                path,
+                copy_from_path,
+                copy_from_rev,
+            });
+        }
+        if changed_paths.is_empty() {
+            return Err(malformed("verbose revision has no parsed changed paths"));
+        }
+        entries.push(SvnLogEntry {
+            revision,
+            author: field(entry, "author")?,
+            date: field(entry, "date")?,
+            message: field(entry, "msg")?,
+            changed_paths,
+        });
+    }
+    Ok(entries)
+}
+
 pub fn parse_svn_log(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
     debug!("parsing svn log XML ({} bytes)", xml.len());
     let mut entries = Vec::new();

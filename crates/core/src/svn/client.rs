@@ -166,13 +166,7 @@ impl SvnClient {
                 &target,
             ])
             .await?;
-        let entries = parse_svn_log(&output)?;
-        if output.matches("<logentry").count() != entries.len() {
-            return Err(SvnError::XmlParseError(
-                "incomplete branch copy history".into(),
-            ));
-        }
-        Ok(entries)
+        super::parser::parse_svn_copy_history(&output)
     }
 
     #[instrument(skip(self), fields(url = %self.url, rev))]

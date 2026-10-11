@@ -60,6 +60,10 @@ pub enum SvnError {
     #[error("failed to parse svn XML output: {0}")]
     XmlParseError(String),
 
+    /// A pair-refresh lineage precondition is permanently unproved.
+    #[error("SVN lineage refused ({reason}): {detail}")]
+    LineageRefused { reason: String, detail: String },
+
     /// An authentication problem with the SVN server.
     #[error("svn authentication failed for user '{username}': {detail}")]
     AuthenticationFailed { username: String, detail: String },
@@ -93,6 +97,7 @@ impl SvnError {
         match self {
             SvnError::AuthenticationFailed { .. } => true,
             SvnError::BinaryNotFound(_) => true,
+            SvnError::LineageRefused { .. } => true,
             SvnError::CommandFailed { stderr, .. } => {
                 stderr.contains("E195023")   // forbidden by pre-commit hook
                     || stderr.contains("E175013") // access denied

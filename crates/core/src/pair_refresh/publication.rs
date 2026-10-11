@@ -4,20 +4,37 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use git2::{Cred, CredentialType, Direction, Oid, PushOptions, RemoteCallbacks, Repository};
+use git2::{FetchOptions, Oid, PushOptions, RemoteCallbacks, RemoteRedirect, Repository};
+use serde::{Deserialize, Serialize};
 
+use super::http_transport::HttpTransport;
 use crate::errors::GitError;
+
+/// Execution approval binds this explicit publication policy. The original
+/// Git-only primitive does not silently acquire additional transports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinnedPushPolicy {
+    GitProtocolV1,
+    SmartHttpV1,
+}
 
 /// Validate URL syntax. Admission must also use [`require_pinned_push_endpoint`]
 /// to reject Git configuration rewrites before any durable intent or SVN write.
 pub fn require_pinned_push_transport(remote_url: &str) -> Result<(), GitError> {
+    require_transport(remote_url, PinnedPushPolicy::GitProtocolV1)
+}
+
+fn require_transport(remote_url: &str, policy: PinnedPushPolicy) -> Result<(), GitError> {
     let parsed = reqwest::Url::parse(remote_url).map_err(|_| {
         git2::Error::from_str("pair refresh requires an explicit smart transport URL")
     })?;
-    // The initial proof uses git:// receive-pack. Other smart transports need
-    // the same shipping-library race controls before admission is expanded.
-    if parsed.scheme() != "git"
-        || parsed.host_str().is_none()
+    let supported = match policy {
+        PinnedPushPolicy::GitProtocolV1 => parsed.scheme() == "git",
+        PinnedPushPolicy::SmartHttpV1 => matches!(parsed.scheme(), "http" | "https"),
+    };
+    if !supported
+        || parsed.host_str().is_none_or(str::is_empty)
         || parsed.password().is_some()
         || (parsed.scheme() != "ssh" && !parsed.username().is_empty())
         || parsed.fragment().is_some()
@@ -32,8 +49,9 @@ pub fn require_pinned_push_transport(remote_url: &str) -> Result<(), GitError> {
 fn pinned_remote<'repo>(
     repo: &'repo Repository,
     remote_url: &str,
+    policy: PinnedPushPolicy,
 ) -> Result<git2::Remote<'repo>, GitError> {
-    require_pinned_push_transport(remote_url)?;
+    require_transport(remote_url, policy)?;
     let remote = repo.remote_anonymous(remote_url)?;
     if remote.url() != Some(remote_url) || remote.pushurl().is_some_and(|url| url != remote_url) {
         return Err(git2::Error::from_str("Git configuration rewrites the pinned endpoint").into());
@@ -44,32 +62,47 @@ fn pinned_remote<'repo>(
 /// Resolve both effective URLs without network I/O. Git insteadOf and
 /// pushInsteadOf rules must not substitute another transport or destination.
 pub fn require_pinned_push_endpoint(repo: &Repository, remote_url: &str) -> Result<(), GitError> {
-    pinned_remote(repo, remote_url)?;
+    require_pinned_push_endpoint_with_policy(repo, remote_url, PinnedPushPolicy::GitProtocolV1)
+}
+
+/// Perform the same effective-endpoint check under the approval's explicit
+/// transport policy before creating a job or publishing to SVN.
+pub fn require_pinned_push_endpoint_with_policy(
+    repo: &Repository,
+    remote_url: &str,
+    policy: PinnedPushPolicy,
+) -> Result<(), GitError> {
+    pinned_remote(repo, remote_url, policy)?;
     Ok(())
 }
 
-fn credentials(token: Option<&str>) -> RemoteCallbacks<'static> {
-    let token = token.map(str::to_owned);
+fn no_credentials() -> RemoteCallbacks<'static> {
     let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(move |url, username, allowed| {
-        if (url.starts_with("https://") || url.starts_with("http://"))
-            && allowed.contains(CredentialType::USER_PASS_PLAINTEXT)
-        {
-            if let Some(token) = &token {
-                return Cred::userpass_plaintext("x-access-token", token);
-            }
-        }
-        if url.starts_with("ssh://") && allowed.contains(CredentialType::SSH_KEY) {
-            return Cred::ssh_key_from_agent(username.unwrap_or("git"));
-        }
-        if allowed.contains(CredentialType::DEFAULT) {
-            return Cred::default();
-        }
+    callbacks.credentials(|_, _, _| {
         Err(git2::Error::from_str(
-            "no supported pair refresh credential",
+            "publication transport cannot request ambient credentials",
         ))
     });
     callbacks
+}
+
+/// Ancestry must describe the complete stored commit graph. Admission and
+/// publication both refuse local overlays or shallow boundaries.
+pub fn require_complete_git_graph(repo: &Repository) -> Result<(), GitError> {
+    let grafts = match std::fs::symlink_metadata(repo.path().join("info/grafts")) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            return Err(git2::Error::from_str("could not inspect Git graph metadata").into());
+        }
+    };
+    if repo.is_shallow() || grafts || repo.references_glob("refs/replace/*")?.next().is_some() {
+        return Err(git2::Error::from_str(
+            "pair refresh requires an unmodified complete Git graph",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Publish exactly one prepared descendant to the pinned child branch using a
@@ -84,7 +117,90 @@ pub fn publish_pinned_child(
     prepared: Oid,
     http_auth_token: Option<&str>,
 ) -> Result<Oid, GitError> {
-    let mut remote = pinned_remote(repo, remote_url)?;
+    publish_pinned_child_with_policy(
+        repo,
+        remote_url,
+        branch,
+        expected_old,
+        prepared,
+        http_auth_token,
+        PinnedPushPolicy::GitProtocolV1,
+    )
+}
+
+/// Explicit-policy publisher used by the approved execution workflow. HTTP
+/// requests use ordinary certificate verification and never follow redirects.
+pub fn publish_pinned_child_with_policy(
+    repo: &Repository,
+    remote_url: &str,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+    http_auth_token: Option<&str>,
+    policy: PinnedPushPolicy,
+) -> Result<Oid, GitError> {
+    match policy {
+        PinnedPushPolicy::GitProtocolV1 => publish_with_callbacks(
+            repo,
+            remote_url,
+            branch,
+            expected_old,
+            prepared,
+            policy,
+            no_credentials,
+        ),
+        PinnedPushPolicy::SmartHttpV1 => {
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .map_err(|_| git2::Error::from_str("could not initialize pinned HTTP client"))?;
+            publish_http_with_client(
+                repo,
+                remote_url,
+                branch,
+                expected_old,
+                prepared,
+                http_auth_token,
+                client,
+            )
+        }
+    }
+}
+
+fn publish_http_with_client(
+    repo: &Repository,
+    remote_url: &str,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+    token: Option<&str>,
+    client: reqwest::Client,
+) -> Result<Oid, GitError> {
+    require_pinned_push_endpoint_with_policy(repo, remote_url, PinnedPushPolicy::SmartHttpV1)?;
+    let transport = HttpTransport::new(remote_url, token, client)?;
+    publish_with_callbacks(
+        repo,
+        &transport.endpoint,
+        branch,
+        expected_old,
+        prepared,
+        PinnedPushPolicy::SmartHttpV1,
+        no_credentials,
+    )
+}
+
+fn publish_with_callbacks<'cb>(
+    repo: &Repository,
+    remote_url: &str,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+    policy: PinnedPushPolicy,
+    mut make_callbacks: impl FnMut() -> RemoteCallbacks<'cb>,
+) -> Result<Oid, GitError> {
+    require_complete_git_graph(repo)?;
+    let mut remote = pinned_remote(repo, remote_url, policy)?;
     let target = format!("refs/heads/{branch}");
     if !git2::Reference::is_valid_name(&target)
         || expected_old.is_zero()
@@ -96,7 +212,7 @@ pub fn publish_pinned_child(
     repo.find_commit(prepared)?;
     let accepted = Arc::new(AtomicBool::new(false));
     let negotiated = Arc::new(AtomicBool::new(false));
-    let mut callbacks = credentials(http_auth_token);
+    let mut callbacks = make_callbacks();
     let negotiation_target = target.clone();
     let negotiation_receipt = negotiated.clone();
     callbacks.push_negotiation(move |updates| {
@@ -124,13 +240,19 @@ pub fn publish_pinned_child(
         Ok(())
     });
     let mut options = PushOptions::new();
+    options.follow_redirects(RemoteRedirect::None);
     options.remote_callbacks(callbacks);
     remote.push(&[&format!("{prepared}:{target}")], Some(&mut options))?;
     if !negotiated.load(Ordering::Relaxed) || !accepted.load(Ordering::Relaxed) {
         return Err(git2::Error::from_str("missing pinned child publication receipt").into());
     }
     remote.disconnect()?;
-    remote.connect_auth(Direction::Fetch, Some(credentials(http_auth_token)), None)?;
+    let mut fetch = FetchOptions::new();
+    fetch.follow_redirects(RemoteRedirect::None);
+    fetch.remote_callbacks(make_callbacks());
+    // A fetch connection through download applies the explicit no-redirect
+    // policy too. It writes only operation-local objects, never remote refs.
+    remote.download(&[&target], Some(&mut fetch))?;
     let observed = remote
         .list()?
         .iter()
@@ -142,3 +264,7 @@ pub fn publish_pinned_child(
     }
     Ok(prepared)
 }
+
+#[cfg(all(test, unix))]
+#[path = "publication_http_tests.rs"]
+mod http_tests;
