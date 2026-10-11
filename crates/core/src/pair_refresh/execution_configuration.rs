@@ -151,6 +151,10 @@ fn svn_url(source: &Source) -> Result<String, DatabaseError> {
         || url.query().is_some()
         || url.fragment().is_some()
         || url.as_str() != raw
+        || (url.scheme() == "svn" && url.port() == Some(3690))
+        || url
+            .host_str()
+            .is_some_and(|host| host.bytes().any(|b| b.is_ascii_uppercase()))
         || raw.contains('%')
         || url.path().split('/').skip(1).any(|segment| {
             matches!(segment, "" | "." | "..")
@@ -196,6 +200,24 @@ pub(crate) fn capture_execution_configuration(
     }
     let child_svn_url = svn_url(&child)?;
     let parent_svn_url = svn_url(&parent)?;
+    let child_endpoint =
+        reqwest::Url::parse(&child_svn_url).map_err(|_| refused("invalid child SVN endpoint"))?;
+    let parent_endpoint =
+        reqwest::Url::parse(&parent_svn_url).map_err(|_| refused("invalid parent SVN endpoint"))?;
+    if (
+        child_endpoint.scheme(),
+        child_endpoint.host_str(),
+        child_endpoint.port(),
+    ) != (
+        parent_endpoint.scheme(),
+        parent_endpoint.host_str(),
+        parent_endpoint.port(),
+    ) {
+        // DNS aliases and transport/default-port spellings cannot establish
+        // distinct SVN nodes. The bounded pair must share one exact authority;
+        // independent observation still proves its repository root and UUID.
+        return Err(refused("one exact SVN endpoint authority is required"));
+    }
     if child_svn_url == parent_svn_url {
         return Err(refused("distinct SVN branches are required"));
     }

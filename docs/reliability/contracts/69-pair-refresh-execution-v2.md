@@ -345,6 +345,11 @@ Registered SVN paths use nonempty ASCII segments containing letters, digits,
 '.', '_' and '-'. Trailing slashes, empty segments and peg syntax refuse before
 distinctness is checked. A real local SVN control confirms that the rejected
 trailing-slash and repeated-slash forms otherwise name the same node.
+Explicit SVN default port 3690 and uppercase SVN hosts also refuse. Both inputs
+must share one exact scheme/host/port authority; alternate authority spellings
+cannot establish distinct branches. A nondefault SVN port remains supported
+when both inputs use the same canonical authority. Live UUID/root proof remains
+required even with equal authorities.
 Any retained child, parent, legacy, global or Personal history block also refuses
 source capture, admission and the first publication intent without clearing it.
 
