@@ -151,6 +151,21 @@ function readJson(path) {
   }
 }
 
+function safeRunId(value) {
+  return typeof value === "string" && value !== "unknown" && /^[A-Za-z0-9]+$/.test(value);
+}
+
+export function reportRunId(identity, env = process.env) {
+  const fromIdentity = identity && typeof identity.run_id === "string" ? identity.run_id : "";
+  if (safeRunId(fromIdentity)) return fromIdentity;
+  const run = String(env.GITHUB_RUN_ID || "");
+  const attempt = String(env.GITHUB_RUN_ATTEMPT || "");
+  if (/^[0-9]+$/.test(run) && /^[0-9]+$/.test(attempt)) return `gha${run}a${attempt}`;
+  const lab = String(env.LAB_RUN_ID || "");
+  if (safeRunId(lab)) return lab;
+  return `norun${process.pid}`;
+}
+
 export function aggregateReport({ evidence, engine, reportDir, candidate }) {
   mkdirSync(reportDir, { recursive: true });
   const selection = selectionFromEnv();
@@ -163,7 +178,7 @@ export function aggregateReport({ evidence, engine, reportDir, candidate }) {
   if (selection.ok && /^[0-9a-f]{40}$/.test(candidate || "")) {
     const identityPath = findNamed(evidence, "identity.json");
     const identity = identityPath ? readJson(identityPath) : null;
-    const runId = identity?.run_id || "unknown";
+    const runId = reportRunId(identity);
     const args = [
       join(here, "aggregate.mjs"),
       "--catalog", join(repoRoot, "tests/acceptance-lab/catalog/operations.json"),
@@ -470,6 +485,43 @@ function commandSelfCheck() {
     assertCheck(fileReady(join(scratch, "rejected-report", "infrastructure-failure.txt")), "bad seed failure was not kept");
     checks += 1;
     assertCheck(!existsSync(pwned), "aggregate executed the seed");
+
+    checks += 1;
+    assertCheck(reportRunId({ run_id: "rs0123abcd" }, {}) === "rs0123abcd", "identity run id was dropped");
+    checks += 1;
+    assertCheck(reportRunId({ run_id: "unknown" }, { GITHUB_RUN_ID: "381", GITHUB_RUN_ATTEMPT: "2" }) === "gha381a2", "unknown identity was kept");
+    checks += 1;
+    assertCheck(reportRunId({ run_id: "nope;rm" }, { GITHUB_RUN_ID: "5", GITHUB_RUN_ATTEMPT: "1", LAB_RUN_ID: "rsdeadbeef" }) === "gha5a1", "unsafe identity reached the report");
+    checks += 1;
+    assertCheck(reportRunId(null, { GITHUB_RUN_ID: "5", GITHUB_RUN_ATTEMPT: "1", LAB_RUN_ID: "rsdeadbeef" }) === "gha5a1", "lab run id outranked the GitHub run");
+    checks += 1;
+    assertCheck(reportRunId(null, { LAB_RUN_ID: "rsdeadbeef" }) === "rsdeadbeef", "lab run id was dropped");
+    checks += 1;
+    assertCheck(reportRunId(null, { LAB_RUN_ID: "unknown", GITHUB_RUN_ID: "5" }) === `norun${process.pid}`, "unknown was emitted");
+    checks += 1;
+    assertCheck(reportRunId(null, {}) === `norun${process.pid}` && reportRunId(null, {}) !== "unknown", "pid fallback was unknown");
+
+    const idRoot = join(scratch, "id-evidence");
+    writeJson(join(idRoot, "identity.json"), { run_id: "rs0123abcd" });
+    const idDir = join(scratch, "id-report");
+    const idRun = runNode(
+      ["aggregate", "--evidence", idRoot, "--engine", join(scratch, "no-engine"), "--report-dir", idDir, "--candidate", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      { LAB_EVENT_NAME: "pull_request", LAB_SUITE_INPUT: "", LAB_SEED_INPUT: "", GITHUB_RUN_ID: "99", GITHUB_RUN_ATTEMPT: "1", LAB_RUN_ID: "" },
+    );
+    const idReport = readJson(join(idDir, "report.json"));
+    checks += 1;
+    assertCheck(idReport && idReport.run_id === "rs0123abcd", `identity report run id ${idReport && idReport.run_id} status ${idRun.status}`);
+
+    const ghaDir = join(scratch, "gha-report");
+    const gha = runNode(
+      ["aggregate", "--evidence", join(scratch, "no-identity"), "--engine", join(scratch, "no-engine"), "--report-dir", ghaDir, "--candidate", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+      { LAB_EVENT_NAME: "pull_request", LAB_SUITE_INPUT: "", LAB_SEED_INPUT: "", GITHUB_RUN_ID: "99", GITHUB_RUN_ATTEMPT: "1", LAB_RUN_ID: "" },
+    );
+    const ghaReport = readJson(join(ghaDir, "report.json"));
+    checks += 1;
+    assertCheck(ghaReport && ghaReport.run_id === "gha99a1", `missing identity run id ${ghaReport && ghaReport.run_id} status ${gha.status} ${(gha.stderr || "").slice(0, 240)}`);
+    checks += 1;
+    assertCheck(ghaReport.run_id !== "unknown", "aggregate emitted unknown");
 
     console.log(`ci-gate self-check PASS ${checks}`);
   } catch (error) {

@@ -224,6 +224,7 @@ DEBIAN_IMAGE=${DEBIAN_IMAGE}
 RUST_IMAGE=${RUST_IMAGE}
 NODE_IMAGE=${NODE_IMAGE}
 GITEA_IMAGE=${GITEA_IMAGE}
+RUST_REPO_DIGEST=${RUST_REPO_DIGEST:-unrecorded}
 SVN_IMAGE=${SVN_IMAGE}
 SVNSERVE_IMAGE=${SVNSERVE_IMAGE}
 GITEA_LAB_IMAGE=${GITEA_LAB_IMAGE}
@@ -698,6 +699,126 @@ build_one() {
   docker build --pull -t "$tag" -f "$dockerfile" "$@" "$context"
 }
 
+graph_dest() {
+  if [ -n "${EVIDENCE:-}" ]; then
+    printf '%s\n' "$EVIDENCE/build-graph"
+  else
+    printf '%s\n' "$ARTIFACT_ROOT/build-graph"
+  fi
+}
+
+record_rust_image_identity() {
+  local dest digest rustc_line cargo_line
+  dest="$(graph_dest)"
+  mkdir -p "$dest"
+  log "pulling harness compiler ${RUST_IMAGE}"
+  docker pull "$RUST_IMAGE"
+  digest="$(docker image inspect "$RUST_IMAGE" --format '{{index .RepoDigests 0}}')"
+  rustc_line="$(docker run --rm "$RUST_IMAGE" rustc --version)"
+  cargo_line="$(docker run --rm "$RUST_IMAGE" cargo --version)"
+  RUST_REPO_DIGEST="$digest"
+  {
+    echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "candidate=${CANDIDATE}"
+    echo "rust_image=${RUST_IMAGE}"
+    echo "rust_toolchain=${RUST_TOOLCHAIN}"
+    echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
+    echo "previous_lab_pin=rust:1.83.0-bookworm"
+    echo "product_dockerfile=unchanged rust:1.83-bookworm"
+    echo "note=this pin does not prove the product Dockerfile or its MSRV"
+    echo "rust_image_id=$(docker image inspect "$RUST_IMAGE" --format '{{.Id}}')"
+    echo "rust_repo_digest=${digest}"
+    echo "rustc=${rustc_line}"
+    echo "cargo=${cargo_line}"
+  } > "$dest/image-identity.txt"
+  if [ -z "$digest" ]; then
+    echo "rust image ${RUST_IMAGE} has no RepoDigest after pull" >&2
+    return 1
+  fi
+  case "$rustc_line" in
+    "rustc ${RUST_TOOLCHAIN} "*|"rustc ${RUST_TOOLCHAIN}") ;;
+    *)
+      echo "rustc identity does not match ${RUST_TOOLCHAIN}: ${rustc_line}" >&2
+      return 1
+      ;;
+  esac
+  case "$cargo_line" in
+    "cargo ${RUST_TOOLCHAIN} "*|"cargo ${RUST_TOOLCHAIN}") ;;
+    *)
+      echo "cargo identity does not match ${RUST_TOOLCHAIN}: ${cargo_line}" >&2
+      return 1
+      ;;
+  esac
+  log "recorded ${RUST_IMAGE} ${digest}"
+}
+
+extract_build_graph() {
+  local dest cid copy_lock copy_sum copy_meta copy_rustc rm_ec expected actual name
+  dest="$(graph_dest)"
+  mkdir -p "$dest"
+  cid="$(docker create "$REPOSYNC_IMAGE")"
+  set +e
+  docker cp "$cid:/usr/local/share/acceptance-lab/Cargo.lock" "$dest/Cargo.lock"
+  copy_lock=$?
+  docker cp "$cid:/usr/local/share/acceptance-lab/Cargo.lock.sha256" "$dest/Cargo.lock.sha256"
+  copy_sum=$?
+  docker cp "$cid:/usr/local/share/acceptance-lab/cargo-metadata.json" "$dest/cargo-metadata.json"
+  copy_meta=$?
+  docker cp "$cid:/usr/local/share/acceptance-lab/rustc-version.txt" "$dest/rustc-version.txt"
+  copy_rustc=$?
+  docker rm "$cid" >/dev/null
+  rm_ec=$?
+  set -e
+  if [ "$copy_lock" -ne 0 ] || [ "$copy_sum" -ne 0 ] || [ "$copy_meta" -ne 0 ] || [ "$copy_rustc" -ne 0 ] || [ "$rm_ec" -ne 0 ]; then
+    echo "failed to copy the resolved build graph out of ${REPOSYNC_IMAGE}" >&2
+    return 1
+  fi
+  for name in Cargo.lock Cargo.lock.sha256 cargo-metadata.json rustc-version.txt; do
+    if [ ! -s "$dest/$name" ]; then
+      echo "build graph evidence is empty: $dest/$name" >&2
+      return 1
+    fi
+  done
+  if grep -q '^rust_repo_digest=unrecorded$' "$dest/rustc-version.txt"; then
+    echo "image did not record a rust repo digest" >&2
+    return 1
+  fi
+  if [ -n "${RUST_REPO_DIGEST:-}" ]; then
+    if ! grep -F -x -q "rust_repo_digest=${RUST_REPO_DIGEST}" "$dest/rustc-version.txt"; then
+      echo "image rust digest does not match the pulled RepoDigest" >&2
+      return 1
+    fi
+  fi
+  expected="$(awk 'NR==1 { print $1 }' "$dest/Cargo.lock.sha256")"
+  actual="$(file_sha256 "$dest/Cargo.lock")"
+  if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+    echo "Cargo.lock sha256 does not match the image record" >&2
+    return 1
+  fi
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$dest/cargo-metadata.json"
+  if [ ! -s "$dest/image-identity.txt" ]; then
+    {
+      echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "candidate=${CANDIDATE}"
+      echo "identity_source=loaded image rustc-version.txt"
+      echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
+      echo "previous_lab_pin=rust:1.83.0-bookworm"
+      echo "product_dockerfile=unchanged rust:1.83-bookworm"
+      cat "$dest/rustc-version.txt"
+    } > "$dest/image-identity.txt"
+  fi
+  {
+    echo "reposync_image=${REPOSYNC_IMAGE}"
+    docker image inspect "$REPOSYNC_IMAGE" --format 'reposync_image_id={{.Id}} reposync_repo_digest={{index .RepoDigests 0}}'
+    echo "lock_sha256=${actual}"
+  } > "$dest/reposync-image.txt"
+  if [ ! -s "$dest/image-identity.txt" ] || [ ! -s "$dest/reposync-image.txt" ]; then
+    echo "image identity evidence is empty" >&2
+    return 1
+  fi
+  log "recorded build graph at $dest"
+}
+
 prepare_images() {
   require_docker
   load_pins
@@ -712,13 +833,18 @@ prepare_images() {
     docker pull "$LDAP_IMAGE"
   fi
   if [ "${ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD:-}" != "1" ] && [ "$scope" != "fixtures" ]; then
+    record_rust_image_identity
     build_one "$REPOSYNC_IMAGE" "$LAB_DIR/docker/Dockerfile.reposync" "$REPO_ROOT" \
       --build-context "labfiles=${LAB_DIR}/docker" \
       --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" \
       --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
-      --build-arg "NODE_IMAGE=${NODE_IMAGE}"
+      --build-arg "NODE_IMAGE=${NODE_IMAGE}" \
+      --build-arg "RUST_REPO_DIGEST=${RUST_REPO_DIGEST}"
   elif [ "${ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD:-}" = "1" ]; then
     docker image inspect "$REPOSYNC_IMAGE" >/dev/null
+  fi
+  if [ "$scope" != "fixtures" ]; then
+    extract_build_graph
   fi
   record_images
 }
@@ -1068,6 +1194,10 @@ publish_outputs() {
   fi
   if [ -f "$RUN_DIR/logs/seed.log" ]; then
     cp "$RUN_DIR/logs/seed.log" "$publish/seed.log"
+  fi
+  if [ -d "$EVIDENCE/build-graph" ]; then
+    mkdir -p "$publish/build-graph"
+    cp -R "$EVIDENCE/build-graph/." "$publish/build-graph/"
   fi
   if [ -f "$RUN_DIR/scan.json" ] && python3 - "$RUN_DIR/scan.json" <<'PY'
 import json, sys

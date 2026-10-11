@@ -77,6 +77,37 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Show recorded toolchain identity
+        if: always()
+        run: |
+          dest="${RUNNER_TEMP}/acceptance-lab/build-graph"
+          if [ -f "$dest/image-identity.txt" ]; then
+            cat "$dest/image-identity.txt"
+          else
+            echo "image-identity.txt was not written"
+          fi
+          if [ -f "$dest/rustc-version.txt" ]; then
+            echo "--- rustc-version.txt ---"
+            cat "$dest/rustc-version.txt"
+          fi
+          if [ -f "$dest/Cargo.lock.sha256" ]; then
+            echo "--- Cargo.lock.sha256 ---"
+            cat "$dest/Cargo.lock.sha256"
+          fi
+          if [ -f "$dest/reposync-image.txt" ]; then
+            echo "--- reposync-image.txt ---"
+            cat "$dest/reposync-image.txt"
+          fi
+
+      - name: Upload toolchain identity and dependency graph
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-lab-build-graph-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-lab/build-graph
+          retention-days: 14
+          if-no-files-found: error
+
   engine:
     name: Real-engine suite
     if: github.event_name == 'workflow_dispatch' && (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'soak')
@@ -89,6 +120,36 @@ jobs:
 
       - name: Install svn and git
         run: sudo apt-get update && sudo apt-get install -y subversion git
+
+      # The unowned suite selects `rustup run stable` when a toolchain named
+      # stable exists, and otherwise uses cargo on PATH. This job installs the
+      # harness pin and removes that stable name. It does not edit the suite
+      # and it does not add a root Cargo.lock. The suite still passes --locked.
+      - name: Prepare the harness compiler
+        run: |
+          . tests/acceptance-lab/pins.env
+          echo "lab_rust_image=${RUST_IMAGE}"
+          echo "lab_rust_toolchain=${RUST_TOOLCHAIN}"
+          echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
+          echo "product Dockerfile remains rust:1.83-bookworm and is not built by this job"
+          echo "before"
+          if command -v rustc >/dev/null 2>&1; then rustc --version; else echo "rustc absent"; fi
+          if command -v cargo >/dev/null 2>&1; then cargo --version; else echo "cargo absent"; fi
+          if command -v rustup >/dev/null 2>&1; then rustup toolchain list; else echo "rustup absent"; fi
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal --no-modify-path
+          echo "${HOME}/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          if rustup toolchain list | grep -q '^stable'; then
+            rustup toolchain uninstall stable
+          fi
+          rustup default "${RUST_TOOLCHAIN}"
+          echo "after"
+          rustc --version
+          cargo --version
+          rustup toolchain list
+          if [ ! -f Cargo.lock ]; then
+            echo "root Cargo.lock is absent; the unowned real-engine suite passes --locked; this harness does not write a shared lock"
+          fi
 
       - name: Run real-engine suite
         id: engine
@@ -104,6 +165,9 @@ jobs:
           unset GITHUB_TOKEN || true
           unset GH_TOKEN || true
           unset SSH_AUTH_SOCK || true
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          rustc --version
+          cargo --version
           scripts/real-engine-scenario-suite.sh
 
       - name: Stage engine summary or the missing-artifact record

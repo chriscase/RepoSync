@@ -230,11 +230,14 @@ services:
     profiles: ["app"]
     build:
       context: ../../..
+      additional_contexts:
+        labfiles: ../docker
       dockerfile: tests/acceptance-lab/docker/Dockerfile.reposync
       args:
         DEBIAN_IMAGE: ${DEBIAN_IMAGE}
         RUST_IMAGE: ${RUST_IMAGE}
         NODE_IMAGE: ${NODE_IMAGE}
+        RUST_REPO_DIGEST: ${RUST_REPO_DIGEST:-unrecorded}
     image: ${REPOSYNC_IMAGE}
     hostname: reposync
     init: true

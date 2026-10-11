@@ -1,9 +1,11 @@
 # Acceptance-lab daemon image. Builds the real daemon and the shipped React
 # bundle. It does not replace the repository's production Dockerfile.
+# The default Rust tag matches Dockerfile.reliability. It does not show that
+# the product Dockerfile (rust:1.83-bookworm) or its MSRV builds.
 # Pins are build args so prepare can record the toolchain identity.
 
 ARG DEBIAN_IMAGE=debian:bookworm-slim
-ARG RUST_IMAGE=rust:1.83.0-bookworm
+ARG RUST_IMAGE=rust:1.98.1-bookworm
 ARG NODE_IMAGE=node:22.14.0-bookworm-slim
 
 FROM ${NODE_IMAGE} AS ui
@@ -15,6 +17,8 @@ RUN npm run build
 RUN test -f dist/index.html
 
 FROM ${RUST_IMAGE} AS rust
+ARG RUST_IMAGE=rust:1.98.1-bookworm
+ARG RUST_REPO_DIGEST=unrecorded
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config libssl-dev cmake ca-certificates \
@@ -22,13 +26,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY Cargo.toml ./
 COPY crates ./crates
 # Two cargo jobs: the public Ubuntu runner is 4 CPUs / 16 GB. Measure before
-# raising this. There is no root Cargo.lock at the recorded base; the resolved
-# graph is copied out of the image as evidence rather than written into a
-# shared lockfile owned by another lane.
+# raising this. There is no root Cargo.lock. Cargo writes a lock for this
+# build only. The launcher copies that lock and metadata out of the image.
+# Nothing here updates a shared lock or the product manifests.
 ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release --bin reposync-daemon --bin reposync \
-    && cargo metadata --format-version 1 --offline > /tmp/cargo-metadata.json \
-    && rustc --version > /tmp/rustc-version.txt \
+    && test -s Cargo.lock \
+    && cp Cargo.lock /tmp/Cargo.lock \
+    && sha256sum Cargo.lock > /tmp/Cargo.lock.sha256 \
+    && cargo metadata --format-version 1 --locked --offline > /tmp/cargo-metadata.json \
+    && { printf 'rust_image=%s\n' "$RUST_IMAGE"; \
+         rustc --version; \
+         cargo --version; \
+         printf 'rust_repo_digest=%s\n' "$RUST_REPO_DIGEST"; } > /tmp/rustc-version.txt \
+    && test -s /tmp/Cargo.lock \
+    && test -s /tmp/Cargo.lock.sha256 \
+    && test -s /tmp/cargo-metadata.json \
+    && test -s /tmp/rustc-version.txt \
     && test -x target/release/reposync-daemon \
     && test -x target/release/reposync
 
@@ -40,13 +54,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=rust /src/target/release/reposync-daemon /usr/local/bin/reposync-daemon
 COPY --from=rust /src/target/release/reposync /usr/local/bin/reposync
 COPY --from=ui /ui/dist /usr/local/bin/static
+COPY --from=rust /tmp/Cargo.lock /usr/local/share/acceptance-lab/Cargo.lock
+COPY --from=rust /tmp/Cargo.lock.sha256 /usr/local/share/acceptance-lab/Cargo.lock.sha256
 COPY --from=rust /tmp/cargo-metadata.json /usr/local/share/acceptance-lab/cargo-metadata.json
 COPY --from=rust /tmp/rustc-version.txt /usr/local/share/acceptance-lab/rustc-version.txt
 # Main's root .dockerignore omits tests/. The launcher passes this directory
 # as the labfiles build context so the entrypoint is still in the image.
 COPY --from=labfiles reposync-entrypoint.sh /usr/local/bin/lab-entrypoint.sh
 RUN chmod 755 /usr/local/bin/lab-entrypoint.sh /usr/local/bin/reposync-daemon /usr/local/bin/reposync \
-    && test -f /usr/local/bin/static/index.html
+    && test -f /usr/local/bin/static/index.html \
+    && test -s /usr/local/share/acceptance-lab/Cargo.lock \
+    && test -s /usr/local/share/acceptance-lab/Cargo.lock.sha256 \
+    && test -s /usr/local/share/acceptance-lab/cargo-metadata.json \
+    && test -s /usr/local/share/acceptance-lab/rustc-version.txt
 USER root
 WORKDIR /var/lib/reposync
 EXPOSE 8080
