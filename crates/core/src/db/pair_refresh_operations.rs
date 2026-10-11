@@ -176,6 +176,17 @@ impl RefreshJobPins {
     fn validate(&self) -> Result<(), DatabaseError> {
         crate::pair_refresh::lineage::validate_stored_refresh_proof(&self.svn.pins.lineage)
             .map_err(|_| refused("missing or contradictory stored lineage proof"))?;
+        let lineage = &self.svn.pins.lineage.pins;
+        let expected_mergeinfo = crate::pair_refresh::svn_preparation::expected_refresh_mergeinfo(
+            &lineage.child.parent_path,
+            lineage.child.parent_baseline_revision,
+            lineage.parent_revision,
+            self.svn.pins.previous_mergeinfo.as_deref(),
+        )
+        .map_err(|_| refused("invalid stored mergeinfo range"))?;
+        if self.svn.mergeinfo != expected_mergeinfo {
+            return Err(refused("stored mergeinfo differs from the approved range"));
+        }
         let child = &self.child;
         let parent = &self.parent;
         let svn = &self.svn.pins.lineage.pins;
@@ -220,7 +231,6 @@ impl RefreshJobPins {
             || copy.repository_uuid != svn.child.repository_uuid
             || copy.child_path != svn.child.child_path
             || copy.parent_path != svn.child.parent_path
-            || copy.copy_from_revision != svn.child.parent_baseline_revision
             || copy.inspected_revision != svn.child.child_revision
             || copy.created_revision < 1
             || copy.created_revision > svn.child.child_revision
@@ -378,6 +388,74 @@ fn write_op(tx: &Connection, op: &PairRefreshOperation) -> Result<(), DatabaseEr
     )
 }
 
+/// The initial copy is the first baseline. A later baseline needs the exact
+/// completed child receipt, not caller-supplied mergeinfo or equal file bytes.
+fn require_baseline_provenance(
+    pins: &RefreshJobPins,
+    operations: &[PairRefreshOperation],
+) -> Result<(), DatabaseError> {
+    let lineage = &pins.svn.pins.lineage;
+    let baseline = lineage.pins.child.parent_baseline_revision;
+    let Some(previous_mergeinfo) = &pins.svn.pins.previous_mergeinfo else {
+        return if lineage.child_copy.copy_from_revision == baseline {
+            Ok(())
+        } else {
+            Err(refused(
+                "advanced baseline lacks a completed refresh receipt",
+            ))
+        };
+    };
+    let mut candidates = operations.iter().filter(|op| {
+        op.phase == PairRefreshPhase::Completed
+            && op.pins.child.scope_uuid == pins.child.scope_uuid
+            && op.pins.git.prepared_sha == pins.child.last_git_sha
+            && op
+                .svn_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.revision == pins.child.last_svn_rev)
+    });
+    let prior = candidates
+        .next()
+        .ok_or_else(|| refused("prior mergeinfo lacks a completed child receipt"))?;
+    if candidates.next().is_some() {
+        return Err(refused("ambiguous completed child receipt"));
+    }
+    let receipt = prior
+        .svn_receipt
+        .as_ref()
+        .ok_or_else(|| refused("completed child receipt is missing"))?;
+    let same_registration = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+        a.repo_id == b.repo_id
+            && a.scope_uuid == b.scope_uuid
+            && a.configuration_digest == b.configuration_digest
+            && a.echo_generation == b.echo_generation
+    };
+    let mut expected_copy = receipt.child_copy.clone();
+    expected_copy.inspected_revision = lineage.child_copy.inspected_revision;
+    let prior_lineage = &prior.pins.svn.pins.lineage;
+    if prior.id == pins.git.operation_id
+        || !same_registration(&prior.pins.child, &pins.child)
+        || !same_registration(&prior.pins.parent, &pins.parent)
+        || pins.git.pins.parent_baseline_tip != prior.pins.parent.last_git_sha
+        || baseline != prior.pins.parent.last_svn_rev
+        || pins.svn.pins.baseline_git_tree != receipt.git_tree
+        || previous_mergeinfo != &receipt.mergeinfo
+        || lineage.child_copy != expected_copy
+        || lineage.parent_originating_revision != prior_lineage.parent_originating_revision
+        || lineage.pins.repository_root_url != prior_lineage.pins.repository_root_url
+        || lineage.pins.child_url != prior_lineage.pins.child_url
+        || lineage.pins.parent_url != prior_lineage.pins.parent_url
+        || pins.git_remote_url != prior.pins.git_remote_url
+        || pins.git_branch != prior.pins.git_branch
+        || pins.transport_policy != prior.pins.transport_policy
+    {
+        return Err(refused(
+            "advanced baseline differs from completed refresh evidence",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the complete journal/hold relationship, including orphan documents
 /// or pointers. Unknown versions and corrupt evidence fail closed for every
 /// writer, even when the damaged entry mentions another repository.
@@ -424,6 +502,9 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
         return Err(refused(
             "unknown journal version, orphan or missing hold/request pointer",
         ));
+    }
+    for op in &operations {
+        require_baseline_provenance(&op.pins, &operations)?;
     }
     Ok(operations)
 }
@@ -704,6 +785,7 @@ impl Database {
             if operations.iter().any(|op| op.id == pins.git.operation_id) {
                 return Err(refused("operation identity was reused"));
             }
+            require_baseline_provenance(&pins, &operations)?;
             require_pins_current(tx, &pins)?;
             for id in [&pins.child.repo_id, &pins.parent.repo_id] {
                 require_no_pair_refresh_hold(tx, Some(id))?;

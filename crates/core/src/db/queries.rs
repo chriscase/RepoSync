@@ -782,21 +782,42 @@ impl Database {
         resolution: &str,
         resolved_by: &str,
     ) -> Result<(), DatabaseError> {
+        self.resolve_conflict_with_content(id, status, resolution, resolved_by, None)
+    }
+
+    /// Resolve and optionally store merged content atomically. A refresh cannot
+    /// be admitted between the status and content writes.
+    pub fn resolve_conflict_with_content(
+        &self,
+        id: &str,
+        status: &str,
+        resolution: &str,
+        resolved_by: &str,
+        content: Option<&str>,
+    ) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        let changed = conn.execute(
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, id)?;
+            let changed = conn.execute(
             "UPDATE conflicts SET status = ?1, resolution = ?2, resolved_by = ?3, resolved_at = ?4
              WHERE id = ?5",
             params![status, resolution, resolved_by, now, id],
         )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "conflict".into(),
-                id: id.to_string(),
-            });
-        }
-        debug!(id, status, resolution, "resolved conflict");
-        Ok(())
+            if changed == 0 {
+                return Err(DatabaseError::NotFound {
+                    entity: "conflict".into(),
+                    id: id.to_string(),
+                });
+            }
+            if let Some(content) = content {
+                conn.execute(
+                    "UPDATE conflicts SET resolved_content=?1 WHERE id=?2",
+                    params![content, id],
+                )?;
+            }
+            debug!(id, status, resolution, "resolved conflict");
+            Ok(())
+        })
     }
 
     /// Resolve a conflict using a ConflictResolution enum.
@@ -807,11 +828,33 @@ impl Database {
         content: Option<&str>,
         resolved_by: &str,
     ) -> Result<(), DatabaseError> {
-        self.resolve_conflict(id, "resolved", &resolution.to_string(), resolved_by)?;
-        if let Some(c) = content {
-            self.store_resolved_content(id, c)?;
+        self.resolve_conflict_with_content(
+            id,
+            "resolved",
+            &resolution.to_string(),
+            resolved_by,
+            content,
+        )
+    }
+
+    fn require_conflict_refresh_quiet(
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<(), DatabaseError> {
+        // Unknown/legacy attribution is a global writer scope. Do not guess
+        // ownership from a pathname while another job holds either identity.
+        let repo: Option<String> = conn
+            .query_row("SELECT repo_id FROM conflicts WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        match repo.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => {
+                super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(conn, id)
+            }
+            None => super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None),
         }
-        Ok(())
     }
 
     /// Store merged/resolved content for a conflict.
@@ -820,29 +863,33 @@ impl Database {
         conflict_id: &str,
         content: &str,
     ) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE conflicts SET resolved_content = ?1 WHERE id = ?2",
-            params![content, conflict_id],
-        )?;
-        Ok(())
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, conflict_id)?;
+            conn.execute(
+                "UPDATE conflicts SET resolved_content = ?1 WHERE id = ?2",
+                params![content, conflict_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Defer a conflict.
     pub fn defer_conflict(&self, id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let changed = conn.execute(
-            "UPDATE conflicts SET status = 'deferred' WHERE id = ?1",
-            params![id],
-        )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "conflict".into(),
-                id: id.to_string(),
-            });
-        }
-        debug!(id, "deferred conflict");
-        Ok(())
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, id)?;
+            let changed = conn.execute(
+                "UPDATE conflicts SET status = 'deferred' WHERE id = ?1",
+                params![id],
+            )?;
+            if changed == 0 {
+                return Err(DatabaseError::NotFound {
+                    entity: "conflict".into(),
+                    id: id.to_string(),
+                });
+            }
+            debug!(id, "deferred conflict");
+            Ok(())
+        })
     }
 
     /// Count conflicts by status.

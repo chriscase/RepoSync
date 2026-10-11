@@ -77,6 +77,14 @@ copies must be present and equal to their column values; split or
 missing copies refuse rather than being collapsed by completion. Copy-origin
 fields must match the pinned lineage and the root mergeinfo property must equal
 the approved mergeinfo string.
+The first baseline must be the original copy source. A later baseline requires
+one completed refresh whose exact child SHA and SVN receipt revision match the
+current child checkpoints. Its parent SHA/revision, resulting tree, mergeinfo,
+copy origin, registration/configuration/echo identities and transport endpoints
+must match the new baseline. Caller-supplied prior mergeinfo is insufficient.
+The complete stored journal validates this provenance chain on every read;
+missing or ambiguous earlier receipts refuse. This storage evidence does not
+replace fresh remote observation or ordinary-engine proof of the next advance.
 All competing active pointers refuse admission; a latest operation without an active pointer
 must still deserialize completely and report completed state. Missing, foreign,
 corrupt or uncertain prior documents refuse.
@@ -148,6 +156,15 @@ to the window. Operator recovery of stale windows, other working-tree writer
 entrances, authenticated execution and complete real-engine recovery evidence
 remain unfinished. These conservative retained windows must not be cleared
 merely because time passed or a new daemon acquired a lease.
+
+Conflict resolution, deferred status and resolved-content storage now check the
+conflict's persisted repository owner in the same transaction as the write.
+NULL, empty or personal legacy attribution uses global exclusion; unrelated
+registered conflicts remain available. A custom merge writes status, resolution
+identity and content atomically, including the named production resolver.
+Failure to store content rolls back the status transition. Other conflict
+working-tree entrances and refresh admission's fresh conflict gate still need
+full caller integration.
 
 ## Preparation and correspondence
 
