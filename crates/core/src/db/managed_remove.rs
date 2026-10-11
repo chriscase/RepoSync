@@ -1162,6 +1162,9 @@ impl Database {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
         super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+            &tx, repo_id,
+        )?;
         let changed = tx.execute(
             "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
             params![Utc::now().to_rfc3339(), repo_id],
@@ -1178,6 +1181,7 @@ impl Database {
     ) -> Result<RemovalAdvance, DatabaseError> {
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
             if let Some(op) = read_op(tx, repo_id)? {
                 if op.state.is_terminal_success() {
                     if load_repo(tx, repo_id)?.is_none() {
@@ -1248,6 +1252,9 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(());
@@ -1268,6 +1275,9 @@ impl Database {
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
@@ -1298,6 +1308,9 @@ impl Database {
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Err(DatabaseError::Other(
@@ -1334,6 +1347,9 @@ impl Database {
         }
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
             let inbound_last_git_sha =
                 crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
@@ -1458,6 +1474,7 @@ impl Database {
         })?;
         self.transaction(|tx| {
             super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
             if removal_in_progress(tx, repo_id)? {
                 return Err(DatabaseError::Other(
                     "managed removal is still in progress; restore is not available".into(),

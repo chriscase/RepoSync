@@ -122,13 +122,28 @@ pub fn capture_refresh_registration(
             .filter(|value| *value > 0 && value.to_string() == raw)
             .ok_or_else(|| refused("echo generation is corrupt"))?,
     };
+    let scoped_git_checkpoint = read(
+        tx,
+        &super::repo_scope_identity::last_git_sha_kv_key(&scope_uuid),
+    )?;
+    let scoped_svn_checkpoint = read(tx, &format!("last_svn_rev_{repo_id}"))?;
+    if scoped_git_checkpoint
+        .as_deref()
+        .is_some_and(|value| value != last_git_sha)
+        || (!last_git_sha.is_empty() && scoped_git_checkpoint.is_none())
+        || scoped_svn_checkpoint
+            .as_deref()
+            .is_some_and(|value| value != last_svn_rev.to_string())
+        || (last_svn_rev > 0 && scoped_svn_checkpoint.is_none())
+    {
+        return Err(refused(
+            "column and scoped checkpoint copies differ or are missing",
+        ));
+    }
     Ok(RefreshRegistrationPin {
         repo_id: repo_id.into(),
-        scoped_git_checkpoint: read(
-            tx,
-            &super::repo_scope_identity::last_git_sha_kv_key(&scope_uuid),
-        )?,
-        scoped_svn_checkpoint: read(tx, &format!("last_svn_rev_{repo_id}"))?,
+        scoped_git_checkpoint,
+        scoped_svn_checkpoint,
         scope_uuid,
         configuration_digest: digest(&configuration)?,
         echo_generation,
@@ -162,6 +177,7 @@ impl RefreshJobPins {
         let child = &self.child;
         let parent = &self.parent;
         let svn = &self.svn.pins.lineage.pins;
+        let copy = &self.svn.pins.lineage.child_copy;
         if child.repo_id.is_empty()
             || parent.repo_id.is_empty()
             || child.repo_id == parent.repo_id
@@ -175,6 +191,12 @@ impl RefreshJobPins {
             || parent.echo_generation < 1
             || child.last_svn_rev < 1
             || parent.last_svn_rev < 1
+            || child.scoped_git_checkpoint.as_deref() != Some(child.last_git_sha.as_str())
+            || parent.scoped_git_checkpoint.as_deref() != Some(parent.last_git_sha.as_str())
+            || child.scoped_svn_checkpoint.as_deref()
+                != Some(child.last_svn_rev.to_string().as_str())
+            || parent.scoped_svn_checkpoint.as_deref()
+                != Some(parent.last_svn_rev.to_string().as_str())
             || !is_full_git_oid(&child.last_git_sha)
             || !is_full_git_oid(&parent.last_git_sha)
             || self.git.operation_id.is_nil()
@@ -193,6 +215,19 @@ impl RefreshJobPins {
             || svn.child.child_revision != child.last_svn_rev
             || svn.parent_revision != parent.last_svn_rev
             || svn.parent_revision <= svn.child.parent_baseline_revision
+            || copy.repository_uuid != svn.child.repository_uuid
+            || copy.child_path != svn.child.child_path
+            || copy.parent_path != svn.child.parent_path
+            || copy.copy_from_revision != svn.child.parent_baseline_revision
+            || copy.inspected_revision != svn.child.child_revision
+            || copy.created_revision < 1
+            || copy.created_revision > svn.child.child_revision
+            || self
+                .svn
+                .result_properties
+                .get("")
+                .and_then(|props| props.get("svn:mergeinfo"))
+                != Some(&self.svn.mergeinfo)
             || self.git_branch.is_empty()
             || !git2::Reference::is_valid_name(&format!("refs/heads/{}", self.git_branch))
             || self.svn.working_copy.as_os_str().is_empty()
@@ -415,6 +450,74 @@ pub fn require_no_pair_refresh_hold_for_writer(
 ) -> Result<(), DatabaseError> {
     let scope = (repo_id != super::personal_scope::PERSONAL_SCOPE_KEY).then_some(repo_id);
     require_no_pair_refresh_hold(tx, scope)
+}
+
+/// Registration and credential mutations must also exclude ancestors of either
+/// held registration. Changing an ancestor can change inherited credentials or
+/// their resolution chain even when it has no refresh hold of its own.
+pub fn require_no_pair_refresh_registration_mutation(
+    tx: &Connection,
+    repo_id: &str,
+) -> Result<(), DatabaseError> {
+    for op in journal(tx)? {
+        if !op.phase.holds_scopes() {
+            continue;
+        }
+        for pin in [&op.pins.child, &op.pins.parent] {
+            let mut current = Some(pin.repo_id.clone());
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(id) = current {
+                if !seen.insert(id.clone()) {
+                    return Err(refused("held registration has a cyclic ancestry"));
+                }
+                if id == repo_id {
+                    return Err(refused(
+                        "a durable pair refresh owns this registration chain",
+                    ));
+                }
+                current = tx
+                    .query_row(
+                        "SELECT parent_id FROM repositories WHERE id=?1",
+                        [&id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .ok_or_else(|| refused("held registration ancestry is missing"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Classify credential state writes. Generic KV is also used by internal
+/// diagnostics and fault injection; typed checkpoint writers have their own
+/// transaction guards. The caller must retain the transaction
+/// containing this read through its mutation, so admission cannot race it.
+pub fn require_no_pair_refresh_state_mutation(
+    tx: &Connection,
+    state_key: &str,
+) -> Result<(), DatabaseError> {
+    for prefix in [
+        "secret_git_token",
+        "secret_svn_password",
+        "git_token",
+        "svn_password",
+    ] {
+        if state_key == prefix {
+            return require_no_pair_refresh_hold(tx, None);
+        }
+        if let Some(id) = state_key.strip_prefix(&format!("{prefix}_")) {
+            return require_no_pair_refresh_registration_mutation(tx, id);
+        }
+    }
+    if matches!(
+        state_key,
+        "encryption_key" | "last_git_hash" | "last_svn_rev"
+    ) || state_key == super::repo_scope_identity::LEGACY_REPO_ID_KV_READS_KEY
+    {
+        return require_no_pair_refresh_hold(tx, None);
+    }
+    Ok(())
 }
 
 fn require_pins_current(tx: &Connection, pins: &RefreshJobPins) -> Result<(), DatabaseError> {
@@ -776,7 +879,10 @@ impl Database {
             let sha = &op.pins.git.prepared_sha;
             let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_records WHERE repo_id=?1 AND (git_sha=?2 OR svn_rev=?3))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
             if conflict { return Err(refused("publication already has correspondence outside this job")); }
+            let conflicting_map: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commit_map WHERE repo_id=?1 AND (git_sha=?2 OR svn_rev=?3) AND NOT (git_sha=?2 AND svn_rev=?3 AND direction='git_to_svn'))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
+            if conflicting_map { return Err(refused("publication has contradictory commit correspondence")); }
             let now = Utc::now().to_rfc3339();
+            tx.execute("INSERT INTO commit_map(repo_id,svn_rev,git_sha,direction,synced_at,svn_author,git_author) SELECT ?1,?2,?3,'git_to_svn',?4,'RepoSync','RepoSync' WHERE NOT EXISTS(SELECT 1 FROM commit_map WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='git_to_svn')", params![child.repo_id, receipt.revision, sha, now])?;
             tx.execute("INSERT INTO sync_records(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) VALUES(?1,?2,?3,?4,'git_to_svn','RepoSync','Update pair from parent',?5,?5,'applied')", params![op.id.to_string(), child.repo_id, receipt.revision, sha, now])?;
             if tx.execute("UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2,last_sync_at=?3,total_syncs=total_syncs+1,updated_at=?3 WHERE id=?4 AND scope_uuid=?5", params![sha, receipt.revision, now, child.repo_id, child.scope_uuid])? != 1 { return Err(refused("child registration disappeared during completion")); }
             crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, &child.repo_id, sha, &now)?;

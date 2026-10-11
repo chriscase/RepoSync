@@ -72,8 +72,12 @@ identity in one transaction under an enrolled current writer lease. Admission
 requires a capability owning both process busy slots; acquisition sorts repository
 IDs and releases partial acquisition on contention. Registration snapshots bind
 the UUID, configuration, echo counter, column checkpoints and both scoped cursor
-copies. Missing identities are refused rather than synthesized. All competing
-active pointers refuse admission; a latest operation without an active pointer
+copies. Missing identities are refused rather than synthesized. Checkpoint
+copies must be present and equal to their column values; split or
+missing copies refuse rather than being collapsed by completion. Copy-origin
+fields must match the pinned lineage and the root mergeinfo property must equal
+the approved mergeinfo string.
+All competing active pointers refuse admission; a latest operation without an active pointer
 must still deserialize completely and report completed state. Missing, foreign,
 corrupt or uncertain prior documents refuse.
 
@@ -90,6 +94,9 @@ missing pointers or noncanonical documents fail closed even for unrelated writer
 The final storage transaction creates the applied child correspondence, updates
 all child cursor copies, marks completion and releases both holds; a database
 failure rolls back all these changes. Completed request lookup is idempotent.
+Both `commit_map` and `sync_records` are written. Contradictory child mapping
+rows with the result revision or SHA refuse; an exact prior child commit-map
+row is preserved without another insert. Parent rows are not adopted.
 Parent state and both echo generations remain unchanged. Journal receipt storage
 is not independent remote verification, API approval, or credential admission.
 The existing import, Git push, SVN commit, team mapping, late-pair publication
@@ -101,9 +108,20 @@ global writer scopes, and corrupt refresh evidence blocks unrelated admission.
 Two-connection import/refresh admission permits one owner; unrelated registered
 imports remain available. These are journal boundaries, not complete external
 writer exclusion. Scheduler/direct engine/import working-tree and publication
-entrances, configuration/credential/conflict/skip mutations, the authenticated
+entrances, conflict/skip working-tree mutations, the authenticated
 publication/recovery caller and real production SyncEngine proof remain
 prerequisites. No execution endpoint is enabled by these components.
+
+Typed registration, checkpoint, reimport reset, deletion, echo-generation and
+credential mutations now check holds in the same SQLite transaction as the
+write. Credential and registration changes also check ancestors of both held
+registrations; global defaults and the encryption key are global mutations.
+Unrelated configuration and credential changes and status/session persistence
+remain available. Generic KV and raw SQL are low-level storage interfaces, not
+publication capabilities; deliberate fault injection can still corrupt evidence
+and current-pin checks refuse that drift. Full production entrances must retain
+exclusion through local working-tree and external publication work before
+execution is enabled.
 
 ## Preparation and correspondence
 

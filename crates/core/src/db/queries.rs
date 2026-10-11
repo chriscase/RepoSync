@@ -903,11 +903,14 @@ impl Database {
     pub fn set_watermark(&self, source: &str, value: &str) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold(&tx, None)?;
+        tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![source, value, now],
         )?;
+        tx.commit()?;
         debug!(source, value, "set watermark");
         Ok(())
     }
@@ -1234,11 +1237,14 @@ impl Database {
     pub fn set_state(&self, key: &str, value: &str) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute(
             "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, now],
         )?;
+        tx.commit()?;
         debug!(key, value, "set kv_state");
         Ok(())
     }
@@ -1247,7 +1253,10 @@ impl Database {
     /// computing scoped keys (the connection mutex is not re-entrant).
     pub fn delete_kv_state(&self, key: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1333,10 +1342,13 @@ impl Database {
     /// Delete all sync records for a specific repository (used during reset/reimport).
     pub fn delete_sync_records_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
-        let count = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        let count = tx.execute(
             "DELETE FROM sync_records WHERE repo_id = ?1",
             params![repo_id],
         )?;
+        tx.commit()?;
         info!(repo_id, count, "deleted sync_records for repo");
         Ok(count)
     }
@@ -1344,10 +1356,13 @@ impl Database {
     /// Delete all commit_map entries for a specific repository (used during reset/reimport).
     pub fn delete_commit_map_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
-        let count = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        let count = tx.execute(
             "DELETE FROM commit_map WHERE repo_id = ?1",
             params![repo_id],
         )?;
+        tx.commit()?;
         info!(repo_id, count, "deleted commit_map entries for repo");
         Ok(count)
     }
@@ -1361,6 +1376,9 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                &conn, repo_id,
+            )?;
             conn.execute(
                 "DELETE FROM sync_records WHERE repo_id = ?1",
                 params![repo_id],
@@ -1432,6 +1450,9 @@ impl Database {
             crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
         }
         self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                conn, repo_id,
+            )?;
             let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
             for table in &tables_with_repo_id {
                 let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
@@ -1531,6 +1552,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         tx.execute(
@@ -1587,6 +1609,7 @@ impl Database {
         };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
 
         // 1. Update repositories table
         tx.execute(
@@ -2651,13 +2674,17 @@ impl Database {
     /// Update a repository's configuration.
     pub fn update_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        if super::managed_remove::new_work_blocked(&conn, &repo.id)? {
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+            &tx, &repo.id,
+        )?;
+        if super::managed_remove::new_work_blocked(&tx, &repo.id)? {
             return Err(DatabaseError::Other(
                 "repository removal is in progress or completed; refusing to rewrite the registration"
                     .into(),
             ));
         }
-        let changed = conn.execute(
+        let changed = tx.execute(
             "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21, allowed_paths = ?22, blocked_patterns = ?23, consecutive_errors = ?24, teams_webhook_url = ?25
              WHERE id = ?26",
             params![
@@ -2695,6 +2722,7 @@ impl Database {
                 id: repo.id.clone(),
             });
         }
+        tx.commit()?;
         debug!(id = %repo.id, name = %repo.name, "updated repository");
         Ok(())
     }
@@ -2725,10 +2753,13 @@ impl Database {
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
         )?;
+        tx.commit()?;
         debug!(
             repo_id,
             svn_rev, git_sha, "updated repo watermark (columns only)"
@@ -2745,6 +2776,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
@@ -2768,10 +2800,13 @@ impl Database {
     /// Used when skipping metadata-only SVN revisions that produce no git commit.
     pub fn advance_svn_watermark(&self, repo_id: &str, svn_rev: i64) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
             params![svn_rev, repo_id],
         )?;
+        tx.commit()?;
         debug!(
             repo_id,
             svn_rev, "advanced SVN watermark (metadata-only skip)"
@@ -2940,6 +2975,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(&conn, None)?;
             conn.execute_batch(
                 "DELETE FROM commit_map;
              DELETE FROM sync_records;
@@ -3016,10 +3052,13 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute(
             "INSERT OR REPLACE INTO encrypted_secrets (key, ciphertext, nonce, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params![key, ciphertext, nonce, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3043,7 +3082,10 @@ impl Database {
     /// Delete an encrypted secret by key.
     pub fn delete_secret(&self, key: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        tx.commit()?;
         Ok(())
     }
 
