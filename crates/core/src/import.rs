@@ -803,18 +803,20 @@ impl Drop for ConfinedTempFileGuard<'_> {
 
 #[cfg(unix)]
 fn read_dirat(dir: &std::os::unix::io::OwnedFd) -> std::io::Result<Vec<std::ffi::OsString>> {
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
 
-    let fd_path = Path::new("/dev/fd").join(dir.as_raw_fd().to_string());
-    let entries = std::fs::read_dir(&fd_path)?;
+    // A fresh descriptor relative to the held directory preserves confinement
+    // across renames and gives each traversal its own offset. macOS cannot
+    // enumerate a directory by reopening its /dev/fd path.
+    let entries = rustix::fs::Dir::new(openat_dir_nofollow(dir, OsStr::new("."))?)?;
     let mut names = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let name = entry.file_name();
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
         if name == "." || name == ".." {
             continue;
         }
-        names.push(name);
+        names.push(name.to_os_string());
     }
     Ok(names)
 }
@@ -5172,5 +5174,51 @@ mod tests {
         assert_eq!(stats.copied, 2);
         let manifest = independent_tree_manifest(src.path()).unwrap();
         verify_against_independent_manifest(dst.path(), &manifest, &noop_policy()).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod directory_iteration_tests {
+    use super::{open_dir_nofollow, read_dirat};
+    use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn held_directory_iteration_preserves_names_and_restarts_each_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut expected = vec![OsString::from("regular"), OsString::from("snowman-☃")];
+        // Exercise non-UTF-8 filenames on Linux as well.
+        #[cfg(target_os = "linux")]
+        expected.push(OsString::from_vec(vec![0xff]));
+        for name in &expected {
+            std::fs::write(tmp.path().join(name), b"fixture").unwrap();
+        }
+        expected.sort();
+        let dir = open_dir_nofollow(tmp.path()).unwrap();
+        for _ in 0..2 {
+            let mut actual = read_dirat(&dir).unwrap();
+            actual.sort();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn held_directory_iteration_does_not_follow_replaced_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let moved = tmp.path().join("moved");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(original.join("owned"), b"inside").unwrap();
+        std::fs::write(outside.join("canary"), b"outside").unwrap();
+        let dir = open_dir_nofollow(&original).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        symlink(&outside, &original).unwrap();
+
+        assert_eq!(read_dirat(&dir).unwrap(), vec![OsString::from("owned")]);
+        assert_eq!(std::fs::read(outside.join("canary")).unwrap(), b"outside");
     }
 }
