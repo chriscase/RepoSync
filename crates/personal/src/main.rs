@@ -196,7 +196,14 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
     // Set up Git repository.
     let git_repo_path = data_dir.join("git-repo");
     let git_client = if git_repo_path.exists() {
-        GitClient::new(&git_repo_path).context("failed to open git repository")?
+        let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
+        sync_git_http_auth_on_existing_checkout(
+            &git_client,
+            &git_repo_path,
+            &db,
+            config.github.token.as_deref(),
+        )?;
+        git_client
     } else {
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         let remote_url = config.github.clone_url();
@@ -327,7 +334,14 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
     // Initialize Git repo for import.
     let git_repo_path = data_dir.join("git-repo");
     let git_client = if git_repo_path.exists() {
-        GitClient::new(&git_repo_path).context("failed to open git repository")?
+        let git_client = GitClient::new(&git_repo_path).context("failed to open git repository")?;
+        sync_git_http_auth_on_existing_checkout(
+            &git_client,
+            &git_repo_path,
+            &db,
+            config.github.token.as_deref(),
+        )?;
+        git_client
     } else {
         std::fs::create_dir_all(&git_repo_path).context("failed to create git repo directory")?;
         // For import, try to clone first; if repo doesn't exist yet, init locally
@@ -369,6 +383,23 @@ fn cmd_log_probe() {
     tracing::trace!("LOG_PROBE trace-level marker");
     // Allow the non-blocking writer's background thread to drain.
     std::thread::sleep(Duration::from_millis(200));
+}
+
+fn sync_git_http_auth_on_existing_checkout(
+    git: &GitClient,
+    git_repo_path: &std::path::Path,
+    db: &Database,
+    config_token: Option<&str>,
+) -> Result<()> {
+    use reposync_core::db::personal_scope::personal_scope_key;
+    reposync_core::git::sync_git_http_auth_from_resolution(
+        git,
+        git_repo_path,
+        db,
+        personal_scope_key(),
+        config_token,
+    )
+    .context("failed to apply git credentials to existing repository")
 }
 
 /// Expand `~` to the user's home directory.

@@ -25,7 +25,7 @@ use reposync_core::echo_suppression::{
 use reposync_core::file_policy::{FilePolicy, FilePolicyDecision};
 use reposync_core::git::github::{GitHubClient, GitHubCommit, PullRequest};
 use reposync_core::git::GitClient;
-use reposync_core::history_inspect::inspect_personal_history;
+use reposync_core::history_inspect::inspect_personal_history_with_http_auth;
 use reposync_core::path_projection::{
     project_git_to_svn_changeset, svn_path_identity, GitToSvnInputChange,
     ProjectedGitToSvnChangeset,
@@ -75,6 +75,7 @@ pub struct GitToSvnSync {
     default_branch: String,
     svn_author: String,
     svn_url: String,
+    http_auth_token: Option<String>,
 }
 
 impl GitToSvnSync {
@@ -111,7 +112,21 @@ impl GitToSvnSync {
             default_branch: config.github.default_branch.clone(),
             svn_author: config.developer.svn_username.clone(),
             svn_url: config.svn.url.clone(),
+            http_auth_token: config.github.token.clone(),
         }
+    }
+
+    fn personal_history_http_auth(&self) -> Option<String> {
+        let config_token = self
+            .http_auth_token
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        reposync_core::git::resolve_git_http_auth_token_for_workdir(
+            &self.db,
+            PERSONAL_REPO_ID,
+            config_token,
+            &self.git_repo_path,
+        )
     }
 
     /// Ensure the SVN working copy directory exists and is properly checked out.
@@ -172,11 +187,14 @@ impl GitToSvnSync {
     ///
     /// Returns a summary of what was synced.
     fn ensure_personal_history_admitted(&self) -> Result<()> {
-        inspect_personal_history(
+        let http_auth_token = self.personal_history_http_auth();
+        inspect_personal_history_with_http_auth(
             &self.db,
             &self.git_repo_path,
             &self.default_branch,
             PERSONAL_REPO_ID,
+            http_auth_token.as_deref(),
+            self.http_auth_token.as_deref(),
         )
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!(e))
@@ -2151,5 +2169,32 @@ M       Cargo.toml
         std::env::remove_var(&key);
         assert!(fired, "path-scoped fixture must fire for that working copy");
         assert!(!other, "path-scoped fixture must not fire for other copies");
+    }
+
+    #[test]
+    fn git_to_svn_personal_history_http_auth_honors_chain_revocation() {
+        use reposync_core::db::Database;
+        use reposync_core::git::startup_handoff;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let git_work = tmp.path().join("git");
+        std::fs::create_dir_all(&git_work).unwrap();
+        startup_handoff::remember_startup_http_auth(&git_work, "handoff-token");
+
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        let chain_key = format!("secret_git_token_{}", PERSONAL_REPO_ID);
+        db.set_state(&chain_key, "").unwrap();
+
+        let config_token = Some("stale-config-token");
+        let resolved = reposync_core::git::resolve_git_http_auth_token_for_workdir(
+            &db,
+            PERSONAL_REPO_ID,
+            config_token,
+            &git_work,
+        );
+        assert!(resolved.is_none());
+        assert!(startup_handoff::peek_startup_http_auth(&git_work).is_none());
     }
 }

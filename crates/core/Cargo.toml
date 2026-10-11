@@ -7,6 +7,7 @@ description = "Core library for RepoSync bidirectional SVN/Git synchronization"
 
 [features]
 reliability-fixture = []
+test-support = []
 
 [dependencies]
 tokio = { workspace = true }
@@ -39,5 +40,6 @@ subtle = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+reposync-core = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
