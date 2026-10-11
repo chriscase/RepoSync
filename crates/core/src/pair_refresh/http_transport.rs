@@ -39,10 +39,7 @@ impl HttpTransport {
         token: Option<&str>,
         client: reqwest::Client,
     ) -> Result<Self, GitError> {
-        let endpoint = reqwest::Url::parse(remote_url).map_err(|_| transport_error())?;
-        if endpoint.as_str() != remote_url {
-            return Err(transport_error());
-        }
+        let endpoint = super::publication::canonical_url(remote_url)?;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|_| transport_error())?;
         listener
             .set_nonblocking(true)

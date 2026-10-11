@@ -118,7 +118,10 @@ fresh remote result. No force update, rebase or remote reset is a recovery tool.
 
 The original Git-only primitive remains Git-only. An approval must explicitly
 select `smart_http_v1` for HTTPS. Cleartext HTTP is refused. The approved URL must
-already be canonical, with no empty or dot path segments. Effective fetch/push
+already be canonical, with nonempty ASCII repository path segments containing
+only letters, digits, '.', '_' and '-'. Empty/dot segments and all percent
+escapes are refused, including encoded separators and double encoding.
+Effective fetch/push
 URL rewrites are refused before connecting. HTTPS uses a fixed upstream endpoint
 through an operation-local
 loopback bridge because shipping libgit2's redirect setting permits some

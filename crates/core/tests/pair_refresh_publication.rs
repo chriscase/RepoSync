@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +15,59 @@ use git2::{Oid, Repository, Signature};
 use reposync_core::pair_refresh::publication::{
     publish_pinned_child, require_pinned_push_endpoint, require_pinned_push_transport,
 };
+
+#[path = "fixtures/owned_process_group.rs"]
+mod fixture_process;
+use fixture_process::OwnedProcessGroup;
+
+#[test]
+fn fixture_drop_stops_descendant_that_ignores_term() {
+    let temp = tempfile::tempdir().unwrap();
+    let heartbeat = temp.path().join("heartbeat");
+    let script = r#"
+import pathlib,subprocess,sys,time
+worker = '''import pathlib,signal,sys,time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+path = pathlib.Path(sys.argv[1])
+while True:
+    with path.open("a") as output:
+        output.write("beat\\n")
+        output.flush()
+    time.sleep(0.01)
+'''
+subprocess.Popen([sys.executable, "-c", worker, sys.argv[1]])
+while True:
+    time.sleep(1)
+"#;
+    let group = OwnedProcessGroup::spawn(
+        Command::new("python3")
+            .args(["-c", script, heartbeat.to_str().unwrap()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !heartbeat
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() >= 10)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture descendant did not start"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(group);
+    let stopped = std::fs::read(&heartbeat).unwrap();
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            std::fs::read(&heartbeat).unwrap(),
+            stopped,
+            "fixture descendant survived cleanup"
+        );
+    }
+}
 
 struct Daemon {
     stopped: Arc<AtomicBool>,
@@ -27,7 +80,7 @@ impl Daemon {
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = stopped.clone();
         let worker = std::thread::spawn(move || {
-            let mut children: Vec<Child> = Vec::new();
+            let mut children: Vec<OwnedProcessGroup> = Vec::new();
             while !worker_stopped.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -37,33 +90,32 @@ impl Daemon {
                         // Keep the reserved listener for the entire fixture.
                         // Each connection runs real Git's smart protocol with
                         // the same receive-pack hooks and old-tip checks.
-                        let child = Command::new("git")
-                            .args([
-                                "daemon",
-                                "--inetd",
-                                "--export-all",
-                                "--enable=receive-pack",
-                                &format!("--base-path={}", root.display()),
-                            ])
-                            .arg(&root)
-                            .stdin(Stdio::from(input))
-                            .stdout(Stdio::from(output))
-                            .stderr(Stdio::null())
-                            .spawn()
-                            .unwrap();
+                        let child = OwnedProcessGroup::spawn(
+                            Command::new("git")
+                                .args([
+                                    "daemon",
+                                    "--inetd",
+                                    "--export-all",
+                                    "--enable=receive-pack",
+                                    &format!("--base-path={}", root.display()),
+                                ])
+                                .arg(&root)
+                                .stdin(Stdio::from(input))
+                                .stdout(Stdio::from(output))
+                                .stderr(Stdio::null()),
+                        )
+                        .unwrap();
                         children.push(child);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => panic!("fixture listener failed: {error}"),
                 }
                 children.retain_mut(|child| child.try_wait().unwrap().is_none());
             }
-            for mut child in children {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            drop(children);
         });
         Self {
             stopped,

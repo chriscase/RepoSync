@@ -25,7 +25,7 @@ pub fn require_pinned_push_transport(remote_url: &str) -> Result<(), GitError> {
     require_transport(remote_url, PinnedPushPolicy::GitProtocolV1)
 }
 
-fn canonical_url(remote_url: &str) -> Result<reqwest::Url, GitError> {
+pub(super) fn canonical_url(remote_url: &str) -> Result<reqwest::Url, GitError> {
     let parsed = reqwest::Url::parse(remote_url).map_err(|_| {
         git2::Error::from_str("pair refresh requires an explicit smart transport URL")
     })?;
@@ -36,11 +36,12 @@ fn canonical_url(remote_url: &str) -> Result<reqwest::Url, GitError> {
         || parsed.fragment().is_some()
         || parsed.query().is_some()
         || remote_url.chars().any(char::is_control)
-        || parsed
-            .path()
-            .split('/')
-            .skip(1)
-            .any(|segment| matches!(segment, "" | "." | ".."))
+        || parsed.path().split('/').skip(1).any(|segment| {
+            matches!(segment, "" | "." | "..")
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
         || parsed.path().is_empty()
     {
         return Err(git2::Error::from_str("noncanonical pair refresh publication URL").into());

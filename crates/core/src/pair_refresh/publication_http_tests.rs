@@ -1,20 +1,17 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+
+#[path = "../../tests/fixtures/owned_process_group.rs"]
+mod fixture_process;
+use fixture_process::OwnedProcessGroup;
 
 use git2::{Oid, Repository, Signature};
 
 use super::{publish_http_with_client, publish_pinned_child_with_policy, PinnedPushPolicy};
 
-struct Server(Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+struct Server(OwnedProcessGroup);
 
 struct HttpFixture {
     _server: Server,
@@ -75,11 +72,7 @@ fn server(
         }
     }
     let mut server = Server(
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
+        OwnedProcessGroup::spawn(command.stdout(Stdio::piped()).stderr(Stdio::inherit())).unwrap(),
     );
     let mut line = String::new();
     BufReader::new(server.0.stdout.take().unwrap())
@@ -472,6 +465,12 @@ fn noncanonical_url_cannot_publish_another_repository_or_present_token() {
         "/../other.git",
         "/./other.git",
         "//other.git",
+        "%2F..%2Fother.git",
+        "%2F%2E%2E%2Fother.git",
+        "%2f..%2fother.git",
+        "%5C..%5Cother.git",
+        "%5c..%5cother.git",
+        "%252F..%252Fother.git",
     ] {
         let error = fixture
             .publish_to(
