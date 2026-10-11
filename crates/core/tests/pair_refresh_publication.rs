@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use git2::{Oid, Repository, Signature};
 use reposync_core::pair_refresh::publication::{
-    publish_pinned_child, require_pinned_push_endpoint, require_pinned_push_transport,
+    observe_pinned_child_with_policy, publish_pinned_child, require_pinned_push_endpoint,
+    require_pinned_push_transport, GitPublicationObservation, PinnedPushPolicy,
 };
 
 #[path = "fixtures/owned_process_group.rs"]
@@ -466,4 +467,160 @@ fn linked_worktree_common_grafts_refuse_before_publication() {
     )
     .is_err());
     assert_eq!(fixture.tip(), fixture.child);
+}
+
+impl Fixture {
+    fn observe(&self) -> Result<GitPublicationObservation, reposync_core::errors::GitError> {
+        observe_pinned_child_with_policy(
+            &self.source,
+            &self.url,
+            "child",
+            self.child,
+            self.prepared,
+            None,
+            PinnedPushPolicy::GitProtocolV1,
+        )
+    }
+}
+
+#[test]
+fn recovery_old_tip_is_only_not_observed_and_never_runs_receive_pack() {
+    let fixture = Fixture::new();
+    let witness = fixture._temp.path().join("receive-pack-witness");
+    fixture.hook(&format!(
+        "#!/bin/sh\nprintf 'write\\n' > '{}'\nexit 1\n",
+        witness.display()
+    ));
+    assert_eq!(
+        fixture.observe().unwrap(),
+        GitPublicationObservation::NotObserved
+    );
+    assert_eq!(fixture.tip(), fixture.child);
+    assert!(!witness.exists());
+}
+
+#[test]
+fn recovery_of_missing_receipt_observes_result_without_second_write_or_local_ref_change() {
+    let fixture = Fixture::new();
+    // Ignore the returned publication receipt, then recover only by reading.
+    let _ = fixture.publish().unwrap();
+    let witness = fixture._temp.path().join("second-write-witness");
+    fixture.hook(&format!(
+        "#!/bin/sh\nprintf 'retry\\n' > '{}'\nexit 1\n",
+        witness.display()
+    ));
+    let refs = || {
+        fixture
+            .source
+            .references()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.name().unwrap().to_owned(), entry.target())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = refs();
+    for _ in 0..2 {
+        assert_eq!(
+            fixture.observe().unwrap(),
+            GitPublicationObservation::Observed(fixture.prepared)
+        );
+        assert_eq!(fixture.tip(), fixture.prepared);
+        assert_eq!(refs(), before);
+        assert!(!witness.exists());
+    }
+}
+
+#[test]
+fn recovery_refuses_older_second_parent_and_later_descendant_tips() {
+    let fixture = Fixture::new();
+    for tip in [fixture.initial, fixture.parent] {
+        fixture
+            .target
+            .reference("refs/heads/child", tip, true, "disposable drift control")
+            .unwrap();
+        assert!(fixture.observe().is_err());
+        assert_eq!(fixture.tip(), tip);
+    }
+    fixture
+        .target
+        .reference(
+            "refs/heads/child",
+            fixture.prepared,
+            true,
+            "disposable published state",
+        )
+        .unwrap();
+    let advanced = commit(&fixture.source, &[fixture.prepared], "new child work");
+    fixture
+        .source
+        .remote_anonymous(fixture.target.path().to_str().unwrap())
+        .unwrap()
+        .push(&[&format!("{advanced}:refs/heads/child")], None)
+        .unwrap();
+    assert!(fixture.observe().is_err());
+    assert_eq!(fixture.tip(), advanced);
+}
+
+#[test]
+fn recovery_missing_branch_refuses_without_recreating_it() {
+    let fixture = Fixture::new();
+    fixture
+        .target
+        .find_reference("refs/heads/child")
+        .unwrap()
+        .delete()
+        .unwrap();
+    assert!(fixture.observe().is_err());
+    assert!(fixture.target.find_reference("refs/heads/child").is_err());
+}
+
+#[test]
+fn recovery_effective_url_rewrite_refuses_without_changing_target() {
+    let fixture = Fixture::new();
+    fixture
+        .source
+        .config()
+        .unwrap()
+        .set_str(
+            &format!("url.file://{}.insteadOf", fixture.target.path().display()),
+            &fixture.url,
+        )
+        .unwrap();
+    let error = fixture.observe().unwrap_err();
+    assert!(
+        error.to_string().contains("rewrites the pinned endpoint"),
+        "{error}"
+    );
+    assert_eq!(fixture.tip(), fixture.child);
+}
+
+#[test]
+fn recovery_invalid_pins_are_refused_before_dialing() {
+    let fixture = Fixture::new();
+    for (branch, old, prepared) in [
+        ("../child", fixture.child, fixture.prepared),
+        ("child", Oid::zero(), fixture.prepared),
+        ("child", fixture.child, fixture.child),
+        ("child", fixture.child, fixture.parent),
+    ] {
+        let error = observe_pinned_child_with_policy(
+            &fixture.source,
+            "git://127.0.0.1:1/target.git",
+            branch,
+            old,
+            prepared,
+            None,
+            PinnedPushPolicy::GitProtocolV1,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid pinned child observation inputs"),
+            "{error}"
+        );
+        assert_eq!(fixture.tip(), fixture.child);
+    }
 }

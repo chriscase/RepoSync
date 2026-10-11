@@ -9,7 +9,10 @@ use fixture_process::OwnedProcessGroup;
 
 use git2::{Oid, Repository, Signature};
 
-use super::{publish_http_with_client, publish_pinned_child_with_policy, PinnedPushPolicy};
+use super::{
+    observe_http_with_client, observe_pinned_child_with_policy, publish_http_with_client,
+    publish_pinned_child_with_policy, GitPublicationObservation, PinnedPushPolicy,
+};
 
 struct Server(OwnedProcessGroup);
 
@@ -603,4 +606,135 @@ fn production_https_ignores_inherited_proxy_with_observed_positive_control() {
         }
         assert_eq!(fixture.tip(), fixture.child);
     }
+}
+
+impl HttpFixture {
+    fn observe_to(
+        &self,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<GitPublicationObservation, crate::errors::GitError> {
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(der) = &self.cert_der {
+            builder = builder.add_root_certificate(reqwest::Certificate::from_der(der).unwrap());
+        }
+        observe_http_with_client(
+            &self.source,
+            url,
+            "child",
+            self.child,
+            self.prepared,
+            token,
+            builder.build().unwrap(),
+        )
+    }
+}
+
+#[test]
+fn https_recovery_observes_old_and_published_tips_without_receive_pack_or_token_persistence() {
+    let fixture = HttpFixture::new(true, Some("synthetic-fixture-token"));
+    let token = Some("synthetic-fixture-token");
+    assert_eq!(
+        fixture.observe_to(&fixture.url, token).unwrap(),
+        GitPublicationObservation::NotObserved
+    );
+    assert_eq!(fixture.publish(token).unwrap(), fixture.prepared);
+    let witness = fixture.temp.path().join("receive-pack-witness");
+    fixture.hook(&format!(
+        "#!/bin/sh\nprintf 'retry\\n' > '{}'\nexit 1\n",
+        witness.display()
+    ));
+    for _ in 0..2 {
+        assert_eq!(
+            fixture.observe_to(&fixture.url, token).unwrap(),
+            GitPublicationObservation::Observed(fixture.prepared)
+        );
+        assert!(!witness.exists());
+        assert_eq!(fixture.tip(), fixture.prepared);
+    }
+    assert!(
+        !std::fs::read_to_string(fixture.source.path().join("config"))
+            .unwrap()
+            .contains("synthetic-fixture-token")
+    );
+}
+
+#[test]
+fn https_recovery_redirect_refuses_without_contacting_destination() {
+    let fixture = HttpFixture::new(true, Some("synthetic-fixture-token"));
+    let cert = fixture.temp.path().join("cert.pem");
+    let key = fixture.temp.path().join("key.pem");
+    let destination_log = fixture.temp.path().join("recovery-redirected.jsonl");
+    let (_destination, destination) = server(
+        fixture.temp.path(),
+        Some((&cert, &key)),
+        Some("synthetic-fixture-token"),
+        None,
+        &destination_log,
+    );
+    let (_origin, origin) = server(
+        fixture.temp.path(),
+        Some((&cert, &key)),
+        Some("synthetic-fixture-token"),
+        Some((destination.strip_suffix("/target.git").unwrap(), false)),
+        &fixture.temp.path().join("recovery-origin.jsonl"),
+    );
+    assert!(fixture
+        .observe_to(&origin, Some("synthetic-fixture-token"))
+        .is_err());
+    assert!(!destination_log.exists());
+    assert_eq!(fixture.tip(), fixture.child);
+}
+
+#[test]
+fn production_recovery_refuses_cleartext_and_untrusted_tls_without_token_contact() {
+    for tls in [false, true] {
+        let fixture = HttpFixture::new(tls, Some("synthetic-fixture-token"));
+        assert!(observe_pinned_child_with_policy(
+            &fixture.source,
+            &fixture.url,
+            "child",
+            fixture.child,
+            fixture.prepared,
+            Some("synthetic-fixture-token"),
+            PinnedPushPolicy::SmartHttpV1
+        )
+        .is_err());
+        assert!(!fixture.temp.path().join("requests.jsonl").exists());
+        assert_eq!(fixture.tip(), fixture.child);
+    }
+}
+
+#[test]
+fn recovery_refuses_aliases_and_rewrites_before_contact_or_token() {
+    let fixture = HttpFixture::new(true, Some("synthetic-fixture-token"));
+    for suffix in [
+        "%2F..%2Fother.git",
+        "%5C..%5Cother.git",
+        "%252F..%252Fother.git",
+    ] {
+        let error = fixture
+            .observe_to(
+                &format!("{}{suffix}", fixture.url),
+                Some("synthetic-fixture-token"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("noncanonical"), "{error}");
+        assert!(!fixture.temp.path().join("requests.jsonl").exists());
+        assert_eq!(fixture.tip(), fixture.child);
+    }
+    fixture
+        .source
+        .config()
+        .unwrap()
+        .set_str("url.https://127.0.0.1:1/other.git.insteadOf", &fixture.url)
+        .unwrap();
+    assert!(fixture
+        .observe_to(&fixture.url, Some("synthetic-fixture-token"))
+        .is_err());
+    assert!(!fixture.temp.path().join("requests.jsonl").exists());
+    assert_eq!(fixture.tip(), fixture.child);
 }

@@ -312,6 +312,121 @@ fn publish_with_callbacks<'cb>(
     Ok(prepared)
 }
 
+/// A read snapshot is recovery evidence, never permission to repeat a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitPublicationObservation {
+    /// The approved old tip is still advertised. This cannot establish that an
+    /// earlier uncertain publication failed; the durable caller keeps its hold.
+    NotObserved,
+    Observed(Oid),
+}
+
+/// Inspect the approved child ref without push negotiation, receive-pack or
+/// local ref updates. Unknown/missing tips and transport/proof errors remain
+/// reconciliation failures. Approval, identity, revocation, SVN correspondence
+/// and durable journal provenance are still the caller's responsibility.
+pub fn observe_pinned_child_with_policy(
+    repo: &Repository,
+    remote_url: &str,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+    http_auth_token: Option<&str>,
+    policy: PinnedPushPolicy,
+) -> Result<GitPublicationObservation, GitError> {
+    require_observation_inputs(repo, branch, expected_old, prepared)?;
+    match policy {
+        PinnedPushPolicy::GitProtocolV1 => observe_remote_child(
+            pinned_remote(repo, remote_url, policy)?,
+            branch,
+            expected_old,
+            prepared,
+        ),
+        PinnedPushPolicy::SmartHttpV1 => {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .map_err(|_| git2::Error::from_str("could not initialize pinned HTTP client"))?;
+            observe_http_with_client(
+                repo,
+                remote_url,
+                branch,
+                expected_old,
+                prepared,
+                http_auth_token,
+                client,
+            )
+        }
+    }
+}
+
+fn require_observation_inputs(
+    repo: &Repository,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+) -> Result<(), GitError> {
+    require_complete_git_graph(repo)?;
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{branch}"))
+        || expected_old.is_zero()
+        || prepared == expected_old
+        || !repo.graph_descendant_of(prepared, expected_old)?
+    {
+        return Err(git2::Error::from_str("invalid pinned child observation inputs").into());
+    }
+    repo.find_commit(prepared)?;
+    Ok(())
+}
+
+fn observe_http_with_client(
+    repo: &Repository,
+    remote_url: &str,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+    token: Option<&str>,
+    client: reqwest::Client,
+) -> Result<GitPublicationObservation, GitError> {
+    require_observation_inputs(repo, branch, expected_old, prepared)?;
+    require_pinned_push_endpoint_with_policy(repo, remote_url, PinnedPushPolicy::SmartHttpV1)?;
+    let transport = HttpTransport::new(remote_url, token, client)?;
+    observe_remote_child(
+        checked_anonymous_remote(repo, &transport.endpoint)?,
+        branch,
+        expected_old,
+        prepared,
+    )
+}
+
+fn observe_remote_child(
+    mut remote: git2::Remote<'_>,
+    branch: &str,
+    expected_old: Oid,
+    prepared: Oid,
+) -> Result<GitPublicationObservation, GitError> {
+    let target = format!("refs/heads/{branch}");
+    let mut options = FetchOptions::new();
+    options.follow_redirects(RemoteRedirect::None);
+    options.remote_callbacks(no_credentials());
+    // Download only operation-local objects; no fetch/update of local refs and
+    // no receive-pack service, even when the expected result already exists.
+    remote.download(&[&target], Some(&mut options))?;
+    let advertised: Vec<_> = remote
+        .list()?
+        .iter()
+        .filter(|head| head.name() == target)
+        .map(|head| head.oid())
+        .collect();
+    remote.disconnect()?;
+    match advertised.as_slice() {
+        [tip] if *tip == prepared => Ok(GitPublicationObservation::Observed(prepared)),
+        [tip] if *tip == expected_old => Ok(GitPublicationObservation::NotObserved),
+        _ => Err(git2::Error::from_str("child ref differs from pinned recovery states").into()),
+    }
+}
+
 #[cfg(all(test, unix))]
 #[path = "publication_http_tests.rs"]
 mod http_tests;

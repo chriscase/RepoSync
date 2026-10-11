@@ -143,6 +143,15 @@ ordinary certificate and hostname verification. Only that pinned client receives
 the explicitly resolved HTTP token; libgit2 receives no credential helper, agent
 or token fallback. SSH, file, local and scp transports remain unsupported.
 
+The standalone Git recovery observer now reads only the approved child ref
+through those same pinned transport protections. It downloads operation-local
+objects without changing local refs or invoking receive-pack. Exact prepared
+SHA is observed publication evidence; the old input tip is only `NotObserved`,
+not proof of a failed earlier attempt and never permission for a blind retry.
+Missing, older, other-parent or later child tips refuse recovery. Identity,
+revocation, corresponding SVN evidence, journal provenance and durable holds
+remain requirements of the unfinished execution caller.
+
 Any error after publication negotiation is an uncertain remote outcome. A
 verification redirect after a successful write also leaves an uncertain result.
 Recovery first observes the remote and compares it with durable evidence. It
