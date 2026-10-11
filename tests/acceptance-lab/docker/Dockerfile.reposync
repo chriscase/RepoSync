@@ -1,0 +1,51 @@
+# Acceptance-lab daemon image. Builds the real daemon and the shipped React
+# bundle. It does not replace the repository's production Dockerfile.
+# Pins are build args so prepare can record the toolchain identity.
+
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+ARG RUST_IMAGE=rust:1.83.0-bookworm
+ARG NODE_IMAGE=node:22.14.0-bookworm-slim
+
+FROM ${NODE_IMAGE} AS ui
+WORKDIR /ui
+COPY web-ui/package.json web-ui/package-lock.json ./
+RUN npm ci
+COPY web-ui/ ./
+RUN npm run build
+RUN test -f dist/index.html
+
+FROM ${RUST_IMAGE} AS rust
+WORKDIR /src
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev cmake ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml ./
+COPY crates ./crates
+# Two cargo jobs: the public Ubuntu runner is 4 CPUs / 16 GB. Measure before
+# raising this. There is no root Cargo.lock at the recorded base; the resolved
+# graph is copied out of the image as evidence rather than written into a
+# shared lockfile owned by another lane.
+ENV CARGO_BUILD_JOBS=2
+RUN cargo build --release --bin reposync-daemon --bin reposync \
+    && cargo metadata --format-version 1 --offline > /tmp/cargo-metadata.json \
+    && rustc --version > /tmp/rustc-version.txt \
+    && test -x target/release/reposync-daemon \
+    && test -x target/release/reposync
+
+FROM ${DEBIAN_IMAGE} AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git libssl3 sqlite3 subversion util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --home-dir /var/lib/reposync --shell /usr/sbin/nologin reposync
+COPY --from=rust /src/target/release/reposync-daemon /usr/local/bin/reposync-daemon
+COPY --from=rust /src/target/release/reposync /usr/local/bin/reposync
+COPY --from=ui /ui/dist /usr/local/bin/static
+COPY --from=rust /tmp/cargo-metadata.json /usr/local/share/acceptance-lab/cargo-metadata.json
+COPY --from=rust /tmp/rustc-version.txt /usr/local/share/acceptance-lab/rustc-version.txt
+COPY tests/acceptance-lab/docker/reposync-entrypoint.sh /usr/local/bin/lab-entrypoint.sh
+RUN chmod 755 /usr/local/bin/lab-entrypoint.sh /usr/local/bin/reposync-daemon /usr/local/bin/reposync \
+    && test -f /usr/local/bin/static/index.html
+USER root
+WORKDIR /var/lib/reposync
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/lab-entrypoint.sh"]

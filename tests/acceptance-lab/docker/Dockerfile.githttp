@@ -1,0 +1,10 @@
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      apache2 ca-certificates git \
+    && a2enmod cgi alias env ssl \
+    && rm -rf /var/lib/apt/lists/*
+COPY githttp-entrypoint.sh /usr/local/bin/githttp-entrypoint.sh
+RUN chmod 755 /usr/local/bin/githttp-entrypoint.sh
+EXPOSE 8443
+ENTRYPOINT ["/usr/local/bin/githttp-entrypoint.sh"]

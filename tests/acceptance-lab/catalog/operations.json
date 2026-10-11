@@ -1,0 +1,2167 @@
+{
+  "schema": "reposync.acceptance-lab.operations.v1",
+  "catalog_status": "frozen_audit",
+  "frozen_catalog_sha256": "427f264e613486379eaaabf0d51bd7a3d79fb0297f6ee3654caf3342b80c4223",
+  "inspected_sha": "068562a90bfafd9b2a142cea524a89574814cba5",
+  "operations": [
+    {
+      "id": "LAB_SMOKE_STACK",
+      "title": "Lab services answer on the per-run network",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_EGRESS_REJECTED",
+      "title": "App network cannot reach an external host",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_CANARY_DETECTS_CONTACT",
+      "title": "Denied-target canary records a real request",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_DENIED_TARGET_NO_CONTACT",
+      "title": "Unenrolled target is not contacted",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R08",
+        "R16"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_BROWSER_LOCAL_LOGIN",
+      "title": "Local admin login through the shipped UI",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R20"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_BROWSER_LDAP_LOGIN",
+      "title": "LDAP login through the shipped UI",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R18"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_TEAM_SVN_TO_GIT",
+      "title": "Team SVN to Git transfer with intermediate and final trees",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R12"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_TEAM_GIT_TO_SVN",
+      "title": "Team Git to SVN transfer",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_TEAM_SECOND_SYNC_NOOP",
+      "title": "Second unchanged sync does no work",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_SVN_LDAP_AUTH",
+      "title": "SVN HTTPS rejects a bad directory password and accepts a real one",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16",
+        "R18"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_GITEA_LDAP_LOGIN",
+      "title": "Gitea LDAP login",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R18"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_GITEA_API_NOT_GHE",
+      "title": "Gitea API compatibility is not GitHub Enterprise qualification",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R24"
+      ],
+      "contract": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "LAB_WEBHOOK_TAMPER",
+      "title": "Tampered webhook is rejected",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R24"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED"
+    },
+    {
+      "id": "LAB_DAEMON_RESTART",
+      "title": "Stop and restart the daemon",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R04",
+        "R22"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_LOST_REPLY",
+      "title": "Lost reply after a successful upstream write",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R05",
+        "R23"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED"
+    },
+    {
+      "id": "LAB_PERSONAL_IMPORT",
+      "title": "Personal-mode import on an independent data directory",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R12"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_PERSONAL_ROUNDTRIP",
+      "title": "Personal-mode direct Git push is not claimed",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "NOT_IMPLEMENTED"
+    },
+    {
+      "id": "LAB_SVNSERVE_TRANSPORT",
+      "title": "svnserve transport fixture is reachable and is not the LDAP claim",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_BARE_GIT_HTTP",
+      "title": "Bare Git HTTPS fixture is reachable and is not a provider claim",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_NOTIFICATION_SINK_ONLY",
+      "title": "Notifications stay on the lab sink",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_SCOPES",
+      "title": "Blocked path is not published",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_SOAK_REPEAT",
+      "title": "Repeated seeded cycles, separate from functional qualification",
+      "suite": "soak",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "R21_COMPANY_INSTALLED_VERSION",
+      "title": "Unknown company-installed version",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R21"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "The deployed company version is NOT ESTABLISHED. This stays NOT_RUN even if library migration fixtures pass."
+    },
+    {
+      "id": "R21_PINNED_OLD_BINARY",
+      "title": "Pinned synthetic old install binary",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R21"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "No pinned historical daemon/UI artifact is vendored. Building the current tree again is not an old install."
+    },
+    {
+      "id": "R13_UPDATE_FROM_PARENT_SUCCESS",
+      "title": "Successful coordinated update-from-parent",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R13"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "Production update-from-parent execution is not claimed. PAIR-REFRESH-EXECUTE records the refusal and does not count as the successful workflow."
+    },
+    {
+      "id": "R14_REANCHOR_SUCCESS",
+      "title": "Re-anchor success",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R14"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "Re-anchor is refused by the product as not implemented. PAIR-REANCHOR records that refusal. The lab does not invent a successful re-anchor."
+    },
+    {
+      "id": "GHE_QUALIFICATION",
+      "title": "GitHub Enterprise qualification",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R24"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "Gitea success is not GitHub Enterprise qualification. No enterprise tenant is contacted."
+    },
+    {
+      "id": "LIVE_ENTERPRISE",
+      "title": "Live enterprise or company run",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R21"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "No live enterprise, company, registration, or security change is authorized."
+    },
+    {
+      "id": "CURSOR_CLOUD_QUALIFICATION",
+      "title": "Cursor Cloud qualification",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "This session has no Cursor Cloud runner. Preparation steps are documented. Qualification stays NOT_RUN."
+    },
+    {
+      "id": "OMARCHY_VM_QUALIFICATION",
+      "title": "Omarchy disposable VM qualification",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "The same launcher is the Omarchy path inside a disposable Ubuntu VM. This session did not run that VM."
+    },
+    {
+      "id": "PRODUCTION_FAULT_HOOKS",
+      "title": "In-process publication barriers",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R05"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "reason": "Reviewed production fault hooks are not in lab-owned files. Lost reply uses the external TLS proxy. Hooks were not added to another owner's sources."
+    },
+    {
+      "id": "GIT-ADD-REGULAR",
+      "title": "Add one regular file (Git mode 100644) and fast-forward the paired branch",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R19"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-EDIT-REGULAR",
+      "title": "Edit bytes of an already-paired regular file and fast-forward",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R19"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-DELETE-REGULAR",
+      "title": "Delete one tracked regular file in Git and fast-forward",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R19"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-RENAME-REGULAR",
+      "title": "Rename a regular file inside the active projection",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19",
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-COPY-EQUIVALENT-ADD",
+      "title": "Git has no first-class copy. A copied file is a new blob/path on a descendant commit",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-EXECUTABLE",
+      "title": "Change a paired file to Git mode 100755 or introduce an executable file",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19",
+        "R01"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-SYMLINK",
+      "title": "Commit a Git symlink, or write through a versioned symlink parent",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-EOL",
+      "title": "Line-ending conversion, svn:eol-style, or core.autocrlf rewriting",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-BINARY-REGULAR",
+      "title": "Add or edit a binary regular file (NUL bytes, mode 100644), not an LFS pointer",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19",
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-LFS-ONGOING",
+      "title": "New commit that introduces or modifies a Git LFS object after the pair is already syncing",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "NEEDS_PRODUCT_DECISION",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-MULTI-COMMIT-LINEAR",
+      "title": "Several linear unsynced commits, including more than one per cycle",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R10"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-BRANCH-CREATE-DERIVED",
+      "title": "Create a Git branch from a verified SVN-derived tip and request pairing",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R06",
+        "R08"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-BRANCH-CREATE-UNRELATED",
+      "title": "Pair a Git branch whose root is not a descendant of a verified SVN import",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R08"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-BRANCH-DELETE",
+      "title": "Delete the paired Git branch on the host",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02",
+        "R16"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-BRANCH-RECREATE",
+      "title": "Delete and recreate the paired Git branch at a new unrelated tip, or at a rewritten tip",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R15",
+        "R16",
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-TAG-LIFECYCLE",
+      "title": "Create, delete, or move a Git tag. Pair refresh fetch uses --no-tags",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-FETCH-PULL",
+      "title": "RepoSync fetch of the paired branch, including the user's git pull on a developer clone",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-PUSH-FF",
+      "title": "Developer or RepoSync fast-forward push of the paired ref",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-MERGE-DAG",
+      "title": "A true merge commit whose parents are inside a qualified P..R frontier that fits one batch",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R10",
+        "R09"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-MERGE-DAG-OVER-CAP",
+      "title": "Merge-DAG frontier larger than the continuation cap",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R10"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-SQUASH-NEW-DESCENDANT",
+      "title": "Squash merge that creates one new descendant commit and fast-forwards the paired branch",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R09"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-SQUASH-FORCE-SYNCED",
+      "title": "Replace already-synced commits by a squashed commit and force-push",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-CHERRY-PICK-NEW",
+      "title": "Cherry-pick of an already-synced commit as a new descendant SHA, then fast-forward",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R09"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-REVERT-NEW",
+      "title": "git revert of a synced commit, producing a new descendant that undoes it",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-LOCAL-REBASE-UNPUBLISHED",
+      "title": "Rebase or amend that exists only in the bridge checkout or a developer clone and was never pushed",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-PUBLISHED-REBASE-UNSYNCED-OBSERVED",
+      "title": "Rebase of commits that were pushed but not yet checkpointed, after RepoSync has observed the pre-rebase tip",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED",
+      "title": "Rebase and force-push of never-synced commits before RepoSync has stored an observed tip newer than P",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-PUBLISHED-REBASE-SYNCED",
+      "title": "Rebase of commits that already have SVN mappings, then force-push",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-AMEND-UNSYNCED",
+      "title": "Amend a pushed but not-yet-synced commit",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-AMEND-SYNCED",
+      "title": "Amend message-only or content of an already-synced commit and force-push",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-RESET-LOCAL",
+      "title": "git reset in a developer clone or a dirty bridge, not a published force-push",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-FORCE-PUSH-SYNCED",
+      "title": "Force-push a non-fast-forward update of an already-synced paired branch",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09",
+        "R24"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-FORCE-WITH-LEASE",
+      "title": "git push --force-with-lease of a rewritten paired branch. RepoSync observes the resulting tip, not the lease flag",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09",
+        "R11"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "hosting",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "GIT-CONFLICT-BOTH",
+      "title": "The same regular file, or a rename/delete pair, changed on SVN and on Git since the mapping",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R07",
+        "R13",
+        "R19"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-MISSING-OBJECT",
+      "title": "Checkpoint object or pending object is missing, including a shallow clone",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R10"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-OVER-1000",
+      "title": "More than 1000 linear pending commits, and the same shape as a merge DAG",
+      "suite": "soak",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R10"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-HOST-PROTECTION",
+      "title": "Branch protection or ruleset rejects force-push or deletion of a paired ref",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R24",
+        "R16"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "n/a",
+      "audit_evidence": "NOT_RUN",
+      "reason": "No disposable host ruleset is configured and no company host is contacted. Product branch protection is not claimed."
+    },
+    {
+      "id": "GIT-AUTH-REJECT",
+      "title": "Git remote authentication failure while polling or pushing",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-CONCURRENT-TIP",
+      "title": "The advertised remote SHA changes between ls-remote and fetch",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R10",
+        "R09"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-WEBHOOK-ABSENT-DELAY-DUP",
+      "title": "Webhook absent, delayed, duplicated, or out of order. Polling remains the gate",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R09",
+        "R24"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "GIT-DOTFILE",
+      "title": "Add a dotfile that is not reserved bridge metadata",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-ADD",
+      "title": "svn add of a regular file and commit on the paired path",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R19"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-EDIT",
+      "title": "Edit file bytes in SVN and commit",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-DELETE",
+      "title": "svn delete of one in-scope file",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-MOVE",
+      "title": "svn move (copy plus delete) of a file or directory inside the paired path",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15",
+        "R19"
+      ],
+      "contract": "NEEDS_PRODUCT_DECISION",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-COPY",
+      "title": "svn copy of a file or subtree, including copy-from a prior revision",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15",
+        "R06"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-REPLACE",
+      "title": "svn delete and add of the same path in one revision (replace)",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-PROPS-EOL-KEYWORDS-EXECUTABLE",
+      "title": "svn:eol-style, svn:keywords, svn:executable, and other file properties",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R19",
+        "R15"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team+personal",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-SYMLINK",
+      "title": "svn:special symlink in the paired tree",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-EXTERNALS",
+      "title": "svn:externals definitions or external contents",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R19"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "personal+team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-EMPTY-REV",
+      "title": "An SVN revision that changes nothing inside the paired path (empty relative to the project)",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R15"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-PROP-ONLY-REV",
+      "title": "A revision that changes only SVN properties",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01",
+        "R15"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-BRANCH-COPY",
+      "title": "Operator or RepoSync copies trunk to branches/name at a pinned revision",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R06",
+        "R11"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-TAG-COPY",
+      "title": "svn copy of a tag path as a release mirror",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R11"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-MERGE-NORMAL",
+      "title": "A normal svn merge from a parent path that commits new content plus mergeinfo",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15",
+        "R13"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-MERGE-REVERSE",
+      "title": "Reverse merge (svn merge -c -N) recorded as a new revision",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-MERGE-CHERRY",
+      "title": "svn merge -c of a single parent revision (cherry-pick merge)",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-MERGEINFO-ONLY",
+      "title": "A commit that changes only svn:mergeinfo",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R15"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-REV-GAP",
+      "title": "Unrelated SVN revisions outside the paired path, so the paired revision numbers jump",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R15",
+        "R10"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-TREE-CONFLICT",
+      "title": "Tree conflict: delete versus edit, or rename versus rename",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R07",
+        "R19"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-BINARY-CONFLICT",
+      "title": "Both sides changed the same binary regular file",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R07"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "personal+team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-PATH-INCARNATION",
+      "title": "Delete and recreate the paired SVN path, or copy a different source over it",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R15",
+        "R08"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-UUID-REPLACE",
+      "title": "Replace the SVN repository at the same URL so the UUID changes",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R15",
+        "R16"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-PERMISSION",
+      "title": "SVN path authorization denies read or commit while authentication succeeds",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "SVN-AUTH",
+      "title": "SVN authentication failure",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "SVN-TRANSPORT",
+      "title": "SVN server unreachable",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-IMPORT-FULL",
+      "title": "Full-history SVN import, the default when import_mode is omitted",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R12",
+        "R01",
+        "R03"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-IMPORT-SNAPSHOT",
+      "title": "Snapshot import at HEAD or a selected revision, with earlier history omitted on purpose",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R11",
+        "R12"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-LATE-PREVIEW",
+      "title": "Preview late pairing of an SVN-derived Git branch",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R06",
+        "R08"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-LATE-PUBLISH",
+      "title": "Publish a late pair: copy SVN from the proven baseline and replay pending Git commits once",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R06"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-LATE-EXISTING-SVN",
+      "title": "Late pair when the SVN branch path already exists and has its own commits",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R07",
+        "R06"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-PARENT-AHEAD",
+      "title": "Parent has new SVN or Git commits; the child pair does not",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R07",
+        "R13"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-CHILD-AHEAD",
+      "title": "Child has Git or SVN commits the parent lacks",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R06",
+        "R13"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-BOTH-DIVERGED",
+      "title": "Parent and child each have unsynced work since the mapping",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R07",
+        "R13"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-REFRESH-PREVIEW",
+      "title": "Read-only update-pair-from-parent preview",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R13"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-REFRESH-EXECUTE",
+      "title": "Execute history-preserving update of a child pair from its parent",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R13",
+        "R14"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-REFRESH-STALE-AND-REPEAT",
+      "title": "Stale preview digest, duplicate preview, and idempotency key reuse",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R13",
+        "R24"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-REANCHOR",
+      "title": "Re-anchor or recreate a pair, retiring a generation without pretending it is an ordinary refresh",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R14",
+        "R13"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-GENERATION",
+      "title": "Pair generation change, echo-receipt scope, and stale receipt after a bump",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R15",
+        "R22"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-DISABLE",
+      "title": "Disable synchronization without deleting local data or remotes",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02",
+        "R18"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-LEGACY-ROOT-DELETE",
+      "title": "Legacy DELETE of a root repository registration",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-MANAGED-REMOVE",
+      "title": "Remove RepoSync's owned local data and keep remotes",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02",
+        "R18"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-REMOTE-DELETE-EXPLICIT",
+      "title": "Explicit deletion of the remote Git ref and SVN path, only when opted in",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R02",
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-CANCEL-IMPORT",
+      "title": "Cancel one full import by operation id at a real phase boundary",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R03",
+        "R04"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-RESTART-HELD",
+      "title": "Restart the process while an import or publication is reconciliation_required",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R04",
+        "R05",
+        "R23"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-CONCURRENT-REPOS",
+      "title": "Two repositories sync or import at once with the same revision numbers and branch names",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-UPGRADE-SYNTHETIC",
+      "title": "Open a synthetic old installation with the current binary and sync one new change each way",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R21",
+        "R22"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL",
+      "reason": "No pinned historical daemon or UI artifact is vendored. Building the current tree again is not an old install. The company-installed version is NOT ESTABLISHED."
+    },
+    {
+      "id": "PAIR-RESTORE-PREWRITE",
+      "title": "Restore an old DB and old binary before any external write of the new binary",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R22",
+        "R23"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "PAIR-RECOVERY-POSTWRITE",
+      "title": "Remote commit succeeded and the DB write failed. Do not restore the old DB and replay",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R05",
+        "R23",
+        "R01"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "PAIR-CANCEL-RESTART-GENERATION",
+      "title": "Cancel, then start a new import, while the old worker is still stopping",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R04"
+      ],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "LDAP-AUTH-VALID",
+      "title": "Valid LDAP user logs in",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R24"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-AUTH-INVALID",
+      "title": "Wrong LDAP password",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-MISSING-USER",
+      "title": "Username not in the directory",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-SERVICE-BIND-SEARCH",
+      "title": "Service account bind and subtree search",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-FILTER-ESCAPE",
+      "title": "Username characters *, (, ), \\, and NUL are escaped before the search filter",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-DUP-OR-MISSING-ATTR",
+      "title": "Duplicate or missing mail, display name, or group attributes",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [],
+      "contract": "NEEDS_PRODUCT_DECISION",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-GROUP-ROLE",
+      "title": "Authorize admin or operator actions from LDAP groups",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-IDENTITY-MAP",
+      "title": "Map SVN authors to Git authors. This is not LDAP login",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "team+personal",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-BIND-ROTATION",
+      "title": "Rotate the service bind password",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-OUTAGE",
+      "title": "Directory unreachable, and behavior on the next attempt",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SAFE_REFUSAL_REQUIRED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-TLS",
+      "title": "TLS certificate verification, and the insecure override",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-SESSION-EXPIRY-LOGOUT",
+      "title": "Session expires after 24 hours, logout, and disabled-user revocation",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "LDAP-FALLTHROUGH",
+      "title": "LDAP failure falls through to the local password database",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [],
+      "contract": "NEEDS_PRODUCT_DECISION",
+      "mode": "web",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-SETUP",
+      "title": "First-time setup wizard: test connections, apply config, start import, cancel",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R12",
+        "R03"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "WEB-LOGIN",
+      "title": "Local login and the LDAP hint on the login page",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-REGISTER-IMPORT-STATUS",
+      "title": "Register a repository, choose full or snapshot import, and read status",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R03",
+        "R11",
+        "R12"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "WEB-PAIR-AND-REFRESH",
+      "title": "Pair a branch from the repo page and request refresh",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R06",
+        "R13"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-CONFLICTS",
+      "title": "List, open, resolve, or defer a conflict",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R07"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-AUDIT-HISTORY",
+      "title": "Audit log, commit map, and sync records",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-ADMIN-CONFIG-LDAP",
+      "title": "Admin pages for users, config, notifications, and LDAP",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-DELETE-NAV",
+      "title": "Deleting the pair that is on screen navigates to the parent and does not keep polling it",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "WEB-BACK-RELOAD-DEEPLINK",
+      "title": "Back, reload, and a stale deep link after deletion",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R20"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "WEB-STALE-ERROR-PERMISSION",
+      "title": "Stale client cache, visible errors, and non-admin permission failures",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R18",
+        "R24"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-RECONNECT",
+      "title": "WebSocket reconnect after the daemon drops",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": false,
+      "r_criteria": [],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "WEB-SKIP-COMMIT",
+      "title": "Operator skips a specific commit",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN"
+    },
+    {
+      "id": "HOST-ACTIONS-CLIENT",
+      "title": "Manual GitHub Actions or local client requests a preview, status, or import cancel",
+      "suite": "full",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R24"
+      ],
+      "contract": "SUPPORTED",
+      "mode": "team",
+      "audit_evidence": "PARTIAL"
+    },
+    {
+      "id": "HOST-WEBHOOK-LIVE",
+      "title": "Live GitHub or SVN webhook subscription",
+      "suite": "full",
+      "disposition": "not_run",
+      "supports_workflow": false,
+      "r_criteria": [
+        "R24"
+      ],
+      "contract": "NOT_IMPLEMENTED",
+      "mode": "team",
+      "audit_evidence": "NOT_RUN",
+      "reason": "No company webhook, ruleset, or workflow_dispatch is registered. Loopback signature checks are LAB_WEBHOOK_TAMPER."
+    },
+    {
+      "id": "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT",
+      "title": "Existing real-engine scenario R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN",
+      "title": "Existing real-engine scenario R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP",
+      "title": "Existing real-engine scenario R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R01_SVNSERVE_FAILED_APPLY_BARRIER",
+      "title": "Existing real-engine scenario R01_SVNSERVE_FAILED_APPLY_BARRIER",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R01_SVNSERVE_FAILED_APPLY_RETRY",
+      "title": "Existing real-engine scenario R01_SVNSERVE_FAILED_APPLY_RETRY",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R01_SVNSERVE_POST_WRITE_RECOVERY",
+      "title": "Existing real-engine scenario R01_SVNSERVE_POST_WRITE_RECOVERY",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R01"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
+      "title": "Existing real-engine scenario R16_SVNSERVE_GIT_REMOTE_UNREACHABLE",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE",
+      "title": "Existing real-engine scenario R16_SVNSERVE_SVN_REMOTE_UNREACHABLE",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_SVN_AUTH_DENIED",
+      "title": "Existing real-engine scenario R16_SVNSERVE_SVN_AUTH_DENIED",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_MISSING_GIT_BRANCH",
+      "title": "Existing real-engine scenario R16_SVNSERVE_MISSING_GIT_BRANCH",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_CREDENTIAL_ROTATION",
+      "title": "Existing real-engine scenario R16_SVNSERVE_CREDENTIAL_ROTATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_PARENT_CHILD_CREDENTIAL_CHAIN_ROTATION",
+      "title": "Existing real-engine scenario R16_SVNSERVE_PARENT_CHILD_CREDENTIAL_CHAIN_ROTATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_SVN_REMOTE_RECREATION",
+      "title": "Existing real-engine scenario R16_SVNSERVE_SVN_REMOTE_RECREATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R16_SVNSERVE_GIT_REMOTE_RECREATION",
+      "title": "Existing real-engine scenario R16_SVNSERVE_GIT_REMOTE_RECREATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R16"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_CONCURRENT_OVERLAP",
+      "title": "Existing real-engine scenario R17_SVNSERVE_CONCURRENT_OVERLAP",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_CHECKPOINT_ISOLATION",
+      "title": "Existing real-engine scenario R17_SVNSERVE_CHECKPOINT_ISOLATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_CREDENTIAL_ISOLATION",
+      "title": "Existing real-engine scenario R17_SVNSERVE_CREDENTIAL_ISOLATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_JOB_ISOLATION",
+      "title": "Existing real-engine scenario R17_SVNSERVE_JOB_ISOLATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD",
+      "title": "Existing real-engine scenario R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD",
+      "title": "Existing real-engine scenario R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    },
+    {
+      "id": "R17_SVNSERVE_NOTIFICATION_ISOLATION",
+      "title": "Existing real-engine scenario R17_SVNSERVE_NOTIFICATION_ISOLATION",
+      "suite": "full",
+      "disposition": "engine",
+      "supports_workflow": true,
+      "r_criteria": [
+        "R17"
+      ],
+      "contract": "SUPPORTED",
+      "reason": "Executed by scripts/real-engine-scenario-suite.sh. A lab journey does not mark this row PASS."
+    }
+  ]
+}

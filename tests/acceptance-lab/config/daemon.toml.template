@@ -1,0 +1,45 @@
+# Generated per acceptance-lab run. Synthetic lab hostnames only.
+[daemon]
+poll_interval_secs = 30
+log_level = "info"
+data_dir = "/var/lib/reposync"
+memory_limit_mb = 1536
+
+[svn]
+url = "https://svn:8443/svn/bootstrap"
+username = "svc-sync"
+password_env = "REPOSYNC_SVN_PASSWORD"
+layout = "standard"
+trunk_path = "trunk"
+branches_path = "branches"
+tags_path = "tags"
+webhook_secret_env = "REPOSYNC_SVN_WEBHOOK_SECRET"
+
+[github]
+provider = "gitea"
+api_url = "https://gitea:3000/api/v1"
+git_base_url = "https://gitea:3000"
+repo = "lab/bootstrap"
+token_env = "REPOSYNC_GITHUB_TOKEN"
+webhook_secret_env = "REPOSYNC_WEBHOOK_SECRET"
+default_branch = "main"
+
+[identity]
+mapping_file = "/etc/reposync/authors.toml"
+email_domain = "lab.invalid"
+ldap_url = "ldaps://ldap:636"
+ldap_base_dn = "dc=lab,dc=invalid"
+ldap_bind_dn = "uid=svc-bind,ou=services,dc=lab,dc=invalid"
+ldap_bind_password_env = "REPOSYNC_LDAP_PASSWORD"
+
+[web]
+listen = "0.0.0.0:8080"
+session_secret_env = "REPOSYNC_SESSION_SECRET"
+auth_mode = "simple"
+admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
+
+[sync]
+mode = "direct"
+auto_merge = true
+sync_branches = true
+sync_tags = true

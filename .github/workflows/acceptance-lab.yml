@@ -1,0 +1,261 @@
+name: Acceptance lab
+
+on:
+  pull_request:
+    paths:
+      - tests/acceptance-lab/**
+      - scripts/acceptance-lab.sh
+      - docs/acceptance-lab/**
+      - .github/workflows/acceptance-lab.yml
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: smoke, full, or soak
+        type: choice
+        options:
+          - smoke
+          - full
+          - soak
+        default: smoke
+      seed:
+        description: Integer seed
+        type: string
+        default: "1"
+
+# Least privilege: contents: read checks out the repository. Artifact upload
+# obtains an Actions runtime token of its own. This workflow makes no
+# repository Actions API call, so it does not grant actions: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: acceptance-lab-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-daemon:
+    name: Build daemon image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Record runner resources
+        run: |
+          echo "documented public runner: 4 vCPU, 16 GB RAM, 14 GB SSD"
+          nproc
+          head -n 8 /proc/meminfo
+          df -h
+
+      - name: Resolve candidate
+        id: id
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "candidate=${sha}"
+          echo "github_sha=${{ github.sha }}"
+          echo "pr_head=${{ github.event.pull_request.head.sha }}"
+          echo "audited=068562a90bfafd9b2a142cea524a89574814cba5"
+          echo "recorded_live_main=af394285869bdffa5f156c651cd1104027832749"
+          echo "pr194=6c84adf858a8a2e5d7ac3a9f618bee1834f4d297"
+
+      - name: Build daemon image
+        env:
+          ACCEPTANCE_LAB_PREPARE_SCOPE: daemon
+          ACCEPTANCE_LAB_ARTIFACT_ROOT: ${{ runner.temp }}/acceptance-lab
+        run: scripts/acceptance-lab.sh prepare --candidate "${{ steps.id.outputs.sha }}"
+
+      - name: Save daemon image
+        run: docker save "rsacc-reposync:${{ steps.id.outputs.sha }}" | gzip -1 > "${{ runner.temp }}/reposync-image.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-lab-daemon-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/reposync-image.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  engine:
+    name: Real-engine suite
+    if: github.event_name == 'workflow_dispatch' && (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'soak')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install svn and git
+        run: sudo apt-get update && sudo apt-get install -y subversion git
+
+      - name: Run real-engine suite
+        id: engine
+        continue-on-error: true
+        env:
+          GIT_AUTHOR_NAME: Test User
+          GIT_AUTHOR_EMAIL: test@example.com
+          GIT_COMMITTER_NAME: Test User
+          GIT_COMMITTER_EMAIL: test@example.com
+          REPOSYNC_TEST_SVN_PW: fixture-only-svn-secret
+          REPOSYNC_TEST_GH_TOKEN: fixture-only-git-secret
+        run: |
+          unset GITHUB_TOKEN || true
+          unset GH_TOKEN || true
+          unset SSH_AUTH_SOCK || true
+          scripts/real-engine-scenario-suite.sh
+
+      - name: Stage engine summary or the missing-artifact record
+        if: always()
+        run: node tests/acceptance-lab/src/ci-gate.mjs stage-engine --root artifacts/real-engine-scenarios --dest "${RUNNER_TEMP}/engine-upload"
+
+      - name: Upload engine summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-lab-engine-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/engine-upload
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Fail when the engine summary is missing
+        if: always()
+        run: node tests/acceptance-lab/src/ci-gate.mjs require-engine --dest "${RUNNER_TEMP}/engine-upload"
+
+      - name: Preserve engine exit
+        if: always() && steps.engine.outcome == 'failure'
+        run: exit 1
+
+  browser:
+    name: Browser and stack
+    needs: build-daemon
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      LAB_EVENT_NAME: ${{ github.event_name }}
+      LAB_SUITE_INPUT: ${{ github.event.inputs.suite }}
+      LAB_SEED_INPUT: ${{ github.event.inputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Record runner resources
+        run: |
+          echo "documented public runner: 4 vCPU, 16 GB RAM, 14 GB SSD"
+          nproc
+          head -n 8 /proc/meminfo
+          df -h
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: acceptance-lab-daemon-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/daemon-image
+
+      - name: Load daemon image
+        run: docker load --input "${{ runner.temp }}/daemon-image/reposync-image.tar.gz"
+
+      - name: Install lab package
+        run: npm --prefix tests/acceptance-lab ci --ignore-scripts --cache "${{ runner.temp }}/npm-cache"
+
+      - name: Install Chromium
+        run: npm --prefix tests/acceptance-lab exec -- playwright install --with-deps chromium
+
+      - name: Run acceptance lab
+        id: lab
+        continue-on-error: true
+        env:
+          ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD: "1"
+          ACCEPTANCE_LAB_SKIP_ENGINE: "1"
+          ACCEPTANCE_LAB_ARTIFACT_ROOT: ${{ runner.temp }}/acceptance-lab
+          LAB_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAB_GITHUB_SHA: ${{ github.sha }}
+          LAB_GITHUB_EVENT: ${{ github.event_name }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          resolved="${RUNNER_TEMP}/acceptance-lab-selection.env"
+          node tests/acceptance-lab/src/ci-gate.mjs resolve --out "$resolved"
+          # resolve writes only an allowlisted suite and an integer seed.
+          . "$resolved"
+          scripts/acceptance-lab.sh test --suite "$SUITE" --candidate "$sha" --seed "$SEED"
+
+      - name: Record missing runtime artifacts
+        if: always()
+        run: node tests/acceptance-lab/src/ci-gate.mjs note-publish --root "${RUNNER_TEMP}/acceptance-lab"
+
+      - name: Upload scrubbed publish directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-lab-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-lab/*/publish
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Fail when required runtime artifacts are missing
+        if: always()
+        run: node tests/acceptance-lab/src/ci-gate.mjs require-publish --root "${RUNNER_TEMP}/acceptance-lab"
+
+      - name: Clean this run
+        if: always()
+        env:
+          ACCEPTANCE_LAB_ARTIFACT_ROOT: ${{ runner.temp }}/acceptance-lab
+        run: |
+          id_file="${RUNNER_TEMP}/acceptance-lab-run-id"
+          if [ -f "$id_file" ]; then
+            scripts/acceptance-lab.sh clean --run-id "$(cat "$id_file")"
+          fi
+
+      - name: Preserve lab exit
+        if: always() && steps.lab.outcome == 'failure'
+        run: exit 1
+
+  report:
+    name: Candidate report
+    if: always()
+    needs:
+      - build-daemon
+      - browser
+      - engine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      LAB_EVENT_NAME: ${{ github.event_name }}
+      LAB_SUITE_INPUT: ${{ github.event.inputs.suite }}
+      LAB_SEED_INPUT: ${{ github.event.inputs.seed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: acceptance-lab-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence
+
+      - uses: actions/download-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'soak')
+        continue-on-error: true
+        with:
+          name: acceptance-lab-engine-${{ github.run_id }}-${{ github.run_attempt }}
+          path: engine
+
+      - name: Aggregate one report
+        id: report
+        run: |
+          sha="$(git rev-parse HEAD)"
+          node tests/acceptance-lab/src/ci-gate.mjs aggregate --evidence evidence --engine engine --report-dir "${RUNNER_TEMP}/acceptance-lab-report" --candidate "$sha"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-lab-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-lab-report
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Fail on infrastructure gaps or a suite that did not pass
+        if: always()
+        run: node tests/acceptance-lab/src/ci-gate.mjs enforce --evidence evidence --engine engine --report-dir "${RUNNER_TEMP}/acceptance-lab-report"

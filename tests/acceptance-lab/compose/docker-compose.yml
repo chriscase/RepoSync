@@ -1,0 +1,334 @@
+# Per-run lab topology. The launcher sets COMPOSE_PROJECT_NAME, published
+# loopback ports, images, and the run directory. The network is internal.
+
+services:
+  ldap:
+    image: ${LDAP_IMAGE}
+    hostname: ldap
+    environment:
+      LDAP_ORGANISATION: RepoSync Lab
+      LDAP_DOMAIN: lab.invalid
+      LDAP_BASE_DN: dc=lab,dc=invalid
+      LDAP_ADMIN_PASSWORD: ${LDAP_ADMIN_PASSWORD}
+      LDAP_CONFIG_PASSWORD: ${LDAP_ADMIN_PASSWORD}
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: ldap.crt
+      LDAP_TLS_KEY_FILENAME: ldap.key
+      LDAP_TLS_CA_CRT_FILENAME: ca.crt
+      LDAP_TLS_ENFORCE: "false"
+      LDAP_REMOVE_CONFIG_AFTER_SETUP: "false"
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/container/service/slapd/assets/certs:ro
+      - ${LAB_RUN_DIR}/ldap-seed.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/50-lab.ldif:ro
+    networks: [lab]
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "ldapsearch -H ldaps://ldap:636 -x -D cn=admin,dc=lab,dc=invalid -w \"$$LDAP_ADMIN_PASSWORD\" -b dc=lab,dc=invalid -s base dn >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  svn:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.svn
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
+    image: ${SVN_IMAGE}
+    hostname: svn
+    environment:
+      LDAP_BIND_DN: uid=svc-bind,ou=services,dc=lab,dc=invalid
+      LDAP_BIND_PASSWORD: ${LDAP_BIND_PASSWORD}
+      LDAP_BASE_DN: dc=lab,dc=invalid
+      SVN_SYNC_PASSWORD: ${SVN_SYNC_PASSWORD}
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - ${LAB_RUN_DIR}/svn-apache.conf:/etc/reposync/svn-apache.conf:ro
+      - ${LAB_RUN_DIR}/svn-authz:/etc/reposync/svn-authz:ro
+      - svn-data:/var/svn
+    ports:
+      - 127.0.0.1:${LAB_SVN_PORT}:8443
+    networks: [lab]
+    depends_on:
+      ldap:
+        condition: service_healthy
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "svn info --non-interactive --config-dir /var/svn/svn-config --username svc-sync --password \"$$SVN_SYNC_PASSWORD\" https://svn:8443/svn/bootstrap >/dev/null"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  svnserve:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.svnserve
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
+    image: ${SVNSERVE_IMAGE}
+    hostname: svnserve
+    volumes:
+      - ${LAB_RUN_DIR}/svnserve-passwd:/etc/reposync/svnserve-passwd:ro
+      - ${LAB_RUN_DIR}/svnserve-authz:/etc/reposync/svnserve-authz:ro
+      - svnserve-data:/var/svnserve
+    ports:
+      - 127.0.0.1:${LAB_SVNSERVE_PORT}:3690
+    networks: [lab]
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+  gitea:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.gitea
+      args:
+        GITEA_IMAGE: ${GITEA_IMAGE}
+    image: ${GITEA_LAB_IMAGE}
+    hostname: gitea
+    init: true
+    mem_limit: 1g
+    environment:
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__server__PROTOCOL: https
+      GITEA__server__DOMAIN: gitea
+      GITEA__server__ROOT_URL: https://gitea:3000/
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__CERT_FILE: /certs/gitea.crt
+      GITEA__server__KEY_FILE: /certs/gitea.key
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__webhook__ALLOWED_HOST_LIST: "*"
+      USER_UID: "1000"
+      USER_GID: "1000"
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - gitea-data:/data
+    ports:
+      - 127.0.0.1:${LAB_GITEA_PORT}:3000
+    networks: [lab]
+    depends_on:
+      ldap:
+        condition: service_healthy
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert /certs/ca.crt --resolve gitea:3000:127.0.0.1 https://gitea:3000/api/v1/version >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  git-http:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.githttp
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
+    image: ${GITHTTP_IMAGE}
+    hostname: git-http
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - ../docker/githttp-apache.conf:/etc/reposync/githttp-apache.conf:ro
+      - githttp-data:/var/git
+    ports:
+      - 127.0.0.1:${LAB_GITHTTP_PORT}:8443
+    networks: [lab]
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+  denied:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.pyenv
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
+    image: ${PYENV_IMAGE}
+    hostname: denied-target
+    user: "0:0"
+    command: ["python3", "/opt/lab/denied_target.py"]
+    environment:
+      DENIED_LOG: /logs/access.log
+      DENIED_CERT: /certs/denied.crt
+      DENIED_KEY: /certs/denied.key
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - denied-logs:/logs
+    networks: [lab]
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+  notify:
+    image: ${PYENV_IMAGE}
+    hostname: notify-sink
+    user: "0:0"
+    command: ["python3", "/opt/lab/notify_sink.py"]
+    environment:
+      NOTIFY_LOG: /logs/notify.log
+    volumes:
+      - notify-logs:/logs
+    networks: [lab]
+    depends_on:
+      denied:
+        condition: service_started
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+  fault:
+    image: ${PYENV_IMAGE}
+    hostname: fault-proxy
+    user: "0:0"
+    command: ["python3", "/opt/lab/fault_proxy.py"]
+    environment:
+      UPSTREAM_HOST: svn
+      UPSTREAM_PORT: "8443"
+      LISTEN_PORT: "8443"
+      CONTROL_PORT: "8090"
+      UPSTREAM_CA: /certs/ca.crt
+      PROXY_CERT: /certs/fault.crt
+      PROXY_KEY: /certs/fault.key
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+    ports:
+      - 127.0.0.1:${LAB_FAULT_PORT}:8443
+      - 127.0.0.1:${LAB_FAULT_CONTROL_PORT}:8090
+    networks: [lab]
+    depends_on:
+      svn:
+        condition: service_healthy
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+  observer:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.observer
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
+    image: ${OBSERVER_IMAGE}
+    hostname: observer
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - observer-work:/work
+    networks: [lab]
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+  reposync:
+    profiles: ["app"]
+    build:
+      context: ../../..
+      dockerfile: tests/acceptance-lab/docker/Dockerfile.reposync
+      args:
+        DEBIAN_IMAGE: ${DEBIAN_IMAGE}
+        RUST_IMAGE: ${RUST_IMAGE}
+        NODE_IMAGE: ${NODE_IMAGE}
+    image: ${REPOSYNC_IMAGE}
+    hostname: reposync
+    init: true
+    mem_limit: 2g
+    environment:
+      REPOSYNC_ADMIN_PASSWORD: ${REPOSYNC_ADMIN_PASSWORD}
+      REPOSYNC_SVN_PASSWORD: ${SVN_SYNC_PASSWORD}
+      REPOSYNC_GITHUB_TOKEN: ${GITEA_ADMIN_TOKEN}
+      REPOSYNC_SESSION_SECRET: ${REPOSYNC_SESSION_SECRET}
+      REPOSYNC_WEBHOOK_SECRET: ${REPOSYNC_WEBHOOK_SECRET}
+      REPOSYNC_SVN_WEBHOOK_SECRET: ${REPOSYNC_SVN_WEBHOOK_SECRET}
+      REPOSYNC_LDAP_PASSWORD: ${LDAP_BIND_PASSWORD}
+      HOME: /var/lib/reposync
+      GIT_CONFIG_GLOBAL: /var/lib/reposync/lab.gitconfig
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_TERMINAL_PROMPT: "0"
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - ${LAB_RUN_DIR}/daemon.toml:/etc/reposync/config.toml:ro
+      - ${LAB_RUN_DIR}/authors.toml:/etc/reposync/authors.toml:ro
+      - reposync-data:/var/lib/reposync
+    ports:
+      - 127.0.0.1:${LAB_UI_PORT}:8080
+    networks: [lab]
+    depends_on:
+      svn:
+        condition: service_healthy
+      gitea:
+        condition: service_healthy
+      ldap:
+        condition: service_healthy
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_MODULE
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/status/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+networks:
+  lab:
+    name: ${COMPOSE_PROJECT_NAME}-lab
+    internal: true
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
+volumes:
+  svn-data:
+    name: ${COMPOSE_PROJECT_NAME}-svn
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  svnserve-data:
+    name: ${COMPOSE_PROJECT_NAME}-svnserve
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  gitea-data:
+    name: ${COMPOSE_PROJECT_NAME}-gitea
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  githttp-data:
+    name: ${COMPOSE_PROJECT_NAME}-githttp
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  reposync-data:
+    name: ${COMPOSE_PROJECT_NAME}-reposync
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  observer-work:
+    name: ${COMPOSE_PROJECT_NAME}-observer
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  denied-logs:
+    name: ${COMPOSE_PROJECT_NAME}-denied
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  notify-logs:
+    name: ${COMPOSE_PROJECT_NAME}-notify
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"

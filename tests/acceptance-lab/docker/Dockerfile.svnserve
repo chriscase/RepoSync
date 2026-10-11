@@ -1,0 +1,9 @@
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends subversion util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --shell /usr/sbin/nologin svn
+COPY svnserve-entrypoint.sh /usr/local/bin/svnserve-entrypoint.sh
+RUN chmod 755 /usr/local/bin/svnserve-entrypoint.sh
+EXPOSE 3690
+ENTRYPOINT ["/usr/local/bin/svnserve-entrypoint.sh"]

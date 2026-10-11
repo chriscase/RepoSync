@@ -1,0 +1,18 @@
+{
+  "name": "reposync-acceptance-lab",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Isolated Playwright acceptance lab. This lockfile is not the web-ui lockfile.",
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@playwright/test": "1.55.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.14.0",
+    "typescript": "5.8.3"
+  }
+}

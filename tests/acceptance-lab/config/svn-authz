@@ -1,0 +1,8 @@
+[groups]
+writers = svc-sync,alice,bob
+readers = observer
+
+[:/]
+@readers = r
+@writers = rw
+* =

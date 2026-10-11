@@ -1,0 +1,7 @@
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+FROM ${DEBIAN_IMAGE}
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY fault_proxy.py denied_target.py notify_sink.py /opt/lab/
+RUN useradd --system --create-home --shell /usr/sbin/nologin lab
+USER lab
