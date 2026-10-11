@@ -110,6 +110,18 @@ Recover the actual child-path revision by marker, affected path, ancestry and
 tree/property/mergeinfo evidence. Repository HEAD and `previous revision + 1`
 are insufficient. Duplicate or ambiguous marker matches retain a hold.
 
+The standalone read-only observer now finds an exact, unique operation message
+in complete child copy history. It requires exactly one child revision after
+the approved input, an unchanged direct copy origin, root mergeinfo modification,
+no changed paths outside the child, and only copy sources from the pinned parent.
+It checks all result properties against the parent plus approved mergeinfo and
+checks all file bytes, modes and directory topology in a fresh pegged checkout.
+A final complete-history read refuses subsequent child work; unrelated repository
+HEAD advances are allowed. Repeating observation performs no remote write.
+`NotObserved` is an observation of missing evidence, never authorization to
+repeat an uncertain commit. Journal provenance, holds and a publication caller
+are still required before this observer can be part of enabled execution.
+
 Publish Git only after the SVN result is verified and recorded. Use one normal
 refspec for the prepared SHA and child branch. The negotiation callback requires
 the exact advertised old tip, prepared new tip and destination ref. Receive-pack
