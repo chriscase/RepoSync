@@ -284,14 +284,11 @@ pub fn resolve_repo_import_baseline(
     }
 
     let scoped_svn_key = format!("last_svn_rev_{repo_id}");
-    let scoped_git_key = format!("last_git_sha_{repo_id}");
     let scoped_svn = db
-        .get_state(&scoped_svn_key)?
+        .get_state(&format!("last_svn_rev_{repo_id}"))?
         .and_then(|value| value.parse::<i64>().ok());
-    let has_scoped_git = db
-        .get_state(&scoped_git_key)?
-        .filter(|value| !value.is_empty())
-        .is_some();
+    let has_scoped_git =
+        crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)?.is_some();
     let has_scoped_svn = scoped_svn.is_some_and(|rev| rev > 0);
 
     // Team sync checkpoints columns plus scoped `last_svn_rev_<repo>` without always
@@ -337,7 +334,17 @@ pub fn resolve_repo_import_baseline(
         });
     }
 
-    if has_scoped_svn || has_scoped_git {
+    if has_scoped_git {
+        return Ok(RepoImportBaseline::ReconciliationRequired {
+            reason: "orphan_scoped_import_checkpoint".into(),
+            detail: "per-repo import cursors exist without a finalized repository checkpoint"
+                .into(),
+        });
+    }
+    if has_scoped_svn {
+        if repo.last_svn_rev > 0 && repo.last_git_sha.is_empty() {
+            return Ok(RepoImportBaseline::Pending);
+        }
         return Ok(RepoImportBaseline::ReconciliationRequired {
             reason: "orphan_scoped_import_checkpoint".into(),
             detail: "per-repo import cursors exist without a finalized repository checkpoint"
@@ -492,7 +499,8 @@ fn complete_import_tx(
         ));
     }
     write_value(tx, &format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())?;
-    write_value(tx, &format!("last_git_sha_{repo_id}"), sha)?;
+    let now = Utc::now().to_rfc3339();
+    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, repo_id, sha, &now)?;
     op.state = ImportOperationState::Completed;
     op.updated_at = Utc::now().to_rfc3339();
     write_value(
@@ -990,7 +998,8 @@ impl Database {
             )?;
             if checkpoint != 0 || !checkpoint_sha.is_empty() || last_sync_at.is_some()
                 || read_value(tx, &format!("last_svn_rev_{repo_id}"))?.is_some_and(|v| v != "0")
-                || read_value(tx, &format!("last_git_sha_{repo_id}"))?.is_some_and(|v| !v.is_empty()) {
+                || crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
+                    .is_some() {
                 return Err(DatabaseError::Other("repository checkpoint changed during held import".into()));
             }
             let svn_rev = op.last_local_svn_rev.ok_or_else(|| DatabaseError::Other("missing local import revision".into()))?;
@@ -2008,6 +2017,22 @@ mod tests {
                 ..
             } if reason == "orphan_scoped_import_checkpoint"
         ));
+    }
+
+    #[test]
+    fn resolve_repo_import_baseline_pending_when_svn_scoped_without_git_checkpoint() {
+        let (_dir, db, _workdir) = open_repo("blocked-git");
+        db.conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev=3, last_git_sha='' WHERE id='blocked-git'",
+                [],
+            )
+            .unwrap();
+        db.set_state("last_svn_rev_blocked-git", "3").unwrap();
+        assert_eq!(
+            resolve_repo_import_baseline(&db, "blocked-git").unwrap(),
+            RepoImportBaseline::Pending
+        );
     }
 
     #[test]

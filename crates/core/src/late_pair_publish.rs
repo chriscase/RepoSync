@@ -503,12 +503,18 @@ fn apply_baseline_watermarks(
     baseline_git_sha: &str,
     svn_rev: i64,
 ) -> Result<(), LatePairPublishRefusal> {
-    db.set_state(&format!("last_git_sha_{child_id}"), baseline_git_sha)
-        .map_err(|e| LatePairPublishRefusal {
-            reason: "watermark_failed".into(),
-            detail: format!("failed to set scoped git watermark: {e}"),
-            plan: None,
-        })?;
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &db.conn(),
+        child_id,
+        baseline_git_sha,
+        &now,
+    )
+    .map_err(|e| LatePairPublishRefusal {
+        reason: "watermark_failed".into(),
+        detail: format!("failed to set scoped git watermark: {e}"),
+        plan: None,
+    })?;
     db.set_state(&format!("last_svn_rev_{child_id}"), &svn_rev.to_string())
         .map_err(|e| LatePairPublishRefusal {
             reason: "watermark_failed".into(),
@@ -620,7 +626,7 @@ async fn replay_pending_git(
         .map(|r| r.last_git_sha.clone())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            db.get_state(&format!("last_git_sha_{}", child.id))
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(db, &child.id)
                 .ok()
                 .flatten()
         });
@@ -681,9 +687,7 @@ async fn replay_pending_git(
             .map(|r| r.last_git_sha.clone())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                engine
-                    .db()
-                    .get_state(&format!("last_git_sha_{}", child.id))
+                crate::echo_receipt_scope::read_scoped_last_git_sha_kv(engine.db(), &child.id)
                     .ok()
                     .flatten()
             })
@@ -711,9 +715,7 @@ async fn replay_pending_git(
             .map(|r| r.last_git_sha.clone())
             .filter(|s| !s.is_empty())
             .or_else(|| {
-                engine
-                    .db()
-                    .get_state(&format!("last_git_sha_{}", child.id))
+                crate::echo_receipt_scope::read_scoped_last_git_sha_kv(engine.db(), &child.id)
                     .ok()
                     .flatten()
             })
@@ -741,9 +743,7 @@ async fn replay_pending_git(
         .map(|r| r.last_git_sha.clone())
         .filter(|s| !s.is_empty())
         .or_else(|| {
-            engine
-                .db()
-                .get_state(&format!("last_git_sha_{}", child.id))
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(engine.db(), &child.id)
                 .ok()
                 .flatten()
         })
@@ -1015,6 +1015,15 @@ pub async fn publish_admitted_late_pair(
             .map_err(db_err)?
             .is_none()
         {
+            if let Err(error) =
+                crate::db::repo_scope_identity::validate_human_repository_id(&child.id)
+            {
+                return Err(LatePairPublishRefusal {
+                    reason: "child_insert_failed".into(),
+                    detail: error.to_string(),
+                    plan: Some(Box::new(plan.clone())),
+                });
+            }
             db.insert_repository(&child)
                 .map_err(|e| LatePairPublishRefusal {
                     reason: "child_insert_failed".into(),

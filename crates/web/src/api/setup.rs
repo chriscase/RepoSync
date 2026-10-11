@@ -587,7 +587,7 @@ async fn apply_config(
             }
         } else {
             let new_repo = reposync_core::models::Repository {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: reposync_core::db::repo_scope_identity::new_human_repository_id(),
                 name: body.git_repo.clone(),
                 svn_url: body.svn_url.clone(),
                 svn_branch: body.svn_trunk_path.clone().unwrap_or_default(),

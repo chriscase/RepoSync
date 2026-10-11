@@ -382,7 +382,7 @@ fn git_remote_identity_nonempty(repo: &Repository) -> bool {
     !repo.git_api_url.trim().is_empty() && !repo.git_repo.trim().is_empty()
 }
 
-fn owned_secret_keys(repo_id: &str) -> [String; 2] {
+pub(crate) fn owned_secret_keys(repo_id: &str) -> [String; 2] {
     [
         format!("secret_svn_password_{repo_id}"),
         format!("secret_git_token_{repo_id}"),
@@ -1321,9 +1321,15 @@ impl Database {
         let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
             DatabaseError::Other(format!("encryption key unavailable: {error}"))
         })?;
+        {
+            let conn = self.conn();
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
+        }
         self.transaction(|tx| {
             let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
-            let inbound_last_git_sha = read_value(tx, &format!("last_git_sha_{repo_id}"))?;
+            let inbound_last_git_sha =
+                crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
+                    .filter(|value| !value.is_empty());
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
@@ -1401,10 +1407,16 @@ impl Database {
                 tx.execute("DELETE FROM kv_state WHERE key=?1", [&secret_key])?;
                 tx.execute("DELETE FROM encrypted_secrets WHERE key=?1", [&secret_key])?;
             }
+            let scoped_svn_rev_at_removal = scoped_svn_rev(tx, repo_id)?;
+            crate::db::repo_scope_identity::purge_repository_kv_before_row_delete(tx, repo_id)?;
             if tx.execute("DELETE FROM repositories WHERE id=?1", [repo_id])? != 1 {
                 return Err(DatabaseError::Other(
                     "registration row was not removed".into(),
                 ));
+            }
+            crate::db::repo_scope_identity::after_repository_row_deleted(tx)?;
+            if let Some(rev) = scoped_svn_rev_at_removal {
+                write_value(tx, &format!("last_svn_rev_{repo_id}"), &rev.to_string())?;
             }
             op.state = ManagedRemoveState::Completed;
             op.restore_supported = true;
@@ -1567,7 +1579,13 @@ impl Database {
                     .as_ref()
                     .filter(|value| !value.is_empty())
                 {
-                    write_value(tx, &format!("last_git_sha_{repo_id}"), inbound)?;
+                    let now = chrono::Utc::now().to_rfc3339();
+                    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                        tx,
+                        repo_id,
+                        inbound,
+                        &now,
+                    )?;
                 }
             } else if baseline_restore == TombstoneBaselineRestore::Pending {
                 for scoped_key in [
@@ -2284,9 +2302,13 @@ mod tests {
                 params!["2026-01-02T00:00:00Z", repo_id],
             )
             .unwrap();
-        db.set_state(
-            &format!("last_git_sha_{repo_id}"),
-            "inboundcheckpoint0123456789abcdef0123456789",
+        let inbound_checkpoint = "inboundcheckpoint0123456789abcdef0123456789";
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &db.conn(),
+            repo_id,
+            inbound_checkpoint,
+            &now,
         )
         .unwrap();
         assert_eq!(
@@ -2342,10 +2364,10 @@ mod tests {
             Some("4")
         );
         assert_eq!(
-            db.get_state(&format!("last_git_sha_{repo_id}"))
+            crate::echo_receipt_scope::read_scoped_last_git_sha_kv(&db, repo_id)
                 .unwrap()
                 .as_deref(),
-            Some("inboundcheckpoint0123456789abcdef0123456789")
+            Some(inbound_checkpoint)
         );
         assert_eq!(
             resolve_repo_import_baseline(&db, repo_id).unwrap(),

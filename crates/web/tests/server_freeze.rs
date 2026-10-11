@@ -39,6 +39,11 @@ use reposync_web::AppState;
 // Test helpers
 // ---------------------------------------------------------------------------
 
+fn inbound_git_sha_kv(db: &Database, repo_id: &str) -> Option<String> {
+    reposync_core::echo_receipt_scope::read_scoped_last_git_sha_kv(db, repo_id)
+        .expect("read inbound git sha kv")
+}
+
 /// A fixed test token pre-seeded into every test server's session map.
 const TEST_TOKEN: &str = "test-session-token-for-freeze-tests";
 
@@ -4298,12 +4303,7 @@ mod import_reconciliation_tests {
             Some("3")
         );
         assert_eq!(
-            fixture
-                .state
-                .db
-                .get_state(&format!("last_git_sha_{}", fixture.id))
-                .unwrap()
-                .as_deref(),
+            inbound_git_sha_kv(&fixture.state.db, &fixture.id).as_deref(),
             Some(before.0.as_str())
         );
         assert!(fixture
@@ -8553,13 +8553,15 @@ async fn candidate_r65_restore_managed_registration() {
             [repo_id],
         )
         .unwrap();
-    state
-        .db
-        .set_state(
-            &format!("last_git_sha_{repo_id}"),
-            "inboundcheckpoint0123456789abcdef0123456789",
-        )
-        .unwrap();
+    let inbound_checkpoint = "inboundcheckpoint0123456789abcdef0123456789";
+    let now = chrono::Utc::now().to_rfc3339();
+    reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &state.db.conn(),
+        repo_id,
+        inbound_checkpoint,
+        &now,
+    )
+    .unwrap();
     let data = state.config.daemon.data_dir.clone();
     std::fs::create_dir_all(data.join("repos").join(repo_id)).unwrap();
 
@@ -8591,12 +8593,8 @@ async fn candidate_r65_restore_managed_registration() {
         Some("restore-token")
     );
     assert_eq!(
-        state
-            .db
-            .get_state(&format!("last_git_sha_{repo_id}"))
-            .unwrap()
-            .as_deref(),
-        Some("inboundcheckpoint0123456789abcdef0123456789")
+        inbound_git_sha_kv(&state.db, repo_id).as_deref(),
+        Some(inbound_checkpoint)
     );
     assert_eq!(
         state

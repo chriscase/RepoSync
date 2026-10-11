@@ -398,8 +398,11 @@ async fn create_repo(
     }
 
     let now = Utc::now().to_rfc3339();
+    let repo_id = reposync_core::db::repo_scope_identity::new_human_repository_id();
+    reposync_core::db::repo_scope_identity::validate_human_repository_id(&repo_id)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let repo = reposync_core::models::Repository {
-        id: Uuid::new_v4().to_string(),
+        id: repo_id,
         name: body.name,
         svn_url: body.svn_url,
         svn_branch: body.svn_branch,
@@ -3233,7 +3236,7 @@ async fn create_branch_pair(
         &baseline.git_sha,
         baseline.svn_revision,
     );
-    let fallback_child = Uuid::new_v4().to_string();
+    let fallback_child = reposync_core::db::repo_scope_identity::new_human_repository_id();
     let child_id = resolve_publish_child_id(db, &parent.id, &fingerprint, &fallback_child)
         .map_err(|e| AppError::Internal(format!("database error: {e}")))?;
     if existing_children
