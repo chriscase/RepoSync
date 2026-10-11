@@ -315,6 +315,32 @@ the emitted SVN merge and inherit the parent work without duplicate replay.
 
 ## Evidence before enabling execution
 
+The registered-source prerequisite captures both direct-pair registrations,
+established checkpoint copies and strict credential chains in one read
+transaction. It refuses unsupported modes/projections/LFS, noncanonical or
+credential-bearing URLs, shared branch endpoints, and incomplete SVN
+credentials. The bounded Git transport requires distinct branches on one HTTPS
+remote. Safe preview metadata contains a credential-context HMAC; credential
+values are neither serialized nor included in Debug output.
+
+Registered-source journal admission compares those actual endpoints, branches,
+identities and configuration with the preparation in the same transaction
+creating both holds. Its checked intent transitions additionally require the
+current writer, both process busy slots, quiet ordinary windows/journals and
+conflicts, and current strict credentials. A repeated intent refuses rather
+than authorizing publication again. These checks are local input evidence;
+they do not prove live remote state, authorize an actor or enable the API.
+
+Refresh SVN clients retain separate private configuration directories for their
+entire clone lifetime, disable platform password stores and credential caching,
+and use only the captured explicit credentials or anonymous access. Subversion
+documents that an explicit configuration directory overrides other configuration
+sources in [svn_config_get_config](https://subversion.apache.org/docs/api/latest/svn__config_8h.html).
+Disposable authenticated svnserve controls demonstrate a readable ambient cache
+with the ordinary CLI, refusal with missing or incorrect refresh passwords,
+success with the explicit password, and unchanged ambient cache contents. This
+is authentication evidence; full publication/recovery proof remains below.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary

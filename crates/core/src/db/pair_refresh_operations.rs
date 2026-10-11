@@ -28,6 +28,13 @@ use crate::pair_refresh::svn_preparation::PreparedCleanChildSvn;
 const PREFIX: &str = "pair_refresh_execution_v2:";
 const FAMILY: &str = "pair_refresh_execution_";
 
+#[derive(PartialEq, Eq)]
+enum AdmissionValidation {
+    Storage,
+    Credentials,
+    RegisteredSources,
+}
+
 fn refused(detail: &str) -> DatabaseError {
     DatabaseError::Other(format!("pair refresh journal: {detail}"))
 }
@@ -787,6 +794,33 @@ fn release(tx: &Connection, op: &PairRefreshOperation) -> Result<(), DatabaseErr
     Ok(())
 }
 
+fn require_held_execution_inputs(
+    tx: &Connection,
+    id: Uuid,
+    busy: &crate::busy::PairBusyGuard,
+) -> Result<PairRefreshOperation, DatabaseError> {
+    crate::writer_fence::require_owned_current(tx)?;
+    let op = owned_operation(tx, id)?;
+    if !op.phase.holds_scopes() || !busy.owns_pair(&op.pins.child.repo_id, &op.pins.parent.repo_id)
+    {
+        return Err(refused("execution does not own both held process scopes"));
+    }
+    require_pins_current(tx, &op.pins)?;
+    require_execution_conflicts_quiet(tx, &op.pins)?;
+    for pin in [&op.pins.child, &op.pins.parent] {
+        require_other_journals_quiet(tx, &pin.repo_id)?;
+        super::ordinary_writer_windows::require_quiet_for_refresh(
+            tx,
+            &pin.repo_id,
+            &pin.scope_uuid,
+        )?;
+    }
+    for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+        require_other_journals_quiet(tx, id)?;
+    }
+    Ok(op)
+}
+
 impl Database {
     pub fn pair_refresh_operation(
         &self,
@@ -818,7 +852,14 @@ impl Database {
         pins: RefreshJobPins,
         busy: &crate::busy::PairBusyGuard,
     ) -> Result<PairRefreshOperation, DatabaseError> {
-        self.admit_pair_refresh_guarded(initiator, request, approved_digest, pins, busy, false)
+        self.admit_pair_refresh_guarded(
+            initiator,
+            request,
+            approved_digest,
+            pins,
+            busy,
+            AdmissionValidation::Storage,
+        )
     }
 
     /// The execution caller must authenticate the initiator and independently
@@ -832,7 +873,35 @@ impl Database {
         pins: RefreshJobPins,
         busy: &crate::busy::PairBusyGuard,
     ) -> Result<PairRefreshOperation, DatabaseError> {
-        self.admit_pair_refresh_guarded(initiator, request, approved_digest, pins, busy, true)
+        self.admit_pair_refresh_guarded(
+            initiator,
+            request,
+            approved_digest,
+            pins,
+            busy,
+            AdmissionValidation::Credentials,
+        )
+    }
+
+    /// Bind registered endpoints/branches and strict credentials in the same
+    /// transaction creating both holds. The caller must still authenticate the
+    /// actor and independently prove live remotes, correspondence and approval.
+    pub fn admit_pair_refresh_with_registered_sources(
+        &self,
+        initiator: &str,
+        request: &str,
+        approved_digest: &str,
+        pins: RefreshJobPins,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<PairRefreshOperation, DatabaseError> {
+        self.admit_pair_refresh_guarded(
+            initiator,
+            request,
+            approved_digest,
+            pins,
+            busy,
+            AdmissionValidation::RegisteredSources,
+        )
     }
 
     fn admit_pair_refresh_guarded(
@@ -842,14 +911,21 @@ impl Database {
         approved_digest: &str,
         pins: RefreshJobPins,
         busy: &crate::busy::PairBusyGuard,
-        current_credentials: bool,
+        validation: AdmissionValidation,
     ) -> Result<PairRefreshOperation, DatabaseError> {
         self.transaction(|tx| {
             let epoch = crate::writer_fence::require_owned_current(tx)?;
             pins.validate()?;
-            if current_credentials {
+            if validation != AdmissionValidation::Storage {
                 require_credentials_current(tx, &pins)?;
                 require_execution_conflicts_quiet(tx, &pins)?;
+            }
+            if validation == AdmissionValidation::RegisteredSources {
+                crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                    tx,
+                    &pins.child.repo_id,
+                )?
+                .require_job_configuration(&pins)?;
             }
             if !busy.owns_pair(&pins.child.repo_id, &pins.parent.repo_id) {
                 return Err(refused("admission does not own both process busy slots"));
@@ -934,28 +1010,106 @@ impl Database {
         busy: &crate::busy::PairBusyGuard,
     ) -> Result<super::pair_refresh_credentials::RefreshCredentials, DatabaseError> {
         self.transaction(|tx| {
-            crate::writer_fence::require_owned_current(tx)?;
-            let op = owned_operation(tx, id)?;
-            if !op.phase.holds_scopes()
-                || !busy.owns_pair(&op.pins.child.repo_id, &op.pins.parent.repo_id)
-            {
-                return Err(refused("execution does not own both held process scopes"));
-            }
-            require_pins_current(tx, &op.pins)?;
-            require_execution_conflicts_quiet(tx, &op.pins)?;
-            for pin in [&op.pins.child, &op.pins.parent] {
-                require_other_journals_quiet(tx, &pin.repo_id)?;
-                super::ordinary_writer_windows::require_quiet_for_refresh(
-                    tx,
-                    &pin.repo_id,
-                    &pin.scope_uuid,
-                )?;
-            }
-            for id in super::personal_scope::personal_repo_ids_for_journal_read() {
-                require_other_journals_quiet(tx, id)?;
-            }
+            let op = require_held_execution_inputs(tx, id, busy)?;
             require_credentials_current(tx, &op.pins)
         })
+    }
+
+    /// Resolve explicit clients only from current held registrations. This is
+    /// local input proof; fresh independent remote evidence remains required.
+    pub fn require_registered_pair_refresh_execution(
+        &self,
+        id: Uuid,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        DatabaseError,
+    > {
+        self.transaction(|tx| {
+            let op = require_held_execution_inputs(tx, id, busy)?;
+            let configuration =
+                crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                    tx,
+                    &op.pins.child.repo_id,
+                )?;
+            configuration.require_job_configuration(&op.pins)?;
+            Ok(configuration)
+        })
+    }
+
+    fn record_registered_refresh_intent(
+        &self,
+        id: Uuid,
+        expected: PairRefreshPhase,
+        next: PairRefreshPhase,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<
+        (
+            PairRefreshOperation,
+            crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        ),
+        DatabaseError,
+    > {
+        self.transaction(|tx| {
+            let mut op = require_held_execution_inputs(tx, id, busy)?;
+            if op.phase != expected || op.reconciliation_detail.is_some() {
+                return Err(refused(
+                    "publication phase changed or requires reconciliation",
+                ));
+            }
+            let configuration =
+                crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                    tx,
+                    &op.pins.child.repo_id,
+                )?;
+            configuration.require_job_configuration(&op.pins)?;
+            op.phase = next;
+            op.updated_at = Utc::now().to_rfc3339();
+            write_op(tx, &op)?;
+            Ok((op, configuration))
+        })
+    }
+
+    /// Persist the first SVN intent with current local inputs and busy ownership.
+    /// The caller must prove fresh remote pins before calling this method.
+    pub fn record_pair_refresh_svn_intent_with_registered_sources(
+        &self,
+        id: Uuid,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<
+        (
+            PairRefreshOperation,
+            crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        ),
+        DatabaseError,
+    > {
+        self.record_registered_refresh_intent(
+            id,
+            PairRefreshPhase::Prepared,
+            PairRefreshPhase::SvnIntent,
+            busy,
+        )
+    }
+
+    /// Persist the first Git intent after independent SVN receipt observation.
+    /// An existing intent or reconciliation hold never authorizes a retry.
+    pub fn record_pair_refresh_git_intent_with_registered_sources(
+        &self,
+        id: Uuid,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<
+        (
+            PairRefreshOperation,
+            crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        ),
+        DatabaseError,
+    > {
+        self.record_registered_refresh_intent(
+            id,
+            PairRefreshPhase::SvnObserved,
+            PairRefreshPhase::GitIntent,
+            busy,
+        )
     }
 
     fn advance_refresh(

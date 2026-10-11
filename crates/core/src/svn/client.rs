@@ -25,6 +25,7 @@ pub struct SvnClient {
     username: String,
     password: String,
     cancel: Option<Arc<AtomicBool>>,
+    refresh_config: Option<Arc<tempfile::TempDir>>,
 }
 
 // Custom Debug implementation that redacts the password field.
@@ -74,9 +75,62 @@ impl SvnClient {
             username: username.into(),
             password: password.into(),
             cancel: None,
+            refresh_config: None,
         };
         info!(url = %client.url, username = %client.username, "created SvnClient");
         client
+    }
+
+    /// Refresh clients never read the daemon user's SVN configuration, cached
+    /// credentials or platform password stores. The private directory remains
+    /// alive until the last client clone drops; ordinary clients are unchanged.
+    pub(crate) fn new_isolated_refresh(
+        url: &str,
+        username: &str,
+        password: Option<&str>,
+    ) -> Result<Self, SvnError> {
+        if password.is_some_and(|value| value.is_empty())
+            || password.is_some() == username.is_empty()
+        {
+            return Err(SvnError::CommandFailed {
+                exit_code: -1,
+                stderr: "refresh requires a complete explicit SVN credential or anonymous access"
+                    .into(),
+            });
+        }
+        let config = tempfile::Builder::new()
+            .prefix("reposync-refresh-auth-")
+            .tempdir()?;
+        std::fs::write(
+            config.path().join("config"),
+            "[auth]\npassword-stores =\nstore-passwords = no\nstore-auth-creds = no\n",
+        )?;
+        std::fs::write(
+            config.path().join("servers"),
+            "[global]\nstore-passwords = no\nstore-plaintext-passwords = no\nstore-ssl-client-cert-pp = no\nstore-ssl-client-cert-pp-plaintext = no\n",
+        )?;
+        let mut client = Self::new(url, username, password.unwrap_or(""));
+        client.refresh_config = Some(Arc::new(config));
+        Ok(client)
+    }
+
+    fn apply_refresh_configuration(&self, command: &mut Command) {
+        if let Some(config) = &self.refresh_config {
+            command
+                .arg("--config-dir")
+                .arg(config.path())
+                .arg("--config-option")
+                .arg("config:auth:password-stores=");
+        }
+    }
+
+    fn command_stderr(&self, bytes: &[u8]) -> String {
+        let stderr = String::from_utf8_lossy(bytes).to_string();
+        if self.refresh_config.is_some() && !self.password.is_empty() {
+            stderr.replace(&self.password, "[REDACTED]")
+        } else {
+            stderr
+        }
     }
 
     pub fn url(&self) -> &str {
@@ -631,6 +685,7 @@ impl SvnClient {
             .arg(&self.password)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.apply_refresh_configuration(&mut cmd);
 
         debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
         let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
@@ -644,7 +699,7 @@ impl SvnClient {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = self.command_stderr(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
@@ -680,6 +735,7 @@ impl SvnClient {
             .arg(&self.password)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.apply_refresh_configuration(&mut cmd);
 
         debug!(cmd = ?format!("svn {} (in {})", args.join(" "), dir.display()), "running svn command in dir");
         let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
@@ -693,7 +749,7 @@ impl SvnClient {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = self.command_stderr(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
@@ -701,7 +757,7 @@ impl SvnClient {
         // Combine stdout and stderr — some SVN operations (especially commit)
         // output the "Committed revision N" line to stderr, not stdout.
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stderr = self.command_stderr(&output.stderr);
         if stdout.is_empty() && !stderr.is_empty() {
             debug!(stderr = %stderr, "svn command produced no stdout, using stderr");
             Ok(format!("{}\n{}", stdout, stderr))
