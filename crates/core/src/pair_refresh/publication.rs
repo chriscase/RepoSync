@@ -8,8 +8,8 @@ use git2::{Cred, CredentialType, Direction, Oid, PushOptions, RemoteCallbacks, R
 
 use crate::errors::GitError;
 
-/// Check before durable admission or SVN publication. libgit2's local transport
-/// does not enforce the receive-pack expected-old-object-ID race check.
+/// Validate URL syntax. Admission must also use [`require_pinned_push_endpoint`]
+/// to reject Git configuration rewrites before any durable intent or SVN write.
 pub fn require_pinned_push_transport(remote_url: &str) -> Result<(), GitError> {
     let parsed = reqwest::Url::parse(remote_url).map_err(|_| {
         git2::Error::from_str("pair refresh requires an explicit smart transport URL")
@@ -26,6 +26,25 @@ pub fn require_pinned_push_transport(remote_url: &str) -> Result<(), GitError> {
     {
         return Err(git2::Error::from_str("unsupported pair refresh publication transport").into());
     }
+    Ok(())
+}
+
+fn pinned_remote<'repo>(
+    repo: &'repo Repository,
+    remote_url: &str,
+) -> Result<git2::Remote<'repo>, GitError> {
+    require_pinned_push_transport(remote_url)?;
+    let remote = repo.remote_anonymous(remote_url)?;
+    if remote.url() != Some(remote_url) || remote.pushurl().is_some_and(|url| url != remote_url) {
+        return Err(git2::Error::from_str("Git configuration rewrites the pinned endpoint").into());
+    }
+    Ok(remote)
+}
+
+/// Resolve both effective URLs without network I/O. Git insteadOf and
+/// pushInsteadOf rules must not substitute another transport or destination.
+pub fn require_pinned_push_endpoint(repo: &Repository, remote_url: &str) -> Result<(), GitError> {
+    pinned_remote(repo, remote_url)?;
     Ok(())
 }
 
@@ -65,7 +84,7 @@ pub fn publish_pinned_child(
     prepared: Oid,
     http_auth_token: Option<&str>,
 ) -> Result<Oid, GitError> {
-    require_pinned_push_transport(remote_url)?;
+    let mut remote = pinned_remote(repo, remote_url)?;
     let target = format!("refs/heads/{branch}");
     if !git2::Reference::is_valid_name(&target)
         || expected_old.is_zero()
@@ -75,7 +94,6 @@ pub fn publish_pinned_child(
         return Err(git2::Error::from_str("invalid pinned child publication inputs").into());
     }
     repo.find_commit(prepared)?;
-    let mut remote = repo.remote_anonymous(remote_url)?;
     let accepted = Arc::new(AtomicBool::new(false));
     let negotiated = Arc::new(AtomicBool::new(false));
     let mut callbacks = credentials(http_auth_token);

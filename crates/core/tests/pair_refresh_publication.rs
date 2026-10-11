@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use git2::{Oid, Repository, Signature};
 use reposync_core::pair_refresh::publication::{
-    publish_pinned_child, require_pinned_push_transport,
+    publish_pinned_child, require_pinned_push_endpoint, require_pinned_push_transport,
 };
 
 struct Daemon(Child);
@@ -244,4 +244,41 @@ fn admission_rejects_ambiguous_and_embedded_credentials_urls() {
         assert!(require_pinned_push_transport(url).is_err());
     }
     assert!(require_pinned_push_transport("git://127.0.0.1:9418/target.git").is_ok());
+}
+
+#[test]
+fn configured_fetch_url_rewrite_cannot_bypass_transport_admission() {
+    let fixture = Fixture::new();
+    fixture
+        .source
+        .config()
+        .unwrap()
+        .set_str(
+            &format!("url.file://{}.insteadOf", fixture.target.path().display()),
+            &fixture.url,
+        )
+        .unwrap();
+    assert!(require_pinned_push_endpoint(&fixture.source, &fixture.url).is_err());
+    assert!(fixture.publish().is_err());
+    assert_eq!(fixture.tip(), fixture.child);
+}
+
+#[test]
+fn configured_push_url_rewrite_cannot_bypass_transport_admission() {
+    let fixture = Fixture::new();
+    fixture
+        .source
+        .config()
+        .unwrap()
+        .set_str(
+            &format!(
+                "url.file://{}.pushInsteadOf",
+                fixture.target.path().display()
+            ),
+            &fixture.url,
+        )
+        .unwrap();
+    assert!(require_pinned_push_endpoint(&fixture.source, &fixture.url).is_err());
+    assert!(fixture.publish().is_err());
+    assert_eq!(fixture.tip(), fixture.child);
 }
