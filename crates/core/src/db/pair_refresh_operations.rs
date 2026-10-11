@@ -822,6 +822,90 @@ fn require_held_execution_inputs(
 }
 
 impl Database {
+    /// Read the unique completed receipt for the current child checkpoints.
+    /// None means that the first-copy baseline still needs independent proof.
+    /// A changed child after an earlier refresh cannot fall back to that case.
+    /// This read-only storage evidence does not prove current remote state or
+    /// authorize a new request; admission must revalidate the preparation.
+    pub fn capture_completed_pair_refresh_baseline(
+        &self,
+        configuration: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+    ) -> Result<Option<PairRefreshOperation>, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &configuration.pin().child.repo_id,
+            )?;
+        if current.pin() != configuration.pin() {
+            return Err(refused(
+                "registered inputs changed before baseline selection",
+            ));
+        }
+        let pin = current.pin();
+        let operations = journal(&tx)?;
+        if operations.iter().any(|op| {
+            op.phase.holds_scopes()
+                && [&op.pins.child.repo_id, &op.pins.parent.repo_id]
+                    .iter()
+                    .any(|id| **id == pin.child.repo_id || **id == pin.parent.repo_id)
+        }) {
+            return Err(refused("a held refresh cannot select a new baseline"));
+        }
+        let prior = operations
+            .iter()
+            .filter(|op| {
+                op.phase == PairRefreshPhase::Completed
+                    && op.pins.child.scope_uuid == pin.child.scope_uuid
+            })
+            .collect::<Vec<_>>();
+        if prior.is_empty() {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let mut matches = prior.into_iter().filter(|op| {
+            op.pins.git.prepared_sha == pin.child.last_git_sha
+                || op
+                    .svn_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.revision == pin.child.last_svn_rev)
+        });
+        let completed = matches
+            .next()
+            .ok_or_else(|| refused("current child has no matching completed refresh baseline"))?;
+        if matches.next().is_some() {
+            return Err(refused("ambiguous completed refresh baseline"));
+        }
+        let receipt = completed
+            .svn_receipt
+            .as_ref()
+            .ok_or_else(|| refused("completed refresh baseline has no SVN receipt"))?;
+        let same_registration = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        if completed.pins.git.prepared_sha != pin.child.last_git_sha
+            || receipt.revision != pin.child.last_svn_rev
+            || !same_registration(&completed.pins.child, &pin.child)
+            || !same_registration(&completed.pins.parent, &pin.parent)
+            || completed.pins.git_remote_url != pin.git_remote_url
+            || completed.pins.git_branch != pin.child_git_branch
+            || completed.pins.transport_policy != pin.transport_policy
+            || completed.pins.svn.pins.lineage.pins.child_url != pin.child_svn_url
+            || completed.pins.svn.pins.lineage.pins.parent_url != pin.parent_svn_url
+        {
+            return Err(refused(
+                "completed refresh baseline differs from current registration",
+            ));
+        }
+        let result = completed.clone();
+        tx.commit()?;
+        Ok(Some(result))
+    }
+
     pub fn pair_refresh_operation(
         &self,
         operation_id: Uuid,

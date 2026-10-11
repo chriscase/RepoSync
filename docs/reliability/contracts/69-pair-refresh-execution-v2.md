@@ -355,6 +355,23 @@ their separately resolved credentials through the pinned HTTPS transport. This
 proves Git inputs only; fresh remote revalidation, SVN evidence and authenticated
 execution approval are still required before publication.
 
+The corresponding SVN observer reads both registered inputs with isolated
+clients and requires one repository UUID/root/HEAD snapshot. Pegged checkpoints
+and complete branch histories must agree with the registered cursors. File,
+property, deletion and replacement revisions beyond either cursor refuse.
+Unrelated repository revisions may advance HEAD. Identity/location/HEAD drift
+during observation also refuses. This proves input history, not copy lineage or
+tree correspondence.
+
+Baseline selection rechecks the captured registration in one read transaction.
+It returns only the unique completed child receipt matching both current child
+checkpoints and unchanged registration/echo identities, endpoints and policy.
+An earlier receipt with changed or partially matching child checkpoints refuses
+rather than reverting to the initial copy. No prior receipt means independent
+first-copy and correspondence proof is still required. Credential rotation does
+not invalidate historical publication evidence; current credentials remain a
+separate admission requirement.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary

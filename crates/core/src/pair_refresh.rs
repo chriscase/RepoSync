@@ -21,6 +21,7 @@ pub mod preparation;
 pub mod publication;
 pub mod svn_observation;
 pub mod svn_preparation;
+pub mod svn_sources;
 
 /// Policy identity pinned into every preview from this slice.
 pub const POLICY_VERSION: &str = "pair_refresh_preview_v1";
