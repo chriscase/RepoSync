@@ -1,12 +1,11 @@
 //! Grok round-6 (#189): atomic removal on deferred v12, scoped KV mirror gating.
 
+use reposync_core::db::repo_scope_identity::last_git_sha_kv_key;
 use reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key;
 use reposync_core::db::{schema, Database};
 use reposync_core::echo_receipt_scope::{
-    read_scoped_last_git_sha_kv, read_team_inbound_git_checkpoint_kv,
-    write_scoped_last_git_sha_kv,
+    read_scoped_last_git_sha_kv, read_team_inbound_git_checkpoint_kv, write_scoped_last_git_sha_kv,
 };
-use reposync_core::db::repo_scope_identity::last_git_sha_kv_key;
 use reposync_core::errors::DatabaseError;
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
@@ -174,14 +173,13 @@ fn team_inbound_git_checkpoint_refuses_legacy_human_key_without_latch() {
     )
     .unwrap();
     let stale = "e".repeat(40);
-    db.set_state(&legacy_last_git_sha_kv_key("a"), &stale).unwrap();
+    db.set_state(&legacy_last_git_sha_kv_key("a"), &stale)
+        .unwrap();
     assert_eq!(
-        db.get_state("reposync_v13_legacy_repo_id_kv_reads").unwrap(),
+        db.get_state("reposync_v13_legacy_repo_id_kv_reads")
+            .unwrap(),
         Some("0".to_string())
     );
     assert_eq!(read_team_inbound_git_checkpoint_kv(&db, "a").unwrap(), None);
-    assert_eq!(
-        db.get_state(&last_git_sha_kv_key(&scope_a)).unwrap(),
-        None
-    );
+    assert_eq!(db.get_state(&last_git_sha_kv_key(&scope_a)).unwrap(), None);
 }
