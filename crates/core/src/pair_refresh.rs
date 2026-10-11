@@ -17,6 +17,7 @@ mod http_transport;
 pub mod lineage;
 pub mod preparation;
 pub mod publication;
+pub mod svn_preparation;
 
 /// Policy identity pinned into every preview from this slice.
 pub const POLICY_VERSION: &str = "pair_refresh_preview_v1";

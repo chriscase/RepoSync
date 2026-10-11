@@ -4,8 +4,8 @@ Refs #69. #69 stays open.
 
 This contract describes the next execution policy. Implementation is in progress.
 The existing v1 preview and its execution refusal remain active. Standalone
-publication, lineage and Git preparation components do not authorize execution.
-The endpoint, durable operation, SVN merge, recovery and real-engine evidence
+publication, lineage, Git and SVN preparation components do not authorize execution.
+The endpoint, durable operation, SVN publication, recovery and real-engine evidence
 below must be implemented and independently reviewed before this policy is
 enabled. The reviewed durable identity dependency must land on main first.
 
@@ -26,8 +26,10 @@ enabled. The reviewed durable identity dependency must land on main first.
 | Uncertain partial publication | Held for reconciliation | Inspect durable evidence; never blindly retry or release the hold |
 | Re-anchor, recreate, retirement or same-name generation reuse | Not implemented | Separate design and approval required |
 
-The first case supports regular file bytes, executable bits and directories
-needed by those files. Corresponding Git and SVN histories can have different
+The first case supports regular file bytes, executable bits, the fixed binary
+`svn:mime-type=application/octet-stream` property and directories needed by those
+files. SVN-only empty directories, inherited properties and other property values
+are refused. Corresponding Git and SVN histories can have different
 graph shapes. Existing published commits and revisions remain intact.
 
 ## Approval and admission
@@ -89,6 +91,15 @@ Verify `svn:mergeinfo` against the exact parent path/range plus any earlier rang
 proved by the previous completed receipt. Missing, partial, conflicting or
 unrelated mergeinfo is refused. Unsupported properties cannot be hidden by an
 equal Git tree or omitted from the evidence.
+
+The standalone SVN preparation component checks the baseline, parent and child
+at their approved pegs in separate operation directories, with externals ignored.
+It compares every file and directory with pinned Git trees, performs a normal
+range merge, checks status separately for text/property/tree conflicts and
+compares the complete result property set with the parent plus the approved root
+mergeinfo. It never commits a remote revision. Existing operation directories
+cannot be overwritten. Its historical checks do not replace live drift checks,
+verified mappings, receipt provenance, identity, revocation or exclusive holds.
 
 ## Publication and recovery
 

@@ -216,6 +216,49 @@ impl SvnClient {
         Ok(())
     }
 
+    /// Isolated refresh preparation never follows externals or a moving URL.
+    pub async fn checkout_pinned_without_externals(
+        &self,
+        path: &Path,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let destination = path.to_str().ok_or_else(|| SvnError::WorkingCopyError {
+            path: path.display().to_string(),
+            detail: "refresh working directory must be UTF-8".into(),
+        })?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "-r",
+            &rev.to_string(),
+            &format!("{}@{}", self.url, rev),
+            destination,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// Full property values, including inherited properties, at the selected peg.
+    pub async fn tree_properties_at_rev(&self, rev: i64) -> Result<String, SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        self.run_svn(&[
+            "proplist",
+            "--xml",
+            "--verbose",
+            "--recursive",
+            "--show-inherited-props",
+            "-r",
+            &rev.to_string(),
+            &format!("{}@{}", self.url, rev),
+        ])
+        .await
+    }
+
     /// Checkout the SVN repository at HEAD into the given directory.
     #[instrument(skip(self), fields(url = %self.url))]
     pub async fn checkout_head(&self, path: &Path) -> Result<(), SvnError> {
