@@ -273,8 +273,9 @@ services:
       - ${LAB_RUN_DIR}/daemon.toml:/etc/reposync/config.toml:ro
       - ${LAB_RUN_DIR}/authors.toml:/etc/reposync/authors.toml:ro
       - reposync-data:/var/lib/reposync
-    ports:
-      - 127.0.0.1:${LAB_UI_PORT}:8080
+    # No host port here. Run 38195547031 marked this container healthy, then
+    # the runner got ECONNREFUSED on 127.0.0.1. The internal network does not
+    # accept that published port. ui-forwarder publishes the loopback port.
     networks: [lab]
     depends_on:
       svn:
@@ -299,10 +300,54 @@ services:
       retries: 40
       start_period: 15s
 
+  ui-forwarder:
+    build:
+      context: ../docker
+      dockerfile: Dockerfile.forwarder
+    image: ${FORWARDER_IMAGE}
+    hostname: ui-forwarder
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - lab
+      - publish
+    ports:
+      - 127.0.0.1:${LAB_UI_PORT}:8080
+    depends_on:
+      reposync:
+        condition: service_healthy
+    profiles: ["app"]
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - SYS_ADMIN
+      - SYS_MODULE
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/api/status/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+      start_period: 2s
+
 networks:
   lab:
     name: ${COMPOSE_PROJECT_NAME}-lab
     internal: true
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+  # Host loopback publish only. Masquerade stays off. Lab services are not
+  # attached, so they still have no route out of the internal network.
+  publish:
+    name: ${COMPOSE_PROJECT_NAME}-publish
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
     labels:
       acceptance-lab.run-id: ${RUN_ID}
       acceptance-lab.disposable: "true"

@@ -37,6 +37,7 @@ listen = "0.0.0.0:8080"
 session_secret_env = "REPOSYNC_SESSION_SECRET"
 auth_mode = "simple"
 admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
+# The launcher inserts cors_origins for this run's loopback UI origin.
 
 [sync]
 mode = "direct"

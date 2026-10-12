@@ -130,6 +130,7 @@ load_pins() {
   GITHTTP_IMAGE="rsacc-githttp:lab"
   PYENV_IMAGE="rsacc-pyenv:lab"
   OBSERVER_IMAGE="rsacc-observer:lab"
+  FORWARDER_IMAGE="rsacc-forwarder:lab"
   REPOSYNC_IMAGE="rsacc-reposync:${CANDIDATE}"
 }
 
@@ -231,6 +232,7 @@ GITEA_LAB_IMAGE=${GITEA_LAB_IMAGE}
 GITHTTP_IMAGE=${GITHTTP_IMAGE}
 PYENV_IMAGE=${PYENV_IMAGE}
 OBSERVER_IMAGE=${OBSERVER_IMAGE}
+FORWARDER_IMAGE=${FORWARDER_IMAGE}
 REPOSYNC_IMAGE=${REPOSYNC_IMAGE}
 LDAP_ADMIN_PASSWORD=$(awk -F= '$1=="LDAP_ADMIN_PASSWORD"{print substr($0,index($0,"=")+1); exit}' "$RUN_DIR/secrets.env")
 LDAP_BIND_PASSWORD=$(awk -F= '$1=="LDAP_BIND_PASSWORD"{print substr($0,index($0,"=")+1); exit}' "$RUN_DIR/secrets.env")
@@ -378,6 +380,20 @@ passwd = "\n".join([
 (run / "svnserve-passwd").write_text(passwd)
 PY
   cp "$LAB_DIR/config/daemon.toml.template" "$RUN_DIR/daemon.toml"
+  python3 - "$RUN_DIR/daemon.toml" "$LAB_UI_PORT" <<'PY'
+import pathlib, sys
+path, port = pathlib.Path(sys.argv[1]), sys.argv[2]
+if not port.isdigit():
+    raise SystemExit("ui port is not an integer")
+text = path.read_text()
+needle = 'admin_password_env = "REPOSYNC_ADMIN_PASSWORD"\n'
+line = f'cors_origins = ["http://127.0.0.1:{port}"]\n'
+if "cors_origins" in text:
+    raise SystemExit("daemon template already sets cors_origins")
+if needle not in text:
+    raise SystemExit("daemon template has no admin_password_env line")
+path.write_text(text.replace(needle, needle + line, 1))
+PY
   cp "$LAB_DIR/config/authors.toml" "$RUN_DIR/authors.toml"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svn-authz"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svnserve-authz"
@@ -857,6 +873,7 @@ prepare_images() {
     build_one "$GITHTTP_IMAGE" "$LAB_DIR/docker/Dockerfile.githttp" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
     build_one "$PYENV_IMAGE" "$LAB_DIR/docker/Dockerfile.pyenv" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
     build_one "$OBSERVER_IMAGE" "$LAB_DIR/docker/Dockerfile.observer" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
+    build_one "$FORWARDER_IMAGE" "$LAB_DIR/docker/Dockerfile.forwarder" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
     docker pull "$LDAP_IMAGE"
   fi
   if [ "${ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD:-}" != "1" ] && [ "$scope" != "fixtures" ]; then
@@ -892,7 +909,7 @@ record_images() {
     local image
     for image in "$DEBIAN_IMAGE" "$RUST_IMAGE" "$NODE_IMAGE" "$GITEA_IMAGE" "$LDAP_IMAGE" \
       "${SVN_IMAGE:-}" "${SVNSERVE_IMAGE:-}" "${GITEA_LAB_IMAGE:-}" "${GITHTTP_IMAGE:-}" \
-      "${PYENV_IMAGE:-}" "${OBSERVER_IMAGE:-}" "${REPOSYNC_IMAGE:-}"; do
+      "${PYENV_IMAGE:-}" "${OBSERVER_IMAGE:-}" "${FORWARDER_IMAGE:-}" "${REPOSYNC_IMAGE:-}"; do
       [ -n "$image" ] || continue
       if docker image inspect "$image" >/dev/null 2>&1; then
         meta="$(inspect_image_metadata "$image")" || return 1
@@ -942,6 +959,35 @@ capture_service_logs() {
   fi
 }
 
+probe_published_ui() {
+  mkdir -p "$EVIDENCE"
+  local fid rid
+  fid="$(compose --profile app ps -q ui-forwarder || true)"
+  rid="$(compose --profile app ps -q reposync || true)"
+  {
+    echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "ui_port=${LAB_UI_PORT}"
+    if [ -n "$fid" ]; then
+      echo "forwarder=$fid"
+      docker port "$fid" || true
+    else
+      echo "forwarder=absent"
+    fi
+    if [ -n "$rid" ]; then
+      echo "reposync=$rid"
+      docker port "$rid" || true
+    else
+      echo "reposync=absent"
+    fi
+  } > "$EVIDENCE/ui-port.txt"
+  if curl --fail --silent --max-time 5 "http://127.0.0.1:${LAB_UI_PORT}/api/status/health" >/dev/null; then
+    echo "host_health=ok" >> "$EVIDENCE/ui-port.txt"
+    return 0
+  fi
+  echo "host_health=fail" >> "$EVIDENCE/ui-port.txt"
+  return 1
+}
+
 up_stack() {
   require_docker || return 1
   local started
@@ -959,8 +1005,12 @@ up_stack() {
     return 1
   fi
   log "starting reposync"
-  if ! compose --profile app up -d --wait reposync; then
-    capture_service_logs reposync gitea ldap svn || true
+  if ! compose --profile app up -d --wait reposync ui-forwarder; then
+    capture_service_logs reposync gitea ldap svn ui-forwarder || true
+    return 1
+  fi
+  if ! probe_published_ui; then
+    capture_service_logs reposync gitea ldap svn ui-forwarder || true
     return 1
   fi
   write_resources || true
@@ -1049,7 +1099,7 @@ export_lab_env() {
   export LAB_RUN_DIR LAB_SVN_PORT LAB_SVNSERVE_PORT LAB_GITEA_PORT LAB_GITHTTP_PORT
   export LAB_FAULT_PORT LAB_FAULT_CONTROL_PORT LAB_UI_PORT RUN_ID COMPOSE_PROJECT_NAME
   export LDAP_IMAGE DEBIAN_IMAGE RUST_IMAGE NODE_IMAGE GITEA_IMAGE SVN_IMAGE SVNSERVE_IMAGE
-  export GITEA_LAB_IMAGE GITHTTP_IMAGE PYENV_IMAGE OBSERVER_IMAGE REPOSYNC_IMAGE
+  export GITEA_LAB_IMAGE GITHTTP_IMAGE PYENV_IMAGE OBSERVER_IMAGE FORWARDER_IMAGE REPOSYNC_IMAGE
 }
 
 write_synthetic_playwright() {
@@ -1248,8 +1298,11 @@ publish_outputs() {
   if [ -f "$RUN_DIR/logs/seed.log" ]; then
     cp "$RUN_DIR/logs/seed.log" "$publish/seed.log"
   fi
+  if [ -f "$EVIDENCE/ui-port.txt" ]; then
+    cp "$EVIDENCE/ui-port.txt" "$publish/ui-port.txt"
+  fi
   local service
-  for service in ldap gitea svn reposync; do
+  for service in ldap gitea svn reposync ui-forwarder; do
     if [ -s "$RUN_DIR/logs/${service}.log" ]; then
       cp "$RUN_DIR/logs/${service}.log" "$publish/${service}.log"
     fi
@@ -1367,6 +1420,7 @@ cmd_test() {
     fi
   fi
   printf 'elapsed_before_report=%s\n' "$(( $(date +%s) - started ))" >> "$EVIDENCE/timings.txt"
+  capture_service_logs ldap gitea svn reposync ui-forwarder || true
   scrub_outputs || true
   if ! scan_outputs; then
     ec=1
