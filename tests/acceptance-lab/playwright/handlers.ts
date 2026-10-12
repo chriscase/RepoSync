@@ -1094,9 +1094,8 @@ start_personal() { nohup reposync personal --personal-config "$cfg" start --fore
 fail_log() {
   echo "personal daemon log:" >&2
   tail -n 40 "$root/daemon.log" >&2 || true
-  echo "closed pulls:" >&2
-  curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/repos/lab/pround/pulls?state=closed&base=main" | head -c 700 >&2 || true
-  echo >&2
+  echo "closed pull fields:" >&2
+  curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/repos/lab/pround/pulls?state=closed&base=main" | tr ',' '\n' | grep -E '"(merged|html_url|sha|ref|state|merge_commit_sha|number)"' | head -n 40 >&2 || true
   exit 1
 }
 start_personal

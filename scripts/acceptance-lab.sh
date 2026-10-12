@@ -1350,7 +1350,7 @@ publish_outputs() {
     cp "$EVIDENCE/ui-port.txt" "$publish/ui-port.txt"
   fi
   local service
-  for service in ldap gitea svn reposync ui-forwarder; do
+  for service in ldap gitea gitea-api svn reposync ui-forwarder; do
     if [ -s "$RUN_DIR/logs/${service}.log" ]; then
       cp "$RUN_DIR/logs/${service}.log" "$publish/${service}.log"
     fi
