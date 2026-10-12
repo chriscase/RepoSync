@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::history_inspect::is_full_git_oid;
 use crate::late_pair::VerifiedMapping;
 
+pub mod actor_policy;
 pub mod execution_configuration;
 pub mod git_sources;
 mod http_transport;

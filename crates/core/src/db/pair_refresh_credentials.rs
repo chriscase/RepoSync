@@ -120,7 +120,7 @@ fn selected<'a>(
     }
 }
 
-fn fingerprint_key(tx: &Connection) -> Result<[u8; 32], DatabaseError> {
+pub(crate) fn fingerprint_key(tx: &Connection) -> Result<[u8; 32], DatabaseError> {
     // A preview must never create a key or repair corrupt state. The daemon's
     // established encryption key supplies a private HMAC key, also when env
     // configuration is its normal source. Key rotation invalidates approval.

@@ -475,6 +475,25 @@ impl SyncEngine {
         &self.config
     }
 
+    /// Capture a recheckable database admin session and this running engine's
+    /// effective policy. This read-only context does not enroll or publish a job.
+    pub fn capture_pair_refresh_actor_policy(
+        &self,
+        bearer: &str,
+    ) -> Result<
+        crate::pair_refresh::actor_policy::LiveRefreshActorPolicy<'_>,
+        crate::errors::DatabaseError,
+    > {
+        crate::pair_refresh::actor_policy::capture(
+            self,
+            &self.db,
+            &self.allowed_paths,
+            &self.blocked_patterns,
+            &self.lfs_threshold_bytes,
+            bearer,
+        )
+    }
+
     /// Return a reference to the identity mapper.
     pub fn identity_mapper(&self) -> &IdentityMapper {
         &self.identity_mapper

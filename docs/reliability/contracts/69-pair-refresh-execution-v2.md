@@ -415,6 +415,23 @@ its actual preparation owner can release it. Deterministic independent-
 connection controls exercise contended admission and preparation drop; the
 original concurrent exact-skip assertions remain unchanged.
 
+The running SyncEngine now captures a read-only actor and effective policy
+context from its own database and configuration. This requires a present,
+enabled database admin with a current session; compatibility in-memory admin
+sessions cannot supply this authority. Stored timestamps are parsed as RFC3339
+instants, including offsets, and malformed, future or expired evidence refuses.
+Only direct whole-tree policy with unrestricted branches and disabled size/LFS
+filters is qualified, including the engine's actual path and LFS overrides.
+Safe preview pins contain the actor ID and domain-separated session/policy
+digests. The bearer and established fingerprint key remain private. Capture
+never creates a key or writes database state. Recheck requires the same current
+engine instance, current actor/session and unchanged context; logout, role or
+enabled changes, session drift and key rotation refuse.
+
+This context still needs atomic binding to authenticated job enrollment,
+retained resources and publication intents. A copied preview pin cannot
+construct the live context, and this component enables no execution endpoint.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary
