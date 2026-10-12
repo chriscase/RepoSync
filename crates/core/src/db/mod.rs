@@ -65,6 +65,7 @@ impl Database {
         let prior_file = OpenedDatabaseFile::capture(path);
 
         let conn = Connection::open(path)?;
+        let connected_file = OpenedDatabaseFile::attest(&conn, path, prior_file);
 
         // Refuse a future schema before WAL checkpoint or other writes.
         let existing_version: u32 =
@@ -96,7 +97,8 @@ impl Database {
         }
 
         debug!("database opened successfully with WAL mode");
-        let opened_file = OpenedDatabaseFile::attest(&conn, path, prior_file);
+        let opened_file = connected_file
+            .and_then(|identity| OpenedDatabaseFile::attest(&conn, path, Some(identity)));
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file,

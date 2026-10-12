@@ -18,6 +18,10 @@ use super::actor_policy::RefreshActorPolicyPin;
 
 const NAMESPACE: &str = "pair-refresh-resources-v2";
 
+#[cfg(test)]
+#[path = "workspace_scm_role_tests.rs"]
+mod scm_role_tests;
+
 fn directory_flags() -> rustix::fs::OFlags {
     rustix::fs::OFlags::RDONLY
         | rustix::fs::OFlags::DIRECTORY
@@ -159,6 +163,38 @@ pub struct ResourceIdentity {
 }
 
 impl ResourceIdentity {
+    fn capture_generated_private_directory(
+        path: &Path,
+        held: &File,
+    ) -> Result<Self, DatabaseError> {
+        // SVN creates its operation/working-copy roots using the process
+        // umask. Only these generated role roots become private; versioned
+        // children retain their original permissions and link semantics.
+        let before = std::fs::symlink_metadata(path)
+            .map_err(|_| refused("generated role metadata is unavailable"))?;
+        if !before.is_dir()
+            || before.uid() != rustix::process::geteuid().as_raw()
+            || std::fs::canonicalize(path)
+                .map_err(|_| refused("generated role path is unavailable"))?
+                != path
+        {
+            return Err(refused("generated role type, owner or path is unsupported"));
+        }
+        let metadata = held
+            .metadata()
+            .map_err(|_| refused("held generated role metadata is unavailable"))?;
+        if metadata.dev() != before.dev()
+            || metadata.ino() != before.ino()
+            || metadata.uid() != before.uid()
+        {
+            return Err(refused("generated role changed before private permissions"));
+        }
+        rustix::fs::fchmod(held, rustix::fs::Mode::from_raw_mode(0o700))
+            .map_err(|_| refused("could not make generated role private"))?;
+        let identity = Self::capture(path, true, true)?;
+        identity.require_handle(held)?;
+        Ok(identity)
+    }
     fn require_handle(&self, file: &File) -> Result<(), DatabaseError> {
         let metadata = file
             .metadata()
@@ -259,13 +295,13 @@ impl WorkspaceOwner {
 
     fn require_current(&self) -> Result<(), DatabaseError> {
         self.require_root()?;
-        for (role, directory) in self
+        for directory in self
             .directories
             .lock()
             .map_err(|_| refused("resource tracking is poisoned"))?
-            .iter()
+            .values()
         {
-            directory.require_current(true, matches!(role.as_str(), "git" | "svn"))?;
+            directory.require_current(true, true)?;
         }
         Ok(())
     }
@@ -361,8 +397,24 @@ impl RefreshWorkspace {
         if working_copy != operation.join("child") {
             return Err(refused("working copy is outside its owned role"));
         }
-        let operation_identity = ResourceIdentity::capture(&operation, true, false)?;
-        let working_identity = ResourceIdentity::capture(working_copy, true, false)?;
+        let svn_identity = self
+            .owner
+            .directories
+            .lock()
+            .map_err(|_| refused("resource tracking is poisoned"))?
+            .get("svn")
+            .cloned()
+            .ok_or_else(|| refused("SVN role is not owned"))?;
+        let svn_handle = open_child(&self.owner.operation_handle, c"svn", true)?;
+        svn_identity.require_handle(&svn_handle)?;
+        let operation_name = std::ffi::CString::new(self.owner.pin.operation_id.to_string())
+            .map_err(|_| refused("invalid operation directory name"))?;
+        let operation_handle = open_child(&svn_handle, &operation_name, true)?;
+        let working_handle = open_child(&operation_handle, c"child", true)?;
+        let operation_identity =
+            ResourceIdentity::capture_generated_private_directory(&operation, &operation_handle)?;
+        let working_identity =
+            ResourceIdentity::capture_generated_private_directory(working_copy, &working_handle)?;
         {
             let mut directories = self
                 .owner

@@ -464,7 +464,10 @@ or directories. Synchronization preserves symlinks through parent directory
 sync; cleanup unlinks them without opening their targets. Hard links lose only
 their owned directory entry, and group-writable ordinary files/directories are
 supported. Changed entries refuse traversal; special entries refuse retention
-without blocking on an open. Root and tracked-role identity checks stay strict.
+without blocking on an open. Generated SVN operation and working-copy roots
+become private through held, no-follow descriptors before tracking, regardless
+of the checkout's umask; versioned descendants keep their modes. Root and
+tracked-role identity checks stay strict.
 
 Before any durable enrollment attempt, resources and directory entries are
 synchronized and retention is marked through the actual engine's actor entry

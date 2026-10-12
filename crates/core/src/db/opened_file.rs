@@ -35,7 +35,10 @@ impl OpenedDatabaseFile {
     }
 
     pub(super) fn attest(conn: &Connection, path: &Path, prior: Option<Self>) -> Option<Self> {
-        let after = Self::capture(path)?;
+        let mut after = Self::capture(path)?;
+        if after.aliased {
+            return None;
+        }
         if prior.is_some_and(|before| before != after) {
             return None;
         }
@@ -46,7 +49,12 @@ impl OpenedDatabaseFile {
         }
         // Detect a path change during the native check too. An initial missing
         // file needs no path-only fallback: its newly opened fd is attested.
-        (Self::capture(path)? == after).then_some(after)
+        if Self::capture(path)? != after {
+            return None;
+        }
+        after.device = native_number(held.st_dev)?;
+        after.inode = native_number(held.st_ino)?;
+        Some(after)
     }
 }
 
@@ -74,7 +82,8 @@ fn connected_main_file_stat(conn: &Connection) -> Option<rustix::fs::Stat> {
     // bundled Unix implementation is inspected; the fd stays borrowed and is
     // never duplicated, closed, or otherwise mutated by this adapter.
     unsafe {
-        if ffi::sqlite3_libversion_number() != 3_045_000
+        if std::mem::size_of::<usize>() != 8
+            || ffi::sqlite3_libversion_number() != 3_045_000
             || CStr::from_ptr(ffi::sqlite3_sourceid()).to_bytes() != SOURCE_ID
         {
             return None;
@@ -114,15 +123,20 @@ fn connected_main_file_stat(conn: &Connection) -> Option<rustix::fs::Stat> {
             (&mut file as *mut *mut ffi::sqlite3_file).cast(),
         ) != ffi::SQLITE_OK
             || file.is_null()
-            || (*file).pMethods.is_null()
         {
             return None;
         }
-        let native = &*file.cast::<BundledUnixFilePrefix>();
-        if native.vfs != vfs || native.methods != (*file).pMethods || native.descriptor < 0 {
+        let methods = (*file).pMethods;
+        if methods.is_null() || !(1..=3).contains(&(*methods).iVersion) {
             return None;
         }
-        rustix::fs::fstat(BorrowedFd::borrow_raw(native.descriptor)).ok()
+        let native = std::ptr::read(file.cast::<BundledUnixFilePrefix>());
+        if native.vfs != vfs || native.methods != methods || native.descriptor < 0 {
+            return None;
+        }
+        let held = rustix::fs::fstat(BorrowedFd::borrow_raw(native.descriptor)).ok()?;
+        (rustix::fs::FileType::from_raw_mode(held.st_mode) == rustix::fs::FileType::RegularFile)
+            .then_some(held)
     }
 }
 
