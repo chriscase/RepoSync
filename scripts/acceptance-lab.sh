@@ -387,12 +387,15 @@ if not port.isdigit():
     raise SystemExit("ui port is not an integer")
 text = path.read_text()
 needle = 'admin_password_env = "REPOSYNC_ADMIN_PASSWORD"\n'
-line = f'cors_origins = ["http://127.0.0.1:{port}"]\n'
-if "cors_origins" in text:
-    raise SystemExit("daemon template already sets cors_origins")
+origin = f'cors_origins = ["http://127.0.0.1:{port}"]\n'
+for raw in text.splitlines():
+    if raw.lstrip().startswith("#"):
+        continue
+    if raw.strip().startswith("cors_origins"):
+        raise SystemExit("daemon template already sets cors_origins")
 if needle not in text:
     raise SystemExit("daemon template has no admin_password_env line")
-path.write_text(text.replace(needle, needle + line, 1))
+path.write_text(text.replace(needle, needle + origin, 1))
 PY
   cp "$LAB_DIR/config/authors.toml" "$RUN_DIR/authors.toml"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svn-authz"
