@@ -59,6 +59,11 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
             Err(_) => GitClient::init(&git_repo_path).context("failed to init git repository")?,
         }
     };
+    // The push uses github.default_branch. A clone of an empty fixture can
+    // leave HEAD on another unborn name, so align before the first commit.
+    git_client
+        .ensure_head_on_branch(&config.github.default_branch)
+        .context("failed to align the personal import with its default branch")?;
 
     let git_client = std::sync::Arc::new(std::sync::Mutex::new(git_client));
     let formatter = reposync_personal::commit_format::CommitFormatter::new(&config.commit_format);
