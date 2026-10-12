@@ -62,15 +62,33 @@ export function listNamed(root, name) {
 export function bindEvidenceIdentity({ evidence, candidate, suite, seed }) {
   const reasons = [];
   const files = listNamed(evidence, "identity.json");
-  if (files.length !== 1) {
-    reasons.push(`infrastructure FAIL: expected one identity.json, found ${files.length}`);
+  if (files.length === 0) {
+    reasons.push("infrastructure FAIL: expected one identity.json, found 0");
     return { ok: false, reasons, identity: null };
   }
-  let identity;
-  try {
-    identity = JSON.parse(readFileSync(files[0], "utf8"));
-  } catch {
-    reasons.push("infrastructure FAIL: identity.json is not readable");
+  const docs = [];
+  for (const file of files) {
+    try {
+      docs.push(JSON.parse(readFileSync(file, "utf8")));
+    } catch {
+      reasons.push("infrastructure FAIL: identity.json is not readable");
+      return { ok: false, reasons, identity: null };
+    }
+  }
+  const identity = docs[0];
+  const signature = JSON.stringify({
+    candidate_sha: identity.candidate_sha,
+    suite: identity.suite,
+    seed: identity.seed,
+    run_id: identity.run_id,
+  });
+  if (docs.some((doc) => JSON.stringify({
+    candidate_sha: doc.candidate_sha,
+    suite: doc.suite,
+    seed: doc.seed,
+    run_id: doc.run_id,
+  }) !== signature)) {
+    reasons.push(`infrastructure FAIL: identity.json copies disagree (${files.length} files)`);
     return { ok: false, reasons, identity: null };
   }
   const source = typeof identity.candidate_sha === "string" ? identity.candidate_sha : "";
@@ -280,15 +298,29 @@ export function enforceReport({ evidence, engine, reportDir }) {
   const report = fileReady(reportPath) ? readJson(reportPath) : null;
   if (!report) reasons.push("infrastructure FAIL: report.json was not produced");
   const identityFiles = listNamed(evidence, "identity.json");
-  if (identityFiles.length > 1) {
-    reasons.push(`infrastructure FAIL: expected one identity.json, found ${identityFiles.length}`);
-  } else if (identityFiles.length === 1 && report) {
-    let identity = null;
+  const identityDocs = [];
+  for (const file of identityFiles) {
     try {
-      identity = JSON.parse(readFileSync(identityFiles[0], "utf8"));
+      identityDocs.push(JSON.parse(readFileSync(file, "utf8")));
     } catch {
-      identity = null;
+      reasons.push("infrastructure FAIL: identity.json is not readable");
     }
+  }
+  const identitySignature = identityDocs[0] ? JSON.stringify({
+    candidate_sha: identityDocs[0].candidate_sha,
+    suite: identityDocs[0].suite,
+    seed: identityDocs[0].seed,
+    run_id: identityDocs[0].run_id,
+  }) : "";
+  if (identityDocs.length > 1 && identityDocs.some((doc) => JSON.stringify({
+    candidate_sha: doc.candidate_sha,
+    suite: doc.suite,
+    seed: doc.seed,
+    run_id: doc.run_id,
+  }) !== identitySignature)) {
+    reasons.push(`infrastructure FAIL: identity.json copies disagree (${identityDocs.length} files)`);
+  } else if (identityDocs.length >= 1 && report) {
+    const identity = identityDocs[0];
     if (!identity || report.candidate !== identity.candidate_sha) {
       reasons.push(`infrastructure FAIL: report candidate ${report.candidate || "missing"} does not match evidence ${identity?.candidate_sha || "missing"}`);
     }

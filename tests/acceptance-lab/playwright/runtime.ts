@@ -88,6 +88,7 @@ export class Lab {
       "-e", "GIT_TOKEN",
       "-e", "GIT_USER",
       "-e", "ALICE_PASSWORD",
+      "-e", "BOB_PASSWORD",
       "-e", "LDAP_BIND_PASSWORD",
       "-e", "WEBHOOK_SECRET",
       "-e", "SVN_WEBHOOK_SECRET",
