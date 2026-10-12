@@ -370,7 +370,14 @@ git rev-parse HEAD
     const before = await this.snap(pair);
     const rev = await this.commitSvn(pair, script);
     await this.triggerSvn(rev);
-    await this.waitUntil(async () => (await this.snap(pair)).svn !== before.svn && (await this.snap(pair)).maps !== before.maps);
+    // Team confirm writes sync_records and the repository watermark. It does
+    // not insert commit_map. Run 38199181879 pushed Git 6593d276 while that
+    // count stayed put, so a map-count wait never observed the transfer.
+    // The published main tip is the signal. gitBytes still checks the root path.
+    await this.waitUntil(async () => {
+      const now = await this.snap(pair);
+      return now.svn !== before.svn && /^[0-9a-f]{40}$/.test(now.git) && now.git !== before.git;
+    });
     return this.snap(pair);
   }
 
