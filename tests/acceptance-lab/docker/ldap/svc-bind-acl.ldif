@@ -3,6 +3,12 @@
 # (uid=alice). The service account can search and read directory data.
 # It cannot read userPassword. Root over ldapi keeps manage so later
 # TLS configuration still applies. Clients still verify server certificates.
+#
+# Run 38198340012: alice's password bind succeeded, then the same
+# connection searched as alice and slapd returned noSuchObject. The
+# product reads cn, mail, and memberOf as the authenticated user.
+# Authenticated users may search the suffix and the OU containers.
+# They may read their own entry. They may not read other people.
 dn: olcDatabase={1}{{ LDAP_BACKEND }},cn=config
 changetype: modify
 delete: olcAccess
@@ -10,4 +16,6 @@ delete: olcAccess
 add: olcAccess
 olcAccess: to * by dn.exact=gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth manage by * break
 olcAccess: to attrs=userPassword,shadowLastChange by self write by dn.exact="cn=admin,{{ LDAP_BASE_DN }}" write by anonymous auth by * none
+olcAccess: to dn.exact="{{ LDAP_BASE_DN }}" by users search by dn.exact="cn=admin,{{ LDAP_BASE_DN }}" write by dn.exact="uid=svc-bind,ou=services,{{ LDAP_BASE_DN }}" read by * none
+olcAccess: to dn.regex="^ou=[^,]+,{{ LDAP_BASE_DN }}$" by users search by dn.exact="cn=admin,{{ LDAP_BASE_DN }}" write by dn.exact="uid=svc-bind,ou=services,{{ LDAP_BASE_DN }}" read by * none
 olcAccess: to * by self read by dn.exact="cn=admin,{{ LDAP_BASE_DN }}" write by dn.exact="uid=svc-bind,ou=services,{{ LDAP_BASE_DN }}" read by * none
