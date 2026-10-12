@@ -354,11 +354,11 @@ pub fn ordinary_current_epoch(tx: &Connection) -> Result<Option<u64>, DatabaseEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestCtx {
         _lock: std::sync::MutexGuard<'static, ()>,

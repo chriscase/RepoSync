@@ -12,7 +12,22 @@ mod fixture_process;
 
 use super::*;
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(super) struct SharedWriterTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(super) struct WriterTestAdmission;
+static SERIAL: WriterTestAdmission = WriterTestAdmission;
+
+impl WriterTestAdmission {
+    pub(super) async fn lock(&self) -> SharedWriterTestGuard {
+        SharedWriterTestGuard {
+            _guard: crate::writer_fence::tests::TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+}
 
 fn run(command: &mut Command) -> String {
     let output = command.output().unwrap();
@@ -807,4 +822,450 @@ async fn authenticated_pre_intent_cancellation_returns_a_signed_durable_idempote
     assert!(!std::fs::read_to_string(&f.log)
         .unwrap()
         .contains("receive-pack"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_svn_stage_commits_once_and_keeps_global_exclusion_for_git_completion() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let before = f.state();
+    let observed = super::super::execution::publish_owned_svn_stage_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "svn-stage",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        observed.phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::SvnObserved
+    );
+    let receipt = observed.svn_receipt.as_ref().unwrap();
+    assert_eq!(receipt.revision, 5);
+    assert_eq!(receipt.git_tree, prepared.pins().git.tree_sha);
+    assert_eq!(receipt.mergeinfo, "/trunk:3-4");
+    assert!(observed.git_receipt_sha.is_none());
+    assert_eq!(f.db.pair_refresh_operation(observed.id).unwrap(), observed);
+    assert!(f
+        .db
+        .begin_ordinary_writer_window(Some("unregistered-alias"))
+        .is_err());
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert_eq!(
+        f.target.find_reference("refs/heads/main").unwrap().target(),
+        Some(f.parent)
+    );
+    assert_eq!(
+        f.state()
+            .into_iter()
+            .filter(|(key, _, _)| !key.starts_with("pair_refresh_execution_")
+                && key != "writer_fence_v1:lease")
+            .collect::<Vec<_>>(),
+        before
+            .into_iter()
+            .filter(|(key, _, _)| key != "writer_fence_v1:lease")
+            .collect::<Vec<_>>()
+    );
+    let repeated = super::super::execution::publish_owned_svn_stage_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "svn-stage",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated, observed);
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unhandled_svn_drift_before_first_intent_keeps_a_cancellable_prepared_job() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    std::fs::write(
+        f._parent_wc.join("file.txt"),
+        b"external unhandled advance\n",
+    )
+    .unwrap();
+    svn(
+        &["commit", "-m", "unhandled external fixture advance"],
+        Some(&f._parent_wc),
+    );
+    assert!(
+        super::super::execution::publish_owned_svn_stage_with_client(
+            &engine,
+            &actor,
+            &prepared,
+            "drift-stage",
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .is_err()
+    );
+    let op =
+        f.db.pair_refresh_operation(prepared.pins().git.operation_id)
+            .unwrap();
+    assert_eq!(
+        op.phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::Prepared
+    );
+    assert!(op.svn_receipt.is_none());
+    assert!(op.git_receipt_sha.is_none());
+    assert!(f.db.begin_ordinary_writer_window(Some("alias")).is_err());
+    let cancelled = actor
+        .cancel_prepared_enrollment(&engine, &prepared, &busy)
+        .unwrap();
+    assert_eq!(
+        cancelled.phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::CancelledBeforePublication
+    );
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert_eq!(
+        f.target.find_reference("refs/heads/main").unwrap().target(),
+        Some(f.parent)
+    );
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+}
+
+fn parent_row(f: &Fixture) -> Vec<rusqlite::types::Value> {
+    f.db.conn()
+        .query_row("SELECT * FROM repositories WHERE id='parent'", [], |row| {
+            (0..row.as_ref().column_count())
+                .map(|index| row.get(index))
+                .collect()
+        })
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_owned_refresh_preserves_histories_and_atomically_advances_only_child() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let parent_before = parent_row(&f);
+    let echoes_before: Vec<_> = f
+        .state()
+        .into_iter()
+        .filter(|(key, _, _)| key.starts_with("repo_echo_generation_"))
+        .collect();
+    let completed = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "complete-first",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        completed.phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::Completed
+    );
+    assert_eq!(completed.svn_receipt.as_ref().unwrap().revision, 5);
+    assert_eq!(
+        completed.git_receipt_sha.as_deref(),
+        Some(prepared.pins().git.prepared_sha.as_str())
+    );
+    assert_eq!(parent_row(&f), parent_before);
+    assert_eq!(
+        f.state()
+            .into_iter()
+            .filter(|(key, _, _)| key.starts_with("repo_echo_generation_"))
+            .collect::<Vec<_>>(),
+        echoes_before
+    );
+    assert_eq!(
+        f.target.find_reference("refs/heads/main").unwrap().target(),
+        Some(f.parent)
+    );
+    let integrated = f
+        .target
+        .find_commit(Oid::from_str(&prepared.pins().git.prepared_sha).unwrap())
+        .unwrap();
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(integrated.id())
+    );
+    assert_eq!(
+        integrated.parent_ids().collect::<Vec<_>>(),
+        vec![f.baseline, f.parent]
+    );
+    assert_eq!(
+        integrated.tree_id().to_string(),
+        prepared.pins().svn.result_git_tree
+    );
+    assert!(f
+        .target
+        .graph_descendant_of(integrated.id(), f.baseline)
+        .unwrap());
+    assert!(f
+        .target
+        .graph_descendant_of(integrated.id(), f.parent)
+        .unwrap());
+    let (sha, rev): (String, i64) =
+        f.db.conn()
+            .query_row(
+                "SELECT last_git_sha,last_svn_rev FROM repositories WHERE id='child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+    assert_eq!(sha, integrated.id().to_string());
+    assert_eq!(rev, 5);
+    assert_eq!(
+        f.db.get_state(&format!("last_git_sha_{}", completed.pins.child.scope_uuid))
+            .unwrap()
+            .as_deref(),
+        Some(sha.as_str())
+    );
+    assert_eq!(
+        f.db.get_state("last_svn_rev_child").unwrap().as_deref(),
+        Some("5")
+    );
+    let correspondence: i64 = f.db.conn().query_row("SELECT count(*) FROM commit_map WHERE repo_id='child' AND svn_rev=5 AND git_sha=?1 AND direction='git_to_svn'", [&sha], |row| row.get(0)).unwrap();
+    let sync_records: i64 = f.db.conn().query_row("SELECT count(*) FROM sync_records WHERE id=?1 AND repo_id='child' AND svn_rev=5 AND git_sha=?2", rusqlite::params![completed.id.to_string(),sha], |row| row.get(0)).unwrap();
+    assert_eq!(correspondence, 1);
+    assert_eq!(sync_records, 1);
+    assert_eq!(
+        f.db.pair_refresh_operation(completed.id).unwrap(),
+        completed
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+    let state_before_repeat = journal_state(&f);
+    let repeated = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "complete-first",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated, completed);
+    assert_eq!(journal_state(&f), state_before_repeat);
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(integrated.id())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn next_owned_refresh_uses_its_signed_completed_baseline_and_preserves_copy_origin() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, first) = prepared(&f, &engine).await;
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let first_approval = actor.prepared_approval_digest(&engine, &first).unwrap();
+    let completed_first = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &first,
+        "first-before-next",
+        &first_approval,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    let first_sha = Oid::from_str(completed_first.git_receipt_sha.as_ref().unwrap()).unwrap();
+    // Model an independently handled parent advance in this preparation fixture.
+    // Full ordinary SyncEngine initialization/cycle qualification is separate.
+    std::fs::write(f._parent_wc.join("file.txt"), b"second parent advance\n").unwrap();
+    svn(
+        &["commit", "-m", "second fixture parent advance"],
+        Some(&f._parent_wc),
+    );
+    let advanced = commit(&f.target, b"second parent advance\n", &[f.parent]);
+    assert!(f.target.graph_descendant_of(advanced, f.parent).unwrap());
+    f.target
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .set_target(advanced, "fixture parent fast-forward")
+        .unwrap();
+    f.db.insert_commit_map_with_repo(
+        6,
+        &advanced.to_string(),
+        "svn_to_git",
+        "fixture",
+        "fixture",
+        Some("parent"),
+    )
+    .unwrap();
+    f.db.update_repo_watermark("parent", 6, &advanced.to_string())
+        .unwrap();
+    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &f.db.conn(),
+        "parent",
+        &advanced.to_string(),
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .unwrap();
+    let parent_before = parent_row(&f);
+    let second_workspace = actor.create_workspace(&engine).unwrap();
+    let second = prepare_registered_in_workspace_for_test(
+        &f.db,
+        "child",
+        second_workspace.clone(),
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.pins().git.pins.child_tip, first_sha.to_string());
+    assert_eq!(
+        second.pins().git.pins.parent_baseline_tip,
+        f.parent.to_string()
+    );
+    assert_eq!(
+        second
+            .pins()
+            .svn
+            .pins
+            .lineage
+            .pins
+            .child
+            .parent_baseline_revision,
+        4
+    );
+    assert_eq!(
+        second.pins().svn.pins.lineage.child_copy.copy_from_revision,
+        2
+    );
+    assert_eq!(
+        second.pins().svn.pins.lineage.child_copy.created_revision,
+        3
+    );
+    let approved = actor.prepared_approval_digest(&engine, &second).unwrap();
+    let completed_second = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &second,
+        "next-refresh",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        completed_second.phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::Completed
+    );
+    let receipt = completed_second.svn_receipt.as_ref().unwrap();
+    assert_eq!(receipt.revision, 7);
+    assert_eq!(receipt.mergeinfo, "/trunk:3-6");
+    assert_eq!(receipt.child_copy.copy_from_revision, 2);
+    assert_eq!(receipt.child_copy.created_revision, 3);
+    assert_eq!(parent_row(&f), parent_before);
+    let tip = f
+        .target
+        .find_reference("refs/heads/feature")
+        .unwrap()
+        .target()
+        .unwrap();
+    let integrated = f.target.find_commit(tip).unwrap();
+    assert_eq!(
+        integrated.parent_ids().collect::<Vec<_>>(),
+        vec![first_sha, advanced]
+    );
+    assert_eq!(integrated.tree_id().to_string(), receipt.git_tree);
+    assert_eq!(
+        f.target.find_reference("refs/heads/main").unwrap().target(),
+        Some(advanced)
+    );
+    assert!(f.target.graph_descendant_of(tip, f.baseline).unwrap());
+    assert!(f.target.graph_descendant_of(tip, f.parent).unwrap());
+    assert_eq!(
+        f.db.pair_refresh_operation(completed_first.id).unwrap(),
+        completed_first
+    );
+    assert_eq!(
+        f.db.pair_refresh_operation(completed_second.id).unwrap(),
+        completed_second
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
 }

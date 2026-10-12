@@ -62,7 +62,7 @@ async fn visible_checkout_properties(
     bound_checkout_property_xml(&xml, root, &canonical, info)
 }
 
-fn bound_checkout_property_xml(
+pub(crate) fn bound_checkout_property_xml(
     xml: &str,
     root: &str,
     checkout: &Path,

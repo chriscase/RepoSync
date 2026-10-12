@@ -17,7 +17,8 @@ use super::super::svn_observation::{
 };
 use super::*;
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SERIAL: super::authenticated_enrollment_tests::WriterTestAdmission =
+    super::authenticated_enrollment_tests::WriterTestAdmission;
 
 fn run(command: &mut Command) -> String {
     let output = command.output().unwrap();

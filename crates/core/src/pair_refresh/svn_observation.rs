@@ -176,6 +176,29 @@ pub async fn observe_prepared_child_svn(
     observation_root: &Path,
     prepared: &PreparedCleanChildSvn,
 ) -> Result<SvnPublicationObservation, SvnError> {
+    observe_prepared_child_svn_checked(child, parent, git_path, observation_root, prepared, false)
+        .await
+}
+
+pub(crate) async fn observe_prepared_child_svn_visible(
+    child: &SvnClient,
+    parent: &SvnClient,
+    git_path: &Path,
+    observation_root: &Path,
+    prepared: &PreparedCleanChildSvn,
+) -> Result<SvnPublicationObservation, SvnError> {
+    observe_prepared_child_svn_checked(child, parent, git_path, observation_root, prepared, true)
+        .await
+}
+
+async fn observe_prepared_child_svn_checked(
+    child: &SvnClient,
+    parent: &SvnClient,
+    git_path: &Path,
+    observation_root: &Path,
+    prepared: &PreparedCleanChildSvn,
+    visible: bool,
+) -> Result<SvnPublicationObservation, SvnError> {
     let pins = &prepared.pins.lineage.pins;
     let mergeinfo = expected_refresh_mergeinfo(
         &pins.child.parent_path,
@@ -195,10 +218,28 @@ pub async fn observe_prepared_child_svn(
             "prepared lineage receipt differs from repository proof",
         ));
     }
-    let mut expected_properties = parse_refresh_properties(
-        &parent.tree_properties_at_rev(pins.parent_revision).await?,
-        parent.url(),
-    )?;
+    let parent_xml = parent.tree_properties_at_rev(pins.parent_revision).await?;
+    let mut expected_properties = if visible {
+        let checkout = super::svn_visibility::observe_subtree(parent, pins.parent_revision).await?;
+        super::svn_visibility::require_empty_visible_ancestors(parent, checkout.info()).await?;
+        let properties = super::svn_preparation::bound_checkout_property_xml(
+            &parent_xml,
+            parent.url(),
+            checkout.path(),
+            checkout.info(),
+        )?;
+        verify_refresh_svn_tree(
+            git_path,
+            &prepared.pins.parent_git_tree,
+            checkout.path(),
+            &properties,
+            None,
+            &pins.child.parent_path,
+        )?;
+        properties
+    } else {
+        parse_refresh_properties(&parent_xml, parent.url())?
+    };
     expected_properties
         .entry(String::new())
         .or_default()
@@ -244,9 +285,27 @@ pub async fn observe_prepared_child_svn(
     ));
     std::fs::create_dir(&directory)?;
     let working_copy = directory.join("child");
-    child
-        .checkout_pinned_without_externals(&working_copy, revision)
-        .await?;
+    if visible {
+        child
+            .checkout_full_pinned_without_externals(&working_copy, revision)
+            .await?;
+        let info = child.info_at_rev(revision).await?;
+        let presence =
+            super::svn_visibility::presence_pin("published_child", &working_copy, &info)?;
+        if presence.repository_uuid != pins.child.repository_uuid
+            || presence.repository_root_url != pins.repository_root_url
+            || presence.url != pins.child_url
+        {
+            return Err(refused(
+                "complete publication checkout differs from approved identity",
+            ));
+        }
+        super::svn_visibility::require_empty_visible_ancestors(child, &info).await?;
+    } else {
+        child
+            .checkout_pinned_without_externals(&working_copy, revision)
+            .await?;
+    }
     verify_refresh_svn_tree(
         git_path,
         &prepared.result_git_tree,
@@ -269,6 +328,70 @@ pub async fn observe_prepared_child_svn(
         )? != Some(revision)
     {
         return Err(refused("child changed while observing publication"));
+    }
+    if visible {
+        let child_head = super::svn_visibility::observe_subtree(child, latest.latest_rev).await?;
+        child_head.require_unchanged_since(revision)?;
+        super::svn_visibility::require_empty_visible_ancestors(child, child_head.info()).await?;
+        let child_properties = super::svn_preparation::bound_checkout_property_xml(
+            &child.tree_properties_at_rev(latest.latest_rev).await?,
+            child.url(),
+            child_head.path(),
+            child_head.info(),
+        )?;
+        if normalized(child_properties.clone()) != properties {
+            return Err(refused(
+                "current complete child properties differ from receipt",
+            ));
+        }
+        verify_refresh_svn_tree(
+            git_path,
+            &prepared.result_git_tree,
+            child_head.path(),
+            &child_properties,
+            Some(&mergeinfo),
+            &pins.child.parent_path,
+        )?;
+        let parent_head = super::svn_visibility::observe_subtree(parent, latest.latest_rev).await?;
+        parent_head.require_unchanged_since(pins.parent_revision)?;
+        super::svn_visibility::require_empty_visible_ancestors(parent, parent_head.info()).await?;
+        let parent_properties = super::svn_preparation::bound_checkout_property_xml(
+            &parent.tree_properties_at_rev(latest.latest_rev).await?,
+            parent.url(),
+            parent_head.path(),
+            parent_head.info(),
+        )?;
+        let mut expected_parent = expected_properties.clone();
+        expected_parent
+            .entry(String::new())
+            .or_default()
+            .remove("svn:mergeinfo");
+        if normalized(parent_properties.clone()) != normalized(expected_parent) {
+            return Err(refused("current complete parent properties drifted"));
+        }
+        verify_refresh_svn_tree(
+            git_path,
+            &prepared.pins.parent_git_tree,
+            parent_head.path(),
+            &parent_properties,
+            None,
+            &pins.child.parent_path,
+        )?;
+        let final_child = child.info().await?;
+        let final_parent = parent.info().await?;
+        if final_child.uuid != latest.uuid
+            || final_child.root_url != latest.root_url
+            || final_child.url != latest.url
+            || final_child.latest_rev != latest.latest_rev
+            || final_parent.uuid != latest.uuid
+            || final_parent.root_url != latest.root_url
+            || final_parent.url != pins.parent_url
+            || final_parent.latest_rev != latest.latest_rev
+        {
+            return Err(refused(
+                "remote identity or HEAD moved during complete receipt observation",
+            ));
+        }
     }
     expected_copy.inspected_revision = revision;
     Ok(SvnPublicationObservation::Observed(Box::new(

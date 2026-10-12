@@ -72,7 +72,7 @@ pub fn observe_registered_git_sources(
     observe_with_client(configuration, source_client()?)
 }
 
-fn source_client() -> Result<reqwest::Client, GitError> {
+pub(crate) fn source_client() -> Result<reqwest::Client, GitError> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -111,7 +111,7 @@ fn observe_in_workspace_with_client(
     Ok(snapshot)
 }
 
-fn observe_with_client(
+pub(crate) fn observe_with_client(
     configuration: &LiveExecutionConfiguration,
     client: reqwest::Client,
 ) -> Result<GitSourceSnapshot, GitError> {
@@ -237,6 +237,66 @@ fn download_pinned_branch(
         repository.find_commit(commit?)?;
     }
     Ok(())
+}
+
+pub(crate) fn observe_completed_pair_with_client(
+    configuration: &LiveExecutionConfiguration,
+    repository: &Repository,
+    prepared: &super::preparation::PreparedCleanChildGit,
+    client: reqwest::Client,
+) -> Result<Oid, GitError> {
+    let pin = configuration.pin();
+    if pin.parent.last_git_sha != prepared.pins.parent_tip
+        || pin.child.last_git_sha != prepared.pins.child_tip
+        || pin.transport_policy != PinnedPushPolicy::SmartHttpV1
+    {
+        return Err(refused(
+            "completed pair observation differs from registered inputs",
+        ));
+    }
+    require_pinned_push_endpoint_with_policy(
+        repository,
+        &pin.git_remote_url,
+        pin.transport_policy,
+    )?;
+    let expected = Oid::from_str(&prepared.prepared_sha)?;
+    let old = Oid::from_str(&prepared.pins.child_tip)?;
+    let observation = super::publication::observe_http_with_client(
+        repository,
+        &pin.git_remote_url,
+        &pin.child_git_branch,
+        old,
+        expected,
+        configuration.credentials().child_git_token(),
+        client.clone(),
+    )?;
+    if observation != super::publication::GitPublicationObservation::Observed(expected) {
+        return Err(refused(
+            "published child ref has not been independently observed",
+        ));
+    }
+    // The parent has its own credential. Do not use the child's token to
+    // substitute parent access or assume an earlier downloaded parent is fresh.
+    let transport = HttpTransport::new(
+        &pin.git_remote_url,
+        configuration.credentials().parent_git_token(),
+        client,
+    )?;
+    download_pinned_branch(
+        repository,
+        &transport,
+        &pin.parent_git_branch,
+        Oid::from_str(&pin.parent.last_git_sha)?,
+        &[
+            (
+                format!("refs/heads/{}", pin.parent_git_branch),
+                Oid::from_str(&pin.parent.last_git_sha)?,
+            ),
+            (format!("refs/heads/{}", pin.child_git_branch), expected),
+        ],
+    )?;
+    require_complete_git_graph(repository)?;
+    Ok(expected)
 }
 
 #[cfg(test)]

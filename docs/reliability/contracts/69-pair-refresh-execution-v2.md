@@ -550,7 +550,19 @@ their scoped storage behavior. Legacy mutation APIs refuse authenticated jobs.
 The actual owner may sign cancellation only at the exact pre-intent phase and
 original lease epoch; cancellation does not authorize resource deletion/adoption.
 
-This enrollment component performs no external publication. The API execution
-refusal remains in place. First-intent remote revalidation, authenticated phase
-advancement, complete execution/recovery orchestration, native owner-death proof,
-no-op results and full real-engine qualification remain required.
+The owned Rust execution path now rechecks complete registered Git/SVN inputs
+and its retained working copy before signing the first SVN intent. It invokes
+one normal SVN commit, independently verifies the complete result, and signs the
+SVN receipt before a fresh Git intent. The pinned child Git compare-and-swap
+uses the child credential; independent child and parent reads use their separate
+credentials. Only complete matching SVN/Git receipts permit the authenticated
+transaction that advances child correspondence and checkpoints, signs completion
+and releases both holds. Parent history, parent checkpoints and echo generations
+remain unchanged. A retained intent never permits a repeated publication.
+
+First and next integrations are covered with real SVN/Git preparation fixtures.
+Those fixtures seed initial correspondence; they do not establish full ordinary
+SyncEngine initialization and cycle qualification. The legacy API execution
+refusal remains in place. Retained-intent reconciliation, native owner-death and
+resource reconstruction, no-op receipts, versioned API orchestration and full
+real-engine qualification remain required before the workflow is complete.

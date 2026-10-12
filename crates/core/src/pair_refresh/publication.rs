@@ -196,7 +196,7 @@ pub fn publish_pinned_child_with_policy(
     }
 }
 
-fn publish_http_with_client(
+pub(crate) fn publish_http_with_client(
     repo: &Repository,
     remote_url: &str,
     branch: &str,
@@ -380,7 +380,7 @@ fn require_observation_inputs(
     Ok(())
 }
 
-fn observe_http_with_client(
+pub(crate) fn observe_http_with_client(
     repo: &Repository,
     remote_url: &str,
     branch: &str,

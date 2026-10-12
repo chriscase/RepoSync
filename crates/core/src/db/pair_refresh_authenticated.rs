@@ -227,6 +227,227 @@ pub(super) fn verify(
 }
 
 impl Database {
+    pub(crate) fn require_authenticated_git_inputs(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        phase: PairRefreshPhase,
+    ) -> Result<
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        DatabaseError,
+    > {
+        if !matches!(
+            phase,
+            PairRefreshPhase::SvnObserved | PairRefreshPhase::GitObserved
+        ) {
+            return Err(refused("unsupported authenticated Git entrance"));
+        }
+        self.immediate_transaction(|tx| {
+            let (_, _, configuration) =
+                execution_inputs(tx, self, engine, actor, prepared, busy, phase)?;
+            Ok(configuration)
+        })
+    }
+
+    pub(crate) fn record_authenticated_git_intent(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        proof: crate::pair_refresh::execution::GitIntentProof<'_>,
+    ) -> Result<
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        DatabaseError,
+    > {
+        self.immediate_transaction(|tx| {
+            let (mut op, evidence, configuration) = execution_inputs(
+                tx,
+                self,
+                engine,
+                actor,
+                prepared,
+                busy,
+                PairRefreshPhase::SvnObserved,
+            )?;
+            proof.require_binding(engine, prepared, &configuration)?;
+            if op.svn_receipt.as_ref() != Some(proof.svn_receipt()) {
+                return Err(refused("fresh SVN receipt differs before Git intent"));
+            }
+            op.phase = PairRefreshPhase::GitIntent;
+            store_progress(tx, &mut op, evidence)?;
+            Ok(configuration)
+        })
+    }
+
+    pub(crate) fn record_authenticated_git_receipt(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        proof: &crate::pair_refresh::execution::GitReceiptProof<'_>,
+    ) -> Result<PairRefreshOperation, DatabaseError> {
+        self.immediate_transaction(|tx| {
+            let (mut op, evidence, configuration) = execution_inputs(
+                tx,
+                self,
+                engine,
+                actor,
+                prepared,
+                busy,
+                PairRefreshPhase::GitIntent,
+            )?;
+            proof.require_binding(engine, prepared, &configuration)?;
+            if op.svn_receipt.as_ref() != Some(proof.svn_receipt()) {
+                return Err(refused("SVN receipt differs at Git confirmation"));
+            }
+            op.git_receipt_sha = Some(proof.sha().into());
+            op.phase = PairRefreshPhase::GitObserved;
+            store_progress(tx, &mut op, evidence)?;
+            Ok(op)
+        })
+    }
+
+    pub(crate) fn finalize_authenticated_refresh(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        proof: crate::pair_refresh::execution::GitReceiptProof<'_>,
+    ) -> Result<PairRefreshOperation, DatabaseError> {
+        self.immediate_transaction(|tx| {
+            let (mut op, evidence, configuration) = execution_inputs(tx, self, engine, actor, prepared, busy, PairRefreshPhase::GitObserved)?;
+            proof.require_binding(engine, prepared, &configuration)?;
+            if op.svn_receipt.as_ref() != Some(proof.svn_receipt()) || op.git_receipt_sha.as_deref() != Some(proof.sha()) {
+                return Err(refused("complete publication proof differs before finalization"));
+            }
+            let receipt = proof.svn_receipt();
+            let child = &op.pins.child;
+            let sha = proof.sha();
+            let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_records WHERE (repo_id=?1 OR repo_id IS NULL OR repo_id='') AND (git_sha=?2 OR svn_rev=?3))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
+            let conflicting_map: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commit_map WHERE (git_sha=?2 OR svn_rev=?3) AND ((repo_id=?1 AND NOT (git_sha=?2 AND svn_rev=?3 AND direction='git_to_svn')) OR repo_id IS NULL OR repo_id=''))", params![child.repo_id, sha, receipt.revision], |row| row.get(0))?;
+            if conflict || conflicting_map { return Err(refused("publication has conflicting correspondence")); }
+            let now = Utc::now().to_rfc3339();
+            tx.execute("INSERT INTO commit_map(repo_id,svn_rev,git_sha,direction,synced_at,svn_author,git_author) SELECT ?1,?2,?3,'git_to_svn',?4,'RepoSync','RepoSync' WHERE NOT EXISTS(SELECT 1 FROM commit_map WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='git_to_svn')", params![child.repo_id, receipt.revision, sha, now])?;
+            tx.execute("INSERT INTO sync_records(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) VALUES(?1,?2,?3,?4,'git_to_svn','RepoSync','Update pair from parent',?5,?5,'applied')", params![op.id.to_string(), child.repo_id, receipt.revision, sha, now])?;
+            if tx.execute("UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2,last_sync_at=?3,total_syncs=total_syncs+1,updated_at=?3 WHERE id=?4 AND scope_uuid=?5", params![sha, receipt.revision, now, child.repo_id, child.scope_uuid])? != 1 { return Err(refused("child registration disappeared during finalization")); }
+            crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, &child.repo_id, sha, &now)?;
+            write(tx, &format!("last_svn_rev_{}", child.repo_id), &receipt.revision.to_string())?;
+            for scope in [&child.scope_uuid, &op.pins.parent.scope_uuid] {
+                if tx.execute("DELETE FROM kv_state WHERE key=?1 AND value=?2", params![operation_key(3,"hold",scope),op.id.to_string()])? != 1 { return Err(refused("lost authenticated completion hold")); }
+            }
+            op.phase = PairRefreshPhase::Completed;
+            store_progress(tx, &mut op, evidence)?;
+            Ok(op)
+        })
+    }
+
+    pub(crate) fn require_authenticated_svn_preparation(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        DatabaseError,
+    > {
+        self.immediate_transaction(|tx| {
+            let (_, _, configuration) = execution_inputs(
+                tx,
+                self,
+                engine,
+                actor,
+                prepared,
+                busy,
+                PairRefreshPhase::Prepared,
+            )?;
+            Ok(configuration)
+        })
+    }
+
+    pub(crate) fn record_authenticated_svn_intent(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        proof: crate::pair_refresh::execution::SvnIntentProof<'_>,
+    ) -> Result<
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        DatabaseError,
+    > {
+        self.immediate_transaction(|tx| {
+            let (mut op, evidence, configuration) = execution_inputs(
+                tx,
+                self,
+                engine,
+                actor,
+                prepared,
+                busy,
+                PairRefreshPhase::Prepared,
+            )?;
+            proof.require_binding(engine, prepared, &configuration)?;
+            op.phase = PairRefreshPhase::SvnIntent;
+            store_progress(tx, &mut op, evidence)?;
+            Ok(configuration)
+        })
+    }
+
+    pub(crate) fn record_authenticated_svn_receipt(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        proof: crate::pair_refresh::execution::SvnReceiptProof<'_>,
+    ) -> Result<PairRefreshOperation, DatabaseError> {
+        self.immediate_transaction(|tx| {
+            let (mut op, evidence, configuration) = execution_inputs(
+                tx,
+                self,
+                engine,
+                actor,
+                prepared,
+                busy,
+                PairRefreshPhase::SvnIntent,
+            )?;
+            proof.require_binding(engine, prepared, &configuration)?;
+            op.svn_receipt = Some(proof.receipt().clone());
+            op.phase = PairRefreshPhase::SvnObserved;
+            op.reconciliation_detail = None;
+            store_progress(tx, &mut op, evidence)?;
+            Ok(op)
+        })
+    }
+
+    pub(crate) fn retain_authenticated_svn_uncertainty(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<(), DatabaseError> {
+        self.immediate_transaction(|tx| {
+            let (mut op, evidence, _) = execution_inputs(
+                tx,
+                self,
+                engine,
+                actor,
+                prepared,
+                busy,
+                PairRefreshPhase::SvnIntent,
+            )?;
+            op.reconciliation_detail =
+                Some("SVN publication requires independent reconciliation".into());
+            store_progress(tx, &mut op, evidence)
+        })
+    }
+
     pub(crate) fn cancel_authenticated_preparation(
         &self,
         engine: &SyncEngine,
@@ -389,4 +610,88 @@ impl Database {
             Ok(op)
         })
     }
+}
+
+fn execution_inputs(
+    tx: &Connection,
+    db: &Database,
+    engine: &SyncEngine,
+    actor: &LiveRefreshActorPolicy<'_>,
+    prepared: &LivePreparedRefresh,
+    busy: &crate::busy::PairBusyGuard,
+    expected: PairRefreshPhase,
+) -> Result<
+    (
+        PairRefreshOperation,
+        Evidence,
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+    ),
+    DatabaseError,
+> {
+    actor.require_current_in_reserved_transaction(engine, tx)?;
+    let epoch = crate::writer_fence::require_owned_current(tx)?;
+    prepared.workspace()?.require_binding(db, actor.pin())?;
+    let evidence = evidence(actor, prepared)?;
+    let operations = journal(tx)?;
+    let op = operations
+        .iter()
+        .find(|op| op.id == prepared.pins().git.operation_id)
+        .ok_or_else(|| refused("authenticated execution job is missing"))?
+        .clone();
+    if op.version != 3
+        || op.phase != expected
+        || op.reconciliation_detail.is_some()
+        || op.admitted_writer_epoch != epoch
+        || op.pins != *prepared.pins()
+        || op.approval_digest != approval(&op.pins, &evidence)?
+        || !busy.owns_pair(&op.pins.child.repo_id, &op.pins.parent.repo_id)
+        || operations
+            .iter()
+            .any(|other| other.id != op.id && other.phase.holds_scopes())
+    {
+        return Err(refused(
+            "authenticated phase, owner, inputs or global exclusion changed",
+        ));
+    }
+    require_pins_current(tx, &op.pins)?;
+    require_credentials_current(tx, &op.pins)?;
+    require_execution_conflicts_quiet(tx, &op.pins)?;
+    let configuration =
+        crate::pair_refresh::execution_configuration::capture_execution_configuration(
+            tx,
+            &op.pins.child.repo_id,
+        )?;
+    configuration.require_job_configuration(&op.pins)?;
+    if configuration.pin() != prepared.configuration().pin() {
+        return Err(refused("authenticated prepared configuration changed"));
+    }
+    super::super::ordinary_writer_windows::require_globally_quiet_for_refresh(tx)?;
+    super::super::pair_refresh_competing_journals::require_globally_quiet(tx)?;
+    Ok((op, evidence, configuration))
+}
+
+fn store_progress(
+    tx: &Connection,
+    op: &mut PairRefreshOperation,
+    evidence: Evidence,
+) -> Result<(), DatabaseError> {
+    let secret = private_key(tx)?.ok_or_else(|| refused("journal key is missing"))?;
+    op.updated_at = Utc::now().to_rfc3339();
+    validate(op)?;
+    let authority = Authority {
+        mac: hex::encode(mac(&secret, &evidence, op)?.finalize().into_bytes()),
+        evidence,
+    };
+    write(
+        tx,
+        &operation_key(3, "document", &op.id.to_string()),
+        &serde_json::to_string(op).map_err(|_| refused("job encoding"))?,
+    )?;
+    write(
+        tx,
+        &operation_key(3, "authority", &op.id.to_string()),
+        &serde_json::to_string(&authority).map_err(|_| refused("authority encoding"))?,
+    )?;
+    journal(tx)?;
+    Ok(())
 }
