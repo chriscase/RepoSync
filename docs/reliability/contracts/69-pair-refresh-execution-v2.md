@@ -405,6 +405,16 @@ Refresh holds, uncertain publication and corrupt evidence refuse. A bounded
 wait never expires, releases or adopts someone else's durable record. Inputs
 are observed and checked after the request actually acquires both guards.
 
+Window admission and ownership transitions reserve the SQLite writer before
+reading their evidence. Under WAL, a deferred transaction can read an old
+snapshot and fail its subsequent write upgrade immediately, without honoring
+the busy timeout. Immediate transactions serialize this local database
+contention without retrying an external publication or changing the five-second
+request deadline. A held, uncertain or corrupt record still refuses, and only
+its actual preparation owner can release it. Deterministic independent-
+connection controls exercise contended admission and preparation drop; the
+original concurrent exact-skip assertions remain unchanged.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary

@@ -204,7 +204,10 @@ impl Database {
     ) -> Result<Option<Document>, DatabaseError> {
         let repo_id =
             repo_id.filter(|id| !id.is_empty() && *id != super::personal_scope::PERSONAL_SCOPE_KEY);
-        self.transaction(|tx| {
+        // Reserve the SQLite writer before reading ownership. A deferred
+        // read-to-write upgrade can fail immediately under WAL contention,
+        // bypassing busy_timeout and turning a quiet scope into a refusal.
+        self.immediate_transaction(|tx| {
             require_no_pair_refresh_hold(tx,repo_id)?;
             // Legacy engine migrations happen after admission. A human scope
             // still excludes refresh while the old schema lacks UUID columns.
@@ -262,7 +265,7 @@ impl OrdinaryWriterWindow<'_> {
                 return Err(refused("window handoff targets another database"));
             }
         }
-        db.transaction(|tx| {
+        db.immediate_transaction(|tx| {
             let doc = self.owned(tx)?;
             if doc.phase != Phase::Preparing {
                 return Err(refused("window already has uncertain publication"));
@@ -293,7 +296,7 @@ impl OrdinaryWriterWindow<'_> {
         if self.admitted.repo_id.is_some() {
             return Ok(());
         }
-        self.db.transaction(|tx| {
+        self.db.immediate_transaction(|tx| {
             let mut doc = self.owned(tx)?;
             doc.phase = Phase::UnjournalledPublicationPossible;
             store(tx, &doc)
@@ -314,7 +317,7 @@ impl OrdinaryWriterWindow<'_> {
     /// Release local preparation only. Possible publication cannot be released
     /// through the public capability without a verified checkpoint transition.
     pub fn finish_preparation(mut self) -> Result<(), DatabaseError> {
-        self.db.transaction(|tx| {
+        self.db.immediate_transaction(|tx| {
             if self.owned(tx)?.phase != Phase::Preparing {
                 return Err(refused("publication still requires a verified checkpoint"));
             }
@@ -326,7 +329,7 @@ impl OrdinaryWriterWindow<'_> {
 
     /// Only a completed normal core cycle can release possible publication.
     pub(crate) fn finish(mut self) -> Result<(), DatabaseError> {
-        self.db.transaction(|tx| {
+        self.db.immediate_transaction(|tx| {
             self.owned(tx)?;
             self.release(tx)
         })?;
@@ -341,7 +344,7 @@ impl OrdinaryWriterWindow<'_> {
         &self,
         checkpoint: impl FnOnce(&Connection) -> Result<(), DatabaseError>,
     ) -> Result<(), DatabaseError> {
-        self.db.transaction(|tx| {
+        self.db.immediate_transaction(|tx| {
             let mut doc = self.owned(tx)?;
             if doc.repo_id.is_some() || doc.phase != Phase::UnjournalledPublicationPossible {
                 return Err(refused(
@@ -360,7 +363,7 @@ impl Drop for OrdinaryWriterWindow<'_> {
         if self.completed {
             return;
         }
-        let result = self.db.transaction(|tx| {
+        let result = self.db.immediate_transaction(|tx| {
             // Retaining uncertainty is read-only: it needs neither a lease
             // renewal nor authority to release the durable window.
             let doc = documents(tx)?
