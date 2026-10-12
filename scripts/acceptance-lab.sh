@@ -752,6 +752,23 @@ record_rust_image_identity() {
   log "recorded ${RUST_IMAGE} ${digest}"
 }
 
+# Local images often have an empty RepoDigests list. `index .RepoDigests 0`
+# exits 1 on that list and drops the immutable id. Record the id, size, and
+# the whole list. An empty list stays empty. This does not invent a digest.
+inspect_image_metadata() {
+  local image="$1"
+  local line
+  line="$(docker image inspect "$image" --format 'id={{.Id}} size={{.Size}} repo_digests={{json .RepoDigests}}')" || return 1
+  case "$line" in
+    id=sha256:*" size="*" repo_digests="\[*\]) ;;
+    *)
+      echo "image identity for ${image} lacks an immutable id or digest list: ${line}" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$line"
+}
+
 extract_build_graph() {
   local dest cid copy_lock copy_sum copy_meta copy_rustc rm_ec expected actual name
   dest="$(graph_dest)"
@@ -807,9 +824,11 @@ extract_build_graph() {
       cat "$dest/rustc-version.txt"
     } > "$dest/image-identity.txt"
   fi
+  local meta
+  meta="$(inspect_image_metadata "$REPOSYNC_IMAGE")" || return 1
   {
     echo "reposync_image=${REPOSYNC_IMAGE}"
-    docker image inspect "$REPOSYNC_IMAGE" --format 'reposync_image_id={{.Id}} reposync_repo_digest={{index .RepoDigests 0}}'
+    printf 'reposync_%s\n' "$meta"
     echo "lock_sha256=${actual}"
   } > "$dest/reposync-image.txt"
   if [ ! -s "$dest/image-identity.txt" ] || [ ! -s "$dest/reposync-image.txt" ]; then
@@ -850,7 +869,7 @@ prepare_images() {
 }
 
 record_images() {
-  local out
+  local out meta
   if [ -n "${EVIDENCE:-}" ]; then
     out="$EVIDENCE/images.txt"
   else
@@ -868,7 +887,8 @@ record_images() {
       "${PYENV_IMAGE:-}" "${OBSERVER_IMAGE:-}" "${REPOSYNC_IMAGE:-}"; do
       [ -n "$image" ] || continue
       if docker image inspect "$image" >/dev/null 2>&1; then
-        docker image inspect "$image" --format "$image id={{.Id}} size={{.Size}} digest={{index .RepoDigests 0}}" || true
+        meta="$(inspect_image_metadata "$image")" || return 1
+        printf '%s %s\n' "$image" "$meta"
       else
         echo "$image absent"
       fi
