@@ -381,8 +381,10 @@ PY
   cp "$LAB_DIR/config/authors.toml" "$RUN_DIR/authors.toml"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svn-authz"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svnserve-authz"
+  cp "$LAB_DIR/docker/ldap/svc-bind-acl.ldif" "$RUN_DIR/ldap-seed/60-svc-bind-acl.ldif"
   chmod 755 "$RUN_DIR/ldap-seed"
-  chmod 644 "$RUN_DIR/ldap-seed/50-lab.ldif" "$RUN_DIR/svn-apache.conf" "$RUN_DIR/svnserve-passwd" \
+  chmod 644 "$RUN_DIR/ldap-seed/50-lab.ldif" "$RUN_DIR/ldap-seed/60-svc-bind-acl.ldif" \
+    "$RUN_DIR/svn-apache.conf" "$RUN_DIR/svnserve-passwd" \
     "$RUN_DIR/daemon.toml" "$RUN_DIR/authors.toml" "$RUN_DIR/svn-authz" "$RUN_DIR/svnserve-authz"
 }
 
@@ -392,7 +394,8 @@ import pathlib, re, sys
 run = pathlib.Path(sys.argv[1])
 pattern = re.compile(r"company\.com|github\.com|github\.company|mentorg|svn\.company|api\.github\.com|test-token", re.I)
 names = [
-    "daemon.toml", "authors.toml", "ldap-seed/50-lab.ldif", "svn-apache.conf",
+    "daemon.toml", "authors.toml", "ldap-seed/50-lab.ldif", "ldap-seed/60-svc-bind-acl.ldif",
+    "svn-apache.conf",
     "svn-authz", "svnserve-passwd", "svnserve-authz", "compose.env",
 ]
 bad = []
