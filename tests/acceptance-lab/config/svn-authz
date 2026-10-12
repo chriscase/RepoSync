@@ -2,7 +2,9 @@
 writers = svc-sync,alice,bob
 readers = observer
 
-[:/]
+# [/] applies to every repository under SVNParentPath. Subversion 1.14
+# rejects [:/] as an empty repository name. Run 38193558242.
+[/]
 @readers = r
 @writers = rw
 * =
