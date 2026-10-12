@@ -339,9 +339,11 @@ async fn successful_legacy_import_verifies_the_remote_before_releasing_its_windo
 #[tokio::test]
 async fn rejected_legacy_publication_retains_exclusion_without_retry_or_checkpoint_advance() {
     let f = job::Fixture::new();
-    let prior_svn = f.db.get_state("last_svn_rev").unwrap();
-    let prior_git = f.db.get_state("last_git_hash").unwrap();
-    let error = legacy(&f, &f.db, true).await.unwrap_err();
+    let legacy_db = Database::in_memory().unwrap();
+    legacy_db.initialize().unwrap();
+    let prior_svn = legacy_db.get_watermark("svn_rev").unwrap();
+    let prior_git = legacy_db.get_watermark("git_sha").unwrap();
+    let error = legacy(&f, &legacy_db, true).await.unwrap_err();
     assert!(
         format!("{error:#}").contains("writer window retained"),
         "{error:#}"
@@ -354,27 +356,26 @@ async fn rejected_legacy_publication_retains_exclusion_without_retry_or_checkpoi
         .unwrap()
         .find_reference("refs/heads/main")
         .is_err());
-    assert_eq!(f.db.get_state("last_svn_rev").unwrap(), prior_svn);
-    assert_eq!(f.db.get_state("last_git_hash").unwrap(), prior_git);
-    assert!(rows(&f.db).iter().any(
-        |(key, value)| key.starts_with("pair_refresh_writer_window_")
-            && value.contains("unjournalled_publication_possible")
-    ));
+    assert_eq!(legacy_db.get_watermark("svn_rev").unwrap(), prior_svn);
+    assert_eq!(legacy_db.get_watermark("git_sha").unwrap(), prior_git);
+    assert!(rows(&legacy_db).iter().any(|(key, value)| key
+        .starts_with("pair_refresh_writer_window_")
+        && value.contains("unjournalled_publication_possible")));
     let pins = f.pins();
-    assert!(f
-        .db
-        .admit_pair_refresh(
-            "admin",
-            "request",
-            &pins.approval_digest().unwrap(),
-            pins,
-            &f.busy()
-        )
-        .is_err());
+    for pin in [&pins.child, &pins.parent] {
+        assert!(
+            reposync_core::db::ordinary_writer_windows::require_quiet_for_refresh(
+                &legacy_db.conn(),
+                &pin.repo_id,
+                &pin.scope_uuid,
+            )
+            .is_err()
+        );
+    }
 }
 
 #[tokio::test]
-async fn confirmed_legacy_push_cannot_bypass_managed_global_watermark_refusal() {
+async fn legacy_import_refuses_managed_checkpoints_before_remote_publication() {
     let f = job::Fixture::new();
     let parent = f.db.get_repo_watermark("parent").unwrap();
     let child = f.db.get_repo_watermark("child").unwrap();
@@ -388,26 +389,27 @@ async fn confirmed_legacy_push_cannot_bypass_managed_global_watermark_refusal() 
     assert!(git2::Repository::open_bare(f.dir.path().join("bare.git"))
         .unwrap()
         .find_reference("refs/heads/main")
-        .is_ok());
+        .is_err());
     assert_eq!(f.db.get_repo_watermark("parent").unwrap(), parent);
     assert_eq!(f.db.get_repo_watermark("child").unwrap(), child);
     assert_eq!(f.db.get_watermark("svn_rev").unwrap(), svn);
     assert_eq!(f.db.get_watermark("git_sha").unwrap(), git);
-    assert!(rows(&f.db).iter().any(
-        |(key, value)| key.starts_with("pair_refresh_writer_window_")
-            && value.contains("unjournalled_publication_possible")
-    ));
+    assert!(!rows(&f.db)
+        .iter()
+        .any(|(key, _)| key.starts_with("pair_refresh_writer_window_")));
     let pins = f.pins();
-    assert!(f
-        .db
-        .admit_pair_refresh(
+    let guard = f.busy();
+    let op =
+        f.db.admit_pair_refresh(
             "admin",
             "request",
             &pins.approval_digest().unwrap(),
             pins,
-            &f.busy()
+            &guard,
         )
-        .is_err());
+        .unwrap();
+    f.db.cancel_unpublished_pair_refresh(op.id).unwrap();
+    assert!(f.no_hold(None));
 }
 
 #[tokio::test]
