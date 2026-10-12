@@ -465,9 +465,15 @@ git rev-parse HEAD
 
   async restartDaemon(): Promise<void> {
     await exec("docker", ["compose", "-p", this.project, "-f", this.composeFile, "--profile", "app", "restart", "reposync"], { timeout: 120_000 });
+    // The forwarder closes the socket while reposync is restarting.
+    // expect.poll does not retry a thrown fetch, so treat that as not ready.
     await this.waitUntil(async () => {
-      const health = await this.api("GET", "/api/status/health", undefined, "");
-      return health.status === 200;
+      try {
+        const health = await this.api("GET", "/api/status/health", undefined, "");
+        return health.status === 200;
+      } catch {
+        return false;
+      }
     }, 120_000);
   }
 
