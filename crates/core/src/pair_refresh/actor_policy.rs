@@ -38,6 +38,89 @@ pub struct LiveRefreshActorPolicy<'engine> {
 }
 
 impl LiveRefreshActorPolicy<'_> {
+    /// Bind the approved owned preparation to one authenticated durable job.
+    /// Enrollment does not grant permission to publish or adopt resources.
+    pub fn enroll_prepared(
+        &self,
+        engine: &SyncEngine,
+        prepared: &super::live_preparation::LivePreparedRefresh,
+        request: &str,
+        approved_digest: &str,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<crate::db::pair_refresh_operations::PairRefreshOperation, DatabaseError> {
+        self.retain_workspace_before_enrollment(engine, prepared.workspace()?)?;
+        self.db.admit_authenticated_pair_refresh(
+            engine,
+            self,
+            prepared,
+            request,
+            approved_digest,
+            busy,
+        )
+    }
+
+    pub fn prepared_approval_digest(
+        &self,
+        engine: &SyncEngine,
+        prepared: &super::live_preparation::LivePreparedRefresh,
+    ) -> Result<String, DatabaseError> {
+        self.require_current(engine)?;
+        prepared.workspace()?.require_binding(self.db, &self.pin)?;
+        crate::db::pair_refresh_operations::authenticated_approval_digest(self, prepared)
+    }
+
+    /// Cancel only this actual owner's authenticated pre-intent preparation.
+    /// Retained files remain available; this does not authorize their deletion.
+    pub fn cancel_prepared_enrollment(
+        &self,
+        engine: &SyncEngine,
+        prepared: &super::live_preparation::LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+    ) -> Result<crate::db::pair_refresh_operations::PairRefreshOperation, DatabaseError> {
+        self.db
+            .cancel_authenticated_preparation(engine, self, prepared, busy)
+    }
+
+    /// Recheck inside the actual reserved SQLite writer transaction. This
+    /// reads the caller's connection directly and never reacquires the database
+    /// mutex. It is actor/policy evidence, not job or publication authority.
+    pub fn require_current_in_reserved_transaction(
+        &self,
+        engine: &SyncEngine,
+        tx: &Connection,
+    ) -> Result<(), DatabaseError> {
+        if !std::ptr::eq(self.engine, engine) || tx.is_autocommit() {
+            return Err(refused(
+                "actual engine and reserved writer transaction required",
+            ));
+        }
+        // SAFETY: the supplied live connection remains borrowed for this call.
+        // The public SQLite query only reads main's transaction state.
+        let state = unsafe { rusqlite::ffi::sqlite3_txn_state(tx.handle(), c"main".as_ptr()) };
+        if state != rusqlite::ffi::SQLITE_TXN_WRITE {
+            return Err(refused("authorization requires a reserved SQLite writer"));
+        }
+        let opened = self.db.opened_file()?;
+        let actual = crate::db::opened_file::OpenedDatabaseFile::attest(tx, &opened.path, None)
+            .ok_or_else(|| refused("authorization connection storage identity is unknown"))?;
+        if actual != *opened {
+            return Err(refused(
+                "authorization connection belongs to different storage",
+            ));
+        }
+        let current = capture_pin_on_connection(
+            tx,
+            &engine.config().sync,
+            self.allowed,
+            self.blocked,
+            *self.lfs_threshold,
+            &self.bearer,
+        )?;
+        if current != self.pin {
+            return Err(refused("actor, session or effective policy changed"));
+        }
+        Ok(())
+    }
     /// Preserve this owned resource set before any enrollment attempt. Current
     /// actor/storage checks still do not authorize a job or external effect.
     pub fn retain_workspace_before_enrollment(
@@ -234,6 +317,29 @@ fn capture_pin(
     lfs_threshold: u64,
     bearer: &str,
 ) -> Result<RefreshActorPolicyPin, DatabaseError> {
+    let policy_context_digest = validate_context(policy, allowed, blocked, lfs_threshold, bearer)?;
+    db.transaction(|tx| capture_pin_for_policy(tx, policy_context_digest, bearer))
+}
+
+fn capture_pin_on_connection(
+    tx: &Connection,
+    policy: &SyncConfig,
+    allowed: &[String],
+    blocked: &[String],
+    lfs_threshold: u64,
+    bearer: &str,
+) -> Result<RefreshActorPolicyPin, DatabaseError> {
+    let policy_context_digest = validate_context(policy, allowed, blocked, lfs_threshold, bearer)?;
+    capture_pin_for_policy(tx, policy_context_digest, bearer)
+}
+
+fn validate_context(
+    policy: &SyncConfig,
+    allowed: &[String],
+    blocked: &[String],
+    lfs_threshold: u64,
+    bearer: &str,
+) -> Result<String, DatabaseError> {
     if bearer.is_empty()
         || bearer.len() > 4096
         || bearer
@@ -242,22 +348,26 @@ fn capture_pin(
     {
         return Err(refused("current database admin session required"));
     }
-    let policy_context_digest = policy_digest(policy, allowed, blocked, lfs_threshold)?;
-    db.transaction(|tx| {
-        let actor = actor(tx, bearer)?;
-        let encoded = serde_json::to_vec(&("pair_refresh_actor_session_v2", bearer, &actor))
-            .map_err(|_| refused("actor context encoding failed"))?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(
-            &crate::db::pair_refresh_credentials::fingerprint_key(tx)?,
-        )
-        .map_err(|_| refused("invalid actor fingerprint key"))?;
-        mac.update(&encoded);
-        Ok(RefreshActorPolicyPin {
-            version: 2,
-            actor_id: actor.id,
-            session_context_digest: hex::encode(mac.finalize().into_bytes()),
-            policy_context_digest,
-        })
+    policy_digest(policy, allowed, blocked, lfs_threshold)
+}
+
+fn capture_pin_for_policy(
+    tx: &Connection,
+    policy_context_digest: String,
+    bearer: &str,
+) -> Result<RefreshActorPolicyPin, DatabaseError> {
+    let actor = actor(tx, bearer)?;
+    let encoded = serde_json::to_vec(&("pair_refresh_actor_session_v2", bearer, &actor))
+        .map_err(|_| refused("actor context encoding failed"))?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(&crate::db::pair_refresh_credentials::fingerprint_key(tx)?)
+            .map_err(|_| refused("invalid actor fingerprint key"))?;
+    mac.update(&encoded);
+    Ok(RefreshActorPolicyPin {
+        version: 2,
+        actor_id: actor.id,
+        session_context_digest: hex::encode(mac.finalize().into_bytes()),
+        policy_context_digest,
     })
 }
 

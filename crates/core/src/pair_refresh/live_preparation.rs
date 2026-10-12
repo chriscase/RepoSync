@@ -1,6 +1,10 @@
 //! Assemble independently observed inputs and both unreferenced/local results.
 //! This preparation does not authorize an actor, admit a job or publish.
 
+#[cfg(test)]
+#[path = "authenticated_enrollment_tests.rs"]
+mod authenticated_enrollment_tests;
+
 use anyhow::{bail, Context, Result};
 use uuid::Uuid;
 
@@ -54,6 +58,15 @@ impl PreparationDirectory {
 }
 
 impl LivePreparedRefresh {
+    pub(crate) fn workspace(&self) -> Result<&RefreshWorkspace, crate::errors::DatabaseError> {
+        match &self._operation_directory {
+            PreparationDirectory::Workspace { owner, .. } => Ok(owner),
+            PreparationDirectory::Temporary(_) => Err(crate::errors::DatabaseError::Other(
+                "temporary preparation cannot enroll an authenticated job".into(),
+            )),
+        }
+    }
+
     pub fn pins(&self) -> &RefreshJobPins {
         &self.pins
     }

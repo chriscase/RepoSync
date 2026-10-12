@@ -103,6 +103,13 @@ pub fn require_quiet_for_refresh(
     Ok(())
 }
 
+pub(crate) fn require_globally_quiet_for_refresh(tx: &Connection) -> Result<(), DatabaseError> {
+    if !documents(tx)?.is_empty() {
+        return Err(refused("an ordinary writer owns a durable window"));
+    }
+    Ok(())
+}
+
 /// Private identity fields make this a capability for one admitted run. Drop
 /// releases only a still-preparing window. Possible legacy publication survives
 /// failure/cancellation/drop, and abrupt process exit preserves every window.

@@ -10,6 +10,7 @@ pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod managed_remove;
 pub mod ordinary_writer_windows;
+mod pair_refresh_competing_journals;
 pub mod pair_refresh_credentials;
 pub mod pair_refresh_operations;
 pub mod personal_scope;

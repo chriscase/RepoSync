@@ -526,3 +526,31 @@ reconciliation hold. Keep existing test oracles unchanged.
 Require exact-head Build & Test and End-to-End gates, independent Grok Build
 adversarial review and Chris's merge authorization. The implementation writer
 does not review or merge its own PR.
+
+Authenticated enrollment uses version 3 documents, request and hold keys. Only a
+current opaque engine actor and an owned, complete visible preparation may enroll.
+The current actor/session, effective policy, native database identity, writer
+lease, busy slots, registered inputs, credentials and conflicts are checked in a
+reserved SQLite writer transaction. Every ordinary window and recognized legacy
+journal family is inspected globally, including unregistered IDs, orphan pointers
+and older uncertain documents. Completed history and an intent-free cancelled
+import with no pending correspondence are supported; other uncertain legacy
+history retains refusal rather than being treated as an absence proof.
+
+A separate private table holds the journal MAC key. First establishment shares
+one transaction with the complete operation, authority, request and both holds;
+a refused entrance or reader cannot establish or repair it. The MAC binds the
+complete phase/receipts, actor/policy metadata, actual database identity, retained
+resource layout and five SVN visibility records. Historical verification does
+not depend on the current session or credential-fingerprint key. A copied journal
+and copied private key do not acquire the original database's native identity.
+Missing/altered/orphan authority or key evidence refuses every writer entrance.
+An active authenticated job holds a global writer barrier; legacy v2 jobs retain
+their scoped storage behavior. Legacy mutation APIs refuse authenticated jobs.
+The actual owner may sign cancellation only at the exact pre-intent phase and
+original lease epoch; cancellation does not authorize resource deletion/adoption.
+
+This enrollment component performs no external publication. The API execution
+refusal remains in place. First-intent remote revalidation, authenticated phase
+advancement, complete execution/recovery orchestration, native owner-death proof,
+no-op results and full real-engine qualification remain required.

@@ -28,6 +28,11 @@ use crate::pair_refresh::svn_preparation::PreparedCleanChildSvn;
 const PREFIX: &str = "pair_refresh_execution_v2:";
 const FAMILY: &str = "pair_refresh_execution_";
 
+#[path = "pair_refresh_authenticated.rs"]
+mod authenticated;
+
+pub(crate) use authenticated::approval_digest as authenticated_approval_digest;
+
 #[derive(PartialEq, Eq)]
 enum AdmissionValidation {
     Storage,
@@ -41,6 +46,18 @@ fn refused(detail: &str) -> DatabaseError {
 
 fn key(kind: &str, id: &str) -> String {
     format!("{PREFIX}{kind}:{id}")
+}
+
+fn operation_key(version: u8, kind: &str, id: &str) -> String {
+    format!("pair_refresh_execution_v{version}:{kind}:{id}")
+}
+
+fn operation_request_key(op: &PairRefreshOperation) -> Result<String, DatabaseError> {
+    Ok(operation_key(
+        op.version,
+        "request",
+        &digest(&(&op.initiator_id, &op.request_id, &op.pins.child.scope_uuid))?,
+    ))
 }
 
 fn read(tx: &Connection, key: &str) -> Result<Option<String>, DatabaseError> {
@@ -329,13 +346,14 @@ fn validate_svn_receipt(
 
 fn validate(op: &PairRefreshOperation) -> Result<(), DatabaseError> {
     op.pins.validate()?;
-    if op.version != 2
+    if !matches!(op.version, 2 | 3)
         || op.id != op.pins.git.operation_id
         || op.initiator_id.is_empty()
         || op.request_id.is_empty()
         || op.request_id.len() > 256
         || op.admitted_writer_epoch == 0
-        || op.approval_digest != op.pins.approval_digest()?
+        || (op.version == 2 && op.approval_digest != op.pins.approval_digest()?)
+        || !full_digest(&op.approval_digest)
         || chrono::DateTime::parse_from_rfc3339(&op.created_at).is_err()
         || chrono::DateTime::parse_from_rfc3339(&op.updated_at).is_err()
     {
@@ -387,6 +405,11 @@ fn parse(raw: &str) -> Result<PairRefreshOperation, DatabaseError> {
 }
 
 fn write_op(tx: &Connection, op: &PairRefreshOperation) -> Result<(), DatabaseError> {
+    if op.version != 2 {
+        return Err(refused(
+            "legacy mutation cannot write authenticated operation",
+        ));
+    }
     validate(op)?;
     write(
         tx,
@@ -482,30 +505,44 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut operations = Vec::new();
     let mut expected = BTreeMap::new();
+    let mut requests = std::collections::BTreeSet::new();
+    let mut held_scopes = std::collections::BTreeSet::new();
     for (name, raw) in &rows {
-        if name.starts_with(&key("document", "")) {
+        if [2, 3]
+            .iter()
+            .any(|version| name.starts_with(&operation_key(*version, "document", "")))
+        {
             let op = parse(raw)?;
-            if name != &key("document", &op.id.to_string()) {
+            if name != &operation_key(op.version, "document", &op.id.to_string())
+                || operations
+                    .iter()
+                    .any(|prior: &PairRefreshOperation| prior.id == op.id)
+            {
                 return Err(refused("document key differs from operation identity"));
             }
             expected.insert(name.clone(), raw.clone());
-            if expected
-                .insert(
-                    request_key(&op.initiator_id, &op.request_id, &op.pins.child.scope_uuid)?,
-                    op.id.to_string(),
-                )
-                .is_some()
-            {
+            if !requests.insert((
+                op.initiator_id.clone(),
+                op.request_id.clone(),
+                op.pins.child.scope_uuid.clone(),
+            )) {
                 return Err(refused("duplicate request ownership"));
+            }
+            expected.insert(operation_request_key(&op)?, op.id.to_string());
+            if op.version == 3 {
+                let name = operation_key(3, "authority", &op.id.to_string());
+                let raw = rows
+                    .get(&name)
+                    .ok_or_else(|| refused("authenticated authority is missing"))?;
+                authenticated::verify(tx, &op, raw)?;
+                expected.insert(name, raw.clone());
             }
             if op.phase.holds_scopes() {
                 for scope in [&op.pins.child.scope_uuid, &op.pins.parent.scope_uuid] {
-                    if expected
-                        .insert(key("hold", scope), op.id.to_string())
-                        .is_some()
-                    {
+                    if !held_scopes.insert(scope.to_owned()) {
                         return Err(refused("duplicate durable scope ownership"));
                     }
+                    expected.insert(operation_key(op.version, "hold", scope), op.id.to_string());
                 }
             }
             operations.push(op);
@@ -516,6 +553,7 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
             "unknown journal version, orphan or missing hold/request pointer",
         ));
     }
+    authenticated::require_key_matches_journal(tx, operations.iter().any(|op| op.version == 3))?;
     let mut completed_receipts = std::collections::BTreeSet::new();
     for op in &operations {
         if op.phase == PairRefreshPhase::Completed {
@@ -544,7 +582,9 @@ pub fn require_no_pair_refresh_hold(
 ) -> Result<(), DatabaseError> {
     let held = journal(tx)?.into_iter().any(|op| {
         op.phase.holds_scopes()
-            && repo_id.is_none_or(|id| id == op.pins.child.repo_id || id == op.pins.parent.repo_id)
+            && (op.version == 3
+                || repo_id
+                    .is_none_or(|id| id == op.pins.child.repo_id || id == op.pins.parent.repo_id))
     });
     if held {
         return Err(refused("a durable pair refresh owns this writer scope"));
@@ -572,6 +612,11 @@ pub fn require_no_pair_refresh_registration_mutation(
     for op in journal(tx)? {
         if !op.phase.holds_scopes() {
             continue;
+        }
+        if op.version == 3 {
+            return Err(refused(
+                "an authenticated pair refresh owns the global writer barrier",
+            ));
         }
         for pin in [&op.pins.child, &op.pins.parent] {
             let mut current = Some(pin.repo_id.clone());
@@ -771,7 +816,7 @@ fn require_other_journals_quiet(tx: &Connection, repo_id: &str) -> Result<(), Da
     Ok(())
 }
 
-fn owned_operation(
+fn lookup_operation(
     tx: &Connection,
     operation_id: Uuid,
 ) -> Result<PairRefreshOperation, DatabaseError> {
@@ -779,6 +824,19 @@ fn owned_operation(
         .into_iter()
         .find(|op| op.id == operation_id)
         .ok_or_else(|| refused("operation not found"))
+}
+
+fn owned_operation(
+    tx: &Connection,
+    operation_id: Uuid,
+) -> Result<PairRefreshOperation, DatabaseError> {
+    let op = lookup_operation(tx, operation_id)?;
+    if op.version != 2 {
+        return Err(refused(
+            "authenticated operation requires its actor capability",
+        ));
+    }
+    Ok(op)
 }
 
 fn release(tx: &Connection, op: &PairRefreshOperation) -> Result<(), DatabaseError> {
@@ -949,7 +1007,7 @@ impl Database {
         &self,
         operation_id: Uuid,
     ) -> Result<PairRefreshOperation, DatabaseError> {
-        owned_operation(&self.conn(), operation_id)
+        lookup_operation(&self.conn(), operation_id)
     }
 
     pub fn pair_refresh_request(
@@ -1066,6 +1124,9 @@ impl Database {
                     && op.request_id == request
                     && op.pins.child.scope_uuid == pins.child.scope_uuid
             }) {
+                if op.version != 2 {
+                    return Err(refused("authenticated request cannot use legacy admission"));
+                }
                 if op.pins != pins || op.approval_digest != approved_digest {
                     return Err(refused(
                         "request ID was already bound to a different intent",
