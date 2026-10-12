@@ -370,6 +370,27 @@ printf 'REVOKED\n'
     if (!output.includes("REVOKED")) throw new Error(`scoped git write for ${repo} was not revoked`);
   }
 
+  async removeScopedGitTeam(repoName: string): Promise<void> {
+    const repo = safe(repoName, "repo");
+    const team = safe(`write${repo}`, "team");
+    try {
+      await this.sh("gitea", `
+set -eu
+json=$(curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" https://gitea:3000/api/v1/orgs/lab/teams)
+team_id=$(printf '%s' "$json" | tr '{' '\n' | grep '"name":"${team}"' | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+if [ -z "$team_id" ]; then printf 'ABSENT\n'; exit 0; fi
+code=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -X DELETE -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/teams/$team_id" || true)
+case "$code" in
+  204|200|404) ;;
+  *) echo "DELETE_TEAM $code"; exit 1 ;;
+esac
+printf 'REMOVED\n'
+`);
+    } catch {
+      // A leftover team must not hide the isolation result, and must not stay for the next test.
+    }
+  }
+
   async snap(pair: Pair): Promise<Snap> {
     const svn = (await this.observer(`
 set -eu

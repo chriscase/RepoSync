@@ -960,6 +960,7 @@ reposync personal --personal-config /var/lib/reposync/personal-${name}/personal.
       return;
     }
     case "LAB_ISOLATION_TWO_REPOS": {
+      try {
       const left = await lab.createPair("isoa");
       const right = await lab.createPair("isob");
       const leftGit = await lab.issueScopedGitToken("isoa", "isob");
@@ -1042,6 +1043,10 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_st
       }
       if (afterDeny.git !== parked.git) throw new Error("isob published after alice's credential replaced bob's");
       lab.pass(`isoa as ${leftGit.user} reached ${changed.git.slice(0, 12)} and isob as ${rightGit.user} reached ${changedRight.git.slice(0, 12)} from trunk r${beforeLeft.svn}; storing isoa's git token on isob and removing isob's write access did not publish bob's next commit; storing alice's svn credential on isob did not publish the commit after that.`);
+      } finally {
+        await lab.removeScopedGitTeam("isoa");
+        await lab.removeScopedGitTeam("isob");
+      }
       return;
     }
     case "LAB_PERSONAL_MULTICOMMIT": {
