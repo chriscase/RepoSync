@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""TLS proxy that answers Gitea HEAD requests with the GET status.
+"""TLS proxy in front of the lab Gitea API.
 
-Gitea 1.22.6 returns 405 for HEAD /api/v1/repos/{owner}/{repo}. The shipped
-personal client treats that as "repository does not exist". This process
-forwards the API unchanged except for that method. It does not create
-repositories and it does not sync.
+Gitea 1.22.6 answers HEAD /api/v1/repos/{owner}/{repo} with 405. The shipped
+personal client treats that as a missing repository (issue #197). This process
+forwards the API and returns the GET status for HEAD. It decodes the upstream
+body before forwarding so a chunked Gitea response stays valid JSON. It does
+not create repositories and it does not sync.
 """
 
+import http.client
 import os
 import socket
 import ssl
@@ -18,6 +20,16 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "3000"))
 CA = os.environ.get("UPSTREAM_CA", "/certs/ca.crt")
 CERT = os.environ.get("PROXY_CERT", "/certs/gitea-api.crt")
 KEY = os.environ.get("PROXY_KEY", "/certs/gitea-api.key")
+
+HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+    "te",
+    "trailer",
+}
 
 
 def read_http_message(sock):
@@ -43,32 +55,55 @@ def read_http_message(sock):
     return head + b"\r\n\r\n" + body[:length]
 
 
-def head_status(response):
-    head = response.split(b"\r\n\r\n", 1)[0]
-    lines = head.split(b"\r\n")
-    kept = [lines[0]]
+def parse_request(request):
+    head, _, body = request.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
+    method, path, _version = lines[0].split(" ", 2)
+    headers = {}
     for line in lines[1:]:
-        lower = line.lower()
-        if lower.startswith(b"content-length:") or lower.startswith(b"transfer-encoding:"):
+        if not line or ":" not in line:
             continue
-        kept.append(line)
-    kept.append(b"Content-Length: 0")
-    return b"\r\n".join(kept) + b"\r\n\r\n"
+        name, value = line.split(":", 1)
+        if name.lower() in HOP or name.lower() == "host" or name.lower() == "content-length":
+            continue
+        headers[name] = value.strip()
+    return method, path, headers, body
 
 
-def prepare(request):
-    head, sep, body = request.partition(b"\r\n\r\n")
-    lines = head.split(b"\r\n")
-    was_head = bool(lines) and lines[0].startswith(b"HEAD ")
+def build_response(status, reason, header_items, body, was_head):
     if was_head:
-        lines[0] = b"GET" + lines[0][4:]
-    forwarded = []
-    for line in lines:
-        if line.lower().startswith(b"host:"):
-            forwarded.append(b"Host: %s:%s" % (UPSTREAM_HOST.encode(), str(UPSTREAM_PORT).encode()))
-        else:
-            forwarded.append(line)
-    return b"\r\n".join(forwarded) + sep + body, was_head
+        body = b""
+    lines = [f"HTTP/1.1 {status} {reason}"]
+    for name, value in header_items:
+        if name.lower() in HOP or name.lower() == "content-length":
+            continue
+        lines.append(f"{name}: {value}")
+    lines.append(f"Content-Length: {len(body)}")
+    lines.append("Connection: close")
+    payload = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
+    return payload + body
+
+
+def forward(method, path, headers, body):
+    context = ssl.create_default_context(cafile=CA)
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    conn = http.client.HTTPSConnection(
+        UPSTREAM_HOST,
+        UPSTREAM_PORT,
+        context=context,
+        timeout=30,
+    )
+    was_head = method == "HEAD"
+    upstream_method = "GET" if was_head else method
+    conn.request(upstream_method, path, body=body if body else None, headers=headers)
+    resp = conn.getresponse()
+    data = resp.read()
+    items = resp.getheaders()
+    status = resp.status
+    reason = resp.reason
+    conn.close()
+    return build_response(status, reason, items, data, was_head)
 
 
 def handle_client(client):
@@ -77,18 +112,8 @@ def handle_client(client):
         if not request:
             client.close()
             return
-        forwarded, was_head = prepare(request)
-        context = ssl.create_default_context(cafile=CA)
-        context.check_hostname = True
-        context.verify_mode = ssl.CERT_REQUIRED
-        raw = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=30)
-        upstream = context.wrap_socket(raw, server_hostname=UPSTREAM_HOST)
-        upstream.sendall(forwarded)
-        response = read_http_message(upstream)
-        upstream.close()
-        if was_head:
-            response = head_status(response)
-        client.sendall(response)
+        method, path, headers, body = parse_request(request)
+        client.sendall(forward(method, path, headers, body))
     except Exception:
         pass
     try:

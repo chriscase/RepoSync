@@ -123,7 +123,7 @@ export class Lab {
       ]) {
         if (secret) stderr = stderr.replaceAll(secret, "[redacted]");
       }
-      stderr = stderr.slice(0, 2000);
+      if (stderr.length > 2000) stderr = stderr.slice(-2000);
       throw new Error(`docker exec ${service} failed: ${stderr || failed.message}`);
     }
   }
