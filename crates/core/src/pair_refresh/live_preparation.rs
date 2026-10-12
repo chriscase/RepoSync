@@ -26,6 +26,7 @@ pub struct LivePreparedRefresh {
     configuration: LiveExecutionConfiguration,
     git: GitSourceSnapshot,
     svn: SvnSourceSnapshot,
+    visibility: Option<Vec<super::svn_visibility::SvnPresencePin>>,
     _operation_directory: PreparationDirectory,
 }
 
@@ -64,6 +65,10 @@ impl LivePreparedRefresh {
     }
     pub fn svn(&self) -> &SvnSourceSnapshot {
         &self.svn
+    }
+
+    pub fn visibility_pins(&self) -> Option<&[super::svn_visibility::SvnPresencePin]> {
+        self.visibility.as_deref()
     }
 
     pub fn resource_pin(
@@ -328,20 +333,39 @@ async fn prepare_observed_sources_at(
                 .tempdir()?,
         ),
     };
-    let prepared_svn = prepare_clean_child_svn(
-        svn.child_client(),
-        svn.parent_client(),
-        git.repository().path(),
-        operation_directory.path(),
-        operation_id,
-        &CleanChildSvnPins {
-            lineage,
-            baseline_git_tree: baseline_tree,
-            parent_git_tree: prepared_git.tree_sha.clone(),
-            previous_mergeinfo,
-        },
-    )
-    .await?;
+    let svn_pins = CleanChildSvnPins {
+        lineage,
+        baseline_git_tree: baseline_tree,
+        parent_git_tree: prepared_git.tree_sha.clone(),
+        previous_mergeinfo,
+    };
+    let (prepared_svn, visibility) =
+        if matches!(&operation_directory, PreparationDirectory::Workspace { .. }) {
+            let (prepared, presence) = super::svn_preparation::prepare_clean_child_svn_visible(
+                svn.child_client(),
+                svn.parent_client(),
+                git.repository().path(),
+                operation_directory.path(),
+                operation_id,
+                &svn_pins,
+                observed.inspected_head_revision,
+            )
+            .await?;
+            (prepared, Some(presence))
+        } else {
+            (
+                prepare_clean_child_svn(
+                    svn.child_client(),
+                    svn.parent_client(),
+                    git.repository().path(),
+                    operation_directory.path(),
+                    operation_id,
+                    &svn_pins,
+                )
+                .await?,
+                None,
+            )
+        };
     if let PreparationDirectory::Workspace { owner, .. } = &operation_directory {
         owner.track_working_copy(&prepared_svn.working_copy)?;
     }
@@ -373,6 +397,7 @@ async fn prepare_observed_sources_at(
         configuration,
         git,
         svn,
+        visibility,
         _operation_directory: operation_directory,
     })
 }

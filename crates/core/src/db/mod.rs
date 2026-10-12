@@ -20,7 +20,7 @@ pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
 pub mod watermark_recovery;
 
-mod opened_file;
+pub(crate) mod opened_file;
 
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;

@@ -480,6 +480,30 @@ admission, publication, adoption or recovery authority. The opaque resources
 still need authenticated atomic enrollment, a global writer barrier, fresh
 remote/actor/policy checks at each first intent and a qualified recovery caller.
 
+Owned preparation now independently inspects fresh full-depth SVN working-copy
+BASE metadata. Successful listing, checkout or empty status does not establish
+visibility: standard authz exclusions appear as server-excluded nodes in WC31.
+Native descriptor identity, schema/integrity, repository/working-copy identity,
+every node's presence/depth/layer/location/revision and parent graph are checked.
+Sparse, excluded, incomplete, switched, external, queued or unsupported metadata
+refuses without repair or a listing fallback. The metadata is read-only.
+
+The original baseline, parent and child checkouts are checked before comparing
+their complete bytes/modes/properties with their pinned Git trees. Fresh current
+parent/child snapshots also require every visible node's changed revision to be
+handled, including directory changes left by removal of an authz-hidden path.
+Their trees must equal the registered checkpoint trees. Five safe presence pins
+record this observation; they do not grant enrollment or publication authority.
+Local and remote property proofs agree. An omitted empty property root is supplied
+only when attested complete WC31 metadata explicitly contains the empty root
+property skeleton; the general XML parser's missing-root refusal remains strict.
+
+Legacy temporary preparation behavior is preserved. This does not qualify every
+server/protocol implementation or prove unavailable inherited ancestor policy.
+Relevant ancestor property visibility and fresh complete observations at each
+first intent remain required for the authenticated execution profile. A changed
+credential, policy or remote after preparation is not authorized by stored pins.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary

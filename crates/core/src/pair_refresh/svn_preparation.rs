@@ -37,6 +37,73 @@ pub struct PreparedCleanChildSvn {
 
 pub type SvnPropertySnapshot = BTreeMap<String, BTreeMap<String, String>>;
 
+async fn visible_checkout_properties(
+    client: &SvnClient,
+    path: &Path,
+    info: &crate::svn::SvnInfo,
+) -> Result<SvnPropertySnapshot, SvnError> {
+    let canonical = path.canonicalize()?;
+    let root = canonical
+        .to_str()
+        .ok_or_else(|| refused("working directory must be UTF-8"))?;
+    let xml = client
+        .run_svn_in_dir_public(
+            &canonical,
+            &[
+                "proplist",
+                "--xml",
+                "--verbose",
+                "--recursive",
+                "--show-inherited-props",
+                root,
+            ],
+        )
+        .await?;
+    bound_checkout_property_xml(&xml, root, &canonical, info)
+}
+
+fn bound_checkout_property_xml(
+    xml: &str,
+    root: &str,
+    checkout: &Path,
+    info: &crate::svn::SvnInfo,
+) -> Result<SvnPropertySnapshot, SvnError> {
+    let document =
+        roxmltree::Document::parse(xml).map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+    let element = document.root_element();
+    if !named(element, "properties") {
+        return Err(refused("invalid local property proof"));
+    }
+    attributes(element, &[])?;
+    let has_root = element
+        .children()
+        .any(|n| named(n, "target") && attribute(n, "path") == Some(root));
+    if has_root {
+        return parse_refresh_properties(xml, root);
+    }
+    // Local proplist legitimately omits an empty root. Add that target only
+    // when the attested complete WC31 BASE metadata independently proves it.
+    // The general XML parser retains its missing-root refusal oracle.
+    if !super::svn_visibility::has_proved_empty_root_properties(checkout, info)? {
+        return Err(refused(
+            "local property proof omits a nonempty or unknown root",
+        ));
+    }
+    let escaped = root
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\r', "&#13;")
+        .replace('\n', "&#10;")
+        .replace('\t', "&#9;");
+    let children: String = element.children().map(|node| &xml[node.range()]).collect();
+    parse_refresh_properties(
+        &format!("<properties><target path=\"{escaped}\"/>{children}</properties>"),
+        root,
+    )
+}
+
 fn refused(detail: &str) -> SvnError {
     SvnError::LineageRefused {
         reason: "unproved_pair_refresh_svn_tree".into(),
@@ -438,6 +505,61 @@ pub async fn prepare_clean_child_svn(
     operation_id: Uuid,
     pins: &CleanChildSvnPins,
 ) -> Result<PreparedCleanChildSvn, SvnError> {
+    Ok(prepare_clean_child_svn_inner(
+        child,
+        parent,
+        git_path,
+        operation_root,
+        operation_id,
+        pins,
+        None,
+    )
+    .await?
+    .0)
+}
+
+pub(crate) async fn prepare_clean_child_svn_visible(
+    child: &SvnClient,
+    parent: &SvnClient,
+    git_path: &Path,
+    operation_root: &Path,
+    operation_id: Uuid,
+    pins: &CleanChildSvnPins,
+    inspected_head: i64,
+) -> Result<
+    (
+        PreparedCleanChildSvn,
+        Vec<super::svn_visibility::SvnPresencePin>,
+    ),
+    SvnError,
+> {
+    prepare_clean_child_svn_inner(
+        child,
+        parent,
+        git_path,
+        operation_root,
+        operation_id,
+        pins,
+        Some(inspected_head),
+    )
+    .await
+}
+
+async fn prepare_clean_child_svn_inner(
+    child: &SvnClient,
+    parent: &SvnClient,
+    git_path: &Path,
+    operation_root: &Path,
+    operation_id: Uuid,
+    pins: &CleanChildSvnPins,
+    inspected_head: Option<i64>,
+) -> Result<
+    (
+        PreparedCleanChildSvn,
+        Vec<super::svn_visibility::SvnPresencePin>,
+    ),
+    SvnError,
+> {
     let lineage = &pins.lineage.pins;
     let baseline = lineage.child.parent_baseline_revision;
     if operation_id.is_nil()
@@ -446,6 +568,15 @@ pub async fn prepare_clean_child_svn(
     {
         return Err(refused(
             "preparation client or operation identity differs from proof",
+        ));
+    }
+    if inspected_head
+        .is_some_and(|head| head < lineage.parent_revision || head < lineage.child.child_revision)
+        || (inspected_head.is_some()
+            && (!child.has_refresh_isolation() || !parent.has_refresh_isolation()))
+    {
+        return Err(refused(
+            "visible preparation requires isolated inputs and a current HEAD",
         ));
     }
     let mergeinfo = expected_refresh_mergeinfo(
@@ -473,6 +604,7 @@ pub async fn prepare_clean_child_svn(
     std::fs::create_dir(&directory)?;
     let working_copy = directory.join("child");
     let mut expected_properties = BTreeMap::new();
+    let mut presence = Vec::new();
     for (client, revision, name, tree, old_mergeinfo) in [
         (
             parent,
@@ -496,14 +628,45 @@ pub async fn prepare_clean_child_svn(
             pins.previous_mergeinfo.as_deref(),
         ),
     ] {
-        let properties = parse_refresh_properties(
-            &client.tree_properties_at_rev(revision).await?,
-            client.url(),
-        )?;
+        let remote_properties_xml = client.tree_properties_at_rev(revision).await?;
         let checkout = directory.join(name);
-        client
-            .checkout_pinned_without_externals(&checkout, revision)
-            .await?;
+        let properties = if inspected_head.is_some() {
+            client
+                .checkout_full_pinned_without_externals(&checkout, revision)
+                .await?;
+            let info = client.info_at_rev(revision).await?;
+            if info.uuid != lineage.child.repository_uuid
+                || info.root_url != lineage.repository_root_url
+                || info.url != client.url()
+                || info.latest_rev != revision
+            {
+                return Err(refused("visible snapshot differs from lineage pins"));
+            }
+            presence.push(super::svn_visibility::presence_pin(name, &checkout, &info)?);
+            let properties = bound_checkout_property_xml(
+                &remote_properties_xml,
+                client.url(),
+                &checkout,
+                &info,
+            )?;
+            let local = visible_checkout_properties(client, &checkout, &info).await?;
+            let meaningful = |mut props: SvnPropertySnapshot| {
+                props.retain(|path, values| path.is_empty() || !values.is_empty());
+                props
+            };
+            if meaningful(local) != meaningful(properties.clone()) {
+                return Err(refused(
+                    "visible checkout properties differ from remote proof",
+                ));
+            }
+            properties
+        } else {
+            let properties = parse_refresh_properties(&remote_properties_xml, client.url())?;
+            client
+                .checkout_pinned_without_externals(&checkout, revision)
+                .await?;
+            properties
+        };
         verify_refresh_svn_tree(
             git_path,
             tree,
@@ -514,6 +677,56 @@ pub async fn prepare_clean_child_svn(
         )?;
         if name == "parent" {
             expected_properties = properties;
+        }
+    }
+    if let Some(head) = inspected_head {
+        for (client, checkpoint, role, tree, old_mergeinfo) in [
+            (
+                parent,
+                lineage.parent_revision,
+                "current_parent",
+                pins.parent_git_tree.as_str(),
+                None,
+            ),
+            (
+                child,
+                lineage.child.child_revision,
+                "current_child",
+                pins.baseline_git_tree.as_str(),
+                pins.previous_mergeinfo.as_deref(),
+            ),
+        ] {
+            let current = super::svn_visibility::observe_subtree(client, head).await?;
+            current.require_unchanged_since(checkpoint)?;
+            let info = current.info();
+            if info.uuid != lineage.child.repository_uuid
+                || info.root_url != lineage.repository_root_url
+                || info.url != client.url()
+            {
+                return Err(refused("current visibility snapshot differs from lineage"));
+            }
+            let props = visible_checkout_properties(client, current.path(), info).await?;
+            verify_refresh_svn_tree(
+                git_path,
+                tree,
+                current.path(),
+                &props,
+                old_mergeinfo,
+                &lineage.child.parent_path,
+            )?;
+            presence.push(super::svn_visibility::presence_pin(
+                role,
+                current.path(),
+                info,
+            )?);
+            let latest = client.info().await?;
+            if latest.uuid != info.uuid
+                || latest.root_url != info.root_url
+                || latest.url != info.url
+                || latest.latest_rev != head
+            {
+                return Err(refused("repository changed during visible preparation"));
+            }
         }
     }
     let source = format!("{}@{}", parent.url(), lineage.parent_revision);
@@ -577,12 +790,15 @@ pub async fn prepare_clean_child_svn(
             "SVN merge properties differ from pinned parent and approved mergeinfo",
         ));
     }
-    Ok(PreparedCleanChildSvn {
-        operation_id,
-        pins: pins.clone(),
-        working_copy,
-        mergeinfo,
-        result_git_tree: pins.parent_git_tree.clone(),
-        result_properties: properties,
-    })
+    Ok((
+        PreparedCleanChildSvn {
+            operation_id,
+            pins: pins.clone(),
+            working_copy,
+            mergeinfo,
+            result_git_tree: pins.parent_git_tree.clone(),
+            result_properties: properties,
+        },
+        presence,
+    ))
 }

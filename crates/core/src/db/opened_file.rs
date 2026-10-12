@@ -17,7 +17,7 @@ pub(crate) struct OpenedDatabaseFile {
 }
 
 impl OpenedDatabaseFile {
-    pub(super) fn capture(path: &Path) -> Option<Self> {
+    pub(crate) fn capture(path: &Path) -> Option<Self> {
         let metadata = std::fs::symlink_metadata(path).ok()?;
         let parent = path
             .parent()
@@ -34,7 +34,7 @@ impl OpenedDatabaseFile {
         })
     }
 
-    pub(super) fn attest(conn: &Connection, path: &Path, prior: Option<Self>) -> Option<Self> {
+    pub(crate) fn attest(conn: &Connection, path: &Path, prior: Option<Self>) -> Option<Self> {
         let mut after = Self::capture(path)?;
         if after.aliased {
             return None;

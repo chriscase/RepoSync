@@ -137,6 +137,10 @@ impl SvnClient {
         &self.url
     }
 
+    pub(crate) fn has_refresh_isolation(&self) -> bool {
+        self.refresh_config.is_some()
+    }
+
     /// Import-scoped cancellation; ordinary sync clients remain unchanged.
     pub fn with_cancel_signal(mut self, signal: Arc<AtomicBool>) -> Self {
         self.cancel = Some(signal);
@@ -286,6 +290,33 @@ impl SvnClient {
         self.run_svn(&[
             "checkout",
             "--ignore-externals",
+            "-r",
+            &rev.to_string(),
+            &format!("{}@{}", self.url, rev),
+            destination,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// A fresh visibility observation always requests the complete subtree.
+    pub async fn checkout_full_pinned_without_externals(
+        &self,
+        path: &Path,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let destination = path.to_str().ok_or_else(|| SvnError::WorkingCopyError {
+            path: path.display().to_string(),
+            detail: "refresh working directory must be UTF-8".into(),
+        })?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "--depth",
+            "infinity",
             "-r",
             &rev.to_string(),
             &format!("{}@{}", self.url, rev),

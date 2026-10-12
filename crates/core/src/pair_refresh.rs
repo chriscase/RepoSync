@@ -24,6 +24,7 @@ pub mod publication;
 pub mod svn_observation;
 pub mod svn_preparation;
 pub mod svn_sources;
+pub mod svn_visibility;
 pub mod workspace;
 
 /// Policy identity pinned into every preview from this slice.
