@@ -563,6 +563,10 @@ remain unchanged. A retained intent never permits a repeated publication.
 First and next integrations are covered with real SVN/Git preparation fixtures.
 Those fixtures seed initial correspondence; they do not establish full ordinary
 SyncEngine initialization and cycle qualification. The legacy API execution
-refusal remains in place. Retained-intent reconciliation, native owner-death and
+refusal remains in place. The actual original owner can now enter a separate
+observation-only reconciliation path for a retained SVN or Git intent. Complete
+fresh observations may sign the missing receipt; absence never authorizes retry,
+cancellation or release. This entrance requires the original actor/resources and
+lease epoch and cannot adopt files or transfer ownership. Native owner-death and
 resource reconstruction, no-op receipts, versioned API orchestration and full
 real-engine qualification remain required before the workflow is complete.

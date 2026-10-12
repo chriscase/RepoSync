@@ -1269,3 +1269,379 @@ async fn next_owned_refresh_uses_its_signed_completed_baseline_and_preserves_cop
             .is_ok()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_owner_observes_lost_svn_and_git_receipts_without_republication() {
+    use crate::db::pair_refresh_operations::PairRefreshPhase;
+
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let parent_before = parent_row(&f);
+    f.db.conn().execute_batch("CREATE TRIGGER interrupt_svn_receipt BEFORE INSERT ON kv_state WHEN NEW.key LIKE 'pair_refresh_execution_v3:document:%' AND json_extract(NEW.value,'$.phase')='svn_observed' BEGIN SELECT RAISE(ABORT,'disposable SVN receipt interruption'); END;").unwrap();
+    let error = super::super::execution::publish_owned_svn_stage_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "lost-receipts",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("disposable SVN receipt interruption"),
+        "{error}"
+    );
+    let intent =
+        f.db.pair_refresh_operation(prepared.pins().git.operation_id)
+            .unwrap();
+    assert_eq!(intent.phase, PairRefreshPhase::SvnIntent);
+    assert!(intent.svn_receipt.is_none());
+    let svn_client = crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "");
+    assert_eq!(svn_client.info().await.unwrap().latest_rev, 5);
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+    assert!(
+        super::super::execution::publish_owned_svn_stage_with_client(
+            &engine,
+            &actor,
+            &prepared,
+            "lost-receipts",
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(svn_client.info().await.unwrap().latest_rev, 5);
+    assert_eq!(f.db.pair_refresh_operation(intent.id).unwrap(), intent);
+    f.db.conn()
+        .execute_batch("DROP TRIGGER interrupt_svn_receipt;")
+        .unwrap();
+    let observed = super::super::execution::reconcile_owned_refresh_intent_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(observed.phase, PairRefreshPhase::SvnObserved);
+    assert_eq!(observed.svn_receipt.as_ref().unwrap().revision, 5);
+    assert_eq!(svn_client.info().await.unwrap().latest_rev, 5);
+    f.db.conn().execute_batch("CREATE TRIGGER interrupt_git_receipt BEFORE INSERT ON kv_state WHEN NEW.key LIKE 'pair_refresh_execution_v3:document:%' AND json_extract(NEW.value,'$.phase')='git_observed' BEGIN SELECT RAISE(ABORT,'disposable Git receipt interruption'); END;").unwrap();
+    let error = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "lost-receipts",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("disposable Git receipt interruption"),
+        "{error}"
+    );
+    let intent = f.db.pair_refresh_operation(intent.id).unwrap();
+    assert_eq!(intent.phase, PairRefreshPhase::GitIntent);
+    assert!(intent.git_receipt_sha.is_none());
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        prepared.pins().git.prepared_sha
+    );
+    let writes_before_reconciliation = std::fs::read_to_string(&f.log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("/git-receive-pack"))
+        .count();
+    assert!(writes_before_reconciliation > 0);
+    assert!(super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "lost-receipts",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .is_err());
+    assert_eq!(f.db.pair_refresh_operation(intent.id).unwrap(), intent);
+    f.db.conn()
+        .execute_batch("DROP TRIGGER interrupt_git_receipt;")
+        .unwrap();
+    let observed = super::super::execution::reconcile_owned_refresh_intent_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(observed.phase, PairRefreshPhase::GitObserved);
+    assert_eq!(
+        observed.git_receipt_sha.as_deref(),
+        Some(prepared.pins().git.prepared_sha.as_str())
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+    let completed = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "lost-receipts",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(completed.phase, PairRefreshPhase::Completed);
+    assert_eq!(
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count(),
+        writes_before_reconciliation
+    );
+    assert_eq!(svn_client.info().await.unwrap().latest_rev, 5);
+    assert_eq!(parent_row(&f), parent_before);
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn denied_svn_intent_and_absence_observation_never_authorize_a_retry() {
+    use crate::db::pair_refresh_operations::PairRefreshPhase;
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let parent_before = parent_row(&f);
+    let hook = f.temp.path().join("svn-repository/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        b"#!/bin/sh\nprintf '%s\\n' 'disposable SVN permission refusal' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        super::super::execution::publish_owned_svn_stage_with_client(
+            &engine,
+            &actor,
+            &prepared,
+            "denied-svn",
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .is_err()
+    );
+    let intent =
+        f.db.pair_refresh_operation(prepared.pins().git.operation_id)
+            .unwrap();
+    assert_eq!(intent.phase, PairRefreshPhase::SvnIntent);
+    assert!(intent.reconciliation_detail.is_some());
+    assert!(intent.svn_receipt.is_none());
+    let before = journal_state(&f);
+    std::fs::remove_file(hook).unwrap();
+    assert!(
+        super::super::execution::reconcile_owned_refresh_intent_with_client(
+            &engine,
+            &actor,
+            &prepared,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(journal_state(&f), before);
+    assert!(
+        super::super::execution::publish_owned_svn_stage_with_client(
+            &engine,
+            &actor,
+            &prepared,
+            "denied-svn",
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(actor
+        .cancel_prepared_enrollment(&engine, &prepared, &busy)
+        .is_err());
+    assert_eq!(journal_state(&f), before);
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        4
+    );
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert_eq!(parent_row(&f), parent_before);
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
+    use crate::db::pair_refresh_operations::PairRefreshPhase;
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let parent_before = parent_row(&f);
+    let hook = f.target.path().join("hooks/pre-receive");
+    std::fs::write(
+        &hook,
+        b"#!/bin/sh\nprintf '%s\\n' 'disposable protected ref refusal' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "protected-child",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .is_err());
+    let intent =
+        f.db.pair_refresh_operation(prepared.pins().git.operation_id)
+            .unwrap();
+    assert_eq!(intent.phase, PairRefreshPhase::GitIntent);
+    assert_eq!(intent.svn_receipt.as_ref().unwrap().revision, 5);
+    assert!(intent.git_receipt_sha.is_none());
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    let requests = std::fs::read_to_string(&f.log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("/git-receive-pack"))
+        .count();
+    assert!(requests > 0);
+    let before = journal_state(&f);
+    std::fs::remove_file(hook).unwrap();
+    assert!(
+        super::super::execution::reconcile_owned_refresh_intent_with_client(
+            &engine,
+            &actor,
+            &prepared,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "protected-child",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .is_err());
+    assert_eq!(journal_state(&f), before);
+    assert_eq!(
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count(),
+        requests
+    );
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert_eq!(parent_row(&f), parent_before);
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+}

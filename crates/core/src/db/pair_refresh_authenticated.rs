@@ -227,6 +227,34 @@ pub(super) fn verify(
 }
 
 impl Database {
+    /// Original-owner observation only. This entrance never returns a first
+    /// intent capability and cannot authorize an external publication retry.
+    pub(crate) fn require_authenticated_reconciliation_inputs(
+        &self,
+        engine: &SyncEngine,
+        actor: &LiveRefreshActorPolicy<'_>,
+        prepared: &LivePreparedRefresh,
+        busy: &crate::busy::PairBusyGuard,
+        phase: PairRefreshPhase,
+    ) -> Result<
+        crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        DatabaseError,
+    > {
+        if !matches!(
+            phase,
+            PairRefreshPhase::SvnIntent | PairRefreshPhase::GitIntent
+        ) {
+            return Err(refused(
+                "reconciliation requires an existing publication intent",
+            ));
+        }
+        self.immediate_transaction(|tx| {
+            let (_, _, configuration) =
+                execution_inputs(tx, self, engine, actor, prepared, busy, phase)?;
+            Ok(configuration)
+        })
+    }
+
     pub(crate) fn require_authenticated_git_inputs(
         &self,
         engine: &SyncEngine,
@@ -306,6 +334,7 @@ impl Database {
             }
             op.git_receipt_sha = Some(proof.sha().into());
             op.phase = PairRefreshPhase::GitObserved;
+            op.reconciliation_detail = None;
             store_progress(tx, &mut op, evidence)?;
             Ok(op)
         })
@@ -640,7 +669,11 @@ fn execution_inputs(
         .clone();
     if op.version != 3
         || op.phase != expected
-        || op.reconciliation_detail.is_some()
+        || (op.reconciliation_detail.is_some()
+            && !matches!(
+                expected,
+                PairRefreshPhase::SvnIntent | PairRefreshPhase::GitIntent
+            ))
         || op.admitted_writer_epoch != epoch
         || op.pins != *prepared.pins()
         || op.approval_digest != approval(&op.pins, &evidence)?

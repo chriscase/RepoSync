@@ -1,4 +1,4 @@
-//! Owned first SVN stage. Git publication, finalization and recovery are separate.
+//! Owned SVN/Git publication and atomic child checkpoint completion.
 //! An existing intent is observation/reconciliation state, never retry permission.
 
 use anyhow::{bail, Context, Result};
@@ -174,6 +174,89 @@ pub async fn complete_owned_refresh(
         super::git_sources::source_client()?,
     )
     .await
+}
+
+/// Independently observe an existing intent using the actual original owner,
+/// retained preparation and current credentials. This never republishes, adopts
+/// resources or transfers a writer epoch. An absent result retains the intent.
+pub async fn reconcile_owned_refresh_intent(
+    engine: &SyncEngine,
+    actor: &LiveRefreshActorPolicy<'_>,
+    prepared: &LivePreparedRefresh,
+    busy: &PairBusyGuard,
+) -> Result<PairRefreshOperation> {
+    reconcile_owned_refresh_intent_with_client(
+        engine,
+        actor,
+        prepared,
+        busy,
+        super::git_sources::source_client()?,
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_owned_refresh_intent_with_client(
+    engine: &SyncEngine,
+    actor: &LiveRefreshActorPolicy<'_>,
+    prepared: &LivePreparedRefresh,
+    busy: &PairBusyGuard,
+    client: reqwest::Client,
+) -> Result<PairRefreshOperation> {
+    let operation = engine
+        .db()
+        .pair_refresh_operation(prepared.pins().git.operation_id)?;
+    let configuration = engine.db().require_authenticated_reconciliation_inputs(
+        engine,
+        actor,
+        prepared,
+        busy,
+        operation.phase,
+    )?;
+    let receipt = observe_complete_svn_receipt(prepared, &configuration).await?;
+    if operation.phase == PairRefreshPhase::SvnIntent {
+        let proof = SvnReceiptProof {
+            engine,
+            prepared,
+            configuration: configuration.pin().clone(),
+            receipt,
+        };
+        return Ok(engine
+            .db()
+            .record_authenticated_svn_receipt(engine, actor, prepared, busy, proof)?);
+    }
+    if operation.svn_receipt.as_ref() != Some(&receipt) {
+        bail!("SVN result changed during intent reconciliation; the global hold is retained");
+    }
+    let path = prepared.git().repository().path().to_owned();
+    let git = prepared.pins().git.clone();
+    let (configuration, sha) = tokio::task::spawn_blocking(move || {
+        let repository = git2::Repository::open_bare(path)?;
+        let sha = super::git_sources::observe_completed_pair_with_client(
+            &configuration,
+            &repository,
+            &git,
+            client,
+        )?;
+        Ok::<_, anyhow::Error>((configuration, sha.to_string()))
+    })
+    .await
+    .context("independent Git reconciliation task failed; the intent remains held")??;
+    // Re-read SVN after both Git observations. No old or absent observation
+    // grants another push, and fresh actor/input checks still precede signing.
+    let current = observe_complete_svn_receipt(prepared, &configuration).await?;
+    if current != receipt {
+        bail!("SVN result changed during Git reconciliation; the global hold is retained");
+    }
+    let proof = GitReceiptProof {
+        engine,
+        prepared,
+        configuration: configuration.pin().clone(),
+        svn_receipt: current,
+        sha,
+    };
+    Ok(engine
+        .db()
+        .record_authenticated_git_receipt(engine, actor, prepared, busy, &proof)?)
 }
 
 pub(crate) async fn complete_owned_refresh_with_client(
