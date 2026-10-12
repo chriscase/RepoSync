@@ -209,6 +209,11 @@ parse_args() {
 }
 
 remember_run_id() {
+  # The interruption probe starts a second up. It must not replace the lab
+  # run id that the workflow's later clean step reads.
+  if [ "${ACCEPTANCE_LAB_SKIP_RUN_ID_FILE:-}" = "1" ]; then
+    return 0
+  fi
   if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${RUNNER_TEMP:-}" ]; then
     printf '%s\n' "$RUN_ID" > "${RUNNER_TEMP}/acceptance-lab-run-id"
   fi
@@ -1420,7 +1425,7 @@ cmd_interrupt_probe() {
     fi
   }
   trap 'stop_child; exit 130' INT TERM
-  ACCEPTANCE_LAB_ARTIFACT_ROOT="$root" "$0" up --suite "$SUITE" --candidate "$CANDIDATE" --seed "$SEED" &
+  ACCEPTANCE_LAB_ARTIFACT_ROOT="$root" ACCEPTANCE_LAB_SKIP_RUN_ID_FILE=1 "$0" up --suite "$SUITE" --candidate "$CANDIDATE" --seed "$SEED" &
   child_pid=$!
   id=""
   cid=""

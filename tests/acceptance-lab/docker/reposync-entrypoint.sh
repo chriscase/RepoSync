@@ -41,6 +41,8 @@ cat > /var/lib/reposync/lab.gitconfig <<'EOF'
 [user]
   name = RepoSync Lab
   email = daemon@lab.invalid
+[init]
+  defaultBranch = main
 [credential]
   helper =
 [core]
