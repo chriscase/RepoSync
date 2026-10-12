@@ -753,7 +753,7 @@ username = "svc-sync"
 password_env = "REPOSYNC_SVN_PASSWORD"
 
 [github]
-api_url = "https://gitea:3000/api/v1"
+api_url = "https://gitea-api:3000/api/v1"
 git_base_url = "https://gitea:3000"
 repo = "lab/${name}"
 token_env = "REPOSYNC_GITHUB_TOKEN"
@@ -1038,7 +1038,7 @@ username = "svc-sync"
 password_env = "REPOSYNC_SVN_PASSWORD"
 
 [github]
-api_url = "https://gitea:3000/api/v1"
+api_url = "https://gitea-api:3000/api/v1"
 git_base_url = "https://gitea:3000"
 repo = "lab/pround"
 token_env = "REPOSYNC_GITHUB_TOKEN"

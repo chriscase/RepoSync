@@ -139,6 +139,32 @@ services:
       retries: 40
       start_period: 20s
 
+  # Gitea 1.22.6 answers HEAD /api/v1/repos/{owner}/{repo} with 405.
+  # Personal repo_exists treats that as a missing repository (issue #197).
+  # This proxy returns the GET status for HEAD and forwards every other call.
+  gitea-api:
+    image: ${PYENV_IMAGE}
+    hostname: gitea-api
+    user: "0:0"
+    command: ["python3", "/opt/lab/gitea_head.py"]
+    environment:
+      UPSTREAM_HOST: gitea
+      UPSTREAM_PORT: "3000"
+      LISTEN_PORT: "3000"
+      PROXY_CERT: /certs/gitea-api.crt
+      PROXY_KEY: /certs/gitea-api.key
+      UPSTREAM_CA: /certs/ca.crt
+    volumes:
+      - ${LAB_RUN_DIR}/certs:/certs:ro
+      - ../docker/gitea_head.py:/opt/lab/gitea_head.py:ro
+    networks: [lab]
+    depends_on:
+      gitea:
+        condition: service_healthy
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+
   git-http:
     build:
       context: ../docker

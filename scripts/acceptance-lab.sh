@@ -301,6 +301,7 @@ EOF
   write_one_cert ldap ldap
   write_one_cert svn svn
   write_one_cert gitea gitea
+  write_one_cert gitea-api gitea-api
   write_one_cert denied denied-target
   write_one_cert fault fault-proxy
   write_one_cert githttp git-http
@@ -1000,7 +1001,7 @@ up_stack() {
   log "starting services except reposync"
   # This function is called from `if`, where set -e does not stop the body.
   # Each step returns on its own status.
-  if ! compose up -d --wait ldap svn svnserve gitea git-http denied notify fault observer; then
+  if ! compose up -d --wait ldap svn svnserve gitea gitea-api git-http denied notify fault observer; then
     capture_service_logs ldap svn gitea || true
     return 1
   fi
