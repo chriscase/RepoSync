@@ -41,5 +41,7 @@ admin_password_env = "REPOSYNC_ADMIN_PASSWORD"
 [sync]
 mode = "direct"
 auto_merge = true
-sync_branches = true
+# SyncConfig.sync_branches is Vec<String>. Empty means every branch.
+# Run 38194436432 rejected boolean true: expected a sequence.
+sync_branches = []
 sync_tags = true
