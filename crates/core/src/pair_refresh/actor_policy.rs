@@ -47,7 +47,10 @@ impl LiveRefreshActorPolicy<'_> {
     ) -> Result<(), DatabaseError> {
         self.require_current(engine)?;
         workspace.require_binding(self.db, &self.pin)?;
-        workspace.retain_before_enrollment()
+        workspace.retain_before_enrollment(|| {
+            self.require_current(engine)?;
+            workspace.require_binding(self.db, &self.pin)
+        })
     }
     /// Observe and prepare registered sources within this owned workspace.
     /// Server time/operation identity are used; approval/enrollment stay separate.

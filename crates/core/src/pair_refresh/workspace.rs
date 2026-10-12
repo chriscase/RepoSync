@@ -39,7 +39,10 @@ fn open_child(
     let flags = if directory {
         directory_flags()
     } else {
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NONBLOCK
     };
     rustix::fs::openat(parent, name, flags, rustix::fs::Mode::empty())
         .map(File::from)
@@ -64,16 +67,29 @@ fn entry_names(directory: &File) -> Result<Vec<std::ffi::CString>, DatabaseError
 
 fn sync_tree(directory: &File) -> Result<(), DatabaseError> {
     for name in entry_names(directory)? {
-        let file = open_child(directory, &name, false)?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| refused("resource metadata is unavailable"))?;
-        ResourceIdentity::require_metadata(&metadata, metadata.is_dir(), false)?;
-        if metadata.is_dir() {
+        let entry = entry_stat(directory, &name)?;
+        let kind = rustix::fs::FileType::from_raw_mode(entry.st_mode);
+        if kind == rustix::fs::FileType::Symlink {
+            // The link is directory metadata. Never open its target, including
+            // a dangling link or one pointing outside this resource tree.
+            continue;
+        }
+        if !matches!(
+            kind,
+            rustix::fs::FileType::Directory | rustix::fs::FileType::RegularFile
+        ) {
+            return Err(refused(
+                "resource synchronization requires an ordinary tree",
+            ));
+        }
+        let file = open_child(directory, &name, kind == rustix::fs::FileType::Directory)?;
+        require_entry_handle(&entry, &file)?;
+        if kind == rustix::fs::FileType::Directory {
             sync_tree(&file)?;
         }
         file.sync_all()
             .map_err(|_| refused("resource synchronization failed"))?;
+        require_same_entry(&entry, &entry_stat(directory, &name)?)?;
     }
     directory
         .sync_all()
@@ -82,24 +98,19 @@ fn sync_tree(directory: &File) -> Result<(), DatabaseError> {
 
 fn remove_contents(directory: &File) -> Result<(), DatabaseError> {
     for name in entry_names(directory)? {
-        let file = open_child(directory, &name, false)?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| refused("resource metadata is unavailable"))?;
-        ResourceIdentity::require_metadata(&metadata, metadata.is_dir(), false)?;
-        if metadata.is_dir() {
+        let entry = entry_stat(directory, &name)?;
+        let is_directory =
+            rustix::fs::FileType::from_raw_mode(entry.st_mode) == rustix::fs::FileType::Directory;
+        if is_directory {
+            let file = open_child(directory, &name, true)?;
+            require_entry_handle(&entry, &file)?;
             remove_contents(&file)?;
         }
         // Inspect the namespace again before unlinking. The traversal used held
-        // descriptors, so replacing a path cannot redirect deletion elsewhere.
-        let current = open_child(directory, &name, metadata.is_dir())?;
-        let current = current
-            .metadata()
-            .map_err(|_| refused("resource metadata is unavailable"))?;
-        if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
-            return Err(refused("resource changed during cleanup"));
-        }
-        let flags = if metadata.is_dir() {
+        // descriptors. Links and non-directory entries are unlinked directly;
+        // no target is opened and a hard link only loses this directory entry.
+        require_same_entry(&entry, &entry_stat(directory, &name)?)?;
+        let flags = if is_directory {
             rustix::fs::AtFlags::REMOVEDIR
         } else {
             rustix::fs::AtFlags::empty()
@@ -108,6 +119,31 @@ fn remove_contents(directory: &File) -> Result<(), DatabaseError> {
             .map_err(|_| refused("confined cleanup failed"))?;
     }
     Ok(())
+}
+
+fn entry_stat(directory: &File, name: &std::ffi::CStr) -> Result<rustix::fs::Stat, DatabaseError> {
+    rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| refused("resource entry metadata is unavailable"))
+}
+
+fn require_same_entry(
+    before: &rustix::fs::Stat,
+    after: &rustix::fs::Stat,
+) -> Result<(), DatabaseError> {
+    if before.st_dev != after.st_dev
+        || before.st_ino != after.st_ino
+        || rustix::fs::FileType::from_raw_mode(before.st_mode)
+            != rustix::fs::FileType::from_raw_mode(after.st_mode)
+    {
+        return Err(refused("resource entry changed during traversal"));
+    }
+    Ok(())
+}
+
+fn require_entry_handle(entry: &rustix::fs::Stat, file: &File) -> Result<(), DatabaseError> {
+    let held =
+        rustix::fs::fstat(file).map_err(|_| refused("held entry metadata is unavailable"))?;
+    require_same_entry(entry, &held)
 }
 
 fn refused(detail: &str) -> DatabaseError {
@@ -346,7 +382,10 @@ impl RefreshWorkspace {
 
     /// This does not authorize enrollment or publication. The future admission
     /// caller must mark retention before attempting its durable transaction.
-    pub(crate) fn retain_before_enrollment(&self) -> Result<(), DatabaseError> {
+    pub(crate) fn retain_before_enrollment(
+        &self,
+        authorize: impl FnOnce() -> Result<(), DatabaseError>,
+    ) -> Result<(), DatabaseError> {
         self.require_current()?;
         sync_tree(&self.owner.operation_handle)?;
         self.owner
@@ -354,6 +393,7 @@ impl RefreshWorkspace {
             .sync_all()
             .map_err(|_| refused("resource namespace synchronization failed"))?;
         self.require_current()?;
+        authorize()?;
         self.owner.retained.store(true, Ordering::Release);
         Ok(())
     }

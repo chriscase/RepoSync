@@ -330,7 +330,9 @@ async fn prepared_objects_and_working_copy_share_one_owned_retained_resource_roo
     );
     assert!(prepared.pins().svn.working_copy.join(".svn").is_dir());
     assert_eq!(f.state(), state);
-    prepared.retain_before_enrollment().unwrap();
+    context
+        .retain_workspace_before_enrollment(&engine, &workspace)
+        .unwrap();
     let commit = prepared.pins().git.prepared_sha.clone();
     let git_path = prepared.git().repository().path().to_owned();
     let wc = prepared.pins().svn.working_copy.clone();
@@ -450,7 +452,9 @@ async fn replaced_git_resource_role_is_not_used_retained_or_deleted() {
     std::fs::write(foreign.path().join("foreign-marker"), "foreign").unwrap();
     std::os::unix::fs::symlink(foreign.path(), &git).unwrap();
     assert!(prepared.resource_pin().is_err());
-    assert!(prepared.retain_before_enrollment().is_err());
+    assert!(context
+        .retain_workspace_before_enrollment(&engine, &workspace)
+        .is_err());
     drop(workspace);
     drop(prepared);
     assert!(root.is_dir());

@@ -20,6 +20,8 @@ pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
 pub mod watermark_recovery;
 
+mod opened_file;
+
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;
 #[cfg(feature = "reliability-fixture")]
@@ -31,15 +33,14 @@ pub mod candidate_migration;
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_readers;
 
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
 use tracing::{debug, info};
 
 use crate::errors::DatabaseError;
+use opened_file::OpenedDatabaseFile;
 
 /// Main database handle wrapping a SQLite connection.
 ///
@@ -51,35 +52,6 @@ pub struct Database {
     opened_file: Option<OpenedDatabaseFile>,
     #[cfg(test)]
     test_force_echo_split_fail: Mutex<bool>,
-}
-
-/// Identity observed at connection construction. Resource callers must not
-/// mistake a replacement at the same filename for the connected database.
-#[derive(PartialEq, Eq)]
-pub(crate) struct OpenedDatabaseFile {
-    pub path: PathBuf,
-    pub device: u64,
-    pub inode: u64,
-    pub aliased: bool,
-}
-
-impl OpenedDatabaseFile {
-    fn capture(path: &Path) -> Option<Self> {
-        let metadata = std::fs::symlink_metadata(path).ok()?;
-        let parent = path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let parent_metadata = std::fs::symlink_metadata(parent).ok()?;
-        let canonical = std::fs::canonicalize(path).ok()?;
-        let target = std::fs::metadata(&canonical).ok()?;
-        target.is_file().then_some(Self {
-            path: canonical,
-            device: target.dev(),
-            inode: target.ino(),
-            aliased: metadata.file_type().is_symlink() || parent_metadata.file_type().is_symlink(),
-        })
-    }
 }
 
 impl Database {
@@ -124,11 +96,7 @@ impl Database {
         }
 
         debug!("database opened successfully with WAL mode");
-        let opened_file = OpenedDatabaseFile::capture(path);
-        let opened_file = match (prior_file, opened_file) {
-            (Some(before), Some(after)) if before != after => None,
-            (_, after) => after,
-        };
+        let opened_file = OpenedDatabaseFile::attest(&conn, path, prior_file);
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file,

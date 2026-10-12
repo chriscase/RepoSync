@@ -76,17 +76,6 @@ impl LivePreparedRefresh {
             )),
         }
     }
-
-    /// Preserve exact resource paths before attempting durable enrollment.
-    /// This grants no job, publication, cleanup or recovery authority.
-    pub fn retain_before_enrollment(&self) -> Result<(), crate::errors::DatabaseError> {
-        match &self._operation_directory {
-            PreparationDirectory::Workspace { owner, .. } => owner.retain_before_enrollment(),
-            PreparationDirectory::Temporary(_) => Err(crate::errors::DatabaseError::Other(
-                "temporary preparation cannot enter durable enrollment".into(),
-            )),
-        }
-    }
 }
 
 /// Prepare the bounded first/next refresh from actual registered sources.

@@ -435,8 +435,15 @@ retained resources and publication intents. A copied preview pin cannot
 construct the live context, and this component enables no execution endpoint.
 
 Owned preparation resources now live beneath the actual connected database's
-configured data directory. The database records the file identity observed at
-opening; memory, replaced/aliased/hardlinked database paths, foreign roots and
+configured data directory. The database binds path identity to the main file
+descriptor SQLite actually opened, including newly created databases. The
+adapter supports the pinned bundled SQLite 3.45.0 Unix implementation, checks
+its exact runtime source ID and built-in VFS open/allocation method, and borrows
+the descriptor only for fstat. It neither opens nor closes another database
+descriptor, which could release SQLite's process locks. Its private native
+layout requires an explicit audit when SQLite changes; unsupported runtimes or
+VFS implementations leave resource identity unknown. In-process native VFS
+registration is trusted code. Memory, replaced/aliased/hardlinked database paths, foreign roots and
 unsupported owner/permission metadata refuse before resource creation. A fresh
 server operation UUID names its private resource directory. No existing Git
 repository or working copy is adopted or reinitialized. The legacy temporary
@@ -451,8 +458,19 @@ macOS iteration uses a fresh descriptor relative to the held directory.
 Observed unknown identity retains resources rather than deleting through a
 replacement pathname.
 
+Ordinary SCM entries do not inherit the private root permission or hard-link
+policy. Traversal classifies entries with no-follow stat before opening files
+or directories. Synchronization preserves symlinks through parent directory
+sync; cleanup unlinks them without opening their targets. Hard links lose only
+their owned directory entry, and group-writable ordinary files/directories are
+supported. Changed entries refuse traversal; special entries refuse retention
+without blocking on an open. Root and tracked-role identity checks stay strict.
+
 Before any durable enrollment attempt, resources and directory entries are
-synchronized and retention is marked. Cleanup is not conditional on a later
+synchronized and retention is marked through the actual engine's actor entry
+point. Actor/session/policy and workspace binding are checked before sync and
+again immediately before the retention flag is set; a preparation result cannot
+set that flag independently. Cleanup is not conditional on a later
 successful commit: an unknown commit result or abrupt process exit must not
 delete a potentially enrolled job's resources. Marking retention grants no
 admission, publication, adoption or recovery authority. The opaque resources
