@@ -29,22 +29,30 @@ COPY crates ./crates
 # raising this. There is no root Cargo.lock. Cargo writes a lock for this
 # build only. The launcher copies that lock and metadata out of the image.
 # Nothing here updates a shared lock or the product manifests.
+# Hosted run 38188277459 finished this release build, then
+# `cargo metadata --locked --offline` failed while downloading
+# android_system_properties 0.1.6. Metadata resolves every target, and the
+# linux build had not fetched that crate. Metadata stays --locked and is not
+# --offline, so it can fetch crates the build did not compile.
 ENV CARGO_BUILD_JOBS=2
 RUN cargo build --release --bin reposync-daemon --bin reposync \
     && test -s Cargo.lock \
     && cp Cargo.lock /tmp/Cargo.lock \
     && sha256sum Cargo.lock > /tmp/Cargo.lock.sha256 \
-    && cargo metadata --format-version 1 --locked --offline > /tmp/cargo-metadata.json \
     && { printf 'rust_image=%s\n' "$RUST_IMAGE"; \
          rustc --version; \
          cargo --version; \
-         printf 'rust_repo_digest=%s\n' "$RUST_REPO_DIGEST"; } > /tmp/rustc-version.txt \
+         printf 'rust_repo_digest=%s\n' "$RUST_REPO_DIGEST"; \
+         printf 'metadata_host=%s\n' "$(rustc -vV | sed -n 's/^host: //p')"; } > /tmp/rustc-version.txt \
     && test -s /tmp/Cargo.lock \
     && test -s /tmp/Cargo.lock.sha256 \
-    && test -s /tmp/cargo-metadata.json \
     && test -s /tmp/rustc-version.txt \
     && test -x target/release/reposync-daemon \
     && test -x target/release/reposync
+RUN host="$(rustc -vV | sed -n 's/^host: //p')" \
+    && test -n "$host" \
+    && cargo metadata --format-version 1 --locked --filter-platform "$host" > /tmp/cargo-metadata.json \
+    && test -s /tmp/cargo-metadata.json
 
 FROM ${DEBIAN_IMAGE} AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
