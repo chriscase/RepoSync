@@ -32,7 +32,8 @@ EOF
 # Wait until the directory accepts a real bind and search. This is infrastructure
 # readiness, not a product assertion.
 i=0
-until ldapsearch -H ldaps://ldap:636 -o ldif-wrap=no \
+until LDAPTLS_CACERT=/certs/ca.crt LDAPTLS_REQCERT=demand \
+      ldapsearch -H ldaps://ldap:636 -o ldif-wrap=no \
       -x -D "${LDAP_BIND_DN}" -w "${LDAP_BIND_PASSWORD}" \
       -b "${LDAP_BASE_DN}" "(uid=alice)" uid cn mail >/tmp/alice.ldif
 do

@@ -17,6 +17,12 @@ services:
       LDAP_TLS_CA_CRT_FILENAME: ca.crt
       LDAP_TLS_ENFORCE: "false"
       LDAP_REMOVE_CONFIG_AFTER_SETUP: "false"
+      # osixia defaults this to demand, which requires a client certificate.
+      # Run 38191685771: ldapsearch inside this container presents ldap.crt
+      # through .ldaprc and succeeds. SVN has no client certificate, and slapd
+      # logs "No certificate was found". Password binds are not mutual TLS.
+      # Clients still verify the server certificate.
+      LDAP_TLS_VERIFY_CLIENT: never
       LDAPTLS_CACERT: /container/service/slapd/assets/certs/ca.crt
       LDAPTLS_REQCERT: demand
     volumes:
