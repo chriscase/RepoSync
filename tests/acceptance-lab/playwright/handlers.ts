@@ -998,7 +998,7 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_st
       if (distinct !== "distinct") throw new Error("the two repos did not keep distinct svn credential records");
       const authzPath = `${process.env.LAB_RUN_DIR}/svn-authz`;
       const { readFileSync, writeFileSync } = await import("node:fs");
-      writeFileSync(authzPath, readFileSync(authzPath, "utf8").replaceAll("svc-sync = rw\n", ""));
+      writeFileSync(authzPath, readFileSync(authzPath, "utf8").replaceAll("svc-sync = rw\n", "svc-sync = r\n"));
       await lab.sh("svn", "apachectl graceful");
       const parked = await lab.snap(right);
       const stolenUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "alice" });
