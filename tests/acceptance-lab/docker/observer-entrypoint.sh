@@ -26,5 +26,13 @@ cat > /home/observer/.svn/config <<'EOF'
 [auth]
 password-stores =
 EOF
+# OpenLDAP does not use the system CA bundle unless TLS_CACERT points at it.
+# Run 38197454766: observer ldapsearch reached slapd, TLS was established,
+# and the client closed before BIND. The SVN client sets these two variables
+# and searched successfully. Certificate checking stays demand.
+cat > /home/observer/.ldaprc <<'EOF'
+TLS_CACERT /certs/ca.crt
+TLS_REQCERT demand
+EOF
 chown -R observer:observer /home/observer /work
 exec runuser -u observer -- sleep infinity
