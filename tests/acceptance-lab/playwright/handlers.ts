@@ -772,7 +772,7 @@ sync_executable_bit = false
 auto_merge = false
 sync_direct_pushes = false
 EOF
-reposync --config /var/lib/reposync/personal-${name}/personal.toml personal import --snapshot
+reposync personal --personal-config /var/lib/reposync/personal-${name}/personal.toml import --snapshot
 `;
       if (op.id === "LAB_PERSONAL_ROUNDTRIP") {
         lab.gap("personal sync_direct_pushes is rejected by product config. A direct Git-to-SVN personal round trip is not claimed.");
@@ -949,7 +949,7 @@ reposync --config /var/lib/reposync/personal-${name}/personal.toml personal impo
     case "LAB_EARLY_CHILD_FAILURE": {
       let failed = false;
       try {
-        await lab.sh("reposync", "reposync --config /does-not-exist.toml personal status", "reposync");
+        await lab.sh("reposync", "reposync personal --personal-config /does-not-exist.toml status", "reposync");
       } catch (error) {
         const text = `${error}`;
         if (!text.includes("docker exec reposync failed")) throw error;
@@ -1057,7 +1057,7 @@ sync_executable_bit = false
 auto_merge = false
 sync_direct_pushes = false
 EOF
-reposync --config "$root/personal.toml" personal import --full
+reposync personal --personal-config "$root/personal.toml" import --full
 test -f "$root/data/git-repo/README.txt"
 test -f "$root/data/git-repo/alpha.txt"
 maps=$(sqlite3 "$root/data/personal.db" "SELECT COUNT(*) FROM commit_map WHERE direction='svn_to_git';")
@@ -1085,12 +1085,12 @@ root=/var/lib/reposync/personal-pround
 cfg="$root/personal.toml"
 db="$root/data/personal.db"
 svn_cfg=/var/lib/reposync/svn-config
-stop_personal() { reposync --config "$cfg" personal stop >/dev/null 2>&1 || true; }
+stop_personal() { reposync personal --personal-config "$cfg" stop >/dev/null 2>&1 || true; }
 trap stop_personal EXIT
 svn_text() { svn cat --non-interactive --config-dir "$svn_cfg" --username svc-sync --password "$REPOSYNC_SVN_PASSWORD" "https://svn:8443/svn/pround/trunk/$1"; }
 svn_rev() { svn info --non-interactive --config-dir "$svn_cfg" --username svc-sync --password "$REPOSYNC_SVN_PASSWORD" --show-item revision https://svn:8443/svn/pround/trunk; }
 records() { sqlite3 "$db" "SELECT COUNT(*) FROM sync_records;"; }
-start_personal() { nohup reposync --config "$cfg" personal start --foreground >>"$root/daemon.log" 2>&1 & }
+start_personal() { nohup reposync personal --personal-config "$cfg" start --foreground >>"$root/daemon.log" 2>&1 & }
 fail_log() { echo "personal daemon log:"; tail -n 80 "$root/daemon.log" >&2 || true; exit 1; }
 start_personal
 i=0
