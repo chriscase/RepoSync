@@ -1091,7 +1091,14 @@ svn_text() { svn cat --non-interactive --config-dir "$svn_cfg" --username svc-sy
 svn_rev() { svn info --non-interactive --config-dir "$svn_cfg" --username svc-sync --password "$REPOSYNC_SVN_PASSWORD" --show-item revision https://svn:8443/svn/pround/trunk; }
 records() { sqlite3 "$db" "SELECT COUNT(*) FROM sync_records;"; }
 start_personal() { nohup reposync personal --personal-config "$cfg" start --foreground >>"$root/daemon.log" 2>&1 & }
-fail_log() { echo "personal daemon log:"; tail -n 80 "$root/daemon.log" >&2 || true; exit 1; }
+fail_log() {
+  echo "personal daemon log:" >&2
+  tail -n 40 "$root/daemon.log" >&2 || true
+  echo "closed pulls:" >&2
+  curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/repos/lab/pround/pulls?state=closed&base=main" | head -c 700 >&2 || true
+  echo >&2
+  exit 1
+}
 start_personal
 i=0
 while [ "$i" -lt 40 ]; do

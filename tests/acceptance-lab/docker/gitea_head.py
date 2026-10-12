@@ -12,6 +12,7 @@ import http.client
 import os
 import socket
 import ssl
+import sys
 import threading
 
 UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST", "gitea")
@@ -70,18 +71,21 @@ def parse_request(request):
     return method, path, headers, body
 
 
+def header_line(text):
+    return text.encode("latin-1", errors="replace")
+
+
 def build_response(status, reason, header_items, body, was_head):
     if was_head:
         body = b""
-    lines = [f"HTTP/1.1 {status} {reason}"]
+    lines = [header_line(f"HTTP/1.1 {status} {reason}")]
     for name, value in header_items:
         if name.lower() in HOP or name.lower() == "content-length":
             continue
-        lines.append(f"{name}: {value}")
-    lines.append(f"Content-Length: {len(body)}")
-    lines.append("Connection: close")
-    payload = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1")
-    return payload + body
+        lines.append(header_line(f"{name}: {value}"))
+    lines.append(header_line(f"Content-Length: {len(body)}"))
+    lines.append(b"Connection: close")
+    return b"\r\n".join(lines) + b"\r\n\r\n" + body
 
 
 def forward(method, path, headers, body):
@@ -113,9 +117,13 @@ def handle_client(client):
             client.close()
             return
         method, path, headers, body = parse_request(request)
-        client.sendall(forward(method, path, headers, body))
-    except Exception:
-        pass
+        response = forward(method, path, headers, body)
+        client.sendall(response)
+        sys.stderr.write(f"gitea-api {method} {path} -> {len(response)} bytes\n")
+        sys.stderr.flush()
+    except Exception as exc:
+        sys.stderr.write(f"gitea-api proxy error: {exc}\n")
+        sys.stderr.flush()
     try:
         client.close()
     except Exception:

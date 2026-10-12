@@ -1536,7 +1536,7 @@ cmd_test() {
     fi
   fi
   printf 'elapsed_before_report=%s\n' "$(( $(date +%s) - started ))" >> "$EVIDENCE/timings.txt"
-  capture_service_logs ldap gitea svn reposync ui-forwarder || true
+  capture_service_logs ldap gitea gitea-api svn reposync ui-forwarder || true
   scrub_outputs || true
   if ! scan_outputs; then
     ec=1
