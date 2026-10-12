@@ -5,6 +5,7 @@
 # Cleanup removes only that run's labeled disposable resources.
 #
 #   scripts/acceptance-lab.sh test --suite smoke|full|soak --candidate <full-SHA> --seed <n>
+#   scripts/acceptance-lab.sh interrupt-probe --candidate <full-SHA> --seed <n>
 #   scripts/acceptance-lab.sh prepare|up|down|reset|report|clean [flags]
 #
 # GitHub-hosted Ubuntu is the runtime qualification host. This script does not
@@ -31,7 +32,7 @@ KEEP=0
 CMD=""
 
 usage() {
-  echo "usage: scripts/acceptance-lab.sh prepare|up|down|reset|report|test|clean [--suite smoke|full|soak] [--candidate SHA] [--seed N] [--run-id ID] [--keep]" >&2
+  echo "usage: scripts/acceptance-lab.sh prepare|up|down|reset|report|test|clean|interrupt-probe [--suite smoke|full|soak] [--candidate SHA] [--seed N] [--run-id ID] [--keep]" >&2
   exit 2
 }
 
@@ -146,7 +147,7 @@ parse_args() {
   CMD="$1"
   shift
   case "$CMD" in
-    prepare|up|down|reset|report|test|clean) ;;
+    prepare|up|down|reset|report|test|clean|interrupt-probe) ;;
     *) usage ;;
   esac
   while [ "$#" -gt 0 ]; do
@@ -1404,6 +1405,74 @@ cmd_clean() {
   cleanup_run
 }
 
+cmd_interrupt_probe() {
+  local root child_pid waited run_json id cid left ec
+  if [ -z "$CANDIDATE" ]; then
+    echo "interrupt-probe requires --candidate" >&2
+    return 2
+  fi
+  root="$(mktemp -d "${TMPDIR:-/tmp}/acceptance-lab-interrupt.XXXXXX")"
+  child_pid=""
+  stop_child() {
+    if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" 2>/dev/null; then
+      kill -TERM "$child_pid" 2>/dev/null || true
+      wait "$child_pid" || true
+    fi
+  }
+  trap 'stop_child; exit 130' INT TERM
+  ACCEPTANCE_LAB_ARTIFACT_ROOT="$root" "$0" up --suite "$SUITE" --candidate "$CANDIDATE" --seed "$SEED" &
+  child_pid=$!
+  id=""
+  cid=""
+  waited=0
+  while [ "$waited" -lt 900 ]; do
+    if ! kill -0 "$child_pid" 2>/dev/null; then
+      echo "up exited before an owned container existed" >&2
+      wait "$child_pid" || true
+      return 1
+    fi
+    run_json=""
+    for candidate in "$root"/*/run.json; do
+      if [ -f "$candidate" ]; then
+        run_json="$candidate"
+        break
+      fi
+    done
+    if [ -n "$run_json" ]; then
+      id="$(basename "$(dirname "$run_json")")"
+      cid=""
+      while IFS= read -r found; do
+        cid="$found"
+        break
+      done < <(docker ps -q --filter "label=acceptance-lab.run-id=${id}")
+      if [ -n "$cid" ]; then
+        break
+      fi
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ -z "$cid" ]; then
+    echo "no owned container appeared for interruption" >&2
+    stop_child
+    return 1
+  fi
+  kill -TERM "$child_pid"
+  set +e
+  wait "$child_pid"
+  ec=$?
+  set -e
+  left="$(docker ps -aq --filter "label=acceptance-lab.run-id=${id}" || true)"
+  if [ -n "$left" ]; then
+    echo "containers remain after SIGTERM for $id (up exit $ec)" >&2
+    docker ps -a --filter "label=acceptance-lab.run-id=${id}" --format '{{.Names}} {{.Status}}' >&2 || true
+    return 1
+  fi
+  printf 'run_id=%s\nup_exit=%s\ncontainers=0\n' "$id" "$ec" > "$root/interrupt-proof.txt"
+  log "interruption cleanup removed run $id (up exit $ec)"
+  cat "$root/interrupt-proof.txt" >&2
+}
+
 cmd_reset() {
   isolate_host_credentials
   load_run
@@ -1500,6 +1569,7 @@ main() {
     report) cmd_report ;;
     test) cmd_test ;;
     clean) cmd_clean ;;
+    interrupt-probe) cmd_interrupt_probe ;;
   esac
 }
 

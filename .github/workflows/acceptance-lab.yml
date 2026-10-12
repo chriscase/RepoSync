@@ -262,6 +262,14 @@ jobs:
         if: always()
         run: node tests/acceptance-lab/src/ci-gate.mjs require-publish --root "${RUNNER_TEMP}/acceptance-lab"
 
+      - name: Prove interruption cleanup
+        if: always()
+        env:
+          ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD: "1"
+        run: |
+          sha="$(git rev-parse HEAD)"
+          scripts/acceptance-lab.sh interrupt-probe --suite smoke --candidate "$sha" --seed 1
+
       - name: Clean this run
         if: always()
         env:

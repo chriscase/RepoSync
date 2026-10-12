@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use reposync_core::config::GitProvider;
-use reposync_core::db::Database;
 use reposync_core::git::github::GitHubClient;
 use reposync_core::git::GitClient;
 use reposync_core::personal_config::PersonalConfig;
@@ -20,12 +19,7 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     println!("Importing SVN history to GitHub...");
     println!();
 
-    // Ensure data directory
-    std::fs::create_dir_all(data_dir).context("failed to create data directory")?;
-
-    // Initialize database
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to initialize database")?;
+    let db = super::open_personal_database(data_dir)?;
 
     // SVN client
     let svn_client = SvnClient::new(

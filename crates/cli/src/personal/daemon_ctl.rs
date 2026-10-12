@@ -5,7 +5,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use reposync_core::config::GitProvider;
-use reposync_core::db::Database;
 use reposync_core::git::github::GitHubClient;
 use reposync_core::git::GitClient;
 use reposync_core::personal_config::PersonalConfig;
@@ -28,12 +27,7 @@ pub async fn run_start(config: &PersonalConfig, foreground: bool) -> Result<()> 
 
     println!("Starting RepoSync Personal daemon...");
 
-    // Ensure data directory exists
-    std::fs::create_dir_all(data_dir).context("failed to create data directory")?;
-
-    // Initialize components
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to open database")?;
+    let db = super::open_personal_database(data_dir)?;
 
     let svn_client = SvnClient::new(
         &config.svn.url,
