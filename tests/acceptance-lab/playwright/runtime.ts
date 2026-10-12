@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
+import { appendFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { expect, type Page, type TestInfo } from "@playwright/test";
 
@@ -54,10 +55,19 @@ export class Lab {
   readonly svnWebhookSecret = required("LAB_SVN_WEBHOOK_SECRET");
   readonly localPassword = required("LAB_LOCAL_PASSWORD");
   private token = "";
+  private minted: string[] = [];
 
   constructor(page: Page, info: TestInfo) {
     this.page = page;
     this.info = info;
+  }
+
+  private rememberSecret(value: string): void {
+    if (value.length < 8) return;
+    this.minted.push(value);
+    const root = process.env.LAB_RUN_DIR;
+    if (!root) throw new Error("LAB_RUN_DIR is not set; refusing to mint a credential");
+    appendFileSync(`${root}/secrets.env`, `SCOPED_${this.minted.length}=${value}\n`);
   }
 
   mark(status: "PASS" | "FAIL" | "PARTIAL" | "NOT_RUN", reason: string, qualification = ""): void {
@@ -124,6 +134,7 @@ export class Lab {
         this.localPassword,
         this.webhookSecret,
         this.svnWebhookSecret,
+        ...this.minted,
       ]) {
         if (secret) stderr = stderr.replaceAll(secret, "[redacted]");
       }
@@ -260,6 +271,99 @@ curl --silent --show-error --cacert /certs/ca.crt \
     if (started.status !== 200) throw new Error(`import ${repo} failed (${started.status}) ${started.text.slice(0, 400)}`);
     await this.waitImport(id);
     return { id, name: repo, svnUrl: `https://svn:8443/svn/${repo}`, gitRepo: `lab/${repo}` };
+  }
+
+  // A Gitea user who can write only this repository. The token is not the lab admin token.
+  async issueScopedGitToken(repoName: string, otherRepo: string): Promise<{ token: string; user: string; tokenName: string }> {
+    const repo = safe(repoName, "repo");
+    const other = safe(otherRepo, "repo");
+    const user = safe(`git${repo}`, "user");
+    const tokenName = safe(`lab${repo}`, "token");
+    const team = safe(`write${repo}`, "team");
+    const password = `${randomBytes(18).toString("hex")}Aa1!`;
+    this.rememberSecret(password);
+    const output = await this.sh("gitea", `
+set -eu
+fail_step() {
+  label="$1"
+  file="$2"
+  msg=$(grep -o '"message":"[^"]*"' "$file" 2>/dev/null | head -n 1 | cut -d'"' -f4 || true)
+  echo "$label $code $msg"
+  exit 1
+}
+code=$(curl --silent --show-error --output /tmp/cu.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"username":"${user}","email":"${user}@lab.invalid","password":"${password}","must_change_password":false,"visibility":"private","source_id":0}' https://gitea:3000/api/v1/admin/users || true)
+case "$code" in
+  201|409) ;;
+  *) fail_step CREATE_USER /tmp/cu.out ;;
+esac
+code=$(curl --silent --show-error --output /tmp/team.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"name":"${team}","permission":"write","can_create_org_repo":false,"includes_all_repositories":false,"units":["repo.code","repo.pulls"]}' https://gitea:3000/api/v1/orgs/lab/teams || true)
+case "$code" in
+  201) ;;
+  *) fail_step CREATE_TEAM /tmp/team.out ;;
+esac
+team_id=$(grep -o '"id":[0-9]*' /tmp/team.out | head -n 1 | cut -d: -f2)
+if [ -z "$team_id" ]; then echo "TEAM_ID"; exit 1; fi
+code=$(curl --silent --show-error --output /tmp/tr.out --write-out '%{http_code}' --cacert /certs/ca.crt -X PUT -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/teams/$team_id/repos/lab/${repo}" || true)
+case "$code" in
+  204|201) ;;
+  *) fail_step TEAM_REPO /tmp/tr.out ;;
+esac
+code=$(curl --silent --show-error --output /tmp/tm.out --write-out '%{http_code}' --cacert /certs/ca.crt -X PUT -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/teams/$team_id/members/${user}" || true)
+case "$code" in
+  204|201) ;;
+  *) fail_step TEAM_MEMBER /tmp/tm.out ;;
+esac
+code=$(curl --silent --show-error --output /tmp/ct.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"name":"${tokenName}","scopes":["all"]}' "https://gitea:3000/api/v1/users/${user}/tokens" || true)
+case "$code" in
+  201) ;;
+  *) fail_step TOKEN /tmp/ct.out ;;
+esac
+value=$(grep -o '"sha1":"[0-9a-fA-F]*"' /tmp/ct.out | head -n 1 | cut -d'"' -f4)
+if [ -z "$value" ]; then
+  value=$(grep -o '"token":"[0-9a-fA-F]*"' /tmp/ct.out | head -n 1 | cut -d'"' -f4)
+fi
+if ! printf '%s\n' "$value" | grep -Eq '^[0-9a-fA-F]{20,}$'; then
+  echo "TOKEN_PARSE"
+  exit 1
+fi
+rm -f /tmp/cu.out /tmp/team.out /tmp/tr.out /tmp/tm.out /tmp/ct.out
+own=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $value" "https://gitea:3000/api/v1/repos/lab/${repo}")
+other_code=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $value" "https://gitea:3000/api/v1/repos/lab/${other}")
+case "$own" in
+  200) ;;
+  *) echo "OWN $own"; exit 1 ;;
+esac
+case "$other_code" in
+  403|404) ;;
+  *) echo "OTHER $other_code"; exit 1 ;;
+esac
+printf 'SCOPED own=%s other=%s\n' "$own" "$other_code"
+printf '%s\n' "$value"
+`);
+    const lines = output.trim().split("\n").map((line) => line.trim()).filter(Boolean);
+    const marker = lines.find((line) => line.startsWith("SCOPED "));
+    const token = lines[lines.length - 1] || "";
+    if (!marker || !/^[0-9a-fA-F]{20,}$/.test(token)) {
+      throw new Error(`scoped git token for ${repo} was not issued (${marker || "no marker"})`);
+    }
+    this.rememberSecret(token);
+    return { token, user, tokenName };
+  }
+
+  async revokeScopedGitToken(repoName: string): Promise<void> {
+    const repo = safe(repoName, "repo");
+    const user = safe(`git${repo}`, "user");
+    const tokenName = safe(`lab${repo}`, "token");
+    const output = await this.sh("gitea", `
+set -eu
+code=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -X DELETE -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/users/${user}/tokens/${tokenName}" || true)
+case "$code" in
+  204|200) ;;
+  *) echo "REVOKE $code"; exit 1 ;;
+esac
+printf 'REVOKED\n'
+`);
+    if (!output.includes("REVOKED")) throw new Error(`scoped git token for ${repo} was not revoked`);
   }
 
   async snap(pair: Pair): Promise<Snap> {

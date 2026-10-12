@@ -962,17 +962,19 @@ reposync personal --personal-config /var/lib/reposync/personal-${name}/personal.
     case "LAB_ISOLATION_TWO_REPOS": {
       const left = await lab.createPair("isoa");
       const right = await lab.createPair("isob");
+      const leftGit = await lab.issueScopedGitToken("isoa", "isob");
+      const rightGit = await lab.issueScopedGitToken("isob", "isoa");
       const leftCred = await lab.api("PUT", `/api/repos/${left.id}`, { svn_username: "alice" });
       if (leftCred.status !== 200) throw new Error(`left username ${leftCred.status}`);
       const rightUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "bob" });
       if (rightUser.status !== 200) throw new Error(`right username ${rightUser.status}`);
       const leftSecret = await lab.api("POST", `/api/repos/${left.id}/credentials`, {
         svn_password: lab.alicePassword,
-        git_token: lab.gitToken,
+        git_token: leftGit.token,
       });
       const cred = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
         svn_password: lab.bobPassword,
-        git_token: lab.gitToken,
+        git_token: rightGit.token,
       });
       if (leftSecret.status !== 200 || cred.status !== 200) throw new Error(`credential status ${leftSecret.status}/${cred.status}`);
       const beforeLeft = await lab.snap(left);
@@ -996,6 +998,26 @@ set -eu
 sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_state WHERE key='secret_svn_password_${left.id}') != (SELECT value FROM kv_state WHERE key='secret_svn_password_${right.id}') THEN 'distinct' ELSE 'same' END;"
 `, "root")).trim();
       if (distinct !== "distinct") throw new Error("the two repos did not keep distinct svn credential records");
+      const swapped = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
+        svn_password: lab.bobPassword,
+        git_token: leftGit.token,
+      });
+      if (swapped.status !== 200) throw new Error(`could not store isoa's git token on isob (${swapped.status})`);
+      await lab.revokeScopedGitToken("isob");
+      const parkedGit = await lab.snap(right);
+      let gitDenied = false;
+      try {
+        await lab.syncSvnChange(right, "printf 'other-token\\n' > other-token.txt\nsvn add --force other-token.txt\n", "bob");
+      } catch {
+        gitDenied = true;
+      }
+      const afterGitDeny = await lab.snap(right);
+      if (!gitDenied || afterGitDeny.git !== parkedGit.git) {
+        throw new Error("isob published after its git credential was replaced with isoa's token");
+      }
+      if (afterGitDeny.records !== parkedGit.records && afterGitDeny.git === parkedGit.git) {
+        throw new Error("isob wrote a checkpoint without publishing the commit made with isoa's git token");
+      }
       const authzPath = `${process.env.LAB_RUN_DIR}/svn-authz`;
       const { readFileSync, writeFileSync } = await import("node:fs");
       writeFileSync(authzPath, readFileSync(authzPath, "utf8").replaceAll("svc-sync = rw\n", "svc-sync = r\n"));
@@ -1019,7 +1041,7 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_st
         throw new Error("isob wrote a checkpoint without publishing bob's commit");
       }
       if (afterDeny.git !== parked.git) throw new Error("isob published after alice's credential replaced bob's");
-      lab.pass(`isoa as alice reached ${changed.git.slice(0, 12)} and isob as bob reached ${changedRight.git.slice(0, 12)} from trunk r${beforeLeft.svn}; storing alice's credential on isob did not publish bob's next commit. Git tokens remain the shared lab admin token.`);
+      lab.pass(`isoa as ${leftGit.user} reached ${changed.git.slice(0, 12)} and isob as ${rightGit.user} reached ${changedRight.git.slice(0, 12)} from trunk r${beforeLeft.svn}; storing isoa's git token on isob and revoking isob's token did not publish bob's next commit; storing alice's svn credential on isob did not publish the commit after that.`);
       return;
     }
     case "LAB_PERSONAL_MULTICOMMIT": {
