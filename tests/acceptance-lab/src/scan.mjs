@@ -4,6 +4,10 @@ import { pathToFileURL } from "node:url";
 
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
 const CANARY = "CANARY_SECRET_SHOULD_NOT_LEAK";
+const LIVE_BASIC = /Authorization:\s+Basic\s+[A-Za-z0-9+/=]{8,}/i;
+const LIVE_BEARER = /Authorization:\s+Bearer\s+\S{8,}/i;
+const LIVE_TOKEN = /Authorization:\s+token\s+(?!\$)[A-Za-z0-9._~+/-]{8,}/i;
+const LEFTOVER_PAYLOAD = /Authorization:\s+\[redacted\]\s+[A-Za-z0-9+/=]{8,}/;
 
 export async function scanTree(root, secrets = []) {
   const findings = [];
@@ -48,6 +52,9 @@ export async function scanTree(root, secrets = []) {
       const decoded = text.toString("utf8");
       if (decoded.includes(CANARY)) findings.push({ path: rel, reason: "canary" });
       if (PRIVATE_KEY.test(decoded)) findings.push({ path: rel, reason: "private_key" });
+      if (LIVE_BASIC.test(decoded) || LIVE_BEARER.test(decoded) || LIVE_TOKEN.test(decoded) || LEFTOVER_PAYLOAD.test(decoded)) {
+        findings.push({ path: rel, reason: "credential_header" });
+      }
       for (const secret of secrets) {
         if (secret && secret.length >= 8 && decoded.includes(secret)) {
           findings.push({ path: rel, reason: "secret_value" });

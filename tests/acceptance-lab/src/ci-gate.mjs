@@ -31,6 +31,64 @@ function selectionFromEnv() {
   return resolveSelection(process.env.LAB_EVENT_NAME, process.env.LAB_SUITE_INPUT, process.env.LAB_SEED_INPUT);
 }
 
+export function listNamed(root, name) {
+  const found = [];
+  if (!root || !existsSync(root)) return found;
+  const stack = [root];
+  while (stack.length) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = join(current, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) stack.push(full);
+      else if (entry.isFile() && entry.name === name) {
+        try {
+          if (statSync(full).size > 0) found.push(full);
+        } catch {
+          // An unreadable file is not a usable artifact.
+        }
+      }
+    }
+  }
+  return found;
+}
+
+export function bindEvidenceIdentity({ evidence, candidate, suite, seed }) {
+  const reasons = [];
+  const files = listNamed(evidence, "identity.json");
+  if (files.length !== 1) {
+    reasons.push(`infrastructure FAIL: expected one identity.json, found ${files.length}`);
+    return { ok: false, reasons, identity: null };
+  }
+  let identity;
+  try {
+    identity = JSON.parse(readFileSync(files[0], "utf8"));
+  } catch {
+    reasons.push("infrastructure FAIL: identity.json is not readable");
+    return { ok: false, reasons, identity: null };
+  }
+  const source = typeof identity.candidate_sha === "string" ? identity.candidate_sha : "";
+  if (source !== candidate) {
+    reasons.push(`infrastructure FAIL: evidence candidate ${source || "missing"} does not match ${candidate}`);
+  }
+  if (identity.suite && identity.suite !== suite) {
+    reasons.push(`infrastructure FAIL: evidence suite ${identity.suite} does not match ${suite}`);
+  }
+  if (identity.seed != null && String(identity.seed) !== String(seed)) {
+    reasons.push(`infrastructure FAIL: evidence seed ${identity.seed} does not match ${seed}`);
+  }
+  if (!safeRunId(identity.run_id)) {
+    reasons.push("infrastructure FAIL: evidence run_id is missing");
+  }
+  return { ok: reasons.length === 0, reasons, identity };
+}
+
 export function findNamed(root, name) {
   if (!root || !existsSync(root)) return "";
   const stack = [root];
@@ -175,7 +233,15 @@ export function aggregateReport({ evidence, engine, reportDir, candidate }) {
   }
   writeReasons(reportDir, reasons);
   let aggregateExit = 0;
-  if (selection.ok && /^[0-9a-f]{40}$/.test(candidate || "")) {
+  let identityOk = true;
+  if (selection.ok && /^[0-9a-f]{40}$/.test(candidate || "") && existsSync(evidence)) {
+    const bound = bindEvidenceIdentity({ evidence, candidate, suite: selection.suite, seed: selection.seed });
+    if (!bound.ok) {
+      identityOk = false;
+      reasons.push(...bound.reasons);
+    }
+  }
+  if (selection.ok && identityOk && /^[0-9a-f]{40}$/.test(candidate || "")) {
     const identityPath = findNamed(evidence, "identity.json");
     const identity = identityPath ? readJson(identityPath) : null;
     const runId = reportRunId(identity);
@@ -213,6 +279,29 @@ export function enforceReport({ evidence, engine, reportDir }) {
   const reportPath = join(reportDir, "report.json");
   const report = fileReady(reportPath) ? readJson(reportPath) : null;
   if (!report) reasons.push("infrastructure FAIL: report.json was not produced");
+  const identityFiles = listNamed(evidence, "identity.json");
+  if (identityFiles.length > 1) {
+    reasons.push(`infrastructure FAIL: expected one identity.json, found ${identityFiles.length}`);
+  } else if (identityFiles.length === 1 && report) {
+    let identity = null;
+    try {
+      identity = JSON.parse(readFileSync(identityFiles[0], "utf8"));
+    } catch {
+      identity = null;
+    }
+    if (!identity || report.candidate !== identity.candidate_sha) {
+      reasons.push(`infrastructure FAIL: report candidate ${report.candidate || "missing"} does not match evidence ${identity?.candidate_sha || "missing"}`);
+    }
+    if (identity?.suite && report.suite && report.suite !== identity.suite) {
+      reasons.push(`infrastructure FAIL: report suite ${report.suite} does not match evidence ${identity.suite}`);
+    }
+    if (identity?.seed != null && report.seed != null && String(report.seed) !== String(identity.seed)) {
+      reasons.push(`infrastructure FAIL: report seed ${report.seed} does not match evidence ${identity.seed}`);
+    }
+    if (identity?.run_id && report.run_id && report.run_id !== identity.run_id) {
+      reasons.push(`infrastructure FAIL: report run ${report.run_id} does not match evidence ${identity.run_id}`);
+    }
+  }
   writeReasons(reportDir, reasons);
   const suiteResult = report?.suite_result || "";
   if (reasons.length) {
@@ -459,6 +548,53 @@ function commandSelfCheck() {
     checks += 1;
     assertCheck(!existsSync(join(passDir, "infrastructure-failure.txt")), "clean pass wrote an infrastructure failure");
 
+    const reviewed = "e16c321b1eff1caea4ecf9c35eb9dc8fc995b6d1";
+    const other = "a".repeat(40);
+    const savedMismatchEvent = process.env.LAB_EVENT_NAME;
+    const savedMismatchSuite = process.env.LAB_SUITE_INPUT;
+    const savedMismatchSeed = process.env.LAB_SEED_INPUT;
+    process.env.LAB_EVENT_NAME = "workflow_dispatch";
+    process.env.LAB_SUITE_INPUT = "smoke";
+    process.env.LAB_SEED_INPUT = "1";
+    const mismatchEvidence = join(scratch, "mismatch-evidence");
+    writeJson(join(mismatchEvidence, "identity.json"), {
+      candidate_sha: reviewed,
+      suite: "smoke",
+      seed: 1,
+      run_id: "rs016ed3f4",
+    });
+    writeJson(join(mismatchEvidence, "playwright.json"), { suites: [] });
+    writeJson(join(mismatchEvidence, "self-test.json"), { cases: [] });
+    const mismatchReport = join(scratch, "mismatch-report");
+    const mismatchAggregate = aggregateReport({
+      evidence: mismatchEvidence,
+      engine: staged,
+      reportDir: mismatchReport,
+      candidate: other,
+    });
+    checks += 1;
+    assertCheck(!mismatchAggregate.ok, "aggregation accepted evidence from another candidate");
+    writeJson(join(mismatchReport, "report.json"), {
+      suite_result: "PASS",
+      suite: "smoke",
+      candidate: other,
+      seed: 1,
+      run_id: "rs016ed3f4",
+    });
+    const mismatchEnforce = enforceReport({
+      evidence: mismatchEvidence,
+      engine: staged,
+      reportDir: mismatchReport,
+    });
+    checks += 1;
+    assertCheck(!mismatchEnforce.ok && mismatchEnforce.reasons.some((reason) => reason.includes(reviewed)), "enforcement accepted evidence from another candidate");
+    if (savedMismatchEvent === undefined) delete process.env.LAB_EVENT_NAME;
+    else process.env.LAB_EVENT_NAME = savedMismatchEvent;
+    if (savedMismatchSuite === undefined) delete process.env.LAB_SUITE_INPUT;
+    else process.env.LAB_SUITE_INPUT = savedMismatchSuite;
+    if (savedMismatchSeed === undefined) delete process.env.LAB_SEED_INPUT;
+    else process.env.LAB_SEED_INPUT = savedMismatchSeed;
+
     const savedEvent = process.env.LAB_EVENT_NAME;
     const savedSuite = process.env.LAB_SUITE_INPUT;
     const savedSeed = process.env.LAB_SEED_INPUT;
@@ -502,7 +638,12 @@ function commandSelfCheck() {
     assertCheck(reportRunId(null, {}) === `norun${process.pid}` && reportRunId(null, {}) !== "unknown", "pid fallback was unknown");
 
     const idRoot = join(scratch, "id-evidence");
-    writeJson(join(idRoot, "identity.json"), { run_id: "rs0123abcd" });
+    writeJson(join(idRoot, "identity.json"), {
+      run_id: "rs0123abcd",
+      candidate_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      suite: "smoke",
+      seed: 1,
+    });
     const idDir = join(scratch, "id-report");
     const idRun = runNode(
       ["aggregate", "--evidence", idRoot, "--engine", join(scratch, "no-engine"), "--report-dir", idDir, "--candidate", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],

@@ -962,37 +962,64 @@ reposync personal --personal-config /var/lib/reposync/personal-${name}/personal.
     case "LAB_ISOLATION_TWO_REPOS": {
       const left = await lab.createPair("isoa");
       const right = await lab.createPair("isob");
-      const cred = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
+      const leftCred = await lab.api("PUT", `/api/repos/${left.id}`, { svn_username: "alice" });
+      if (leftCred.status !== 200) throw new Error(`left username ${leftCred.status}`);
+      const rightUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "bob" });
+      if (rightUser.status !== 200) throw new Error(`right username ${rightUser.status}`);
+      const leftSecret = await lab.api("POST", `/api/repos/${left.id}/credentials`, {
         svn_password: lab.alicePassword,
-        git_token: "isob-synthetic-token-not-shared",
+        git_token: lab.gitToken,
       });
-      if (cred.status !== 200) throw new Error(`right credentials ${cred.status}`);
+      const cred = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
+        svn_password: lab.bobPassword,
+        git_token: lab.gitToken,
+      });
+      if (leftSecret.status !== 200 || cred.status !== 200) throw new Error(`credential status ${leftSecret.status}/${cred.status}`);
       const beforeLeft = await lab.snap(left);
       const beforeRight = await lab.snap(right);
       if (beforeLeft.svn !== beforeRight.svn) {
         throw new Error(`trunk revisions did not overlap before the sync: ${beforeLeft.svn} vs ${beforeRight.svn}`);
       }
-      const changed = await lab.syncSvnChange(left, "printf 'only-left\\n' > only-left.txt\nsvn add --force only-left.txt\n");
+      const changed = await lab.syncSvnChange(left, "printf 'only-left\\n' > only-left.txt\nsvn add --force only-left.txt\n", "alice");
+      const changedRight = await lab.syncSvnChange(right, "printf 'only-right\\n' > only-right.txt\nsvn add --force only-right.txt\n", "bob");
+      const afterLeft = await lab.snap(left);
       const afterRight = await lab.snap(right);
-      if (afterRight.svn !== beforeRight.svn || afterRight.git !== beforeRight.git || afterRight.maps !== beforeRight.maps || afterRight.records !== beforeRight.records || afterRight.watermark !== beforeRight.watermark) {
-        throw new Error(`right repo moved svn ${beforeRight.svn}->${afterRight.svn} git ${beforeRight.git}->${afterRight.git} maps ${beforeRight.maps}->${afterRight.maps} records ${beforeRight.records}->${afterRight.records} watermark ${beforeRight.watermark}->${afterRight.watermark}`);
-      }
+      if (afterLeft.git === changedRight.git) throw new Error("the two repos published the same git tip");
+      if (afterRight.svn === beforeRight.svn) throw new Error("bob's repository did not advance");
       const crossed = (await lab.sh("reposync", `
 set -eu
 sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM sync_records WHERE repo_id='${right.id}' AND git_sha='${changed.git}';"
 `, "root")).trim();
-      if (crossed !== "0") throw new Error(`right repo stored the left git sha`);
-      const secretRows = (await lab.sh("reposync", `
-set -eu
-sqlite3 /var/lib/reposync/reposync.db "SELECT key FROM kv_state WHERE key IN ('secret_svn_password_${left.id}','secret_svn_password_${right.id}','secret_git_token_${left.id}','secret_git_token_${right.id}') ORDER BY key;"
-`, "root")).trim().split("\n").filter(Boolean);
-      if (secretRows.length !== 4) throw new Error(`expected four credential keys, found ${secretRows.length}`);
+      if (crossed !== "0") throw new Error("right repo stored the left git sha");
       const distinct = (await lab.sh("reposync", `
 set -eu
-sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_state WHERE key='secret_svn_password_${left.id}') != (SELECT value FROM kv_state WHERE key='secret_svn_password_${right.id}') AND (SELECT value FROM kv_state WHERE key='secret_git_token_${left.id}') != (SELECT value FROM kv_state WHERE key='secret_git_token_${right.id}') THEN 'distinct' ELSE 'same' END;"
+sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_state WHERE key='secret_svn_password_${left.id}') != (SELECT value FROM kv_state WHERE key='secret_svn_password_${right.id}') THEN 'distinct' ELSE 'same' END;"
 `, "root")).trim();
-      if (distinct !== "distinct") throw new Error("the two repos did not keep distinct svn and git credential records");
-      lab.pass(`isoa and isob both used trunk at r${beforeLeft.svn}; only isoa advanced to ${changed.git.slice(0, 12)} and the credential records stayed distinct`);
+      if (distinct !== "distinct") throw new Error("the two repos did not keep distinct svn credential records");
+      const authzPath = `${process.env.LAB_RUN_DIR}/svn-authz`;
+      const { readFileSync, writeFileSync } = await import("node:fs");
+      writeFileSync(authzPath, readFileSync(authzPath, "utf8").replaceAll("svc-sync = rw\n", ""));
+      await lab.sh("svn", "apachectl graceful");
+      const parked = await lab.snap(right);
+      const stolenUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "alice" });
+      const stolenSecret = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
+        svn_password: lab.alicePassword,
+        git_token: lab.gitToken,
+      });
+      if (stolenUser.status !== 200 || stolenSecret.status !== 200) throw new Error("could not present alice's credential to isob");
+      let denied = false;
+      try {
+        await lab.syncSvnChange(right, "printf 'stolen\\n' > stolen.txt\nsvn add --force stolen.txt\n", "bob");
+      } catch {
+        denied = true;
+      }
+      if (!denied) throw new Error("isob published a commit while its stored credential was alice");
+      const afterDeny = await lab.snap(right);
+      if (afterDeny.git === parked.git && afterDeny.records !== parked.records) {
+        throw new Error("isob wrote a checkpoint without publishing bob's commit");
+      }
+      if (afterDeny.git !== parked.git) throw new Error("isob published after alice's credential replaced bob's");
+      lab.pass(`isoa as alice reached ${changed.git.slice(0, 12)} and isob as bob reached ${changedRight.git.slice(0, 12)} from trunk r${beforeLeft.svn}; storing alice's credential on isob did not publish bob's next commit. Git tokens remain the shared lab admin token.`);
       return;
     }
     case "LAB_PERSONAL_MULTICOMMIT": {

@@ -99,4 +99,4 @@ Syntax, type, and harness-detector checks do not qualify the services, the brows
 
 ## Reading a failure
 
-`publish/report.md` lists the suite result, whether the audit SHA covers the candidate, and each operation. Infrastructure failures stay infrastructure failures. Product failures stay on their existing owners. This lab does not patch production Rust, the web UI, shared lockfiles, or PR 194 to make a red case green.
+`publish/report.md` lists the suite result, whether the audit SHA covers the candidate, and each operation. Infrastructure failures stay infrastructure failures. Product failures stay on their existing owners. This branch already contains four Personal production files, `crates/cli/src/personal/mod.rs`, `import.rs`, `daemon_ctl.rs`, and `crates/personal/src/engine.rs`, so that a fresh personal database is initialized, import commits on the configured branch, and Git-to-SVN errors keep their cause. Those files are part of this draft. The harness repair does not add further production Rust. It does not patch the web UI, shared lockfiles, or PR 194 to make a red case green.

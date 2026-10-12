@@ -8,3 +8,17 @@ readers = observer
 @readers = r
 @writers = rw
 * =
+
+# isoa and isob are more specific than [/]. Alice can write only isoa.
+# Bob can write only isob. The other account is denied.
+[isoa:/]
+alice = rw
+svc-sync = rw
+bob =
+* =
+
+[isob:/]
+bob = rw
+svc-sync = rw
+alice =
+* =

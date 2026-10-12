@@ -878,30 +878,30 @@ prepare_images() {
   load_pins
   local scope="${ACCEPTANCE_LAB_PREPARE_SCOPE:-all}"
   if [ "$scope" = "all" ] || [ "$scope" = "fixtures" ]; then
-    build_one "$SVN_IMAGE" "$LAB_DIR/docker/Dockerfile.svn" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
-    build_one "$SVNSERVE_IMAGE" "$LAB_DIR/docker/Dockerfile.svnserve" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
-    build_one "$GITEA_LAB_IMAGE" "$LAB_DIR/docker/Dockerfile.gitea" "$LAB_DIR/docker" --build-arg "GITEA_IMAGE=${GITEA_IMAGE}"
-    build_one "$GITHTTP_IMAGE" "$LAB_DIR/docker/Dockerfile.githttp" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
-    build_one "$PYENV_IMAGE" "$LAB_DIR/docker/Dockerfile.pyenv" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
-    build_one "$OBSERVER_IMAGE" "$LAB_DIR/docker/Dockerfile.observer" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
-    build_one "$FORWARDER_IMAGE" "$LAB_DIR/docker/Dockerfile.forwarder" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}"
-    docker pull "$LDAP_IMAGE"
+    build_one "$SVN_IMAGE" "$LAB_DIR/docker/Dockerfile.svn" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" || return 1
+    build_one "$SVNSERVE_IMAGE" "$LAB_DIR/docker/Dockerfile.svnserve" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" || return 1
+    build_one "$GITEA_LAB_IMAGE" "$LAB_DIR/docker/Dockerfile.gitea" "$LAB_DIR/docker" --build-arg "GITEA_IMAGE=${GITEA_IMAGE}" || return 1
+    build_one "$GITHTTP_IMAGE" "$LAB_DIR/docker/Dockerfile.githttp" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" || return 1
+    build_one "$PYENV_IMAGE" "$LAB_DIR/docker/Dockerfile.pyenv" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" || return 1
+    build_one "$OBSERVER_IMAGE" "$LAB_DIR/docker/Dockerfile.observer" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" || return 1
+    build_one "$FORWARDER_IMAGE" "$LAB_DIR/docker/Dockerfile.forwarder" "$LAB_DIR/docker" --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" || return 1
+    docker pull "$LDAP_IMAGE" || return 1
   fi
   if [ "${ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD:-}" != "1" ] && [ "$scope" != "fixtures" ]; then
-    record_rust_image_identity
+    record_rust_image_identity || return 1
     build_one "$REPOSYNC_IMAGE" "$LAB_DIR/docker/Dockerfile.reposync" "$REPO_ROOT" \
       --build-context "labfiles=${LAB_DIR}/docker" \
       --build-arg "DEBIAN_IMAGE=${DEBIAN_IMAGE}" \
       --build-arg "RUST_IMAGE=${RUST_IMAGE}" \
       --build-arg "NODE_IMAGE=${NODE_IMAGE}" \
-      --build-arg "RUST_REPO_DIGEST=${RUST_REPO_DIGEST}"
+      --build-arg "RUST_REPO_DIGEST=${RUST_REPO_DIGEST}" || return 1
   elif [ "${ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD:-}" = "1" ]; then
-    docker image inspect "$REPOSYNC_IMAGE" >/dev/null
+    docker image inspect "$REPOSYNC_IMAGE" >/dev/null || return 1
   fi
   if [ "$scope" != "fixtures" ]; then
-    extract_build_graph
+    extract_build_graph || return 1
   fi
-  record_images
+  record_images || return 1
 }
 
 record_images() {
@@ -1031,28 +1031,55 @@ up_stack() {
 verify_project_resources() {
   local id label disp vol net
   local ids vols nets
-  ids="$(docker ps -aq --filter "label=com.docker.compose.project=${PROJECT}" || true)"
+  if ! ids="$(docker ps -aq --filter "label=com.docker.compose.project=${PROJECT}")"; then
+    echo "container enumeration failed" >&2
+    return 1
+  fi
   for id in $ids; do
-    label="$(docker inspect --format '{{index .Config.Labels "acceptance-lab.run-id"}}' "$id")"
-    disp="$(docker inspect --format '{{index .Config.Labels "acceptance-lab.disposable"}}' "$id")"
+    if ! label="$(docker inspect --format '{{index .Config.Labels "acceptance-lab.run-id"}}' "$id")"; then
+      echo "container inspection failed for $id" >&2
+      return 1
+    fi
+    if ! disp="$(docker inspect --format '{{index .Config.Labels "acceptance-lab.disposable"}}' "$id")"; then
+      echo "container inspection failed for $id" >&2
+      return 1
+    fi
     if [ "$label" != "$RUN_ID" ] || [ "$disp" != "true" ]; then
       echo "refusing container $id: run=$label disposable=$disp" >&2
       return 1
     fi
   done
-  vols="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT}" || true)"
+  if ! vols="$(docker volume ls -q --filter "label=com.docker.compose.project=${PROJECT}")"; then
+    echo "volume enumeration failed" >&2
+    return 1
+  fi
   for vol in $vols; do
-    label="$(docker volume inspect --format '{{index .Labels "acceptance-lab.run-id"}}' "$vol")"
-    disp="$(docker volume inspect --format '{{index .Labels "acceptance-lab.disposable"}}' "$vol")"
+    if ! label="$(docker volume inspect --format '{{index .Labels "acceptance-lab.run-id"}}' "$vol")"; then
+      echo "volume inspection failed for $vol" >&2
+      return 1
+    fi
+    if ! disp="$(docker volume inspect --format '{{index .Labels "acceptance-lab.disposable"}}' "$vol")"; then
+      echo "volume inspection failed for $vol" >&2
+      return 1
+    fi
     if [ "$label" != "$RUN_ID" ] || [ "$disp" != "true" ]; then
       echo "refusing volume $vol: run=$label disposable=$disp" >&2
       return 1
     fi
   done
-  nets="$(docker network ls -q --filter "label=com.docker.compose.project=${PROJECT}" || true)"
+  if ! nets="$(docker network ls -q --filter "label=com.docker.compose.project=${PROJECT}")"; then
+    echo "network enumeration failed" >&2
+    return 1
+  fi
   for net in $nets; do
-    label="$(docker network inspect --format '{{index .Labels "acceptance-lab.run-id"}}' "$net")"
-    disp="$(docker network inspect --format '{{index .Labels "acceptance-lab.disposable"}}' "$net")"
+    if ! label="$(docker network inspect --format '{{index .Labels "acceptance-lab.run-id"}}' "$net")"; then
+      echo "network inspection failed for $net" >&2
+      return 1
+    fi
+    if ! disp="$(docker network inspect --format '{{index .Labels "acceptance-lab.disposable"}}' "$net")"; then
+      echo "network inspection failed for $net" >&2
+      return 1
+    fi
     if [ "$label" != "$RUN_ID" ] || [ "$disp" != "true" ]; then
       echo "refusing network $net: run=$label disposable=$disp" >&2
       return 1
@@ -1067,13 +1094,19 @@ cleanup_run() {
   # container and volume on run 38188946403.
   compose --profile app down -v --remove-orphans || return 1
   local left
-  left="$(docker ps -aq --filter "label=acceptance-lab.run-id=${RUN_ID}" || true)"
+  if ! left="$(docker ps -aq --filter "label=acceptance-lab.run-id=${RUN_ID}")"; then
+    echo "post-cleanup container query failed" >&2
+    return 1
+  fi
   if [ -n "$left" ]; then
     echo "containers remain for $RUN_ID" >&2
     docker ps -a --filter "label=acceptance-lab.run-id=${RUN_ID}" --format '{{.Names}} {{.Status}}' >&2 || true
     return 1
   fi
-  left="$(docker volume ls -q --filter "label=acceptance-lab.run-id=${RUN_ID}" || true)"
+  if ! left="$(docker volume ls -q --filter "label=acceptance-lab.run-id=${RUN_ID}")"; then
+    echo "post-cleanup volume query failed" >&2
+    return 1
+  fi
   if [ -n "$left" ]; then
     echo "volumes remain for $RUN_ID" >&2
     return 1
@@ -1258,6 +1291,7 @@ run_playwright() {
   if [ ! -s "$EVIDENCE/playwright.json" ]; then
     write_synthetic_playwright "playwright exited $ec without a report"
   fi
+  return "$ec"
 }
 
 run_engine() {
@@ -1445,11 +1479,16 @@ cmd_interrupt_probe() {
     done
     if [ -n "$run_json" ]; then
       id="$(basename "$(dirname "$run_json")")"
+      if ! probe_ids="$(docker ps -q --filter "label=acceptance-lab.run-id=${id}")"; then
+        echo "interruption ownership query failed" >&2
+        stop_child
+        return 1
+      fi
       cid=""
-      while IFS= read -r found; do
+      for found in $probe_ids; do
         cid="$found"
         break
-      done < <(docker ps -q --filter "label=acceptance-lab.run-id=${id}")
+      done
       if [ -n "$cid" ]; then
         break
       fi
@@ -1530,7 +1569,7 @@ cmd_test() {
     fi
   fi
   if [ "$ec" -eq 0 ]; then
-    run_playwright || true
+    run_playwright || ec=1
     if [ "$SUITE" != "smoke" ] && [ "${ACCEPTANCE_LAB_SKIP_ENGINE:-}" != "1" ]; then
       run_engine || true
     fi
@@ -1578,4 +1617,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${ACCEPTANCE_LAB_SOURCE_ONLY:-}" != "1" ]; then
+  main "$@"
+fi

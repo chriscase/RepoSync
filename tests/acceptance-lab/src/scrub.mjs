@@ -7,8 +7,11 @@ function redactText(text, secrets) {
   // diff as one JSON line, and eating through the closing quote made
   // report.json impossible to parse on run 38188946403.
   let next = text
-    .replace(/Authorization:\s+(?:Bearer\s+|token\s+)?[A-Za-z0-9._~+/]+=*/gi, "Authorization: [redacted]")
+    .replace(/Authorization:\s+Basic\s+[A-Za-z0-9+/=]+/gi, "Authorization: [redacted]")
+    .replace(/Authorization:\s+Bearer\s+\S+/gi, "Authorization: [redacted]")
+    .replace(/Authorization:\s+token\s+(?!\$)[A-Za-z0-9._~+/-]+=*/gi, "Authorization: [redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/g, "Bearer [redacted]")
+    .replace(/Authorization:\s+\[redacted\]\s+[A-Za-z0-9+/=]{8,}/g, "Authorization: [redacted]")
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
   const ordered = [...secrets].filter((secret) => secret && secret.length >= 8).sort((a, b) => b.length - a.length);
   for (const secret of ordered) {

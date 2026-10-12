@@ -93,6 +93,56 @@ const omittedReport = await buildReport({
 const skipReport = await buildReport({
   catalogPath, matrixPath, rulesPath, playwrightPath, suite: "full", outPath: "",
 });
+const falsePassPath = join(directory, "false-pass.json");
+await writeFile(falsePassPath, JSON.stringify({
+  suites: [{
+    specs: [{
+      title: "annotated pass then fails",
+      annotations: [
+        { type: "labCase", description: "LAB_FALSE_PASS" },
+        { type: "labStatus", description: "PASS" },
+      ],
+      tests: [{ results: [{ status: "failed", retry: 0, error: { message: "failure after PASS annotation" } }] }],
+    }],
+  }],
+}));
+const falsePassWalk = walkPlaywright(JSON.parse(await readFile(falsePassPath, "utf8")));
+const runnerPath = join(directory, "runner-error.json");
+await writeFile(runnerPath, JSON.stringify({
+  errors: [{ message: "worker shutdown failure" }],
+  suites: [{
+    specs: [{
+      title: "runner error",
+      annotations: [
+        { type: "labCase", description: "LAB_FALSE_PASS" },
+        { type: "labStatus", description: "PASS" },
+      ],
+      tests: [{ results: [{ status: "passed", retry: 0 }] }],
+    }],
+  }],
+}));
+const runnerCatalog = join(directory, "runner-catalog.json");
+await writeFile(runnerCatalog, JSON.stringify({
+  catalog_status: "self-test",
+  operations: [
+    { id: "LAB_FALSE_PASS", title: "false pass", suite: "smoke", disposition: "execute", r_criteria: ["R01"], supports_workflow: true },
+  ],
+}));
+const runnerReport = await buildReport({
+  catalogPath: runnerCatalog, matrixPath, rulesPath, playwrightPath: runnerPath, suite: "smoke", outPath: "",
+});
+const basicUser = "lab-user";
+const basicPassword = "lab-secret-value";
+const basicPayload = Buffer.from(`${basicUser}:${basicPassword}`).toString("base64");
+const basicHeader = `Authorization: Basic ${basicPayload}`;
+const basicRedacted = redactText(JSON.stringify({ header: basicHeader, keep: true }), []);
+const basicParsed = JSON.parse(basicRedacted);
+const basicScanDir = join(directory, "basic-scan");
+await mkdir(basicScanDir, { recursive: true });
+await writeFile(join(basicScanDir, "leaked.txt"), basicHeader);
+const leakedScan = await scanTree(basicScanDir, []);
+await writeFile(join(basicScanDir, "leaked.txt"), basicRedacted);
+const cleanScan = await scanTree(basicScanDir, []);
 
 const cases = [
   caseRow("HARNESS_BAD_BASELINE", detected.bad_tree, "known-bad tree was not flagged"),
@@ -110,6 +160,9 @@ const cases = [
   caseRow("HARNESS_RETRY_IS_FAIL", retryWalk.cases[0]?.status === "FAIL" && retryWalk.attempts[0]?.first_status === "failed" && retryWalk.attempts[0]?.final_status === "passed", "a later pass replaced the failed first attempt"),
   caseRow("HARNESS_REDACTED_REPORT", scrubSelfCheck() === "PASS" && parsedRedacted.suite_result === "FAIL" && !redactedReport.includes(reportSecret) && redactedReport.includes("[redacted]"), "a scrubbed failing report was not parseable"),
   caseRow("HARNESS_APP_PROFILE_CLEANUP", appPlan.ok === true && appPlan.remove.includes("rsaccrsabc123-reposync-1") && prunedApp.ok === false, "cleanup dropped the application profile or accepted a global prune"),
+  caseRow("HARNESS_FALSE_PASS_ANNOTATION", falsePassWalk.cases[0]?.status === "FAIL" && falsePassWalk.cases[0]?.first_status === "failed", "a PASS annotation hid a failed Playwright result"),
+  caseRow("HARNESS_RUNNER_ERROR", runnerReport.suite_result === "FAIL", "a runner error stayed PASS"),
+  caseRow("HARNESS_BASIC_REDACTION", basicParsed.keep === true && !basicRedacted.includes(basicPayload) && leakedScan.ok === false && cleanScan.ok === true, "a Basic credential payload survived redaction or the publish scan"),
 ];
 
 const outDir = process.argv[2] || join(directory, "out");

@@ -38,11 +38,15 @@ export function walkPlaywright(report) {
           skipped.push({ title: spec.title, reason: "missing_labCase_annotation" });
           continue;
         }
+        const actual = final?.status || "missing";
+        const blocksPass = actual === "failed" || actual === "timedOut" || actual === "interrupted" || actual === "missing";
         let status = PASS;
-        if (statusAnn) status = statusAnn;
-        else if (!final || final.status === "skipped") status = "SKIP";
-        else if (final.status !== "passed") status = FAIL;
+        if (blocksPass) status = FAIL;
+        else if (actual === "skipped") status = statusAnn === NOT_RUN ? NOT_RUN : FAIL;
+        else if (actual !== "passed") status = FAIL;
+        else if (statusAnn && statusAnn !== PASS) status = statusAnn;
         if (retries > 0 && status === PASS) status = FAIL;
+        if (Array.isArray(report?.errors) && report.errors.length > 0 && status === PASS) status = FAIL;
         for (const id of ids) {
           cases.push({
             id,
@@ -64,7 +68,13 @@ export function walkPlaywright(report) {
     for (const child of suite.suites || []) visitSuite(child);
   }
   for (const suite of report.suites || []) visitSuite(suite);
-  return { cases, skipped, attempts, discovered: cases.length };
+  return {
+    cases,
+    skipped,
+    attempts,
+    discovered: cases.length,
+    runner_error: Array.isArray(report?.errors) && report.errors.length > 0,
+  };
 }
 
 function matrixIds(matrix) {
@@ -323,6 +333,9 @@ export async function buildReport(options) {
     "HARNESS_RETRY_IS_FAIL",
     "HARNESS_REDACTED_REPORT",
     "HARNESS_APP_PROFILE_CLEANUP",
+    "HARNESS_FALSE_PASS_ANNOTATION",
+    "HARNESS_RUNNER_ERROR",
+    "HARNESS_BASIC_REDACTION",
   ];
   const gate = requiredGate.map((id) => byId.get(id) || { id, status: FAIL, reason: "gate case missing" });
   const gateFailed = gate.filter((row) => row.status !== PASS);
@@ -333,7 +346,7 @@ export async function buildReport(options) {
   const smokeRows = rows.filter((row) => (catalog.operations || []).some((op) => op.id === row.id && op.suite === "smoke" && op.disposition === "execute"));
   const smokeFail = smokeRows.filter((row) => row.status !== PASS);
   let suiteResult = PASS;
-  if (gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery) suiteResult = FAIL;
+  if (gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery || walked.runner_error) suiteResult = FAIL;
   if (suite === "smoke" && smokeFail.length) suiteResult = FAIL;
   if (suite === "full") {
     const blocking = rows.filter((row) => row.supports_workflow && row.status !== PASS);

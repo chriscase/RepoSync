@@ -48,6 +48,7 @@ export class Lab {
   readonly adminUser = process.env.LAB_ADMIN_USER || "admin";
   readonly adminPassword = required("LAB_ADMIN_PASSWORD");
   readonly alicePassword = required("ALICE_PASSWORD");
+  readonly bobPassword = required("BOB_PASSWORD");
   readonly bindPassword = required("LDAP_BIND_PASSWORD");
   readonly webhookSecret = required("LAB_WEBHOOK_SECRET");
   readonly svnWebhookSecret = required("LAB_SVN_WEBHOOK_SECRET");
@@ -100,6 +101,7 @@ export class Lab {
       GIT_TOKEN: this.gitToken,
       GIT_USER: this.gitUser,
       ALICE_PASSWORD: this.alicePassword,
+      BOB_PASSWORD: this.bobPassword,
       LDAP_BIND_PASSWORD: this.bindPassword,
       WEBHOOK_SECRET: this.webhookSecret,
       SVN_WEBHOOK_SECRET: this.svnWebhookSecret,
@@ -116,6 +118,7 @@ export class Lab {
         this.gitToken,
         this.adminPassword,
         this.alicePassword,
+        this.bobPassword,
         this.bindPassword,
         this.localPassword,
         this.webhookSecret,
@@ -344,16 +347,18 @@ cat ${dir}/${rel}
 `);
   }
 
-  async commitSvn(pair: Pair, script: string): Promise<string> {
+  async commitSvn(pair: Pair, script: string, username = "svc-sync"): Promise<string> {
     const dir = `/work/svn-${pair.name}-${randomBytes(3).toString("hex")}`;
+    const user = safe(username, "svn user");
+    const password = user === "alice" ? "$ALICE_PASSWORD" : user === "bob" ? "$BOB_PASSWORD" : "$SVN_PASSWORD";
     const output = await this.observer(`
 set -eu
-svn checkout --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
+svn checkout --non-interactive --config-dir "$HOME/.svn" --username ${user} --password "${password}" \
   ${pair.svnUrl}/trunk ${dir}
 cd ${dir}
 ${script}
-svn commit --non-interactive --username svc-sync --password "$SVN_PASSWORD" -m "lab ${pair.name}" .
-svn info --non-interactive --username svc-sync --password "$SVN_PASSWORD" --show-item revision .
+svn commit --non-interactive --username ${user} --password "${password}" -m "lab ${pair.name}" .
+svn info --non-interactive --username ${user} --password "${password}" --show-item revision .
 `);
     const lines = output.trim().split("\n");
     return lines[lines.length - 1].trim();
@@ -381,9 +386,9 @@ git rev-parse HEAD
     return lines[lines.length - 1].trim();
   }
 
-  async syncSvnChange(pair: Pair, script: string): Promise<Snap> {
+  async syncSvnChange(pair: Pair, script: string, username = "svc-sync"): Promise<Snap> {
     const before = await this.snap(pair);
-    const rev = await this.commitSvn(pair, script);
+    const rev = await this.commitSvn(pair, script, username);
     await this.triggerSvn(rev);
     // Team confirm writes sync_records and last_svn_rev_<repo>. It does not
     // insert commit_map. Run 38199181879 moved the Git tip while that map
