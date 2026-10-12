@@ -642,7 +642,10 @@ async fn prepare_clean_child_svn_inner(
             {
                 return Err(refused("visible snapshot differs from lineage pins"));
             }
-            presence.push(super::svn_visibility::presence_pin(name, &checkout, &info)?);
+            let mut pin = super::svn_visibility::presence_pin(name, &checkout, &info)?;
+            pin.ancestors =
+                super::svn_visibility::require_empty_visible_ancestors(client, &info).await?;
+            presence.push(pin);
             let properties = bound_checkout_property_xml(
                 &remote_properties_xml,
                 client.url(),
@@ -714,11 +717,10 @@ async fn prepare_clean_child_svn_inner(
                 old_mergeinfo,
                 &lineage.child.parent_path,
             )?;
-            presence.push(super::svn_visibility::presence_pin(
-                role,
-                current.path(),
-                info,
-            )?);
+            let mut pin = super::svn_visibility::presence_pin(role, current.path(), info)?;
+            pin.ancestors =
+                super::svn_visibility::require_empty_visible_ancestors(client, info).await?;
+            presence.push(pin);
             let latest = client.info().await?;
             if latest.uuid != info.uuid
                 || latest.root_url != info.root_url

@@ -141,6 +141,51 @@ impl SvnClient {
         self.refresh_config.is_some()
     }
 
+    pub(crate) fn refresh_ancestor_client(&self, url: &str) -> Result<Self, SvnError> {
+        let refused = || SvnError::LineageRefused {
+            reason: "unproved_svn_ancestor_visibility".into(),
+            detail: "ancestor observation requires the same isolated source authority".into(),
+        };
+        let source = reqwest::Url::parse(&self.url).map_err(|_| refused())?;
+        let ancestor = reqwest::Url::parse(url).map_err(|_| refused())?;
+        let parent = ancestor.path().trim_end_matches('/');
+        if !self.has_refresh_isolation()
+            || source.scheme() != ancestor.scheme()
+            || source.host_str() != ancestor.host_str()
+            || source.port_or_known_default() != ancestor.port_or_known_default()
+            || !ancestor.username().is_empty()
+            || ancestor.password().is_some()
+            || ancestor.query().is_some()
+            || ancestor.fragment().is_some()
+            || !source
+                .path()
+                .strip_prefix(parent)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        {
+            return Err(refused());
+        }
+        let mut client = self.clone();
+        client.url = url.to_owned();
+        Ok(client)
+    }
+
+    pub(crate) async fn direct_properties_at_rev(&self, revision: i64) -> Result<String, SvnError> {
+        if revision < 1 {
+            return Err(SvnError::RevisionNotFound(revision));
+        }
+        self.run_svn(&[
+            "proplist",
+            "--xml",
+            "--verbose",
+            "--depth",
+            "empty",
+            "-r",
+            &revision.to_string(),
+            &format!("{}@{}", self.url, revision),
+        ])
+        .await
+    }
+
     /// Import-scoped cancellation; ordinary sync clients remain unchanged.
     pub fn with_cancel_signal(mut self, signal: Arc<AtomicBool>) -> Self {
         self.cancel = Some(signal);

@@ -523,3 +523,150 @@ async fn empty_root_property_claim_requires_the_actual_pristine_metadata() {
     assert!(!has_proved_empty_root_properties(observed.path(), observed.info()).unwrap());
     assert_eq!(f.youngest().trim(), "1");
 }
+
+#[tokio::test]
+async fn ancestor_properties_hidden_by_authz_cannot_be_inferred_empty_from_the_subtree() {
+    let f = Fixture::new(false).await;
+    let admin = f.root.path().join("ancestor-admin");
+    let url = reqwest::Url::from_directory_path(&f.repository).unwrap();
+    command(&[
+        "svn",
+        "checkout",
+        "--depth",
+        "empty",
+        url.as_str(),
+        admin.to_str().unwrap(),
+        "--non-interactive",
+    ]);
+    command(&[
+        "svn",
+        "propset",
+        "fixture:ancestor-policy",
+        "unsupported",
+        admin.to_str().unwrap(),
+        "--non-interactive",
+    ]);
+    command(&[
+        "svn",
+        "commit",
+        admin.to_str().unwrap(),
+        "-m",
+        "disposable ancestor policy",
+        "--non-interactive",
+    ]);
+    std::fs::write(
+        f.repository.join("conf/authz"),
+        "[repo:/]\nreader =\n[repo:/trunk]\nreader = r\n",
+    )
+    .unwrap();
+    let snapshot = observe_subtree(&f.client, 2).await.unwrap();
+    assert_eq!(snapshot.node_count(), 5);
+    assert!(has_proved_empty_root_properties(snapshot.path(), snapshot.info()).unwrap());
+    assert!(require_empty_visible_ancestors(&f.client, snapshot.info())
+        .await
+        .is_err());
+    assert_eq!(f.youngest().trim(), "2");
+}
+
+#[tokio::test]
+async fn visible_nonempty_ancestor_policy_is_refused_and_authority_cannot_be_retargeted() {
+    let f = Fixture::new(false).await;
+    let initial = observe_subtree(&f.client, 1).await.unwrap();
+    let ancestors = require_empty_visible_ancestors(&f.client, initial.info())
+        .await
+        .unwrap();
+    assert_eq!(ancestors.len(), 1);
+    assert_eq!(ancestors[0].url, initial.info().root_url);
+    assert_eq!(ancestors[0].revision, 1);
+    assert_eq!(ancestors[0].empty_properties_digest.len(), 64);
+    assert!(f
+        .client
+        .refresh_ancestor_client("svn://127.0.0.1:1/other")
+        .is_err());
+    let admin = f.root.path().join("ancestor-admin");
+    let url = reqwest::Url::from_directory_path(&f.repository).unwrap();
+    command(&[
+        "svn",
+        "checkout",
+        "--depth",
+        "empty",
+        url.as_str(),
+        admin.to_str().unwrap(),
+        "--non-interactive",
+    ]);
+    command(&[
+        "svn",
+        "propset",
+        "fixture:ancestor-policy",
+        "unsupported",
+        admin.to_str().unwrap(),
+        "--non-interactive",
+    ]);
+    command(&[
+        "svn",
+        "commit",
+        admin.to_str().unwrap(),
+        "-m",
+        "disposable ancestor policy",
+        "--non-interactive",
+    ]);
+    let later = f.client.info_at_rev(2).await.unwrap();
+    assert!(require_empty_visible_ancestors(&f.client, &later)
+        .await
+        .is_err());
+    assert_eq!(f.youngest().trim(), "2");
+}
+
+#[tokio::test]
+async fn actual_pair_preparation_refuses_unreadable_ancestor_policy_without_publishing() {
+    let (f, child, git, pins) = pair_fixture().await;
+    let admin = f.root.path().join("root-admin");
+    let url = reqwest::Url::from_directory_path(&f.repository).unwrap();
+    command(&[
+        "svn",
+        "checkout",
+        "--depth",
+        "empty",
+        url.as_str(),
+        admin.to_str().unwrap(),
+        "--non-interactive",
+    ]);
+    command(&[
+        "svn",
+        "propset",
+        "fixture:ancestor-policy",
+        "unsupported",
+        admin.to_str().unwrap(),
+        "--non-interactive",
+    ]);
+    command(&[
+        "svn",
+        "commit",
+        admin.to_str().unwrap(),
+        "-m",
+        "disposable hidden policy",
+        "--non-interactive",
+    ]);
+    std::fs::write(
+        f.repository.join("conf/authz"),
+        "[repo:/]\nreader =\n[repo:/trunk]\nreader = r\n[repo:/child]\nreader = r\n",
+    )
+    .unwrap();
+    let before_git = git.head().unwrap().target();
+    let staging = tempfile::tempdir().unwrap();
+    assert!(
+        super::super::svn_preparation::prepare_clean_child_svn_visible(
+            &child,
+            &f.client,
+            git.path(),
+            staging.path(),
+            uuid::Uuid::new_v4(),
+            &pins,
+            4,
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(f.youngest().trim(), "4");
+    assert_eq!(git.head().unwrap().target(), before_git);
+}

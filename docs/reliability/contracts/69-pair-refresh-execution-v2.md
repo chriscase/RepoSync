@@ -498,11 +498,18 @@ Local and remote property proofs agree. An omitted empty property root is suppli
 only when attested complete WC31 metadata explicitly contains the empty root
 property skeleton; the general XML parser's missing-root refusal remains strict.
 
+Relevant ancestor properties are inspected directly at every selected revision
+with the same isolated source credentials. Only a matching authority and a true
+URL ancestor may be retargeted; no sibling/foreign endpoint is used. Each ancestor
+must be readable, match the pinned repository/revision and have an explicit empty
+direct property set. A complete property-free subtree cannot establish that its
+unreadable ancestors lack policy. Unreadable, nonempty or ambiguous ancestor
+evidence refuses. Safe ancestor pins record the observation with each role.
+
 Legacy temporary preparation behavior is preserved. This does not qualify every
-server/protocol implementation or prove unavailable inherited ancestor policy.
-Relevant ancestor property visibility and fresh complete observations at each
-first intent remain required for the authenticated execution profile. A changed
-credential, policy or remote after preparation is not authorized by stored pins.
+server/protocol implementation. Fresh complete observations at each first intent
+remain required for the authenticated execution profile. A changed credential,
+policy or remote after preparation is not authorized by stored pins.
 
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git

@@ -49,6 +49,15 @@ pub struct SvnPresencePin {
     pub max_changed_revision: i64,
     pub node_count: usize,
     pub presence_digest: String,
+    pub ancestors: Vec<SvnAncestorPin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SvnAncestorPin {
+    pub url: String,
+    pub revision: i64,
+    pub repository_uuid: String,
+    pub empty_properties_digest: String,
 }
 
 pub(crate) fn presence_pin(
@@ -67,7 +76,103 @@ pub(crate) fn presence_pin(
         max_changed_revision,
         node_count,
         presence_digest,
+        ancestors: Vec::new(),
     })
+}
+
+pub(crate) async fn require_empty_visible_ancestors(
+    client: &SvnClient,
+    expected: &SvnInfo,
+) -> Result<Vec<SvnAncestorPin>, SvnError> {
+    let root =
+        reqwest::Url::parse(&expected.root_url).map_err(|_| refused("invalid ancestor root"))?;
+    let target =
+        reqwest::Url::parse(&expected.url).map_err(|_| refused("invalid subtree location"))?;
+    let relative = target
+        .path()
+        .strip_prefix(root.path().trim_end_matches('/'))
+        .and_then(|p| p.strip_prefix('/'))
+        .ok_or_else(|| refused("subtree has no qualified repository ancestors"))?;
+    let segments: Vec<_> = relative.split('/').collect();
+    if segments
+        .iter()
+        .any(|s| matches!(*s, "" | "." | "..") || s.contains('%'))
+    {
+        return Err(refused("unsupported ancestor path"));
+    }
+    let mut ancestors = Vec::new();
+    let mut url = root;
+    for segment in segments {
+        let ancestor = client.refresh_ancestor_client(url.as_str())?;
+        let info = ancestor.info_at_rev(expected.latest_rev).await?;
+        if info.uuid != expected.uuid
+            || info.root_url != expected.root_url
+            || info.url != ancestor.url()
+            || info.latest_rev != expected.latest_rev
+        {
+            return Err(refused("ancestor identity differs from the pegged source"));
+        }
+        let xml = ancestor
+            .direct_properties_at_rev(expected.latest_rev)
+            .await?;
+        require_direct_property_set_empty(&xml, ancestor.url())?;
+        let digest = hex::encode(Sha256::digest(
+            serde_json::to_vec(&("pair_refresh_empty_ancestor_properties_v1", &info))
+                .map_err(|_| refused("ancestor evidence cannot be encoded"))?,
+        ));
+        ancestors.push(SvnAncestorPin {
+            url: info.url,
+            revision: info.latest_rev,
+            repository_uuid: info.uuid,
+            empty_properties_digest: digest,
+        });
+        url.path_segments_mut()
+            .map_err(|_| refused("invalid ancestor path"))?
+            .pop_if_empty()
+            .push(segment);
+    }
+    Ok(ancestors)
+}
+
+fn require_direct_property_set_empty(xml: &str, url: &str) -> Result<(), SvnError> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|_| refused("invalid direct ancestor property XML"))?;
+    let root = document.root_element();
+    let named = |n: roxmltree::Node<'_, '_>, name: &str| {
+        n.is_element() && n.tag_name().namespace().is_none() && n.tag_name().name() == name
+    };
+    if !named(root, "properties") || root.attributes().len() != 0 {
+        return Err(refused("unsupported direct property document"));
+    }
+    let mut targets = 0;
+    for target in root.children() {
+        if !target.is_element() {
+            if target.is_text() && target.text().is_some_and(|t| !t.trim().is_empty()) {
+                return Err(refused("unexpected property text"));
+            }
+            continue;
+        }
+        if !named(target, "target")
+            || target.attributes().len() != 1
+            || target
+                .attributes()
+                .any(|a| a.namespace().is_some() || a.name() != "path")
+            || target.attribute("path") != Some(url)
+        {
+            return Err(refused("direct property target differs from ancestor"));
+        }
+        targets += 1;
+        if targets > 1
+            || target.children().any(|n| {
+                n.is_element() || (n.is_text() && n.text().is_some_and(|t| !t.trim().is_empty()))
+            })
+        {
+            return Err(refused(
+                "inherited ancestor properties are unsupported or ambiguous",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl VisibleSvnCheckout {
