@@ -10,6 +10,7 @@ not create repositories and it does not sync.
 
 import http.client
 import os
+import re
 import socket
 import ssl
 import sys
@@ -21,6 +22,10 @@ LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "3000"))
 CA = os.environ.get("UPSTREAM_CA", "/certs/ca.crt")
 CERT = os.environ.get("PROXY_CERT", "/certs/gitea-api.crt")
 KEY = os.environ.get("PROXY_KEY", "/certs/gitea-api.key")
+
+# Gitea 1.22 has no GitHub route /repos/{owner}/{repo}/commits/{sha}.
+# The shipped client uses that route for merge-strategy detection.
+COMMIT_PATH = re.compile(r"^(/api/v1/repos/[^/]+/[^/]+)/commits/([0-9a-fA-F]{40})$")
 
 HOP = {
     "connection",
@@ -54,6 +59,14 @@ def read_http_message(sock):
             break
         body += chunk
     return head + b"\r\n\r\n" + body[:length]
+
+
+def rewrite_path(path):
+    base, sep, query = path.partition("?")
+    match = COMMIT_PATH.match(base)
+    if match:
+        base = f"{match.group(1)}/git/commits/{match.group(2)}"
+    return base + (sep + query if sep else "")
 
 
 def parse_request(request):
@@ -117,6 +130,7 @@ def handle_client(client):
             client.close()
             return
         method, path, headers, body = parse_request(request)
+        path = rewrite_path(path)
         response = forward(method, path, headers, body)
         client.sendall(response)
         sys.stderr.write(f"gitea-api {method} {path} -> {len(response)} bytes\n")
