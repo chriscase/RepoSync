@@ -747,7 +747,7 @@ record_rust_image_identity() {
   dest="$(graph_dest)"
   mkdir -p "$dest"
   log "pulling harness compiler ${RUST_IMAGE}"
-  docker pull "$RUST_IMAGE"
+  docker pull "$RUST_IMAGE" || return 1
   digest="$(docker image inspect "$RUST_IMAGE" --format '{{index .RepoDigests 0}}')"
   rustc_line="$(docker run --rm "$RUST_IMAGE" rustc --version)"
   cargo_line="$(docker run --rm "$RUST_IMAGE" cargo --version)"
@@ -1112,8 +1112,12 @@ cleanup_run() {
     return 1
   fi
   if [ "${ACCEPTANCE_LAB_REMOVE_IMAGES:-}" = "1" ]; then
-    local tag
-    for tag in $(docker images --format '{{.Repository}}:{{.Tag}}' || true); do
+    local tags tag
+    if ! tags="$(docker images --format '{{.Repository}}:{{.Tag}}')"; then
+      echo "image enumeration failed" >&2
+      return 1
+    fi
+    for tag in $tags; do
       case "$tag" in
         *"$RUN_ID"*) docker rmi "$tag" || return 1 ;;
       esac
@@ -1507,7 +1511,15 @@ cmd_interrupt_probe() {
   wait "$child_pid"
   ec=$?
   set -e
-  left="$(docker ps -aq --filter "label=acceptance-lab.run-id=${id}" || true)"
+  record_interrupt_absence "$id" "$ec" "$root"
+}
+
+record_interrupt_absence() {
+  local id="$1" ec="$2" root="$3" left
+  if ! left="$(docker ps -aq --filter "label=acceptance-lab.run-id=${id}")"; then
+    echo "post-interruption container query failed" >&2
+    return 1
+  fi
   if [ -n "$left" ]; then
     echo "containers remain after SIGTERM for $id (up exit $ec)" >&2
     docker ps -a --filter "label=acceptance-lab.run-id=${id}" --format '{{.Names}} {{.Status}}' >&2 || true

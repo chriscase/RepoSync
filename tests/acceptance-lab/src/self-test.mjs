@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { buildReport, detectorSelfTest, walkPlaywright } from "./aggregate.mjs";
 import { planCleanup } from "./cleanup.mjs";
 import { scanTree } from "./scan.mjs";
-import { redactText, scrubSelfCheck } from "./scrub.mjs";
+import { redactText, scrubSelfCheck, scrubTree } from "./scrub.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -134,15 +134,43 @@ const runnerReport = await buildReport({
 const basicUser = "lab-user";
 const basicPassword = "lab-secret-value";
 const basicPayload = Buffer.from(`${basicUser}:${basicPassword}`).toString("base64");
+const bearerSecret = "bearer-secret-value-0123456789";
+const tokenSecret = "token-secret-value-0123456789";
 const basicHeader = `Authorization: Basic ${basicPayload}`;
 const basicRedacted = redactText(JSON.stringify({ header: basicHeader, keep: true }), []);
 const basicParsed = JSON.parse(basicRedacted);
+const bearerParsed = JSON.parse(redactText(JSON.stringify({ header: `Authorization: Bearer ${bearerSecret}`, keep: true }), []));
+const tokenParsed = JSON.parse(redactText(JSON.stringify({ header: `Authorization: token ${tokenSecret}`, keep: true }), []));
 const basicScanDir = join(directory, "basic-scan");
 await mkdir(basicScanDir, { recursive: true });
 await writeFile(join(basicScanDir, "leaked.txt"), basicHeader);
 const leakedScan = await scanTree(basicScanDir, []);
 await writeFile(join(basicScanDir, "leaked.txt"), basicRedacted);
 const cleanScan = await scanTree(basicScanDir, []);
+const jsonDir = join(directory, "json-headers");
+await mkdir(jsonDir);
+await writeFile(join(jsonDir, "headers.json"), JSON.stringify({
+  basic: `Authorization: Basic ${basicPayload}`,
+  bearer: `Authorization: Bearer ${bearerSecret}`,
+  token: `Authorization: token ${tokenSecret}`,
+}));
+await scrubTree(jsonDir, []);
+const jsonScrubbed = JSON.parse(await readFile(join(jsonDir, "headers.json"), "utf8"));
+const nulRaw = Buffer.concat([
+  Buffer.from("pre\0Authorization: Basic ", "latin1"),
+  Buffer.from(basicPayload, "latin1"),
+  Buffer.from("\0post", "latin1"),
+]);
+const nulDir = join(directory, "nul-basic");
+await mkdir(nulDir);
+await writeFile(join(nulDir, "auth.bin"), nulRaw);
+await scrubTree(nulDir, []);
+const nulAfter = await readFile(join(nulDir, "auth.bin"));
+const nulScan = await scanTree(nulDir, []);
+const survivorDir = join(directory, "nul-survivor");
+await mkdir(survivorDir);
+await writeFile(join(survivorDir, "survivor.bin"), nulRaw);
+const survivorScan = await scanTree(survivorDir, []);
 
 const cases = [
   caseRow("HARNESS_BAD_BASELINE", detected.bad_tree, "known-bad tree was not flagged"),
@@ -162,7 +190,7 @@ const cases = [
   caseRow("HARNESS_APP_PROFILE_CLEANUP", appPlan.ok === true && appPlan.remove.includes("rsaccrsabc123-reposync-1") && prunedApp.ok === false, "cleanup dropped the application profile or accepted a global prune"),
   caseRow("HARNESS_FALSE_PASS_ANNOTATION", falsePassWalk.cases[0]?.status === "FAIL" && falsePassWalk.cases[0]?.first_status === "failed", "a PASS annotation hid a failed Playwright result"),
   caseRow("HARNESS_RUNNER_ERROR", runnerReport.suite_result === "FAIL", "a runner error stayed PASS"),
-  caseRow("HARNESS_BASIC_REDACTION", basicParsed.keep === true && !basicRedacted.includes(basicPayload) && leakedScan.ok === false && cleanScan.ok === true, "a Basic credential payload survived redaction or the publish scan"),
+  caseRow("HARNESS_BASIC_REDACTION", basicParsed.keep === true && bearerParsed.header === "Authorization: [redacted]" && tokenParsed.header === "Authorization: [redacted]" && !basicRedacted.includes(basicPayload) && !bearerParsed.header.includes(bearerSecret) && !tokenParsed.header.includes(tokenSecret) && jsonScrubbed.basic === "Authorization: [redacted]" && jsonScrubbed.bearer === "Authorization: [redacted]" && jsonScrubbed.token === "Authorization: [redacted]" && leakedScan.ok === false && cleanScan.ok === true && nulAfter.includes(0) && !nulAfter.toString("latin1").includes(basicPayload) && nulScan.ok === true && survivorScan.ok === false && survivorScan.findings.some((item) => item.reason === "credential_header"), "a Basic, Bearer, or token credential survived JSON or binary redaction, or the publish scan missed a planted survivor"),
 ];
 
 const outDir = process.argv[2] || join(directory, "out");

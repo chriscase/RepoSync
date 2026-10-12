@@ -346,7 +346,7 @@ export async function buildReport(options) {
   const smokeRows = rows.filter((row) => (catalog.operations || []).some((op) => op.id === row.id && op.suite === "smoke" && op.disposition === "execute"));
   const smokeFail = smokeRows.filter((row) => row.status !== PASS);
   let suiteResult = PASS;
-  if (gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery || walked.runner_error) suiteResult = FAIL;
+  if (gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery || walked.runner_error || walked.cases.some((row) => row.status === FAIL)) suiteResult = FAIL;
   if (suite === "smoke" && smokeFail.length) suiteResult = FAIL;
   if (suite === "full") {
     const blocking = rows.filter((row) => row.supports_workflow && row.status !== PASS);

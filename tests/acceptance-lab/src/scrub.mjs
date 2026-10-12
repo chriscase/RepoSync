@@ -6,11 +6,12 @@ function redactText(text, secrets) {
   // Match a credential, not the rest of the line. Playwright writes the git
   // diff as one JSON line, and eating through the closing quote made
   // report.json impossible to parse on run 38188946403.
+  const credential = "[A-Za-z0-9._~+/=-]+";
   let next = text
-    .replace(/Authorization:\s+Basic\s+[A-Za-z0-9+/=]+/gi, "Authorization: [redacted]")
-    .replace(/Authorization:\s+Bearer\s+\S+/gi, "Authorization: [redacted]")
-    .replace(/Authorization:\s+token\s+(?!\$)[A-Za-z0-9._~+/-]+=*/gi, "Authorization: [redacted]")
-    .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/g, "Bearer [redacted]")
+    .replace(new RegExp(`Authorization:\\s+Basic\\s+${credential}`, "gi"), "Authorization: [redacted]")
+    .replace(new RegExp(`Authorization:\\s+Bearer\\s+${credential}`, "gi"), "Authorization: [redacted]")
+    .replace(new RegExp(`Authorization:\\s+token\\s+(?!\\$)${credential}`, "gi"), "Authorization: [redacted]")
+    .replace(new RegExp(`Bearer\\s+${credential}`, "g"), "Bearer [redacted]")
     .replace(/Authorization:\s+\[redacted\]\s+[A-Za-z0-9+/=]{8,}/g, "Authorization: [redacted]")
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
   const ordered = [...secrets].filter((secret) => secret && secret.length >= 8).sort((a, b) => b.length - a.length);
@@ -21,20 +22,8 @@ function redactText(text, secrets) {
 }
 
 function redactBytes(raw, secrets) {
-  let next = Buffer.from(raw);
-  const ordered = [...secrets].filter((secret) => secret && secret.length >= 8).sort((a, b) => b.length - a.length);
-  for (const secret of ordered) {
-    const needle = Buffer.from(secret);
-    const replacement = Buffer.alloc(needle.length, 0x78);
-    let index = 0;
-    while (index <= next.length - needle.length) {
-      const found = next.indexOf(needle, index);
-      if (found === -1) break;
-      replacement.copy(next, found);
-      index = found + needle.length;
-    }
-  }
-  return next;
+  const text = Buffer.from(raw).toString("latin1");
+  return Buffer.from(redactText(text, secrets), "latin1");
 }
 
 export async function scrubTree(root, secrets = []) {
@@ -89,6 +78,17 @@ export function scrubSelfCheck() {
   const headerOut = redactText(header, [secret]);
   if (headerOut.includes(secret)) throw new Error("credential remained");
   if (!headerOut.includes("Authorization: [redacted]")) throw new Error("header was not redacted");
+  const bearer = "bearer-secret-value-0123456789";
+  const token = "token-secret-value-0123456789";
+  const basicPayload = Buffer.from("lab-user:lab-secret-value").toString("base64");
+  for (const [scheme, value] of [["Basic", basicPayload], ["Bearer", bearer], ["token", token]]) {
+    const raw = JSON.stringify({ header: `Authorization: ${scheme} ${value}`, keep: true });
+    const out = redactText(raw, []);
+    const parsed = JSON.parse(out);
+    if (parsed.keep !== true) throw new Error(`${scheme} JSON field was lost`);
+    if (parsed.header !== "Authorization: [redacted]") throw new Error(`${scheme} header was ${parsed.header}`);
+    if (out.includes(value)) throw new Error(`${scheme} payload survived JSON redaction`);
+  }
   return "PASS";
 }
 
