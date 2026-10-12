@@ -106,6 +106,69 @@
       "contract": "SUPPORTED"
     },
     {
+      "id": "LAB_TEAM_RESTART_STATE",
+      "title": "Team multi-commit round trip survives restart and repeats as a no-op",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R01"],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_DENIED_AUTH",
+      "title": "Denied login is rejected by the running daemon",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R18"],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_MISSING_ARTIFACT",
+      "title": "A missing repository is not found",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R16"],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_INVALID_INPUT",
+      "title": "An empty repository body is rejected",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R16"],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_EARLY_CHILD_FAILURE",
+      "title": "A missing personal config fails before sync",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R16"],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_ISOLATION_TWO_REPOS",
+      "title": "Two trunk repos do not share credentials or checkpoints",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R01", "R17"],
+      "contract": "SUPPORTED"
+    },
+    {
+      "id": "LAB_PERSONAL_MULTICOMMIT",
+      "title": "Personal multi-commit round trip through a merged pull request, restart, and repeat no-op",
+      "suite": "smoke",
+      "disposition": "execute",
+      "supports_workflow": true,
+      "r_criteria": ["R01"],
+      "contract": "SUPPORTED"
+    },
+    {
       "id": "LAB_SVN_LDAP_AUTH",
       "title": "SVN HTTPS rejects a bad directory password and accepts a real one",
       "suite": "full",

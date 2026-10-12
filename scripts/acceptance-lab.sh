@@ -17,10 +17,11 @@ REPO_ROOT="$(cd "$LAB_DIR/../.." && pwd)"
 COMPOSE_FILE="$LAB_DIR/compose/docker-compose.yml"
 
 # Recorded when this harness was written. These are not a live fetch and they
-# are not the candidate under test.
+# are not the candidate under test. write_identity also records the live refs.
 RECORDED_LIVE_MAIN="af394285869bdffa5f156c651cd1104027832749"
 RECORDED_LIVE_MAIN_PARENT="068562a90bfafd9b2a142cea524a89574814cba5"
 RECORDED_PR194_HEAD="6c84adf858a8a2e5d7ac3a9f618bee1834f4d297"
+CLEANING=0
 
 SUITE="smoke"
 CANDIDATE=""
@@ -1132,8 +1133,36 @@ open(sys.argv[1], "w").write(json.dumps(report, indent=2) + "\n")
 PY
 }
 
+live_ref() {
+  local ref="$1" sha="" url="https://github.com/chriscase/RepoSync.git"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    sha="$(git -c "http.extraHeader=AUTHORIZATION: bearer ${GITHUB_TOKEN}" ls-remote "$url" "$ref" 2>/dev/null | awk 'NR==1 { print $1 }' || true)"
+  fi
+  if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+    sha="$(git ls-remote "$url" "$ref" 2>/dev/null | awk 'NR==1 { print $1 }' || true)"
+  fi
+  if printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+    printf '%s' "$sha"
+  else
+    printf '%s' "NOT_ESTABLISHED"
+  fi
+}
+
+interrupt_cleanup() {
+  local sig="$1"
+  if [ "$CLEANING" = "1" ]; then
+    exit 130
+  fi
+  CLEANING=1
+  echo "acceptance-lab received ${sig}; cleaning owned run ${RUN_ID:-unset}" >&2
+  if [ -n "${RUN_ID:-}" ] && [ -n "${RUN_DIR:-}" ] && [ -f "${RUN_DIR}/run.json" ]; then
+    cleanup_run || echo "cleanup after ${sig} failed" >&2
+  fi
+  exit 130
+}
+
 write_identity() {
-  local inspected catalog_sha script_sha
+  local inspected catalog_sha script_sha live_main live_pr194 live_pr195
   inspected="$(python3 - "$LAB_DIR/catalog/operations.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1])).get("inspected_sha", ""))
@@ -1141,19 +1170,25 @@ PY
 )"
   catalog_sha="$(file_sha256 "$LAB_DIR/catalog/operation-catalog.json")"
   script_sha="$(file_sha256 "$REPO_ROOT/scripts/acceptance-lab.sh")"
+  live_main="$(live_ref refs/heads/main)"
+  live_pr194="$(live_ref refs/heads/codex/pair-refresh-20261011)"
+  live_pr195="$(live_ref refs/heads/grok/reposync-acceptance-lab-20261011)"
   python3 - "$EVIDENCE/identity.json" "$CANDIDATE" "$HEAD_SHA" "$inspected" "$catalog_sha" \
     "$script_sha" "$RUN_ID" "$SEED" "$SUITE" "$RECORDED_LIVE_MAIN" "$RECORDED_LIVE_MAIN_PARENT" \
-    "$RECORDED_PR194_HEAD" "${LAB_PR_HEAD_SHA:-}" "${LAB_GITHUB_SHA:-}" "${LAB_GITHUB_EVENT:-}" <<'PY'
+    "$RECORDED_PR194_HEAD" "${LAB_PR_HEAD_SHA:-}" "${LAB_GITHUB_SHA:-}" "${LAB_GITHUB_EVENT:-}" \
+    "$live_main" "$live_pr194" "$live_pr195" <<'PY'
 import json, sys
 (candidate, head, inspected, catalog_sha, script_sha, run_id, seed, suite,
- live_main, live_parent, pr194, pr_head, github_sha, event) = sys.argv[2:16]
+ live_main, live_parent, pr194, pr_head, github_sha, event,
+ fetched_main, fetched_pr194, fetched_pr195) = sys.argv[2:19]
 covers = bool(candidate) and candidate == inspected
 note = (
     "The frozen audit inspected %s. Candidate %s is the checkout HEAD. "
-    "Recorded live main %s (parent %s) is not this candidate. "
-    "PR 194 head %s is not this candidate. "
+    "The authored snapshot of main is %s (parent %s) and of PR 194 is %s. "
+    "This run fetched main %s, PR 194 %s, and PR 195 %s. "
+    "A fetched value of NOT_ESTABLISHED was not observed. "
     "A pull_request runner checks out a merge commit, which can include product changes the audit did not inspect."
-) % (inspected, candidate, live_main, live_parent, pr194)
+) % (inspected, candidate, live_main, live_parent, pr194, fetched_main, fetched_pr194, fetched_pr195)
 payload = {
     "candidate_sha": candidate,
     "head_sha": head,
@@ -1165,6 +1200,9 @@ payload = {
     "recorded_live_main_sha": live_main,
     "recorded_live_main_parent": live_parent,
     "recorded_pr194_head": pr194,
+    "live_main_sha": fetched_main,
+    "live_pr194_head": fetched_pr194,
+    "live_pr195_head": fetched_pr195,
     "pr_head_sha": pr_head,
     "github_sha": github_sha,
     "github_event": event,
@@ -1437,16 +1475,20 @@ cmd_test() {
     ec=1
   fi
   if [ "$KEEP" != "1" ]; then
+    CLEANING=1
     if ! cleanup_run; then
       ec=1
       log "cleanup failed"
     fi
+    CLEANING=0
   fi
   return "$ec"
 }
 
 main() {
   parse_args "$@"
+  trap 'interrupt_cleanup INT' INT
+  trap 'interrupt_cleanup TERM' TERM
   artifact_root
   require_tools
   case "$CMD" in

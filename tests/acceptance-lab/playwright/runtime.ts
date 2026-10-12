@@ -21,7 +21,7 @@ export type Pair = {
   gitRepo: string;
 };
 
-type Snap = { svn: string; git: string; maps: string };
+type Snap = { svn: string; git: string; maps: string; records: string; watermark: string };
 
 function required(name: string): string {
   const value = process.env[name];
@@ -110,11 +110,20 @@ export class Lab {
       return result.stdout;
     } catch (error) {
       const failed = error as { stdout?: string; stderr?: string; message?: string };
-      const stderr = `${failed.stderr || ""}\n${failed.stdout || ""}`
-        .replaceAll(this.svnPassword, "[redacted]")
-        .replaceAll(this.gitToken, "[redacted]")
-        .replaceAll(this.adminPassword, "[redacted]")
-        .slice(0, 2000);
+      let stderr = `${failed.stderr || ""}\n${failed.stdout || ""}`;
+      for (const secret of [
+        this.svnPassword,
+        this.gitToken,
+        this.adminPassword,
+        this.alicePassword,
+        this.bindPassword,
+        this.localPassword,
+        this.webhookSecret,
+        this.svnWebhookSecret,
+      ]) {
+        if (secret) stderr = stderr.replaceAll(secret, "[redacted]");
+      }
+      stderr = stderr.slice(0, 2000);
       throw new Error(`docker exec ${service} failed: ${stderr || failed.message}`);
     }
   }
@@ -262,11 +271,17 @@ auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
 git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt \
   ls-remote https://gitea:3000/${pair.gitRepo}.git refs/heads/main | awk '{print $1}'
 `)).trim();
-    const maps = (await this.sh("reposync", `
+    const counts = (await this.sh("reposync", `
 set -eu
-sqlite3 "file:/var/lib/reposync/reposync.db?mode=ro" "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.id}';"
-`, "root")).trim();
-    return { svn, git, maps };
+sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.id}'; SELECT COUNT(*) FROM sync_records WHERE repo_id='${pair.id}'; SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_svn_rev_${pair.id}'), 'none');"
+`, "root")).trim().split(/\s+/);
+    return {
+      svn,
+      git,
+      maps: counts[0] || "0",
+      records: counts[1] || "0",
+      watermark: counts[2] || "none",
+    };
   }
 
   async triggerSvn(revision: string): Promise<void> {
@@ -370,14 +385,23 @@ git rev-parse HEAD
     const before = await this.snap(pair);
     const rev = await this.commitSvn(pair, script);
     await this.triggerSvn(rev);
-    // Team confirm writes sync_records and the repository watermark. It does
-    // not insert commit_map. Run 38199181879 pushed Git 6593d276 while that
-    // count stayed put, so a map-count wait never observed the transfer.
-    // The published main tip is the signal. gitBytes still checks the root path.
-    await this.waitUntil(async () => {
+    // Team confirm writes sync_records and last_svn_rev_<repo>. It does not
+    // insert commit_map. Run 38199181879 moved the Git tip while that map
+    // count stayed put. The receipt and the watermark are the checkpoint.
+    // Issue #196 remains the unstripped trunk-path warning.
+    try {
+      await this.waitUntil(async () => {
+        const now = await this.snap(pair);
+        return now.svn !== before.svn
+          && /^[0-9a-f]{40}$/.test(now.git)
+          && now.git !== before.git
+          && now.records !== before.records
+          && now.watermark === now.svn;
+      });
+    } catch (error) {
       const now = await this.snap(pair);
-      return now.svn !== before.svn && /^[0-9a-f]{40}$/.test(now.git) && now.git !== before.git;
-    });
+      throw new Error(`svn checkpoint not observed: svn ${before.svn}->${now.svn} git ${before.git}->${now.git} maps ${before.maps}->${now.maps} records ${before.records}->${now.records} watermark ${before.watermark}->${now.watermark}; ${error}`);
+    }
     return this.snap(pair);
   }
 
@@ -386,7 +410,15 @@ git rev-parse HEAD
     await this.commitGit(pair, script);
     const status = await this.triggerGit(pair.gitRepo, false);
     if (status !== 200) throw new Error(`git webhook ${status}`);
-    await this.waitUntil(async () => (await this.snap(pair)).svn !== before.svn);
+    try {
+      await this.waitUntil(async () => {
+        const now = await this.snap(pair);
+        return now.svn !== before.svn && now.records !== before.records;
+      });
+    } catch (error) {
+      const now = await this.snap(pair);
+      throw new Error(`git checkpoint not observed: svn ${before.svn}->${now.svn} git ${before.git}->${now.git} maps ${before.maps}->${now.maps} records ${before.records}->${now.records} watermark ${before.watermark}->${now.watermark}; ${error}`);
+    }
     return this.snap(pair);
   }
 
@@ -396,7 +428,11 @@ git rev-parse HEAD
     const start = Date.now();
     await expect.poll(async () => {
       const now = await this.snap(pair);
-      const same = now.svn === before.svn && now.git === before.git && now.maps === before.maps;
+      const same = now.svn === before.svn
+        && now.git === before.git
+        && now.maps === before.maps
+        && now.records === before.records
+        && now.watermark === before.watermark;
       return same && Date.now() - start > 12_000;
     }, { timeout: 25_000, intervals: [1000] }).toBe(true);
   }
@@ -428,7 +464,11 @@ git rev-parse HEAD
   }
 
   async restartDaemon(): Promise<void> {
-    await exec("docker", ["compose", "-p", this.project, "-f", this.composeFile, "restart", "reposync"], { timeout: 120_000 });
+    await exec("docker", ["compose", "-p", this.project, "-f", this.composeFile, "--profile", "app", "restart", "reposync"], { timeout: 120_000 });
+    await this.waitUntil(async () => {
+      const health = await this.api("GET", "/api/status/health", undefined, "");
+      return health.status === 200;
+    }, 120_000);
   }
 
   async deniedLines(): Promise<number> {

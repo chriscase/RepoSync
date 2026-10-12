@@ -58,8 +58,9 @@ jobs:
           echo "github_sha=${{ github.sha }}"
           echo "pr_head=${{ github.event.pull_request.head.sha }}"
           echo "audited=068562a90bfafd9b2a142cea524a89574814cba5"
-          echo "recorded_live_main=af394285869bdffa5f156c651cd1104027832749"
-          echo "pr194=6c84adf858a8a2e5d7ac3a9f618bee1834f4d297"
+          echo "authored_snapshot_main=af394285869bdffa5f156c651cd1104027832749"
+          echo "authored_snapshot_pr194=6c84adf858a8a2e5d7ac3a9f618bee1834f4d297"
+          echo "live refs are fetched into identity.json; a miss stays NOT_ESTABLISHED"
 
       - name: Build daemon image
         env:

@@ -889,6 +889,288 @@ reposync --config /var/lib/reposync/personal-${name}/personal.toml personal impo
       lab.pass("status and dry-run preview completed against the lab daemon");
       return;
     }
+    case "LAB_TEAM_RESTART_STATE": {
+      const pair = await team(lab);
+      await lab.syncSvnChange(pair, "printf 'alpha\\n' > restart-alpha.txt\nsvn add --force restart-alpha.txt\n");
+      const alpha = await lab.gitBytes(pair, "restart-alpha.txt");
+      if (alpha.trim() !== "alpha") throw new Error(`alpha git bytes ${JSON.stringify(alpha.trim())}`);
+      await lab.syncSvnChange(pair, "printf 'beta\\n' > restart-beta.txt\nsvn add --force restart-beta.txt\n");
+      const beta = await lab.gitBytes(pair, "restart-beta.txt");
+      const alphaStill = await lab.gitBytes(pair, "restart-alpha.txt");
+      if (beta.trim() !== "beta" || alphaStill.trim() !== "alpha") {
+        throw new Error(`intermediate team tree alpha=${JSON.stringify(alphaStill.trim())} beta=${JSON.stringify(beta.trim())}`);
+      }
+      await lab.syncGitChange(pair, "printf 'gamma\\n' > restart-gamma.txt\ngit add restart-gamma.txt\ngit commit -m 'restart gamma'\n");
+      const gamma = await lab.svnBytes(pair, "restart-gamma.txt");
+      if (gamma.trim() !== "gamma") throw new Error(`gamma svn bytes ${JSON.stringify(gamma.trim())}`);
+      const before = await lab.snap(pair);
+      await lab.restartDaemon();
+      const after = await lab.snap(pair);
+      if (after.svn !== before.svn || after.git !== before.git || after.maps !== before.maps || after.records !== before.records || after.watermark !== before.watermark) {
+        throw new Error(`team state moved across restart svn ${before.svn}->${after.svn} git ${before.git}->${after.git} maps ${before.maps}->${after.maps} records ${before.records}->${after.records} watermark ${before.watermark}->${after.watermark}`);
+      }
+      if ((await lab.gitBytes(pair, "restart-alpha.txt")).trim() !== "alpha") throw new Error("alpha missing after restart");
+      if ((await lab.gitBytes(pair, "restart-beta.txt")).trim() !== "beta") throw new Error("beta missing after restart");
+      if ((await lab.svnBytes(pair, "restart-gamma.txt")).trim() !== "gamma") throw new Error("gamma missing after restart");
+      await lab.expectNoWrite(pair, async () => {
+        await lab.triggerSvn(after.svn);
+        const status = await lab.triggerGit(pair.gitRepo);
+        if (status !== 200) throw new Error(`repeat webhook ${status}`);
+      });
+      lab.pass(`team round trip kept r${after.svn} and ${after.records} sync records across restart; the repeat trigger was idle`);
+      return;
+    }
+    case "LAB_DENIED_AUTH": {
+      const denied = await lab.api("POST", "/api/auth/login", {
+        username: "nobody-lab",
+        password: "not-a-real-password",
+      }, "");
+      if (denied.status !== 401) throw new Error(`denied login status ${denied.status}: ${denied.text.slice(0, 180)}`);
+      if (typeof (denied.json as { token?: string } | null)?.token === "string") {
+        throw new Error("denied login returned a session token");
+      }
+      lab.pass("unknown user was rejected with 401 and no session");
+      return;
+    }
+    case "LAB_MISSING_ARTIFACT": {
+      await lab.admin();
+      const missing = await lab.api("GET", "/api/repos/repo-not-in-this-lab");
+      if (missing.status !== 404) throw new Error(`missing repo status ${missing.status}: ${missing.text.slice(0, 180)}`);
+      lab.pass("authenticated request for a missing repository returned 404");
+      return;
+    }
+    case "LAB_INVALID_INPUT": {
+      await lab.admin();
+      const invalid = await lab.api("POST", "/api/repos", {});
+      if (invalid.status !== 422) throw new Error(`empty repo body status ${invalid.status}: ${invalid.text.slice(0, 180)}`);
+      lab.pass("empty repository body was rejected with 422");
+      return;
+    }
+    case "LAB_EARLY_CHILD_FAILURE": {
+      let failed = false;
+      try {
+        await lab.sh("reposync", "reposync --config /does-not-exist.toml personal status", "reposync");
+      } catch (error) {
+        const text = `${error}`;
+        if (!text.includes("docker exec reposync failed")) throw error;
+        failed = true;
+      }
+      if (!failed) throw new Error("missing personal config exited 0");
+      lab.pass("missing personal config failed before a sync and was not a pass");
+      return;
+    }
+    case "LAB_ISOLATION_TWO_REPOS": {
+      const left = await lab.createPair("isoa");
+      const right = await lab.createPair("isob");
+      const cred = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
+        svn_password: lab.alicePassword,
+        git_token: "isob-synthetic-token-not-shared",
+      });
+      if (cred.status !== 200) throw new Error(`right credentials ${cred.status}`);
+      const beforeLeft = await lab.snap(left);
+      const beforeRight = await lab.snap(right);
+      if (beforeLeft.svn !== beforeRight.svn) {
+        throw new Error(`trunk revisions did not overlap before the sync: ${beforeLeft.svn} vs ${beforeRight.svn}`);
+      }
+      const changed = await lab.syncSvnChange(left, "printf 'only-left\\n' > only-left.txt\nsvn add --force only-left.txt\n");
+      const afterRight = await lab.snap(right);
+      if (afterRight.svn !== beforeRight.svn || afterRight.git !== beforeRight.git || afterRight.maps !== beforeRight.maps || afterRight.records !== beforeRight.records || afterRight.watermark !== beforeRight.watermark) {
+        throw new Error(`right repo moved svn ${beforeRight.svn}->${afterRight.svn} git ${beforeRight.git}->${afterRight.git} maps ${beforeRight.maps}->${afterRight.maps} records ${beforeRight.records}->${afterRight.records} watermark ${beforeRight.watermark}->${afterRight.watermark}`);
+      }
+      const crossed = (await lab.sh("reposync", `
+set -eu
+sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM sync_records WHERE repo_id='${right.id}' AND git_sha='${changed.git}';"
+`, "root")).trim();
+      if (crossed !== "0") throw new Error(`right repo stored the left git sha`);
+      const secretRows = (await lab.sh("reposync", `
+set -eu
+sqlite3 /var/lib/reposync/reposync.db "SELECT key FROM kv_state WHERE key IN ('secret_svn_password_${left.id}','secret_svn_password_${right.id}','secret_git_token_${left.id}','secret_git_token_${right.id}') ORDER BY key;"
+`, "root")).trim().split("\n").filter(Boolean);
+      if (secretRows.length !== 4) throw new Error(`expected four credential keys, found ${secretRows.length}`);
+      const distinct = (await lab.sh("reposync", `
+set -eu
+sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_state WHERE key='secret_svn_password_${left.id}') != (SELECT value FROM kv_state WHERE key='secret_svn_password_${right.id}') AND (SELECT value FROM kv_state WHERE key='secret_git_token_${left.id}') != (SELECT value FROM kv_state WHERE key='secret_git_token_${right.id}') THEN 'distinct' ELSE 'same' END;"
+`, "root")).trim();
+      if (distinct !== "distinct") throw new Error("the two repos did not keep distinct svn and git credential records");
+      lab.pass(`isoa and isob both used trunk at r${beforeLeft.svn}; only isoa advanced to ${changed.git.slice(0, 12)} and the credential records stayed distinct`);
+      return;
+    }
+    case "LAB_PERSONAL_MULTICOMMIT": {
+      await lab.sh("svn", `
+set -eu
+if [ ! -d /var/svn/pround ]; then
+  svnadmin create /var/svn/pround
+  chown -R www-data:www-data /var/svn/pround
+  work=$(mktemp -d)
+  svn checkout --non-interactive "file:///var/svn/pround" "$work"
+  mkdir -p "$work/trunk" "$work/branches" "$work/tags"
+  printf 'seed\\n' > "$work/trunk/README.txt"
+  svn add "$work/trunk" "$work/branches" "$work/tags"
+  svn commit --username svc-sync -m "seed" "$work"
+  printf 'alpha\\n' > "$work/trunk/alpha.txt"
+  svn add "$work/trunk/alpha.txt"
+  svn commit --username svc-sync -m "alpha" "$work"
+  rm -rf "$work"
+  chown -R www-data:www-data /var/svn/pround
+fi
+`);
+      await lab.sh("gitea", `
+set -eu
+org=$(curl --silent --show-error --output /tmp/org.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"username":"lab","visibility":"private"}' https://gitea:3000/api/v1/orgs || true)
+case "$org" in 201|409|422) ;; *) echo "gitea org $org"; cat /tmp/org.out; exit 1 ;; esac
+repo=$(curl --silent --show-error --output /tmp/pround.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"name":"pround","private":true,"auto_init":false,"default_branch":"main"}' https://gitea:3000/api/v1/orgs/lab/repos || true)
+case "$repo" in 201|409) ;; *) echo "gitea repo $repo"; cat /tmp/pround.out; exit 1 ;; esac
+`);
+      const imported = await lab.sh("reposync", `
+set -eu
+root=/var/lib/reposync/personal-pround
+rm -rf "$root"
+mkdir -p "$root"
+cat > "$root/personal.toml" <<'EOF'
+[personal]
+poll_interval_secs = 2
+log_level = "info"
+data_dir = "/var/lib/reposync/personal-pround/data"
+
+[svn]
+url = "https://svn:8443/svn/pround/trunk"
+username = "svc-sync"
+password_env = "REPOSYNC_SVN_PASSWORD"
+
+[github]
+api_url = "https://gitea:3000/api/v1"
+git_base_url = "https://gitea:3000"
+repo = "lab/pround"
+token_env = "REPOSYNC_GITHUB_TOKEN"
+default_branch = "main"
+auto_create = false
+private = true
+
+[developer]
+name = "Alice Lab"
+email = "alice@lab.invalid"
+svn_username = "alice"
+
+[options]
+normalize_line_endings = false
+sync_executable_bit = false
+auto_merge = false
+sync_direct_pushes = false
+EOF
+reposync --config "$root/personal.toml" personal import --full
+test -f "$root/data/git-repo/README.txt"
+test -f "$root/data/git-repo/alpha.txt"
+maps=$(sqlite3 "$root/data/personal.db" "SELECT COUNT(*) FROM commit_map WHERE direction='svn_to_git';")
+records=$(sqlite3 "$root/data/personal.db" "SELECT COUNT(*) FROM sync_records WHERE direction='svn_to_git' AND status='applied';")
+printf 'PERSONAL_IMPORT maps=%s records=%s\\n' "$maps" "$records"
+`, "reposync");
+      const importLine = imported.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("PERSONAL_IMPORT ")).pop() || "";
+      const importMaps = Number(importLine.match(/maps=(\d+)/)?.[1]);
+      const importRecords = Number(importLine.match(/records=(\d+)/)?.[1]);
+      if (!Number.isFinite(importMaps) || !Number.isFinite(importRecords) || importMaps < 2 || importRecords < 2) {
+        throw new Error(`personal import checkpoint ${importLine || imported.trim().slice(-300)}`);
+      }
+      await lab.sh("svn", `
+set -eu
+work=$(mktemp -d)
+svn checkout --non-interactive "file:///var/svn/pround/trunk" "$work"
+printf 'beta\\n' > "$work/beta.txt"
+svn add "$work/beta.txt"
+svn commit --username svc-sync -m "beta" "$work"
+rm -rf "$work"
+`);
+      const synced = await lab.sh("reposync", `
+set -eu
+root=/var/lib/reposync/personal-pround
+cfg="$root/personal.toml"
+db="$root/data/personal.db"
+svn_cfg=/var/lib/reposync/svn-config
+stop_personal() { reposync --config "$cfg" personal stop >/dev/null 2>&1 || true; }
+trap stop_personal EXIT
+svn_text() { svn cat --non-interactive --config-dir "$svn_cfg" --username svc-sync --password "$REPOSYNC_SVN_PASSWORD" "https://svn:8443/svn/pround/trunk/$1"; }
+svn_rev() { svn info --non-interactive --config-dir "$svn_cfg" --username svc-sync --password "$REPOSYNC_SVN_PASSWORD" --show-item revision https://svn:8443/svn/pround/trunk; }
+records() { sqlite3 "$db" "SELECT COUNT(*) FROM sync_records;"; }
+start_personal() { nohup reposync --config "$cfg" personal start --foreground >>"$root/daemon.log" 2>&1 & }
+fail_log() { echo "personal daemon log:"; tail -n 80 "$root/daemon.log" >&2 || true; exit 1; }
+start_personal
+i=0
+while [ "$i" -lt 40 ]; do
+  if [ -f "$root/data/git-repo/beta.txt" ] && grep -q '^beta$' "$root/data/git-repo/beta.txt" && grep -q '^alpha$' "$root/data/git-repo/alpha.txt"; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 2
+done
+grep -q '^beta$' "$root/data/git-repo/beta.txt" || fail_log
+grep -q '^alpha$' "$root/data/git-repo/alpha.txt" || fail_log
+stop_personal
+after_beta=$(records)
+if [ "$after_beta" -le ${importRecords} ]; then
+  echo "sync records stayed at $after_beta after beta" >&2
+  fail_log
+fi
+cd "$root/data/git-repo"
+git checkout main
+git checkout -b gamma
+git config user.name "Alice Lab"
+git config user.email "alice@lab.invalid"
+printf 'gamma\\n' > gamma.txt
+git add gamma.txt
+git commit -m "gamma"
+auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
+git -c http.sslCAInfo=/certs/ca.crt -c http.extraHeader="Authorization: Basic $auth" push origin gamma
+before_gamma=$(svn_rev)
+start_personal
+pr=$(curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"title":"gamma","head":"gamma","base":"main"}' https://gitea:3000/api/v1/repos/lab/pround/pulls)
+num=$(printf '%s' "$pr" | sed -n 's/.*"number":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+if [ -z "$num" ]; then echo "pull request was not created: $pr" >&2; fail_log; fi
+merge_code=$(curl --silent --show-error --output /tmp/merge.out --write-out '%{http_code}' --cacert /certs/ca.crt -X POST -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"Do":"merge","MergeMessageField":"gamma"}' "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num/merge" || true)
+if [ "$merge_code" != "200" ] && [ "$merge_code" != "201" ]; then
+  merge_code=$(curl --silent --show-error --output /tmp/merge.out --write-out '%{http_code}' --cacert /certs/ca.crt -X PUT -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"merge_method":"merge"}' "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num/merge" || true)
+fi
+if [ "$merge_code" != "200" ] && [ "$merge_code" != "201" ]; then
+  echo "merge status $merge_code" >&2
+  cat /tmp/merge.out >&2 || true
+  fail_log
+fi
+i=0
+while [ "$i" -lt 40 ]; do
+  if svn_text gamma.txt 2>/dev/null | grep -q '^gamma$'; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 2
+done
+svn_text gamma.txt | grep -q '^gamma$' || fail_log
+svn_text alpha.txt | grep -q '^alpha$' || fail_log
+svn_text beta.txt | grep -q '^beta$' || fail_log
+after_gamma=$(svn_rev)
+if [ "$after_gamma" = "$before_gamma" ]; then echo "svn revision did not advance for gamma" >&2; fail_log; fi
+after_gamma_records=$(records)
+if [ "$after_gamma_records" -le "$after_beta" ]; then echo "sync records did not grow for gamma" >&2; fail_log; fi
+stop_personal
+start_personal
+sleep 8
+stop_personal
+noop_rev=$(svn_rev)
+noop_records=$(records)
+if [ "$noop_rev" != "$after_gamma" ] || [ "$noop_records" != "$after_gamma_records" ]; then
+  echo "repeat run changed svn $after_gamma->$noop_rev records $after_gamma_records->$noop_records" >&2
+  fail_log
+fi
+svn_text gamma.txt | grep -q '^gamma$' || fail_log
+printf 'PERSONAL_FINAL records=%s svn=%s noop_svn=%s\\n' "$noop_records" "$after_gamma" "$noop_rev"
+`, "reposync");
+      const finalLine = synced.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("PERSONAL_FINAL ")).pop() || "";
+      const finalRecords = Number(finalLine.match(/records=(\d+)/)?.[1]);
+      const finalSvn = finalLine.match(/svn=(\d+)/)?.[1] || "";
+      const noopSvn = finalLine.match(/noop_svn=(\d+)/)?.[1] || "";
+      if (!Number.isFinite(finalRecords) || finalRecords <= importRecords || !finalSvn || finalSvn !== noopSvn) {
+        throw new Error(`personal round trip ${finalLine || synced.trim().slice(-400)}`);
+      }
+      lab.pass(`personal import mapped ${importMaps} revisions and ${importRecords} svn_to_git receipts; both directions reached ${finalRecords} sync records at r${finalSvn}; the restarted daemon left that revision unchanged`);
+      return;
+    }
     default:
       throw new Error(`no executor for ${op.id}`);
   }

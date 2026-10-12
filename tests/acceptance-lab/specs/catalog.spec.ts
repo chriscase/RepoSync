@@ -14,6 +14,7 @@ for (const operation of operations) {
   test(operation.id, { tag: `@${operation.suite}` }, async ({ page }, info) => {
     info.annotations.push({ type: "labCase", description: operation.id });
     if (operation.suite === "soak" || operation.id === "GIT-OVER-1000") info.setTimeout(1_200_000);
+    if (operation.id === "LAB_ISOLATION_TWO_REPOS" || operation.id === "LAB_PERSONAL_MULTICOMMIT" || operation.id === "LAB_TEAM_RESTART_STATE") info.setTimeout(600_000);
     const lab = new Lab(page, info);
     page.on("console", (message) => {
       if (message.type() === "error") info.annotations.push({ type: "console", description: message.text().slice(0, 300) });

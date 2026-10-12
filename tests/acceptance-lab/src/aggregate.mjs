@@ -319,6 +319,10 @@ export async function buildReport(options) {
     "HARNESS_STARTUP_FAILURE",
     "HARNESS_SCAN_FAILURE",
     "HARNESS_CLEANUP_FAILURE",
+    "HARNESS_OMITTED_NOT_PASS",
+    "HARNESS_RETRY_IS_FAIL",
+    "HARNESS_REDACTED_REPORT",
+    "HARNESS_APP_PROFILE_CLEANUP",
   ];
   const gate = requiredGate.map((id) => byId.get(id) || { id, status: FAIL, reason: "gate case missing" });
   const gateFailed = gate.filter((row) => row.status !== PASS);
