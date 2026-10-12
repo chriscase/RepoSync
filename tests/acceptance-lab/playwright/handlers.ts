@@ -1119,10 +1119,11 @@ git add gamma.txt
 git commit -m "gamma"
 auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
 git -c http.sslCAInfo=/certs/ca.crt -c http.extraHeader="Authorization: Basic $auth" push origin gamma
+git checkout main
 before_gamma=$(svn_rev)
 start_personal
 pr=$(curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"title":"gamma","head":"gamma","base":"main"}' https://gitea:3000/api/v1/repos/lab/pround/pulls)
-num=$(printf '%s' "$pr" | sed -n 's/.*"number":[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)
+num=$(printf '%s' "$pr" | grep -o '"number":[[:space:]]*[0-9][0-9]*' | head -n 1 | grep -o '[0-9][0-9]*$')
 if [ -z "$num" ]; then echo "pull request was not created: $pr" >&2; fail_log; fi
 merge_code=$(curl --silent --show-error --output /tmp/merge.out --write-out '%{http_code}' --cacert /certs/ca.crt -X POST -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"Do":"merge","MergeMessageField":"gamma"}' "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num/merge" || true)
 if [ "$merge_code" != "200" ] && [ "$merge_code" != "201" ]; then
