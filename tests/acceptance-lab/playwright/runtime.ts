@@ -313,20 +313,20 @@ case "$code" in
   204|201) ;;
   *) fail_step TEAM_MEMBER /tmp/tm.out ;;
 esac
-code=$(curl --silent --show-error --output /tmp/ct.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"name":"${tokenName}","scopes":["all"]}' "https://gitea:3000/api/v1/users/${user}/tokens" || true)
-case "$code" in
-  201) ;;
-  *) fail_step TOKEN /tmp/ct.out ;;
-esac
-value=$(grep -o '"sha1":"[0-9a-fA-F]*"' /tmp/ct.out | head -n 1 | cut -d'"' -f4)
-if [ -z "$value" ]; then
-  value=$(grep -o '"token":"[0-9a-fA-F]*"' /tmp/ct.out | head -n 1 | cut -d'"' -f4)
+token_cli="gitea admin user generate-access-token --config /data/gitea/conf/app.ini --username ${user} --token-name ${tokenName} --scopes all --raw"
+if ! sh -c "$token_cli" > /tmp/ct.out 2>/tmp/ct.err; then
+  if ! su -s /bin/sh git -c "$token_cli" > /tmp/ct.out 2>/tmp/ct.err; then
+    echo "TOKEN_CLI $(tr '\n' ' ' < /tmp/ct.err | cut -c1-180)"
+    rm -f /tmp/ct.out /tmp/ct.err
+    exit 1
+  fi
 fi
+value=$(awk 'NF { line=$NF } END { print line }' /tmp/ct.out)
+rm -f /tmp/cu.out /tmp/team.out /tmp/tr.out /tmp/tm.out /tmp/ct.out /tmp/ct.err
 if ! printf '%s\n' "$value" | grep -Eq '^[0-9a-fA-F]{20,}$'; then
   echo "TOKEN_PARSE"
   exit 1
 fi
-rm -f /tmp/cu.out /tmp/team.out /tmp/tr.out /tmp/tm.out /tmp/ct.out
 own=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $value" "https://gitea:3000/api/v1/repos/lab/${repo}")
 other_code=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $value" "https://gitea:3000/api/v1/repos/lab/${other}")
 case "$own" in
@@ -353,17 +353,21 @@ printf '%s\n' "$value"
   async revokeScopedGitToken(repoName: string): Promise<void> {
     const repo = safe(repoName, "repo");
     const user = safe(`git${repo}`, "user");
-    const tokenName = safe(`lab${repo}`, "token");
+    const team = safe(`write${repo}`, "team");
     const output = await this.sh("gitea", `
 set -eu
-code=$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /certs/ca.crt -X DELETE -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/users/${user}/tokens/${tokenName}" || true)
+json=$(curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" https://gitea:3000/api/v1/orgs/lab/teams)
+team_id=$(printf '%s' "$json" | tr '{' '\n' | grep '"name":"${team}"' | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+if [ -z "$team_id" ]; then echo "REVOKE_TEAM"; exit 1; fi
+code=$(curl --silent --output /tmp/rv.out --write-out '%{http_code}' --cacert /certs/ca.crt -X DELETE -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/teams/$team_id/members/${user}" || true)
 case "$code" in
   204|200) ;;
   *) echo "REVOKE $code"; exit 1 ;;
 esac
+rm -f /tmp/rv.out
 printf 'REVOKED\n'
 `);
-    if (!output.includes("REVOKED")) throw new Error(`scoped git token for ${repo} was not revoked`);
+    if (!output.includes("REVOKED")) throw new Error(`scoped git write for ${repo} was not revoked`);
   }
 
   async snap(pair: Pair): Promise<Snap> {
