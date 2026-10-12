@@ -174,29 +174,58 @@ impl Database {
         })
     }
 
+    /// A caller may queue behind a still-preparing ordinary run. None grants
+    /// no capability and performs no mutation. Uncertain publication, corrupt
+    /// evidence and refresh holds remain errors; waiting never releases them.
+    pub fn try_begin_ordinary_writer_window(
+        &self,
+        repo_id: Option<&str>,
+    ) -> Result<Option<OrdinaryWriterWindow<'_>>, DatabaseError> {
+        Ok(self
+            .try_admit_ordinary_writer_window(repo_id)?
+            .map(|admitted| OrdinaryWriterWindow {
+                db: WindowDatabase::Borrowed(self),
+                admitted,
+                completed: false,
+            }))
+    }
+
     fn admit_ordinary_writer_window(
         &self,
         repo_id: Option<&str>,
     ) -> Result<Document, DatabaseError> {
+        self.try_admit_ordinary_writer_window(repo_id)?
+            .ok_or_else(|| refused("another run owns this writer scope"))
+    }
+
+    fn try_admit_ordinary_writer_window(
+        &self,
+        repo_id: Option<&str>,
+    ) -> Result<Option<Document>, DatabaseError> {
         let repo_id =
             repo_id.filter(|id| !id.is_empty() && *id != super::personal_scope::PERSONAL_SCOPE_KEY);
         self.transaction(|tx| {
             require_no_pair_refresh_hold(tx,repo_id)?;
-            let writer_epoch=crate::writer_fence::ordinary_current_epoch(tx)?;
             // Legacy engine migrations happen after admission. A human scope
             // still excludes refresh while the old schema lacks UUID columns.
             let has_scope:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('repositories') WHERE name='scope_uuid')",[],|r|r.get(0))?;
             let scope_uuid=if has_scope {
                 repo_id.map(|id|tx.query_row("SELECT scope_uuid FROM repositories WHERE id=?1",[id],|row|row.get::<_,Option<String>>(0)).optional()).transpose()?.flatten().flatten()
             } else { None };
-            let doc=Document {version:1,id:Uuid::new_v4(),repo_id:repo_id.map(str::to_owned),scope_uuid,writer_epoch,created_at:Utc::now().to_rfc3339(),phase:Phase::Preparing};
-            if documents(tx)?.iter().any(|prior|overlaps(prior,&doc)) {
-                return Err(refused("another run owns this writer scope"));
+            let mut doc=Document {version:1,id:Uuid::new_v4(),repo_id:repo_id.map(str::to_owned),scope_uuid,writer_epoch:None,created_at:Utc::now().to_rfc3339(),phase:Phase::Preparing};
+            let prior=documents(tx)?;
+            if prior.iter().any(|prior|overlaps(prior,&doc) && prior.phase!=Phase::Preparing) {
+                return Err(refused("another run owns this writer scope with possible publication"));
             }
+            if prior.iter().any(|prior|overlaps(prior,&doc)) {
+                return Ok(None);
+            }
+            // Even lease renewal waits until a real admission is possible.
+            doc.writer_epoch=crate::writer_fence::ordinary_current_epoch(tx)?;
             store(tx,&doc)?;
             // Validate newly emitted evidence before committing it too.
             documents(tx)?;
-            Ok(doc)
+            Ok(Some(doc))
         })
     }
 }

@@ -396,6 +396,15 @@ caller. Authenticated actor/effective-policy approval, fresh remote checks at
 each first publication intent, durable retention, exclusive orchestration and
 crash recovery remain required before enabling execution.
 
+Exact skip requests retain both the process busy guard and a durable ordinary
+window through their existing remote observation and checkpoint action. They
+may queue briefly behind an ordinary Preparing run instead of replacing the
+exact-skip result with an immediate busy response. Pending admission performs
+no write or lease renewal; the original owner must release its own window.
+Refresh holds, uncertain publication and corrupt evidence refuse. A bounded
+wait never expires, releases or adopts someone else's durable record. Inputs
+are observed and checked after the request actually acquires both guards.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary
