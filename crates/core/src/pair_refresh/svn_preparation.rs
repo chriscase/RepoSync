@@ -37,7 +37,7 @@ pub struct PreparedCleanChildSvn {
 
 pub type SvnPropertySnapshot = BTreeMap<String, BTreeMap<String, String>>;
 
-async fn visible_checkout_properties(
+pub(crate) async fn visible_checkout_properties(
     client: &SvnClient,
     path: &Path,
     info: &crate::svn::SvnInfo,

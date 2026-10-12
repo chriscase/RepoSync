@@ -89,7 +89,7 @@ pub(crate) fn observe_registered_git_sources_in_workspace(
     observe_in_workspace_with_client(configuration, workspace, source_client()?)
 }
 
-fn observe_in_workspace_with_client(
+pub(crate) fn observe_in_workspace_with_client(
     configuration: &LiveExecutionConfiguration,
     workspace: RefreshWorkspace,
     client: reqwest::Client,

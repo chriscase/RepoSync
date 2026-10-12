@@ -12,6 +12,11 @@ use crate::pair_refresh::actor_policy::LiveRefreshActorPolicy;
 use crate::pair_refresh::live_preparation::LivePreparedRefresh;
 use crate::sync_engine::SyncEngine;
 
+#[path = "pair_refresh_noop.rs"]
+mod noop;
+
+pub(crate) use noop::approval_digest as noop_approval_digest;
+
 const KEY_TABLE: &str = "pair_refresh_journal_key_v3";
 const KEY_SCHEMA: &str = "CREATE TABLE pair_refresh_journal_key_v3 (id INTEGER PRIMARY KEY CHECK(id=1), secret BLOB NOT NULL CHECK(length(secret)=32))";
 const DOMAIN: &str = "reposync_pair_refresh_authority_v3";
@@ -46,11 +51,23 @@ fn evidence(
     actor: &LiveRefreshActorPolicy<'_>,
     prepared: &LivePreparedRefresh,
 ) -> Result<Evidence, DatabaseError> {
-    let resources = prepared.resource_pin()?;
-    let visibility = prepared
-        .visibility_pins()
-        .filter(|pins| pins.len() == 5)
-        .ok_or_else(|| refused("complete owned SVN visibility is required"))?;
+    evidence_parts(
+        actor,
+        prepared.resource_pin()?,
+        prepared.visibility_pins().unwrap_or_default(),
+        prepared.pins().git.operation_id,
+    )
+}
+
+fn evidence_parts(
+    actor: &LiveRefreshActorPolicy<'_>,
+    resources: crate::pair_refresh::workspace::RefreshResourcePin,
+    visibility: &[crate::pair_refresh::svn_visibility::SvnPresencePin],
+    operation_id: uuid::Uuid,
+) -> Result<Evidence, DatabaseError> {
+    if visibility.len() != 5 {
+        return Err(refused("complete owned SVN visibility is required"));
+    }
     let roles = visibility
         .iter()
         .map(|pin| pin.role.as_str())
@@ -64,7 +81,7 @@ fn evidence(
             "current_child",
         ]
         .into()
-        || resources.workspace.operation_id != prepared.pins().git.operation_id
+        || resources.workspace.operation_id != operation_id
         || resources.workspace.actor_policy != *actor.pin()
     {
         return Err(refused(
@@ -145,8 +162,10 @@ fn private_key(tx: &Connection) -> Result<Option<[u8; 32]>, DatabaseError> {
 
 pub(super) fn require_key_matches_journal(
     tx: &Connection,
-    authenticated: bool,
+    operations: &[PairRefreshOperation],
 ) -> Result<(), DatabaseError> {
+    let noops = noop::verify_history(tx, operations)?;
+    let authenticated = operations.iter().any(|op| op.version == 3) || !noops.is_empty();
     if private_key(tx)?.is_some() != authenticated {
         return Err(refused("journal key and authenticated history differ"));
     }
@@ -207,7 +226,13 @@ pub(super) fn verify(
     {
         return Err(refused("authenticated operation MAC differs"));
     }
-    let expected = &authority.evidence.database;
+    require_database_binding(tx, &authority.evidence.database)
+}
+
+fn require_database_binding(
+    tx: &Connection,
+    expected: &DatabaseBinding,
+) -> Result<(), DatabaseError> {
     let actual = super::super::opened_file::OpenedDatabaseFile::attest(tx, &expected.path, None)
         .ok_or_else(|| refused("authenticated database identity is unknown"))?;
     let metadata = std::fs::symlink_metadata(&expected.path)

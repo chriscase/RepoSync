@@ -1645,3 +1645,658 @@ async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
             .is_err()
     );
 }
+
+fn noop_projection(f: &Fixture) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = f.db.conn();
+    let mut result = Vec::new();
+    for query in [
+        "SELECT * FROM repositories ORDER BY id",
+        "SELECT * FROM commit_map ORDER BY id",
+        "SELECT * FROM sync_records ORDER BY id",
+    ] {
+        let mut statement = conn.prepare(query).unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|index| row.get(index))
+                    .collect::<Result<Vec<rusqlite::types::Value>, _>>()
+            })
+            .unwrap();
+        result.extend(rows.collect::<Result<Vec<_>, _>>().unwrap());
+    }
+    result
+}
+
+fn initial_noop_fixture() -> Fixture {
+    // New branches and a separate fresh SVN repository do not rewrite any
+    // existing fixture ref/history. These are source-observation fixtures;
+    // ordinary-engine initialization qualification remains a separate control.
+    let mut f = Fixture::new();
+    let repository = f.temp.path().join("initial-noop-svn");
+    run(Command::new("svnadmin").arg("create").arg(&repository));
+    let root = reqwest::Url::from_file_path(repository.canonicalize().unwrap())
+        .unwrap()
+        .to_string();
+    svn(
+        &[
+            "mkdir",
+            &format!("{root}/trunk"),
+            &format!("{root}/branches"),
+            "-m",
+            "no-op layout",
+        ],
+        None,
+    );
+    let working = f.temp.path().join("initial-noop-parent-wc");
+    svn(
+        &[
+            "checkout",
+            &format!("{root}/trunk"),
+            working.to_str().unwrap(),
+        ],
+        None,
+    );
+    std::fs::write(working.join("file.txt"), b"baseline\n").unwrap();
+    svn(&["add", "file.txt"], Some(&working));
+    svn(&["commit", "-m", "no-op baseline"], Some(&working));
+    svn(
+        &[
+            "copy",
+            &format!("{root}/trunk@2"),
+            &format!("{root}/branches/f"),
+            "-m",
+            "no-op direct copy",
+        ],
+        None,
+    );
+    f.target
+        .reference(
+            "refs/heads/unchanged-parent",
+            f.baseline,
+            false,
+            "fresh no-op fixture branch",
+        )
+        .unwrap();
+    f.target
+        .reference(
+            "refs/heads/unchanged-child",
+            f.baseline,
+            false,
+            "fresh no-op fixture branch",
+        )
+        .unwrap();
+    for (id, branch, revision) in [
+        ("parent", "unchanged-parent", 2),
+        ("child", "unchanged-child", 3),
+    ] {
+        f.db.conn().execute("UPDATE repositories SET svn_url=?1,git_branch=?2,last_svn_rev=?3,last_git_sha=?4 WHERE id=?5",rusqlite::params![root,branch,revision,f.baseline.to_string(),id]).unwrap();
+        f.db.set_state(&format!("last_svn_rev_{id}"), &revision.to_string())
+            .unwrap();
+        let scope: String =
+            f.db.conn()
+                .query_row(
+                    "SELECT scope_uuid FROM repositories WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        f.db.set_state(&format!("last_git_sha_{scope}"), &f.baseline.to_string())
+            .unwrap();
+    }
+    f.root = root;
+    f.parent = f.baseline;
+    f._parent_wc = working;
+    f
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_parent_after_completion_returns_a_distinct_signed_noop_without_publication() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, first) = prepared(&f, &engine).await;
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let approved = actor.prepared_approval_digest(&engine, &first).unwrap();
+    let completed = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &first,
+        "before-noop",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    let before = noop_projection(&f);
+    let original_kv = journal_state(&f);
+    let before_writes = std::fs::read_to_string(&f.log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("/git-receive-pack"))
+        .count();
+    let workspace = actor.create_workspace(&engine).unwrap();
+    let path = workspace.pin().operation_directory.path.clone();
+    let noop = super::super::noop::prepare_registered_noop_with_client(
+        &f.db,
+        "child",
+        workspace.clone(),
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(noop.pins().baseline_operation_id, Some(completed.id));
+    assert_eq!(noop.pins().parent_baseline_sha, f.parent.to_string());
+    let approved = actor.noop_approval_digest(&engine, &noop).unwrap();
+    let receipt = super::super::noop::complete_owned_noop_with_client(
+        &engine,
+        &actor,
+        &noop,
+        "unchanged-parent",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.version, 1);
+    assert_eq!(receipt.id, noop.pins().operation_id);
+    assert_ne!(receipt.id, completed.id);
+    assert_eq!(receipt.pins.child.last_svn_rev, 5);
+    assert_eq!(receipt.pins.parent.last_svn_rev, 4);
+    assert_eq!(noop_projection(&f), before);
+    assert_eq!(
+        journal_state(&f)
+            .into_iter()
+            .filter(|(key, _, _)| !key.starts_with("pair_refresh_noop_"))
+            .collect::<Vec<_>>(),
+        original_kv
+    );
+    assert_eq!(
+        f.db.pair_refresh_operation(completed.id).unwrap(),
+        completed
+    );
+    assert!(f.db.pair_refresh_operation(receipt.id).is_err());
+    assert_eq!(
+        actor
+            .noop_request_receipt(&engine, "unchanged-parent", &receipt.pins.child.scope_uuid)
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    let original = journal_state(&f);
+    let repeated = super::super::noop::complete_owned_noop_with_client(
+        &engine,
+        &actor,
+        &noop,
+        "unchanged-parent",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated, receipt);
+    assert_eq!(journal_state(&f), original);
+    assert_eq!(noop_projection(&f), before);
+    assert_eq!(
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count(),
+        before_writes
+    );
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+    drop(noop);
+    drop(workspace);
+    assert!(!path.exists());
+    assert_eq!(
+        actor
+            .noop_request_receipt(&engine, "unchanged-parent", &receipt.pins.child.scope_uuid)
+            .unwrap(),
+        Some(receipt)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_copy_noop_is_atomic_authenticated_and_cannot_become_a_publication_job() {
+    let _serial = SERIAL.lock().await;
+    let f = initial_noop_fixture();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let actor = engine
+        .capture_pair_refresh_actor_policy("disposable-workspace-session")
+        .unwrap();
+    let workspace = actor.create_workspace(&engine).unwrap();
+    let noop = super::super::noop::prepare_registered_noop_with_client(
+        &f.db,
+        "child",
+        workspace.clone(),
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(noop.pins().baseline_operation_id, None);
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let before = noop_projection(&f);
+    let original = journal_state(&f);
+    assert!(!key_table(&f));
+    assert!(super::super::noop::complete_owned_noop_with_client(
+        &engine,
+        &actor,
+        &noop,
+        "first-noop",
+        &"0".repeat(64),
+        &busy,
+        f.client.clone()
+    )
+    .await
+    .is_err());
+    assert!(!key_table(&f));
+    assert_eq!(journal_state(&f), original);
+    let approved = actor.noop_approval_digest(&engine, &noop).unwrap();
+    f.db.conn().execute_batch("CREATE TRIGGER interrupt_noop BEFORE INSERT ON kv_state WHEN NEW.key LIKE 'pair_refresh_noop_v1:request:%' BEGIN SELECT RAISE(ABORT,'disposable no-op interruption'); END;").unwrap();
+    assert!(super::super::noop::complete_owned_noop_with_client(
+        &engine,
+        &actor,
+        &noop,
+        "first-noop",
+        &approved,
+        &busy,
+        f.client.clone()
+    )
+    .await
+    .is_err());
+    assert!(!key_table(&f));
+    assert_eq!(journal_state(&f), original);
+    f.db.conn()
+        .execute_batch("DROP TRIGGER interrupt_noop;")
+        .unwrap();
+    let receipt = super::super::noop::complete_owned_noop_with_client(
+        &engine,
+        &actor,
+        &noop,
+        "first-noop",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(key_table(&f));
+    assert_eq!(receipt.pins.child.last_git_sha, f.baseline.to_string());
+    assert_eq!(receipt.pins.parent.last_git_sha, f.baseline.to_string());
+    assert_eq!(receipt.pins.child.last_svn_rev, 3);
+    assert_eq!(receipt.pins.parent.last_svn_rev, 2);
+    assert_eq!(noop_projection(&f), before);
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        3
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+    let key = format!("pair_refresh_noop_v1:document:{}", receipt.id);
+    let raw = f.db.get_state(&key).unwrap().unwrap();
+    let mut altered: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    altered["receipt"]["pins"]["git_tree"] = serde_json::Value::String("a".repeat(40));
+    f.db.conn()
+        .execute(
+            "UPDATE kv_state SET value=?1 WHERE key=?2",
+            rusqlite::params![serde_json::to_string(&altered).unwrap(), key],
+        )
+        .unwrap();
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+    assert!(actor
+        .noop_request_receipt(&engine, "first-noop", &receipt.pins.child.scope_uuid)
+        .is_err());
+    f.db.conn()
+        .execute(
+            "UPDATE kv_state SET value=?1 WHERE key=?2",
+            rusqlite::params![raw, key],
+        )
+        .unwrap();
+    f.db.conn()
+        .execute(
+            "DELETE FROM kv_state WHERE key LIKE 'pair_refresh_noop_v1:request:%'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+    assert_eq!(noop_projection(&f), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn noop_refuses_git_and_svn_drift_without_establishing_receipt_authority() {
+    let _serial = SERIAL.lock().await;
+    for git_drift in [false, true] {
+        let f = initial_noop_fixture();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let actor = engine
+            .capture_pair_refresh_actor_policy("disposable-workspace-session")
+            .unwrap();
+        let workspace = actor.create_workspace(&engine).unwrap();
+        let noop = super::super::noop::prepare_registered_noop_with_client(
+            &f.db,
+            "child",
+            workspace,
+            f.client.clone(),
+        )
+        .await
+        .unwrap();
+        let approved = actor.noop_approval_digest(&engine, &noop).unwrap();
+        let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+        if git_drift {
+            let advanced = commit(&f.target, b"external Git parent advance\n", &[f.baseline]);
+            f.target
+                .find_reference("refs/heads/unchanged-parent")
+                .unwrap()
+                .set_target(advanced, "external fixture fast-forward")
+                .unwrap();
+            assert!(f.target.graph_descendant_of(advanced, f.baseline).unwrap());
+        } else {
+            std::fs::write(
+                f._parent_wc.join("file.txt"),
+                b"external SVN parent advance\n",
+            )
+            .unwrap();
+            svn(
+                &["commit", "-m", "external fixture parent advance"],
+                Some(&f._parent_wc),
+            );
+        }
+        let before = noop_projection(&f);
+        let original = journal_state(&f);
+        assert!(super::super::noop::complete_owned_noop_with_client(
+            &engine,
+            &actor,
+            &noop,
+            "drifted-noop",
+            &approved,
+            &busy,
+            f.client.clone()
+        )
+        .await
+        .is_err());
+        assert!(!key_table(&f));
+        assert_eq!(journal_state(&f), original);
+        assert_eq!(noop_projection(&f), before);
+        assert!(!std::fs::read_to_string(&f.log)
+            .unwrap()
+            .contains("receive-pack"));
+        assert_eq!(
+            crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+                .info()
+                .await
+                .unwrap()
+                .latest_rev,
+            if git_drift { 3 } else { 4 }
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn noop_refuses_revocation_session_loss_competing_window_unknown_history_and_foreign_busy() {
+    let _serial = SERIAL.lock().await;
+    for case in ["credential", "session", "window", "unknown-history", "busy"] {
+        let f = initial_noop_fixture();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let actor = engine
+            .capture_pair_refresh_actor_policy("disposable-workspace-session")
+            .unwrap();
+        let workspace = actor.create_workspace(&engine).unwrap();
+        let noop = super::super::noop::prepare_registered_noop_with_client(
+            &f.db,
+            "child",
+            workspace,
+            f.client.clone(),
+        )
+        .await
+        .unwrap();
+        let approved = actor.noop_approval_digest(&engine, &noop).unwrap();
+        let mut window = None;
+        match case {
+            "credential" => {
+                f.db.set_state("secret_git_token_child", "").unwrap();
+            }
+            "session" => {
+                f.db.delete_session("disposable-workspace-session").unwrap();
+            }
+            "window" => {
+                window = Some(
+                    f.db.begin_ordinary_writer_window(Some("unregistered-alias"))
+                        .unwrap(),
+                );
+            }
+            "unknown-history" => {
+                f.db.set_state("pair_refresh_noop_v99:document:unknown", "corrupt")
+                    .unwrap();
+            }
+            "busy" => {}
+            _ => unreachable!(),
+        }
+        let busy = if case == "busy" {
+            crate::busy::try_acquire_pair("foreign-one", "foreign-two").unwrap()
+        } else {
+            crate::busy::try_acquire_pair("child", "parent").unwrap()
+        };
+        let before = noop_projection(&f);
+        let original = journal_state(&f);
+        assert!(
+            super::super::noop::complete_owned_noop_with_client(
+                &engine,
+                &actor,
+                &noop,
+                "refused-noop",
+                &approved,
+                &busy,
+                f.client.clone()
+            )
+            .await
+            .is_err(),
+            "{case}"
+        );
+        assert!(!key_table(&f), "{case}");
+        assert_eq!(journal_state(&f), original, "{case}");
+        assert_eq!(noop_projection(&f), before, "{case}");
+        assert!(
+            !std::fs::read_to_string(&f.log)
+                .unwrap()
+                .contains("receive-pack"),
+            "{case}"
+        );
+        assert_eq!(
+            crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+                .info()
+                .await
+                .unwrap()
+                .latest_rev,
+            3,
+            "{case}"
+        );
+        if let Some(window) = window {
+            window.finish_preparation().unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_noop_history_does_not_replace_the_copy_baseline_for_a_later_real_integration() {
+    let _serial = SERIAL.lock().await;
+    let f = initial_noop_fixture();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let actor = engine
+        .capture_pair_refresh_actor_policy("disposable-workspace-session")
+        .unwrap();
+    let workspace = actor.create_workspace(&engine).unwrap();
+    let noop = super::super::noop::prepare_registered_noop_with_client(
+        &f.db,
+        "child",
+        workspace.clone(),
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    let approved = actor.noop_approval_digest(&engine, &noop).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let receipt = super::super::noop::complete_owned_noop_with_client(
+        &engine,
+        &actor,
+        &noop,
+        "noop-before-advance",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    let original_noop =
+        f.db.get_state(&format!("pair_refresh_noop_v1:document:{}", receipt.id))
+            .unwrap();
+    drop(noop);
+    drop(workspace);
+    // Parent handling is modeled with production checkpoint helpers in this
+    // source fixture. Full ordinary-engine qualification remains separate.
+    std::fs::write(f._parent_wc.join("file.txt"), b"advance after no-op\n").unwrap();
+    svn(
+        &["commit", "-m", "fixture parent advance after no-op"],
+        Some(&f._parent_wc),
+    );
+    let advanced = commit(&f.target, b"advance after no-op\n", &[f.baseline]);
+    f.target
+        .find_reference("refs/heads/unchanged-parent")
+        .unwrap()
+        .set_target(advanced, "fixture parent fast-forward")
+        .unwrap();
+    f.db.insert_commit_map_with_repo(
+        4,
+        &advanced.to_string(),
+        "svn_to_git",
+        "fixture",
+        "fixture",
+        Some("parent"),
+    )
+    .unwrap();
+    f.db.update_repo_watermark("parent", 4, &advanced.to_string())
+        .unwrap();
+    crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+        &f.db.conn(),
+        "parent",
+        &advanced.to_string(),
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .unwrap();
+    let parent_before = parent_row(&f);
+    let workspace = actor.create_workspace(&engine).unwrap();
+    let prepared =
+        prepare_registered_in_workspace_for_test(&f.db, "child", workspace, f.client.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        prepared.pins().git.pins.parent_baseline_tip,
+        f.baseline.to_string()
+    );
+    assert_eq!(
+        prepared
+            .pins()
+            .svn
+            .pins
+            .lineage
+            .child_copy
+            .copy_from_revision,
+        2
+    );
+    assert_eq!(
+        prepared.pins().svn.pins.lineage.child_copy.created_revision,
+        3
+    );
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let completed = super::super::execution::complete_owned_refresh_with_client(
+        &engine,
+        &actor,
+        &prepared,
+        "advance-after-noop",
+        &approved,
+        &busy,
+        f.client.clone(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(completed.id, receipt.id);
+    assert_eq!(
+        completed.phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::Completed
+    );
+    assert_eq!(completed.svn_receipt.as_ref().unwrap().revision, 5);
+    assert_eq!(parent_row(&f), parent_before);
+    let tip = f
+        .target
+        .find_reference("refs/heads/unchanged-child")
+        .unwrap()
+        .target()
+        .unwrap();
+    assert_eq!(
+        f.target
+            .find_commit(tip)
+            .unwrap()
+            .parent_ids()
+            .collect::<Vec<_>>(),
+        vec![f.baseline, advanced]
+    );
+    assert!(f.target.graph_descendant_of(tip, f.baseline).unwrap());
+    assert!(f.target.graph_descendant_of(tip, advanced).unwrap());
+    assert_eq!(
+        actor
+            .noop_request_receipt(
+                &engine,
+                "noop-before-advance",
+                &receipt.pins.child.scope_uuid
+            )
+            .unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        f.db.get_state(&format!("pair_refresh_noop_v1:document:{}", receipt.id))
+            .unwrap(),
+        original_noop
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+}

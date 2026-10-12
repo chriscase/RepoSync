@@ -568,5 +568,33 @@ observation-only reconciliation path for a retained SVN or Git intent. Complete
 fresh observations may sign the missing receipt; absence never authorizes retry,
 cancellation or release. This entrance requires the original actor/resources and
 lease epoch and cannot adopt files or transfer ownership. Native owner-death and
-resource reconstruction, no-op receipts, versioned API orchestration and full
+resource reconstruction, versioned API orchestration and full
 real-engine qualification remain required before the workflow is complete.
+
+No parent advance now has a distinct owned no-op observation and terminal receipt
+path. It supports the unchanged direct copy and an unchanged parent after an
+exact completed refresh baseline. Both registered Git branches and complete
+graphs, direct SVN copy origin and parent incarnation, five full visible SVN
+snapshots, complete trees/properties and readable empty ancestors must agree.
+The same sources are freshly observed before the final reserved transaction.
+Current actor/policy, actual storage/resources, credentials/configuration, writer
+lease, sorted busy ownership and global writer/journal/conflict exclusion are
+rechecked before signing. No merge commit, SVN merge/commit, Git push,
+correspondence or checkpoint update occurs.
+
+No-op receipts have their own versioned namespace and approval/receipt MAC
+domains. They share the private journal key and native database binding, but
+never become publication jobs or replace an integration baseline. Receipt and
+request pointer are atomic, including first key establishment; refusal and
+readers cannot repair the key. Every refresh journal reader checks all no-op
+records, including unknown versions, duplicate IDs/requests and missing/orphan
+pointers, so corrupt history cannot downgrade writer guards. The current actor
+can retrieve the original request receipt after ephemeral observation resources
+are cleaned. That lookup grants no publication, adoption or cleanup authority.
+
+The no-op controls use source fixtures and preserve all existing oracles. They
+cover first-copy and post-integration results, repeat lookup, atomic SQL refusal,
+drift, revocation/session loss, competing windows, unknown history, wrong busy
+ownership and a later actual integration that retains the original copy baseline.
+Their parent handling is modeled; full ordinary-engine qualification remains
+required.

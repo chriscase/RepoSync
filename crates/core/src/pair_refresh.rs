@@ -20,6 +20,7 @@ pub mod git_sources;
 mod http_transport;
 pub mod lineage;
 pub mod live_preparation;
+pub mod noop;
 pub mod preparation;
 pub mod publication;
 pub mod svn_observation;

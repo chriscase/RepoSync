@@ -32,6 +32,7 @@ const FAMILY: &str = "pair_refresh_execution_";
 mod authenticated;
 
 pub(crate) use authenticated::approval_digest as authenticated_approval_digest;
+pub(crate) use authenticated::noop_approval_digest as authenticated_noop_approval_digest;
 
 #[derive(PartialEq, Eq)]
 enum AdmissionValidation {
@@ -553,7 +554,7 @@ fn journal(tx: &Connection) -> Result<Vec<PairRefreshOperation>, DatabaseError> 
             "unknown journal version, orphan or missing hold/request pointer",
         ));
     }
-    authenticated::require_key_matches_journal(tx, operations.iter().any(|op| op.version == 3))?;
+    authenticated::require_key_matches_journal(tx, &operations)?;
     let mut completed_receipts = std::collections::BTreeSet::new();
     for op in &operations {
         if op.phase == PairRefreshPhase::Completed {

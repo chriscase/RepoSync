@@ -38,6 +38,44 @@ pub struct LiveRefreshActorPolicy<'engine> {
 }
 
 impl LiveRefreshActorPolicy<'_> {
+    /// Return the original terminal receipt for this current actor's request.
+    /// Historical receipt lookup grants no publication or resource authority.
+    pub fn noop_request_receipt(
+        &self,
+        engine: &SyncEngine,
+        request: &str,
+        child_scope: &str,
+    ) -> Result<Option<super::noop::NoopRefreshReceipt>, DatabaseError> {
+        self.db
+            .authenticated_noop_request(engine, self, request, child_scope)
+    }
+
+    /// Observe a clean, unchanged parent without preparing an integration.
+    pub async fn prepare_noop_in_workspace(
+        &self,
+        engine: &SyncEngine,
+        child_id: &str,
+        workspace: &super::workspace::RefreshWorkspace,
+    ) -> anyhow::Result<super::noop::LivePreparedNoopRefresh> {
+        self.require_current(engine)?;
+        workspace.require_binding(self.db, &self.pin)?;
+        let prepared =
+            super::noop::prepare_registered_noop(self.db, child_id, workspace.clone()).await?;
+        self.require_current(engine)?;
+        workspace.require_binding(self.db, &self.pin)?;
+        Ok(prepared)
+    }
+
+    pub fn noop_approval_digest(
+        &self,
+        engine: &SyncEngine,
+        prepared: &super::noop::LivePreparedNoopRefresh,
+    ) -> Result<String, DatabaseError> {
+        self.require_current(engine)?;
+        prepared.workspace().require_binding(self.db, &self.pin)?;
+        crate::db::pair_refresh_operations::authenticated_noop_approval_digest(self, prepared)
+    }
+
     /// Bind the approved owned preparation to one authenticated durable job.
     /// Enrollment does not grant permission to publish or adopt resources.
     pub fn enroll_prepared(
