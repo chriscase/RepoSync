@@ -15,6 +15,7 @@ use super::lineage::{
 use super::preparation::{prepare_clean_child_git, CleanChildGitPins};
 use super::svn_preparation::{prepare_clean_child_svn, CleanChildSvnPins};
 use super::svn_sources::{observe_registered_svn_sources, SvnSourceSnapshot};
+use super::workspace::RefreshWorkspace;
 
 /// These resources belong only to this preparation. A durable execution caller
 /// must arrange workspace retention/reconstruction before using the pins for
@@ -25,7 +26,30 @@ pub struct LivePreparedRefresh {
     configuration: LiveExecutionConfiguration,
     git: GitSourceSnapshot,
     svn: SvnSourceSnapshot,
-    _operation_directory: tempfile::TempDir,
+    _operation_directory: PreparationDirectory,
+}
+
+struct PreparationLocation {
+    operation_id: Uuid,
+    prepared_at: i64,
+    workspace: Option<RefreshWorkspace>,
+}
+
+enum PreparationDirectory {
+    Temporary(tempfile::TempDir),
+    Workspace {
+        path: std::path::PathBuf,
+        owner: RefreshWorkspace,
+    },
+}
+
+impl PreparationDirectory {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Temporary(directory) => directory.path(),
+            Self::Workspace { path, .. } => path,
+        }
+    }
 }
 
 impl LivePreparedRefresh {
@@ -40,6 +64,28 @@ impl LivePreparedRefresh {
     }
     pub fn svn(&self) -> &SvnSourceSnapshot {
         &self.svn
+    }
+
+    pub fn resource_pin(
+        &self,
+    ) -> Result<super::workspace::RefreshResourcePin, crate::errors::DatabaseError> {
+        match &self._operation_directory {
+            PreparationDirectory::Workspace { owner, .. } => owner.resource_pin(),
+            PreparationDirectory::Temporary(_) => Err(crate::errors::DatabaseError::Other(
+                "temporary preparation has no durable resource pin".into(),
+            )),
+        }
+    }
+
+    /// Preserve exact resource paths before attempting durable enrollment.
+    /// This grants no job, publication, cleanup or recovery authority.
+    pub fn retain_before_enrollment(&self) -> Result<(), crate::errors::DatabaseError> {
+        match &self._operation_directory {
+            PreparationDirectory::Workspace { owner, .. } => owner.retain_before_enrollment(),
+            PreparationDirectory::Temporary(_) => Err(crate::errors::DatabaseError::Other(
+                "temporary preparation cannot enter durable enrollment".into(),
+            )),
+        }
     }
 }
 
@@ -85,6 +131,118 @@ async fn prepare_observed_sources(
     operation_id: Uuid,
     prepared_at: i64,
 ) -> Result<LivePreparedRefresh> {
+    prepare_observed_sources_at(
+        db,
+        configuration,
+        git,
+        svn,
+        baseline,
+        PreparationLocation {
+            operation_id,
+            prepared_at,
+            workspace: None,
+        },
+    )
+    .await
+}
+
+pub(crate) async fn prepare_registered_in_workspace(
+    db: &Database,
+    child_id: &str,
+    workspace: RefreshWorkspace,
+    prepared_at: i64,
+) -> Result<LivePreparedRefresh> {
+    prepare_registered_with_git_observer(
+        db,
+        child_id,
+        workspace,
+        prepared_at,
+        super::git_sources::observe_registered_git_sources_in_workspace,
+    )
+    .await
+}
+
+async fn prepare_registered_with_git_observer(
+    db: &Database,
+    child_id: &str,
+    workspace: RefreshWorkspace,
+    prepared_at: i64,
+    observer: impl FnOnce(
+            &LiveExecutionConfiguration,
+            RefreshWorkspace,
+        ) -> Result<GitSourceSnapshot, crate::errors::GitError>
+        + Send
+        + 'static,
+) -> Result<LivePreparedRefresh> {
+    workspace.require_current()?;
+    let configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let baseline = db.capture_completed_pair_refresh_baseline(&configuration)?;
+    let operation_id = workspace.pin().operation_id;
+    let source_workspace = workspace.clone();
+    let (configuration, git) = tokio::task::spawn_blocking(move || {
+        let git = observer(&configuration, source_workspace)?;
+        Ok::<_, anyhow::Error>((configuration, git))
+    })
+    .await
+    .context("owned Git preparation task failed")??;
+    let svn = observe_registered_svn_sources(&configuration).await?;
+    prepare_observed_sources_at(
+        db,
+        configuration,
+        git,
+        svn,
+        baseline,
+        PreparationLocation {
+            operation_id,
+            prepared_at,
+            workspace: Some(workspace),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn prepare_registered_in_workspace_for_test(
+    db: &Database,
+    child_id: &str,
+    workspace: RefreshWorkspace,
+    client: reqwest::Client,
+) -> Result<LivePreparedRefresh> {
+    prepare_registered_with_git_observer(
+        db,
+        child_id,
+        workspace,
+        chrono::Utc::now().timestamp(),
+        move |configuration, workspace| {
+            super::git_sources::observe_registered_git_sources_in_workspace_for_test(
+                configuration,
+                workspace,
+                client,
+            )
+        },
+    )
+    .await
+}
+
+async fn prepare_observed_sources_at(
+    db: &Database,
+    configuration: LiveExecutionConfiguration,
+    git: GitSourceSnapshot,
+    svn: SvnSourceSnapshot,
+    baseline: Option<PairRefreshOperation>,
+    location: PreparationLocation,
+) -> Result<LivePreparedRefresh> {
+    let PreparationLocation {
+        operation_id,
+        prepared_at,
+        workspace,
+    } = location;
+    if let Some(workspace) = workspace.as_ref() {
+        workspace.require_current()?;
+        if workspace.pin().operation_id != operation_id {
+            bail!("workspace operation identity differs");
+        }
+    }
     let source = configuration.pin();
     let observed = svn.pins();
     let probe = SvnLineagePins {
@@ -170,9 +328,17 @@ async fn prepare_observed_sources(
             bail!("completed baseline Git tree differs from its publication evidence");
         }
     }
-    let operation_directory = tempfile::Builder::new()
-        .prefix("reposync-refresh-preparation-")
-        .tempdir()?;
+    let operation_directory = match workspace {
+        Some(owner) => PreparationDirectory::Workspace {
+            path: owner.create_directory("svn")?,
+            owner,
+        },
+        None => PreparationDirectory::Temporary(
+            tempfile::Builder::new()
+                .prefix("reposync-refresh-preparation-")
+                .tempdir()?,
+        ),
+    };
     let prepared_svn = prepare_clean_child_svn(
         svn.child_client(),
         svn.parent_client(),
@@ -187,6 +353,9 @@ async fn prepare_observed_sources(
         },
     )
     .await?;
+    if let PreparationDirectory::Workspace { owner, .. } = &operation_directory {
+        owner.track_working_copy(&prepared_svn.working_copy)?;
+    }
     let pins = RefreshJobPins {
         child: source.child.clone(),
         parent: source.parent.clone(),
@@ -207,6 +376,9 @@ async fn prepare_observed_sources(
         bail!("registered inputs or baseline evidence changed during preparation");
     }
     db.require_registered_pair_refresh_preparation(&current, &pins)?;
+    if let PreparationDirectory::Workspace { owner, .. } = &operation_directory {
+        owner.require_current()?;
+    }
     Ok(LivePreparedRefresh {
         pins,
         configuration,
@@ -219,3 +391,7 @@ async fn prepare_observed_sources(
 #[cfg(test)]
 #[path = "live_preparation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "workspace_preparation_tests.rs"]
+mod workspace_tests;

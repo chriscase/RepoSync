@@ -3,6 +3,7 @@
 
 use git2::{FetchOptions, Oid, RemoteRedirect, Repository, RepositoryInitOptions};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 use crate::errors::GitError;
 
@@ -12,6 +13,7 @@ use super::publication::{
     checked_anonymous_remote, no_credentials, require_complete_git_graph,
     require_pinned_push_endpoint_with_policy, PinnedPushPolicy,
 };
+use super::workspace::RefreshWorkspace;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObservedGitSourcePins {
@@ -27,7 +29,24 @@ pub struct ObservedGitSourcePins {
 pub struct GitSourceSnapshot {
     repository: Repository,
     pins: ObservedGitSourcePins,
-    _directory: tempfile::TempDir,
+    _directory: SourceDirectory,
+}
+
+enum SourceDirectory {
+    Temporary(tempfile::TempDir),
+    Workspace {
+        path: PathBuf,
+        _owner: RefreshWorkspace,
+    },
+}
+
+impl SourceDirectory {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(directory) => directory.path(),
+            Self::Workspace { path, .. } => path,
+        }
+    }
 }
 
 impl GitSourceSnapshot {
@@ -50,24 +69,65 @@ fn refused(detail: &str) -> GitError {
 pub fn observe_registered_git_sources(
     configuration: &LiveExecutionConfiguration,
 ) -> Result<GitSourceSnapshot, GitError> {
+    observe_with_client(configuration, source_client()?)
+}
+
+fn source_client() -> Result<reqwest::Client, GitError> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|_| refused("could not initialize pinned Git source client"))?;
-    observe_with_client(configuration, client)
+    Ok(client)
+}
+
+pub(crate) fn observe_registered_git_sources_in_workspace(
+    configuration: &LiveExecutionConfiguration,
+    workspace: RefreshWorkspace,
+) -> Result<GitSourceSnapshot, GitError> {
+    observe_in_workspace_with_client(configuration, workspace, source_client()?)
+}
+
+fn observe_in_workspace_with_client(
+    configuration: &LiveExecutionConfiguration,
+    workspace: RefreshWorkspace,
+    client: reqwest::Client,
+) -> Result<GitSourceSnapshot, GitError> {
+    let path = workspace
+        .create_directory("git")
+        .map_err(|_| refused("owned Git resource directory is unavailable"))?;
+    let snapshot = observe_at_directory(
+        configuration,
+        client,
+        SourceDirectory::Workspace {
+            path,
+            _owner: workspace.clone(),
+        },
+    )?;
+    workspace
+        .require_current()
+        .map_err(|_| refused("owned Git resource identity changed"))?;
+    Ok(snapshot)
 }
 
 fn observe_with_client(
     configuration: &LiveExecutionConfiguration,
     client: reqwest::Client,
 ) -> Result<GitSourceSnapshot, GitError> {
-    let pin = configuration.pin();
     let directory = tempfile::Builder::new()
         .prefix("reposync-refresh-git-input-")
         .tempdir()
         .map_err(|_| refused("could not create private Git input directory"))?;
+    observe_at_directory(configuration, client, SourceDirectory::Temporary(directory))
+}
+
+fn observe_at_directory(
+    configuration: &LiveExecutionConfiguration,
+    client: reqwest::Client,
+    directory: SourceDirectory,
+) -> Result<GitSourceSnapshot, GitError> {
+    let pin = configuration.pin();
     let mut init = RepositoryInitOptions::new();
     init.bare(true).external_template(false).no_reinit(true);
     let repository = Repository::init_opts(directory.path(), &init)?;
@@ -120,6 +180,15 @@ fn observe_with_client(
         },
         _directory: directory,
     })
+}
+
+#[cfg(test)]
+pub(super) fn observe_registered_git_sources_in_workspace_for_test(
+    configuration: &LiveExecutionConfiguration,
+    workspace: RefreshWorkspace,
+    client: reqwest::Client,
+) -> Result<GitSourceSnapshot, GitError> {
+    observe_in_workspace_with_client(configuration, workspace, client)
 }
 
 // Private test CA injection does not alter the production client or its TLS

@@ -31,7 +31,9 @@ pub mod candidate_migration;
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_readers;
 
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
@@ -46,8 +48,38 @@ use crate::errors::DatabaseError;
 /// `Mutex` so that `Database` is `Send + Sync`, enabling use inside `Arc`.
 pub struct Database {
     conn: Mutex<Connection>,
+    opened_file: Option<OpenedDatabaseFile>,
     #[cfg(test)]
     test_force_echo_split_fail: Mutex<bool>,
+}
+
+/// Identity observed at connection construction. Resource callers must not
+/// mistake a replacement at the same filename for the connected database.
+#[derive(PartialEq, Eq)]
+pub(crate) struct OpenedDatabaseFile {
+    pub path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub aliased: bool,
+}
+
+impl OpenedDatabaseFile {
+    fn capture(path: &Path) -> Option<Self> {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let parent_metadata = std::fs::symlink_metadata(parent).ok()?;
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let target = std::fs::metadata(&canonical).ok()?;
+        target.is_file().then_some(Self {
+            path: canonical,
+            device: target.dev(),
+            inode: target.ino(),
+            aliased: metadata.file_type().is_symlink() || parent_metadata.file_type().is_symlink(),
+        })
+    }
 }
 
 impl Database {
@@ -58,6 +90,7 @@ impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
         info!(path = %path.display(), "opening database");
+        let prior_file = OpenedDatabaseFile::capture(path);
 
         let conn = Connection::open(path)?;
 
@@ -91,8 +124,14 @@ impl Database {
         }
 
         debug!("database opened successfully with WAL mode");
+        let opened_file = OpenedDatabaseFile::capture(path);
+        let opened_file = match (prior_file, opened_file) {
+            (Some(before), Some(after)) if before != after => None,
+            (_, after) => after,
+        };
         Ok(Self {
             conn: Mutex::new(conn),
+            opened_file,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -104,8 +143,17 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            opened_file: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
+        })
+    }
+
+    pub(crate) fn opened_file(&self) -> Result<&OpenedDatabaseFile, DatabaseError> {
+        self.opened_file.as_ref().ok_or_else(|| {
+            DatabaseError::Other(
+                "pair refresh resources require a known file-backed database".into(),
+            )
         })
     }
 

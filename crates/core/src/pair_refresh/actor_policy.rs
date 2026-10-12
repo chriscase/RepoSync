@@ -38,6 +38,51 @@ pub struct LiveRefreshActorPolicy<'engine> {
 }
 
 impl LiveRefreshActorPolicy<'_> {
+    /// Preserve this owned resource set before any enrollment attempt. Current
+    /// actor/storage checks still do not authorize a job or external effect.
+    pub fn retain_workspace_before_enrollment(
+        &self,
+        engine: &SyncEngine,
+        workspace: &super::workspace::RefreshWorkspace,
+    ) -> Result<(), DatabaseError> {
+        self.require_current(engine)?;
+        workspace.require_binding(self.db, &self.pin)?;
+        workspace.retain_before_enrollment()
+    }
+    /// Observe and prepare registered sources within this owned workspace.
+    /// Server time/operation identity are used; approval/enrollment stay separate.
+    pub async fn prepare_in_workspace(
+        &self,
+        engine: &SyncEngine,
+        child_id: &str,
+        workspace: &super::workspace::RefreshWorkspace,
+    ) -> anyhow::Result<super::live_preparation::LivePreparedRefresh> {
+        self.require_current(engine)?;
+        workspace.require_binding(self.db, &self.pin)?;
+        let prepared = super::live_preparation::prepare_registered_in_workspace(
+            self.db,
+            child_id,
+            workspace.clone(),
+            Utc::now().timestamp(),
+        )
+        .await?;
+        self.require_current(engine)?;
+        workspace.require_binding(self.db, &self.pin)?;
+        Ok(prepared)
+    }
+    /// Allocate owned resources for this actual engine/storage context. This
+    /// does not enroll a job, retain an attempt or authorize a publication.
+    pub fn create_workspace(
+        &self,
+        engine: &SyncEngine,
+    ) -> Result<super::workspace::RefreshWorkspace, DatabaseError> {
+        self.require_current(engine)?;
+        let workspace =
+            super::workspace::create(self.db, &engine.config().daemon.data_dir, &self.pin)?;
+        self.require_current(engine)?;
+        workspace.require_binding(self.db, &self.pin)?;
+        Ok(workspace)
+    }
     pub fn pin(&self) -> &RefreshActorPolicyPin {
         &self.pin
     }

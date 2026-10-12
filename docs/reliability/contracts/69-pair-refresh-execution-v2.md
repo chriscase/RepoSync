@@ -434,6 +434,31 @@ This context still needs atomic binding to authenticated job enrollment,
 retained resources and publication intents. A copied preview pin cannot
 construct the live context, and this component enables no execution endpoint.
 
+Owned preparation resources now live beneath the actual connected database's
+configured data directory. The database records the file identity observed at
+opening; memory, replaced/aliased/hardlinked database paths, foreign roots and
+unsupported owner/permission metadata refuse before resource creation. A fresh
+server operation UUID names its private resource directory. No existing Git
+repository or working copy is adopted or reinitialized. The legacy temporary
+preparation API and its cleanup behavior remain unchanged.
+
+Git observation and SVN preparation share the owned directory lifetime. The
+resource pin includes the original storage/root identities and tracked Git,
+SVN operation and working-copy directory identities. Role/path replacement
+refuses further use or retention. Namespace creation, synchronization and
+unpublished cleanup use held directory descriptors and no-follow opens;
+macOS iteration uses a fresh descriptor relative to the held directory.
+Observed unknown identity retains resources rather than deleting through a
+replacement pathname.
+
+Before any durable enrollment attempt, resources and directory entries are
+synchronized and retention is marked. Cleanup is not conditional on a later
+successful commit: an unknown commit result or abrupt process exit must not
+delete a potentially enrolled job's resources. Marking retention grants no
+admission, publication, adoption or recovery authority. The opaque resources
+still need authenticated atomic enrollment, a global writer barrier, fresh
+remote/actor/policy checks at each first intent and a qualified recovery caller.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary
