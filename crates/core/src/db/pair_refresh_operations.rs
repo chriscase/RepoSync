@@ -822,6 +822,45 @@ fn require_held_execution_inputs(
 }
 
 impl Database {
+    /// Validate newly prepared local evidence without enrolling a request.
+    /// Remote proof and actor authorization come from the separate caller.
+    pub fn require_registered_pair_refresh_preparation(
+        &self,
+        configuration: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        pins: &RefreshJobPins,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &configuration.pin().child.repo_id,
+            )?;
+        if current.pin() != configuration.pin() {
+            return Err(refused("registered inputs changed during preparation"));
+        }
+        current.require_job_configuration(pins)?;
+        pins.validate()?;
+        let operations = journal(&tx)?;
+        require_no_pair_refresh_hold(&tx, Some(&pins.child.repo_id))?;
+        require_no_pair_refresh_hold(&tx, Some(&pins.parent.repo_id))?;
+        require_baseline_provenance(pins, &operations)?;
+        require_execution_conflicts_quiet(&tx, pins)?;
+        for pin in [&pins.child, &pins.parent] {
+            require_other_journals_quiet(&tx, &pin.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &pin.repo_id,
+                &pin.scope_uuid,
+            )?;
+        }
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Read the unique completed receipt for the current child checkpoints.
     /// None means that the first-copy baseline still needs independent proof.
     /// A changed child after an earlier refresh cannot fall back to that case.

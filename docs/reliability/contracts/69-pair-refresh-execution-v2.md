@@ -377,6 +377,25 @@ first-copy and correspondence proof is still required. Credential rotation does
 not invalidate historical publication evidence; current credentials remain a
 separate admission requirement.
 
+The preparation assembler combines those private snapshots with independent
+copy/continuous-parent lineage and full Git/SVN bytes, modes, properties and
+mergeinfo checks. The first supported case requires the current child SVN
+checkpoint to be the original direct-copy creation revision. Its current scoped
+Git checkpoint itself must be a shared ancestor of the advanced parent; an
+arbitrary historical mapping or equal-tree child commit is not substituted.
+A later refresh uses the exact completed receipt selected above, retains the
+original copy origin and parent incarnation, and carries its prior mergeinfo.
+Both results are computed locally before a final read-only registration,
+credential, checkpoint, baseline and writer/conflict check. Preparation neither
+admits a job nor changes a remote ref, remote revision or database checkpoint.
+
+The private preparation resources are temporary and are cleaned on drop. Their
+paths participate in the prepared pins, so a durable execution caller must
+retain or safely reconstruct them before admission; this assembler is not that
+caller. Authenticated actor/effective-policy approval, fresh remote checks at
+each first publication intent, durable retention, exclusive orchestration and
+crash recovery remain required before enabling execution.
+
 Use disposable real Git and svnadmin repositories initialized and synchronized
 through production SyncEngine. Prove preserved histories, mergeinfo, both Git
 parents, corresponding final trees, all checkpoint forms and a no-op ordinary

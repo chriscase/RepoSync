@@ -122,6 +122,16 @@ fn observe_with_client(
     })
 }
 
+// Private test CA injection does not alter the production client or its TLS
+// verification, proxy, redirect or credential behavior.
+#[cfg(test)]
+pub(super) fn observe_registered_git_sources_for_test(
+    configuration: &LiveExecutionConfiguration,
+    client: reqwest::Client,
+) -> Result<GitSourceSnapshot, GitError> {
+    observe_with_client(configuration, client)
+}
+
 fn download_pinned_branch(
     repository: &Repository,
     transport: &HttpTransport,
