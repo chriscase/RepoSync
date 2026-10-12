@@ -3,8 +3,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 function redactText(text, secrets) {
+  // Match a credential, not the rest of the line. Playwright writes the git
+  // diff as one JSON line, and eating through the closing quote made
+  // report.json impossible to parse on run 38188946403.
   let next = text
-    .replace(/Authorization:\s*[^\r\n]+/gi, "Authorization: [redacted]")
+    .replace(/Authorization:\s+(?:Bearer\s+|token\s+)?[A-Za-z0-9._~+/]+=*/gi, "Authorization: [redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/g, "Bearer [redacted]")
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted-private-key]");
   const ordered = [...secrets].filter((secret) => secret && secret.length >= 8).sort((a, b) => b.length - a.length);
@@ -65,6 +68,27 @@ export async function scrubTree(root, secrets = []) {
   return { files };
 }
 
+export function scrubSelfCheck() {
+  const secret = "0123456789abcdef";
+  const jsonLine = JSON.stringify({
+    gitDiff: 'curl -H "Authorization: token $LAB_TOKEN" https://gitea\nnext',
+    actualWorkers: 1,
+  });
+  const redacted = redactText(jsonLine, [secret]);
+  const parsed = JSON.parse(redacted);
+  if (!parsed.gitDiff.includes("$LAB_TOKEN")) {
+    throw new Error("source placeholder was removed from the JSON line");
+  }
+  if (!String(parsed.actualWorkers)) {
+    throw new Error("JSON field after the diff was lost");
+  }
+  const header = `prefix Authorization: Bearer ${secret}\nAuthorization: token ${secret}\n`;
+  const headerOut = redactText(header, [secret]);
+  if (headerOut.includes(secret)) throw new Error("credential remained");
+  if (!headerOut.includes("Authorization: [redacted]")) throw new Error("header was not redacted");
+  return "PASS";
+}
+
 export { redactText };
 
 async function secretsFromFile(path) {
@@ -79,6 +103,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const index = args.indexOf(flag);
     return index === -1 ? "" : args[index + 1] || "";
   };
+  if (args.includes("--self-check")) {
+    console.log(`scrub self-check ${scrubSelfCheck()}`);
+    process.exit(0);
+  }
   const root = get("--root");
   if (!root) {
     console.error("usage: node scrub.mjs --root <dir> [--secrets-file <file>]");

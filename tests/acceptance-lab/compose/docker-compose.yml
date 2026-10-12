@@ -17,15 +17,19 @@ services:
       LDAP_TLS_CA_CRT_FILENAME: ca.crt
       LDAP_TLS_ENFORCE: "false"
       LDAP_REMOVE_CONFIG_AFTER_SETUP: "false"
+      LDAPTLS_CACERT: /container/service/slapd/assets/certs/ca.crt
+      LDAPTLS_REQCERT: demand
     volumes:
-      - ${LAB_RUN_DIR}/certs:/container/service/slapd/assets/certs:ro
+      # osixia chmods and chowns this directory before slapd listens. A
+      # read-only mount exits 1. Run 38188946403 lost the container logs.
+      - ${LAB_RUN_DIR}/certs:/container/service/slapd/assets/certs
       - ${LAB_RUN_DIR}/ldap-seed.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/50-lab.ldif:ro
     networks: [lab]
     labels:
       acceptance-lab.run-id: ${RUN_ID}
       acceptance-lab.disposable: "true"
     healthcheck:
-      test: ["CMD-SHELL", "ldapsearch -H ldaps://ldap:636 -x -D cn=admin,dc=lab,dc=invalid -w \"$$LDAP_ADMIN_PASSWORD\" -b dc=lab,dc=invalid -s base dn >/dev/null"]
+      test: ["CMD-SHELL", "LDAPTLS_CACERT=/container/service/slapd/assets/certs/ca.crt LDAPTLS_REQCERT=demand ldapsearch -H ldaps://ldap:636 -x -D cn=admin,dc=lab,dc=invalid -w \"$$LDAP_ADMIN_PASSWORD\" -b dc=lab,dc=invalid -s base dn >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 30

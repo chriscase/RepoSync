@@ -923,17 +923,39 @@ write_resources() {
   } >> "$EVIDENCE/resources.txt"
 }
 
+capture_service_logs() {
+  local service
+  mkdir -p "$RUN_DIR/logs"
+  for service in "$@"; do
+    compose logs --no-color --tail 120 "$service" > "$RUN_DIR/logs/${service}.log" 2>&1 || true
+  done
+  if [ -f "$RUN_DIR/secret-values.txt" ]; then
+    node "$LAB_DIR/src/scrub.mjs" --root "$RUN_DIR/logs" --secrets-file "$RUN_DIR/secret-values.txt" >/dev/null || true
+  fi
+}
+
 up_stack() {
-  require_docker
+  require_docker || return 1
   local started
   started="$(date +%s)"
-  write_resources
+  write_resources || true
   log "starting services except reposync"
-  compose up -d --wait ldap svn svnserve gitea git-http denied notify fault observer
-  seed_gitea
+  # This function is called from `if`, where set -e does not stop the body.
+  # Each step returns on its own status.
+  if ! compose up -d --wait ldap svn svnserve gitea git-http denied notify fault observer; then
+    capture_service_logs ldap svn gitea || true
+    return 1
+  fi
+  if ! seed_gitea; then
+    capture_service_logs gitea ldap || true
+    return 1
+  fi
   log "starting reposync"
-  compose --profile app up -d --wait reposync
-  write_resources
+  if ! compose --profile app up -d --wait reposync; then
+    capture_service_logs reposync gitea ldap svn || true
+    return 1
+  fi
+  write_resources || true
   log "up finished in $(( $(date +%s) - started ))s"
 }
 
@@ -972,11 +994,14 @@ verify_project_resources() {
 cleanup_run() {
   require_docker || return 1
   verify_project_resources || return 1
-  compose down -v --remove-orphans
+  # reposync is behind the app profile. down without that profile left its
+  # container and volume on run 38188946403.
+  compose --profile app down -v --remove-orphans || return 1
   local left
   left="$(docker ps -aq --filter "label=acceptance-lab.run-id=${RUN_ID}" || true)"
   if [ -n "$left" ]; then
     echo "containers remain for $RUN_ID" >&2
+    docker ps -a --filter "label=acceptance-lab.run-id=${RUN_ID}" --format '{{.Names}} {{.Status}}' >&2 || true
     return 1
   fi
   left="$(docker volume ls -q --filter "label=acceptance-lab.run-id=${RUN_ID}" || true)"
@@ -1215,6 +1240,12 @@ publish_outputs() {
   if [ -f "$RUN_DIR/logs/seed.log" ]; then
     cp "$RUN_DIR/logs/seed.log" "$publish/seed.log"
   fi
+  local service
+  for service in ldap gitea svn reposync; do
+    if [ -s "$RUN_DIR/logs/${service}.log" ]; then
+      cp "$RUN_DIR/logs/${service}.log" "$publish/${service}.log"
+    fi
+  done
   if [ -d "$EVIDENCE/build-graph" ]; then
     mkdir -p "$publish/build-graph"
     cp -R "$EVIDENCE/build-graph/." "$publish/build-graph/"

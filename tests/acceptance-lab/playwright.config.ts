@@ -16,6 +16,9 @@ export default defineConfig({
   workers: Number(process.env.LAB_WORKERS || "1"),
   retries: 0,
   forbidOnly: true,
+  // Keep the commit id. The CI diff embeds this repository, and a later
+  // Authorization scrub of that one JSON line made playwright.json unreadable.
+  captureGitInfo: { commit: true, diff: false },
   grep: pattern,
   reporter: [
     ["list"],

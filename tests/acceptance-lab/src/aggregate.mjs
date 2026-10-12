@@ -141,13 +141,26 @@ async function loadAudit(dir) {
   return { status: "INGESTED", operations, files };
 }
 
+async function readGeneratedJson(path) {
+  const text = await readFile(path, "utf8");
+  try {
+    return { value: JSON.parse(text), error: "" };
+  } catch (error) {
+    return { value: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export async function buildReport(options) {
   const catalog = JSON.parse(await readFile(options.catalogPath, "utf8"));
   const matrix = JSON.parse(await readFile(options.matrixPath, "utf8"));
   const rules = JSON.parse(await readFile(options.rulesPath, "utf8"));
-  const playwright = options.playwrightPath
-    ? JSON.parse(await readFile(options.playwrightPath, "utf8"))
-    : { suites: [] };
+  let playwright = { suites: [] };
+  let playwrightParseError = "";
+  if (options.playwrightPath) {
+    const loaded = await readGeneratedJson(options.playwrightPath);
+    if (loaded.value) playwright = loaded.value;
+    else playwrightParseError = `playwright.json: ${loaded.error}`;
+  }
   const engine = options.enginePath ? JSON.parse(await readFile(options.enginePath, "utf8")) : null;
   const selfTest = options.selfTestPath ? JSON.parse(await readFile(options.selfTestPath, "utf8")) : { cases: [] };
   const audit = await loadAudit(options.auditDir);
@@ -365,6 +378,7 @@ export async function buildReport(options) {
     attempts: walked.attempts,
     first_attempt_preserved: true,
     retries_are_not_pass: true,
+    playwright_parse_error: playwrightParseError,
     rows,
     r_coverage: coverage(rows),
   };
