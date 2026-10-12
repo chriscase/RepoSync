@@ -55,7 +55,6 @@ impl LiveRefreshActorPolicy<'_> {
             self.blocked,
             *self.lfs_threshold,
             &self.bearer,
-            Utc::now(),
         )?;
         if current != self.pin {
             return Err(refused("actor, session or effective policy changed"));
@@ -79,7 +78,6 @@ pub(crate) fn capture<'engine>(
         blocked,
         *lfs_threshold,
         bearer,
-        Utc::now(),
     )?;
     Ok(LiveRefreshActorPolicy {
         engine,
@@ -133,7 +131,7 @@ struct Actor {
     session_expires_at: String,
 }
 
-fn actor(tx: &Connection, bearer: &str, now: DateTime<Utc>) -> Result<Actor, DatabaseError> {
+fn actor(tx: &Connection, bearer: &str) -> Result<Actor, DatabaseError> {
     let actor = tx
         .query_row(
             "SELECT u.id,u.role,u.enabled,u.created_at,u.updated_at,s.created_at,s.expires_at
@@ -153,6 +151,9 @@ fn actor(tx: &Connection, bearer: &str, now: DateTime<Utc>) -> Result<Actor, Dat
         )
         .optional()?
         .ok_or_else(|| refused("current database admin session required"))?;
+    // The connection lock and query may wait. Sample expiry only after reading
+    // the session, so an old entrance timestamp cannot extend authorization.
+    let now = Utc::now();
     let instant = |raw: &str| {
         DateTime::parse_from_rfc3339(raw)
             .map(|time| time.with_timezone(&Utc))
@@ -184,7 +185,6 @@ fn capture_pin(
     blocked: &[String],
     lfs_threshold: u64,
     bearer: &str,
-    now: DateTime<Utc>,
 ) -> Result<RefreshActorPolicyPin, DatabaseError> {
     if bearer.is_empty()
         || bearer.len() > 4096
@@ -196,7 +196,7 @@ fn capture_pin(
     }
     let policy_context_digest = policy_digest(policy, allowed, blocked, lfs_threshold)?;
     db.transaction(|tx| {
-        let actor = actor(tx, bearer, now)?;
+        let actor = actor(tx, bearer)?;
         let encoded = serde_json::to_vec(&("pair_refresh_actor_session_v2", bearer, &actor))
             .map_err(|_| refused("actor context encoding failed"))?;
         let mut mac = Hmac::<Sha256>::new_from_slice(
@@ -211,4 +211,57 @@ fn capture_pin(
             policy_context_digest,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Session, User};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn a_session_that_expires_while_waiting_for_the_database_is_refused() {
+        let db = Arc::new(Database::in_memory().unwrap());
+        db.initialize().unwrap();
+        db.set_state("encryption_key", &"41".repeat(32)).unwrap();
+        let created = (Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+        db.insert_user(&User {
+            id: "admin".into(),
+            username: "admin".into(),
+            display_name: "Admin".into(),
+            email: "admin@example.invalid".into(),
+            password_hash: "fixture".into(),
+            role: "admin".into(),
+            enabled: true,
+            created_at: created.clone(),
+            updated_at: created,
+        })
+        .unwrap();
+        db.insert_session(&Session {
+            token: "disposable-waiting-session".into(),
+            user_id: "admin".into(),
+            created_at: (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+            expires_at: (Utc::now() + chrono::Duration::milliseconds(200)).to_rfc3339(),
+        })
+        .unwrap();
+        let held = db.conn();
+        let other = db.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            capture_pin(
+                &other,
+                &SyncConfig::default(),
+                &[],
+                &[],
+                0,
+                "disposable-waiting-session",
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        drop(held);
+        assert!(thread.join().unwrap().is_err());
+    }
 }

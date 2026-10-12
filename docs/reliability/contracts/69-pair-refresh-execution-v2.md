@@ -420,6 +420,8 @@ context from its own database and configuration. This requires a present,
 enabled database admin with a current session; compatibility in-memory admin
 sessions cannot supply this authority. Stored timestamps are parsed as RFC3339
 instants, including offsets, and malformed, future or expired evidence refuses.
+Expiry is sampled after the session row is read, so waiting for the database
+cannot extend a session using an older entrance timestamp.
 Only direct whole-tree policy with unrestricted branches and disabled size/LFS
 filters is qualified, including the engine's actual path and LFS overrides.
 Safe preview pins contain the actor ID and domain-separated session/policy
