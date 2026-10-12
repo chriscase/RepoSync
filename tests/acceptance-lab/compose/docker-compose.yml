@@ -112,6 +112,7 @@ services:
       GITEA__server__PROTOCOL: https
       GITEA__server__DOMAIN: gitea
       GITEA__server__ROOT_URL: https://gitea:3000/
+      GITEA__repository__DEFAULT_BRANCH: main
       GITEA__server__HTTP_PORT: "3000"
       GITEA__server__CERT_FILE: /certs/gitea.crt
       GITEA__server__KEY_FILE: /certs/gitea.key
