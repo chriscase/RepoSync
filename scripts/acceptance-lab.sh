@@ -356,7 +356,11 @@ for key, value in mapping.items():
     ldif = ldif.replace(key, value)
 if "@@" in ldif:
     raise SystemExit("unreplaced LDIF placeholder")
-(run / "ldap-seed.ldif").write_text(ldif)
+# osixia rewrites this file with sed -i. A single-file mount cannot be
+# renamed, so the seed is a normal file inside a mounted directory.
+seed_dir = run / "ldap-seed"
+seed_dir.mkdir(exist_ok=True)
+(seed_dir / "50-lab.ldif").write_text(ldif)
 apache = (lab / "docker/svn/apache.conf.template").read_text()
 apache = apache.replace("@@LDAP_BIND_DN@@", "uid=svc-bind,ou=services,dc=lab,dc=invalid")
 apache = apache.replace("@@LDAP_BIND_PASSWORD@@", secrets["LDAP_BIND_PASSWORD"])
@@ -377,7 +381,8 @@ PY
   cp "$LAB_DIR/config/authors.toml" "$RUN_DIR/authors.toml"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svn-authz"
   cp "$LAB_DIR/config/svn-authz" "$RUN_DIR/svnserve-authz"
-  chmod 644 "$RUN_DIR/ldap-seed.ldif" "$RUN_DIR/svn-apache.conf" "$RUN_DIR/svnserve-passwd" \
+  chmod 755 "$RUN_DIR/ldap-seed"
+  chmod 644 "$RUN_DIR/ldap-seed/50-lab.ldif" "$RUN_DIR/svn-apache.conf" "$RUN_DIR/svnserve-passwd" \
     "$RUN_DIR/daemon.toml" "$RUN_DIR/authors.toml" "$RUN_DIR/svn-authz" "$RUN_DIR/svnserve-authz"
 }
 
@@ -387,7 +392,7 @@ import pathlib, re, sys
 run = pathlib.Path(sys.argv[1])
 pattern = re.compile(r"company\.com|github\.com|github\.company|mentorg|svn\.company|api\.github\.com|test-token", re.I)
 names = [
-    "daemon.toml", "authors.toml", "ldap-seed.ldif", "svn-apache.conf",
+    "daemon.toml", "authors.toml", "ldap-seed/50-lab.ldif", "svn-apache.conf",
     "svn-authz", "svnserve-passwd", "svnserve-authz", "compose.env",
 ]
 bad = []

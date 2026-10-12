@@ -21,10 +21,12 @@ services:
       LDAPTLS_REQCERT: demand
     volumes:
       # osixia chowns this tree before slapd listens. Read-only mounts exit 1.
-      # Run 38188946403 failed on the cert directory. Run 38190170467 then
-      # failed on 50-lab.ldif. Certificate checking stays demand.
+      # Run 38188946403 failed on the cert directory. Run 38190170467 failed
+      # on a read-only 50-lab.ldif. Run 38190883797 then failed because sed -i
+      # cannot rename a single-file mount. The seed directory is one filesystem.
+      # Certificate checking stays demand.
       - ${LAB_RUN_DIR}/certs:/container/service/slapd/assets/certs
-      - ${LAB_RUN_DIR}/ldap-seed.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/50-lab.ldif
+      - ${LAB_RUN_DIR}/ldap-seed:/container/service/slapd/assets/config/bootstrap/ldif/custom
     networks: [lab]
     labels:
       acceptance-lab.run-id: ${RUN_ID}
