@@ -51,7 +51,11 @@ jobs:
       - run: node tests/acceptance-lab/src/engine-lock-check.mjs
       - name: Install SQLite and SVN for observer regressions
         run: (command -v sqlite3 && command -v svn && command -v svnadmin) || (sudo apt-get update && sudo apt-get install -y sqlite3 subversion)
-      - name: Verify isolation infrastructure failures are rejected
+      # The login-locator control renders banner/error structure in Chromium;
+      # it does not qualify the daemon's web login.
+      - name: Install Chromium for the login locator regression
+        run: npm --prefix tests/acceptance-lab exec -- playwright install --with-deps chromium
+      - name: Verify isolation and harness failures are rejected
         run: npm --prefix tests/acceptance-lab exec -- playwright test -c tests/acceptance-lab/playwright.regression.config.ts --grep-invert 'annotated pass then fails'
       - name: Verify unqualified cases and failures do not omit later cases
         run: node tests/acceptance-lab/src/continuation-check.mjs

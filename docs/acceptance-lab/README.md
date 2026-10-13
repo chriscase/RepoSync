@@ -99,6 +99,28 @@ Syntax, type, and harness-detector checks do not qualify the services, the brows
 
 ## Reading a failure
 
+The follow-up to the `78a06db` review exercises SVN revision gaps with actual
+sibling-path commits between two confirmed content revisions. Empty-to-project
+qualification additionally requires an explicit no-target receipt and cursor;
+quietly omitting the outside revision does not qualify that catalog row.
+SVN refusal checks allow the operator's intentional source revision, require
+unchanged destination/mappings/checkpoints, and require an exact daemon failure
+audit row. `SVN-PROP-ONLY-REV` sets only `svn:eol-style` on an existing file.
+
+The remaining branch-admission cases seed real SVN-derived Git refs and verify
+preview pins, no-copy/no-child/no-journal behavior, copyfrom provenance, replay
+receipts, directional checkpoints, parent isolation and idle repeat. Late-pair
+publish remains PARTIAL unless crash and pre-final activation timing are also
+exercised. LDAP group-role and logout use complete API bodies; observed role
+refusal does not implement group mapping, and logout does not qualify expiry or
+disabled-user revocation. The browser login asserts the actual 401 and the error
+span inside the login form, then requires a successful login. A separate
+Chromium locator regression covers the `lab.invalid` banner collision.
+
+Scrubbed per-case observations are retained under `observations/` in the
+published evidence, alongside Playwright annotations. Regression fixtures and
+negative controls remain implementation checks, not runtime qualification.
+
 `publish/report.md` lists the suite result, whether the audit SHA covers the candidate, and each operation. Infrastructure failures stay infrastructure failures. Product failures stay on their existing owners. This branch already contains four Personal production files, `crates/cli/src/personal/mod.rs`, `import.rs`, `daemon_ctl.rs`, and `crates/personal/src/engine.rs`, so that a fresh personal database is initialized, import commits on the configured branch, and Git-to-SVN errors keep their cause. Those files are part of this draft. The harness repair does not add further production Rust. It does not patch the web UI, shared lockfiles, or PR 194 to make a red case green.
 
 

@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { assertAuthRefusal, assertLdapUser, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
+import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, loginError, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
 
 function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
@@ -37,6 +37,103 @@ async function syncedSvnFile(lab: Lab, op: LabOp, body: string): Promise<void> {
     await lab.triggerSvn(before.svn);
   });
   lab.pass(`${path} published once from SVN; second trigger was idle`);
+}
+
+async function latePairCase(lab: Lab, op: LabOp): Promise<void> {
+  const parent = await own(lab, op);
+  const baseline = await lab.snap(parent);
+  const branch = slug(op.id);
+  await lab.commitGit(parent, `git branch ${branch}\ngit push origin refs/heads/${branch}:refs/heads/${branch}\n`);
+  const source = {...parent, gitBranch: branch, svnBranch: `branches/${branch}`};
+  const commits: string[] = [];
+  if (op.id !== "SVN-BRANCH-COPY") {
+    for (const n of [1, 2]) commits.push(await lab.commitGit(source,
+      `printf 'child${n}\\n' > child${n}.txt\ngit add child${n}.txt\ngit commit -m child${n}\n`));
+  } else {
+    // Advance trunk after selecting B<->rN. A copy of younger HEAD must fail
+    // the provenance/tree checks even if branch admission returned 200.
+    for (const n of [1, 2, 3, 4, 5]) await lab.syncSvnChange(parent,
+      `printf 'younger${n}\\n' > younger${n}.txt\nsvn add younger${n}.txt\n`);
+  }
+  const tip = commits.at(-1) || baseline.git;
+  const parentBefore = await lab.snap(parent);
+  const rowsBefore = await lab.repos();
+  const journals = async () => (await lab.sqlRows("SELECT value FROM kv_state WHERE key LIKE 'late_pair_publish_v1:document:%';"))
+    .map(row => JSON.parse(row.value)).filter(row => row.parent_repo_id === parent.id && row.git_branch === branch);
+  expect(await journals()).toEqual([]);
+  const body = {svn_branch: source.svnBranch, git_branch: branch, dry_run: true,
+    auto_create_svn_branch: false, auto_create_git_branch: false};
+  let plan: any;
+  await lab.expectNoWrite(parent, async () => {
+    const preview = await lab.api("POST", `/api/repos/${parent.id}/branches`, body);
+    if (preview.status !== 200) throw new Error(`valid derived branch preview ${preview.status}: ${preview.text.slice(0, 350)}`);
+    plan = preview.json;
+    expect(plan.parent_id).toBe(parent.id);
+    expect(plan.git_tip).toBe(tip);
+    expect(plan.verified_baseline).toMatchObject({git_sha: baseline.git, svn_revision: Number(baseline.watermark)});
+    expect(plan.pending_git.count).toBe(commits.length);
+    expect(plan.proposed_svn_copy_source_revision).toBe(Number(baseline.watermark));
+    expect(plan.existing_svn_target.exists).toBe(false);
+    expect(plan.scheduler_active).toBe(false);
+    expect(plan.published).toBe(false);
+  });
+  expect(await lab.repos()).toEqual(rowsBefore);
+  expect(await journals()).toEqual([]);
+  const gitRef = (await lab.observer(`set -eu\nauth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')\ngit -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt ls-remote https://gitea:3000/${parent.gitRepo}.git refs/heads/${branch} | awk '{print $1}'\n`)).trim();
+  expect(gitRef).toBe(tip);
+  expect(await lab.svnBytesOrMissing(source, "README.txt")).toBeNull();
+  lab.observation(`${branch}-preview`, {baseline, commits, plan, parentBefore, parentAfter: await lab.snap(parent)});
+  if (op.id === "PAIR-LATE-PREVIEW") {
+    lab.pass("real derived ref with two pending commits previewed at exact baseline/tip; no SVN copy, child row, journal or checkpoint write");
+    return;
+  }
+  const publishBody = {...body, dry_run: false, auto_create_svn_branch: true};
+  const published = await lab.api("POST", `/api/repos/${parent.id}/branches`, publishBody);
+  if (published.status !== 200) throw new Error(`valid derived branch publish ${published.status}: ${published.text.slice(0, 350)}`);
+  expect(published.json).toMatchObject({published: true, scheduler_active: true, git_tip: tip});
+  const rows = (await lab.repos()).filter(row => row.parent_id === parent.id && row.git_branch === branch);
+  if (rows.length !== 1 || rows[0].svn_url !== parent.svnUrl || rows[0].git_repo !== parent.gitRepo || rows[0].svn_branch !== source.svnBranch) throw new Error("published child has incorrect parent/remotes");
+  const child: Pair = {...source, id: rows[0].id, parentId: parent.id};
+  const journal = await journals();
+  expect(journal).toHaveLength(1);
+  expect(journal[0]).toMatchObject({state: "completed", child_repo_id: child.id, baseline_git_sha: baseline.git,
+    baseline_svn_rev: Number(baseline.watermark), svn_copy_source_rev: Number(baseline.watermark), pinned_git_tip: tip,
+    replayed_git_shas: commits});
+  const copyLog = await lab.observer(`set -eu\nsvn log --xml -v --stop-on-copy --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${parent.svnUrl}/${source.svnBranch}\n`);
+  expect(copyLog).toContain(`copyfrom-rev="${baseline.watermark}"`);
+  expect(copyLog).toContain('copyfrom-path="/trunk"');
+  const after = await lab.snap(child);
+  expect(after.git).toBe(tip);
+  expect(after.gitWatermark).toBe(tip);
+  expect(after.gitColumn).toBe(tip);
+  for (const [i, sha] of commits.entries()) {
+    await lab.assertSingleReceipt(child, "git_to_svn", sha);
+    expect(await lab.svnBytes(child, `child${i + 1}.txt`)).toBe(`child${i + 1}\n`);
+    expect(await lab.svnBytesOrMissing(parent, `child${i + 1}.txt`)).toBeNull();
+  }
+  const replayRows = await lab.sqlRows(`SELECT git_sha,svn_rev FROM sync_records WHERE repo_id='${child.id}' AND direction='git_to_svn' AND status='applied' ORDER BY svn_rev;`);
+  expect(replayRows.map(row => row.git_sha)).toEqual(commits);
+  if (commits.length === 2) {
+    expect(Number(replayRows[1].svn_rev)).toBeGreaterThan(Number(replayRows[0].svn_rev));
+    expect(await lab.svnBytesAtRevision(child, "child1.txt", String(replayRows[0].svn_rev))).toBe("child1\n");
+    expect(await lab.svnBytesOrMissing(child, "child2.txt", String(replayRows[0].svn_rev))).toBeNull();
+  } else {
+    for (const n of [1, 2, 3, 4, 5]) expect(await lab.svnBytesOrMissing(child, `younger${n}.txt`)).toBeNull();
+    expect(await lab.svnBytes(child, "README.txt")).toBe(await lab.svnBytesAtRevision(parent, "README.txt", baseline.watermark));
+  }
+  const parentAfter = await lab.snap(parent);
+  for (const field of ["git", "maps", "records", "watermark", "gitWatermark", "gitColumn"] as const) expect(parentAfter[field]).toBe(parentBefore[field]);
+  await lab.expectNoWrite(child, async () => {
+    const repeat = await lab.api("POST", `/api/repos/${parent.id}/branches`, publishBody);
+    assertCompletedPublishRefusal(repeat, branch);
+  });
+  expect(await journals()).toEqual(journal);
+  lab.observation(`${branch}-publish`, {child, baseline, commits, copyLog, journal, replayRows, after, parentBefore, parentAfter});
+  if (op.id === "PAIR-LATE-PUBLISH") {
+    lab.mark("PARTIAL", "baseline copy, two ordered replay receipts, final child activation and idle repeat verified; crash during copy/replay and pre-final activation timing were not injected", "UNQUALIFIED");
+    return;
+  }
+  lab.pass("real SVN-derived ref published with pinned copy provenance, exact replay/checkpoints, unchanged parent and idle repeat");
 }
 
 export async function runCase(lab: Lab, op: LabOp): Promise<void> {
@@ -78,10 +175,12 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     }
     case "LAB_BROWSER_LOCAL_LOGIN":
     case "WEB-LOGIN": {
-      await lab.uiLogin(lab.adminUser, "not-the-admin-password");
+      assertAuthRefusal(await lab.uiLogin(lab.adminUser, "not-the-admin-password"));
       await expect(lab.page).toHaveURL(/\/login/);
-      await expect(lab.page.getByText(/invalid|failed|unauthorized|incorrect/i)).toBeVisible();
-      await lab.uiLogin(lab.adminUser, lab.adminPassword);
+      await expect(loginError(lab.page)).toHaveText(/invalid|failed|unauthorized|incorrect/i);
+      await expect(loginError(lab.page)).toBeVisible();
+      const accepted = await lab.uiLogin(lab.adminUser, lab.adminPassword);
+      if (accepted.status !== 200 || !(accepted.json as {token?: string})?.token) throw new Error("real UI login was not accepted");
       await expect(lab.page).toHaveURL(/\/$/);
       await expect(lab.page.getByRole("link", { name: "Repositories" })).toBeVisible();
       lab.pass("bad password stayed on /login; real password entered the app");
@@ -203,12 +302,10 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     case "GIT-EOL":
     case "GIT-LFS-ONGOING":
     case "GIT-TAG-LIFECYCLE":
-    case "SVN-SYMLINK":
     case "SVN-EXTERNALS":
     case "SVN-PROPS-EOL-KEYWORDS-EXECUTABLE":
     case "SVN-COPY":
     case "SVN-REPLACE":
-    case "SVN-PROP-ONLY-REV":
     case "SVN-TAG-COPY":
     case "SVN-MERGE-NORMAL":
     case "SVN-MERGE-REVERSE":
@@ -231,10 +328,8 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       } else if (op.id.startsWith("SVN-MERGE")) {
         await lab.commitSvn(pair, "printf 'trunk\\n' > merged.txt\nsvn add merged.txt\n");
         await lab.observer(`svn copy --parents --non-interactive --username svc-sync --password "$SVN_PASSWORD" ${pair.svnUrl}/trunk ${pair.svnUrl}/branches/${slug(op.id)} -m branch`);
-      } else if (op.id === "SVN-PROPS-EOL-KEYWORDS-EXECUTABLE" || op.id === "SVN-PROP-ONLY-REV") {
+      } else if (op.id === "SVN-PROPS-EOL-KEYWORDS-EXECUTABLE") {
         await lab.commitSvn(pair, "printf 'prop\\n' > prop.txt\nsvn add prop.txt\nsvn propset svn:executable '*' prop.txt\n");
-      } else if (op.id === "SVN-SYMLINK") {
-        await lab.commitSvn(pair, "ln -s README.txt link.txt\ntest -L link.txt\nsvn add link.txt\nsvn propget svn:special link.txt | grep -F '*'\n");
       } else if (op.id === "SVN-EXTERNALS") {
         await lab.commitSvn(pair, "svn propset svn:externals 'ext https://denied-target:8443/svn/nope' .\n");
       } else {
@@ -259,37 +354,25 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       lab.gap(`${op.id} contract is ${op.contract}. Observed unchanged=${unchanged}. A refusal or partial publish is not the successful workflow.`);
       return;
     }
+    case "SVN-SYMLINK":
+    case "SVN-PROP-ONLY-REV": {
+      const pair = await own(lab, op);
+      const before = await lab.snap(pair);
+      const revision = await lab.commitSvn(pair, op.id === "SVN-SYMLINK"
+        ? "ln -s README.txt link.txt\ntest -L link.txt\nsvn add link.txt\nsvn propget svn:special link.txt | grep -F '*'\n"
+        : "svn propset svn:eol-style LF README.txt\n");
+      // Do not call the operator's source commit a bridge write. A quiet daemon
+      // is also not a refusal: require the exact repository/revision audit row.
+      await lab.expectSvnRefusal(pair, before, revision);
+      lab.pass(`${op.id} intentional SVN r${revision} remained pending; destination/checkpoints stayed pinned and daemon refusal was recorded`);
+      return;
+    }
     case "GIT-BRANCH-CREATE-DERIVED":
     case "PAIR-LATE-PREVIEW":
     case "PAIR-LATE-PUBLISH":
     case "PAIR-CHILD-AHEAD":
     case "SVN-BRANCH-COPY": {
-      const pair = await lab.bootstrap();
-      const preview = await lab.api("POST", `/api/repos/${pair.id}/branches`, {
-        svn_branch: `branches/${slug(op.id)}`,
-        git_branch: slug(op.id),
-        dry_run: true,
-        auto_create_svn_branch: false,
-        auto_create_git_branch: false,
-      });
-      if (op.id === "PAIR-LATE-PUBLISH" || op.id === "GIT-BRANCH-CREATE-DERIVED" || op.id === "PAIR-CHILD-AHEAD") {
-        const published = await lab.api("POST", `/api/repos/${pair.id}/branches`, {
-          svn_branch: `branches/${slug(op.id)}`,
-          git_branch: slug(op.id),
-          dry_run: false,
-          auto_create_svn_branch: true,
-          auto_create_git_branch: true,
-        });
-        if (published.status >= 400) {
-          lab.gap(`${op.id} publish returned ${published.status}: ${published.text.slice(0, 240)}`);
-        }
-        lab.pass(`${op.id} publish returned ${published.status}`);
-        return;
-      }
-      if (preview.status >= 400) throw new Error(`preview ${preview.status} ${preview.text.slice(0, 240)}`);
-      const before = await lab.snap(pair);
-      if (before.svn === "") throw new Error("missing svn revision during preview");
-      lab.pass("dry-run branch preview returned without requiring a remote write");
+      await latePairCase(lab, op);
       return;
     }
     case "GIT-BRANCH-CREATE-UNRELATED":
@@ -463,13 +546,44 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         lab.gap("svn move published bytes; rename detection versus delete/add is a product decision and is not marked supported");
         return;
       }
-      await lab.commitSvn(pair, "printf 'gap\\n' > gap.txt\nsvn add gap.txt\n");
-      await lab.commitSvn(pair, "svn propset lab:note mark gap.txt\n");
-      await lab.commitSvn(pair, "printf 'gap2\\n' > gap.txt\n");
-      const rev = await lab.observer(`svn info --non-interactive --username svc-sync --password "$SVN_PASSWORD" --show-item revision ${pair.svnUrl}/trunk`);
-      await lab.triggerSvn(rev.trim());
-      await lab.waitUntil(async () => (await lab.gitBytesOrMissing(pair, "gap.txt"))?.includes("gap2") || false);
-      lab.pass("content revisions were not dropped around a property-only revision");
+      const first = await lab.syncSvnChange(pair, "printf 'first\\n' > first.txt\nsvn add first.txt\n");
+      expect(await lab.gitBytes(pair, "first.txt")).toBe("first\n");
+      await lab.assertSingleReceipt(pair, "svn_to_git", first.svn);
+      const outside = await lab.commitSvn({...pair, svnBranch: "branches"}, "printf 'outside\\n' > outside.txt\nsvn add outside.txt\n");
+      const outsideLog = await lab.svnRevisionLog(pair, outside);
+      expect(outsideLog).toContain("/branches/outside.txt");
+      expect(outsideLog).not.toContain("/trunk/");
+      await lab.triggerSvn(outside);
+      const postSource = await lab.snap(pair);
+      const outsideStart = Date.now();
+      await expect.poll(async () => {
+        const now = await lab.snap(pair);
+        expect(now.git).toBe(first.git);
+        expect(now.gitWatermark).toBe(first.gitWatermark);
+        expect(now.gitColumn).toBe(first.gitColumn);
+        expect([first.watermark, outside]).toContain(now.watermark);
+        return Date.now() - outsideStart >= 12_000;
+      }, {timeout: 25_000, intervals: [1000]}).toBe(true);
+      const afterOutside = await lab.snap(pair);
+      expect(afterOutside.git).toBe(first.git);
+      expect(await lab.gitBytesOrMissing(pair, "outside.txt")).toBeNull();
+      expect(await lab.gitBytesOrMissing(pair, "branches/outside.txt")).toBeNull();
+      const emptyReceipts = await lab.sqlRows(`SELECT action,svn_rev,details FROM audit_log WHERE repo_id='${pair.id}' AND svn_rev=${outside} AND action='svn_to_git_no_target' AND success=1;`);
+      const second = await lab.syncSvnChange(pair, "printf 'second\\n' > second.txt\nsvn add second.txt\n");
+      expect(Number(second.svn)).toBeGreaterThan(Number(first.svn) + 1);
+      expect(second.watermark).toBe(second.svn);
+      expect(await lab.gitBytes(pair, "first.txt")).toBe("first\n");
+      expect(await lab.gitBytes(pair, "second.txt")).toBe("second\n");
+      expect(await lab.gitBytesOrMissing(pair, "outside.txt")).toBeNull();
+      expect(await lab.gitBytesOrMissing(pair, "branches/outside.txt")).toBeNull();
+      await lab.assertSingleReceipt(pair, "svn_to_git", second.svn);
+      await lab.expectNoWrite(pair, () => lab.triggerSvn(second.svn));
+      lab.observation(`${slug(op.id)}-gap`, {first, outside, outsideLog, postSource, afterOutside, emptyReceipts, second});
+      if (op.id === "SVN-EMPTY-REV" && emptyReceipts.length !== 1) {
+        lab.gap("outside-path revision was exercised between two confirmed content revisions, but has no explicit no-target audit receipt; the empty-revision catalog contract remains unqualified");
+      }
+      if (op.id === "SVN-EMPTY-REV") expect(afterOutside.watermark).toBe(outside);
+      lab.pass("two content revisions each published once across a real sibling-path SVN revision; outside bytes stayed absent and repeat was idle");
       return;
     }
     case "PAIR-IMPORT-FULL":
@@ -650,12 +764,15 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       }
       if (op.id === "LDAP-GROUP-ROLE") {
         const result = await lab.login("alice", lab.alicePassword);
+        assertLdapUser(result, "alice");
         const role = (result.json as { user?: { role?: string } }).user?.role;
-        const denied = await lab.api("PUT", "/api/admin/ldap", { enabled: true }, (result.json as { token?: string }).token || "");
-        if (role === "admin" || denied.status !== 401 && denied.status !== 403) {
-          lab.gap(`group member alice role=${role} ldap PUT ${denied.status}`);
-        }
-        lab.gap("alice is in reposync-admins and was not granted admin. Group-to-role is not implemented.");
+        const body = lab.ldapConfig();
+        // The same complete body was accepted by enableLdap as local admin.
+        // A schema error must never stand in for an authorization refusal.
+        const denied = await lab.api("PUT", "/api/admin/ldap", body, (result.json as { token: string }).token);
+        if (role !== "user" || ![401, 403].includes(denied.status)) throw new Error(`group member alice role=${role} valid ldap PUT ${denied.status}`);
+        lab.observation("ldap-group-role", {username: "alice", role, valid_config_status: denied.status});
+        lab.mark("PARTIAL", "LDAP group member alice has role=user and a valid admin configuration PUT was refused; group-to-role mapping remains NOT_IMPLEMENTED", "UNQUALIFIED");
         return;
       }
       if (op.id === "LDAP-IDENTITY-MAP") {
@@ -707,11 +824,15 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       }
       if (op.id === "LDAP-SESSION-EXPIRY-LOGOUT") {
         const result = await lab.login("alice", lab.alicePassword);
-        const token = (result.json as { token?: string }).token || "";
-        const out = await lab.api("POST", "/api/auth/logout", {}, token);
+        assertLdapUser(result, "alice");
+        const token = (result.json as { token: string }).token;
+        const before = await lab.api("GET", "/api/auth/me", undefined, token);
+        if (before.status !== 200) throw new Error(`fresh LDAP session ${before.status}`);
+        const out = await lab.api("POST", "/api/auth/logout", {token}, token);
         const again = await lab.api("GET", "/api/auth/me", undefined, token);
-        if (out.status >= 400 || again.status !== 401) throw new Error(`logout ${out.status} reuse ${again.status}`);
-        lab.pass("logout token was rejected");
+        if (out.status !== 200 || !(out.json as {ok?: boolean})?.ok || again.status !== 401) throw new Error(`valid logout ${out.status} reuse ${again.status}`);
+        lab.observation("ldap-logout", {fresh_session: before.status, logout: out.status, reused_session: again.status});
+        lab.mark("PARTIAL", "valid logout removed a working LDAP session and reuse returned 401; 24-hour expiry and disabled-user revocation were not exercised", "UNQUALIFIED");
         return;
       }
       if (op.id === "LDAP-DUP-OR-MISSING-ATTR" || op.id === "LDAP-FALLTHROUGH") {

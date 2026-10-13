@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { expect, type Page, type TestInfo } from "@playwright/test";
 
@@ -25,7 +25,28 @@ export type Pair = {
   parentId?: string;
 };
 
-type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
+export type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
+
+export function assertSvnRefusalState(before: Snap, now: Snap, revision: string): void {
+  // The operator owns the new SVN revision. Only the bridge's destination,
+  // mappings and directional checkpoints must remain at the pre-source pins.
+  if (now.svn !== revision) throw new Error("SVN source moved beyond the intentional fixture revision");
+  for (const field of ["git", "maps", "watermark", "gitWatermark", "gitColumn"] as const) {
+    if (now[field] !== before[field]) throw new Error(`SVN refusal contract changed ${field}: ${before[field]} -> ${now[field]}`);
+  }
+}
+
+export function loginError(page: Page) {
+  // Login.tsx renders its error span in the red border inside the form. The
+  // LDAP domain badge lives outside it and may legitimately contain "invalid".
+  return page.locator("form .border-red-700 span");
+}
+
+export function assertCompletedPublishRefusal(result: {status: number; json: unknown}, branch: string): void {
+  if (result.status !== 400 || (result.json as {error?: string} | null)?.error !== `a branch pair with git_branch '${branch}' already exists`) {
+    throw new Error(`repeat publish did not return the completed-child refusal (${result.status})`);
+  }
+}
 
 function required(name: string): string {
   const value = process.env[name];
@@ -149,6 +170,42 @@ export class Lab {
   gap(reason: string): never {
     this.mark("FAIL", reason, "UNQUALIFIED");
     throw new Error(reason);
+  }
+
+  observation(name: string, data: unknown): void {
+    let text = JSON.stringify(data);
+    for (const secret of [this.svnPassword, this.gitToken, this.adminPassword, this.alicePassword,
+      this.bobPassword, this.bindPassword, this.localPassword, this.webhookSecret, this.svnWebhookSecret, ...this.minted]) {
+      if (secret) text = text.replaceAll(secret, "[redacted]");
+    }
+    this.info.annotations.push({type: "labObservation", description: `${name}: ${text}`});
+    const root = `${required("LAB_RUN_DIR")}/evidence/observations`;
+    mkdirSync(root, {recursive: true});
+    writeFileSync(`${root}/${safe(name, "observation")}-${randomBytes(4).toString("hex")}.json`, text + "\n");
+  }
+
+  async sqlRows(sql: string): Promise<Array<Record<string, any>>> {
+    // SQL is supplied only by harness code; observations always open readonly.
+    const encoded = Buffer.from(sql, "utf8").toString("base64");
+    const result = await this.sh("reposync", `set -eu\nprintf %s '${encoded}' | base64 -d | sqlite3 -readonly -json /var/lib/reposync/reposync.db`, "root");
+    return result.trim() ? JSON.parse(result) : [];
+  }
+
+  async expectSvnRefusal(pair: Pair, before: Snap, revision: string): Promise<void> {
+    if (!/^[0-9]+$/.test(revision)) throw new Error("invalid refusal source revision");
+    const postSource = await this.snap(pair);
+    this.observation(`${pair.name}-refusal-source`, {before, postSource, revision});
+    assertSvnRefusalState(before, postSource, revision);
+    await this.triggerSvn(revision);
+    const start = Date.now();
+    let receipt: Array<Record<string, any>> = [];
+    await this.waitUntil(async () => {
+      const now = await this.snap(pair);
+      assertSvnRefusalState(before, now, revision);
+      receipt = await this.sqlRows(`SELECT action,svn_rev,details,success,repo_id FROM audit_log WHERE repo_id='${safe(pair.id, "repo id")}' AND svn_rev=${revision} AND direction='svn_to_git' AND action='svn_to_git_apply_failed' AND success=0;`);
+      return Date.now() - start >= 12_000 && receipt.length > 0;
+    }, 25_000);
+    this.observation(`${pair.name}-refusal-receipt`, {revision, receipt, after: await this.snap(pair)});
   }
 
   async sh(service: string, script: string, user = ""): Promise<string> {
@@ -629,14 +686,15 @@ sqlite3 -readonly "$db" "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.i
     return bytes;
   }
 
-  async svnBytesOrMissing(pair: Pair, path: string): Promise<string | null> {
+  async svnBytesOrMissing(pair: Pair, path: string, revision?: string): Promise<string | null> {
     const rel = safeRelativePath(path);
+    if (revision !== undefined && !/^[0-9]+$/.test(revision)) throw new Error("invalid SVN read revision");
     return readResult(await this.observer(`
 set -eu
 export LC_ALL=C
 data=$(mktemp); err=$(mktemp)
 trap 'rm -f "$data" "$err"' EXIT
-if svn cat --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
+if svn cat ${revision === undefined ? "" : `-r ${revision}`} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
   ${svnTarget(pair)}/${rel} >"$data" 2>"$err"; then
   printf 'LAB_READ_PRESENT\\n'; cat "$data"
 elif grep -q "W160013:.*path not found" "$err" && ! grep -E '(E|W)[0-9]{6}' "$err" | grep -Ev '(W160013|E200009)' >/dev/null; then
@@ -688,6 +746,16 @@ svn commit --non-interactive --username ${user} --password "${password}" -m "lab
     const committed = output.match(/^Committed revision ([0-9]+)\.$/m);
     if (!committed) throw new Error("SVN commit did not return a committed revision");
     return committed[1];
+  }
+
+  async svnRevisionLog(pair: Pair, revision: string): Promise<string> {
+    if (!/^[0-9]+$/.test(revision)) throw new Error("invalid SVN log revision");
+    return this.observer(`set -eu\nsvn log --xml -v -r ${revision} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${pair.svnUrl}\n`);
+  }
+
+  async svnBytesAtRevision(pair: Pair, path: string, revision: string): Promise<string> {
+    if (!/^[0-9]+$/.test(revision)) throw new Error("invalid SVN read revision");
+    return this.observer(`set -eu\nsvn cat -r ${revision} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${svnTarget(pair)}/${safeRelativePath(path)}\n`);
   }
 
   async commitGit(pair: Pair, script: string, ref = pair.gitBranch || "main", publish = true): Promise<string> {
@@ -774,9 +842,8 @@ git rev-parse HEAD
     }, { timeout: 25_000, intervals: [1000] }).toBe(true);
   }
 
-  async enableLdap(): Promise<void> {
-    await this.admin();
-    const saved = await this.api("PUT", "/api/admin/ldap", {
+  ldapConfig() {
+    return {
       enabled: true,
       url: "ldaps://ldap:636",
       base_dn: "dc=lab,dc=invalid",
@@ -787,7 +854,12 @@ git rev-parse HEAD
       bind_dn: "uid=svc-bind,ou=services,dc=lab,dc=invalid",
       bind_password: this.bindPassword,
       tls_verify: true,
-    });
+    };
+  }
+
+  async enableLdap(): Promise<void> {
+    await this.admin();
+    const saved = await this.api("PUT", "/api/admin/ldap", this.ldapConfig());
     if (saved.status !== 200) throw new Error(`save ldap failed (${saved.status})`);
   }
 
@@ -800,7 +872,7 @@ git rev-parse HEAD
     this.info.annotations.push({type: "labObservation", description: "Daemon observed the LDAP server rejecting the configured service-account bind after the accepted configuration change"});
   }
 
-  async uiLogin(username: string, password: string): Promise<void> {
+  async uiLogin(username: string, password: string): Promise<{status: number; json: unknown}> {
     await this.page.goto("/login");
     await this.page.evaluate(() => localStorage.clear());
     await this.page.goto("/login");
@@ -810,10 +882,12 @@ git rev-parse HEAD
     const reply = this.page.waitForResponse(response => response.url().endsWith("/api/auth/login") && response.request().method() === "POST");
     await this.page.getByRole("button", { name: "Sign in" }).click();
     const response = await reply;
+    const json = await response.json();
     if (response.status() === 200) {
-      const token = (await response.json() as {token?: string}).token;
+      const token = (json as {token?: string}).token;
       if (token) this.rememberSecret(token);
     }
+    return {status: response.status(), json};
   }
 
   async restartDaemon(): Promise<void> {
