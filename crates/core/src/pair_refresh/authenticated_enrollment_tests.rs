@@ -2315,8 +2315,59 @@ async fn new_epoch_and_unknown_or_live_native_owner_cannot_adopt_signed_resource
         .enroll_prepared(&engine, &prepared, "native-owner-refusal", &approved, &busy)
         .unwrap();
     let old_epoch = fence.epoch();
+    let prior_lease = f.db.get_state("writer_fence_v1:lease").unwrap().unwrap();
     drop(fence);
-    let next = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let before_refused_claim = f.state();
+    assert!(crate::writer_fence::claim(engine.db(), f.temp.path()).is_err());
+    assert_eq!(f.state(), before_refused_claim);
+
+    // Keep exercising the later recovery gate against a stale ordinary epoch,
+    // even though ordinary startup now refuses to create that state. Acquire a
+    // new epoch in a separate disposable database and copy only its lease rows
+    // into this fixture. The signed journal and private key remain untouched.
+    let held_journal: Vec<_> = before_refused_claim
+        .iter()
+        .filter(|(key, _, _)| key.starts_with("pair_refresh_execution_v3:"))
+        .cloned()
+        .collect();
+    assert!(!held_journal.is_empty());
+    let foreign_epoch_dir = tempfile::tempdir().unwrap();
+    let foreign_epoch_db = Database::new(foreign_epoch_dir.path().join("reposync.db")).unwrap();
+    foreign_epoch_db.initialize().unwrap();
+    let mut stale_lease: serde_json::Value = serde_json::from_str(&prior_lease).unwrap();
+    stale_lease["holder_pid"] = serde_json::json!(0);
+    foreign_epoch_db
+        .set_state(
+            "writer_fence_v1:lease",
+            &serde_json::to_string(&stale_lease).unwrap(),
+        )
+        .unwrap();
+    let next = crate::writer_fence::claim(&foreign_epoch_db, foreign_epoch_dir.path()).unwrap();
+    let foreign_rows: Vec<(String, String, String)> = foreign_epoch_db
+        .conn()
+        .prepare("SELECT key,value,updated_at FROM kv_state WHERE key IN ('writer_fence_v1:lease','writer_fence_v1:native') ORDER BY key")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    f.db.immediate_transaction(|tx| {
+        for (key, value, updated_at) in &foreign_rows {
+            tx.execute(
+                "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                rusqlite::params![key, value, updated_at],
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        f.state()
+            .into_iter()
+            .filter(|(key, _, _)| key.starts_with("pair_refresh_execution_v3:"))
+            .collect::<Vec<_>>(),
+        held_journal
+    );
     assert!(next.epoch() > old_epoch);
     let state = journal_state(&f);
     assert!(super::super::recovery::prepare_owned_refresh_recovery(
@@ -3158,6 +3209,12 @@ async fn owned_service_native_restart_handles_prepared_and_uncertain_svn_git() {
         };
         assert_eq!(approval.kind, "recovery");
         assert_eq!(approval.operation_id, id);
+        let before = journal_after_native_lease_claim(
+            &f,
+            &before,
+            op.admitted_writer_epoch,
+            std::process::id(),
+        );
         assert_eq!(journal_state(&f), before);
         assert_eq!(f.db.pair_refresh_operation(id).unwrap(), op);
         assert!(service
@@ -3488,7 +3545,10 @@ async fn recovery_server_fence_lifetime_preserves_held_epoch_and_cleans_only_ter
     actor
         .cancel_prepared_enrollment(&engine, &prepared, &busy)
         .unwrap();
-    let terminal = journal_state(&f);
+    let terminal = journal_state(&f)
+        .into_iter()
+        .filter(|(key, _, _)| key != "writer_fence_v1:native")
+        .collect::<Vec<_>>();
     fence.release_if_quiet(engine.db()).unwrap();
     assert!(f.db.get_state("writer_fence_v1:lease").unwrap().is_none());
     assert!(f.db.get_state("writer_fence_v1:native").unwrap().is_none());
@@ -3597,4 +3657,80 @@ raise SystemExit(1)
         1
     );
     assert!(crate::busy::try_acquire_pair("child", "parent").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_startup_and_unproved_claim_preserve_a_valid_authenticated_hold() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let digest = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let op = actor
+        .enroll_prepared(&engine, &prepared, "held-startup", &digest, &busy)
+        .unwrap();
+    drop(fence);
+    drop(lock);
+    let before = f.state();
+    let path = f.temp.path().join("reposync.db");
+    let wal = path.with_extension("db-wal");
+    let bytes = std::fs::read(&path).unwrap();
+    let wal_bytes = std::fs::read(&wal).unwrap();
+    assert!(Database::open_with_exclusive_owner(f.temp.path()).is_err());
+    assert_eq!(f.state(), before);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read(&wal).unwrap(), wal_bytes);
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    assert!(crate::writer_fence::claim(engine.db(), f.temp.path()).is_err());
+    assert_eq!(f.state(), before);
+    assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+}
+
+// Only successful native claims use this expected-state builder. Ordinary
+// journal snapshots keep native metadata visible, including renewal invariance.
+fn journal_after_native_lease_claim(
+    f: &Fixture,
+    before: &[(String, String, String)],
+    previous_epoch: u64,
+    expected_pid: u32,
+) -> Vec<(String, String, String)> {
+    let lease: serde_json::Value =
+        serde_json::from_str(&f.db.get_state("writer_fence_v1:lease").unwrap().unwrap()).unwrap();
+    let native_row = journal_state(f)
+        .into_iter()
+        .find(|(key, _, _)| key == "writer_fence_v1:native")
+        .unwrap();
+    let native: serde_json::Value = serde_json::from_str(&native_row.1).unwrap();
+    for field in [
+        "version",
+        "epoch",
+        "holder_pid",
+        "holder_host",
+        "acquired_at",
+    ] {
+        assert_eq!(native["lease"][field], lease[field], "{field}");
+    }
+    assert!(lease["epoch"].as_u64().unwrap() > previous_epoch);
+    assert_eq!(lease["holder_pid"].as_u64(), Some(u64::from(expected_pid)));
+    let owner: crate::pair_refresh::native_owner::NativeProcessOwner =
+        serde_json::from_value(native["owner"].clone()).unwrap();
+    owner.validate().unwrap();
+    assert_eq!(owner.pid(), expected_pid);
+    assert!(owner
+        .same_domain(&crate::pair_refresh::native_owner::NativeProcessOwner::capture().unwrap()));
+    let mut expected = before
+        .iter()
+        .filter(|(key, _, _)| key != "writer_fence_v1:native")
+        .cloned()
+        .collect::<Vec<_>>();
+    expected.push(native_row);
+    expected.sort();
+    expected
 }

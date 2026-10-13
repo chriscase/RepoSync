@@ -186,6 +186,34 @@ struct NativeLease {
     owner: crate::pair_refresh::native_owner::NativeProcessOwner,
 }
 
+fn same_lease_acquisition(captured: &WriterLease, current: &WriterLease) -> bool {
+    captured.version == current.version
+        && captured.epoch == current.epoch
+        && captured.holder_pid == current.holder_pid
+        && captured.holder_host == current.holder_host
+        && captured.acquired_at == current.acquired_at
+}
+
+fn native_lease_matches(captured: &WriterLease, current: &WriterLease) -> bool {
+    if !same_lease_acquisition(captured, current) {
+        return false;
+    }
+    if captured.renewed_at == current.renewed_at {
+        return true;
+    }
+    // A heartbeat can advance only the ordinary lease's observation time. It
+    // cannot change which acquisition or native process owns that epoch.
+    let parse = chrono::DateTime::parse_from_rfc3339;
+    match (
+        parse(&captured.acquired_at),
+        parse(&captured.renewed_at),
+        parse(&current.renewed_at),
+    ) {
+        (Ok(acquired), Ok(recorded), Ok(renewed)) => acquired <= recorded && recorded <= renewed,
+        _ => false,
+    }
+}
+
 fn local_host_id() -> String {
     if let Ok(host) = std::env::var("REPOSYNC_FENCE_HOST") {
         if !host.is_empty() {
@@ -265,10 +293,14 @@ fn store_lease_with_native(
         native
     };
     if let Some(previous) = &previous_native {
-        if prior.as_ref() != Some(&previous.lease)
+        if !prior
+            .as_ref()
+            .is_some_and(|prior| native_lease_matches(&previous.lease, prior))
             || previous.owner.pid() != previous.lease.holder_pid
             || native.is_none()
-            || (previous.lease.epoch == lease.epoch && native.as_ref() != Some(&previous.owner))
+            || (previous.lease.epoch == lease.epoch
+                && (!native_lease_matches(&previous.lease, lease)
+                    || native.as_ref() != Some(&previous.owner)))
         {
             return Err(DatabaseError::WriterFenced(
                 "native lease acquisition identity changed or became unknown".into(),
@@ -294,6 +326,14 @@ fn store_lease_with_native(
             Utc::now().to_rfc3339()
         ],
     )?;
+    if previous_native
+        .as_ref()
+        .is_some_and(|previous| previous.lease.epoch == lease.epoch)
+    {
+        // Acquisition evidence is immutable for this epoch. Validation above
+        // still recaptures the actual owner before the ordinary lease changes.
+        return Ok(());
+    }
     if let Some(owner) = native {
         let metadata = NativeLease {
             lease: lease.clone(),
@@ -421,6 +461,7 @@ fn claim_lease_tx(tx: &Connection, host: &str, pid: u32) -> Result<u64, Database
             "taking over stale writer fence lease"
         );
     }
+    crate::db::pair_refresh_operations::require_no_authenticated_startup_hold(tx)?;
     let floor = crate::db::pair_refresh_operations::authenticated_refresh_epoch_floor(tx)?;
     let previous = existing_epoch_floor(tx)?.max(floor);
     let epoch = previous
@@ -467,7 +508,7 @@ pub(crate) fn claim_authenticated_recovery_tx(
             DatabaseError::WriterFenced("recovery lease has no native acquisition evidence".into())
         })?)
         .map_err(|_| DatabaseError::WriterFenced("invalid native lease evidence".into()))?;
-        if native.lease != *lease
+        if !native_lease_matches(&native.lease, lease)
             || native.owner.pid() != lease.holder_pid
             || lease.epoch < previous_epoch
             || (lease.epoch == previous_epoch && native.owner != *proof.old())
@@ -555,6 +596,12 @@ pub fn require_current(tx: &Connection) -> Result<(), DatabaseError> {
     let Some(lease) = lease else {
         return Ok(());
     };
+    require_current_holder(&lease)?;
+    renew_lease_tx(tx, &lease)?;
+    Ok(())
+}
+
+fn require_current_holder(lease: &WriterLease) -> Result<(), DatabaseError> {
     let Some((holder_host, holder_pid)) = current_holder_identity() else {
         return Err(DatabaseError::WriterFenced(format!(
             "writer fence epoch not held locally; active holder is host {} PID {} epoch {}",
@@ -573,8 +620,47 @@ pub fn require_current(tx: &Connection) -> Result<(), DatabaseError> {
             "writer fence holder identity mismatch".into(),
         ));
     }
-    renew_lease_tx(tx, &lease)?;
     Ok(())
+}
+
+/// An idempotent admission may return an existing record without renewing any
+/// durable evidence. Recheck the actual holder and native acquisition just as
+/// renewal would; this grants no new epoch or publication authority.
+pub(crate) fn require_owned_current_readonly(tx: &Connection) -> Result<u64, DatabaseError> {
+    let lease = read_lease(tx)?.ok_or_else(|| {
+        DatabaseError::WriterFenced("pair refresh requires an enrolled writer lease".into())
+    })?;
+    if lease.epoch == 0 || lease.holder_pid == 0 || lease.holder_host.is_empty() {
+        return Err(DatabaseError::WriterFenced(
+            "pair refresh requires a valid writer lease".into(),
+        ));
+    }
+    require_current_holder(&lease)?;
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [NATIVE_LEASE_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(raw) = raw {
+        let native: NativeLease = serde_json::from_str(&raw)
+            .map_err(|_| DatabaseError::WriterFenced("invalid native lease evidence".into()))?;
+        if !native_lease_matches(&native.lease, &lease)
+            || native.owner.pid() != lease.holder_pid
+            || crate::pair_refresh::native_owner::NativeProcessOwner::capture().as_ref()
+                != Some(&native.owner)
+        {
+            return Err(DatabaseError::WriterFenced(
+                "native lease acquisition identity changed or became unknown".into(),
+            ));
+        }
+    } else if lease.holder_host.starts_with("pair-refresh-native-") {
+        return Err(DatabaseError::WriterFenced(
+            "native recovery claim has no acquisition evidence".into(),
+        ));
+    }
+    Ok(lease.epoch)
 }
 
 /// Require an enrolled current daemon writer for a new pair-refresh job.
@@ -908,8 +994,8 @@ mod native_lease_transition_tests {
             epoch,
             holder_pid: std::process::id(),
             holder_host: host.into(),
-            acquired_at: "original".into(),
-            renewed_at: "original".into(),
+            acquired_at: "2026-10-13T00:00:00Z".into(),
+            renewed_at: "2026-10-13T00:00:00Z".into(),
         }
     }
     fn state(db: &Database) -> (Option<String>, Option<String>) {
@@ -937,7 +1023,7 @@ mod native_lease_transition_tests {
         .unwrap();
         let before = state(&db);
         let mut renewed = original.clone();
-        renewed.renewed_at = "renewed".into();
+        renewed.renewed_at = "2026-10-13T00:00:01Z".into();
         for candidate in [Some(owner("c")), None] {
             assert!(db
                 .immediate_transaction(|tx| store_lease_with_native(tx, &renewed, candidate, None))
@@ -948,8 +1034,10 @@ mod native_lease_transition_tests {
             .unwrap();
         let stored: NativeLease =
             serde_json::from_str(&db.get_state(NATIVE_LEASE_KEY).unwrap().unwrap()).unwrap();
-        assert_eq!(stored.lease, renewed);
+        assert_eq!(stored.lease, original);
         assert_eq!(stored.owner, a);
+        assert_eq!(db.get_state(NATIVE_LEASE_KEY).unwrap(), before.1);
+        assert_eq!(read_lease(&db.conn()).unwrap(), Some(renewed));
     }
 
     #[test]
@@ -980,7 +1068,7 @@ mod native_lease_transition_tests {
             .is_err());
         assert_eq!(state(&db), before);
         let mut renewed = claim.clone();
-        renewed.renewed_at = "renewed".into();
+        renewed.renewed_at = "2026-10-13T00:00:01Z".into();
         assert!(db
             .immediate_transaction(|tx| store_lease_with_native(tx, &renewed, None, None))
             .is_err());
@@ -1057,4 +1145,199 @@ fn legacy_native_unknown_stays_unknown_until_a_new_epoch_is_acquired() {
         serde_json::from_str(&db.get_state(NATIVE_LEASE_KEY).unwrap().unwrap()).unwrap();
     assert_eq!(stored.lease, acquired);
     assert_eq!(stored.owner, current);
+}
+
+#[cfg(test)]
+#[test]
+fn owned_readonly_fence_check_preserves_all_rows_and_rejects_unknown_native_evidence() {
+    let _serial = tests::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::new(dir.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    let _owner = claim(&db, dir.path()).unwrap();
+    let rows = || {
+        let conn = db.conn();
+        let mut query = conn
+            .prepare("SELECT key,value,updated_at FROM kv_state ORDER BY key")
+            .unwrap();
+        query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before = rows();
+    assert_eq!(
+        db.immediate_transaction(require_owned_current_readonly)
+            .unwrap(),
+        _owner.epoch()
+    );
+    assert_eq!(rows(), before);
+    db.set_state(NATIVE_LEASE_KEY, "unknown-native-evidence")
+        .unwrap();
+    let corrupt = rows();
+    assert!(db
+        .immediate_transaction(require_owned_current_readonly)
+        .is_err());
+    assert_eq!(rows(), corrupt);
+}
+
+#[cfg(test)]
+#[test]
+fn native_acquisition_bytes_survive_heartbeats_and_still_bind_the_current_lease() {
+    let _serial = tests::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::new(dir.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    let owner: crate::pair_refresh::native_owner::NativeProcessOwner =
+        serde_json::from_value(serde_json::json!({
+            "version":1,"platform":"linux","host_digest":"a".repeat(64),
+            "boot_digest":"b".repeat(64),"pid_namespace":"1:2",
+            "pid":std::process::id(),"uid":rustix::process::geteuid().as_raw()
+        }))
+        .unwrap();
+    let original = WriterLease {
+        version: 1,
+        epoch: 1,
+        holder_pid: std::process::id(),
+        holder_host: "fixture".into(),
+        acquired_at: "2026-10-13T00:00:00Z".into(),
+        renewed_at: "2026-10-13T00:00:00Z".into(),
+    };
+    db.immediate_transaction(|tx| {
+        store_lease_with_native(tx, &original, Some(owner.clone()), None)
+    })
+    .unwrap();
+    let native_row = || {
+        db.conn()
+            .query_row(
+                "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                [NATIVE_LEASE_KEY],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap()
+    };
+    let acquisition = native_row();
+    for at in ["2026-10-13T00:00:01Z", "2026-10-13T00:00:02Z"] {
+        let renewed = WriterLease {
+            renewed_at: at.into(),
+            ..original.clone()
+        };
+        db.immediate_transaction(|tx| {
+            store_lease_with_native(tx, &renewed, Some(owner.clone()), None)
+        })
+        .unwrap();
+        assert_eq!(read_lease(&db.conn()).unwrap(), Some(renewed.clone()));
+        assert_eq!(native_row(), acquisition);
+        assert!(native_lease_matches(&original, &renewed));
+    }
+    let mut changed = original.clone();
+    changed.holder_host = "another-acquisition".into();
+    assert!(!native_lease_matches(&original, &changed));
+    assert!(db
+        .immediate_transaction(|tx| store_lease_with_native(
+            tx,
+            &changed,
+            Some(owner.clone()),
+            None
+        ))
+        .is_err());
+    assert_eq!(native_row(), acquisition);
+    let renewed = read_lease(&db.conn()).unwrap().unwrap();
+    assert!(db
+        .immediate_transaction(|tx| store_lease_with_native(tx, &renewed, None, None))
+        .is_err());
+    assert_eq!(native_row(), acquisition);
+    assert_eq!(read_lease(&db.conn()).unwrap(), Some(renewed));
+    let mut invalid_capture = original.clone();
+    invalid_capture.renewed_at = "foreign-renewal".into();
+    assert!(!native_lease_matches(&invalid_capture, &original));
+    changed.epoch = 2;
+    db.immediate_transaction(|tx| {
+        store_lease_with_native(tx, &changed, Some(owner.clone()), Some(&owner))
+    })
+    .unwrap();
+    assert_ne!(native_row(), acquisition);
+    let captured: NativeLease = serde_json::from_str(&native_row().0).unwrap();
+    assert_eq!(captured.lease, changed);
+    assert_eq!(captured.owner, owner);
+}
+
+#[cfg(test)]
+#[test]
+fn backward_native_heartbeat_refuses_before_any_row_changes_and_forward_time_recovers() {
+    let _serial = tests::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let db = Database::in_memory().unwrap();
+    db.initialize().unwrap();
+    let owner: crate::pair_refresh::native_owner::NativeProcessOwner =
+        serde_json::from_value(serde_json::json!({
+            "version":1,"platform":"linux","host_digest":"a".repeat(64),
+            "boot_digest":"b".repeat(64),"pid_namespace":"1:2",
+            "pid":std::process::id(),"uid":rustix::process::geteuid().as_raw()
+        }))
+        .unwrap();
+    let acquired = WriterLease {
+        version: 1,
+        epoch: 1,
+        holder_pid: std::process::id(),
+        holder_host: "clock-rollback-fixture".into(),
+        acquired_at: "2026-10-13T00:00:00Z".into(),
+        renewed_at: "2026-10-13T00:00:00Z".into(),
+    };
+    db.immediate_transaction(|tx| {
+        store_lease_with_native(tx, &acquired, Some(owner.clone()), None)
+    })
+    .unwrap();
+    let rows = || {
+        db.conn()
+            .prepare("SELECT key,value,updated_at FROM kv_state ORDER BY key")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before = rows();
+    for at in ["2026-10-12T23:59:59Z", "unknown-time"] {
+        let outgoing = WriterLease {
+            renewed_at: at.into(),
+            ..acquired.clone()
+        };
+        assert!(db
+            .immediate_transaction(|tx| {
+                store_lease_with_native(tx, &outgoing, Some(owner.clone()), None)
+            })
+            .is_err());
+        assert_eq!(rows(), before);
+    }
+    let forward = WriterLease {
+        renewed_at: "2026-10-13T00:00:01Z".into(),
+        ..acquired.clone()
+    };
+    db.immediate_transaction(|tx| store_lease_with_native(tx, &forward, Some(owner.clone()), None))
+        .unwrap();
+    assert_eq!(read_lease(&db.conn()).unwrap(), Some(forward.clone()));
+    assert!(native_lease_matches(&acquired, &forward));
+    assert_eq!(
+        rows()
+            .into_iter()
+            .filter(|r| r.0 == NATIVE_LEASE_KEY)
+            .collect::<Vec<_>>(),
+        before
+            .into_iter()
+            .filter(|r| r.0 == NATIVE_LEASE_KEY)
+            .collect::<Vec<_>>()
+    );
 }

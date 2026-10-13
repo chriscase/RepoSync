@@ -607,6 +607,35 @@ pub(crate) fn authenticated_refresh_epoch_floor(tx: &Connection) -> Result<u64, 
     Ok(floor)
 }
 
+/// Ordinary startup must not mutate retained authenticated work before native
+/// recovery. This read also rejects corrupt/orphan execution evidence. Legacy
+/// databases without the journal table remain eligible for ordinary migration.
+pub(crate) fn require_no_authenticated_startup_hold(tx: &Connection) -> Result<(), DatabaseError> {
+    let has_kv: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='kv_state')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_kv {
+        return Ok(());
+    }
+    let has_evidence: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE substr(key,1,?1)=?2)",
+        params![FAMILY.len(), FAMILY],
+        |row| row.get(0),
+    )?;
+    if has_evidence
+        && journal(tx)?
+            .iter()
+            .any(|op| op.version == 3 && op.phase.holds_scopes())
+    {
+        return Err(refused(
+            "ordinary startup refuses a retained authenticated job; use pair-refresh recovery",
+        ));
+    }
+    Ok(())
+}
+
 /// Existing personal-mode journals have no managed registration identity and
 /// must be treated as global writers for refresh exclusion.
 pub fn require_no_pair_refresh_hold_for_writer(
@@ -1171,7 +1200,7 @@ impl Database {
         validation: AdmissionValidation,
     ) -> Result<PairRefreshOperation, DatabaseError> {
         self.transaction(|tx| {
-            let epoch = crate::writer_fence::require_owned_current(tx)?;
+            crate::writer_fence::require_owned_current_readonly(tx)?;
             pins.validate()?;
             if validation != AdmissionValidation::Storage {
                 require_credentials_current(tx, &pins)?;
@@ -1213,6 +1242,7 @@ impl Database {
             if operations.iter().any(|op| op.id == pins.git.operation_id) {
                 return Err(refused("operation identity was reused"));
             }
+            let epoch = crate::writer_fence::require_owned_current(tx)?;
             require_baseline_provenance(&pins, &operations)?;
             require_pins_current(tx, &pins)?;
             for id in [&pins.child.repo_id, &pins.parent.repo_id] {

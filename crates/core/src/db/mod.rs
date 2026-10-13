@@ -214,7 +214,18 @@ impl Database {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
         let lock = crate::data_dir::acquire(data_dir)?;
-        let db = Self::new(data_dir.join("reposync.db"))?;
+        let path = data_dir.join("reposync.db");
+        if path.try_exists()? {
+            // Open read-only before ordinary startup can checkpoint, migrate,
+            // seed credentials or claim a replacement lease. The local lock is
+            // retained through startup; the lease claim rechecks in its writer
+            // transaction before a new epoch can be created.
+            let probe =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            probe.execute_batch("BEGIN;")?;
+            pair_refresh_operations::require_no_authenticated_startup_hold(&probe)?;
+        }
+        let db = Self::new(path)?;
         db.initialize()?;
         let fence = crate::writer_fence::claim(&db, data_dir)?;
         Ok((db, crate::data_dir::DataDirOwner { lock, fence }))

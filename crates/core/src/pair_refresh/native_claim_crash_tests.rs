@@ -111,7 +111,15 @@ async fn native_recovery_survives_two_interrupted_claims_before_transfer() {
                 .unwrap();
         assert_eq!(lease["epoch"], claim["epoch"]);
         assert_eq!(lease["holder_pid"], claim["pid"]);
-        assert_eq!(journal_state(&f), before);
+        assert_eq!(
+            journal_state(&f),
+            journal_after_native_lease_claim(
+                &f,
+                &before,
+                original.admitted_writer_epoch,
+                claim["pid"].as_u64().unwrap() as u32
+            )
+        );
         assert_eq!(f.db.pair_refresh_operation(id).unwrap(), original);
         assert!(
             crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
@@ -129,6 +137,12 @@ async fn native_recovery_survives_two_interrupted_claims_before_transfer() {
     .unwrap();
     assert!(fence.epoch() > epoch);
     let claimed_lease = f.db.get_state("writer_fence_v1:lease").unwrap();
+    let claimed_journal = journal_after_native_lease_claim(
+        &f,
+        &before,
+        original.admitted_writer_epoch,
+        std::process::id(),
+    );
     assert!(
         crate::pair_refresh::recovery::claim_owned_refresh_recovery_writer(
             &engine, &actor, id, &busy, &lock
@@ -139,7 +153,7 @@ async fn native_recovery_survives_two_interrupted_claims_before_transfer() {
         f.db.get_state("writer_fence_v1:lease").unwrap(),
         claimed_lease
     );
-    assert_eq!(journal_state(&f), before);
+    assert_eq!(journal_state(&f), claimed_journal);
     let recovery =
         crate::pair_refresh::recovery::prepare_owned_refresh_recovery(&engine, &actor, id, &busy)
             .unwrap();
@@ -203,7 +217,6 @@ async fn native_recovery_refuses_unbound_or_foreign_native_lease_even_with_match
     let ready: serde_json::Value = serde_json::from_str(marker).unwrap();
     let id = Uuid::parse_str(ready["id"].as_str().unwrap()).unwrap();
     let original = f.db.pair_refresh_operation(id).unwrap();
-    let journal = journal_state(&f);
     let native_raw = f.db.get_state("writer_fence_v1:native").unwrap().unwrap();
     let lease_raw = f.db.get_state("writer_fence_v1:lease").unwrap().unwrap();
     let native: serde_json::Value = serde_json::from_str(&native_raw).unwrap();
@@ -246,6 +259,7 @@ async fn native_recovery_refuses_unbound_or_foreign_native_lease_even_with_match
                 .unwrap();
         }
         let before = f.db.get_state("writer_fence_v1:native").unwrap();
+        let journal = journal_state(&f);
         assert!(
             crate::pair_refresh::recovery::claim_owned_refresh_recovery_writer(
                 &engine, &actor, id, &busy, &lock

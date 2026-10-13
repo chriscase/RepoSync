@@ -172,3 +172,39 @@ fn recovery_git_open_preserves_sidecar_without_using_it_or_creating_storage() {
     assert_eq!(std::fs::read(&sidecar).unwrap(), b"disposable-legacy-token");
     assert!(opened.stored_http_auth_token().is_none());
 }
+
+#[test]
+fn ordinary_startup_refuses_orphan_native_jobs_before_checkpoint_or_migration() {
+    for suffix in ["document", "authority", "hold", "request"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reposync.db");
+        let db = Database::new(&path).unwrap();
+        db.initialize().unwrap();
+        db.ensure_repository_scope_schema_upgrade().unwrap();
+        db.conn()
+            .execute_batch("PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        db.set_state("writer_fence_v1:lease", "preserve-unknown-owner")
+            .unwrap();
+        db.set_state("secret_git_token", "preserve-plaintext")
+            .unwrap();
+        db.set_state(
+            &format!("pair_refresh_execution_v3:{suffix}:orphan"),
+            "preserve-evidence",
+        )
+        .unwrap();
+        let before = state(&db);
+        let wal = path.with_extension("db-wal");
+        let main_bytes = std::fs::read(&path).unwrap();
+        let wal_bytes = std::fs::read(&wal).unwrap();
+        assert!(
+            Database::open_with_exclusive_owner(temp.path()).is_err(),
+            "{suffix}"
+        );
+        assert_eq!(state(&db), before, "{suffix}");
+        assert_eq!(std::fs::read(&path).unwrap(), main_bytes, "{suffix}");
+        assert_eq!(std::fs::read(&wal).unwrap(), wal_bytes, "{suffix}");
+        assert!(db.get_state("encryption_key").unwrap().is_none());
+        assert!(db.get_encrypted_secret("git_token").unwrap().is_none());
+    }
+}
