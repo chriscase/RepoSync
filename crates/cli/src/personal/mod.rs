@@ -13,9 +13,12 @@ pub mod pr_log;
 pub mod status;
 pub mod style;
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
+use reposync_core::db::Database;
 use reposync_core::personal_config::PersonalConfig;
 
 /// Personal branch mode subcommands.
@@ -143,6 +146,25 @@ pub async fn run_personal(cmd: PersonalCommands, config_path: &str) -> Result<()
     }
 }
 
+/// Open `personal.db` and create the schema.
+///
+/// `Database::new` only opens the file. Team mode calls `initialize` before
+/// use. Import and start must do the same or the first repository read fails
+/// with "no such table: repositories" (issue #198).
+pub(crate) fn open_personal_database(data_dir: &Path) -> Result<Database> {
+    std::fs::create_dir_all(data_dir).with_context(|| {
+        format!(
+            "failed to create personal data directory {}",
+            data_dir.display()
+        )
+    })?;
+    let db =
+        Database::new(data_dir.join("personal.db")).context("failed to open personal database")?;
+    db.initialize()
+        .context("failed to initialize personal database schema")?;
+    Ok(db)
+}
+
 /// Load and validate the personal config.
 fn load_config(config_path: &str) -> Result<PersonalConfig> {
     let resolved = expand_tilde(config_path);
@@ -160,4 +182,19 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::open_personal_database;
+
+    #[test]
+    fn fresh_personal_database_can_read_repositories() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = open_personal_database(dir.path()).expect("open personal database");
+        let missing = db
+            .get_repository("personal")
+            .expect("repositories table should exist");
+        assert!(missing.is_none());
+    }
 }

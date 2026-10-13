@@ -1,0 +1,24 @@
+[groups]
+writers = svc-sync,alice,bob
+readers = observer
+
+# [/] applies to every repository under SVNParentPath. Subversion 1.14
+# rejects [:/] as an empty repository name. Run 38193558242.
+[/]
+@readers = r
+@writers = rw
+* =
+
+# isoa and isob are more specific than [/]. Alice can write only isoa.
+# Bob can write only isob. The other account is denied.
+[isoa:/]
+alice = rw
+svc-sync = rw
+bob =
+* =
+
+[isob:/]
+bob = rw
+svc-sync = rw
+alice =
+* =
