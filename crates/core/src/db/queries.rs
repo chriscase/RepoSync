@@ -315,51 +315,55 @@ impl Database {
     ) -> Result<String, DatabaseError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+        self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
              base_content, svn_rev, git_sha, status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'detected', ?9)",
-            params![
-                id,
-                file_path,
-                conflict_type,
-                svn_content,
-                git_content,
-                base_content,
-                svn_rev,
-                git_sha,
-                now
-            ],
-        )?;
-        debug!(id = %id, file_path, conflict_type, "inserted conflict");
-        Ok(id)
+                params![
+                    id,
+                    file_path,
+                    conflict_type,
+                    svn_content,
+                    git_content,
+                    base_content,
+                    svn_rev,
+                    git_sha,
+                    now
+                ],
+            )?;
+            debug!(id = %id, file_path, conflict_type, "inserted conflict");
+            Ok(id)
+        })
     }
 
     /// Insert a conflict from a model struct.
     pub fn insert_conflict(&self, conflict: &models::Conflict) -> Result<String, DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
+        self.transaction(|conn| {
+            Self::require_conflict_scope_refresh_quiet(conn, conflict.repo_id.as_deref())?;
+            conn.execute(
+                "INSERT INTO conflicts (id, file_path, conflict_type, svn_content, git_content,
              base_content, svn_rev, git_sha, status, created_at, repo_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                conflict.id,
-                conflict.file_path,
-                conflict.conflict_type,
-                conflict.svn_content,
-                conflict.git_content,
-                conflict.base_content,
-                conflict.svn_revision,
-                conflict.git_hash,
-                conflict.status,
-                now,
-                conflict.repo_id
-            ],
-        )?;
-        debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
-        Ok(conflict.id.clone())
+                params![
+                    conflict.id,
+                    conflict.file_path,
+                    conflict.conflict_type,
+                    conflict.svn_content,
+                    conflict.git_content,
+                    conflict.base_content,
+                    conflict.svn_revision,
+                    conflict.git_hash,
+                    conflict.status,
+                    now,
+                    conflict.repo_id
+                ],
+            )?;
+            debug!(id = %conflict.id, file_path = %conflict.file_path, "inserted conflict");
+            Ok(conflict.id.clone())
+        })
     }
 
     /// Conflict statuses that must block SVN/Git apply in team mode.
@@ -464,6 +468,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            Self::require_conflict_scope_refresh_quiet(&conn, conflict.repo_id.as_deref())?;
             let existing: Option<(String, String)> = conn
                 .query_row(
                     "SELECT id, status FROM conflicts
@@ -782,21 +787,42 @@ impl Database {
         resolution: &str,
         resolved_by: &str,
     ) -> Result<(), DatabaseError> {
+        self.resolve_conflict_with_content(id, status, resolution, resolved_by, None)
+    }
+
+    /// Resolve and optionally store merged content atomically. A refresh cannot
+    /// be admitted between the status and content writes.
+    pub fn resolve_conflict_with_content(
+        &self,
+        id: &str,
+        status: &str,
+        resolution: &str,
+        resolved_by: &str,
+        content: Option<&str>,
+    ) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn();
-        let changed = conn.execute(
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, id)?;
+            let changed = conn.execute(
             "UPDATE conflicts SET status = ?1, resolution = ?2, resolved_by = ?3, resolved_at = ?4
              WHERE id = ?5",
             params![status, resolution, resolved_by, now, id],
         )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "conflict".into(),
-                id: id.to_string(),
-            });
-        }
-        debug!(id, status, resolution, "resolved conflict");
-        Ok(())
+            if changed == 0 {
+                return Err(DatabaseError::NotFound {
+                    entity: "conflict".into(),
+                    id: id.to_string(),
+                });
+            }
+            if let Some(content) = content {
+                conn.execute(
+                    "UPDATE conflicts SET resolved_content=?1 WHERE id=?2",
+                    params![content, id],
+                )?;
+            }
+            debug!(id, status, resolution, "resolved conflict");
+            Ok(())
+        })
     }
 
     /// Resolve a conflict using a ConflictResolution enum.
@@ -807,11 +833,43 @@ impl Database {
         content: Option<&str>,
         resolved_by: &str,
     ) -> Result<(), DatabaseError> {
-        self.resolve_conflict(id, "resolved", &resolution.to_string(), resolved_by)?;
-        if let Some(c) = content {
-            self.store_resolved_content(id, c)?;
+        self.resolve_conflict_with_content(
+            id,
+            "resolved",
+            &resolution.to_string(),
+            resolved_by,
+            content,
+        )
+    }
+
+    fn require_conflict_refresh_quiet(
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<(), DatabaseError> {
+        // Unknown/legacy attribution is a global writer scope. Do not guess
+        // ownership from a pathname while another job holds either identity.
+        let repo: Option<String> = conn
+            .query_row("SELECT repo_id FROM conflicts WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        Self::require_conflict_scope_refresh_quiet(conn, repo.as_deref())
+    }
+
+    fn require_conflict_scope_refresh_quiet(
+        conn: &rusqlite::Connection,
+        repo_id: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        // Historical Personal conflict rows used the literal "personal". They
+        // lack a managed registration identity, so conservatively exclude every
+        // held scope rather than treating that label as an unrelated repository.
+        match repo_id.filter(|id| !id.is_empty() && *id != "personal") {
+            Some(id) => {
+                super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(conn, id)
+            }
+            None => super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None),
         }
-        Ok(())
     }
 
     /// Store merged/resolved content for a conflict.
@@ -820,29 +878,33 @@ impl Database {
         conflict_id: &str,
         content: &str,
     ) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE conflicts SET resolved_content = ?1 WHERE id = ?2",
-            params![content, conflict_id],
-        )?;
-        Ok(())
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, conflict_id)?;
+            conn.execute(
+                "UPDATE conflicts SET resolved_content = ?1 WHERE id = ?2",
+                params![content, conflict_id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Defer a conflict.
     pub fn defer_conflict(&self, id: &str) -> Result<(), DatabaseError> {
-        let conn = self.conn();
-        let changed = conn.execute(
-            "UPDATE conflicts SET status = 'deferred' WHERE id = ?1",
-            params![id],
-        )?;
-        if changed == 0 {
-            return Err(DatabaseError::NotFound {
-                entity: "conflict".into(),
-                id: id.to_string(),
-            });
-        }
-        debug!(id, "deferred conflict");
-        Ok(())
+        self.transaction(|conn| {
+            Self::require_conflict_refresh_quiet(conn, id)?;
+            let changed = conn.execute(
+                "UPDATE conflicts SET status = 'deferred' WHERE id = ?1",
+                params![id],
+            )?;
+            if changed == 0 {
+                return Err(DatabaseError::NotFound {
+                    entity: "conflict".into(),
+                    id: id.to_string(),
+                });
+            }
+            debug!(id, "deferred conflict");
+            Ok(())
+        })
     }
 
     /// Count conflicts by status.
@@ -903,11 +965,14 @@ impl Database {
     pub fn set_watermark(&self, source: &str, value: &str) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold(&tx, None)?;
+        tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(source) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![source, value, now],
         )?;
+        tx.commit()?;
         debug!(source, value, "set watermark");
         Ok(())
     }
@@ -931,13 +996,8 @@ impl Database {
         tx: &rusqlite::Connection,
         sha: &str,
     ) -> Result<(), DatabaseError> {
-        let repo_count: i64 =
-            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
-        if repo_count > 0 {
-            return Err(DatabaseError::Other(
-                "refusing global git_sha watermark while repositories table is non-empty".into(),
-            ));
-        }
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        Self::require_legacy_import_watermarks_available_tx(tx)?;
         let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO watermarks (source, value, updated_at) VALUES (?1, ?2, ?3)
@@ -949,6 +1009,26 @@ impl Database {
             value = sha,
             "set watermark in transaction"
         );
+        Ok(())
+    }
+
+    /// Refuse a known checkpoint incompatibility before a legacy import can
+    /// publish. Recheck inside checkpoint storage to account for later drift.
+    pub fn require_legacy_import_watermarks_available(&self) -> Result<(), DatabaseError> {
+        self.transaction(Self::require_legacy_import_watermarks_available_tx)
+    }
+
+    pub(crate) fn require_legacy_import_watermarks_available_tx(
+        tx: &rusqlite::Connection,
+    ) -> Result<(), DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+        let repo_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+        if repo_count > 0 {
+            return Err(DatabaseError::Other(
+                "refusing global git_sha watermark while repositories table is non-empty".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1234,11 +1314,14 @@ impl Database {
     pub fn set_state(&self, key: &str, value: &str) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute(
             "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, now],
         )?;
+        tx.commit()?;
         debug!(key, value, "set kv_state");
         Ok(())
     }
@@ -1247,7 +1330,10 @@ impl Database {
     /// computing scoped keys (the connection mutex is not re-entrant).
     pub fn delete_kv_state(&self, key: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute("DELETE FROM kv_state WHERE key = ?1", params![key])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1333,10 +1419,13 @@ impl Database {
     /// Delete all sync records for a specific repository (used during reset/reimport).
     pub fn delete_sync_records_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
-        let count = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        let count = tx.execute(
             "DELETE FROM sync_records WHERE repo_id = ?1",
             params![repo_id],
         )?;
+        tx.commit()?;
         info!(repo_id, count, "deleted sync_records for repo");
         Ok(count)
     }
@@ -1344,10 +1433,13 @@ impl Database {
     /// Delete all commit_map entries for a specific repository (used during reset/reimport).
     pub fn delete_commit_map_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
         let conn = self.conn();
-        let count = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        let count = tx.execute(
             "DELETE FROM commit_map WHERE repo_id = ?1",
             params![repo_id],
         )?;
+        tx.commit()?;
         info!(repo_id, count, "deleted commit_map entries for repo");
         Ok(count)
     }
@@ -1361,6 +1453,9 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(
+                &conn, repo_id,
+            )?;
             conn.execute(
                 "DELETE FROM sync_records WHERE repo_id = ?1",
                 params![repo_id],
@@ -1427,11 +1522,11 @@ impl Database {
     /// Hard-delete a repository and all associated data from all tables.
     /// Used for branch pair cleanup. Wraps all deletes in a transaction.
     pub fn hard_delete_repository(&self, repo_id: &str) -> Result<(), DatabaseError> {
-        {
-            let conn = self.conn();
-            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
-        }
         self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                conn, repo_id,
+            )?;
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(conn)?;
             let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
             for table in &tables_with_repo_id {
                 let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
@@ -1531,6 +1626,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         tx.execute(
@@ -1541,6 +1637,10 @@ impl Database {
         crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&tx, repo_id, frontier_sha, &now)?;
 
         if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
+            super::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+                &tx,
+                "last_git_hash",
+            )?;
             tx.execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
                 params![frontier_sha, now],
@@ -1587,6 +1687,7 @@ impl Database {
         };
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
 
         // 1. Update repositories table
         tx.execute(
@@ -1598,6 +1699,10 @@ impl Database {
         crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&tx, repo_id, git_sha, &now)?;
 
         if Self::repo_writes_global_git_watermark(&tx, repo_id)? {
+            super::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+                &tx,
+                "last_git_hash",
+            )?;
             tx.execute(
                 "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES ('last_git_hash', ?1, ?2)",
                 params![git_sha, now],
@@ -2453,7 +2558,12 @@ impl Database {
 
     /// Insert a new repository.
     pub fn insert_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
-        let conn = self.conn();
+        let held_conn = self.conn();
+        let conn = rusqlite::Transaction::new_unchecked(
+            &held_conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold(&conn, None)?;
         if super::managed_remove::new_work_blocked(&conn, &repo.id)? {
             return Err(DatabaseError::Other(
                 "stale job cannot recreate a removed repository".into(),
@@ -2507,6 +2617,7 @@ impl Database {
         if repo_count > 1 {
             crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(&conn)?;
         }
+        conn.commit()?;
         debug!(id = %repo.id, name = %repo.name, "inserted repository");
         Ok(())
     }
@@ -2651,13 +2762,17 @@ impl Database {
     /// Update a repository's configuration.
     pub fn update_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        if super::managed_remove::new_work_blocked(&conn, &repo.id)? {
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+            &tx, &repo.id,
+        )?;
+        if super::managed_remove::new_work_blocked(&tx, &repo.id)? {
             return Err(DatabaseError::Other(
                 "repository removal is in progress or completed; refusing to rewrite the registration"
                     .into(),
             ));
         }
-        let changed = conn.execute(
+        let changed = tx.execute(
             "UPDATE repositories SET name = ?1, svn_url = ?2, svn_branch = ?3, svn_username = ?4, git_provider = ?5, git_api_url = ?6, git_repo = ?7, git_branch = ?8, sync_mode = ?9, poll_interval_secs = ?10, lfs_threshold_mb = ?11, auto_merge = ?12, enabled = ?13, updated_at = ?14, last_svn_rev = ?15, last_git_sha = ?16, last_sync_at = ?17, sync_status = ?18, total_syncs = ?19, total_errors = ?20, parent_id = ?21, allowed_paths = ?22, blocked_patterns = ?23, consecutive_errors = ?24, teams_webhook_url = ?25
              WHERE id = ?26",
             params![
@@ -2695,6 +2810,7 @@ impl Database {
                 id: repo.id.clone(),
             });
         }
+        tx.commit()?;
         debug!(id = %repo.id, name = %repo.name, "updated repository");
         Ok(())
     }
@@ -2725,10 +2841,13 @@ impl Database {
         git_sha: &str,
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
         )?;
+        tx.commit()?;
         debug!(
             repo_id,
             svn_rev, git_sha, "updated repo watermark (columns only)"
@@ -2745,6 +2864,7 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
         tx.execute(
             "UPDATE repositories SET last_svn_rev = ?1, last_git_sha = ?2, last_sync_at = datetime('now') WHERE id = ?3",
             params![svn_rev, git_sha, repo_id],
@@ -2768,10 +2888,13 @@ impl Database {
     /// Used when skipping metadata-only SVN revisions that produce no git commit.
     pub fn advance_svn_watermark(&self, repo_id: &str, svn_rev: i64) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        tx.execute(
             "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
             params![svn_rev, repo_id],
         )?;
+        tx.commit()?;
         debug!(
             repo_id,
             svn_rev, "advanced SVN watermark (metadata-only skip)"
@@ -2916,11 +3039,11 @@ impl Database {
     }
 
     pub fn delete_repository(&self, id: &str) -> Result<(), DatabaseError> {
-        {
-            let conn = self.conn();
-            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
-        }
         self.transaction(|conn| {
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                conn, id,
+            )?;
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(conn)?;
             crate::db::repo_scope_identity::delete_repository_registration_row(conn, id)?;
             Ok(())
         })?;
@@ -2940,6 +3063,7 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold(&conn, None)?;
             conn.execute_batch(
                 "DELETE FROM commit_map;
              DELETE FROM sync_records;
@@ -3016,10 +3140,13 @@ impl Database {
     ) -> Result<(), DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute(
             "INSERT OR REPLACE INTO encrypted_secrets (key, ciphertext, nonce, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params![key, ciphertext, nonce, now],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3043,7 +3170,10 @@ impl Database {
     /// Delete an encrypted secret by key.
     pub fn delete_secret(&self, key: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_state_mutation(&tx, key)?;
+        tx.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        tx.commit()?;
         Ok(())
     }
 

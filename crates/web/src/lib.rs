@@ -82,6 +82,7 @@ impl AppState {
 /// The web server.
 pub struct WebServer {
     state: Arc<AppState>,
+    recovery_service: Option<Arc<reposync_core::pair_refresh::service::RefreshService>>,
 }
 
 impl WebServer {
@@ -102,6 +103,24 @@ impl WebServer {
             .expect("cannot safely start while svn-to-git push recovery state is unwritable");
         db.hold_interrupted_team_cycle_mappings()
             .expect("cannot safely start while team cycle mapping recovery state is unwritable");
+        Self::from_dependencies(
+            config,
+            db,
+            sync_engine,
+            sync_trigger,
+            config_path,
+            import_progress,
+        )
+    }
+
+    fn from_dependencies(
+        config: AppConfig,
+        db: Database,
+        sync_engine: Arc<SyncEngine>,
+        sync_trigger: tokio::sync::mpsc::Sender<()>,
+        config_path: std::path::PathBuf,
+        import_progress: Arc<tokio::sync::RwLock<ImportProgress>>,
+    ) -> Self {
         let (ws_tx, _) = broadcast::channel(256);
         let state = Arc::new(AppState {
             db,
@@ -117,7 +136,36 @@ impl WebServer {
             login_attempts: std::sync::Mutex::new(HashMap::new()),
             import_handles: tokio::sync::Mutex::new(Vec::new()),
         });
-        Self { state }
+        Self {
+            state,
+            recovery_service: None,
+        }
+    }
+
+    /// Dedicated recovery serving does not run ordinary journal startup or
+    /// expose configuration, import, synchronization or repository mutations.
+    pub fn for_pair_refresh_recovery(
+        config: AppConfig,
+        db: Database,
+        sync_engine: Arc<SyncEngine>,
+        config_path: std::path::PathBuf,
+        lock: Arc<reposync_core::data_dir::LockGuard>,
+    ) -> anyhow::Result<Self> {
+        let service = reposync_core::pair_refresh::service::RefreshService::recovery_only(
+            sync_engine.clone(),
+            lock,
+        )?;
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let mut server = Self::from_dependencies(
+            config,
+            db,
+            sync_engine,
+            sender,
+            config_path,
+            Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+        );
+        server.recovery_service = Some(service);
+        Ok(server)
     }
 
     /// Get a clone of the shared application state.
@@ -133,6 +181,27 @@ impl WebServer {
     /// Start the web server, listening on the given address.
     pub async fn start(self, listen_addr: &str) -> anyhow::Result<()> {
         let addr: SocketAddr = listen_addr.parse()?;
+        if let Some(service) = self.recovery_service {
+            let app = Router::new()
+                .merge(api::auth::routes())
+                .merge(api::pair_refresh::recovery_routes(service.clone()))
+                .layer(DefaultBodyLimit::max(16 * 1024))
+                .layer(TraceLayer::new_for_http())
+                .with_state(self.state);
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            info!(addr = %addr, "serving authenticated pair refresh recovery");
+            let result = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                tokio::signal::ctrl_c().await.ok();
+            })
+            .await;
+            service.shutdown().await;
+            result?;
+            return Ok(());
+        }
 
         // CORS: use configured origins, or derive from the listen address.
         let cors = {
@@ -199,6 +268,7 @@ impl WebServer {
             .merge(api::setup::routes())
             .merge(api::users::routes())
             .merge(api::repos::routes())
+            .merge(api::pair_refresh::routes(self.state.sync_engine.clone()))
             // WebSocket
             .merge(ws::routes())
             // React SPA (fallback for everything else)

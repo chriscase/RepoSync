@@ -79,6 +79,21 @@ impl GitClient {
         })
     }
 
+    /// Open the existing recovery engine cache without credential-sidecar
+    /// migration or any other repair. The sidecar is never loaded as authority.
+    pub fn open_existing_for_pair_refresh_recovery(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, GitError> {
+        let path = path.as_ref();
+        let repo = Repository::open(path)
+            .map_err(|_| GitError::RepositoryNotFound(path.display().to_string()))?;
+        Ok(Self {
+            repo,
+            repo_path: path.to_path_buf(),
+            http_auth_token: RefCell::new(None),
+        })
+    }
+
     /// Initialize a new empty Git repository at `repo_path`.
     pub fn init<P: AsRef<Path>>(repo_path: P) -> Result<Self, GitError> {
         let path = repo_path.as_ref();

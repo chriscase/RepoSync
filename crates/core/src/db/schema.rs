@@ -407,6 +407,7 @@ pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
     if get_schema_version(conn)? >= 13 {
         return Ok(());
     }
+    super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
     if get_schema_version(conn)? < 12 {
         return Err(DatabaseError::MigrationFailed {
             version: 13,
@@ -418,7 +419,11 @@ pub fn ensure_v13_migration(conn: &Connection) -> Result<(), DatabaseError> {
         .find(|(version, _, _)| *version == 13)
         .expect("v13 migration must be registered");
     let (version, description, sql) = migration;
-    apply_one_migration(conn, *version, description, sql)
+    if conn.is_autocommit() {
+        apply_one_migration(conn, *version, description, sql)
+    } else {
+        apply_migration_body(conn, *version, sql)
+    }
 }
 
 /// Refuse a schema written by a newer executable.
@@ -446,28 +451,36 @@ fn apply_one_migration(
             detail: e.to_string(),
         }
     })?;
-    tx.execute_batch(sql)
+    apply_migration_body(&tx, version, sql)?;
+    tx.commit().map_err(|e| DatabaseError::MigrationFailed {
+        version,
+        detail: e.to_string(),
+    })?;
+    debug!(version, "migration applied successfully");
+    Ok(())
+}
+
+fn apply_migration_body(conn: &Connection, version: u32, sql: &str) -> Result<(), DatabaseError> {
+    if version == 13 {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
+    }
+    conn.execute_batch(sql)
         .map_err(|e| DatabaseError::MigrationFailed {
             version,
             detail: e.to_string(),
         })?;
     if version == 13 {
-        super::repo_scope_identity::migrate_v13_scope_uuid(&tx).map_err(|e| {
+        super::repo_scope_identity::migrate_v13_scope_uuid(conn).map_err(|e| {
             DatabaseError::MigrationFailed {
                 version,
                 detail: e.to_string(),
             }
         })?;
     }
-    set_schema_version(&tx, version).map_err(|e| DatabaseError::MigrationFailed {
+    set_schema_version(conn, version).map_err(|e| DatabaseError::MigrationFailed {
         version,
         detail: e.to_string(),
     })?;
-    tx.commit().map_err(|e| DatabaseError::MigrationFailed {
-        version,
-        detail: e.to_string(),
-    })?;
-    debug!(version, "migration applied successfully");
     Ok(())
 }
 

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use std::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use reposync_core::db::Database;
+use reposync_core::db::{ordinary_writer_windows::OrdinaryWriterWindow, Database};
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::github::GitHubClient;
 use reposync_core::git::GitClient;
@@ -45,6 +45,26 @@ impl<'a> InitialImport<'a> {
     ///
     /// Returns the number of commits created.
     pub async fn import(&self, mode: ImportMode) -> Result<u64> {
+        let window = self
+            .db
+            .begin_ordinary_writer_window(None)
+            .context("Personal initial import writer admission refused")?;
+        self.import_with_writer_window(mode, window).await
+    }
+
+    /// Continue the caller's preparation window across clone and import. A
+    /// fresh admission here would leave a gap or contend with the caller itself.
+    pub async fn import_with_writer_window(
+        &self,
+        mode: ImportMode,
+        window: OrdinaryWriterWindow<'_>,
+    ) -> Result<u64> {
+        window
+            .require_engine_scope(self.db, None)
+            .context("Personal initial import writer handoff refused")?;
+        self.db
+            .require_legacy_import_watermarks_available()
+            .context("Personal initial import checkpoint admission refused")?;
         // LFS preflight: if LFS is configured, verify git-lfs is available.
         if self.config.options.lfs_threshold > 0 {
             match reposync_core::lfs::preflight_check() {
@@ -68,10 +88,14 @@ impl<'a> InitialImport<'a> {
         // Ensure the GitHub repo exists (auto-create if configured)
         self.ensure_github_repo().await?;
 
-        match mode {
-            ImportMode::Snapshot => self.import_snapshot().await,
-            ImportMode::Full => self.import_full().await,
-        }
+        let count = match mode {
+            ImportMode::Snapshot => self.import_snapshot(&window).await?,
+            ImportMode::Full => self.import_full(&window).await?,
+        };
+        window
+            .finish_preparation()
+            .context("Personal initial import writer completion refused")?;
+        Ok(count)
     }
 
     /// Auto-create the GitHub repo if it doesn't exist and auto_create is enabled.
@@ -128,7 +152,10 @@ impl<'a> InitialImport<'a> {
     /// Reuses the shared core snapshot engine (`resolve_snapshot_pin` +
     /// `materialize_snapshot` + projected-content verify). Team onboarding
     /// uses the same functions; do not add a second snapshot implementation.
-    async fn import_snapshot(&self) -> Result<u64> {
+    async fn import_snapshot(
+        &self,
+        window: &reposync_core::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<u64> {
         info!("starting snapshot import");
 
         let pin = reposync_core::snapshot::resolve_snapshot_pin(
@@ -244,6 +271,8 @@ impl<'a> InitialImport<'a> {
         .context("snapshot Git commit does not match pinned SVN projection")?;
 
         // Push (credentials via remote URL)
+        self.db.require_legacy_import_watermarks_available()?;
+        window.mark_unjournalled_publication_possible()?;
         {
             let git_client = self.git_client.lock().unwrap();
             git_client
@@ -251,19 +280,24 @@ impl<'a> InitialImport<'a> {
                 .context("failed to push to GitHub")?;
         }
 
-        // Record checkpoint atomically: scoped commit_map, receipt, and watermarks.
-        self.db
-            .checkpoint_personal_snapshot_import(
-                head_rev,
-                &sha,
-                &self.config.developer.svn_username,
-                &format!(
-                    "{} <{}>",
-                    self.config.developer.name, self.config.developer.email
-                ),
-                "svn_rev",
-            )
-            .context("failed to checkpoint personal snapshot import")?;
+        reposync_core::import::confirm_personal_snapshot_import_publication(
+            window,
+            reposync_core::import::LegacyImportRef {
+                workdir: &repo_path,
+                remote: "origin",
+                branch: &self.config.github.default_branch,
+                token: self.config.github.token.as_deref(),
+                sha: &sha,
+            },
+            head_rev,
+            &self.config.developer.svn_username,
+            &format!(
+                "{} <{}>",
+                self.config.developer.name, self.config.developer.email
+            ),
+        )
+        .await
+        .context("failed to checkpoint personal snapshot import")?;
 
         self.db
             .insert_audit_log(
@@ -282,7 +316,10 @@ impl<'a> InitialImport<'a> {
     }
 
     /// Full history import: replay every SVN revision as a Git commit.
-    async fn import_full(&self) -> Result<u64> {
+    async fn import_full(
+        &self,
+        window: &reposync_core::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<u64> {
         info!("starting full history import");
 
         // Build identity mapper if configured — allows preserving original SVN authors.
@@ -453,6 +490,8 @@ impl<'a> InitialImport<'a> {
 
         // Push all at once (credentials via remote URL)
         if count > 0 {
+            self.db.require_legacy_import_watermarks_available()?;
+            window.mark_unjournalled_publication_possible()?;
             let git_client = self.git_client.lock().unwrap();
             git_client
                 .push("origin", &self.config.github.default_branch)
@@ -462,14 +501,30 @@ impl<'a> InitialImport<'a> {
 
         // Set watermarks (both must succeed or the import fails closed).
         if let Some(last) = log_entries.last() {
-            let git_client = self.git_client.lock().unwrap();
-            let head_sha = git_client
-                .get_head_sha()
-                .context("failed to read Git HEAD")?;
-            drop(git_client);
-            self.db
-                .finalize_personal_full_import_watermarks(last.revision, &head_sha)
-                .context("failed to finalize personal full-import watermarks")?;
+            let head_sha = {
+                let git_client = self.git_client.lock().unwrap();
+                git_client
+                    .get_head_sha()
+                    .context("failed to read Git HEAD")?
+            };
+            if count > 0 {
+                reposync_core::import::confirm_personal_full_import_publication(
+                    window,
+                    reposync_core::import::LegacyImportRef {
+                        workdir: &repo_path,
+                        remote: "origin",
+                        branch: &self.config.github.default_branch,
+                        token: self.config.github.token.as_deref(),
+                        sha: &head_sha,
+                    },
+                    last.revision,
+                )
+                .await?;
+            } else {
+                self.db
+                    .finalize_personal_full_import_watermarks(last.revision, &head_sha)
+                    .context("failed to finalize personal full-import watermarks")?;
+            }
         }
 
         self.db

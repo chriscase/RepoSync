@@ -25,6 +25,7 @@ pub struct SvnClient {
     username: String,
     password: String,
     cancel: Option<Arc<AtomicBool>>,
+    refresh_config: Option<Arc<tempfile::TempDir>>,
 }
 
 // Custom Debug implementation that redacts the password field.
@@ -74,13 +75,115 @@ impl SvnClient {
             username: username.into(),
             password: password.into(),
             cancel: None,
+            refresh_config: None,
         };
         info!(url = %client.url, username = %client.username, "created SvnClient");
         client
     }
 
+    /// Refresh clients never read the daemon user's SVN configuration, cached
+    /// credentials or platform password stores. The private directory remains
+    /// alive until the last client clone drops; ordinary clients are unchanged.
+    pub(crate) fn new_isolated_refresh(
+        url: &str,
+        username: &str,
+        password: Option<&str>,
+    ) -> Result<Self, SvnError> {
+        if password.is_some_and(|value| value.is_empty())
+            || password.is_some() == username.is_empty()
+        {
+            return Err(SvnError::CommandFailed {
+                exit_code: -1,
+                stderr: "refresh requires a complete explicit SVN credential or anonymous access"
+                    .into(),
+            });
+        }
+        let config = tempfile::Builder::new()
+            .prefix("reposync-refresh-auth-")
+            .tempdir()?;
+        std::fs::write(
+            config.path().join("config"),
+            "[auth]\npassword-stores =\nstore-passwords = no\nstore-auth-creds = no\n",
+        )?;
+        std::fs::write(
+            config.path().join("servers"),
+            "[global]\nstore-passwords = no\nstore-plaintext-passwords = no\nstore-ssl-client-cert-pp = no\nstore-ssl-client-cert-pp-plaintext = no\n",
+        )?;
+        let mut client = Self::new(url, username, password.unwrap_or(""));
+        client.refresh_config = Some(Arc::new(config));
+        Ok(client)
+    }
+
+    fn apply_refresh_configuration(&self, command: &mut Command) {
+        if let Some(config) = &self.refresh_config {
+            command
+                .arg("--config-dir")
+                .arg(config.path())
+                .arg("--config-option")
+                .arg("config:auth:password-stores=");
+        }
+    }
+
+    fn command_stderr(&self, bytes: &[u8]) -> String {
+        let stderr = String::from_utf8_lossy(bytes).to_string();
+        if self.refresh_config.is_some() && !self.password.is_empty() {
+            stderr.replace(&self.password, "[REDACTED]")
+        } else {
+            stderr
+        }
+    }
+
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    pub(crate) fn has_refresh_isolation(&self) -> bool {
+        self.refresh_config.is_some()
+    }
+
+    pub(crate) fn refresh_ancestor_client(&self, url: &str) -> Result<Self, SvnError> {
+        let refused = || SvnError::LineageRefused {
+            reason: "unproved_svn_ancestor_visibility".into(),
+            detail: "ancestor observation requires the same isolated source authority".into(),
+        };
+        let source = reqwest::Url::parse(&self.url).map_err(|_| refused())?;
+        let ancestor = reqwest::Url::parse(url).map_err(|_| refused())?;
+        let parent = ancestor.path().trim_end_matches('/');
+        if !self.has_refresh_isolation()
+            || source.scheme() != ancestor.scheme()
+            || source.host_str() != ancestor.host_str()
+            || source.port_or_known_default() != ancestor.port_or_known_default()
+            || !ancestor.username().is_empty()
+            || ancestor.password().is_some()
+            || ancestor.query().is_some()
+            || ancestor.fragment().is_some()
+            || !source
+                .path()
+                .strip_prefix(parent)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+        {
+            return Err(refused());
+        }
+        let mut client = self.clone();
+        client.url = url.to_owned();
+        Ok(client)
+    }
+
+    pub(crate) async fn direct_properties_at_rev(&self, revision: i64) -> Result<String, SvnError> {
+        if revision < 1 {
+            return Err(SvnError::RevisionNotFound(revision));
+        }
+        self.run_svn(&[
+            "proplist",
+            "--xml",
+            "--verbose",
+            "--depth",
+            "empty",
+            "-r",
+            &revision.to_string(),
+            &format!("{}@{}", self.url, revision),
+        ])
+        .await
     }
 
     /// Import-scoped cancellation; ordinary sync clients remain unchanged.
@@ -143,6 +246,61 @@ impl SvnClient {
         parse_svn_log(&output)
     }
 
+    /// A complete bounded verbose observation for checkpoint proof. Unlike
+    /// ordinary display/replay parsing, any malformed entry or path refuses.
+    pub(crate) async fn strict_log_range(
+        &self,
+        start_rev: i64,
+        end_rev: i64,
+    ) -> Result<Vec<SvnLogEntry>, SvnError> {
+        if start_rev < 1 || end_rev < start_rev {
+            return Err(SvnError::XmlParseError("invalid proof log range".into()));
+        }
+        let range = format!("{start_rev}:{end_rev}");
+        let target = format!("{}@{end_rev}", self.url);
+        let output = self
+            .run_svn(&["log", "--xml", "--verbose", "-r", &range, &target])
+            .await?;
+        let entries = super::parser::parse_svn_copy_history(&output)?;
+        let mut revisions = std::collections::BTreeSet::new();
+        if entries.iter().any(|entry| {
+            entry.revision < start_rev
+                || entry.revision > end_rev
+                || !revisions.insert(entry.revision)
+        }) {
+            return Err(SvnError::XmlParseError(
+                "out-of-range or duplicate proof revision".into(),
+            ));
+        }
+        Ok(entries)
+    }
+
+    /// Complete history of the selected path incarnation, stopping at its
+    /// originating copy rather than following an older source path. No fixed
+    /// revision window or limit may truncate the origin used for approval.
+    pub async fn copy_history_at_rev(
+        &self,
+        peg_revision: i64,
+    ) -> Result<Vec<SvnLogEntry>, SvnError> {
+        if peg_revision < 1 {
+            return Err(SvnError::RevisionNotFound(peg_revision));
+        }
+        let range = format!("{peg_revision}:1");
+        let target = format!("{}@{peg_revision}", self.url);
+        let output = self
+            .run_svn(&[
+                "log",
+                "--xml",
+                "--verbose",
+                "--stop-on-copy",
+                "-r",
+                &range,
+                &target,
+            ])
+            .await?;
+        super::parser::parse_svn_copy_history(&output)
+    }
+
     #[instrument(skip(self), fields(url = %self.url, rev))]
     pub async fn diff(&self, rev: i64) -> Result<Vec<SvnDiffEntry>, SvnError> {
         if rev < 1 {
@@ -188,6 +346,76 @@ impl SvnClient {
             .await?;
         info!(path = %path.display(), rev, "svn checkout completed");
         Ok(())
+    }
+
+    /// Isolated refresh preparation never follows externals or a moving URL.
+    pub async fn checkout_pinned_without_externals(
+        &self,
+        path: &Path,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let destination = path.to_str().ok_or_else(|| SvnError::WorkingCopyError {
+            path: path.display().to_string(),
+            detail: "refresh working directory must be UTF-8".into(),
+        })?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "-r",
+            &rev.to_string(),
+            &format!("{}@{}", self.url, rev),
+            destination,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// A fresh visibility observation always requests the complete subtree.
+    pub async fn checkout_full_pinned_without_externals(
+        &self,
+        path: &Path,
+        rev: i64,
+    ) -> Result<(), SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        let destination = path.to_str().ok_or_else(|| SvnError::WorkingCopyError {
+            path: path.display().to_string(),
+            detail: "refresh working directory must be UTF-8".into(),
+        })?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "--depth",
+            "infinity",
+            "-r",
+            &rev.to_string(),
+            &format!("{}@{}", self.url, rev),
+            destination,
+        ])
+        .await?;
+        Ok(())
+    }
+
+    /// Full property values, including inherited properties, at the selected peg.
+    pub async fn tree_properties_at_rev(&self, rev: i64) -> Result<String, SvnError> {
+        if rev < 1 {
+            return Err(SvnError::RevisionNotFound(rev));
+        }
+        self.run_svn(&[
+            "proplist",
+            "--xml",
+            "--verbose",
+            "--recursive",
+            "--show-inherited-props",
+            "-r",
+            &rev.to_string(),
+            &format!("{}@{}", self.url, rev),
+        ])
+        .await
     }
 
     /// Checkout the SVN repository at HEAD into the given directory.
@@ -562,6 +790,7 @@ impl SvnClient {
             .arg(&self.password)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.apply_refresh_configuration(&mut cmd);
 
         debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
         let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
@@ -575,7 +804,7 @@ impl SvnClient {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = self.command_stderr(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
@@ -611,6 +840,7 @@ impl SvnClient {
             .arg(&self.password)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.apply_refresh_configuration(&mut cmd);
 
         debug!(cmd = ?format!("svn {} (in {})", args.join(" "), dir.display()), "running svn command in dir");
         let output = crate::process::run(cmd, SVN_COMMAND_TIMEOUT, self.cancel.as_ref())
@@ -624,7 +854,7 @@ impl SvnClient {
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stderr = self.command_stderr(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
@@ -632,7 +862,7 @@ impl SvnClient {
         // Combine stdout and stderr — some SVN operations (especially commit)
         // output the "Committed revision N" line to stderr, not stdout.
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stderr = self.command_stderr(&output.stderr);
         if stdout.is_empty() && !stderr.is_empty() {
             debug!(stderr = %stderr, "svn command produced no stdout, using stderr");
             Ok(format!("{}\n{}", stdout, stderr))

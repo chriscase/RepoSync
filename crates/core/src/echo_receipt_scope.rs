@@ -175,6 +175,7 @@ pub fn bump_repo_echo_generation_tx(
     tx: &Connection,
     repo_id: &str,
 ) -> Result<i64, DatabaseError> {
+    crate::db::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
     let next = repo_echo_generation_tx(tx, repo_id)? + 1;
     let scope = scope_token_for_repo(tx, repo_id)?;
     let key = repo_echo_generation_kv_key(&scope);

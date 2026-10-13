@@ -25,6 +25,7 @@ pub mod reason {
     pub const NON_CONTIGUOUS: &str = "skip_commit_non_contiguous_selection";
     pub const ALREADY_EXCLUDED: &str = "skip_commit_already_excluded";
     pub const WORKDIR_UNAVAILABLE: &str = "skip_commit_workdir_unavailable";
+    pub const WRITER_HELD: &str = "skip_commit_writer_held";
 }
 
 pub fn exclusion_receipt_key(repo_id: &str, sha: &str) -> String {
@@ -259,6 +260,41 @@ pub fn execute_exact_skip(
     _observed_bridge_tip: Option<&str>,
     request: &SkipCommitRequest,
 ) -> Result<SkipCommitOutcome, SkipCommitRefusal> {
+    let window = db
+        .begin_ordinary_writer_window(Some(repo_id))
+        .map_err(|error| SkipCommitRefusal {
+            code: reason::WRITER_HELD.into(),
+            detail: error.to_string(),
+        })?;
+    execute_exact_skip_with_writer_window(
+        db,
+        repo_id,
+        workdir,
+        observed_remote_tip,
+        _observed_bridge_tip,
+        request,
+        window,
+    )
+}
+
+/// Keep the API's admitted window across credential/remote observation and
+/// exact skip. This action writes only local cursor/disposition state; dropping
+/// its still-preparing window releases it after the complete action returns.
+pub fn execute_exact_skip_with_writer_window(
+    db: &Database,
+    repo_id: &str,
+    workdir: &Path,
+    observed_remote_tip: &str,
+    _observed_bridge_tip: Option<&str>,
+    request: &SkipCommitRequest,
+    window: crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+) -> Result<SkipCommitOutcome, SkipCommitRefusal> {
+    window
+        .require_engine_scope(db, Some(repo_id))
+        .map_err(|error| SkipCommitRefusal {
+            code: reason::WRITER_HELD.into(),
+            detail: error.to_string(),
+        })?;
     let pinned_cursor = normalize_sha(&request.pinned_cursor)?;
     let expected_remote_tip = normalize_sha(&request.expected_remote_tip)?;
     let expected_bridge_tip = request

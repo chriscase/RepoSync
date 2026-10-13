@@ -661,6 +661,45 @@ impl AppConfig {
         }
     }
 
+    /// Read existing recovery secrets without key creation, plaintext migration
+    /// or any persistent mutation before an authenticated writer claim.
+    pub fn resolve_recovery_secrets_from_db(&mut self, db: &Database) -> anyhow::Result<()> {
+        let secret = |name: &str, legacy: &str| -> anyhow::Result<Option<String>> {
+            if let Some((ciphertext, nonce)) = db.get_encrypted_secret(name)? {
+                let encoded = db
+                    .get_state("encryption_key")?
+                    .ok_or_else(|| anyhow::anyhow!("recovery secret key is missing"))?;
+                let bytes = hex::decode(encoded)?;
+                let key: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("recovery secret key is invalid"))?;
+                return Ok(Some(crate::crypto::decrypt_credential(
+                    &ciphertext,
+                    &nonce,
+                    &key,
+                )?));
+            }
+            Ok(db.get_state(legacy)?.filter(|value| !value.is_empty()))
+        };
+        if self.svn.password.is_none() {
+            self.svn.password = secret("svn_password", "secret_svn_password")?;
+        }
+        if self.github.token.is_none() {
+            self.github.token = secret("git_token", "secret_git_token")?;
+        }
+        if self.web.admin_password.is_none() {
+            self.web.admin_password = db
+                .get_state("secret_admin_password_hash")?
+                .filter(|value| !value.is_empty());
+            if self.web.admin_password.is_none() {
+                self.web.admin_password = db
+                    .get_state("secret_admin_password")?
+                    .filter(|value| !value.is_empty());
+            }
+        }
+        Ok(())
+    }
+
     /// Validate that all required fields are present and sane.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.svn.url.is_empty() {

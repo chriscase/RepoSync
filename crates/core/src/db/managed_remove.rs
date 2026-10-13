@@ -1160,10 +1160,16 @@ impl Database {
     /// journal and does not delete mappings, secrets, files, or remotes.
     pub fn legacy_disable_repository(&self, repo_id: &str) -> Result<bool, DatabaseError> {
         let conn = self.conn();
-        let changed = conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(&tx, repo_id)?;
+        super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+            &tx, repo_id,
+        )?;
+        let changed = tx.execute(
             "UPDATE repositories SET enabled=0, updated_at=?1 WHERE id=?2",
             params![Utc::now().to_rfc3339(), repo_id],
         )?;
+        tx.commit()?;
         Ok(changed == 1)
     }
 
@@ -1174,6 +1180,8 @@ impl Database {
         request_id: &str,
     ) -> Result<RemovalAdvance, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
             if let Some(op) = read_op(tx, repo_id)? {
                 if op.state.is_terminal_success() {
                     if load_repo(tx, repo_id)?.is_none() {
@@ -1243,6 +1251,10 @@ impl Database {
         remote: &ManagedRemoveRemoteOutcome,
     ) -> Result<(), DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(());
@@ -1262,6 +1274,10 @@ impl Database {
         detail: &str,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Ok(op);
@@ -1291,6 +1307,10 @@ impl Database {
         remote: Option<&ManagedRemoveRemoteOutcome>,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
         self.transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
             let mut op = require_active(tx, repo_id, op_id)?;
             if op.state.is_terminal_success() {
                 return Err(DatabaseError::Other(
@@ -1318,14 +1338,15 @@ impl Database {
         op_id: &str,
         remote: &ManagedRemoveRemoteOutcome,
     ) -> Result<ManagedRemoveOperation, DatabaseError> {
-        let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
-            DatabaseError::Other(format!("encryption key unavailable: {error}"))
-        })?;
-        {
-            let conn = self.conn();
-            crate::db::repo_scope_identity::ensure_repository_removal_ready(&conn)?;
-        }
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
+                tx, repo_id,
+            )?;
+            let enc_key = crate::crypto::get_or_create_encryption_key_tx(tx).map_err(|error| {
+                DatabaseError::Other(format!("encryption key unavailable: {error}"))
+            })?;
+            crate::db::repo_scope_identity::ensure_repository_removal_ready(tx)?;
             let scoped_secrets = capture_owned_scoped_secrets(tx, repo_id, &enc_key)?;
             let inbound_last_git_sha =
                 crate::echo_receipt_scope::read_scoped_last_git_sha_kv_tx(tx, repo_id)?
@@ -1445,10 +1466,12 @@ impl Database {
         &self,
         repo_id: &str,
     ) -> Result<RestoreAdvance, DatabaseError> {
-        let enc_key = crate::crypto::get_or_create_encryption_key(self).map_err(|error| {
-            DatabaseError::Other(format!("encryption key unavailable: {error}"))
-        })?;
-        self.transaction(|tx| {
+        self.immediate_transaction(|tx| {
+            super::pair_refresh_operations::require_no_pair_refresh_hold_for_writer(tx, repo_id)?;
+            super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(tx, repo_id)?;
+            let enc_key = crate::crypto::get_or_create_encryption_key_tx(tx).map_err(|error| {
+                DatabaseError::Other(format!("encryption key unavailable: {error}"))
+            })?;
             if removal_in_progress(tx, repo_id)? {
                 return Err(DatabaseError::Other(
                     "managed removal is still in progress; restore is not available".into(),

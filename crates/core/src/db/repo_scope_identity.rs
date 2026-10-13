@@ -10,7 +10,7 @@ use crate::errors::DatabaseError;
 
 pub const SCOPE_UUID_COLUMN: &str = "scope_uuid";
 
-const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads";
+pub(crate) const LEGACY_REPO_ID_KV_READS_KEY: &str = "reposync_v13_legacy_repo_id_kv_reads";
 const V13_SCOPE_UUID_MIGRATION_DONE_KEY: &str = "reposync_v13_scope_uuid_migration_done";
 
 const HANDLED_GIT_NO_TARGET_PREFIX: &str = "handled_git_no_target_";
@@ -509,6 +509,7 @@ pub(crate) fn delete_repository_registration_row(
     conn: &Connection,
     repo_id: &str,
 ) -> Result<(), DatabaseError> {
+    super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(conn, repo_id)?;
     purge_repository_kv_before_row_delete(conn, repo_id)?;
     let changed = conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
     if changed == 0 {
@@ -604,6 +605,17 @@ fn write_legacy_repo_id_kv_reads_flag(
     conn: &Connection,
     enabled: bool,
 ) -> Result<(), DatabaseError> {
+    if conn.is_autocommit() {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        write_legacy_repo_id_kv_reads_flag(&tx, enabled)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    super::pair_refresh_operations::require_no_pair_refresh_state_mutation(
+        conn,
+        LEGACY_REPO_ID_KV_READS_KEY,
+    )?;
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
         "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)

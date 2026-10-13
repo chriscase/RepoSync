@@ -38,9 +38,7 @@ use reposync_core::pair_refresh::{
     format_refusal, parse_operation, reanchor_refusal, svn_path_missing, GitLayout,
     RefreshObservations, RefreshOperation,
 };
-use reposync_core::skip_commit::{
-    build_skip_context, execute_exact_skip, reason as skip_reason, SkipCommitRequest,
-};
+use reposync_core::skip_commit::{build_skip_context, reason as skip_reason, SkipCommitRequest};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::{validate_session, validate_session_with_role};
@@ -4078,6 +4076,43 @@ async fn skip_commit_context(
     Ok(Json(serde_json::json!({ "ok": true, "context": context })))
 }
 
+async fn acquire_skip_commit_writer<'db>(
+    db: &'db Database,
+    id: &str,
+) -> Result<
+    (
+        reposync_core::busy::BusyGuard,
+        reposync_core::db::ordinary_writer_windows::OrdinaryWriterWindow<'db>,
+    ),
+    AppError,
+> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        reposync_core::db::pair_refresh_operations::require_no_pair_refresh_hold(
+            &db.conn(),
+            Some(id),
+        )
+        .map_err(|error| AppError::Conflict(error.to_string()))?;
+        if let Some(busy) = reposync_core::busy::try_acquire(id) {
+            if let Some(window) = db
+                .try_begin_ordinary_writer_window(Some(id))
+                .map_err(|error| AppError::Conflict(error.to_string()))?
+            {
+                return Ok((busy, window));
+            }
+            // Release this attempt before waiting for the existing writer.
+            drop(busy);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AppError::Conflict(format!(
+                "{}: existing writer has not released its scope",
+                skip_reason::WRITER_HELD
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 async fn skip_commit(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -4095,6 +4130,7 @@ async fn skip_commit(
 
     let db = &state.db;
     reject_held_import(db, &id)?;
+    let (_busy, writer_window) = acquire_skip_commit_writer(db, &id).await?;
     let repo = db
         .get_repository(&id)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
@@ -4125,8 +4161,16 @@ async fn skip_commit(
         })
         .ok();
 
-    let outcome = execute_exact_skip(db, &id, &workdir, &remote_tip, bridge_tip.as_deref(), &body)
-        .map_err(|refuse| AppError::Conflict(refuse.message()))?;
+    let outcome = reposync_core::skip_commit::execute_exact_skip_with_writer_window(
+        db,
+        &id,
+        &workdir,
+        &remote_tip,
+        bridge_tip.as_deref(),
+        &body,
+        writer_window,
+    )
+    .map_err(|refuse| AppError::Conflict(refuse.message()))?;
 
     let _ = db.reset_consecutive_errors(&id);
     let _ = db.conn().execute(

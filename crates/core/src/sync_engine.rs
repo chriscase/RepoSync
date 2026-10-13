@@ -59,7 +59,7 @@ use crate::git_push::{
 };
 use crate::history_inspect::{
     clear_transient_history_block, enforce_durable_history_block, history_block_key,
-    inspect_fetched_history, is_full_git_oid, persist_history_block, HistoryInspectReject,
+    is_full_git_oid, persist_history_block, HistoryInspectReject,
 };
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
@@ -475,6 +475,25 @@ impl SyncEngine {
         &self.config
     }
 
+    /// Capture a recheckable database admin session and this running engine's
+    /// effective policy. This read-only context does not enroll or publish a job.
+    pub fn capture_pair_refresh_actor_policy(
+        &self,
+        bearer: &str,
+    ) -> Result<
+        crate::pair_refresh::actor_policy::LiveRefreshActorPolicy<'_>,
+        crate::errors::DatabaseError,
+    > {
+        crate::pair_refresh::actor_policy::capture(
+            self,
+            &self.db,
+            &self.allowed_paths,
+            &self.blocked_patterns,
+            &self.lfs_threshold_bytes,
+            bearer,
+        )
+    }
+
     /// Return a reference to the identity mapper.
     pub fn identity_mapper(&self) -> &IdentityMapper {
         &self.identity_mapper
@@ -499,6 +518,22 @@ impl SyncEngine {
     /// The sync lock is released via a drop guard so it is freed even if
     /// the cycle panics.
     pub async fn run_sync_cycle(&self) -> Result<SyncStats, SyncError> {
+        self.run_sync_cycle_in_window(None).await
+    }
+
+    /// Consume the scheduler's admitted preparation window so mutable prep and
+    /// the cycle share one continuous durable owner, without reacquisition.
+    pub async fn run_sync_cycle_with_writer_window(
+        &self,
+        window: crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<SyncStats, SyncError> {
+        self.run_sync_cycle_in_window(Some(window)).await
+    }
+
+    async fn run_sync_cycle_in_window(
+        &self,
+        supplied_window: Option<crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>>,
+    ) -> Result<SyncStats, SyncError> {
         // Acquire the sync lock.
         if self
             .running
@@ -512,6 +547,21 @@ impl SyncEngine {
 
         // RAII guard that clears the running flag on drop (even on panic).
         let _guard = SyncLockGuard(self.running.clone());
+
+        // Admit before credential reload, schema changes or working-tree work.
+        // Refresh admission checks this durable window in its own transaction.
+        let writer_window = match supplied_window {
+            Some(window) => {
+                window
+                    .require_engine_scope(&self.db, self.effective_repo_id())
+                    .map_err(SyncError::DatabaseError)?;
+                window
+            }
+            None => self
+                .db
+                .begin_ordinary_writer_window(self.effective_repo_id())
+                .map_err(SyncError::DatabaseError)?,
+        };
 
         // Hot-reload credentials from DB (changed via Setup Wizard).
         self.reload_credentials();
@@ -528,7 +578,7 @@ impl SyncEngine {
         // Store the sync state (per-repo for managed pairs, global otherwise).
         let _ = self.persist_sync_state("detecting");
 
-        let result = self.do_sync_cycle(&mut stats).await;
+        let result = self.do_sync_cycle(&mut stats, &writer_window).await;
 
         // Record completion
         let (final_state, details) = match &result {
@@ -579,6 +629,7 @@ impl SyncEngine {
 
         if result.is_ok() {
             let _ = clear_transient_history_block(&self.db, &self.history_block_key());
+            writer_window.finish().map_err(SyncError::DatabaseError)?;
         }
 
         // Lock is released by _guard drop (happens here at scope end).
@@ -2004,11 +2055,29 @@ impl SyncEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let http_token = git.stored_http_auth_token();
-        match inspect_fetched_history(
+        let refresh = match (self.effective_repo_id(), p.as_deref()) {
+            (Some(id), Some(checkpoint))
+                if git.head_sha().map_err(SyncError::GitError)? != checkpoint =>
+            {
+                // A refusal here grants no exception; the ordinary inspector
+                // remains authoritative for all other local-history shapes.
+                crate::pair_refresh::engine_checkout::CompletedRefreshCheckout::capture(
+                    &self.db,
+                    id,
+                    &self.config.github.default_branch,
+                    checkpoint,
+                )
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+        match crate::history_inspect::inspect_fetched_history_with_refresh_baseline(
             git.repo_path(),
             &self.config.github.default_branch,
             p.clone(),
             http_token.as_deref(),
+            refresh.as_ref(),
         ) {
             Ok(admission) => Ok(TeamHistoryAdmission {
                 checkpoint: admission.checkpoint,
@@ -2025,7 +2094,11 @@ impl SyncEngine {
         }
     }
 
-    async fn do_sync_cycle(&self, stats: &mut SyncStats) -> Result<(), SyncError> {
+    async fn do_sync_cycle(
+        &self,
+        stats: &mut SyncStats,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<(), SyncError> {
         if let Some(rid) = self.effective_repo_id() {
             if let Some(op) = self
                 .db
@@ -2169,7 +2242,7 @@ impl SyncEngine {
 
         // 3. Apply SVN -> Git.
         let _ = self.persist_sync_state("applying");
-        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count)
+        self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count, writer_window)
             .await?;
 
         // The exact remote Git tip had no pending commits before this SVN
@@ -2190,8 +2263,64 @@ impl SyncEngine {
 
         // 4. Apply Git -> SVN.
         stats.git_to_svn_count = self
-            .sync_git_to_svn(&git_fetch.replay_batch, batch_continuation.as_ref())
+            .sync_git_to_svn(
+                &git_fetch.replay_batch,
+                batch_continuation.as_ref(),
+                writer_window,
+            )
             .await?;
+
+        // Receipt filtering must eventually advance the inbound cursor too.
+        // Only a complete range consisting entirely of our emitted commits is
+        // eligible, in a cycle with no source work or opposite publication.
+        if svn_changes.is_empty()
+            && !git_fetch.has_more
+            && git_fetch.replay_batch.is_empty()
+            && git_fetch.pending_total > 0
+            && self.allowed_paths.is_empty()
+            && self.blocked_patterns.is_empty()
+        {
+            if let Some(rid) = self.effective_repo_id() {
+                let selection = {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    git.pending_commits_between(
+                        &admission.checkpoint,
+                        &admission.remote_tip,
+                        self.replay_batch_cap(),
+                    )
+                    .map_err(SyncError::GitError)?
+                };
+                if !selection.has_more && selection.total == selection.commits.len() {
+                    let shas = selection
+                        .commits
+                        .iter()
+                        .map(|commit| commit.sha.as_str())
+                        .collect::<Vec<_>>();
+                    writer_window
+                        .settle_emitted_git_echoes(
+                            rid,
+                            &admission.checkpoint,
+                            &admission.remote_tip,
+                            &shas,
+                        )
+                        .map_err(SyncError::DatabaseError)?;
+                }
+            }
+        }
+
+        // A later quiet ordinary cycle may observe only SVN revisions emitted
+        // by this parent. Settle its inbound cursor only from that complete
+        // branch observation and current applied correspondence.
+        if svn_changes.is_empty()
+            && git_fetch.pending_total == 0
+            && stats.svn_to_git_count == 0
+            && stats.git_to_svn_count == 0
+            && self.allowed_paths.is_empty()
+            && self.blocked_patterns.is_empty()
+        {
+            self.settle_parent_svn_echoes(&admission.checkpoint, writer_window)
+                .await?;
+        }
 
         // Collect commit details for notifications (max 10 commits)
         for change in &svn_changes {
@@ -2258,6 +2387,7 @@ impl SyncEngine {
         &self,
         svn_changes: &[SvnChangeSet],
         applied: &mut usize,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
     ) -> Result<(), SyncError> {
         let resume_svn_rev = if let Some(rid) = self.effective_repo_id() {
             match self
@@ -2633,6 +2763,9 @@ impl SyncEngine {
                 }
             }
 
+            writer_window
+                .mark_unjournalled_publication_possible()
+                .map_err(SyncError::DatabaseError)?;
             let push_result = tokio::task::block_in_place(|| {
                 let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
                 git.push(&remote, &branch).map_err(SyncError::GitError)
@@ -3301,6 +3434,7 @@ impl SyncEngine {
         &self,
         git_changes: &[GitChangeSet],
         batch_continuation: Option<&GitReplayBatchContinuation>,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
     ) -> Result<usize, SyncError> {
         let mut count = 0;
         let resume_sha = if let Some(rid) = self.effective_repo_id() {
@@ -3849,6 +3983,9 @@ impl SyncEngine {
                     &change.sha[..8.min(change.sha.len())]
                 ),
             };
+            writer_window
+                .mark_unjournalled_publication_possible()
+                .map_err(SyncError::DatabaseError)?;
             let mut svn_commit_result = svn
                 .commit(svn_wc_dir.path(), &commit_message, &svn_username)
                 .await;
@@ -4070,6 +4207,84 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
     // Change fetching
     // -----------------------------------------------------------------------
+
+    async fn settle_parent_svn_echoes(
+        &self,
+        git_checkpoint: &str,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<(), SyncError> {
+        let Some(repo_id) = self.effective_repo_id() else {
+            return Ok(());
+        };
+        // Keep other ordinary/Personal roots on their existing cursor protocol.
+        let eligible: bool = self.db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM repositories WHERE parent_id=?1 AND id<>?1 AND sync_mode='team' AND enabled=1)",
+            [repo_id], |row| row.get(0),
+        ).map_err(crate::errors::DatabaseError::from).map_err(SyncError::DatabaseError)?;
+        if !eligible {
+            return Ok(());
+        }
+        let (last_rev, column_git) = self
+            .db
+            .get_repo_watermark(repo_id)
+            .map_err(SyncError::DatabaseError)?;
+        if last_rev <= 0 || column_git != git_checkpoint {
+            return Ok(());
+        }
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let head = svn.info().await.map_err(SyncError::SvnError)?.latest_rev;
+        if head <= last_rev {
+            return Ok(());
+        }
+        let entries = svn
+            .strict_log_range(last_rev + 1, head)
+            .await
+            .map_err(SyncError::SvnError)?;
+        let mut receipts = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.revision <= last_rev || entry.revision > head {
+                return Ok(());
+            }
+            let matches = {
+                let conn = self.db.conn();
+                let mut query = conn.prepare(
+                    "SELECT git_sha FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND direction='git_to_svn' AND status='applied'",
+                ).map_err(crate::errors::DatabaseError::from).map_err(SyncError::DatabaseError)?;
+                let matches = query
+                    .query_map(rusqlite::params![repo_id, entry.revision], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(crate::errors::DatabaseError::from)
+                    .map_err(SyncError::DatabaseError)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(crate::errors::DatabaseError::from)
+                    .map_err(SyncError::DatabaseError)?;
+                matches
+            };
+            let [sha] = matches.as_slice() else {
+                return Ok(());
+            };
+            if sha != git_checkpoint
+                && !self
+                    .git_client
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_ancestor(sha, git_checkpoint)
+                    .map_err(SyncError::GitError)?
+            {
+                return Ok(());
+            }
+            receipts.push((entry.revision, sha.clone()));
+        }
+        receipts.sort_by_key(|(revision, _)| *revision);
+        writer_window
+            .settle_emitted_svn_echoes(repo_id, last_rev, git_checkpoint, &receipts)
+            .map_err(SyncError::DatabaseError)
+    }
 
     async fn fetch_svn_changes(&self) -> Result<Vec<SvnChangeSet>, SyncError> {
         let last_rev = if let Some(rid) = self.effective_repo_id() {

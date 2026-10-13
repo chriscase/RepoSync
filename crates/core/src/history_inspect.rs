@@ -190,6 +190,16 @@ pub fn inspect_fetched_history(
     p: Option<String>,
     http_auth_token: Option<&str>,
 ) -> Result<HistoryInspectAdmission, HistoryInspectReject> {
+    inspect_fetched_history_with_refresh_baseline(path, branch, p, http_auth_token, None)
+}
+
+pub(crate) fn inspect_fetched_history_with_refresh_baseline(
+    path: &Path,
+    branch: &str,
+    p: Option<String>,
+    http_auth_token: Option<&str>,
+    refresh: Option<&crate::pair_refresh::engine_checkout::CompletedRefreshCheckout>,
+) -> Result<HistoryInspectAdmission, HistoryInspectReject> {
     let run = |args: &[&str]| -> std::io::Result<Output> {
         #[cfg(debug_assertions)]
         let fault = std::env::var("REPOSYNC_TEST_INSPECTION_FAULT").ok();
@@ -451,8 +461,19 @@ pub fn inspect_fetched_history(
             }
         }
     }
+    let completed_refresh_checkout = refresh
+        .is_some_and(|proof| proof.permits(branch, checkpoint, &local))
+        && run(&["merge-base", "--is-ancestor", &local, checkpoint])
+            .is_ok_and(|output| output.status.code() == Some(0));
     for (ancestor, descendant) in [
-        (checkpoint, local.as_str()),
+        (
+            if completed_refresh_checkout {
+                local.as_str()
+            } else {
+                checkpoint
+            },
+            local.as_str(),
+        ),
         (local.as_str(), fetched.as_str()),
     ] {
         match run(&["merge-base", "--is-ancestor", ancestor, descendant]) {

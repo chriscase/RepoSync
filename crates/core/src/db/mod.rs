@@ -9,6 +9,10 @@ pub mod git_push_operations;
 pub mod import_operations;
 pub mod late_pair_publish_operations;
 pub mod managed_remove;
+pub mod ordinary_writer_windows;
+mod pair_refresh_competing_journals;
+pub mod pair_refresh_credentials;
+pub mod pair_refresh_operations;
 pub mod personal_scope;
 pub mod queries;
 pub mod repo_scope_identity;
@@ -16,6 +20,8 @@ pub mod schema;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
 pub mod watermark_recovery;
+
+pub(crate) mod opened_file;
 
 #[cfg(feature = "reliability-fixture")]
 pub mod candidate_authority;
@@ -35,6 +41,7 @@ use rusqlite::Connection;
 use tracing::{debug, info};
 
 use crate::errors::DatabaseError;
+use opened_file::OpenedDatabaseFile;
 
 /// Main database handle wrapping a SQLite connection.
 ///
@@ -43,6 +50,7 @@ use crate::errors::DatabaseError;
 /// `Mutex` so that `Database` is `Send + Sync`, enabling use inside `Arc`.
 pub struct Database {
     conn: Mutex<Connection>,
+    opened_file: Option<OpenedDatabaseFile>,
     #[cfg(test)]
     test_force_echo_split_fail: Mutex<bool>,
 }
@@ -55,8 +63,10 @@ impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
         info!(path = %path.display(), "opening database");
+        let prior_file = OpenedDatabaseFile::capture(path);
 
         let conn = Connection::open(path)?;
+        let connected_file = OpenedDatabaseFile::attest(&conn, path, prior_file);
 
         // Refuse a future schema before WAL checkpoint or other writes.
         let existing_version: u32 =
@@ -88,8 +98,53 @@ impl Database {
         }
 
         debug!("database opened successfully with WAL mode");
+        let opened_file = connected_file
+            .and_then(|identity| OpenedDatabaseFile::attest(&conn, path, Some(identity)));
         Ok(Self {
             conn: Mutex::new(conn),
+            opened_file,
+            #[cfg(test)]
+            test_force_echo_split_fail: Mutex::new(false),
+        })
+    }
+
+    /// Open existing current-schema WAL storage for authenticated pair refresh
+    /// recovery. This entrance never creates storage, migrates, checkpoints,
+    /// seeds credentials, repairs journals or obtains a writer lease.
+    pub fn open_existing_for_pair_refresh_recovery(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let prior = OpenedDatabaseFile::capture(path).ok_or_else(|| {
+            DatabaseError::Other("recovery requires existing native database storage".into())
+        })?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let opened_file = OpenedDatabaseFile::attest(&conn, path, Some(prior))
+            .ok_or_else(|| DatabaseError::Other("recovery database identity changed".into()))?;
+        let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != schema::CURRENT_SCHEMA_VERSION {
+            return Err(DatabaseError::Other(
+                "recovery requires an already current database schema".into(),
+            ));
+        }
+        let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            return Err(DatabaseError::Other(
+                "recovery requires existing WAL storage".into(),
+            ));
+        }
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(DatabaseError::Other(
+                "recovery database integrity check refused".into(),
+            ));
+        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA wal_autocheckpoint = 0;",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            opened_file: Some(opened_file),
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -101,8 +156,17 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(Self {
             conn: Mutex::new(conn),
+            opened_file: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
+        })
+    }
+
+    pub(crate) fn opened_file(&self) -> Result<&OpenedDatabaseFile, DatabaseError> {
+        self.opened_file.as_ref().ok_or_else(|| {
+            DatabaseError::Other(
+                "pair refresh resources require a known file-backed database".into(),
+            )
         })
     }
 
@@ -150,7 +214,18 @@ impl Database {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
         let lock = crate::data_dir::acquire(data_dir)?;
-        let db = Self::new(data_dir.join("reposync.db"))?;
+        let path = data_dir.join("reposync.db");
+        if path.try_exists()? {
+            // Open read-only before ordinary startup can checkpoint, migrate,
+            // seed credentials or claim a replacement lease. The local lock is
+            // retained through startup; the lease claim rechecks in its writer
+            // transaction before a new epoch can be created.
+            let probe =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            probe.execute_batch("BEGIN;")?;
+            pair_refresh_operations::require_no_authenticated_startup_hold(&probe)?;
+        }
+        let db = Self::new(path)?;
         db.initialize()?;
         let fence = crate::writer_fence::claim(&db, data_dir)?;
         Ok((db, crate::data_dir::DataDirOwner { lock, fence }))
@@ -186,8 +261,26 @@ impl Database {
     where
         F: FnOnce(&Connection) -> Result<T, DatabaseError>,
     {
+        self.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred, f)
+    }
+
+    pub(crate) fn immediate_transaction<F, T>(&self, f: F) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(&Connection) -> Result<T, DatabaseError>,
+    {
+        self.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate, f)
+    }
+
+    fn transaction_with_behavior<F, T>(
+        &self,
+        behavior: rusqlite::TransactionBehavior,
+        f: F,
+    ) -> Result<T, DatabaseError>
+    where
+        F: FnOnce(&Connection) -> Result<T, DatabaseError>,
+    {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(behavior)?;
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result)

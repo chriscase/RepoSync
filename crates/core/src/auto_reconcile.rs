@@ -96,6 +96,49 @@ pub async fn reconcile_held_external_writes(
     svn: &SvnClient,
     git_workdir: Option<&Path>,
 ) -> Result<AutoReconcileResult, DatabaseError> {
+    let writer_window = db.begin_ordinary_writer_window(Some(&repo.id))?;
+    reconcile_with_window(db, repo, svn, git_workdir, writer_window).await
+}
+
+/// Scheduler entry: credential resolution and client construction occur only
+/// after exclusion. The client-taking variant remains for explicit callers.
+pub async fn reconcile_held_external_writes_with_resolved_credentials(
+    db: &Database,
+    repo: &Repository,
+    git_workdir: Option<&Path>,
+) -> Result<AutoReconcileResult, DatabaseError> {
+    let writer_window = db.begin_ordinary_writer_window(Some(&repo.id))?;
+    let credential = db.resolve_credential_chain_state(&repo.id, "secret_svn_password");
+    if credential.explicitly_revoked {
+        return Err(DatabaseError::Other(
+            "automatic reconciliation SVN credential explicitly revoked".into(),
+        ));
+    }
+    let url = if repo.svn_branch.is_empty() {
+        repo.svn_url.clone()
+    } else {
+        format!(
+            "{}/{}",
+            repo.svn_url.trim_end_matches('/'),
+            repo.svn_branch.trim_start_matches('/')
+        )
+    };
+    let svn = SvnClient::new(
+        &url,
+        &repo.svn_username,
+        credential.value.as_deref().unwrap_or(""),
+    );
+    reconcile_with_window(db, repo, &svn, git_workdir, writer_window).await
+}
+
+async fn reconcile_with_window(
+    db: &Database,
+    repo: &Repository,
+    svn: &SvnClient,
+    git_workdir: Option<&Path>,
+    writer_window: crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+) -> Result<AutoReconcileResult, DatabaseError> {
+    writer_window.require_engine_scope(db, Some(&repo.id))?;
     let mut result = AutoReconcileResult::default();
 
     if let Some(op) = db.active_import_operation(&repo.id)? {
@@ -220,5 +263,6 @@ pub async fn reconcile_held_external_writes(
         }
     }
 
+    writer_window.finish()?;
     Ok(result)
 }
