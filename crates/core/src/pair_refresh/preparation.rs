@@ -159,3 +159,60 @@ pub fn prepare_clean_child_git(
         parent_advance_commits,
     })
 }
+
+/// Read the exact retained object without manufacturing a missing commit during
+/// recovery. The immutable OID, parents, tree, author and operation marker agree.
+pub(crate) fn require_prepared_refresh_object(
+    repo: &Repository,
+    prepared: &PreparedCleanChildGit,
+) -> Result<(), GitError> {
+    require_complete_git_graph(repo)?;
+    let commit = repo.find_commit(pin(&prepared.prepared_sha)?)?;
+    let expected = [
+        pin(&prepared.pins.child_tip)?,
+        pin(&prepared.pins.parent_tip)?,
+    ];
+    let message = format!(
+        "[reposync] Update pair from parent\n\nRepoSync-Pair-Refresh: {}\n",
+        prepared.operation_id
+    );
+    if commit.parent_ids().collect::<Vec<_>>() != expected
+        || commit.tree_id() != pin(&prepared.tree_sha)?
+        || commit.message_bytes() != message.as_bytes()
+    {
+        return Err(refused("retained prepared commit differs from signed job"));
+    }
+    for signature in [commit.author(), commit.committer()] {
+        if signature.name_bytes() != b"RepoSync"
+            || signature.email_bytes() != b"reposync@localhost"
+            || signature.when().seconds() != prepared.prepared_at
+            || signature.when().offset_minutes() != 0
+        {
+            return Err(refused("retained prepared commit signature differs"));
+        }
+    }
+    require_supported_refresh_tree(repo, &commit.tree()?)?;
+    let baseline = repo.find_commit(pin(&prepared.pins.parent_baseline_tip)?)?;
+    let child = repo.find_commit(expected[0])?;
+    if child.tree_id() != baseline.tree_id()
+        || (child.id() != baseline.id() && !repo.graph_descendant_of(child.id(), baseline.id())?)
+    {
+        return Err(refused("retained unchanged child baseline differs"));
+    }
+    let mut current = expected[1];
+    let mut count = 0;
+    while current != baseline.id() {
+        let commit = repo.find_commit(current)?;
+        if commit.parent_count() != 1 || count >= MAX_PARENT_ADVANCE {
+            return Err(refused("retained parent advance is unsupported"));
+        }
+        require_supported_refresh_tree(repo, &commit.tree()?)?;
+        current = commit.parent_id(0)?;
+        count += 1;
+    }
+    if count == 0 || count != prepared.parent_advance_commits {
+        return Err(refused("retained parent advance count differs"));
+    }
+    require_supported_refresh_tree(repo, &baseline.tree()?)?;
+    require_supported_refresh_tree(repo, &child.tree()?)
+}

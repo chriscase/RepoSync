@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::db::Database;
@@ -154,7 +154,8 @@ fn refused(detail: &str) -> DatabaseError {
     DatabaseError::Other(format!("pair refresh resources refused: {detail}"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceIdentity {
     pub path: PathBuf,
     pub device: u64,
@@ -253,7 +254,8 @@ impl ResourceIdentity {
 
 /// Internal server-computed resource metadata for later authenticated binding.
 /// A serialized pin cannot construct a live workspace or authorize cleanup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefreshWorkspacePin {
     pub version: u8,
     pub operation_id: Uuid,
@@ -262,9 +264,12 @@ pub struct RefreshWorkspacePin {
     pub namespace: ResourceIdentity,
     pub operation_directory: ResourceIdentity,
     pub actor_policy: RefreshActorPolicyPin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_owner: Option<super::native_owner::NativeProcessOwner>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefreshResourcePin {
     pub workspace: RefreshWorkspacePin,
     pub directories: BTreeMap<String, ResourceIdentity>,
@@ -272,6 +277,7 @@ pub struct RefreshResourcePin {
 
 struct WorkspaceOwner {
     pin: RefreshWorkspacePin,
+    creator_pid: u32,
     // Set before any durable enrollment attempt, not after a successful commit.
     // An unknown commit outcome must not trigger resource deletion on drop.
     retained: AtomicBool,
@@ -294,6 +300,12 @@ impl WorkspaceOwner {
     }
 
     fn require_current(&self) -> Result<(), DatabaseError> {
+        if self.creator_pid != std::process::id() {
+            return Err(refused("live workspace belongs to another native process"));
+        }
+        if let Some(owner) = &self.pin.native_owner {
+            owner.require_current()?;
+        }
         self.require_root()?;
         for directory in self
             .directories
@@ -337,6 +349,108 @@ pub struct RefreshWorkspace {
 }
 
 impl RefreshWorkspace {
+    /// Reopen only MAC-verified identities after positive native predecessor
+    /// death. No directory creation, permission repair or cleanup is performed.
+    pub(crate) fn reconstruct(
+        db: &Database,
+        configured_data_directory: &Path,
+        candidate: &crate::db::pair_refresh_operations::VerifiedRecoveryCandidate,
+    ) -> Result<Self, DatabaseError> {
+        candidate.require_native_proof()?;
+        let resources = candidate.resources();
+        let old = candidate.old_resources();
+        if resources.workspace.version != 2
+            || resources.workspace.operation_id != candidate.operation().id
+            || old.workspace.native_owner.is_none()
+            || resources
+                .directories
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                != ["git", "svn", "svn-operation", "svn-working-copy"]
+        {
+            return Err(refused("unsupported authenticated retained layout"));
+        }
+        let pin = &resources.workspace;
+        let configured = std::fs::canonicalize(configured_data_directory)
+            .map_err(|_| refused("recovery data directory is unavailable"))?;
+        let opened = db.opened_file()?;
+        if opened.aliased
+            || opened.path != pin.database.path
+            || opened.device != pin.database.device
+            || opened.inode != pin.database.inode
+            || configured != pin.data_directory.path
+            || opened.path.parent() != Some(configured.as_path())
+            || pin.namespace.path != configured.join(NAMESPACE)
+            || pin.operation_directory.path != pin.namespace.path.join(pin.operation_id.to_string())
+        {
+            return Err(refused("recovery storage or namespace differs"));
+        }
+        for (name, path) in [
+            ("git", pin.operation_directory.path.join("git")),
+            ("svn", pin.operation_directory.path.join("svn")),
+            (
+                "svn-operation",
+                pin.operation_directory
+                    .path
+                    .join("svn")
+                    .join(pin.operation_id.to_string()),
+            ),
+            (
+                "svn-working-copy",
+                pin.operation_directory
+                    .path
+                    .join("svn")
+                    .join(pin.operation_id.to_string())
+                    .join("child"),
+            ),
+        ] {
+            let identity = resources
+                .directories
+                .get(name)
+                .ok_or_else(|| refused("retained role is missing"))?;
+            if identity.path != path {
+                return Err(refused("retained role path differs"));
+            }
+            identity.require_current(true, true)?;
+        }
+        pin.database.require_current(false, false)?;
+        pin.data_directory.require_current(true, false)?;
+        pin.namespace.require_current(true, true)?;
+        pin.operation_directory.require_current(true, true)?;
+        let data_handle = open_directory(&configured)?;
+        pin.data_directory.require_handle(&data_handle)?;
+        let namespace_name =
+            std::ffi::CString::new(NAMESPACE).map_err(|_| refused("invalid namespace"))?;
+        let namespace_handle = open_child(&data_handle, &namespace_name, true)?;
+        pin.namespace.require_handle(&namespace_handle)?;
+        let operation_name = std::ffi::CString::new(pin.operation_id.to_string())
+            .map_err(|_| refused("invalid retained operation"))?;
+        let operation_handle = open_child(&namespace_handle, &operation_name, true)?;
+        pin.operation_directory.require_handle(&operation_handle)?;
+        let git_handle = open_child(&operation_handle, c"git", true)?;
+        resources.directories["git"].require_handle(&git_handle)?;
+        let svn_handle = open_child(&operation_handle, c"svn", true)?;
+        resources.directories["svn"].require_handle(&svn_handle)?;
+        let svn_operation = open_child(&svn_handle, &operation_name, true)?;
+        resources.directories["svn-operation"].require_handle(&svn_operation)?;
+        let working = open_child(&svn_operation, c"child", true)?;
+        resources.directories["svn-working-copy"].require_handle(&working)?;
+        candidate.require_native_proof()?;
+        let workspace = Self {
+            owner: Arc::new(WorkspaceOwner {
+                pin: pin.clone(),
+                creator_pid: std::process::id(),
+                retained: AtomicBool::new(true),
+                directories: Mutex::new(resources.directories.clone()),
+                namespace_handle,
+                operation_handle,
+            }),
+        };
+        workspace.require_current()?;
+        Ok(workspace)
+    }
+
     /// Snapshot the complete currently tracked resource layout for later
     /// authenticated enrollment. This snapshot is not cleanup/adoption authority.
     pub fn resource_pin(&self) -> Result<RefreshResourcePin, DatabaseError> {
@@ -539,7 +653,9 @@ pub(crate) fn create(
                 namespace,
                 operation_directory,
                 actor_policy: actor_policy.clone(),
+                native_owner: super::native_owner::NativeProcessOwner::capture(),
             },
+            creator_pid: std::process::id(),
             retained: AtomicBool::new(false),
             directories: Mutex::new(BTreeMap::new()),
             namespace_handle,

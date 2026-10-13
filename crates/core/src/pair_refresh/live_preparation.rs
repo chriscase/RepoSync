@@ -58,6 +58,46 @@ impl PreparationDirectory {
 }
 
 impl LivePreparedRefresh {
+    pub(crate) fn reconstruct(
+        candidate: &mut crate::db::pair_refresh_operations::VerifiedRecoveryCandidate,
+        workspace: RefreshWorkspace,
+    ) -> Result<Self> {
+        candidate.require_native_proof()?;
+        let configuration = candidate.take_configuration()?;
+        let git = GitSourceSnapshot::reconstruct(candidate, &configuration, workspace.clone())?;
+        let svn = SvnSourceSnapshot::reconstruct(candidate, &configuration)?;
+        let visibility = candidate.original_visibility()?;
+        let path = candidate
+            .resources()
+            .directories
+            .get("svn")
+            .context("retained SVN role is missing")?
+            .path
+            .clone();
+        if candidate.operation().pins.svn.working_copy
+            != candidate
+                .resources()
+                .directories
+                .get("svn-working-copy")
+                .context("retained working copy is missing")?
+                .path
+        {
+            bail!("retained working copy differs from signed job");
+        }
+        workspace.require_current()?;
+        Ok(Self {
+            pins: candidate.operation().pins.clone(),
+            configuration,
+            git,
+            svn,
+            visibility: Some(visibility),
+            _operation_directory: PreparationDirectory::Workspace {
+                path,
+                owner: workspace,
+            },
+        })
+    }
+
     pub(crate) fn workspace(&self) -> Result<&RefreshWorkspace, crate::errors::DatabaseError> {
         match &self._operation_directory {
             PreparationDirectory::Workspace { owner, .. } => Ok(owner),
@@ -165,6 +205,24 @@ pub(crate) async fn prepare_registered_in_workspace(
         workspace,
         prepared_at,
         super::git_sources::observe_registered_git_sources_in_workspace,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_registered_in_workspace_with_client(
+    db: &Database,
+    child_id: &str,
+    workspace: RefreshWorkspace,
+    client: reqwest::Client,
+) -> Result<LivePreparedRefresh> {
+    prepare_registered_with_git_observer(
+        db,
+        child_id,
+        workspace,
+        chrono::Utc::now().timestamp(),
+        move |configuration, workspace| {
+            super::git_sources::observe_in_workspace_with_client(configuration, workspace, client)
+        },
     )
     .await
 }

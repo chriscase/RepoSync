@@ -33,6 +33,7 @@ mod authenticated;
 
 pub(crate) use authenticated::approval_digest as authenticated_approval_digest;
 pub(crate) use authenticated::noop_approval_digest as authenticated_noop_approval_digest;
+pub(crate) use authenticated::VerifiedRecoveryCandidate;
 
 #[derive(PartialEq, Eq)]
 enum AdmissionValidation {
@@ -593,6 +594,19 @@ pub fn require_no_pair_refresh_hold(
     Ok(())
 }
 
+/// Keep a released lease from reusing an epoch while an authenticated refresh
+/// still owns durable scopes. Completed history and legacy clean release keep
+/// their established epoch behavior.
+pub(crate) fn authenticated_refresh_epoch_floor(tx: &Connection) -> Result<u64, DatabaseError> {
+    let mut floor = 0;
+    for operation in journal(tx)? {
+        if operation.version == 3 && operation.phase.holds_scopes() {
+            floor = floor.max(authenticated::effective_writer_epoch(tx, &operation)?);
+        }
+    }
+    Ok(floor)
+}
+
 /// Existing personal-mode journals have no managed registration identity and
 /// must be treated as global writers for refresh exclusion.
 pub fn require_no_pair_refresh_hold_for_writer(
@@ -881,6 +895,34 @@ fn require_held_execution_inputs(
 }
 
 impl Database {
+    /// Internal worker cleanup proof. Complete authenticated history is checked
+    /// even if the request's session was revoked during a refused action.
+    pub(crate) fn verified_refresh_job_holds(&self, id: Uuid) -> Result<bool, DatabaseError> {
+        self.immediate_transaction(|tx| {
+            Ok(journal(tx)?
+                .iter()
+                .any(|op| op.id == id && op.phase.holds_scopes()))
+        })
+    }
+
+    pub(crate) fn authenticated_refresh_request(
+        &self,
+        engine: &crate::sync_engine::SyncEngine,
+        actor: &crate::pair_refresh::actor_policy::LiveRefreshActorPolicy<'_>,
+        request: &str,
+        child_scope: &str,
+    ) -> Result<Option<PairRefreshOperation>, DatabaseError> {
+        self.immediate_transaction(|tx| {
+            actor.require_current_in_reserved_transaction(engine, tx)?;
+            Ok(journal(tx)?.into_iter().find(|operation| {
+                operation.version == 3
+                    && operation.initiator_id == actor.pin().actor_id
+                    && operation.request_id == request
+                    && operation.pins.child.scope_uuid == child_scope
+            }))
+        })
+    }
+
     /// Validate newly prepared local evidence without enrolling a request.
     /// Remote proof and actor authorization come from the separate caller.
     pub fn require_registered_pair_refresh_preparation(
@@ -918,6 +960,39 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The ordinary engine may inspect its exact pre-refresh checkout after
+    /// signed completion. This is not preparation for another refresh: current
+    /// transient local diagnostics must still be checked by normal inspection,
+    /// and the parent is free to advance after completion.
+    pub(crate) fn completed_refresh_for_engine_checkout(
+        &self,
+        child_id: &str,
+    ) -> Result<Option<PairRefreshOperation>, DatabaseError> {
+        self.transaction(|tx| {
+            require_no_pair_refresh_hold(tx, None)?;
+            let child = capture_refresh_registration(tx, child_id)?;
+            let operations = journal(tx)?;
+            let mut matching = operations.into_iter().filter(|op| {
+                op.version == 3
+                    && op.phase == PairRefreshPhase::Completed
+                    && op.pins.child.repo_id == child.repo_id
+                    && op.pins.child.scope_uuid == child.scope_uuid
+                    && op.pins.child.configuration_digest == child.configuration_digest
+                    && op.pins.child.echo_generation == child.echo_generation
+                    && op.pins.git.prepared_sha == child.last_git_sha
+                    && op
+                        .svn_receipt
+                        .as_ref()
+                        .is_some_and(|r| r.revision == child.last_svn_rev)
+            });
+            let result = matching.next();
+            if matching.next().is_some() {
+                return Err(refused("ambiguous completed checkout receipt"));
+            }
+            Ok(result)
+        })
     }
 
     /// Read the unique completed receipt for the current child checkpoints.

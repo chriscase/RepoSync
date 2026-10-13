@@ -31,6 +31,44 @@ pub struct SvnSourceSnapshot {
 }
 
 impl SvnSourceSnapshot {
+    pub(crate) fn reconstruct(
+        candidate: &crate::db::pair_refresh_operations::VerifiedRecoveryCandidate,
+        configuration: &LiveExecutionConfiguration,
+    ) -> Result<Self, SvnError> {
+        candidate
+            .require_native_proof()
+            .map_err(|_| refused("native recovery proof changed"))?;
+        let operation = candidate.operation();
+        let lineage = &operation.pins.svn.pins.lineage.pins;
+        let visibility = candidate
+            .original_visibility()
+            .map_err(|_| refused("stored visibility is unavailable"))?;
+        let heads = visibility
+            .iter()
+            .filter(|pin| matches!(pin.role.as_str(), "current_child" | "current_parent"))
+            .map(|pin| pin.revision)
+            .collect::<Vec<_>>();
+        if visibility.len() != 5 || heads.len() != 2 || heads[0] != heads[1] {
+            return Err(refused("stored source HEAD is contradictory"));
+        }
+        let (child, parent) = configuration.isolated_svn_clients()?;
+        Ok(Self {
+            child,
+            parent,
+            pins: ObservedSvnSourcePins {
+                repository_uuid: lineage.child.repository_uuid.clone(),
+                repository_root_url: lineage.repository_root_url.clone(),
+                inspected_head_revision: heads[0],
+                child_url: lineage.child_url.clone(),
+                parent_url: lineage.parent_url.clone(),
+                child_path: lineage.child.child_path.clone(),
+                parent_path: lineage.child.parent_path.clone(),
+                child_checkpoint_revision: operation.pins.child.last_svn_rev,
+                parent_checkpoint_revision: operation.pins.parent.last_svn_rev,
+            },
+        })
+    }
+
     pub fn pins(&self) -> &ObservedSvnSourcePins {
         &self.pins
     }

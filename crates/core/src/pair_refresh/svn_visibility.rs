@@ -8,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::opened_file::OpenedDatabaseFile;
@@ -38,7 +38,8 @@ pub struct VisibleSvnCheckout {
 }
 
 /// Safe facts from a particular fresh snapshot, not admission authority.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SvnPresencePin {
     pub profile: String,
     pub role: String,
@@ -52,7 +53,8 @@ pub struct SvnPresencePin {
     pub ancestors: Vec<SvnAncestorPin>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SvnAncestorPin {
     pub url: String,
     pub revision: i64,

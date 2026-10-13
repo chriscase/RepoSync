@@ -59,7 +59,7 @@ use crate::git_push::{
 };
 use crate::history_inspect::{
     clear_transient_history_block, enforce_durable_history_block, history_block_key,
-    inspect_fetched_history, is_full_git_oid, persist_history_block, HistoryInspectReject,
+    is_full_git_oid, persist_history_block, HistoryInspectReject,
 };
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
@@ -2055,11 +2055,29 @@ impl SyncEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let http_token = git.stored_http_auth_token();
-        match inspect_fetched_history(
+        let refresh = match (self.effective_repo_id(), p.as_deref()) {
+            (Some(id), Some(checkpoint))
+                if git.head_sha().map_err(SyncError::GitError)? != checkpoint =>
+            {
+                // A refusal here grants no exception; the ordinary inspector
+                // remains authoritative for all other local-history shapes.
+                crate::pair_refresh::engine_checkout::CompletedRefreshCheckout::capture(
+                    &self.db,
+                    id,
+                    &self.config.github.default_branch,
+                    checkpoint,
+                )
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+        match crate::history_inspect::inspect_fetched_history_with_refresh_baseline(
             git.repo_path(),
             &self.config.github.default_branch,
             p.clone(),
             http_token.as_deref(),
+            refresh.as_ref(),
         ) {
             Ok(admission) => Ok(TeamHistoryAdmission {
                 checkpoint: admission.checkpoint,
@@ -2251,6 +2269,58 @@ impl SyncEngine {
                 writer_window,
             )
             .await?;
+
+        // Receipt filtering must eventually advance the inbound cursor too.
+        // Only a complete range consisting entirely of our emitted commits is
+        // eligible, in a cycle with no source work or opposite publication.
+        if svn_changes.is_empty()
+            && !git_fetch.has_more
+            && git_fetch.replay_batch.is_empty()
+            && git_fetch.pending_total > 0
+            && self.allowed_paths.is_empty()
+            && self.blocked_patterns.is_empty()
+        {
+            if let Some(rid) = self.effective_repo_id() {
+                let selection = {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    git.pending_commits_between(
+                        &admission.checkpoint,
+                        &admission.remote_tip,
+                        self.replay_batch_cap(),
+                    )
+                    .map_err(SyncError::GitError)?
+                };
+                if !selection.has_more && selection.total == selection.commits.len() {
+                    let shas = selection
+                        .commits
+                        .iter()
+                        .map(|commit| commit.sha.as_str())
+                        .collect::<Vec<_>>();
+                    writer_window
+                        .settle_emitted_git_echoes(
+                            rid,
+                            &admission.checkpoint,
+                            &admission.remote_tip,
+                            &shas,
+                        )
+                        .map_err(SyncError::DatabaseError)?;
+                }
+            }
+        }
+
+        // A later quiet ordinary cycle may observe only SVN revisions emitted
+        // by this parent. Settle its inbound cursor only from that complete
+        // branch observation and current applied correspondence.
+        if svn_changes.is_empty()
+            && git_fetch.pending_total == 0
+            && stats.svn_to_git_count == 0
+            && stats.git_to_svn_count == 0
+            && self.allowed_paths.is_empty()
+            && self.blocked_patterns.is_empty()
+        {
+            self.settle_parent_svn_echoes(&admission.checkpoint, writer_window)
+                .await?;
+        }
 
         // Collect commit details for notifications (max 10 commits)
         for change in &svn_changes {
@@ -4137,6 +4207,84 @@ impl SyncEngine {
     // -----------------------------------------------------------------------
     // Change fetching
     // -----------------------------------------------------------------------
+
+    async fn settle_parent_svn_echoes(
+        &self,
+        git_checkpoint: &str,
+        writer_window: &crate::db::ordinary_writer_windows::OrdinaryWriterWindow<'_>,
+    ) -> Result<(), SyncError> {
+        let Some(repo_id) = self.effective_repo_id() else {
+            return Ok(());
+        };
+        // Keep other ordinary/Personal roots on their existing cursor protocol.
+        let eligible: bool = self.db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM repositories WHERE parent_id=?1 AND id<>?1 AND sync_mode='team' AND enabled=1)",
+            [repo_id], |row| row.get(0),
+        ).map_err(crate::errors::DatabaseError::from).map_err(SyncError::DatabaseError)?;
+        if !eligible {
+            return Ok(());
+        }
+        let (last_rev, column_git) = self
+            .db
+            .get_repo_watermark(repo_id)
+            .map_err(SyncError::DatabaseError)?;
+        if last_rev <= 0 || column_git != git_checkpoint {
+            return Ok(());
+        }
+        let svn = self
+            .svn_client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let head = svn.info().await.map_err(SyncError::SvnError)?.latest_rev;
+        if head <= last_rev {
+            return Ok(());
+        }
+        let entries = svn
+            .strict_log_range(last_rev + 1, head)
+            .await
+            .map_err(SyncError::SvnError)?;
+        let mut receipts = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if entry.revision <= last_rev || entry.revision > head {
+                return Ok(());
+            }
+            let matches = {
+                let conn = self.db.conn();
+                let mut query = conn.prepare(
+                    "SELECT git_sha FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND direction='git_to_svn' AND status='applied'",
+                ).map_err(crate::errors::DatabaseError::from).map_err(SyncError::DatabaseError)?;
+                let matches = query
+                    .query_map(rusqlite::params![repo_id, entry.revision], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(crate::errors::DatabaseError::from)
+                    .map_err(SyncError::DatabaseError)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(crate::errors::DatabaseError::from)
+                    .map_err(SyncError::DatabaseError)?;
+                matches
+            };
+            let [sha] = matches.as_slice() else {
+                return Ok(());
+            };
+            if sha != git_checkpoint
+                && !self
+                    .git_client
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_ancestor(sha, git_checkpoint)
+                    .map_err(SyncError::GitError)?
+            {
+                return Ok(());
+            }
+            receipts.push((entry.revision, sha.clone()));
+        }
+        receipts.sort_by_key(|(revision, _)| *revision);
+        writer_window
+            .settle_emitted_svn_echoes(repo_id, last_rev, git_checkpoint, &receipts)
+            .map_err(SyncError::DatabaseError)
+    }
 
     async fn fetch_svn_changes(&self) -> Result<Vec<SvnChangeSet>, SyncError> {
         let last_rev = if let Some(rid) = self.effective_repo_id() {

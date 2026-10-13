@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{SyncConfig, SyncMode};
@@ -17,7 +17,8 @@ fn refused(detail: &str) -> DatabaseError {
 }
 
 /// Safe preview metadata. A client-supplied copy cannot construct live context.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RefreshActorPolicyPin {
     pub version: u8,
     pub actor_id: String,
@@ -38,6 +39,19 @@ pub struct LiveRefreshActorPolicy<'engine> {
 }
 
 impl LiveRefreshActorPolicy<'_> {
+    /// Read this current actor's authenticated request state after a lost HTTP
+    /// response. This receipt is metadata, never an execution capability.
+    pub fn refresh_request_receipt(
+        &self,
+        engine: &SyncEngine,
+        request: &str,
+        child_scope: &str,
+    ) -> Result<Option<crate::db::pair_refresh_operations::PairRefreshOperation>, DatabaseError>
+    {
+        self.db
+            .authenticated_refresh_request(engine, self, request, child_scope)
+    }
+
     /// Return the original terminal receipt for this current actor's request.
     /// Historical receipt lookup grants no publication or resource authority.
     pub fn noop_request_receipt(

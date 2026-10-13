@@ -23,6 +23,30 @@ use crate::errors::DatabaseError;
 pub struct LockGuard {
     _file: File,
     path: PathBuf,
+    creator_pid: u32,
+}
+
+impl LockGuard {
+    /// Attest the actual held local lock before an authenticated recovery claim.
+    pub(crate) fn require_current(&self, data_dir: &Path) -> Result<(), DatabaseError> {
+        use std::os::unix::fs::MetadataExt;
+        let refused = || DatabaseError::WriterFenced("recovery local lock changed".into());
+        let directory = data_dir.canonicalize().map_err(|_| refused())?;
+        let path = directory.join("reposync.lock");
+        let named = std::fs::symlink_metadata(&path).map_err(|_| refused())?;
+        let held = self._file.metadata().map_err(|_| refused())?;
+        if self.creator_pid != std::process::id()
+            || self.path.canonicalize().map_err(|_| refused())? != path
+            || !named.is_file()
+            || named.uid() != rustix::process::geteuid().as_raw()
+            || named.dev() != held.dev()
+            || named.ino() != held.ino()
+            || named.uid() != held.uid()
+        {
+            return Err(refused());
+        }
+        try_lock_exclusive(&self._file).map_err(|_| refused())
+    }
 }
 
 /// Combined local flock and durable cross-host writer fence.
@@ -65,6 +89,7 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, DatabaseError> {
             Ok(LockGuard {
                 _file: file,
                 path: lock_path,
+                creator_pid: std::process::id(),
             })
         }
         Err(_) => {
@@ -85,6 +110,7 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, DatabaseError> {
                         Ok(LockGuard {
                             _file: file,
                             path: lock_path,
+                            creator_pid: std::process::id(),
                         })
                     }
                     Err(_) => Err(DatabaseError::Other(

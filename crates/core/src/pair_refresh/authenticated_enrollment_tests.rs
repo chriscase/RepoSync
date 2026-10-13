@@ -2300,3 +2300,1301 @@ async fn signed_noop_history_does_not_replace_the_copy_baseline_for_a_later_real
             .is_ok()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_epoch_and_unknown_or_live_native_owner_cannot_adopt_signed_resources() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let operation = actor
+        .enroll_prepared(&engine, &prepared, "native-owner-refusal", &approved, &busy)
+        .unwrap();
+    let old_epoch = fence.epoch();
+    drop(fence);
+    let next = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    assert!(next.epoch() > old_epoch);
+    let state = journal_state(&f);
+    assert!(super::super::recovery::prepare_owned_refresh_recovery(
+        &engine,
+        &actor,
+        operation.id,
+        &busy
+    )
+    .is_err());
+    assert_eq!(journal_state(&f), state);
+    assert_eq!(
+        f.db.pair_refresh_operation(operation.id).unwrap(),
+        operation
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+    let working_copy = prepared.pins().svn.working_copy.clone();
+    drop(prepared);
+    drop(workspace);
+    assert!(working_copy.join(".svn").is_dir());
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_recovery_fixture_worker() {
+    let Ok(root) = std::env::var("REPOSYNC_NATIVE_RECOVERY_FIXTURE_ROOT") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    assert_eq!(root.canonicalize().unwrap(), root);
+    let stage = std::env::var("REPOSYNC_NATIVE_RECOVERY_FIXTURE_STAGE").unwrap();
+    assert!(matches!(
+        stage.as_str(),
+        "prepared" | "svn_intent" | "git_intent"
+    ));
+    let db = Database::new(root.join("reposync.db")).unwrap();
+    let mut config: crate::config::AppConfig = toml::from_str(
+        r#"
+        [daemon]
+        data_dir = "/unused"
+        [svn]
+        url = "file:///unused/svn"
+        username = ""
+        password_env = ""
+        [github]
+        repo = "fixture/repo"
+        token_env = ""
+    "#,
+    )
+    .unwrap();
+    config.daemon.data_dir = root.clone();
+    let engine = crate::sync_engine::SyncEngine::new(
+        config,
+        db,
+        crate::svn::SvnClient::new("file:///unused/svn", "", ""),
+        crate::git::client::GitClient::new(root.join("engine-git")).unwrap(),
+        std::sync::Arc::new(
+            crate::identity::mapper::IdentityMapper::new(&crate::config::IdentityConfig::default())
+                .unwrap(),
+        ),
+    );
+    let _lock = crate::data_dir::acquire(&root).unwrap();
+    let _fence = crate::writer_fence::claim_with_identity(
+        engine.db(),
+        &root,
+        "native-recovery-fixture",
+        std::process::id(),
+    )
+    .unwrap();
+    let actor = engine
+        .capture_pair_refresh_actor_policy("disposable-workspace-session")
+        .unwrap();
+    let workspace = actor.create_workspace(&engine).unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .add_root_certificate(
+            reqwest::Certificate::from_der(&std::fs::read(root.join("cert.der")).unwrap()).unwrap(),
+        )
+        .build()
+        .unwrap();
+    let prepared =
+        prepare_registered_in_workspace_for_test(engine.db(), "child", workspace, client.clone())
+            .await
+            .unwrap();
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    match stage.as_str() {
+        "prepared" => {
+            actor
+                .enroll_prepared(&engine, &prepared, "native-worker", &approved, &busy)
+                .unwrap();
+        }
+        "svn_intent" => {
+            engine.db().conn().execute_batch("CREATE TRIGGER native_interrupt BEFORE INSERT ON kv_state WHEN NEW.key LIKE 'pair_refresh_execution_v3:document:%' AND json_extract(NEW.value,'$.phase')='svn_observed' BEGIN SELECT RAISE(ABORT,'native fixture lost SVN receipt'); END;").unwrap();
+            let error = super::super::execution::publish_owned_svn_stage_with_client(
+                &engine,
+                &actor,
+                &prepared,
+                "native-worker",
+                &approved,
+                &busy,
+                client.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("native fixture lost SVN receipt"), "{error}");
+            engine
+                .db()
+                .conn()
+                .execute_batch("DROP TRIGGER native_interrupt;")
+                .unwrap();
+        }
+        "git_intent" => {
+            engine.db().conn().execute_batch("CREATE TRIGGER native_interrupt BEFORE INSERT ON kv_state WHEN NEW.key LIKE 'pair_refresh_execution_v3:document:%' AND json_extract(NEW.value,'$.phase')='git_observed' BEGIN SELECT RAISE(ABORT,'native fixture lost Git receipt'); END;").unwrap();
+            let error = super::super::execution::complete_owned_refresh_with_client(
+                &engine,
+                &actor,
+                &prepared,
+                "native-worker",
+                &approved,
+                &busy,
+                client.clone(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("native fixture lost Git receipt"), "{error}");
+            engine
+                .db()
+                .conn()
+                .execute_batch("DROP TRIGGER native_interrupt;")
+                .unwrap();
+        }
+        _ => unreachable!(),
+    }
+    println!(
+        "REPOSYNC_NATIVE_RECOVERY_READY {}",
+        serde_json::json!({"id":prepared.pins().git.operation_id,"pid":std::process::id(),"stage":stage})
+    );
+    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+    // Deliberately skip Rust guard destruction. The parent verifies the durable
+    // lease and signed resources survive, then proves this actual PID absent.
+    std::process::exit(0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_worker_exit_recovers_prepared_and_both_uncertain_publication_intents() {
+    use crate::db::pair_refresh_operations::PairRefreshPhase;
+    let _serial = SERIAL.lock().await;
+    for stage in ["prepared", "svn_intent", "git_intent"] {
+        let f = Fixture::new();
+        let engine = f.engine();
+        let parent_before = parent_row(&f);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact","pair_refresh::live_preparation::authenticated_enrollment_tests::native_recovery_fixture_worker","--nocapture","--test-threads=1"])
+            .env("REPOSYNC_NATIVE_RECOVERY_FIXTURE_ROOT",f.temp.path().canonicalize().unwrap())
+            .env("REPOSYNC_NATIVE_RECOVERY_FIXTURE_STAGE",stage);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let marker = stdout
+            .lines()
+            .find_map(|line| {
+                line.split_once("REPOSYNC_NATIVE_RECOVERY_READY ")
+                    .map(|(_, value)| value)
+            })
+            .expect("worker did not reach its durable phase");
+        let ready: serde_json::Value = serde_json::from_str(marker).unwrap();
+        let id = Uuid::parse_str(ready["id"].as_str().unwrap()).unwrap();
+        let operation = f.db.pair_refresh_operation(id).unwrap();
+        assert_eq!(
+            operation.phase,
+            match stage {
+                "prepared" => PairRefreshPhase::Prepared,
+                "svn_intent" => PairRefreshPhase::SvnIntent,
+                "git_intent" => PairRefreshPhase::GitIntent,
+                _ => unreachable!(),
+            }
+        );
+        let authority_key = format!("pair_refresh_execution_v3:authority:{id}");
+        let raw = f.db.get_state(&authority_key).unwrap().unwrap();
+        let original: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let native = original["evidence"]["resources"]["workspace"].get("native_owner");
+        #[cfg(target_os = "linux")]
+        assert!(
+            native.is_some(),
+            "Linux worker must record native owner identity"
+        );
+        if let Some(native) = native {
+            assert_eq!(native["pid"], ready["pid"]);
+        }
+        let lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let actor = engine
+            .capture_pair_refresh_actor_policy("disposable-workspace-session")
+            .unwrap();
+        let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+        let before = journal_state(&f);
+        let claimed = super::super::recovery::claim_owned_refresh_recovery_writer(
+            &engine, &actor, id, &busy, &lock,
+        );
+        if native.is_none() {
+            assert!(claimed.is_err());
+            assert_eq!(journal_state(&f), before);
+            assert_eq!(f.db.pair_refresh_operation(id).unwrap(), operation);
+            assert!(
+                crate::db::pair_refresh_operations::require_no_pair_refresh_hold(
+                    &f.db.conn(),
+                    None
+                )
+                .is_err()
+            );
+            assert_eq!(parent_row(&f), parent_before);
+            continue;
+        }
+        let fence = claimed.unwrap();
+        assert!(fence.epoch() > operation.admitted_writer_epoch);
+        let recovery =
+            super::super::recovery::prepare_owned_refresh_recovery(&engine, &actor, id, &busy)
+                .unwrap();
+        let approved = recovery.approval_digest(&engine, &actor).unwrap();
+        let recovered = recovery
+            .transfer(&engine, &actor, &approved, &busy)
+            .unwrap();
+        assert_eq!(recovered.operation(), &operation);
+        let transferred: serde_json::Value =
+            serde_json::from_str(&f.db.get_state(&authority_key).unwrap().unwrap()).unwrap();
+        assert_eq!(transferred["evidence"], original["evidence"]);
+        assert_eq!(transferred["recoveries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            transferred["recoveries"][0]["writer_epoch"].as_u64(),
+            Some(fence.epoch())
+        );
+        if stage != "prepared" {
+            let observed = super::super::execution::reconcile_owned_refresh_intent_with_client(
+                &engine,
+                &actor,
+                recovered.prepared_for_test(),
+                &busy,
+                f.client.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                observed.phase,
+                if stage == "svn_intent" {
+                    PairRefreshPhase::SvnObserved
+                } else {
+                    PairRefreshPhase::GitObserved
+                }
+            );
+        }
+        let completed = super::super::execution::complete_owned_refresh_with_client(
+            &engine,
+            &actor,
+            recovered.prepared_for_test(),
+            &operation.request_id,
+            &operation.approval_digest,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed.phase, PairRefreshPhase::Completed);
+        assert_eq!(completed.id, operation.id);
+        assert_eq!(
+            completed.admitted_writer_epoch,
+            operation.admitted_writer_epoch
+        );
+        assert_eq!(completed.svn_receipt.as_ref().unwrap().revision, 5);
+        assert_eq!(parent_row(&f), parent_before);
+        assert_eq!(
+            crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+                .info()
+                .await
+                .unwrap()
+                .latest_rev,
+            5
+        );
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            operation.pins.git.prepared_sha
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f.log)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("/git-receive-pack"))
+                .count(),
+            1
+        );
+        assert!(
+            crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+                .is_ok()
+        );
+        let final_authority: serde_json::Value =
+            serde_json::from_str(&f.db.get_state(&authority_key).unwrap().unwrap()).unwrap();
+        assert_eq!(final_authority["evidence"], original["evidence"]);
+        assert_eq!(final_authority["recoveries"], transferred["recoveries"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_recovery_claim_refuses_live_or_unknown_owner_and_foreign_lock() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, workspace, prepared) = prepared(&f, &engine).await;
+    let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let operation = actor
+        .enroll_prepared(&engine, &prepared, "native-claim-refusal", &approved, &busy)
+        .unwrap();
+    let before = journal_state(&f);
+    let lease = f.db.get_state("writer_fence_v1:lease").unwrap();
+    assert!(super::super::recovery::claim_owned_refresh_recovery_writer(
+        &engine,
+        &actor,
+        operation.id,
+        &busy,
+        &lock,
+    )
+    .is_err());
+    assert_eq!(journal_state(&f), before);
+    assert_eq!(f.db.get_state("writer_fence_v1:lease").unwrap(), lease);
+    let foreign = tempfile::tempdir().unwrap();
+    let foreign_lock = crate::data_dir::acquire(foreign.path()).unwrap();
+    assert!(super::super::recovery::claim_owned_refresh_recovery_writer(
+        &engine,
+        &actor,
+        operation.id,
+        &busy,
+        &foreign_lock,
+    )
+    .is_err());
+    assert_eq!(journal_state(&f), before);
+    assert_eq!(f.db.get_state("writer_fence_v1:lease").unwrap(), lease);
+    assert_eq!(
+        f.db.pair_refresh_operation(operation.id).unwrap(),
+        operation
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None,)
+            .is_err()
+    );
+    assert!(workspace.pin().operation_directory.path.is_dir());
+    assert!(prepared.pins().svn.working_copy.is_dir());
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[path = "native_claim_crash_tests.rs"]
+mod native_claim_crash_tests;
+
+#[path = "real_engine_refresh_tests.rs"]
+mod real_engine_refresh_tests;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_request_lookup_is_read_only_scoped_and_rejects_corruption_and_logout() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let scope = prepared.pins().child.scope_uuid.clone();
+    let before = journal_state(&f);
+    assert!(actor
+        .refresh_request_receipt(&engine, "lookup-request", &scope)
+        .unwrap()
+        .is_none());
+    assert_eq!(journal_state(&f), before);
+    assert!(!key_table(&f));
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let digest = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let admitted = actor
+        .enroll_prepared(&engine, &prepared, "lookup-request", &digest, &busy)
+        .unwrap();
+    let saved = journal_state(&f);
+    assert_eq!(
+        actor
+            .refresh_request_receipt(&engine, "lookup-request", &scope)
+            .unwrap(),
+        Some(admitted.clone())
+    );
+    assert!(actor
+        .refresh_request_receipt(&engine, "other-request", &scope)
+        .unwrap()
+        .is_none());
+    assert!(actor
+        .refresh_request_receipt(&engine, "lookup-request", &Uuid::new_v4().to_string())
+        .unwrap()
+        .is_none());
+    assert_eq!(journal_state(&f), saved);
+    let cancelled = actor
+        .cancel_prepared_enrollment(&engine, &prepared, &busy)
+        .unwrap();
+    let saved = journal_state(&f);
+    assert_eq!(
+        actor
+            .refresh_request_receipt(&engine, "lookup-request", &scope)
+            .unwrap(),
+        Some(cancelled)
+    );
+    assert_eq!(journal_state(&f), saved);
+    let authority = format!("pair_refresh_execution_v3:authority:{}", admitted.id);
+    let original = f.db.get_state(&authority).unwrap().unwrap();
+    f.db.conn()
+        .execute("UPDATE kv_state SET value='{}' WHERE key=?1", [&authority])
+        .unwrap();
+    let corrupt = journal_state(&f);
+    assert!(actor
+        .refresh_request_receipt(&engine, "lookup-request", &scope)
+        .is_err());
+    assert_eq!(journal_state(&f), corrupt);
+    f.db.conn()
+        .execute(
+            "UPDATE kv_state SET value=?1 WHERE key=?2",
+            rusqlite::params![original, authority],
+        )
+        .unwrap();
+    f.db.delete_session("disposable-workspace-session").unwrap();
+    let logged_out = journal_state(&f);
+    assert!(actor
+        .refresh_request_receipt(&engine, "lookup-request", &scope)
+        .is_err());
+    assert_eq!(journal_state(&f), logged_out);
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_retains_preparation_and_returns_exact_publication_and_noop_receipts() {
+    use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = std::sync::Arc::new(f.engine());
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let service = RefreshService::with_fixture_client(engine.clone(), f.client.clone());
+    let token = "disposable-workspace-session";
+    let approval = match service
+        .prepare(token.into(), "child".into(), "service-request".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Approval(approval) => approval,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(approval.kind, "integration");
+    assert_ne!(approval.preparation_id, approval.operation_id);
+    assert!(f.db.pair_refresh_operation(approval.operation_id).is_err());
+    let before = journal_state(&f);
+    assert!(service
+        .act(
+            token.into(),
+            "child",
+            "service-request",
+            approval.preparation_id,
+            "wrong".into(),
+            RefreshAction::Execute
+        )
+        .await
+        .is_err());
+    assert_eq!(journal_state(&f), before);
+    let receipt = service
+        .act(
+            token.into(),
+            "child",
+            "service-request",
+            approval.preparation_id,
+            approval.approval_digest.clone(),
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.operation_id, approval.operation_id);
+    assert_eq!(receipt.phase, "completed");
+    assert_eq!(receipt.svn_revision, Some(5));
+    assert_eq!(
+        f.db.get_repo_watermark("child").unwrap(),
+        (5, receipt.git_sha.clone().unwrap())
+    );
+    assert_eq!(
+        f.db.get_repo_watermark("parent").unwrap(),
+        (4, f.parent.to_string())
+    );
+    let publications = || {
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count()
+    };
+    assert_eq!(publications(), 1);
+    let retry = service
+        .act(
+            token.into(),
+            "child",
+            "service-request",
+            approval.preparation_id,
+            approval.approval_digest,
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.operation_id, receipt.operation_id);
+    assert_eq!(retry.git_sha, receipt.git_sha);
+    assert_eq!(publications(), 1);
+    match service
+        .prepare(token.into(), "child".into(), "service-request".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Receipt(found) => assert_eq!(found.operation_id, receipt.operation_id),
+        other => panic!("unexpected {other:?}"),
+    }
+    let noop = match service
+        .prepare(token.into(), "child".into(), "service-noop".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Approval(approval) => approval,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(noop.kind, "no_op");
+    let before = f.db.get_repo_watermark("child").unwrap();
+    let noop_receipt = service
+        .act(
+            token.into(),
+            "child",
+            "service-noop",
+            noop.preparation_id,
+            noop.approval_digest,
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(noop_receipt.phase, "no_op");
+    assert_eq!(noop_receipt.operation_id, noop.operation_id);
+    assert_ne!(noop_receipt.operation_id, receipt.operation_id);
+    assert_eq!(f.db.get_repo_watermark("child").unwrap(), before);
+    assert_eq!(publications(), 1);
+    assert_eq!(
+        crate::svn::SvnClient::new(&f.root, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_finishes_a_disconnected_request_without_republication() {
+    use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = std::sync::Arc::new(f.engine());
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let service = RefreshService::with_fixture_client(engine, f.client.clone());
+    let token = "disposable-workspace-session";
+    let approval = match service
+        .prepare(token.into(), "child".into(), "disconnected-request".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Approval(approval) => approval,
+        other => panic!("unexpected {other:?}"),
+    };
+    let hook = f.temp.path().join("svn-repository/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        r#"#!/usr/bin/env python3
+from pathlib import Path
+import time
+root=Path(__file__).resolve().parents[2]
+(root/'http-disconnect-ready').write_text('ready')
+for _ in range(600):
+    if (root/'http-disconnect-release').exists():
+        raise SystemExit(0)
+    time.sleep(0.05)
+raise SystemExit(1)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let handle = approval.preparation_id;
+    let digest = approval.approval_digest.clone();
+    let request_service = service.clone();
+    let request = tokio::spawn(async move {
+        request_service
+            .act(
+                token.into(),
+                "child",
+                "disconnected-request",
+                handle,
+                digest,
+                RefreshAction::Execute,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        while !f.temp.path().join("http-disconnect-ready").is_file() {
+            assert!(
+                !request.is_finished(),
+                "request ended before entering actual SVN publication"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.db.pair_refresh_operation(approval.operation_id)
+            .unwrap()
+            .phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::SvnIntent
+    );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    std::fs::write(f.temp.path().join("http-disconnect-release"), b"release").unwrap();
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        loop {
+            if let Some(receipt) = service
+                .receipt(token, "child", "disconnected-request")
+                .unwrap()
+            {
+                if receipt.phase == "completed" {
+                    break receipt;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(receipt.operation_id, approval.operation_id);
+    assert_eq!(receipt.svn_revision, Some(5));
+    let retry = service
+        .act(
+            token.into(),
+            "child",
+            "disconnected-request",
+            approval.preparation_id,
+            approval.approval_digest,
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.operation_id, receipt.operation_id);
+    assert_eq!(
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        crate::svn::SvnClient::new(&f.root, "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+    assert_eq!(
+        f.db.get_repo_watermark("child").unwrap(),
+        (5, receipt.git_sha.unwrap())
+    );
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_recovery_refuses_live_owner_without_claim_or_transfer() {
+    use crate::pair_refresh::service::RefreshService;
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = std::sync::Arc::new(f.engine());
+    let lock = std::sync::Arc::new(crate::data_dir::acquire(f.temp.path()).unwrap());
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let (actor, workspace, prepared) = prepared(&f, &engine).await;
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let digest = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let op = actor
+        .enroll_prepared(&engine, &prepared, "live-recovery-refusal", &digest, &busy)
+        .unwrap();
+    let saved = journal_state(&f);
+    let lease = f.db.get_state("writer_fence_v1:lease").unwrap();
+    let native = f.db.get_state("writer_fence_v1:native").unwrap();
+    drop(busy);
+    let ordinary = RefreshService::with_fixture_client(engine.clone(), f.client.clone());
+    assert!(ordinary
+        .prepare_recovery(
+            "disposable-workspace-session".into(),
+            "child".into(),
+            "live-recovery-refusal".into()
+        )
+        .await
+        .is_err());
+    let recovery = RefreshService::recovery_only(engine.clone(), lock).unwrap();
+    assert!(recovery
+        .prepare_recovery(
+            "disposable-workspace-session".into(),
+            "child".into(),
+            "live-recovery-refusal".into()
+        )
+        .await
+        .is_err());
+    assert!(recovery
+        .prepare(
+            "disposable-workspace-session".into(),
+            "child".into(),
+            "new-request".into()
+        )
+        .await
+        .is_err());
+    assert_eq!(journal_state(&f), saved);
+    assert_eq!(f.db.get_state("writer_fence_v1:lease").unwrap(), lease);
+    assert_eq!(f.db.get_state("writer_fence_v1:native").unwrap(), native);
+    assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
+    assert!(workspace.pin().operation_directory.path.is_dir());
+    assert!(prepared.pins().svn.working_copy.is_dir());
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_err()
+    );
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_native_restart_handles_prepared_and_uncertain_svn_git() {
+    use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    let _serial = SERIAL.lock().await;
+    for stage in ["prepared", "svn_intent", "git_intent"] {
+        let f = Fixture::new();
+        let engine = std::sync::Arc::new(f.engine());
+        let parent_before = parent_row(&f);
+        let output = run(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "pair_refresh::live_preparation::authenticated_enrollment_tests::native_recovery_fixture_worker", "--nocapture", "--test-threads=1"])
+            .env("REPOSYNC_NATIVE_RECOVERY_FIXTURE_ROOT", f.temp.path().canonicalize().unwrap())
+            .env("REPOSYNC_NATIVE_RECOVERY_FIXTURE_STAGE", stage));
+        let ready: serde_json::Value = serde_json::from_str(
+            output
+                .lines()
+                .find_map(|line| {
+                    line.split_once("REPOSYNC_NATIVE_RECOVERY_READY ")
+                        .map(|(_, value)| value)
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let id = Uuid::parse_str(ready["id"].as_str().unwrap()).unwrap();
+        let op = f.db.pair_refresh_operation(id).unwrap();
+        let authority_key = format!("pair_refresh_execution_v3:authority:{id}");
+        let authority: serde_json::Value =
+            serde_json::from_str(&f.db.get_state(&authority_key).unwrap().unwrap()).unwrap();
+        let native = authority["evidence"]["resources"]["workspace"].get("native_owner");
+        #[cfg(target_os = "linux")]
+        assert!(
+            native.is_some(),
+            "Linux restart qualification requires actual native identity"
+        );
+        let lock = std::sync::Arc::new(crate::data_dir::acquire(f.temp.path()).unwrap());
+        let service =
+            RefreshService::with_fixture_recovery_client(engine.clone(), lock, f.client.clone())
+                .unwrap();
+        let before = journal_state(&f);
+        let token = "disposable-workspace-session";
+        let result = service
+            .prepare_recovery(token.into(), "child".into(), "native-worker".into())
+            .await;
+        if native.is_none() {
+            assert!(result.is_err());
+            assert_eq!(journal_state(&f), before);
+            assert_eq!(f.db.pair_refresh_operation(id).unwrap(), op);
+            assert!(
+                crate::db::pair_refresh_operations::require_no_pair_refresh_hold(
+                    &f.db.conn(),
+                    None
+                )
+                .is_err()
+            );
+            continue;
+        }
+        let approval = match result.unwrap() {
+            RefreshResponse::Approval(value) => value,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(approval.kind, "recovery");
+        assert_eq!(approval.operation_id, id);
+        assert_eq!(journal_state(&f), before);
+        assert_eq!(f.db.pair_refresh_operation(id).unwrap(), op);
+        assert!(service
+            .act(
+                token.into(),
+                "child",
+                "native-worker",
+                approval.preparation_id,
+                "wrong".into(),
+                RefreshAction::Execute
+            )
+            .await
+            .is_err());
+        assert_eq!(journal_state(&f), before);
+        if stage != "prepared" {
+            assert!(service
+                .act(
+                    token.into(),
+                    "child",
+                    "native-worker",
+                    approval.preparation_id,
+                    approval.approval_digest.clone(),
+                    RefreshAction::Execute
+                )
+                .await
+                .is_err());
+            assert_eq!(f.db.pair_refresh_operation(id).unwrap().phase, op.phase);
+            let observed = service
+                .act(
+                    token.into(),
+                    "child",
+                    "native-worker",
+                    approval.preparation_id,
+                    approval.approval_digest.clone(),
+                    RefreshAction::Reconcile,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                observed.phase,
+                if stage == "svn_intent" {
+                    "svn_observed"
+                } else {
+                    "git_observed"
+                }
+            );
+        }
+        let completed = service
+            .act(
+                token.into(),
+                "child",
+                "native-worker",
+                approval.preparation_id,
+                approval.approval_digest.clone(),
+                RefreshAction::Execute,
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.phase, "completed");
+        assert_eq!(completed.operation_id, id);
+        assert_eq!(completed.svn_revision, Some(5));
+        assert_eq!(
+            completed.git_sha.as_deref(),
+            Some(op.pins.git.prepared_sha.as_str())
+        );
+        let repeated = service
+            .act(
+                token.into(),
+                "child",
+                "native-worker",
+                approval.preparation_id,
+                approval.approval_digest,
+                RefreshAction::Execute,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.operation_id, id);
+        assert_eq!(repeated.phase, "completed");
+        assert_eq!(parent_row(&f), parent_before);
+        assert_eq!(
+            crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+                .info()
+                .await
+                .unwrap()
+                .latest_rev,
+            5
+        );
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            op.pins.git.prepared_sha
+        );
+        assert_eq!(
+            std::fs::read_to_string(&f.log)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("/git-receive-pack"))
+                .count(),
+            1
+        );
+        assert!(
+            crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+                .is_ok()
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::busy::try_acquire_pair("child", "parent").is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_single_flights_requests_and_binds_terminal_receipts_to_approval() {
+    use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = std::sync::Arc::new(f.engine());
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let service = RefreshService::with_fixture_client(engine, f.client.clone());
+    let token = "disposable-workspace-session";
+    let (first, second) = tokio::join!(
+        service.prepare(token.into(), "child".into(), "single-flight".into()),
+        service.prepare(token.into(), "child".into(), "single-flight".into())
+    );
+    let approval = match (first, second) {
+        (Ok(RefreshResponse::Approval(approval)), Err(error))
+        | (Err(error), Ok(RefreshResponse::Approval(approval))) => {
+            assert!(error.to_string().contains("already has a live preparation"));
+            approval
+        }
+        other => panic!("duplicate request did not have one owner: {other:?}"),
+    };
+    assert!(service
+        .prepare(token.into(), "child".into(), "single-flight".into())
+        .await
+        .is_err());
+    let completed = service
+        .act(
+            token.into(),
+            "child",
+            "single-flight",
+            approval.preparation_id,
+            approval.approval_digest.clone(),
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.operation_id, approval.operation_id);
+    assert_eq!(completed.phase, "completed");
+    let saved = journal_state(&f);
+    for handle in [approval.preparation_id, Uuid::new_v4()] {
+        assert!(service
+            .act(
+                token.into(),
+                "child",
+                "single-flight",
+                handle,
+                "other-approval".into(),
+                RefreshAction::Execute
+            )
+            .await
+            .is_err());
+    }
+    assert_eq!(journal_state(&f), saved);
+    let again = service
+        .act(
+            token.into(),
+            "child",
+            "single-flight",
+            approval.preparation_id,
+            approval.approval_digest,
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.operation_id, completed.operation_id);
+    let noop = match service
+        .prepare(token.into(), "child".into(), "single-noop".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Approval(value) => value,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(noop.kind, "no_op");
+    assert!(service
+        .act(
+            token.into(),
+            "child",
+            "single-noop",
+            noop.preparation_id,
+            noop.approval_digest.clone(),
+            RefreshAction::Reconcile
+        )
+        .await
+        .is_err());
+    assert!(crate::busy::try_acquire_pair("child", "parent").is_some());
+    assert!(service
+        .receipt(token, "child", "single-noop")
+        .unwrap()
+        .is_none());
+    assert_eq!(journal_state(&f), saved);
+    let no_op = service
+        .act(
+            token.into(),
+            "child",
+            "single-noop",
+            noop.preparation_id,
+            noop.approval_digest,
+            RefreshAction::Execute,
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_op.phase, "no_op");
+    assert!(service
+        .act(
+            token.into(),
+            "child",
+            "single-noop",
+            Uuid::new_v4(),
+            "other-noop-approval".into(),
+            RefreshAction::Execute
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        crate::svn::SvnClient::new(format!("{}/branches/f", f.root), "", "")
+            .info()
+            .await
+            .unwrap()
+            .latest_rev,
+        5
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_releases_busy_after_revoked_credentials_refuse_before_admission() {
+    use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = std::sync::Arc::new(f.engine());
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let service = RefreshService::with_fixture_client(engine, f.client.clone());
+    let token = "disposable-workspace-session";
+    let approval = match service
+        .prepare(token.into(), "child".into(), "revoked-service".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Approval(value) => value,
+        other => panic!("unexpected {other:?}"),
+    };
+    f.db.set_state("secret_git_token_child", "").unwrap();
+    let saved = journal_state(&f);
+    assert!(service
+        .act(
+            token.into(),
+            "child",
+            "revoked-service",
+            approval.preparation_id,
+            approval.approval_digest,
+            RefreshAction::Execute
+        )
+        .await
+        .is_err());
+    assert!(crate::busy::try_acquire_pair("child", "parent").is_some());
+    assert_eq!(journal_state(&f), saved);
+    assert!(service
+        .receipt(token, "child", "revoked-service")
+        .unwrap()
+        .is_none());
+    assert!(f.db.pair_refresh_operation(approval.operation_id).is_err());
+    assert!(
+        crate::db::pair_refresh_operations::require_no_pair_refresh_hold(&f.db.conn(), None)
+            .is_ok()
+    );
+    assert_eq!(
+        f.target
+            .find_reference("refs/heads/feature")
+            .unwrap()
+            .target(),
+        Some(f.baseline)
+    );
+    assert!(!std::fs::read_to_string(&f.log)
+        .unwrap()
+        .contains("receive-pack"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_server_fence_lifetime_preserves_held_epoch_and_cleans_only_terminal_state() {
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = f.engine();
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let fence = crate::writer_fence::claim(engine.db(), f.temp.path())
+        .unwrap()
+        .into_recovery_lifetime();
+    let (actor, _workspace, prepared) = prepared(&f, &engine).await;
+    let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+    let digest = actor.prepared_approval_digest(&engine, &prepared).unwrap();
+    let op = actor
+        .enroll_prepared(&engine, &prepared, "lifetime-request", &digest, &busy)
+        .unwrap();
+    let saved = journal_state(&f);
+    let lease = f.db.get_state("writer_fence_v1:lease").unwrap();
+    let native = f.db.get_state("writer_fence_v1:native").unwrap();
+    assert!(fence.release_if_quiet(engine.db()).is_err());
+    fence.require_current(engine.db()).unwrap();
+    assert_eq!(journal_state(&f), saved);
+    assert_eq!(f.db.get_state("writer_fence_v1:lease").unwrap(), lease);
+    assert_eq!(f.db.get_state("writer_fence_v1:native").unwrap(), native);
+    assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
+    actor
+        .cancel_prepared_enrollment(&engine, &prepared, &busy)
+        .unwrap();
+    let terminal = journal_state(&f);
+    fence.release_if_quiet(engine.db()).unwrap();
+    assert!(f.db.get_state("writer_fence_v1:lease").unwrap().is_none());
+    assert!(f.db.get_state("writer_fence_v1:native").unwrap().is_none());
+    assert_eq!(journal_state(&f), terminal);
+    assert!(fence.require_current(engine.db()).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owned_service_shutdown_joins_an_authorized_publication_before_returning() {
+    use crate::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = SERIAL.lock().await;
+    let f = Fixture::new();
+    let engine = std::sync::Arc::new(f.engine());
+    let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+    let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+    let service = RefreshService::with_fixture_client(engine, f.client.clone());
+    let token = "disposable-workspace-session";
+    let approval = match service
+        .prepare(token.into(), "child".into(), "shutdown-request".into())
+        .await
+        .unwrap()
+    {
+        RefreshResponse::Approval(value) => value,
+        other => panic!("unexpected {other:?}"),
+    };
+    let hook = f.temp.path().join("svn-repository/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        r#"#!/usr/bin/env python3
+from pathlib import Path
+import time
+root=Path(__file__).resolve().parents[2]
+(root/'shutdown-ready').write_text('ready')
+for _ in range(600):
+    if (root/'shutdown-release').exists():
+        raise SystemExit(0)
+    time.sleep(0.05)
+raise SystemExit(1)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let request_service = service.clone();
+    let handle = approval.preparation_id;
+    let digest = approval.approval_digest;
+    let request = tokio::spawn(async move {
+        request_service
+            .act(
+                token.into(),
+                "child",
+                "shutdown-request",
+                handle,
+                digest,
+                RefreshAction::Execute,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        while !f.temp.path().join("shutdown-ready").is_file() {
+            assert!(!request.is_finished());
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.db.pair_refresh_operation(approval.operation_id)
+            .unwrap()
+            .phase,
+        crate::db::pair_refresh_operations::PairRefreshPhase::SvnIntent
+    );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    let shutdown_service = service.clone();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let shutdown = tokio::spawn(async move {
+        started.send(()).unwrap();
+        shutdown_service.shutdown().await;
+    });
+    ready.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    assert!(!shutdown.is_finished());
+    assert!(service
+        .prepare(token.into(), "child".into(), "during-shutdown".into())
+        .await
+        .is_err());
+    std::fs::write(f.temp.path().join("shutdown-release"), b"release").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(45), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    let receipt = service
+        .receipt(token, "child", "shutdown-request")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.operation_id, approval.operation_id);
+    assert_eq!(receipt.phase, "completed");
+    assert_eq!(receipt.svn_revision, Some(5));
+    assert_eq!(
+        std::fs::read_to_string(&f.log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("/git-receive-pack"))
+            .count(),
+        1
+    );
+    assert!(crate::busy::try_acquire_pair("child", "parent").is_some());
+}

@@ -246,6 +246,35 @@ impl SvnClient {
         parse_svn_log(&output)
     }
 
+    /// A complete bounded verbose observation for checkpoint proof. Unlike
+    /// ordinary display/replay parsing, any malformed entry or path refuses.
+    pub(crate) async fn strict_log_range(
+        &self,
+        start_rev: i64,
+        end_rev: i64,
+    ) -> Result<Vec<SvnLogEntry>, SvnError> {
+        if start_rev < 1 || end_rev < start_rev {
+            return Err(SvnError::XmlParseError("invalid proof log range".into()));
+        }
+        let range = format!("{start_rev}:{end_rev}");
+        let target = format!("{}@{end_rev}", self.url);
+        let output = self
+            .run_svn(&["log", "--xml", "--verbose", "-r", &range, &target])
+            .await?;
+        let entries = super::parser::parse_svn_copy_history(&output)?;
+        let mut revisions = std::collections::BTreeSet::new();
+        if entries.iter().any(|entry| {
+            entry.revision < start_rev
+                || entry.revision > end_rev
+                || !revisions.insert(entry.revision)
+        }) {
+            return Err(SvnError::XmlParseError(
+                "out-of-range or duplicate proof revision".into(),
+            ));
+        }
+        Ok(entries)
+    }
+
     /// Complete history of the selected path incarnation, stopping at its
     /// originating copy rather than following an older source path. No fixed
     /// revision window or limit may truncate the origin used for approval.

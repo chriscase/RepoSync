@@ -50,6 +50,55 @@ impl SourceDirectory {
 }
 
 impl GitSourceSnapshot {
+    pub(crate) fn reconstruct(
+        candidate: &crate::db::pair_refresh_operations::VerifiedRecoveryCandidate,
+        configuration: &LiveExecutionConfiguration,
+        workspace: RefreshWorkspace,
+    ) -> Result<Self, GitError> {
+        candidate
+            .require_native_proof()
+            .map_err(|_| refused("native recovery proof changed"))?;
+        workspace
+            .require_current()
+            .map_err(|_| refused("retained Git identity changed"))?;
+        let path = candidate
+            .resources()
+            .directories
+            .get("git")
+            .ok_or_else(|| refused("retained Git role is missing"))?
+            .path
+            .clone();
+        let repository = Repository::open_bare(&path)?;
+        if !repository.is_bare() || repository.path().canonicalize()? != path {
+            return Err(refused("retained Git repository differs"));
+        }
+        require_pinned_push_endpoint_with_policy(
+            &repository,
+            &configuration.pin().git_remote_url,
+            configuration.pin().transport_policy,
+        )?;
+        require_complete_git_graph(&repository)?;
+        super::preparation::require_prepared_refresh_object(
+            &repository,
+            &candidate.operation().pins.git,
+        )?;
+        let pin = configuration.pin();
+        Ok(Self {
+            repository,
+            pins: ObservedGitSourcePins {
+                remote_url: pin.git_remote_url.clone(),
+                child_branch: pin.child_git_branch.clone(),
+                parent_branch: pin.parent_git_branch.clone(),
+                child_tip: pin.child.last_git_sha.clone(),
+                parent_tip: pin.parent.last_git_sha.clone(),
+            },
+            _directory: SourceDirectory::Workspace {
+                path,
+                _owner: workspace,
+            },
+        })
+    }
+
     pub fn repository(&self) -> &Repository {
         &self.repository
     }

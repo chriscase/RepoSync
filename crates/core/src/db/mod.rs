@@ -108,6 +108,48 @@ impl Database {
         })
     }
 
+    /// Open existing current-schema WAL storage for authenticated pair refresh
+    /// recovery. This entrance never creates storage, migrates, checkpoints,
+    /// seeds credentials, repairs journals or obtains a writer lease.
+    pub fn open_existing_for_pair_refresh_recovery(
+        path: impl AsRef<Path>,
+    ) -> Result<Self, DatabaseError> {
+        let path = path.as_ref();
+        let prior = OpenedDatabaseFile::capture(path).ok_or_else(|| {
+            DatabaseError::Other("recovery requires existing native database storage".into())
+        })?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let opened_file = OpenedDatabaseFile::attest(&conn, path, Some(prior))
+            .ok_or_else(|| DatabaseError::Other("recovery database identity changed".into()))?;
+        let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != schema::CURRENT_SCHEMA_VERSION {
+            return Err(DatabaseError::Other(
+                "recovery requires an already current database schema".into(),
+            ));
+        }
+        let journal: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !journal.eq_ignore_ascii_case("wal") {
+            return Err(DatabaseError::Other(
+                "recovery requires existing WAL storage".into(),
+            ));
+        }
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(DatabaseError::Other(
+                "recovery database integrity check refused".into(),
+            ));
+        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA wal_autocheckpoint = 0;",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            opened_file: Some(opened_file),
+            #[cfg(test)]
+            test_force_echo_split_fail: Mutex::new(false),
+        })
+    }
+
     /// Open an in-memory database (useful for testing).
     pub fn in_memory() -> Result<Self, DatabaseError> {
         let conn = Connection::open_in_memory()?;

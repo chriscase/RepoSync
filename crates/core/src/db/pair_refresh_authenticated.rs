@@ -14,6 +14,17 @@ use crate::sync_engine::SyncEngine;
 
 #[path = "pair_refresh_noop.rs"]
 mod noop;
+#[path = "pair_refresh_recovery.rs"]
+mod recovery;
+pub(crate) use recovery::VerifiedRecoveryCandidate;
+
+pub(super) fn effective_writer_epoch(
+    tx: &Connection,
+    op: &PairRefreshOperation,
+) -> Result<u64, DatabaseError> {
+    let authority = recovery::read_authority(tx, op)?;
+    Ok(recovery::effective_owner(op, &authority).1)
+}
 
 pub(crate) use noop::approval_digest as noop_approval_digest;
 
@@ -45,6 +56,8 @@ struct Evidence {
 struct Authority {
     evidence: Evidence,
     mac: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recoveries: Vec<recovery::RecoveryStep>,
 }
 
 fn evidence(
@@ -192,13 +205,23 @@ fn mac(
     key: &[u8; 32],
     evidence: &Evidence,
     op: &PairRefreshOperation,
+    recoveries: &[recovery::RecoveryStep],
 ) -> Result<Hmac<Sha256>, DatabaseError> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key).map_err(|_| refused("invalid journal key"))?;
-    mac.update(
-        &serde_json::to_vec(&(DOMAIN, "operation", evidence, op))
-            .map_err(|_| refused("authority encoding"))?,
-    );
+    let bytes = if recoveries.is_empty() {
+        serde_json::to_vec(&(DOMAIN, "operation", evidence, op))
+    } else {
+        serde_json::to_vec(&(
+            DOMAIN,
+            "operation_with_recovery_v1",
+            evidence,
+            op,
+            recoveries,
+        ))
+    }
+    .map_err(|_| refused("authority encoding"))?;
+    mac.update(&bytes);
     Ok(mac)
 }
 
@@ -220,12 +243,13 @@ pub(super) fn verify(
     let key = private_key(tx)?.ok_or_else(|| refused("historical journal key is missing"))?;
     let signature = hex::decode(&authority.mac).map_err(|_| refused("invalid authority MAC"))?;
     if !full_digest(&authority.mac)
-        || mac(&key, &authority.evidence, op)?
+        || mac(&key, &authority.evidence, op, &authority.recoveries)?
             .verify_slice(&signature)
             .is_err()
     {
         return Err(refused("authenticated operation MAC differs"));
     }
+    recovery::validate_history(op, &authority)?;
     require_database_binding(tx, &authority.evidence.database)
 }
 
@@ -515,12 +539,17 @@ impl Database {
             let epoch = crate::writer_fence::require_owned_current(tx)?;
             prepared.workspace()?.require_binding(self, actor.pin())?;
             let mut op = lookup_operation(tx, prepared.pins().git.operation_id)?;
+            let previous = recovery::read_authority(tx, &op)?;
+            let (owned_evidence, owned_epoch) = recovery::effective_owner(&op, &previous);
+            if *owned_evidence != evidence {
+                return Err(refused("cancellation owner differs"));
+            }
             if op.version != 3
-                || op.admitted_writer_epoch != epoch
+                || owned_epoch != epoch
                 || op.phase != PairRefreshPhase::Prepared
                 || op.reconciliation_detail.is_some()
                 || op.pins != *prepared.pins()
-                || op.approval_digest != approval(&op.pins, &evidence)?
+                || op.approval_digest != approval(&op.pins, &previous.evidence)?
                 || !busy.owns_pair(&op.pins.child.repo_id, &op.pins.parent.repo_id)
             {
                 return Err(refused(
@@ -532,8 +561,13 @@ impl Database {
             op.updated_at = Utc::now().to_rfc3339();
             validate(&op)?;
             let authority = Authority {
-                mac: hex::encode(mac(&secret, &evidence, &op)?.finalize().into_bytes()),
-                evidence,
+                mac: hex::encode(
+                    mac(&secret, &previous.evidence, &op, &previous.recoveries)?
+                        .finalize()
+                        .into_bytes(),
+                ),
+                evidence: previous.evidence,
+                recoveries: previous.recoveries,
             };
             write(
                 tx,
@@ -576,7 +610,6 @@ impl Database {
             pins.validate()?;
             if request.is_empty()
                 || request.len() > 256
-                || approval(pins, &evidence)? != approved_digest
                 || !busy.owns_pair(&pins.child.repo_id, &pins.parent.repo_id)
             {
                 return Err(refused(
@@ -589,15 +622,22 @@ impl Database {
                     && op.request_id == request
                     && op.pins.child.scope_uuid == pins.child.scope_uuid
             }) {
+                let authority = recovery::read_authority(tx, prior)?;
+                let (owned_evidence, owned_epoch) = recovery::effective_owner(prior, &authority);
                 if prior.version != 3
                     || prior.pins != *pins
                     || prior.approval_digest != approved_digest
+                    || *owned_evidence != evidence
+                    || (prior.phase.holds_scopes() && owned_epoch != epoch)
                 {
                     return Err(refused(
                         "request already belongs to another authenticated intent",
                     ));
                 }
                 return Ok(prior.clone());
+            }
+            if approval(pins, &evidence)? != approved_digest {
+                return Err(refused("new authenticated approval differs"));
             }
             if operations.iter().any(|op| op.id == pins.git.operation_id) {
                 return Err(refused("authenticated operation identity was reused"));
@@ -643,8 +683,9 @@ impl Database {
             };
             validate(&op)?;
             let authority = Authority {
-                mac: hex::encode(mac(&secret, &evidence, &op)?.finalize().into_bytes()),
+                mac: hex::encode(mac(&secret, &evidence, &op, &[])?.finalize().into_bytes()),
                 evidence,
+                recoveries: Vec::new(),
             };
             write(
                 tx,
@@ -692,6 +733,13 @@ fn execution_inputs(
         .find(|op| op.id == prepared.pins().git.operation_id)
         .ok_or_else(|| refused("authenticated execution job is missing"))?
         .clone();
+    let authority = recovery::read_authority(tx, &op)?;
+    let (owned_evidence, owned_epoch) = recovery::effective_owner(&op, &authority);
+    if evidence != *owned_evidence {
+        return Err(refused(
+            "current execution actor/resources differ from signed owner",
+        ));
+    }
     if op.version != 3
         || op.phase != expected
         || (op.reconciliation_detail.is_some()
@@ -699,9 +747,9 @@ fn execution_inputs(
                 expected,
                 PairRefreshPhase::SvnIntent | PairRefreshPhase::GitIntent
             ))
-        || op.admitted_writer_epoch != epoch
+        || owned_epoch != epoch
         || op.pins != *prepared.pins()
-        || op.approval_digest != approval(&op.pins, &evidence)?
+        || op.approval_digest != approval(&op.pins, &authority.evidence)?
         || !busy.owns_pair(&op.pins.child.repo_id, &op.pins.parent.repo_id)
         || operations
             .iter()
@@ -736,9 +784,19 @@ fn store_progress(
     let secret = private_key(tx)?.ok_or_else(|| refused("journal key is missing"))?;
     op.updated_at = Utc::now().to_rfc3339();
     validate(op)?;
+    let previous = recovery::read_authority_unchecked_document(tx, op.id)?;
+    let (owned_evidence, _) = recovery::effective_owner(op, &previous);
+    if *owned_evidence != evidence {
+        return Err(refused("progress differs from authenticated owner"));
+    }
     let authority = Authority {
-        mac: hex::encode(mac(&secret, &evidence, op)?.finalize().into_bytes()),
-        evidence,
+        mac: hex::encode(
+            mac(&secret, &previous.evidence, op, &previous.recoveries)?
+                .finalize()
+                .into_bytes(),
+        ),
+        evidence: previous.evidence,
+        recoveries: previous.recoveries,
     };
     write(
         tx,

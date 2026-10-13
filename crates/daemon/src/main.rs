@@ -4,6 +4,7 @@
 //! and sync scheduler, and handles graceful shutdown.
 
 pub(crate) mod memory;
+mod pair_refresh_recovery;
 mod scheduler;
 mod signals;
 
@@ -45,6 +46,10 @@ struct Args {
     /// Override the log level from the config file (trace, debug, info, warn, error).
     #[arg(long)]
     log_level: Option<String>,
+
+    /// Serve only authentication and explicit recovery of a retained pair refresh.
+    #[arg(long)]
+    pair_refresh_recovery: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +134,10 @@ async fn main() -> Result<()> {
     info!("Data dir      : {}", config.daemon.data_dir.display());
     info!("Log level     : {}", log_level);
     info!("========================================");
+
+    if args.pair_refresh_recovery {
+        return pair_refresh_recovery::serve(config, args.config).await;
+    }
 
     // Exclusive data-directory owner (reposync.lock) plus schema init.
     // The lock is held for the lifetime of _lock_guard. On process exit

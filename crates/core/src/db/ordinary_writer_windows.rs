@@ -241,6 +241,119 @@ impl Database {
 }
 
 impl OrdinaryWriterWindow<'_> {
+    /// The actual engine has selected this complete P..R graph after normal
+    /// history admission. Settle only SVN-emitted commits, with current scoped
+    /// receipt/checkpoint and writer ownership checks in the same transaction.
+    pub(crate) fn settle_emitted_git_echoes(
+        &self,
+        repo_id: &str,
+        checkpoint: &str,
+        remote_tip: &str,
+        commits: &[&str],
+    ) -> Result<(), DatabaseError> {
+        if commits.is_empty() || !commits.contains(&remote_tip) {
+            return Ok(());
+        }
+        self.db.immediate_transaction(|tx| {
+            let doc = self.owned(tx)?;
+            if doc.phase != Phase::Preparing || doc.repo_id.as_deref() != Some(repo_id) {
+                return Err(refused("echo settlement requires the current engine window"));
+            }
+            require_no_pair_refresh_hold(tx, Some(repo_id))?;
+            // Preserve the legacy dual-cursor protocol for ordinary roots.
+            // This convergence is needed only for a registered branch pair's
+            // parent to become an eligible refresh source.
+            let refresh_parent: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM repositories WHERE parent_id=?1 AND id<>?1 AND sync_mode='team' AND enabled=1)",
+                [repo_id], |row| row.get(0),
+            )?;
+            if !refresh_parent {
+                return Ok(());
+            }
+            let (scope, emitted, revision): (Option<String>, String, i64) = tx.query_row(
+                "SELECT scope_uuid,last_git_sha,last_svn_rev FROM repositories WHERE id=?1",
+                [repo_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let handled = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(tx, repo_id)?;
+            if scope.is_none() || scope != doc.scope_uuid || emitted != remote_tip
+                || handled.as_deref() != Some(checkpoint)
+            {
+                return Ok(());
+            }
+            for sha in commits {
+                let matching: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='svn_to_git' AND status='applied' AND svn_rev>0 AND svn_rev<=?3",
+                    rusqlite::params![repo_id,sha,revision], |row| row.get(0),
+                )?;
+                if matching != 1 {
+                    return Ok(());
+                }
+            }
+            crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                tx, repo_id, remote_tip, &Utc::now().to_rfc3339(),
+            )
+        })
+    }
+
+    /// The real engine observed the complete branch log beyond this checkpoint
+    /// and proved each mapped Git source is an ancestor of its admitted tip.
+    /// Recheck every receipt and cursor under the current owned writer window.
+    pub(crate) fn settle_emitted_svn_echoes(
+        &self,
+        repo_id: &str,
+        checkpoint: i64,
+        git_checkpoint: &str,
+        receipts: &[(i64, String)],
+    ) -> Result<(), DatabaseError> {
+        let Some((latest, latest_git)) = receipts.last() else {
+            return Ok(());
+        };
+        if checkpoint <= 0
+            || latest_git != git_checkpoint
+            || receipts.first().is_some_and(|(rev, _)| *rev <= checkpoint)
+            || receipts.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Ok(());
+        }
+        self.db.immediate_transaction(|tx| {
+            let doc = self.owned(tx)?;
+            if doc.phase != Phase::Preparing || doc.repo_id.as_deref() != Some(repo_id) {
+                return Err(refused("SVN echo settlement requires the current engine window"));
+            }
+            require_no_pair_refresh_hold(tx, Some(repo_id))?;
+            let eligible: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM repositories WHERE parent_id=?1 AND id<>?1 AND sync_mode='team' AND enabled=1)",
+                [repo_id], |row| row.get(0),
+            )?;
+            let (scope, rev, sha): (Option<String>, i64, String) = tx.query_row(
+                "SELECT scope_uuid,last_svn_rev,last_git_sha FROM repositories WHERE id=?1",
+                [repo_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let svn_key = format!("last_svn_rev_{repo_id}");
+            let inbound_svn: Option<String> = tx.query_row(
+                "SELECT value FROM kv_state WHERE key=?1", [&svn_key], |row| row.get(0),
+            ).optional()?;
+            let inbound_git = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(tx, repo_id)?;
+            if !eligible || scope.is_none() || scope != doc.scope_uuid || rev != checkpoint
+                || inbound_svn.as_deref() != Some(checkpoint.to_string().as_str())
+                || sha != git_checkpoint || inbound_git.as_deref() != Some(git_checkpoint)
+            {
+                return Ok(());
+            }
+            for (revision, source) in receipts {
+                let mut query = tx.prepare("SELECT git_sha FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND direction='git_to_svn' AND status='applied'")?;
+                let matches = query.query_map(params![repo_id, revision], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if matches.as_slice() != std::slice::from_ref(source) {
+                    return Ok(());
+                }
+            }
+            tx.execute("UPDATE repositories SET last_svn_rev=?1 WHERE id=?2", params![latest, repo_id])?;
+            tx.execute("UPDATE kv_state SET value=?1,updated_at=?2 WHERE key=?3", params![latest.to_string(), Utc::now().to_rfc3339(), svn_key])?;
+            Ok(())
+        })
+    }
+
     /// Validate a preparation handoff before resolving credentials or touching
     /// a checkout. The capability remains bound to its original storage, scope,
     /// writer epoch and durable preparation phase.

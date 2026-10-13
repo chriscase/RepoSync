@@ -3,6 +3,8 @@
 Refs #69. #69 stays open.
 
 This contract describes the next execution policy. Implementation is in progress.
+The draft v2 service and explicit recovery workflow are described in
+[69-pair-refresh-v2-api.md](69-pair-refresh-v2-api.md); qualification remains in progress.
 The existing v1 preview and its execution refusal remain active. Standalone
 publication, lineage, Git and SVN preparation components do not authorize execution.
 The endpoint, complete writer exclusion, SVN publication, recovery and real-engine
