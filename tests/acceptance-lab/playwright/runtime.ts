@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
 import { expect, type Page, type TestInfo } from "@playwright/test";
 
@@ -20,6 +20,9 @@ export type Pair = {
   name: string;
   svnUrl: string;
   gitRepo: string;
+  svnBranch?: string;
+  gitBranch?: string;
+  parentId?: string;
 };
 
 type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
@@ -35,6 +38,58 @@ function safe(value: string, label: string): string {
     throw new Error(`unsafe ${label}`);
   }
   return value;
+}
+
+export function safeRelativePath(value: string): string {
+  if (!value || value.length > 200 || value.split("/").some(part =>
+    !/^[A-Za-z0-9_.][A-Za-z0-9._-]*$/.test(part) || part === "." || part === "..")) {
+    throw new Error("unsafe path");
+  }
+  return value;
+}
+
+// One worker runs the catalog. Keep its login budget on disk so a failed
+// Playwright worker cannot forget requests made by its predecessor.
+export async function reserveLoginAttempt(root: string, identity: string,
+  now = Date.now, sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))): Promise<void> {
+  const file = `${root}/login-budget.json`;
+  const stored = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {identity, attempts: []};
+  if (stored.identity !== identity || !Array.isArray(stored.attempts)
+    || stored.attempts.some((x: unknown) => typeof x !== "number" || !Number.isFinite(x))) {
+    throw new Error("invalid or foreign login budget");
+  }
+  let attempts: number[] = stored.attempts;
+  for (;;) {
+    const time = now();
+    attempts = attempts.filter(t => time - t < 61_000);
+    if (attempts.some(t => t > time)) throw new Error("login budget clock moved backwards");
+    if (attempts.length < 8) {
+      writeFileSync(file, JSON.stringify({identity, attempts: [...attempts, time]}), {mode: 0o600});
+      return;
+    }
+    await sleep(Math.min(60_000, Math.max(1, attempts[0] + 61_000 - time)));
+  }
+}
+
+function svnTarget(pair: Pair): string { return `${pair.svnUrl}/${pair.svnBranch || "trunk"}`; }
+
+function readResult(output: string): string | null {
+  if (output === "LAB_READ_ABSENT\n") return null;
+  if (!output.startsWith("LAB_READ_PRESENT\n")) throw new Error("invalid published-file observation");
+  return output.slice("LAB_READ_PRESENT\n".length);
+}
+
+export function assertLdapUser(result: {status: number; json: unknown}, username: string): void {
+  const body = result.json as {token?: string; user?: {username?: string}} | null;
+  if (result.status !== 200 || !body?.token || body.user?.username !== username) {
+    throw new Error(`healthy LDAP control failed (${result.status})`);
+  }
+}
+
+export function assertAuthRefusal(result: {status: number; json: unknown}): void {
+  if (result.status !== 401 || (result.json as {token?: string} | null)?.token) {
+    throw new Error(`expected authentication refusal 401, received ${result.status}; throttle/setup errors are not LDAP evidence`);
+  }
 }
 
 export function isCredentialRefusal(line: string, pair: Pair, addresses: string[], protocol: "git" | "svn"): boolean {
@@ -156,6 +211,7 @@ export class Lab {
   }
 
   async api(method: string, path: string, body?: unknown, token = this.token): Promise<{ status: number; json: unknown; text: string }> {
+    if (method === "POST" && path === "/api/auth/login") await this.reserveLogin();
     const headers: Record<string, string> = {};
     if (token) headers.authorization = `Bearer ${token}`;
     if (body !== undefined) headers["content-type"] = "application/json";
@@ -171,7 +227,15 @@ export class Lab {
     } catch {
       json = null;
     }
+    if (path === "/api/auth/login" && response.status === 200) {
+      const minted = (json as {token?: string} | null)?.token;
+      if (minted) this.rememberSecret(minted);
+    }
     return { status: response.status, json, text };
+  }
+
+  async reserveLogin(): Promise<void> {
+    await reserveLoginAttempt(required("LAB_RUN_DIR"), `${this.project}|${this.ui}`);
   }
 
   async admin(): Promise<string> {
@@ -182,7 +246,8 @@ export class Lab {
     }, "");
     const token = (result.json as { token?: string } | null)?.token;
     if (result.status !== 200 || !token) {
-      throw new Error(`admin login failed (${result.status})`);
+      const reason = (result.json as {error?: string} | null)?.error || "no server reason";
+      throw new Error(`admin login failed (${result.status}): ${reason.replaceAll(this.adminPassword, "[redacted]").slice(0, 200)}`);
     }
     this.token = token;
     return token;
@@ -193,7 +258,7 @@ export class Lab {
     return result;
   }
 
-  async repos(): Promise<Array<{ id: string; git_repo: string; name: string; svn_url: string }>> {
+  async repos(): Promise<Array<{ id: string; git_repo: string; name: string; svn_url: string; git_branch?: string; svn_branch?: string; parent_id?: string }>> {
     await this.admin();
     const result = await this.api("GET", "/api/repos");
     if (result.status !== 200 || !Array.isArray(result.json)) throw new Error(`list repos failed (${result.status})`);
@@ -289,6 +354,28 @@ curl --silent --show-error --cacert /certs/ca.crt \
     if (started.status !== 200) throw new Error(`import ${repo} failed (${started.status}) ${started.text.slice(0, 400)}`);
     await this.waitImport(id);
     return { id, name: repo, svnUrl: `https://svn:8443/svn/${repo}`, gitRepo: `lab/${repo}` };
+  }
+
+  async createChildPair(parent: Pair, branchName: string): Promise<Pair> {
+    const branch = safe(branchName, "branch");
+    // Admission requires a real Git ref with SVN-origin ancestry. Seed the
+    // ref from the imported parent; the product owns SVN copy and registration.
+    await this.commitGit(parent, `git branch ${branch}\ngit push origin refs/heads/${branch}:refs/heads/${branch}\n`);
+    const published = await this.api("POST", `/api/repos/${parent.id}/branches`, {
+      svn_branch: `branches/${branch}`, git_branch: branch, dry_run: false,
+      auto_create_svn_branch: true, auto_create_git_branch: false,
+    });
+    if (published.status !== 200) throw new Error(`child fixture admission failed (${published.status}): ${published.text.slice(0, 350)}`);
+    const rows = (await this.repos()).filter(row => row.parent_id === parent.id && row.git_branch === branch);
+    if (rows.length !== 1 || rows[0].svn_url !== parent.svnUrl || rows[0].svn_branch !== `branches/${branch}` || rows[0].git_repo !== parent.gitRepo) {
+      throw new Error("child fixture did not establish the expected parent and remotes");
+    }
+    const child: Pair = {id: rows[0].id, name: parent.name, svnUrl: parent.svnUrl, gitRepo: parent.gitRepo,
+      svnBranch: rows[0].svn_branch, gitBranch: branch, parentId: parent.id};
+    const head = await this.snap(child);
+    if (!/^[0-9a-f]{40}$/.test(head.git) || !/^[0-9]+$/.test(head.svn)) throw new Error("child fixture remote pins are missing");
+    this.info.annotations.push({type: "labObservation", description: `child ${child.id} parent ${parent.id} Git ${branch}@${head.git} SVN ${child.svnBranch}@${head.svn}`});
+    return child;
   }
 
   // A Gitea user who can write only this repository. The token is not the lab admin token.
@@ -414,13 +501,13 @@ printf 'REMOVED\n'
 set -eu
 svn info --non-interactive \
   --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
-  --show-item revision ${pair.svnUrl}/trunk
+  --show-item revision ${svnTarget(pair)}
 `)).trim();
     const git = (await this.observer(`
 set -eu
 auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
 git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt \
-  ls-remote https://gitea:3000/${pair.gitRepo}.git refs/heads/main | awk '{print $1}'
+  ls-remote https://gitea:3000/${pair.gitRepo}.git refs/heads/${safe(pair.gitBranch || "main", "ref")} | awk '{print $1}'
 `)).trim();
     const counts = (await this.sh("reposync", `
 set -eu
@@ -537,28 +624,52 @@ sqlite3 -readonly "$db" "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.i
   }
 
   async svnBytes(pair: Pair, path: string): Promise<string> {
-    const rel = safe(path, "path");
-    return this.observer(`
+    const bytes = await this.svnBytesOrMissing(pair, path);
+    if (bytes === null) throw new Error(`published SVN path is absent: ${path}`);
+    return bytes;
+  }
+
+  async svnBytesOrMissing(pair: Pair, path: string): Promise<string | null> {
+    const rel = safeRelativePath(path);
+    return readResult(await this.observer(`
 set -eu
-svn cat --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
-  ${pair.svnUrl}/trunk/${rel}
-`);
+export LC_ALL=C
+data=$(mktemp); err=$(mktemp)
+trap 'rm -f "$data" "$err"' EXIT
+if svn cat --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
+  ${svnTarget(pair)}/${rel} >"$data" 2>"$err"; then
+  printf 'LAB_READ_PRESENT\\n'; cat "$data"
+elif grep -q "W160013:.*path not found" "$err" && ! grep -E '(E|W)[0-9]{6}' "$err" | grep -Ev '(W160013|E200009)' >/dev/null; then
+  printf 'LAB_READ_ABSENT\\n'
+else
+  cat "$err" >&2; exit 1
+fi
+`));
   }
 
   async gitBytes(pair: Pair, path: string): Promise<string> {
-    const rel = safe(path, "path");
-    const dir = `/work/read-${pair.name}`;
-    return this.observer(`
+    const bytes = await this.gitBytesOrMissing(pair, path);
+    if (bytes === null) throw new Error(`published Git path is absent: ${path}`);
+    return bytes;
+  }
+
+  async gitBytesOrMissing(pair: Pair, path: string): Promise<string | null> {
+    const rel = safeRelativePath(path);
+    const branch = safe(pair.gitBranch || "main", "ref");
+    const dir = `/work/read-${safe(pair.id, "repo id")}`;
+    return readResult(await this.observer(`
 set -eu
 auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
 if [ ! -d ${dir}/.git ]; then
   git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt \
-    clone --branch main https://gitea:3000/${pair.gitRepo}.git ${dir}
+    clone --branch ${branch} https://gitea:3000/${pair.gitRepo}.git ${dir}
 fi
-git -C ${dir} -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt fetch origin main
-git -C ${dir} checkout -q FETCH_HEAD
-cat ${dir}/${rel}
-`);
+git -C ${dir} -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt fetch origin ${branch}
+entry=$(git -C ${dir} ls-tree FETCH_HEAD -- ${rel})
+if [ -z "$entry" ]; then printf 'LAB_READ_ABSENT\\n'; else
+  printf 'LAB_READ_PRESENT\\n'; git -C ${dir} show FETCH_HEAD:${rel}
+fi
+`));
   }
 
   async commitSvn(pair: Pair, script: string, username = "svc-sync"): Promise<string> {
@@ -569,7 +680,7 @@ cat ${dir}/${rel}
 set -eu
 export LC_ALL=C
 svn checkout --non-interactive --config-dir "$HOME/.svn" --username ${user} --password "${password}" \
-  ${pair.svnUrl}/trunk ${dir}
+  ${svnTarget(pair)} ${dir}
 cd ${dir}
 ${script}
 svn commit --non-interactive --username ${user} --password "${password}" -m "lab ${pair.name}" .
@@ -579,7 +690,7 @@ svn commit --non-interactive --username ${user} --password "${password}" -m "lab
     return committed[1];
   }
 
-  async commitGit(pair: Pair, script: string, ref = "main"): Promise<string> {
+  async commitGit(pair: Pair, script: string, ref = pair.gitBranch || "main", publish = true): Promise<string> {
     const dir = `/work/git-${pair.name}-${randomBytes(3).toString("hex")}`;
     const branch = safe(ref, "ref");
     const output = await this.observer(`
@@ -594,11 +705,15 @@ cd ${dir}
 git config user.name "Alice Lab"
 git config user.email "alice@lab.invalid"
 ${script}
-git push origin ${branch}
+${publish ? `git push origin ${branch}` : "# Local-only history edit; no push or webhook."}
 git rev-parse HEAD
 `);
     const lines = output.trim().split("\n");
     return lines[lines.length - 1].trim();
+  }
+
+  async commitGitLocal(pair: Pair, script: string): Promise<string> {
+    return this.commitGit(pair, script, pair.gitBranch || "main", false);
   }
 
   async syncSvnChange(pair: Pair, script: string, username = "svc-sync"): Promise<Snap> {
@@ -676,13 +791,29 @@ git rev-parse HEAD
     if (saved.status !== 200) throw new Error(`save ldap failed (${saved.status})`);
   }
 
+  async expectLdapBindRefusal(since: string): Promise<void> {
+    const logs = await exec("docker", ["compose", "-p", this.project, "-f", this.composeFile,
+      "logs", "--no-color", "--since", since, "reposync"], {timeout: 10_000, maxBuffer: 8_000_000});
+    const observed = `${logs.stdout}\n${logs.stderr}`.split("\n").find(line =>
+      line.includes("LDAP auth failed for 'alice'") && line.includes("service account bind rejected"));
+    if (!observed) throw new Error("LDAP server service-bind refusal was not observed");
+    this.info.annotations.push({type: "labObservation", description: "Daemon observed the LDAP server rejecting the configured service-account bind after the accepted configuration change"});
+  }
+
   async uiLogin(username: string, password: string): Promise<void> {
     await this.page.goto("/login");
     await this.page.evaluate(() => localStorage.clear());
     await this.page.goto("/login");
     await this.page.locator('input[name="username"]').fill(username);
     await this.page.locator('input[type="password"]').fill(password);
+    await this.reserveLogin();
+    const reply = this.page.waitForResponse(response => response.url().endsWith("/api/auth/login") && response.request().method() === "POST");
     await this.page.getByRole("button", { name: "Sign in" }).click();
+    const response = await reply;
+    if (response.status() === 200) {
+      const token = (await response.json() as {token?: string}).token;
+      if (token) this.rememberSecret(token);
+    }
   }
 
   async restartDaemon(): Promise<void> {

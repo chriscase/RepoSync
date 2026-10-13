@@ -144,6 +144,25 @@ qualification. Full, real-engine, old-install and live tiers remain unqualified.
 
 ### Full-suite continuation and engine lock setup
 
+Fixture authentication is paced using a run-local login budget: at most eight
+requests in a rolling 61-second window, with the same budget used by API and
+browser logins. The budget survives Playwright worker restarts. It does not
+retry refusals or disable the daemon's authentication rate limiter. Successful
+fixture session tokens are added to the run's scrub list.
+
+The service-bind case uses the reachable LDAP TLS endpoint, verifies healthy
+user logins before and after the fault, checks that the wrong-bind configuration
+was accepted, and requires both a 401 and the daemon's observed LDAP service-bind
+rejection. A throttle response or failed setup cannot qualify that case.
+
+Published-file polling treats an absent SVN path or Git blob as not ready;
+transport, authentication, and other observer errors still fail. Relative paths
+permit dotfiles and reject traversal. Local reset/rebase fixtures never push;
+the SVN symlink fixture commits a real `svn:special` node. Refresh fixtures first
+establish a child through the production branch-pair API and verify its parent,
+remote branches, and pins. Admission failures remain failures, and unsupported
+refresh/re-anchor execution is not promoted to PASS.
+
 The browser catalog uses one worker in default execution mode. A failed case
 keeps its failed result, while later cases run after the worker restarts. Shared
 lab pairs are found by their persisted repository identity and matching remotes

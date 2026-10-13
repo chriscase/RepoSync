@@ -49,8 +49,8 @@ jobs:
       - run: node tests/acceptance-lab/src/self-test.mjs
       - run: node tests/acceptance-lab/src/ci-gate.mjs self-check --scratch "${RUNNER_TEMP}/lab-artifacts/ci-gate-check"
       - run: node tests/acceptance-lab/src/engine-lock-check.mjs
-      - name: Install SQLite for observer regressions
-        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
+      - name: Install SQLite and SVN for observer regressions
+        run: (command -v sqlite3 && command -v svn && command -v svnadmin) || (sudo apt-get update && sudo apt-get install -y sqlite3 subversion)
       - name: Verify isolation infrastructure failures are rejected
         run: npm --prefix tests/acceptance-lab exec -- playwright test -c tests/acceptance-lab/playwright.regression.config.ts --grep-invert 'annotated pass then fails'
       - name: Verify unqualified cases and failures do not omit later cases

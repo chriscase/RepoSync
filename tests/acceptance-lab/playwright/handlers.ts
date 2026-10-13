@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
+import { assertAuthRefusal, assertLdapUser, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
 
 function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
@@ -182,11 +182,8 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       await lab.syncGitChange(pair, "printf 'notes\\n' > .notes\ngit add .notes\ngit commit -m 'dot'\n");
       const svn = await lab.svnBytes(pair, ".notes");
       if (svn.trim() !== "notes") throw new Error("dotfile missing");
-      const pair2 = await own(lab, op);
-      await lab.expectNoWrite(pair2, async () => {
-        await lab.commitGit(pair2, "mkdir -p escape\nprintf 'no\\n' > escape/file\ngit add escape\nprintf '..' > .git-escape-name || true\ngit commit --allow-empty -m 'escape probe'\n");
-      });
-      lab.pass("dotfile synced; escape probe made no extra claim");
+      await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
+      lab.pass("dotfile synced; repeat trigger was idle");
       return;
     }
     case "GIT-MULTI-COMMIT-LINEAR": {
@@ -194,7 +191,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       const before = await lab.snap(pair);
       await lab.commitGit(pair, "printf 'A\\n' > seq.txt\ngit add seq.txt\ngit commit -m A\nprintf 'B\\n' > seq.txt\ngit add seq.txt\ngit commit -m B\nprintf 'C\\n' > seq.txt\ngit add seq.txt\ngit commit -m C\n");
       await lab.triggerGit(pair.gitRepo);
-      await lab.waitUntil(async () => (await lab.svnBytes(pair, "seq.txt")).includes("C"));
+      await lab.waitUntil(async () => (await lab.svnBytesOrMissing(pair, "seq.txt"))?.includes("C") || false);
       const after = await lab.snap(pair);
       if (Number(after.svn) < Number(before.svn) + 1) throw new Error("no svn revision for the sequence");
       await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
@@ -237,7 +234,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       } else if (op.id === "SVN-PROPS-EOL-KEYWORDS-EXECUTABLE" || op.id === "SVN-PROP-ONLY-REV") {
         await lab.commitSvn(pair, "printf 'prop\\n' > prop.txt\nsvn add prop.txt\nsvn propset svn:executable '*' prop.txt\n");
       } else if (op.id === "SVN-SYMLINK") {
-        await lab.commitSvn(pair, "printf 'link target\\n' > link.txt\nsvn add link.txt\nsvn propset svn:special '*' link.txt\n");
+        await lab.commitSvn(pair, "ln -s README.txt link.txt\ntest -L link.txt\nsvn add link.txt\nsvn propget svn:special link.txt | grep -F '*'\n");
       } else if (op.id === "SVN-EXTERNALS") {
         await lab.commitSvn(pair, "svn propset svn:externals 'ext https://denied-target:8443/svn/nope' .\n");
       } else {
@@ -347,10 +344,11 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       const synced = await lab.snap(pair);
       if (op.id === "GIT-RESET-LOCAL" || op.id === "GIT-LOCAL-REBASE-UNPUBLISHED") {
         await lab.expectNoWrite(pair, async () => {
-          await lab.observer(`cd /work/git-${pair.name}-* 2>/dev/null || true`);
-          await lab.commitGit(pair, "git reset --mixed HEAD~1 || true\n");
+          await lab.commitGitLocal(pair, op.id === "GIT-RESET-LOCAL"
+            ? "git reset --mixed HEAD~1\n"
+            : "git checkout -b local-only HEAD~1\nprintf 'local\\n' > local-rebase.txt\ngit add local-rebase.txt\ngit commit -m local-only\ngit rebase main\n");
         });
-        lab.pass("local reset was not published");
+        lab.pass(`${op.id} edited local history without publishing; remote tips and cursors stayed unchanged`);
         return;
       }
       await lab.commitGit(pair, "git commit --allow-empty --amend -m rewritten || git commit --allow-empty -m rewritten\ngit push --force-with-lease origin main || git push --force origin main\n");
@@ -470,7 +468,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       await lab.commitSvn(pair, "printf 'gap2\\n' > gap.txt\n");
       const rev = await lab.observer(`svn info --non-interactive --username svc-sync --password "$SVN_PASSWORD" --show-item revision ${pair.svnUrl}/trunk`);
       await lab.triggerSvn(rev.trim());
-      await lab.waitUntil(async () => (await lab.gitBytes(pair, "gap.txt")).includes("gap2"));
+      await lab.waitUntil(async () => (await lab.gitBytesOrMissing(pair, "gap.txt"))?.includes("gap2") || false);
       lab.pass("content revisions were not dropped around a property-only revision");
       return;
     }
@@ -520,16 +518,25 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     case "PAIR-BOTH-DIVERGED":
     case "PAIR-LATE-EXISTING-SVN":
     case "WEB-PAIR-AND-REFRESH": {
-      const pair = await lab.bootstrap();
+      const parent = await own(lab, op);
+      const pair = await lab.createChildPair(parent, `c${slug(op.id)}`);
+      if (op.id === "PAIR-PARENT-AHEAD" || op.id === "PAIR-BOTH-DIVERGED") {
+        await lab.commitGit(parent, "printf 'parent\\n' > parent-ahead.txt\ngit add parent-ahead.txt\ngit commit -m parent-ahead\n");
+        if (op.id === "PAIR-BOTH-DIVERGED") await lab.commitGit(pair, "printf 'child\\n' > child-ahead.txt\ngit add child-ahead.txt\ngit commit -m child-ahead\n");
+      }
       const execute = op.id === "PAIR-REFRESH-EXECUTE" || op.id === "PAIR-REFRESH-STALE-AND-REPEAT";
       const operation = op.id === "PAIR-REANCHOR" ? "reanchor" : "update_pair_from_parent";
-      const response = await lab.api("POST", `/api/repos/${pair.id}/refresh`, { operation, execute, dry_run: !execute });
       const before = await lab.snap(pair);
+      const response = await lab.api("POST", `/api/repos/${pair.id}/refresh`, { operation, execute, dry_run: !execute });
       if (op.contract === "NOT_IMPLEMENTED" || op.id === "PAIR-REANCHOR" || op.id === "WEB-PAIR-AND-REFRESH") {
         if (response.status < 400 && execute) lab.gap(`${op.id} execute was accepted`);
         lab.gap(`${op.id} returned ${response.status}: ${response.text.slice(0, 220)}. Refusal is not the successful workflow. svn ${before.svn}`);
       }
       if (response.status >= 400) throw new Error(`refresh preview ${response.status} ${response.text.slice(0, 240)}`);
+      const plan = response.json as {pair_id?: string; parent_id?: string};
+      if (plan.pair_id !== pair.id || plan.parent_id !== parent.id) throw new Error("refresh preview did not identify the established child and parent");
+      const after = await lab.snap(pair);
+      if (JSON.stringify(after) !== JSON.stringify(before)) throw new Error("refresh preview changed remote tips or checkpoints");
       lab.pass(`refresh preview returned ${response.status}`);
       return;
     }
@@ -637,7 +644,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         const name = op.id === "LDAP-FILTER-ESCAPE" ? "*)(uid=*" : op.id === "LDAP-MISSING-USER" ? "nobody-lab" : "alice";
         const password = op.id === "LDAP-AUTH-INVALID" ? "wrong-password-value" : lab.alicePassword;
         const result = await lab.login(name, password);
-        if (result.status === 200) throw new Error(`${op.id} created a session`);
+        assertAuthRefusal(result);
         lab.pass(`${op.id} returned ${result.status}`);
         return;
       }
@@ -660,9 +667,10 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         return;
       }
       if (op.id === "LDAP-OUTAGE" || op.id === "LDAP-TLS" || op.id === "LDAP-SERVICE-BIND-SEARCH") {
+        assertLdapUser(await lab.login("alice", lab.alicePassword), "alice");
         const body = {
           enabled: true,
-          url: op.id === "LDAP-TLS" ? "ldaps://svn:8443" : "ldaps://ldap:639",
+          url: op.id === "LDAP-TLS" ? "ldaps://svn:8443" : op.id === "LDAP-SERVICE-BIND-SEARCH" ? "ldaps://ldap:636" : "ldaps://ldap:639",
           base_dn: "dc=lab,dc=invalid",
           search_filter: "(&(objectClass=inetOrgPerson)(uid={0}))",
           display_name_attr: "cn", email_attr: "mail", group_attr: "memberOf",
@@ -670,11 +678,17 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
           bind_password: op.id === "LDAP-SERVICE-BIND-SEARCH" ? "wrong-bind-password" : lab.bindPassword,
           tls_verify: true,
         };
-        await lab.api("PUT", "/api/admin/ldap", body);
-        const result = await lab.login("alice", lab.alicePassword);
-        await lab.enableLdap();
-        if (result.status === 200) throw new Error(`${op.id} authenticated during directory failure`);
-        lab.pass(`${op.id} failed closed (${result.status}) and checking stayed on`);
+        try {
+          const saved = await lab.api("PUT", "/api/admin/ldap", body);
+          if (saved.status !== 200) throw new Error(`LDAP fault configuration rejected (${saved.status})`);
+          const since = new Date().toISOString();
+          assertAuthRefusal(await lab.login("alice", lab.alicePassword));
+          if (op.id === "LDAP-SERVICE-BIND-SEARCH") await lab.expectLdapBindRefusal(since);
+        } finally {
+          await lab.enableLdap();
+        }
+        assertLdapUser(await lab.login("alice", lab.alicePassword), "alice");
+        lab.pass(`${op.id} had healthy login controls before and after an accepted fault configuration; authentication refused with 401${op.id === "LDAP-SERVICE-BIND-SEARCH" ? "; LDAP server service-bind rejection observed" : ""}`);
         return;
       }
       if (op.id === "LDAP-BIND-ROTATION") {
@@ -687,7 +701,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         });
         const bad = await lab.login("alice", lab.alicePassword);
         await lab.enableLdap();
-        if (bad.status === 200) throw new Error("rotation kept the old bind password");
+        assertAuthRefusal(bad);
         lab.pass("replacing the bind password stopped user login until it was restored");
         return;
       }
