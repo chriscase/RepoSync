@@ -100,3 +100,38 @@ Syntax, type, and harness-detector checks do not qualify the services, the brows
 ## Reading a failure
 
 `publish/report.md` lists the suite result, whether the audit SHA covers the candidate, and each operation. Infrastructure failures stay infrastructure failures. Product failures stay on their existing owners. This branch already contains four Personal production files, `crates/cli/src/personal/mod.rs`, `import.rs`, `daemon_ctl.rs`, and `crates/personal/src/engine.rs`, so that a fresh personal database is initialized, import commits on the configured branch, and Git-to-SVN errors keep their cause. Those files are part of this draft. The harness repair does not add further production Rust. It does not patch the web UI, shared lockfiles, or PR 194 to make a red case green.
+
+
+### Repair verification after the 418ed374 review
+
+The CI harness-regression job checks missing or conflicting identity metadata,
+failed compiler identity commands, and isolation setup/trigger failures before
+building the daemon. Evidence and report identities must include candidate,
+suite, seed and run ID. Repeated agreeing identity copies in a publish bundle
+remain supported.
+
+The isolation smoke case uses two valid repository-scoped Git users and distinct
+SVN users. Both repositories exercise both sync directions. The negative source
+change must be committed before triggering; a server access-log refusal must
+identify the daemon IP and the target repository. Git's unauthenticated 401
+challenge is not a refusal receipt. SVN refusal must identify Alice attempting
+Bob's repository. Restoring the correct credential must publish the pending
+change with one source receipt, and a repeated trigger must be idle. The wrong
+Git-token case keeps the correct user's permission intact to detect stale token
+selection. Provisioning and observer reads still use the lab admin credentials;
+this does not qualify admin-token rotation or real-engine/live isolation.
+
+Local harness regressions (no Docker daemon or browser download required):
+
+```sh
+npm --prefix tests/acceptance-lab ci --ignore-scripts
+npm --prefix tests/acceptance-lab run typecheck
+node tests/acceptance-lab/src/identity-check.mjs
+npm --prefix tests/acceptance-lab exec -- playwright test -c tests/acceptance-lab/playwright.regression.config.ts --grep-invert 'annotated pass then fails'
+bash tests/acceptance-lab/src/fail-closed-check.sh
+```
+
+The deliberately failing Playwright fixture inside the final command must exit
+nonzero; the enclosing regression must succeed only after aggregation and
+enforcement both reject it. These synthetic checks do not count as runtime
+qualification. Full, real-engine, old-install and live tiers remain unqualified.

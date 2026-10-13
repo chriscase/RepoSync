@@ -743,29 +743,19 @@ graph_dest() {
 }
 
 record_rust_image_identity() {
-  local dest digest rustc_line cargo_line
+  local dest digest image_id rustc_line cargo_line
   dest="$(graph_dest)"
-  mkdir -p "$dest"
+  mkdir -p "$dest" || return 1
   log "pulling harness compiler ${RUST_IMAGE}"
   docker pull "$RUST_IMAGE" || return 1
-  digest="$(docker image inspect "$RUST_IMAGE" --format '{{index .RepoDigests 0}}')"
-  rustc_line="$(docker run --rm "$RUST_IMAGE" rustc --version)"
-  cargo_line="$(docker run --rm "$RUST_IMAGE" cargo --version)"
-  RUST_REPO_DIGEST="$digest"
-  {
-    echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "candidate=${CANDIDATE}"
-    echo "rust_image=${RUST_IMAGE}"
-    echo "rust_toolchain=${RUST_TOOLCHAIN}"
-    echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
-    echo "previous_lab_pin=rust:1.83.0-bookworm"
-    echo "product_dockerfile=unchanged rust:1.83-bookworm"
-    echo "note=this pin does not prove the product Dockerfile or its MSRV"
-    echo "rust_image_id=$(docker image inspect "$RUST_IMAGE" --format '{{.Id}}')"
-    echo "rust_repo_digest=${digest}"
-    echo "rustc=${rustc_line}"
-    echo "cargo=${cargo_line}"
-  } > "$dest/image-identity.txt"
+  digest="$(docker image inspect "$RUST_IMAGE" --format '{{index .RepoDigests 0}}')" || return 1
+  image_id="$(docker image inspect "$RUST_IMAGE" --format '{{.Id}}')" || return 1
+  if ! [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "rust image identity is missing or invalid" >&2
+    return 1
+  fi
+  rustc_line="$(docker run --rm "$RUST_IMAGE" rustc --version)" || return 1
+  cargo_line="$(docker run --rm "$RUST_IMAGE" cargo --version)" || return 1
   if [ -z "$digest" ]; then
     echo "rust image ${RUST_IMAGE} has no RepoDigest after pull" >&2
     return 1
@@ -784,6 +774,21 @@ record_rust_image_identity() {
       return 1
       ;;
   esac
+  RUST_REPO_DIGEST="$digest"
+  {
+    echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "candidate=${CANDIDATE}"
+    echo "rust_image=${RUST_IMAGE}"
+    echo "rust_toolchain=${RUST_TOOLCHAIN}"
+    echo "aligned_with=Dockerfile.reliability rust:1.98.1-bookworm"
+    echo "previous_lab_pin=rust:1.83.0-bookworm"
+    echo "product_dockerfile=unchanged rust:1.83-bookworm"
+    echo "note=this pin does not prove the product Dockerfile or its MSRV"
+    echo "rust_image_id=${image_id}"
+    echo "rust_repo_digest=${digest}"
+    echo "rustc=${rustc_line}"
+    echo "cargo=${cargo_line}"
+  } > "$dest/image-identity.txt" || return 1
   log "recorded ${RUST_IMAGE} ${digest}"
 }
 

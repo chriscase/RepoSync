@@ -1004,45 +1004,52 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_st
         git_token: leftGit.token,
       });
       if (swapped.status !== 200) throw new Error(`could not store isoa's git token on isob (${swapped.status})`);
-      await lab.revokeScopedGitToken("isob");
       const parkedGit = await lab.snap(right);
-      let gitDenied = false;
-      try {
-        await lab.syncSvnChange(right, "printf 'other-token\\n' > other-token.txt\nsvn add --force other-token.txt\n", "bob");
-      } catch {
-        gitDenied = true;
-      }
+      const gitRevision = await lab.commitSvn(right, "printf 'other-token\\n' > other-token.txt\nsvn add --force other-token.txt\n", "bob");
+      if (gitRevision === parkedGit.svn || (await lab.snap(right)).svn !== gitRevision) throw new Error("negative Git source revision was not committed");
+      await lab.expectCredentialDenial(right, () => lab.triggerSvn(gitRevision), "git");
       const afterGitDeny = await lab.snap(right);
-      if (!gitDenied || afterGitDeny.git !== parkedGit.git) {
-        throw new Error("isob published after its git credential was replaced with isoa's token");
-      }
-      if (afterGitDeny.records !== parkedGit.records && afterGitDeny.git === parkedGit.git) {
-        throw new Error("isob wrote a checkpoint without publishing the commit made with isoa's git token");
-      }
-      const authzPath = `${process.env.LAB_RUN_DIR}/svn-authz`;
-      const { readFileSync, writeFileSync } = await import("node:fs");
-      writeFileSync(authzPath, readFileSync(authzPath, "utf8").replaceAll("svc-sync = rw\n", "svc-sync = r\n"));
-      await lab.sh("svn", "apachectl graceful");
-      const parked = await lab.snap(right);
+      if (afterGitDeny.git !== parkedGit.git || afterGitDeny.records !== parkedGit.records || afterGitDeny.watermark !== parkedGit.watermark) throw new Error("wrong Git token advanced publication or checkpoint");
+      // Keep gitisob authorized throughout: a stale cached right token would
+      // publish, making this a test of credential selection as well as refusal.
+      const restoredGit = await lab.api("POST", `/api/repos/${right.id}/credentials`, { svn_password: lab.bobPassword, git_token: rightGit.token });
+      if (restoredGit.status !== 200) throw new Error("could not restore right Git credential");
+      await lab.triggerSvn(gitRevision);
+      await lab.waitSvnPublication(right, parkedGit, gitRevision);
+      if ((await lab.gitBytes(right, "other-token.txt")).trim() !== "other-token") throw new Error("recovered Git publication lost the pending bytes");
+      await lab.expectNoWrite(right, () => lab.triggerSvn(gitRevision));
+      await lab.assertSingleReceipt(right, "svn_to_git", gitRevision);
+
+      // Prove positive Git-to-SVN behavior on BOTH scoped repositories too.
+      await lab.syncGitChange(left, "printf 'left-return\\n' > left-return.txt\ngit add left-return.txt\ngit commit -m left-return\n");
+      await lab.syncGitChange(right, "printf 'right-return\\n' > right-return.txt\ngit add right-return.txt\ngit commit -m right-return\n");
+      if ((await lab.svnBytes(left, "left-return.txt")).trim() !== "left-return" || (await lab.svnBytes(right, "right-return.txt")).trim() !== "right-return") throw new Error("scoped reverse sync lost bytes");
+
       const stolenUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "alice" });
-      const stolenSecret = await lab.api("POST", `/api/repos/${right.id}/credentials`, {
-        svn_password: lab.alicePassword,
-        git_token: lab.gitToken,
-      });
+      const stolenSecret = await lab.api("POST", `/api/repos/${right.id}/credentials`, { svn_password: lab.alicePassword, git_token: rightGit.token });
       if (stolenUser.status !== 200 || stolenSecret.status !== 200) throw new Error("could not present alice's credential to isob");
-      let denied = false;
-      try {
-        await lab.syncSvnChange(right, "printf 'stolen\\n' > stolen.txt\nsvn add --force stolen.txt\n", "bob");
-      } catch {
-        denied = true;
-      }
-      if (!denied) throw new Error("isob published a commit while its stored credential was alice");
-      const afterDeny = await lab.snap(right);
-      if (afterDeny.git === parked.git && afterDeny.records !== parked.records) {
-        throw new Error("isob wrote a checkpoint without publishing bob's commit");
-      }
-      if (afterDeny.git !== parked.git) throw new Error("isob published after alice's credential replaced bob's");
-      lab.pass(`isoa as ${leftGit.user} reached ${changed.git.slice(0, 12)} and isob as ${rightGit.user} reached ${changedRight.git.slice(0, 12)} from trunk r${beforeLeft.svn}; storing isoa's git token on isob and removing isob's write access did not publish bob's next commit; storing alice's svn credential on isob did not publish the commit after that.`);
+      const parkedSvn = await lab.snap(right);
+      const pendingGit = await lab.commitGit(right, "printf 'svn-denial\\n' > svn-denial.txt\ngit add svn-denial.txt\ngit commit -m svn-denial\n");
+      if (pendingGit === parkedSvn.git || (await lab.snap(right)).git !== pendingGit) throw new Error("negative SVN source commit was not published");
+      await lab.expectCredentialDenial(right, async () => {
+        if (await lab.triggerGit(right.gitRepo) !== 200) throw new Error("negative SVN webhook failed");
+      }, "svn");
+      const afterSvnDeny = await lab.snap(right);
+      if (afterSvnDeny.svn !== parkedSvn.svn || afterSvnDeny.records !== parkedSvn.records || afterSvnDeny.watermark !== parkedSvn.watermark) throw new Error("wrong SVN credential advanced publication or checkpoint");
+      const restoredUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "bob" });
+      const restoredSvn = await lab.api("POST", `/api/repos/${right.id}/credentials`, { svn_password: lab.bobPassword, git_token: rightGit.token });
+      if (restoredUser.status !== 200 || restoredSvn.status !== 200) throw new Error("could not restore bob's SVN credential");
+      if (await lab.triggerGit(right.gitRepo) !== 200) throw new Error("recovery SVN webhook failed");
+      await lab.waitUntil(async () => {
+        const now = await lab.snap(right);
+        return now.svn !== parkedSvn.svn && now.records !== parkedSvn.records && now.watermark === now.svn;
+      });
+      if ((await lab.svnBytes(right, "svn-denial.txt")).trim() !== "svn-denial") throw new Error("recovered SVN publication lost the pending bytes");
+      await lab.expectNoWrite(right, async () => {
+        if (await lab.triggerGit(right.gitRepo) !== 200) throw new Error("repeat SVN webhook failed");
+      });
+      await lab.assertSingleReceipt(right, "git_to_svn", pendingGit);
+      lab.pass(`isoa as ${leftGit.user} and isob as ${rightGit.user} synced both directions from trunk r${beforeLeft.svn} to distinct Git tips; wrong Git and SVN credentials produced repository-specific server refusals from the daemon IP after committed source changes and successful triggers; restoring the correct credentials published both pending changes and repeat triggers were idle.`);
       } finally {
         await lab.removeScopedGitTeam("isoa");
         await lab.removeScopedGitTeam("isob");

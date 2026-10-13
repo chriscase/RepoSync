@@ -49,7 +49,7 @@ export function listNamed(root, name) {
       if (entry.isDirectory()) stack.push(full);
       else if (entry.isFile() && entry.name === name) {
         try {
-          if (statSync(full).size > 0) found.push(full);
+          if (statSync(full).isFile()) found.push(full);
         } catch {
           // An unreadable file is not a usable artifact.
         }
@@ -59,51 +59,43 @@ export function listNamed(root, name) {
   return found;
 }
 
+function identityErrors(identity) {
+  const errors = [];
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return ["identity must be an object"];
+  if (typeof identity.candidate_sha !== "string" || !/^[0-9a-f]{40}$/.test(identity.candidate_sha)) errors.push("candidate_sha must be a 40 character lowercase sha");
+  if (typeof identity.suite !== "string" || !["smoke", "full", "soak"].includes(identity.suite)) errors.push("suite is missing or invalid");
+  if (!validSeed(identity.seed)) errors.push("seed is missing or invalid");
+  if (!safeRunId(identity.run_id)) errors.push("run_id is missing or invalid");
+  return errors;
+}
+
+function validSeed(value) {
+  return (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+    || (typeof value === "string" && /^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)));
+}
+
 export function bindEvidenceIdentity({ evidence, candidate, suite, seed }) {
   const reasons = [];
   const files = listNamed(evidence, "identity.json");
-  if (files.length === 0) {
-    reasons.push("infrastructure FAIL: expected one identity.json, found 0");
-    return { ok: false, reasons, identity: null };
-  }
+  if (files.length === 0) return { ok: false, reasons: ["infrastructure FAIL: identity.json is missing"], identity: null };
   const docs = [];
   for (const file of files) {
     try {
-      docs.push(JSON.parse(readFileSync(file, "utf8")));
+      const doc = JSON.parse(readFileSync(file, "utf8"));
+      const invalid = identityErrors(doc);
+      if (invalid.length) reasons.push(...invalid.map((reason) => `infrastructure FAIL: evidence ${reason}`));
+      else docs.push(doc);
     } catch {
       reasons.push("infrastructure FAIL: identity.json is not readable");
-      return { ok: false, reasons, identity: null };
     }
   }
+  if (reasons.length) return { ok: false, reasons, identity: null };
   const identity = docs[0];
-  const signature = JSON.stringify({
-    candidate_sha: identity.candidate_sha,
-    suite: identity.suite,
-    seed: identity.seed,
-    run_id: identity.run_id,
-  });
-  if (docs.some((doc) => JSON.stringify({
-    candidate_sha: doc.candidate_sha,
-    suite: doc.suite,
-    seed: doc.seed,
-    run_id: doc.run_id,
-  }) !== signature)) {
-    reasons.push(`infrastructure FAIL: identity.json copies disagree (${files.length} files)`);
-    return { ok: false, reasons, identity: null };
-  }
-  const source = typeof identity.candidate_sha === "string" ? identity.candidate_sha : "";
-  if (source !== candidate) {
-    reasons.push(`infrastructure FAIL: evidence candidate ${source || "missing"} does not match ${candidate}`);
-  }
-  if (identity.suite && identity.suite !== suite) {
-    reasons.push(`infrastructure FAIL: evidence suite ${identity.suite} does not match ${suite}`);
-  }
-  if (identity.seed != null && String(identity.seed) !== String(seed)) {
-    reasons.push(`infrastructure FAIL: evidence seed ${identity.seed} does not match ${seed}`);
-  }
-  if (!safeRunId(identity.run_id)) {
-    reasons.push("infrastructure FAIL: evidence run_id is missing");
-  }
+  const signature = (doc) => JSON.stringify([doc.candidate_sha, doc.suite, Number(doc.seed), doc.run_id]);
+  if (docs.some((doc) => signature(doc) !== signature(identity))) reasons.push(`infrastructure FAIL: identity.json copies disagree (${files.length} files)`);
+  if (identity.candidate_sha !== candidate) reasons.push(`infrastructure FAIL: evidence candidate ${identity.candidate_sha} does not match ${candidate}`);
+  if (identity.suite !== suite) reasons.push(`infrastructure FAIL: evidence suite ${identity.suite} does not match ${suite}`);
+  if (!validSeed(seed) || Number(identity.seed) !== Number(seed)) reasons.push(`infrastructure FAIL: evidence seed ${identity.seed} does not match ${seed}`);
   return { ok: reasons.length === 0, reasons, identity };
 }
 
@@ -252,7 +244,7 @@ export function aggregateReport({ evidence, engine, reportDir, candidate }) {
   writeReasons(reportDir, reasons);
   let aggregateExit = 0;
   let identityOk = true;
-  if (selection.ok && /^[0-9a-f]{40}$/.test(candidate || "") && existsSync(evidence)) {
+  if (selection.ok && /^[0-9a-f]{40}$/.test(candidate || "")) {
     const bound = bindEvidenceIdentity({ evidence, candidate, suite: selection.suite, seed: selection.seed });
     if (!bound.ok) {
       identityOk = false;
@@ -297,41 +289,15 @@ export function enforceReport({ evidence, engine, reportDir }) {
   const reportPath = join(reportDir, "report.json");
   const report = fileReady(reportPath) ? readJson(reportPath) : null;
   if (!report) reasons.push("infrastructure FAIL: report.json was not produced");
-  const identityFiles = listNamed(evidence, "identity.json");
-  const identityDocs = [];
-  for (const file of identityFiles) {
-    try {
-      identityDocs.push(JSON.parse(readFileSync(file, "utf8")));
-    } catch {
-      reasons.push("infrastructure FAIL: identity.json is not readable");
-    }
-  }
-  const identitySignature = identityDocs[0] ? JSON.stringify({
-    candidate_sha: identityDocs[0].candidate_sha,
-    suite: identityDocs[0].suite,
-    seed: identityDocs[0].seed,
-    run_id: identityDocs[0].run_id,
-  }) : "";
-  if (identityDocs.length > 1 && identityDocs.some((doc) => JSON.stringify({
-    candidate_sha: doc.candidate_sha,
-    suite: doc.suite,
-    seed: doc.seed,
-    run_id: doc.run_id,
-  }) !== identitySignature)) {
-    reasons.push(`infrastructure FAIL: identity.json copies disagree (${identityDocs.length} files)`);
-  } else if (identityDocs.length >= 1 && report) {
-    const identity = identityDocs[0];
-    if (!identity || report.candidate !== identity.candidate_sha) {
-      reasons.push(`infrastructure FAIL: report candidate ${report.candidate || "missing"} does not match evidence ${identity?.candidate_sha || "missing"}`);
-    }
-    if (identity?.suite && report.suite && report.suite !== identity.suite) {
-      reasons.push(`infrastructure FAIL: report suite ${report.suite} does not match evidence ${identity.suite}`);
-    }
-    if (identity?.seed != null && report.seed != null && String(report.seed) !== String(identity.seed)) {
-      reasons.push(`infrastructure FAIL: report seed ${report.seed} does not match evidence ${identity.seed}`);
-    }
-    if (identity?.run_id && report.run_id && report.run_id !== identity.run_id) {
-      reasons.push(`infrastructure FAIL: report run ${report.run_id} does not match evidence ${identity.run_id}`);
+  const bound = bindEvidenceIdentity({ evidence, candidate: report?.candidate, suite: selection.suite, seed: selection.seed });
+  reasons.push(...bound.reasons);
+  if (report) {
+    reasons.push(...identityErrors({ ...report, candidate_sha: report.candidate }).map((reason) => `infrastructure FAIL: report ${reason}`));
+    if (bound.identity) {
+      const identity = bound.identity;
+      if (report.suite !== identity.suite) reasons.push("infrastructure FAIL: report suite does not match evidence");
+      if (!validSeed(report.seed) || Number(report.seed) !== Number(identity.seed)) reasons.push("infrastructure FAIL: report seed does not match evidence");
+      if (report.run_id !== identity.run_id) reasons.push("infrastructure FAIL: report run does not match evidence");
     }
   }
   writeReasons(reportDir, reasons);
@@ -535,6 +501,9 @@ function commandSelfCheck() {
     const reportDir = join(scratch, "report");
     writeJson(join(evidence, "playwright.json"), { suites: [] });
     writeJson(join(evidence, "self-test.json"), { ok: true });
+    const fixtureIdentity = { candidate_sha: "a".repeat(40), suite: "smoke", seed: 1, run_id: "rsfixture1" };
+    const fixtureReport = { candidate: fixtureIdentity.candidate_sha, suite: "smoke", seed: 1, run_id: "rsfixture1" };
+    writeJson(join(evidence, "identity.json"), fixtureIdentity);
     writeJson(join(reportDir, "report.json"), { suite_result: "PASS" });
     const hiddenPass = runNode(["enforce", "--evidence", join(scratch, "no-evidence"), "--engine", join(scratch, "no-engine"), "--report-dir", reportDir], {
       LAB_EVENT_NAME: "pull_request",
@@ -547,7 +516,7 @@ function commandSelfCheck() {
     assertCheck(fileReady(join(reportDir, "infrastructure-failure.txt")), "gate did not keep the infrastructure failure");
 
     const productFailDir = join(scratch, "product-report");
-    writeJson(join(productFailDir, "report.json"), { suite_result: "FAIL" });
+    writeJson(join(productFailDir, "report.json"), { ...fixtureReport, suite_result: "FAIL" });
     const productFail = runNode(["enforce", "--evidence", evidence, "--engine", join(scratch, "no-engine"), "--report-dir", productFailDir], {
       LAB_EVENT_NAME: "pull_request",
       LAB_SUITE_INPUT: "full",
@@ -569,7 +538,8 @@ function commandSelfCheck() {
     assertCheck(fullMissing.status === 1 && fullMissing.stdout.includes("engine summary.json"), "full suite ignored a missing engine summary");
 
     const passDir = join(scratch, "pass-report");
-    writeJson(join(passDir, "report.json"), { suite_result: "PASS" });
+    writeJson(join(evidence, "identity.json"), { ...fixtureIdentity, seed: 3 });
+    writeJson(join(passDir, "report.json"), { ...fixtureReport, seed: 3, suite_result: "PASS" });
     const pass = runNode(["enforce", "--evidence", evidence, "--engine", staged, "--report-dir", passDir], {
       LAB_EVENT_NAME: "workflow_dispatch",
       LAB_SUITE_INPUT: "smoke",
@@ -692,9 +662,9 @@ function commandSelfCheck() {
     );
     const ghaReport = readJson(join(ghaDir, "report.json"));
     checks += 1;
-    assertCheck(ghaReport && ghaReport.run_id === "gha99a1", `missing identity run id ${ghaReport && ghaReport.run_id} status ${gha.status} ${(gha.stderr || "").slice(0, 240)}`);
+    assertCheck(gha.status === 1 && !ghaReport, "missing identity must not be replaced by a GitHub fallback");
     checks += 1;
-    assertCheck(ghaReport.run_id !== "unknown", "aggregate emitted unknown");
+    assertCheck(fileReady(join(ghaDir, "infrastructure-failure.txt")), "missing identity failure was not recorded");
 
     console.log(`ci-gate self-check PASS ${checks}`);
   } catch (error) {

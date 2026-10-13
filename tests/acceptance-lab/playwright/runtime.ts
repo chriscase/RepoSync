@@ -37,6 +37,14 @@ function safe(value: string, label: string): string {
   return value;
 }
 
+export function isCredentialRefusal(line: string, pair: Pair, addresses: string[], protocol: "git" | "svn"): boolean {
+  if (protocol === "git") {
+    return line.includes(`/${pair.gitRepo}.git/`) && addresses.some(ip => line.includes(`for ${ip}:`)) && /, (403|404) /.test(line);
+  }
+  const repository = line.includes(`/svn/${pair.name}/`) || line.includes(`/svn/${pair.name} `);
+  return repository && addresses.some(ip => line.includes(`${ip} - alice `)) && /" 403 /.test(line);
+}
+
 export class Lab {
   readonly page: Page;
   readonly info: TestInfo;
@@ -417,6 +425,43 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE rep
     };
   }
 
+  async expectCredentialDenial(pair: Pair, trigger: () => Promise<void>, protocol: "git" | "svn"): Promise<void> {
+    // Server-side refusal must come from this daemon, on this repository, after
+    // the committed source change. Observer reads and normal 401 challenges do
+    // not prove that the daemon used the wrong scoped credential.
+    const prefix = ["compose", "-p", this.project, "-f", this.composeFile];
+    const ids = (await exec("docker", [...prefix, "ps", "-q", "reposync"], { timeout: 10_000 })).stdout.trim().split(/\s+/);
+    if (ids.length !== 1 || !/^[0-9a-f]{12,64}$/.test(ids[0])) throw new Error("cannot identify the daemon for authentication observation");
+    const addresses = (await exec("docker", ["inspect", "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", ids[0]], { timeout: 10_000 })).stdout.trim().split(/\s+/);
+    if (!addresses.length || addresses.some(ip => !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(ip))) throw new Error("cannot identify daemon network addresses");
+    const since = new Date().toISOString();
+    await trigger(); // An HTTP/setup error is a failure, never a denial receipt.
+    let refusal = "";
+    await this.waitUntil(async () => {
+      const result = await exec("docker", [...prefix, "logs", "--no-color", "--since", since, protocol === "git" ? "gitea" : "svn"], { timeout: 10_000, maxBuffer: 8_000_000 });
+      const lines = `${result.stdout}\n${result.stderr}`.split("\n");
+      refusal = lines.find(line => isCredentialRefusal(line, pair, addresses, protocol)) || "";
+      return Boolean(refusal);
+    }, 90_000);
+    if (!refusal) throw new Error("credential refusal from the daemon was not observed");
+    this.info.annotations.push({ type: "labObservation", description: `${pair.name}: ${protocol} server refused daemon access after committed source change: ${refusal}` });
+  }
+
+  async assertSingleReceipt(pair: Pair, direction: "svn_to_git" | "git_to_svn", source: string): Promise<void> {
+    if (direction === "svn_to_git" ? !/^[0-9]+$/.test(source) : !/^[0-9a-f]{40}$/.test(source)) throw new Error("invalid receipt source");
+    const column = direction === "svn_to_git" ? "svn_rev" : "git_sha";
+    const count = (await this.sh("reposync", `sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM sync_records WHERE repo_id='${safe(pair.id, "repo id")}' AND direction='${direction}' AND ${column}='${source}';"`, "root")).trim();
+    if (count !== "1") throw new Error(`${pair.name} ${direction} source has ${count} receipts instead of one`);
+  }
+
+  async waitSvnPublication(pair: Pair, before: Snap, revision: string): Promise<Snap> {
+    await this.waitUntil(async () => {
+      const now = await this.snap(pair);
+      return now.svn === revision && now.git !== before.git && now.records !== before.records && now.watermark === revision;
+    });
+    return this.snap(pair);
+  }
+
   async triggerSvn(revision: string): Promise<void> {
     const response = await fetch(`${this.ui}/webhook/svn`, {
       method: "POST",
@@ -483,15 +528,16 @@ cat ${dir}/${rel}
     const password = user === "alice" ? "$ALICE_PASSWORD" : user === "bob" ? "$BOB_PASSWORD" : "$SVN_PASSWORD";
     const output = await this.observer(`
 set -eu
+export LC_ALL=C
 svn checkout --non-interactive --config-dir "$HOME/.svn" --username ${user} --password "${password}" \
   ${pair.svnUrl}/trunk ${dir}
 cd ${dir}
 ${script}
 svn commit --non-interactive --username ${user} --password "${password}" -m "lab ${pair.name}" .
-svn info --non-interactive --username ${user} --password "${password}" --show-item revision .
 `);
-    const lines = output.trim().split("\n");
-    return lines[lines.length - 1].trim();
+    const committed = output.match(/^Committed revision ([0-9]+)\.$/m);
+    if (!committed) throw new Error("SVN commit did not return a committed revision");
+    return committed[1];
   }
 
   async commitGit(pair: Pair, script: string, ref = "main"): Promise<string> {

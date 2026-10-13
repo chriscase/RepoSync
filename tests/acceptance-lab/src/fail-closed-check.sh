@@ -172,6 +172,39 @@ grep -q EXTRACT "$RECORD" && fail "prepare extracted a build graph after a faile
 grep -q RECORDED "$RECORD" && fail "prepare recorded images after a failed rust pull"
 [ ! -f "$ARTIFACT_ROOT/build-graph/image-identity.txt" ] || fail "failed pull still wrote rust image identity"
 
+# Exercise the real compiler identity function through prepare_images under if.
+# Each command can print apparently valid cached output and still fail.
+for fault in digest image_id empty_id rustc cargo; do
+  docker() {
+    case "$1" in
+      pull) return 0 ;;
+      image)
+        if [ "$5" = '{{.Id}}' ]; then
+          [ "$fault" = empty_id ] && return 0
+          printf 'sha256:%064d\n' 0
+          [ "$fault" != image_id ] || return 42
+        else
+          printf 'rust@sha256:%064d\n' 0
+          [ "$fault" != digest ] || return 42
+        fi ;;
+      run)
+        if [[ "$*" == *rustc* ]]; then
+          printf 'rustc %s (cached)\n' "$RUST_TOOLCHAIN"
+          [ "$fault" != rustc ] || return 42
+        else
+          printf 'cargo %s (cached)\n' "$RUST_TOOLCHAIN"
+          [ "$fault" != cargo ] || return 42
+        fi ;;
+    esac
+    return 0
+  }
+  reset_record
+  if prepare_images; then fail "$fault failure accepted by prepare_images"; fi
+  grep -q "BUILD ${REPOSYNC_IMAGE}" "$RECORD" && fail "$fault failure reached daemon build"
+  grep -q RECORDED "$RECORD" && fail "$fault failure recorded success"
+  [ ! -f "$ARTIFACT_ROOT/build-graph/image-identity.txt" ] || fail "$fault failure wrote identity receipt"
+done
+
 ACCEPTANCE_LAB_REMOVE_IMAGES=1
 docker() {
   printf 'DOCKER %s\n' "$*" >> "$RECORD"
@@ -252,4 +285,5 @@ console.log(`aggregate_exit ${process.argv[2]}`);
 console.log(`enforce_exit ${process.argv[3]}`);
 ' "$report_dir/report.json" "$agg_ec" "$enf_ec" || fail "false-pass report did not fail the suite"
 rm -rf "$ARTIFACT_ROOT" "$probe_root" "$json" "$regression_output" "$evidence" "$report_dir" "$engine_dir"
+node "$ROOT/tests/acceptance-lab/src/identity-check.mjs"
 printf 'fail-closed checks passed\n'
