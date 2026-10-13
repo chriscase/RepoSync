@@ -116,14 +116,18 @@ change must be committed before triggering; a server access-log refusal must
 identify the daemon IP and the target repository. Git's unauthenticated 401
 challenge is not a refusal receipt. SVN refusal must identify Alice attempting
 Bob's repository. Git-to-SVN recovery verifies both stored Git checkpoints against
-the pending source SHA; the SVN-read cursor need not equal the new SVN revision.
+the pending source SHA; the observer selects the UUID-scoped key when the schema
+contains `scope_uuid`, and the repository-ID key on the older schema. A missing
+UUID-scoped value never falls back to a legacy mirror. The SVN-read cursor need
+not equal the new SVN revision.
 Restoring the correct credential must publish the pending
 change with one source receipt, and a repeated trigger must be idle. The wrong
 Git-token case keeps the correct user's permission intact to detect stale token
 selection. Provisioning and observer reads still use the lab admin credentials;
 this does not qualify admin-token rotation or real-engine/live isolation.
 
-Local harness regressions (no Docker daemon or browser download required):
+Local harness regressions (Node, Bash and the SQLite CLI required; no Docker daemon
+or browser download required):
 
 ```sh
 npm --prefix tests/acceptance-lab ci --ignore-scripts

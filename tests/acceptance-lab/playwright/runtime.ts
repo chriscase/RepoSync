@@ -414,7 +414,19 @@ git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca
 `)).trim();
     const counts = (await this.sh("reposync", `
 set -eu
-sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.id}'; SELECT COUNT(*) FROM sync_records WHERE repo_id='${pair.id}'; SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_svn_rev_${pair.id}'), 'none'); SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_git_sha_${pair.id}'), 'none'); SELECT COALESCE(NULLIF(last_git_sha, ''), 'none') FROM repositories WHERE id='${pair.id}';"
+db=/var/lib/reposync/reposync.db
+scope_column=$(sqlite3 -readonly "$db" "SELECT COUNT(*) FROM pragma_table_info('repositories') WHERE name='scope_uuid';")
+case "$scope_column" in
+  0) checkpoint_scope='${safe(pair.id, "repo id")}' ;;
+  1)
+    checkpoint_scope=$(sqlite3 -readonly "$db" "SELECT scope_uuid FROM repositories WHERE id='${safe(pair.id, "repo id")}';")
+    printf '%s\\n' "$checkpoint_scope" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || { echo 'missing or invalid repository scope UUID' >&2; exit 1; }
+    ;;
+  *) echo 'cannot identify repository checkpoint schema' >&2; exit 1 ;;
+esac
+# New schemas use the durable scope UUID. Never borrow a legacy mirror when
+# that scoped checkpoint is absent; absence must fail recovery qualification.
+sqlite3 -readonly "$db" "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.id}'; SELECT COUNT(*) FROM sync_records WHERE repo_id='${pair.id}'; SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_svn_rev_${pair.id}'), 'none'); SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_git_sha_$checkpoint_scope'), 'none'); SELECT COALESCE(NULLIF(last_git_sha, ''), 'none') FROM repositories WHERE id='${pair.id}';"
 `, "root")).trim().split(/\s+/);
     return {
       svn,

@@ -1,3 +1,7 @@
+import {execFileSync} from 'node:child_process';
+import {mkdtempSync, rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {test, expect} from '@playwright/test';
 import {runCase} from '../../playwright/handlers.ts';
 import {isCredentialRefusal, Lab, type Pair} from '../../playwright/runtime.ts';
@@ -53,3 +57,38 @@ test('Git recovery requires both source checkpoints and accepts an unchanged SVN
   };
   expect(await Lab.prototype.waitGitPublication.call(fake as unknown as Lab, pair, before, source)).toEqual(restored);
 });
+
+
+for (const layout of ['legacy', 'scoped', 'missing-scoped', 'invalid-scope', 'missing-database']) {
+  test(`snapshot reads the authoritative ${layout} checkpoint without fallback`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lab-checkpoint-'));
+    const database = join(root, 'state.db');
+    const source = 'c'.repeat(40), stale = 'd'.repeat(40);
+    const scope = '11111111-2222-3333-4444-555555555555';
+    try {
+      if (layout !== 'missing-database') {
+        execFileSync('sqlite3', [database, `
+          CREATE TABLE repositories (id TEXT, last_git_sha TEXT${layout === 'legacy' ? '' : ', scope_uuid TEXT'});
+          CREATE TABLE kv_state (key TEXT, value TEXT);
+          CREATE TABLE commit_map (repo_id TEXT);
+          CREATE TABLE sync_records (repo_id TEXT);
+          INSERT INTO repositories VALUES ('isob', '${source}'${layout === 'legacy' ? '' : `, '${layout === 'invalid-scope' ? '' : scope}'`});
+          INSERT INTO kv_state VALUES ('last_git_sha_isob', '${layout === 'scoped' ? stale : source}');
+          ${layout === 'scoped' ? `INSERT INTO kv_state VALUES ('last_git_sha_${scope}', '${source}');` : ''}
+        `]);
+      }
+      let observation = 0;
+      const fake = {
+        observer: async () => ++observation === 1 ? '5' : source,
+        sh: async (_service: string, script: string) => execFileSync('sh', ['-c', script.replaceAll('/var/lib/reposync/reposync.db', database)], {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']}),
+      };
+      const read = Lab.prototype.snap.call(fake as unknown as Lab, pair);
+      if (layout === 'invalid-scope' || layout === 'missing-database') await expect(read).rejects.toThrow();
+      else {
+        const snapshot = await read;
+        expect(snapshot.gitWatermark).toBe(layout === 'missing-scoped' ? 'none' : source);
+        expect(snapshot.gitColumn).toBe(source);
+      }
+    } finally { rmSync(root, {recursive: true, force: true}); }
+  });
+}

@@ -48,6 +48,8 @@ jobs:
       - run: npm --prefix tests/acceptance-lab run typecheck
       - run: node tests/acceptance-lab/src/self-test.mjs
       - run: node tests/acceptance-lab/src/ci-gate.mjs self-check --scratch "${RUNNER_TEMP}/lab-artifacts/ci-gate-check"
+      - name: Install SQLite for observer regressions
+        run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
       - name: Verify isolation infrastructure failures are rejected
         run: npm --prefix tests/acceptance-lab exec -- playwright test -c tests/acceptance-lab/playwright.regression.config.ts --grep-invert 'annotated pass then fails'
       - name: Verify launcher and evidence failures are rejected
