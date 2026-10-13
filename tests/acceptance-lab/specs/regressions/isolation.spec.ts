@@ -7,6 +7,23 @@ import {runCase} from '../../playwright/handlers.ts';
 import {isCredentialRefusal, Lab, type Pair} from '../../playwright/runtime.ts';
 
 const pair: Pair={id:'isob',name:'isob',gitRepo:'lab/isob',svnUrl:'https://svn/svn/isob'};
+
+test('worker restart finds its existing pair without registering or importing again', async () => {
+  const row = {id: 'persisted', name: 'team', git_repo: 'lab/team', svn_url: 'https://svn:8443/svn/team'};
+  const waited: string[] = [];
+  const fake = {repos: async () => [row], waitImport: async (id: string) => {waited.push(id);}, sh: async () => {throw new Error('unexpected remote mutation');}};
+  expect(await Lab.prototype.createPair.call(fake as unknown as Lab, 'team')).toEqual({id: row.id, name: row.name, gitRepo: row.git_repo, svnUrl: row.svn_url});
+  expect(waited).toEqual(['persisted']);
+});
+
+for (const fault of ['ambiguous', 'different-remotes']) {
+  test(`worker restart rejects ${fault} existing pair`, async () => {
+    const row = {id: 'persisted', name: 'team', git_repo: 'lab/team', svn_url: 'https://svn:8443/svn/team'};
+    const fake = {repos: async () => fault === 'ambiguous' ? [row, {...row, id: 'other'}] : [{...row, svn_url: 'https://svn:8443/svn/foreign'}], waitImport: async () => {throw new Error('unexpected import wait');}, sh: async () => {throw new Error('unexpected remote mutation');}};
+    await expect(Lab.prototype.createPair.call(fake as unknown as Lab, 'team')).rejects.toThrow(/ambiguous|different remotes/);
+  });
+}
+
 test('denial receipt requires the daemon IP, target repository and refusal status',()=>{
   const ip=['172.18.0.8'];
   const git='router: completed GET /lab/isob.git/info/refs?service=git-upload-pack for 172.18.0.8:5000, 404 Not Found';

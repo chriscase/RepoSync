@@ -721,7 +721,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       const who = await lab.sh("gitea", "curl --silent --cacert /certs/ca.crt -H \"Authorization: token $GIT_TOKEN\" https://gitea:3000/api/v1/user");
       if (!who.includes(lab.gitUser)) throw new Error("seeded token did not authenticate");
       if (who.toLowerCase().includes("ghe") || who.includes("github.company")) throw new Error("provider identity looked like a company host");
-      lab.gap("Gitea API answered with a seeded token. This is not GitHub Enterprise qualification.");
+      lab.mark("PARTIAL", "Gitea API answered with a seeded token. GitHub Enterprise remains unqualified.", "UNQUALIFIED");
       return;
     }
     case "LAB_WEBHOOK_TAMPER": {

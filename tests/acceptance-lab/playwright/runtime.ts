@@ -228,6 +228,16 @@ export class Lab {
 
   async createPair(name: string): Promise<Pair> {
     const repo = safe(name, "repo");
+    // Playwright restarts its worker after a failed case. Find the persisted
+    // pair instead of registering a duplicate when the in-memory cache is gone.
+    const existing = (await this.repos()).filter(row => row.git_repo === `lab/${repo}` || row.name === repo);
+    if (existing.length > 1) throw new Error(`ambiguous existing lab pair ${repo}`);
+    if (existing.length === 1) {
+      const row = existing[0];
+      if (row.name !== repo || row.git_repo !== `lab/${repo}` || row.svn_url !== `https://svn:8443/svn/${repo}`) throw new Error(`existing lab pair ${repo} has different remotes`);
+      await this.waitImport(row.id);
+      return {id: row.id, name: repo, svnUrl: row.svn_url, gitRepo: row.git_repo};
+    }
     await this.sh("svn", `
 set -eu
 if [ ! -d /var/svn/${repo} ]; then

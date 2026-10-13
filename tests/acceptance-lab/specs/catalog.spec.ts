@@ -8,7 +8,8 @@ const selected = new Set(requested);
 if (selected.has("full")) selected.add("smoke");
 const operations = catalog.operations.filter((operation) => operation.disposition === "execute" && selected.has(operation.suite));
 
-test.describe.configure({ mode: "serial" });
+// One worker preserves order, while default mode continues after a failure.
+test.describe.configure({ mode: "default" });
 
 for (const operation of operations) {
   test(operation.id, { tag: `@${operation.suite}` }, async ({ page }, info) => {

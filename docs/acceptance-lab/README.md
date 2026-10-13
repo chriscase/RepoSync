@@ -85,7 +85,7 @@ GitHub registers `workflow_dispatch` from the workflow file on the default branc
 
 The daemon image is built in one job and loaded in the browser job (`ACCEPTANCE_LAB_SKIP_REPOSYNC_BUILD=1`). The entrypoint is passed as its own Docker build context. The root `.dockerignore` on main omits `tests/`, so a copy from the repository context cannot see that file. The build job uploads `acceptance-lab-build-graph-<run id>-<attempt>` after prepare. A successful image without that graph fails the job. The upload still runs when prepare fails after the base image identity was written. The real-engine job runs only for a dispatched `full` or `soak`, and it does not join the lab Compose network. Evidence upload is limited to the run's `publish/` directory after scrub and scan. A failed scan withholds the bundle.
 
-On that dispatched job, the workflow installs the harness Rust pin from `tests/acceptance-lab/pins.env` and removes a rustup toolchain named `stable` when one is present. `scripts/real-engine-scenario-suite.sh` is not edited. It selects `rustup run stable` when that name exists, and otherwise uses `cargo` on `PATH`. The suite passes `--locked`. This repository has no root `Cargo.lock`, and this harness does not add one, so a dispatched engine run can fail there. That failure stays a suite result. `workflow_dispatch` itself stays unavailable until this workflow file is on the default branch. Pull requests keep running smoke. Full and soak are manual dispatch inputs for after that registration. They are not installed on a schedule.
+On that dispatched job, the workflow installs the harness Rust pin from `tests/acceptance-lab/pins.env` and removes a rustup toolchain named `stable` when one is present. `scripts/real-engine-scenario-suite.sh` is not edited. It selects `rustup run stable` when that name exists, and otherwise uses `cargo` on `PATH`. The engine job waits for the daemon build and downloads its build graph from the same workflow attempt. `engine-lock.mjs` checks the candidate, immutable image ID and both recorded lockfile hashes before installing that lock into the disposable job checkout. It rejects a different existing root lock. No root lock is committed. The suite retains `--locked`, and a post-run comparison checks that the installed lock did not change. The engine artifact records the selected lock identity, scenario summary and scrubbed scenario logs. A missing summary or failed scan remains a failure. Full and soak are manual dispatch inputs; they are not installed on a schedule.
 
 When the browser job does not produce `identity.json`, the candidate report run id is `gha<github.run_id>a<github.run_attempt>`. It is not the literal `unknown`. Reports already uploaded from earlier attempts stay as they were. A smoke result does not qualify the full suite. `NOT_RUN`, `PARTIAL`, and `UNQUALIFIED` rows block a full PASS. Runtime fault, egress, zero-discovery, artifact, and cleanup controls are not claimed from the synthetic harness self-test.
 
@@ -141,3 +141,29 @@ The deliberately failing Playwright fixture inside the final command must exit
 nonzero; the enclosing regression must succeed only after aggregation and
 enforcement both reject it. These synthetic checks do not count as runtime
 qualification. Full, real-engine, old-install and live tiers remain unqualified.
+
+### Full-suite continuation and engine lock setup
+
+The browser catalog uses one worker in default execution mode. A failed case
+keeps its failed result, while later cases run after the worker restarts. Shared
+lab pairs are found by their persisted repository identity and matching remotes
+when the worker's in-memory cache is empty; ambiguous or mismatched pairs fail.
+Later cases can still encounter state left by an earlier failure, so those
+failures must be interpreted with their logs and prerequisite history.
+
+`LAB_GITEA_API_NOT_GHE` records `PARTIAL` / `UNQUALIFIED` after the synthetic
+Gitea API check. It does not throw solely because the fixture is not GHE.
+Authentication or provider-identity errors still fail. GitHub Enterprise and
+live qualification stay unqualified, and a PARTIAL row still blocks full PASS.
+
+Additional local checks (no Docker or browser download):
+
+```sh
+node tests/acceptance-lab/src/engine-lock-check.mjs
+node tests/acceptance-lab/src/continuation-check.mjs
+```
+
+The continuation check executes an instrumented copy of the shipped catalog
+registration: the GHE case stays unqualified, a real failure stays FAIL, and a
+later case must execute. The lock checks reject missing, wrong-candidate or
+modified graph data before installing a lock or writing a success receipt.

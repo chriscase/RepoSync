@@ -48,10 +48,13 @@ jobs:
       - run: npm --prefix tests/acceptance-lab run typecheck
       - run: node tests/acceptance-lab/src/self-test.mjs
       - run: node tests/acceptance-lab/src/ci-gate.mjs self-check --scratch "${RUNNER_TEMP}/lab-artifacts/ci-gate-check"
+      - run: node tests/acceptance-lab/src/engine-lock-check.mjs
       - name: Install SQLite for observer regressions
         run: command -v sqlite3 || (sudo apt-get update && sudo apt-get install -y sqlite3)
       - name: Verify isolation infrastructure failures are rejected
         run: npm --prefix tests/acceptance-lab exec -- playwright test -c tests/acceptance-lab/playwright.regression.config.ts --grep-invert 'annotated pass then fails'
+      - name: Verify unqualified cases and failures do not omit later cases
+        run: node tests/acceptance-lab/src/continuation-check.mjs
       - name: Verify launcher and evidence failures are rejected
         run: bash tests/acceptance-lab/src/fail-closed-check.sh
 
@@ -134,9 +137,12 @@ jobs:
 
   engine:
     name: Real-engine suite
+    needs: build-daemon
     if: github.event_name == 'workflow_dispatch' && (github.event.inputs.suite == 'full' || github.event.inputs.suite == 'soak')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -148,7 +154,8 @@ jobs:
       # The unowned suite selects `rustup run stable` when a toolchain named
       # stable exists, and otherwise uses cargo on PATH. This job installs the
       # harness pin and removes that stable name. It does not edit the suite
-      # and it does not add a root Cargo.lock. The suite still passes --locked.
+      # and it does not commit a root Cargo.lock. The disposable checkout uses
+      # the verified lock exported by this candidate's daemon build.
       - name: Prepare the harness compiler
         run: |
           . tests/acceptance-lab/pins.env
@@ -171,9 +178,20 @@ jobs:
           rustc --version
           cargo --version
           rustup toolchain list
-          if [ ! -f Cargo.lock ]; then
-            echo "root Cargo.lock is absent; the unowned real-engine suite passes --locked; this harness does not write a shared lock"
-          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: acceptance-lab-build-graph-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/engine-build-graph
+
+      - name: Install the candidate build lockfile
+        id: lock
+        run: |
+          node tests/acceptance-lab/src/engine-lock.mjs \
+            --graph "${RUNNER_TEMP}/engine-build-graph" \
+            --candidate "$(git rev-parse HEAD)" \
+            --destination Cargo.lock \
+            --receipt "${RUNNER_TEMP}/engine-lock-identity.json"
 
       - name: Run real-engine suite
         id: engine
@@ -194,12 +212,37 @@ jobs:
           cargo --version
           scripts/real-engine-scenario-suite.sh
 
+      - name: Verify the engine retained the selected lockfile
+        if: always() && steps.lock.outcome == 'success'
+        run: cmp "${RUNNER_TEMP}/engine-build-graph/Cargo.lock" Cargo.lock
+
       - name: Stage engine summary or the missing-artifact record
         if: always()
         run: node tests/acceptance-lab/src/ci-gate.mjs stage-engine --root artifacts/real-engine-scenarios --dest "${RUNNER_TEMP}/engine-upload"
 
-      - name: Upload engine summary
+      - name: Stage and scrub engine diagnostics
+        id: engine_publish
         if: always()
+        run: |
+          dest="${RUNNER_TEMP}/engine-upload"
+          mkdir -p "$dest/logs"
+          if [ -f "${RUNNER_TEMP}/engine-lock-identity.json" ]; then
+            cp "${RUNNER_TEMP}/engine-lock-identity.json" "$dest/lock-identity.json"
+          fi
+          for directory in artifacts/real-engine-scenarios/*; do
+            [ -d "$directory" ] || continue
+            mkdir -p "$dest/logs/$(basename "$directory")"
+            for file in "$directory"/*.log "$directory"/results.ndjson; do
+              [ -f "$file" ] || continue
+              cp "$file" "$dest/logs/$(basename "$directory")/"
+            done
+          done
+          printf '%s\n' fixture-only-svn-secret fixture-only-git-secret > "${RUNNER_TEMP}/engine-secrets.txt"
+          node tests/acceptance-lab/src/scrub.mjs --root "$dest" --secrets-file "${RUNNER_TEMP}/engine-secrets.txt"
+          node tests/acceptance-lab/src/scan.mjs --root "$dest" --secrets-file "${RUNNER_TEMP}/engine-secrets.txt" --out "$dest/scan.json"
+
+      - name: Upload engine summary
+        if: always() && steps.engine_publish.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: acceptance-lab-engine-${{ github.run_id }}-${{ github.run_attempt }}
