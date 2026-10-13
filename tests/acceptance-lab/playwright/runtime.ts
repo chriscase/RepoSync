@@ -48,6 +48,20 @@ export function assertCompletedPublishRefusal(result: {status: number; json: unk
   }
 }
 
+export function assertReplayEndpoints(endpoints: unknown, commits: string[]): void {
+  // The journal records handled_after once per cycle. One cycle can drain
+  // several commits; individual applied sync_records prove each publication.
+  if (!Array.isArray(endpoints) || (commits.length === 0 ? endpoints.length !== 0 : endpoints.at(-1) !== commits.at(-1))) {
+    throw new Error("publish journal does not end at the selected Git tip");
+  }
+  let previous = -1;
+  for (const endpoint of endpoints) {
+    const index = typeof endpoint === "string" ? commits.indexOf(endpoint) : -1;
+    if (index <= previous) throw new Error("publish journal contains an unknown, repeated or unordered cycle endpoint");
+    previous = index;
+  }
+}
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`acceptance lab env ${name} is not set`);

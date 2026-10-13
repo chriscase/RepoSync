@@ -3,11 +3,56 @@ import {mkdtempSync, mkdirSync, rmSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {test, expect} from "@playwright/test";
-import {assertCompletedPublishRefusal, Lab, loginError, type Pair, type Snap} from "../../playwright/runtime.ts";
+import {assertCompletedPublishRefusal, assertReplayEndpoints, Lab, loginError, type Pair, type Snap} from "../../playwright/runtime.ts";
 import {runCase} from "../../playwright/handlers.ts";
 
 const initial: Snap = {svn: "1", git: "a".repeat(40), maps: "1", records: "1", watermark: "1", gitWatermark: "a".repeat(40), gitColumn: "a".repeat(40)};
 const pair: Pair = {id: "fixture", name: "fixture", svnUrl: "https://unused/svn/fixture", gitRepo: "lab/fixture"};
+
+test("cycle endpoints allow a two-commit drain without substituting for per-commit receipts", () => {
+  const commits = ["b".repeat(40), "c".repeat(40)];
+  assertReplayEndpoints([commits[1]], commits);
+  assertReplayEndpoints(commits, commits);
+  assertReplayEndpoints([], []);
+  for (const endpoints of [[], [commits[0]], ["d".repeat(40), commits[1]], [commits[0], commits[0], commits[1]], [commits[1], commits[0], commits[1]], null]) {
+    expect(() => assertReplayEndpoints(endpoints, commits)).toThrow();
+  }
+});
+
+for (const fault of ["none", "missing-first-receipt", "wrong-intermediate-tree", "baseline-read-cursor"]) {
+  test(`actual publish accepts a per-cycle endpoint but still requires individual replay proof: ${fault}`, async () => {
+    const commits = ["b".repeat(40), "c".repeat(40)], branch = "pairlatepublish";
+    let seeded = false, writes = 0, published = false, disposition = "";
+    const child = {id: "child", parent_id: pair.id, svn_url: pair.svnUrl, git_repo: pair.gitRepo, svn_branch: `branches/${branch}`, git_branch: branch};
+    const journal = {state: "completed", parent_repo_id: pair.id, git_branch: branch, child_repo_id: "child", baseline_git_sha: initial.git,
+      baseline_svn_rev: 1, svn_copy_source_rev: 1, pinned_git_tip: commits[1], replayed_git_shas: [commits[1]]};
+    const plan = {parent_id: pair.id, git_tip: commits[1], verified_baseline: {git_sha: initial.git, svn_revision: 1}, pending_git: {count: 2},
+      proposed_svn_copy_source_revision: 1, existing_svn_target: {exists: false}, scheduler_active: false, published: false};
+    const fake: any = {
+      createPair: async () => pair,
+      snap: async (p: Pair) => p.id === "child" ? {...initial, svn: "4", git: commits[1], watermark: fault === "baseline-read-cursor" ? "2" : "4", gitWatermark: commits[1], gitColumn: commits[1]} : {...initial, svn: published ? "4" : "1"},
+      commitGit: async () => {if (!seeded) {seeded = true; return initial.git;} return commits[writes++];},
+      repos: async () => published ? [child] : [],
+      sqlRows: async (sql: string) => sql.includes("late_pair_publish_v1") ? published ? [{value: JSON.stringify(journal)}] : [] : commits.map((git_sha, i) => ({git_sha, svn_rev: i + 3})),
+      api: async (_m: string, _p: string, body: any) => {
+        if (body.dry_run) return {status: 200, json: plan};
+        if (published) return {status: 400, json: {error: `a branch pair with git_branch '${branch}' already exists`}};
+        published = true; return {status: 200, json: {...plan, published: true, scheduler_active: true}};
+      },
+      observer: async (script: string) => script.includes("ls-remote") ? commits[1] : '<path copyfrom-rev="1" copyfrom-path="/trunk"/>',
+      svnBytesOrMissing: async (_p: Pair, path: string, revision?: string) => fault === "wrong-intermediate-tree" && path === "child2.txt" && revision === "3" ? "child2\n" : null,
+      svnBytes: async (_p: Pair, path: string) => path === "child1.txt" ? "child1\n" : "child2\n",
+      svnBytesAtRevision: async () => "child1\n",
+      sh: async (_service: string, sql: string) => fault === "missing-first-receipt" && sql.includes(commits[0]) ? "0" : "1",
+      assertSingleReceipt: (p: Pair, d: "svn_to_git" | "git_to_svn", sha: string) => Lab.prototype.assertSingleReceipt.call(fake, p, d, sha),
+      expectNoWrite: async (p: Pair, action: () => Promise<void>) => {const before = await fake.snap(p); await action(); expect(await fake.snap(p)).toEqual(before);},
+      observation: () => {}, mark: (status: string) => {disposition = status;}, pass: () => {throw new Error("crash qualification must remain partial");},
+    };
+    const run = runCase(fake, {id: "PAIR-LATE-PUBLISH", title: "fixture", suite: "full"});
+    if (fault === "none" || fault === "baseline-read-cursor") {await run; expect(disposition).toBe("PARTIAL");}
+    else {await expect(run).rejects.toThrow(); expect(disposition).toBe("");}
+  });
+}
 
 test("completed-publish repeat accepts only the exact existing-child refusal", () => {
   const error = "a branch pair with git_branch 'feature' already exists";

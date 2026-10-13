@@ -109,8 +109,12 @@ audit row. `SVN-PROP-ONLY-REV` sets only `svn:eol-style` on an existing file.
 
 The remaining branch-admission cases seed real SVN-derived Git refs and verify
 preview pins, no-copy/no-child/no-journal behavior, copyfrom provenance, replay
-receipts, directional checkpoints, parent isolation and idle repeat. Late-pair
-publish remains PARTIAL unless crash and pre-final activation timing are also
+receipts, directional checkpoints, parent isolation and idle repeat.
+The publish journal records one handled Git endpoint per cycle; a cycle may
+drain both pending commits. Per-commit receipts and the intermediate SVN tree
+prove individual replay. SVN-read and outbound Git checkpoints remain separate;
+a verified Git-to-SVN echo does not have to advance the SVN-read cursor.
+Late-pair publish remains PARTIAL unless crash and pre-final activation timing are also
 exercised. LDAP group-role and logout use complete API bodies; observed role
 refusal does not implement group mapping, and logout does not qualify expiry or
 disabled-user revocation. The browser login asserts the actual 401 and the error

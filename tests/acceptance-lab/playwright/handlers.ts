@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, loginError, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
+import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, loginError, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
 
 function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
@@ -97,8 +97,8 @@ async function latePairCase(lab: Lab, op: LabOp): Promise<void> {
   const journal = await journals();
   expect(journal).toHaveLength(1);
   expect(journal[0]).toMatchObject({state: "completed", child_repo_id: child.id, baseline_git_sha: baseline.git,
-    baseline_svn_rev: Number(baseline.watermark), svn_copy_source_rev: Number(baseline.watermark), pinned_git_tip: tip,
-    replayed_git_shas: commits});
+    baseline_svn_rev: Number(baseline.watermark), svn_copy_source_rev: Number(baseline.watermark), pinned_git_tip: tip});
+  assertReplayEndpoints(journal[0].replayed_git_shas, commits);
   const copyLog = await lab.observer(`set -eu\nsvn log --xml -v --stop-on-copy --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${parent.svnUrl}/${source.svnBranch}\n`);
   expect(copyLog).toContain(`copyfrom-rev="${baseline.watermark}"`);
   expect(copyLog).toContain('copyfrom-path="/trunk"');
