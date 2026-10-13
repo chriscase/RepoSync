@@ -1009,7 +1009,7 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_st
       if (gitRevision === parkedGit.svn || (await lab.snap(right)).svn !== gitRevision) throw new Error("negative Git source revision was not committed");
       await lab.expectCredentialDenial(right, () => lab.triggerSvn(gitRevision), "git");
       const afterGitDeny = await lab.snap(right);
-      if (afterGitDeny.git !== parkedGit.git || afterGitDeny.records !== parkedGit.records || afterGitDeny.watermark !== parkedGit.watermark) throw new Error("wrong Git token advanced publication or checkpoint");
+      if (afterGitDeny.git !== parkedGit.git || afterGitDeny.records !== parkedGit.records || afterGitDeny.watermark !== parkedGit.watermark || afterGitDeny.gitWatermark !== parkedGit.gitWatermark || afterGitDeny.gitColumn !== parkedGit.gitColumn) throw new Error("wrong Git token advanced publication or checkpoint");
       // Keep gitisob authorized throughout: a stale cached right token would
       // publish, making this a test of credential selection as well as refusal.
       const restoredGit = await lab.api("POST", `/api/repos/${right.id}/credentials`, { svn_password: lab.bobPassword, git_token: rightGit.token });
@@ -1035,15 +1035,12 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT CASE WHEN (SELECT value FROM kv_st
         if (await lab.triggerGit(right.gitRepo) !== 200) throw new Error("negative SVN webhook failed");
       }, "svn");
       const afterSvnDeny = await lab.snap(right);
-      if (afterSvnDeny.svn !== parkedSvn.svn || afterSvnDeny.records !== parkedSvn.records || afterSvnDeny.watermark !== parkedSvn.watermark) throw new Error("wrong SVN credential advanced publication or checkpoint");
+      if (afterSvnDeny.svn !== parkedSvn.svn || afterSvnDeny.records !== parkedSvn.records || afterSvnDeny.watermark !== parkedSvn.watermark || afterSvnDeny.gitWatermark !== parkedSvn.gitWatermark || afterSvnDeny.gitColumn !== parkedSvn.gitColumn) throw new Error("wrong SVN credential advanced publication or checkpoint");
       const restoredUser = await lab.api("PUT", `/api/repos/${right.id}`, { svn_username: "bob" });
       const restoredSvn = await lab.api("POST", `/api/repos/${right.id}/credentials`, { svn_password: lab.bobPassword, git_token: rightGit.token });
       if (restoredUser.status !== 200 || restoredSvn.status !== 200) throw new Error("could not restore bob's SVN credential");
       if (await lab.triggerGit(right.gitRepo) !== 200) throw new Error("recovery SVN webhook failed");
-      await lab.waitUntil(async () => {
-        const now = await lab.snap(right);
-        return now.svn !== parkedSvn.svn && now.records !== parkedSvn.records && now.watermark === now.svn;
-      });
+      await lab.waitGitPublication(right, parkedSvn, pendingGit);
       if ((await lab.svnBytes(right, "svn-denial.txt")).trim() !== "svn-denial") throw new Error("recovered SVN publication lost the pending bytes");
       await lab.expectNoWrite(right, async () => {
         if (await lab.triggerGit(right.gitRepo) !== 200) throw new Error("repeat SVN webhook failed");

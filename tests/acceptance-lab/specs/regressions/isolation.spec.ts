@@ -1,6 +1,6 @@
 import {test, expect} from '@playwright/test';
 import {runCase} from '../../playwright/handlers.ts';
-import {isCredentialRefusal, type Lab, type Pair} from '../../playwright/runtime.ts';
+import {isCredentialRefusal, Lab, type Pair} from '../../playwright/runtime.ts';
 
 const pair: Pair={id:'isob',name:'isob',gitRepo:'lab/isob',svnUrl:'https://svn/svn/isob'};
 test('denial receipt requires the daemon IP, target repository and refusal status',()=>{
@@ -33,3 +33,23 @@ for(const failure of ['commit','unchanged-source','webhook','denial-observation'
     expect(observed).toBe(failure==='denial-observation');
   });
 }
+
+
+test('Git recovery requires both source checkpoints and accepts an unchanged SVN-read cursor', async () => {
+  const source = 'c'.repeat(40);
+  const before = {svn: '4', git: source, records: '3', maps: '0', watermark: '3', gitWatermark: 'a'.repeat(40), gitColumn: 'a'.repeat(40)};
+  const restored = {...before, svn: '5', records: '4', gitWatermark: source, gitColumn: source};
+  let current = {...before};
+  const fake = {
+    snap: async () => ({...current}),
+    waitUntil: async (read: () => Promise<boolean>) => {
+      for (const state of [before, {...restored, gitWatermark: before.gitWatermark}, {...restored, gitColumn: before.gitColumn}, {...restored, records: before.records}, {...restored, svn: before.svn}]) {
+        current = state;
+        expect(await read()).toBe(false);
+      }
+      current = restored;
+      expect(await read()).toBe(true);
+    },
+  };
+  expect(await Lab.prototype.waitGitPublication.call(fake as unknown as Lab, pair, before, source)).toEqual(restored);
+});

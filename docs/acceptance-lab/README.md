@@ -115,7 +115,9 @@ SVN users. Both repositories exercise both sync directions. The negative source
 change must be committed before triggering; a server access-log refusal must
 identify the daemon IP and the target repository. Git's unauthenticated 401
 challenge is not a refusal receipt. SVN refusal must identify Alice attempting
-Bob's repository. Restoring the correct credential must publish the pending
+Bob's repository. Git-to-SVN recovery verifies both stored Git checkpoints against
+the pending source SHA; the SVN-read cursor need not equal the new SVN revision.
+Restoring the correct credential must publish the pending
 change with one source receipt, and a repeated trigger must be idle. The wrong
 Git-token case keeps the correct user's permission intact to detect stale token
 selection. Provisioning and observer reads still use the lab admin credentials;

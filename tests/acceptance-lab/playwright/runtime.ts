@@ -22,7 +22,7 @@ export type Pair = {
   gitRepo: string;
 };
 
-type Snap = { svn: string; git: string; maps: string; records: string; watermark: string };
+type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
 
 function required(name: string): string {
   const value = process.env[name];
@@ -414,7 +414,7 @@ git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca
 `)).trim();
     const counts = (await this.sh("reposync", `
 set -eu
-sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.id}'; SELECT COUNT(*) FROM sync_records WHERE repo_id='${pair.id}'; SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_svn_rev_${pair.id}'), 'none');"
+sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.id}'; SELECT COUNT(*) FROM sync_records WHERE repo_id='${pair.id}'; SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_svn_rev_${pair.id}'), 'none'); SELECT COALESCE((SELECT value FROM kv_state WHERE key='last_git_sha_${pair.id}'), 'none'); SELECT COALESCE(NULLIF(last_git_sha, ''), 'none') FROM repositories WHERE id='${pair.id}';"
 `, "root")).trim().split(/\s+/);
     return {
       svn,
@@ -422,6 +422,8 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE rep
       maps: counts[0] || "0",
       records: counts[1] || "0",
       watermark: counts[2] || "none",
+      gitWatermark: counts[3] || "none",
+      gitColumn: counts[4] || "none",
     };
   }
 
@@ -450,7 +452,7 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE rep
   async assertSingleReceipt(pair: Pair, direction: "svn_to_git" | "git_to_svn", source: string): Promise<void> {
     if (direction === "svn_to_git" ? !/^[0-9]+$/.test(source) : !/^[0-9a-f]{40}$/.test(source)) throw new Error("invalid receipt source");
     const column = direction === "svn_to_git" ? "svn_rev" : "git_sha";
-    const count = (await this.sh("reposync", `sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM sync_records WHERE repo_id='${safe(pair.id, "repo id")}' AND direction='${direction}' AND ${column}='${source}';"`, "root")).trim();
+    const count = (await this.sh("reposync", `sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM sync_records WHERE repo_id='${safe(pair.id, "repo id")}' AND direction='${direction}' AND status='applied' AND ${column}='${source}';"`, "root")).trim();
     if (count !== "1") throw new Error(`${pair.name} ${direction} source has ${count} receipts instead of one`);
   }
 
@@ -459,6 +461,21 @@ sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM commit_map WHERE rep
       const now = await this.snap(pair);
       return now.svn === revision && now.git !== before.git && now.records !== before.records && now.watermark === revision;
     });
+    return this.snap(pair);
+  }
+
+  async waitGitPublication(pair: Pair, before: Snap, source: string): Promise<Snap> {
+    // Git-to-SVN confirmation advances both Git checkpoints, not the SVN-read
+    // cursor (db/svn_commit_operations.rs::finalize_tx).
+    try {
+      await this.waitUntil(async () => {
+        const now = await this.snap(pair);
+        return now.svn !== before.svn && now.records !== before.records
+          && now.gitWatermark === source && now.gitColumn === source;
+      });
+    } catch (error) {
+      throw new Error(`Git recovery checkpoint not observed: before=${JSON.stringify(before)} after=${JSON.stringify(await this.snap(pair))}; ${error}`);
+    }
     return this.snap(pair);
   }
 
@@ -613,7 +630,9 @@ git rev-parse HEAD
         && now.git === before.git
         && now.maps === before.maps
         && now.records === before.records
-        && now.watermark === before.watermark;
+        && now.watermark === before.watermark
+        && now.gitWatermark === before.gitWatermark
+        && now.gitColumn === before.gitColumn;
       return same && Date.now() - start > 12_000;
     }, { timeout: 25_000, intervals: [1000] }).toBe(true);
   }
