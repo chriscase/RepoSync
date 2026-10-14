@@ -49,7 +49,7 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     // 3. Database
     let db_path = data_dir.join("personal.db");
     if db_path.exists() {
-        match Database::new(&db_path) {
+        match Database::open_existing_read_only(&db_path) {
             Ok(db) => {
                 let schema_ok = db.get_watermark("svn_rev").is_ok();
                 if schema_ok {
@@ -118,7 +118,7 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
 
     // 7. Watermark consistency
     let db_path = data_dir.join("personal.db");
-    if let Ok(db) = Database::new(&db_path) {
+    if let Ok(db) = Database::open_existing_read_only(&db_path) {
         let svn_wm = db.get_watermark("svn_rev").ok().flatten();
         let git_wm = db.get_watermark("git_sha").ok().flatten();
 
