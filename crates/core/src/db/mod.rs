@@ -18,6 +18,7 @@ pub mod queries;
 pub mod repo_scope_identity;
 pub mod schema;
 pub(crate) mod startup;
+mod startup_rollback;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
 pub mod watermark_recovery;

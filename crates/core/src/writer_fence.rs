@@ -121,6 +121,7 @@ impl RecoveryWriterFence {
             lock.require_current(data_dir)?;
             db.immediate_transaction(|tx| {
                 let saved = db.opened_file()?;
+                saved.require_unaliased_owner(tx)?;
                 let actual = crate::db::opened_file::OpenedDatabaseFile::attest(
                     tx,
                     &saved.path,
@@ -269,15 +270,35 @@ fn native_lease_matches(captured: &WriterLease, current: &WriterLease) -> bool {
     }
 }
 
+#[cfg(test)]
 fn local_host_id() -> String {
+    ordinary_host_id().expect("test process requires a stable native hostname")
+}
+
+fn ordinary_host_id() -> Result<String, DatabaseError> {
     if let Ok(host) = std::env::var("REPOSYNC_FENCE_HOST") {
         if !host.is_empty() {
-            return host;
+            return Ok(host);
         }
     }
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| format!("host-{}", std::process::id()))
+    let mut name = [0u8; 256];
+    // SAFETY: gethostname writes at most this buffer's length; a missing
+    // terminator or invalid text remains unknown instead of a PID fallback.
+    let result = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    if result == 0 {
+        if let Some(end) = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .filter(|end| *end != 0)
+        {
+            if let Ok(host) = std::str::from_utf8(&name[..end]) {
+                return Ok(host.to_owned());
+            }
+        }
+    }
+    Err(DatabaseError::WriterFenced(
+        "ordinary startup requires a stable native hostname".into(),
+    ))
 }
 
 fn parse_lease(raw: &str) -> Result<WriterLease, DatabaseError> {
@@ -434,7 +455,7 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 fn holder_is_local(lease: &WriterLease) -> bool {
-    lease.holder_host == local_host_id()
+    ordinary_host_id().is_ok_and(|host| lease.holder_host == host)
 }
 
 /// Whether another claimant must refuse because this holder still owns the lease.
@@ -469,7 +490,7 @@ fn in_use_message(lease: &WriterLease) -> String {
 
 /// Claim or renew the durable writer lease after the local flock is held.
 pub fn claim(db: &Database, data_dir: &Path) -> Result<WriterFenceGuard, DatabaseError> {
-    claim_with_identity(db, data_dir, &local_host_id(), std::process::id())
+    claim_with_identity(db, data_dir, &ordinary_host_id()?, std::process::id())
 }
 
 /// Startup checks this through a read-only connection and again under its
@@ -510,11 +531,12 @@ pub(crate) fn claim_for_ordinary_startup(
     lock: &crate::data_dir::LockGuard,
     data_dir: &Path,
 ) -> Result<OrdinaryStartupClaim, DatabaseError> {
-    let host = local_host_id();
+    let host = ordinary_host_id()?;
     let pid = std::process::id();
     let (epoch, lease, native) = db.immediate_transaction(|tx| {
         lock.require_current(data_dir)?;
         let saved = db.opened_file()?;
+        saved.require_unaliased_owner(tx)?;
         let actual = crate::db::opened_file::OpenedDatabaseFile::attest(
             tx,
             &saved.path,

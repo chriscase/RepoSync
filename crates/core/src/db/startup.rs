@@ -63,9 +63,18 @@ impl Database {
     /// Open existing storage for inspection without creating it, checkpointing,
     /// migrating, claiming ownership or seeding credentials.
     pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
-        let path = path.as_ref();
+        let canonical = path.as_ref().canonicalize()?;
+        let path = canonical.as_path();
+        if super::startup_rollback::has_journal(path)? || std::fs::metadata(path)?.len() == 0 {
+            return Err(DatabaseError::WriterFenced(
+                "read-only inspection refuses pending or empty rollback storage".into(),
+            ));
+        }
         let prior = super::OpenedDatabaseFile::capture(path);
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
         conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -98,30 +107,63 @@ impl Database {
         let lock = crate::data_dir::acquire(&data_dir)?;
         lock.require_current(&data_dir)?;
         let path = data_dir.join(file);
-        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-            if !metadata.is_file() {
-                return Err(DatabaseError::Other(
-                    "ordinary startup requires a regular database file".into(),
-                ));
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                use std::os::unix::fs::MetadataExt;
+                if !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || metadata.uid() != rustix::process::geteuid().as_raw()
+                {
+                    return Err(DatabaseError::Other(
+                        "ordinary startup requires an owned singly linked regular database file"
+                            .into(),
+                    ));
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        if path.try_exists()? {
-            let probe = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            probe.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-            probe.execute_batch("BEGIN;")?;
-            require_quiet(&probe)?;
+        let preimage = if super::startup_rollback::has_journal(&path)? {
+            // SQLite may unlink an empty main file's journal even on a
+            // read-only connection. Inspect raw frozen inputs first.
+            Some(super::startup_rollback::require_quiet_preimage(&path)?)
+        } else {
+            None
+        };
+        if path.try_exists()? && std::fs::metadata(&path)?.len() != 0 && preimage.is_none() {
+            let probe = (|| {
+                let probe = Connection::open_with_flags(
+                    &path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )?;
+                probe.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+                probe.execute_batch("BEGIN;")?;
+                require_quiet(&probe).map(|_| ())
+            })();
+            probe?;
         }
 
         // Opening this connection cannot checkpoint on error or owner Drop.
         // Existing evidence is rechecked under the SQLite writer reservation.
         let prior = super::OpenedDatabaseFile::capture(&path);
-        let conn = Connection::open(&path)?;
+        if let Some(preimage) = &preimage {
+            preimage.require_current()?;
+        } else if super::startup_rollback::has_journal(&path)? {
+            return Err(DatabaseError::WriterFenced(
+                "rollback journal appeared after startup inspection".into(),
+            ));
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         let opened_file =
             super::OpenedDatabaseFile::attest(&conn, &path, prior).ok_or_else(|| {
                 DatabaseError::Other("ordinary startup database identity changed".into())
             })?;
+        opened_file.require_unaliased_owner(&conn)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         let mut db = Self {
             conn: std::sync::Mutex::new(conn),
             opened_file: Some(opened_file),

@@ -377,3 +377,28 @@ fn personal_status_reports_existing_database_query_failures_without_checkpointin
         assert!(db.get_state("encryption_key").unwrap().is_none());
     }
 }
+
+#[test]
+fn personal_doctor_labels_failed_watermark_reads_without_checkpointing() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let path = data.join("personal.db");
+    let db = Database::new(&path).unwrap();
+    db.initialize().unwrap();
+    db.conn()
+        .execute_batch("PRAGMA wal_autocheckpoint=0; DROP TABLE watermarks;")
+        .unwrap();
+    let main = std::fs::read(&path).unwrap();
+    let wal_path = path.with_extension("db-wal");
+    let wal = std::fs::read(&wal_path).unwrap();
+    let config = config(root.path(), &data);
+    let mut process = spawn(root.path(), &config, &["doctor"]);
+    assert!(wait(&mut process, root.path()).success());
+    let stdout = std::fs::read_to_string(root.path().join("stdout")).unwrap();
+    assert!(stdout.contains("Read failed"), "{stdout}");
+    assert!(!stdout.contains("Watermarks        Not set"), "{stdout}");
+    assert_eq!(std::fs::read(&path).unwrap(), main);
+    assert_eq!(std::fs::read(&wal_path).unwrap(), wal);
+    assert!(!data.join("reposync.lock").exists());
+}
