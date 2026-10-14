@@ -736,11 +736,64 @@ sqlite3 -readonly "$db" "SELECT COUNT(*) FROM commit_map WHERE repo_id='${pair.i
     this.info.annotations.push({ type: "labObservation", description: `${pair.name}: ${protocol} server refused daemon access after committed source change: ${refusal}` });
   }
 
-  async assertSingleReceipt(pair: Pair, direction: "svn_to_git" | "git_to_svn", source: string): Promise<void> {
+  async appliedReceiptCount(pair: Pair, direction: "svn_to_git" | "git_to_svn", source: string): Promise<string> {
     if (direction === "svn_to_git" ? !/^[0-9]+$/.test(source) : !/^[0-9a-f]{40}$/.test(source)) throw new Error("invalid receipt source");
     const column = direction === "svn_to_git" ? "svn_rev" : "git_sha";
     const count = (await this.sh("reposync", `sqlite3 /var/lib/reposync/reposync.db "SELECT COUNT(*) FROM sync_records WHERE repo_id='${safe(pair.id, "repo id")}' AND direction='${direction}' AND status='applied' AND ${column}='${source}';"`, "root")).trim();
+    if (!/^[0-9]+$/.test(count)) throw new Error(`${pair.name} ${direction} receipt count is invalid`);
+    return count;
+  }
+
+  async assertSingleReceipt(pair: Pair, direction: "svn_to_git" | "git_to_svn", source: string): Promise<void> {
+    // Call through the prototype so a harness fake that only supplies sh still works.
+    const count = await Lab.prototype.appliedReceiptCount.call(this, pair, direction, source);
     if (count !== "1") throw new Error(`${pair.name} ${direction} source has ${count} receipts instead of one`);
+  }
+
+  async gitCommitsSince(pair: Pair, ancestor: string): Promise<string[]> {
+    if (!/^[0-9a-f]{40}$/.test(ancestor)) throw new Error("invalid ancestor");
+    const branch = safe(pair.gitBranch || "main", "ref");
+    const dir = `/work/read-${safe(pair.id, "repo id")}`;
+    const output = await this.observer(`
+set -eu
+auth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')
+if [ ! -d ${dir}/.git ]; then
+  git -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt \
+    clone --branch ${branch} https://gitea:3000/${pair.gitRepo}.git ${dir}
+fi
+git -C ${dir} -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt fetch origin ${branch}
+git -C ${dir} rev-list --reverse ${ancestor}..FETCH_HEAD
+`);
+    const commits = output.trim().split("\n").filter(line => line.length > 0);
+    if (commits.some(sha => !/^[0-9a-f]{40}$/.test(sha))) throw new Error("invalid commit list");
+    return commits;
+  }
+
+  async waitOutboundGitHistory(pair: Pair, before: Snap, commits: string[], path: string, bytes: string): Promise<Snap> {
+    // Finish every intended Git-to-SVN receipt, the selected tip, its bytes,
+    // and both outbound Git checkpoints before any repeat-idleness baseline.
+    // An earlier SVN revision is still the original publication. watermark is
+    // the inbound SVN-read cursor and is not one of those checkpoints.
+    if (commits.length === 0 || new Set(commits).size !== commits.length || commits.some(sha => !/^[0-9a-f]{40}$/.test(sha))) {
+      throw new Error("intended Git commits are missing");
+    }
+    const tip = commits[commits.length - 1];
+    const published = async () => {
+      const now = await this.snap(pair);
+      if (now.git !== tip || now.gitWatermark !== tip || now.gitColumn !== tip) return false;
+      if (now.svn === before.svn || now.records === before.records) return false;
+      if (await this.svnBytesOrMissing(pair, path) !== bytes) return false;
+      for (const sha of commits) {
+        if (await Lab.prototype.appliedReceiptCount.call(this, pair, "git_to_svn", sha) !== "1") return false;
+      }
+      return true;
+    };
+    try {
+      await this.waitUntil(published);
+    } catch (error) {
+      throw new Error(`outbound Git history not settled before the repeat baseline: tip=${tip} before=${JSON.stringify(before)} after=${JSON.stringify(await this.snap(pair))}; ${error}`);
+    }
+    return this.snap(pair);
   }
 
   async waitSvnPublication(pair: Pair, before: Snap, revision: string): Promise<Snap> {

@@ -480,6 +480,14 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
           await lab.commitGit(pair, "printf '1\\n' > squash.txt\ngit add squash.txt\ngit commit -m one\nprintf '2\\n' > squash.txt\ngit commit -am two\ngit reset --soft HEAD~2\ngit commit -m squashed\n");
         } else if (op.id === "GIT-REVERT-NEW") {
           await lab.commitGit(pair, "printf 'v1\\n' > revert.txt\ngit add revert.txt\ngit commit -m v1\nprintf 'v2\\n' > revert.txt\ngit commit -am v2\ngit revert --no-edit HEAD\n");
+          const status = await lab.triggerGit(pair.gitRepo, false);
+          if (status !== 200) throw new Error(`revert webhook ${status}`);
+          const commits = await lab.gitCommitsSince(pair, before.git);
+          if (commits.length !== 3) throw new Error(`revert history has ${commits.length} commits after ${before.git}`);
+          await lab.waitOutboundGitHistory(pair, before, commits, "revert.txt", "v1\n");
+          await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
+          lab.pass("three revert commits reached v1 bytes and the repeat was idle");
+          return;
         } else {
           await lab.commitGit(pair, "printf 'fetch\\n' > fetch.txt\ngit add fetch.txt\ngit commit -m fetch\n");
         }
@@ -1381,6 +1389,25 @@ fail_log() {
   curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/repos/lab/pround/pulls?state=closed&base=main" | tr ',' '\n' | grep -E '"(merged|html_url|sha|ref|state|merge_commit_sha|number)"' | head -n 40 >&2 || true
   exit 1
 }
+# Gitea 1.22.6 answers mustAllowPulls with 404 while the repo is still empty.
+# The personal poll uses this exact list. Wait for 200 before the daemon starts.
+pull_code=""
+i=0
+while [ "$i" -lt 30 ]; do
+  pull_code=$(curl --silent --show-error --output /tmp/pulls-ready.out --write-out '%{http_code}' --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/repos/lab/pround/pulls?state=closed&base=main&per_page=100" || true)
+  if [ "$pull_code" = "200" ]; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+if [ "$pull_code" != "200" ]; then
+  echo "merged pull list not ready: HTTP $pull_code" >&2
+  cat /tmp/pulls-ready.out >&2 || true
+  exit 1
+fi
+main_sha=$(git -c http.sslCAInfo=/certs/ca.crt -c http.extraHeader="Authorization: Basic $(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')" ls-remote https://gitea:3000/lab/pround.git refs/heads/main | awk '{print $1}')
+printf '%s\n' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "origin/main is not a commit: $main_sha" >&2; exit 1; }
 start_personal
 i=0
 while [ "$i" -lt 40 ]; do
@@ -1400,6 +1427,12 @@ if [ "$after_beta" -le ${importRecords} ]; then
 fi
 cd "$root/data/git-repo"
 git checkout main
+local_main=$(git rev-parse HEAD)
+remote_main=$(git -c http.sslCAInfo=/certs/ca.crt -c http.extraHeader="Authorization: Basic $(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')" ls-remote https://gitea:3000/lab/pround.git refs/heads/main | awk '{print $1}')
+if [ -z "$remote_main" ] || [ "$local_main" != "$remote_main" ]; then
+  echo "origin/main is not the imported tip: local $local_main remote $remote_main" >&2
+  fail_log
+fi
 git checkout -b gamma
 git config user.name "Alice Lab"
 git config user.email "alice@lab.invalid"
@@ -1414,10 +1447,26 @@ start_personal
 pr=$(curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"title":"gamma","head":"gamma","base":"main"}' https://gitea:3000/api/v1/repos/lab/pround/pulls)
 num=$(printf '%s' "$pr" | grep -o '"number":[[:space:]]*[0-9][0-9]*' | head -n 1 | grep -o '[0-9][0-9]*$')
 if [ -z "$num" ]; then echo "pull request was not created: $pr" >&2; fail_log; fi
-merge_code=$(curl --silent --show-error --output /tmp/merge.out --write-out '%{http_code}' --cacert /certs/ca.crt -X POST -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"Do":"merge","MergeMessageField":"gamma"}' "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num/merge" || true)
-if [ "$merge_code" != "200" ] && [ "$merge_code" != "201" ]; then
-  merge_code=$(curl --silent --show-error --output /tmp/merge.out --write-out '%{http_code}' --cacert /certs/ca.crt -X PUT -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"merge_method":"merge"}' "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num/merge" || true)
+# MergePullRequest returns 405 until the checker marks the pull mergeable.
+# Read that flag, then POST once. A second method is not a retry of the write.
+i=0
+mergeable=0
+pr_body=""
+while [ "$i" -lt 30 ]; do
+  pr_body=$(curl --silent --show-error --cacert /certs/ca.crt -H "Authorization: token $GIT_TOKEN" "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num" || true)
+  if printf '%s' "$pr_body" | grep -Eq '"mergeable"[[:space:]]*:[[:space:]]*true'; then
+    mergeable=1
+    break
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+if [ "$mergeable" != 1 ]; then
+  echo "pull request $num is not mergeable" >&2
+  printf '%s\n' "$pr_body" >&2
+  fail_log
 fi
+merge_code=$(curl --silent --show-error --output /tmp/merge.out --write-out '%{http_code}' --cacert /certs/ca.crt -X POST -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -d '{"Do":"merge","MergeMessageField":"gamma"}' "https://gitea:3000/api/v1/repos/lab/pround/pulls/$num/merge" || true)
 if [ "$merge_code" != "200" ] && [ "$merge_code" != "201" ]; then
   echo "merge status $merge_code" >&2
   cat /tmp/merge.out >&2 || true

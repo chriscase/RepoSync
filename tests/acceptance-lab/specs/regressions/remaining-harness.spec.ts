@@ -211,6 +211,58 @@ for (const fault of ["none", "login", "fresh", "logout", "reuse"]) {
   });
 }
 
+for (const fault of ["delayed", "duplicate"]) {
+  test(`revert idle baseline waits for every outbound receipt: ${fault}`, async () => {
+    const ancestor = "a".repeat(40);
+    const commits = [1, 2, 3].map(n => n.toString(16).repeat(40));
+    const tip = commits[2];
+    const beforeSnap: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
+    let phase = "before";
+    let triggers = 0;
+    let passed = false;
+    const snap = (): Snap => {
+      if (phase === "before") return {...beforeSnap};
+      if (phase === "duplicated") return {svn: "9", git: tip, maps: "1", records: "9", watermark: "1", gitWatermark: tip, gitColumn: tip};
+      if (phase === "first-svn") return {svn: "2", git: tip, maps: "1", records: "2", watermark: "1", gitWatermark: ancestor, gitColumn: ancestor};
+      return {svn: "4", git: tip, maps: "1", records: "4", watermark: "1", gitWatermark: tip, gitColumn: tip};
+    };
+    const fake: any = {
+      createPair: async () => pair,
+      snap: async () => snap(),
+      commitGit: async () => {phase = fault === "duplicate" ? "settled" : "first-svn"; return tip;},
+      gitCommitsSince: async (_p: Pair, ancestorSha: string) => {expect(ancestorSha).toBe(ancestor); return commits;},
+      triggerGit: async () => {triggers++; if (fault === "duplicate" && triggers > 1) phase = "duplicated"; return 200;},
+      svnBytesOrMissing: async () => phase === "first-svn" ? "v2\n" : "v1\n",
+      sh: async (_service: string, sql: string) => {
+        const sha = commits.find(item => sql.includes(item));
+        if (!sha) return "0";
+        if (phase === "settled" || phase === "duplicated") return "1";
+        if (phase === "tip-without-receipts") return sha === tip ? "1" : "0";
+        return sha === commits[0] ? "1" : "0";
+      },
+      waitUntil: async (read: () => Promise<boolean>) => {
+        const stages = fault === "duplicate" ? ["settled"] : ["first-svn", "tip-without-receipts", "settled"];
+        for (const stage of stages) {
+          phase = stage;
+          expect(await read()).toBe(stage === "settled");
+        }
+      },
+      expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {
+        expect(phase).toBe("settled");
+        const baseline = snap();
+        await action();
+        expect(snap()).toEqual(baseline);
+      },
+      pass: () => {passed = true;},
+    };
+    fake.appliedReceiptCount = (...args: unknown[]) => Lab.prototype.appliedReceiptCount.call(fake, ...(args as [Pair, "git_to_svn", string]));
+    fake.waitOutboundGitHistory = (...args: unknown[]) => Lab.prototype.waitOutboundGitHistory.call(fake, ...(args as [Pair, Snap, string[], string, string]));
+    const run = runCase(fake, {id: "GIT-REVERT-NEW", title: "fixture", suite: "full"});
+    if (fault === "delayed") {await run; expect(passed).toBe(true); expect(triggers).toBe(2);}
+    else {await expect(run).rejects.toThrow(); expect(passed).toBe(false);}
+  });
+}
+
 test("login error locator excludes the LDAP domain and requires an actual form error", async ({page}) => {
   await page.setContent(`<div><span>(lab.invalid)</span></div><form><div class="border-red-700"><div><svg></svg><span>invalid username or password</span></div></div><input name="username"><input type="password"><button>Sign in</button></form>`);
   await expect(page.getByText(/invalid|failed|unauthorized|incorrect/i)).toHaveCount(2);
