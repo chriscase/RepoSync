@@ -709,7 +709,7 @@ export LC_ALL=C
 data=$(mktemp); err=$(mktemp)
 trap 'rm -f "$data" "$err"' EXIT
 if svn cat ${revision === undefined ? "" : `-r ${revision}`} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" \
-  ${svnTarget(pair)}/${rel} >"$data" 2>"$err"; then
+  ${svnTarget(pair)}/${rel}${revision === undefined ? "" : `@${revision}`} >"$data" 2>"$err"; then
   printf 'LAB_READ_PRESENT\\n'; cat "$data"
 elif grep -q "W160013:.*path not found" "$err" && ! grep -E '(E|W)[0-9]{6}' "$err" | grep -Ev '(W160013|E200009)' >/dev/null; then
   printf 'LAB_READ_ABSENT\\n'
@@ -769,7 +769,7 @@ svn commit --non-interactive --username ${user} --password "${password}" -m "lab
 
   async svnBytesAtRevision(pair: Pair, path: string, revision: string): Promise<string> {
     if (!/^[0-9]+$/.test(revision)) throw new Error("invalid SVN read revision");
-    return this.observer(`set -eu\nsvn cat -r ${revision} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${svnTarget(pair)}/${safeRelativePath(path)}\n`);
+    return this.observer(`set -eu\nsvn cat -r ${revision} --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${svnTarget(pair)}/${safeRelativePath(path)}@${revision}\n`);
   }
 
   async commitGit(pair: Pair, script: string, ref = pair.gitBranch || "main", publish = true): Promise<string> {

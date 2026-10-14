@@ -112,7 +112,10 @@ preview pins, no-copy/no-child/no-journal behavior, copyfrom provenance, replay
 receipts, directional checkpoints, parent isolation and idle repeat.
 The publish journal records one handled Git endpoint per cycle; a cycle may
 drain both pending commits. Per-commit receipts and the intermediate SVN tree
-prove individual replay. SVN-read and outbound Git checkpoints remain separate;
+prove individual replay. Historical SVN reads pin both the operative and peg
+revision so absence and bytes come from that path at that revision, including
+after deletion or recreation at HEAD. Observer errors remain fatal.
+SVN-read and outbound Git checkpoints remain separate;
 a verified Git-to-SVN echo does not have to advance the SVN-read cursor.
 Late-pair publish remains PARTIAL unless crash and pre-final activation timing are also
 exercised. LDAP group-role and logout use complete API bodies; observed role

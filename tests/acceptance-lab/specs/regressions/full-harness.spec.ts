@@ -101,6 +101,49 @@ test("real SVN/Git observers distinguish delayed paths, bytes and broken remotes
   } finally {rmSync(f.root, {recursive: true, force: true});}
 });
 
+test("historical SVN reads distinguish a path before birth from its later bytes", async () => {
+  const f = vcsFixture();
+  try {
+    const revision = await Lab.prototype.commitSvn.call(f.fake as unknown as Lab, f.pair,
+      "printf 'first\\n' > first.txt\nsvn add first.txt\n");
+    const later = await Lab.prototype.commitSvn.call(f.fake as unknown as Lab, f.pair,
+      "printf 'second\\n' > second.txt\nsvn add second.txt\n");
+    expect(await Lab.prototype.svnBytesOrMissing.call(f.fake as unknown as Lab, f.pair, "second.txt", revision)).toBeNull();
+    expect(await Lab.prototype.svnBytesOrMissing.call(f.fake as unknown as Lab, f.pair, "first.txt", revision)).toBe("first\n");
+    expect(await Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, f.pair, "first.txt", revision)).toBe("first\n");
+    expect(await Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, f.pair, "second.txt", later)).toBe("second\n");
+    await expect(Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, f.pair, "second.txt", revision)).rejects.toThrow();
+  } finally {rmSync(f.root, {recursive: true, force: true});}
+});
+
+test("historical SVN reads survive deletion and recreation at HEAD", async () => {
+  const f = vcsFixture();
+  try {
+    const old = await Lab.prototype.commitSvn.call(f.fake as unknown as Lab, f.pair,
+      "printf 'original\\n' > replaced.txt\nsvn add replaced.txt\n");
+    await Lab.prototype.commitSvn.call(f.fake as unknown as Lab, f.pair, "svn rm replaced.txt\n");
+    const replacement = await Lab.prototype.commitSvn.call(f.fake as unknown as Lab, f.pair,
+      "printf 'replacement\\n' > replaced.txt\nsvn add replaced.txt\n");
+    expect(await f.fake.svnBytesOrMissing(f.pair, "replaced.txt")).toBe("replacement\n");
+    expect(await Lab.prototype.svnBytesOrMissing.call(f.fake as unknown as Lab, f.pair, "replaced.txt", old)).toBe("original\n");
+    expect(await Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, f.pair, "replaced.txt", old)).toBe("original\n");
+    expect(await Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, f.pair, "replaced.txt", replacement)).toBe("replacement\n");
+  } finally {rmSync(f.root, {recursive: true, force: true});}
+});
+
+test("historical SVN reads keep broken remotes and invalid revisions fatal", async () => {
+  const f = vcsFixture();
+  try {
+    const broken = {...f.pair, svnUrl: `file://${f.root}/broken`};
+    await expect(Lab.prototype.svnBytesOrMissing.call(f.fake as unknown as Lab, broken, "first.txt", "1")).rejects.toThrow();
+    await expect(Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, broken, "first.txt", "1")).rejects.toThrow();
+    for (const revision of ["HEAD", "-1", "1;id"]) {
+      await expect(Lab.prototype.svnBytesOrMissing.call(f.fake as unknown as Lab, f.pair, "first.txt", revision)).rejects.toThrow("invalid SVN read revision");
+      await expect(Lab.prototype.svnBytesAtRevision.call(f.fake as unknown as Lab, f.pair, "first.txt", revision)).rejects.toThrow("invalid SVN read revision");
+    }
+  } finally {rmSync(f.root, {recursive: true, force: true});}
+});
+
 test("local reset and rebase leave the actual published Git tip unchanged", async () => {
   const f = vcsFixture();
   try {
