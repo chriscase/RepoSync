@@ -968,7 +968,7 @@ capture_service_logs() {
   local service
   mkdir -p "$RUN_DIR/logs"
   for service in "$@"; do
-    compose logs --no-color --tail 120 "$service" > "$RUN_DIR/logs/${service}.log" 2>&1 || true
+    compose logs --no-color --tail all "$service" > "$RUN_DIR/logs/${service}.log" 2>&1 || true
   done
   if [ -f "$RUN_DIR/secret-values.txt" ]; then
     node "$LAB_DIR/src/scrub.mjs" --root "$RUN_DIR/logs" --secrets-file "$RUN_DIR/secret-values.txt" >/dev/null || true
@@ -1004,6 +1004,27 @@ probe_published_ui() {
   return 1
 }
 
+probe_fault_control() {
+  local fid stats
+  fid="$(compose ps -q fault-control-forwarder)" || return 1
+  if [ -z "$fid" ]; then
+    echo "fault control forwarder is absent" >&2
+    return 1
+  fi
+  stats="$EVIDENCE/fault-control-stats.json"
+  curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+    "http://127.0.0.1:${LAB_FAULT_CONTROL_PORT}/stats" > "$stats" || return 1
+  python3 - "$stats" "$EVIDENCE/fault-control.json" "$RUN_ID" "$LAB_FAULT_CONTROL_PORT" "$fid" <<'PY'
+import json, sys
+stats = json.load(open(sys.argv[1]))
+keys = ("drop_responses_remaining", "client_connections", "upstream_connections", "dropped_responses", "forwarded_responses")
+if not isinstance(stats, dict) or any(type(stats.get(k)) is not int or stats[k] < 0 for k in keys):
+    raise SystemExit("invalid fault-control readiness stats")
+payload = {"run_id": sys.argv[3], "control_port": int(sys.argv[4]), "forwarder": sys.argv[5], "host_health": "ok", "stats": stats}
+open(sys.argv[2], "w").write(json.dumps(payload, indent=2) + "\n")
+PY
+}
+
 up_stack() {
   require_docker || return 1
   local started
@@ -1012,8 +1033,12 @@ up_stack() {
   log "starting services except reposync"
   # This function is called from `if`, where set -e does not stop the body.
   # Each step returns on its own status.
-  if ! compose up -d --wait ldap svn svnserve gitea gitea-api git-http denied notify fault observer; then
-    capture_service_logs ldap svn gitea || true
+  if ! compose up -d --wait ldap svn svnserve gitea gitea-api git-http denied notify fault fault-control-forwarder observer; then
+    capture_service_logs ldap svn gitea fault fault-control-forwarder || true
+    return 1
+  fi
+  if ! probe_fault_control; then
+    capture_service_logs fault fault-control-forwarder || true
     return 1
   fi
   if ! seed_gitea; then
@@ -1379,7 +1404,7 @@ publish_outputs() {
   rm -rf "$publish"
   mkdir -p "$publish"
   local name
-  for name in report.json report.md self-test.json identity.json resources.txt timings.txt playwright.json engine-summary.json engine-exit.txt; do
+  for name in report.json report.md self-test.json identity.json resources.txt timings.txt playwright.json engine-summary.json engine-exit.txt fault-control.json fault-control-stats.json; do
     if [ -f "$EVIDENCE/$name" ]; then
       cp "$EVIDENCE/$name" "$publish/$name"
     fi
@@ -1394,7 +1419,7 @@ publish_outputs() {
     cp "$EVIDENCE/ui-port.txt" "$publish/ui-port.txt"
   fi
   local service
-  for service in ldap gitea gitea-api svn reposync ui-forwarder; do
+  for service in ldap gitea gitea-api svn reposync ui-forwarder fault fault-control-forwarder; do
     if [ -s "$RUN_DIR/logs/${service}.log" ]; then
       cp "$RUN_DIR/logs/${service}.log" "$publish/${service}.log"
     fi
@@ -1593,7 +1618,7 @@ cmd_test() {
     fi
   fi
   printf 'elapsed_before_report=%s\n' "$(( $(date +%s) - started ))" >> "$EVIDENCE/timings.txt"
-  capture_service_logs ldap gitea gitea-api svn reposync ui-forwarder || true
+  capture_service_logs ldap gitea gitea-api svn reposync ui-forwarder fault fault-control-forwarder || true
   scrub_outputs || true
   if ! scan_outputs; then
     ec=1

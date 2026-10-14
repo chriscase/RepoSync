@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, loginError, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
+import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, loginError, readFaultStats, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
 
 function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
@@ -721,18 +721,40 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         return;
       }
       if (op.id === "LAB_LOST_REPLY" || op.id === "PAIR-RECOVERY-POSTWRITE" || op.id === "PAIR-RESTART-HELD") {
-        const armed = await fetch(`${process.env.LAB_FAULT_CONTROL_URL}/drop-next-response`, {
-          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ count: 1 }),
-        });
-        if (!armed.ok) throw new Error(`fault control ${armed.status}`);
-        const client = await lab.observer(`svn info --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" https://fault-proxy:8443/svn/bootstrap || true`);
-        const stats = await fetch(`${process.env.LAB_FAULT_CONTROL_URL}/stats`).then((response) => response.json()) as { dropped_responses?: number; upstream_connections?: number };
-        if (!stats.dropped_responses) throw new Error(`proxy did not drop; client=${client.slice(0, 180)}`);
-        const after = await lab.snap(pair);
-        if (after.svn !== before.svn || after.maps !== before.maps) {
-          throw new Error("lost-reply probe moved cursors");
+        const beforeStats = readFaultStats(await lab.faultRequest("stats"));
+        if (beforeStats.drop_responses_remaining !== 0) throw new Error("fault proxy has an unconsumed earlier injection");
+        const target = pair.svnUrl.replace("https://svn:8443/", "https://fault-proxy:8443/") + `/${pair.svnBranch || "trunk"}`;
+        await lab.observer(`set -eu\ncurl --fail --silent --show-error --max-time 30 --cacert /certs/ca.crt --user "svc-sync:$SVN_PASSWORD" -X OPTIONS ${target} >/dev/null\n`);
+        const healthy = readFaultStats(await lab.faultRequest("stats"));
+        if (healthy.upstream_connections <= beforeStats.upstream_connections || healthy.forwarded_responses <= beforeStats.forwarded_responses
+          || healthy.dropped_responses !== beforeStats.dropped_responses || healthy.drop_responses_remaining !== 0) {
+          throw new Error("fault proxy did not forward the healthy repository control");
         }
-        lab.mark("PARTIAL", "The proxy dropped a forwarded response and cursors stayed put. A full WebDAV commit through the proxy is not claimed. In-process hooks remain NOT_RUN.", "UNQUALIFIED");
+        const armed = await lab.faultRequest("drop-next-response", {count: 1});
+        expect(armed).toMatchObject({ok: true, armed: 1});
+        const armedStats = readFaultStats(await lab.faultRequest("stats"));
+        expect(armedStats.drop_responses_remaining).toBe(1);
+        expect(armedStats.dropped_responses).toBe(healthy.dropped_responses);
+        const client = await lab.observer(`
+set -eu
+output=$(mktemp)
+trap 'rm -f "$output"' EXIT
+set +e
+svn info --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${target} >"$output" 2>&1
+ec=$?
+set -e
+printf 'LAB_FAULT_CLIENT_EXIT:%s\\n' "$ec"
+cat "$output"
+`);
+        if (!/^LAB_FAULT_CLIENT_EXIT:[0-9]+\n/.test(client)) throw new Error("fault client returned no exit receipt");
+        const stats = readFaultStats(await lab.faultRequest("stats"));
+        if (stats.dropped_responses !== healthy.dropped_responses + 1 || stats.upstream_connections <= healthy.upstream_connections || stats.drop_responses_remaining !== 0) {
+          throw new Error("current request did not consume exactly one forwarded-response drop");
+        }
+        const after = await lab.snap(pair);
+        expect(after).toEqual(before);
+        lab.observation(`${pair.name}-fault-read`, {pair, before, beforeStats, healthy, armedStats, stats, client, after});
+        lab.mark("PARTIAL", "Healthy scoped OPTIONS forwarded, then exactly one response to an SVN read was dropped; snapshots stayed unchanged. Write recovery, held restart and in-process hooks were not injected.", "UNQUALIFIED");
         return;
       }
       lab.pass("generation probe kept the snapshot stable");

@@ -26,6 +26,15 @@ export type Pair = {
 };
 
 export type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
+export type FaultStats = {drop_responses_remaining: number; client_connections: number; upstream_connections: number; dropped_responses: number; forwarded_responses: number};
+
+export function readFaultStats(value: unknown): FaultStats {
+  const stats = value as FaultStats | null;
+  for (const key of ["drop_responses_remaining", "client_connections", "upstream_connections", "dropped_responses", "forwarded_responses"] as const) {
+    if (!stats || !Number.isSafeInteger(stats[key]) || stats[key] < 0) throw new Error("invalid fault control stats");
+  }
+  return stats!;
+}
 
 export function assertSvnRefusalState(before: Snap, now: Snap, revision: string): void {
   // The operator owns the new SVN revision. Only the bridge's destination,
@@ -329,7 +338,7 @@ export class Lab {
     return result;
   }
 
-  async repos(): Promise<Array<{ id: string; git_repo: string; name: string; svn_url: string; git_branch?: string; svn_branch?: string; parent_id?: string }>> {
+  async repos(): Promise<Array<{ id: string; git_repo: string; name: string; svn_url: string; git_branch?: string; svn_branch?: string; parent_id?: string; enabled?: boolean }>> {
     await this.admin();
     const result = await this.api("GET", "/api/repos");
     if (result.status !== 200 || !Array.isArray(result.json)) throw new Error(`list repos failed (${result.status})`);
@@ -354,12 +363,71 @@ export class Lab {
     return { id: row.id, name: "bootstrap", svnUrl: "https://svn:8443/svn/bootstrap", gitRepo: "lab/bootstrap" };
   }
 
-  async waitImport(id: string): Promise<void> {
-    await expect.poll(async () => {
-      const status = await this.api("GET", `/api/repos/${id}/import/status`);
-      const body = status.json as { phase?: string; lifecycle?: string } | null;
-      return body?.phase || body?.lifecycle || `http-${status.status}`;
-    }, { timeout: 180_000, intervals: [1000, 2000, 3000] }).toMatch(/completed|Completed/);
+  async waitImport(id: string, operation?: string): Promise<void> {
+    let last: unknown = null;
+    let pinnedOperation = operation;
+    try {
+      await expect.poll(async () => {
+        const status = await this.api("GET", `/api/repos/${id}/import/status`);
+        last = status.json;
+        const body = status.json as {phase?: string; lifecycle?: string; operation_id?: string; error?: string; outcome_detail?: string} | null;
+        if (status.status !== 200 || !body || !body.operation_id || (pinnedOperation && body.operation_id !== pinnedOperation)) {
+          throw new Error(`import ${id} status is invalid (${status.status}) or belongs to another operation`);
+        }
+        pinnedOperation ??= body.operation_id;
+        const phase = (body.phase || body.lifecycle || "").toLowerCase();
+        if (!phase) throw new Error(`import ${id} returned no phase`);
+        if (!body.lifecycle) throw new Error(`import ${id} returned no durable lifecycle`);
+        if (/failed|cancelled|reconciliation.?required/i.test(`${phase} ${body.lifecycle || ""}`)) {
+          throw new Error(`import ${id} terminated as ${phase}: ${body.error || body.outcome_detail || "no server detail"}`);
+        }
+        // The in-memory progress can finish before durable finalization.
+        return phase === "completed" ? body.lifecycle.toLowerCase() : phase;
+      }, {timeout: 180_000, intervals: [1000, 2000, 3000]}).toBe("completed");
+      this.observation(`import-${safe(id, "repo id")}`, {repo_id: id, operation_id: pinnedOperation, result: last});
+    } catch (error) {
+      this.observation(`import-${safe(id, "repo id")}`, {repo_id: id, operation_id: pinnedOperation, result: last, setup_failed: true});
+      throw error;
+    }
+  }
+
+  async giteaApi(method: "GET" | "POST", path: string, body?: unknown): Promise<{status: number; json: any}> {
+    if (!/^\/api\/v1\/[A-Za-z0-9_./-]+$/.test(path)) throw new Error("unsafe Gitea fixture API path");
+    const payload = Buffer.from(JSON.stringify(body ?? {}), "utf8").toString("base64");
+    const output = await this.sh("gitea", `
+set -eu
+data=$(mktemp)
+trap 'rm -f "$data"' EXIT
+printf %s '${payload}' | base64 -d > "$data"
+curl --silent --show-error --connect-timeout 5 --max-time 30 --cacert /certs/ca.crt \
+  -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" -X ${method} \
+  ${method === "POST" ? '--data-binary "@$data"' : ""} \
+  --write-out '\\nLAB_HTTP_STATUS:%{http_code}\\n' https://gitea:3000${path}
+`);
+    const status = output.match(/\nLAB_HTTP_STATUS:([0-9]{3})\n$/);
+    if (!status) throw new Error("Gitea fixture API returned no HTTP status");
+    let json: unknown = null;
+    try {json = JSON.parse(output.slice(0, status.index));} catch { /* Status still identifies the failed provider request. */ }
+    return {status: Number(status[1]), json};
+  }
+
+  async enableFixturePair(pair: Pair): Promise<void> {
+    const enabled = await this.api("PUT", `/api/repos/${pair.id}`, {enabled: true});
+    const body = enabled.json as {id?: string; enabled?: boolean; git_repo?: string; svn_url?: string} | null;
+    if (enabled.status !== 200 || body?.id !== pair.id || body.enabled !== true || body.git_repo !== pair.gitRepo || body.svn_url !== pair.svnUrl) {
+      throw new Error(`fixture ${pair.name} activation failed (${enabled.status})`);
+    }
+  }
+
+  async faultRequest(path: "stats" | "drop-next-response", body?: {count: number}): Promise<unknown> {
+    const root = new URL(required("LAB_FAULT_CONTROL_URL"));
+    if (root.protocol !== "http:" || root.hostname !== "127.0.0.1" || !root.port || root.pathname !== "/" || root.username || root.password || root.search || root.hash) {
+      throw new Error("fault control must use the run's published loopback port");
+    }
+    const response = await fetch(new URL(path, root), {method: body ? "POST" : "GET", headers: {"content-type": "application/json"},
+      body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(5000), redirect: "error"});
+    if (response.status !== 200) throw new Error(`fault control ${path} failed (${response.status})`);
+    return response.json();
   }
 
   async createPair(name: string): Promise<Pair> {
@@ -372,7 +440,9 @@ export class Lab {
       const row = existing[0];
       if (row.name !== repo || row.git_repo !== `lab/${repo}` || row.svn_url !== `https://svn:8443/svn/${repo}`) throw new Error(`existing lab pair ${repo} has different remotes`);
       await this.waitImport(row.id);
-      return {id: row.id, name: repo, svnUrl: row.svn_url, gitRepo: row.git_repo};
+      const pair = {id: row.id, name: repo, svnUrl: row.svn_url, gitRepo: row.git_repo};
+      if (row.enabled === false) await this.enableFixturePair(pair);
+      return pair;
     }
     await this.sh("svn", `
 set -eu
@@ -389,17 +459,16 @@ if [ ! -d /var/svn/${repo} ]; then
   chown -R www-data:www-data /var/svn/${repo}
 fi
 `);
-    await this.sh("gitea", `
-set -eu
-code=$(curl --silent --show-error --output /tmp/repo.out --write-out '%{http_code}' --cacert /certs/ca.crt \
-  -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" \
-  -d '{"username":"lab","visibility":"private"}' \
-  https://gitea:3000/api/v1/orgs || true)
-curl --silent --show-error --cacert /certs/ca.crt \
-  -H "Authorization: token $GIT_TOKEN" -H "Content-Type: application/json" \
-  -d '{"name":"${repo}","private":true,"auto_init":false,"default_branch":"main"}' \
-  https://gitea:3000/api/v1/orgs/lab/repos >/tmp/repo2.out || true
-`);
+    const organization = await this.giteaApi("GET", "/api/v1/orgs/lab");
+    if (organization.status !== 200) throw new Error(`fixture organization unavailable (${organization.status})`);
+    const provider = await this.giteaApi("POST", "/api/v1/orgs/lab/repos", {name: repo, private: true, auto_init: false, default_branch: "main"});
+    if (![201, 409, 422].includes(provider.status)) throw new Error(`Gitea fixture ${repo} creation failed (${provider.status})`);
+    const remote = await this.giteaApi("GET", `/api/v1/repos/lab/${repo}`);
+    if (remote.status !== 200 || remote.json?.full_name !== `lab/${repo}` || remote.json.private !== true || remote.json.default_branch !== "main") {
+      throw new Error(`Gitea fixture ${repo} has missing or different remote metadata (${remote.status})`);
+    }
+    const refs = await this.observer(`set -eu\nauth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')\ngit -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt ls-remote https://gitea:3000/lab/${repo}.git\n`);
+    if (refs.trim()) throw new Error(`Gitea fixture ${repo} is not empty; refusing to replay into an existing target`);
     await this.admin();
     const created = await this.api("POST", "/api/repos", {
       name: repo,
@@ -412,7 +481,8 @@ curl --silent --show-error --cacert /certs/ca.crt \
       git_branch: "main",
       sync_mode: "direct",
       poll_interval_secs: 30,
-      enabled: true,
+      // Keep the ordinary poller out of the initial-import working tree.
+      enabled: false,
     });
     const id = (created.json as { id?: string } | null)?.id;
     if (created.status !== 200 || !id) throw new Error(`create repo ${repo} failed (${created.status})`);
@@ -423,8 +493,20 @@ curl --silent --show-error --cacert /certs/ca.crt \
     if (creds.status !== 200) throw new Error(`credentials for ${repo} failed`);
     const started = await this.api("POST", `/api/repos/${id}/import`, { import_mode: "full" });
     if (started.status !== 200) throw new Error(`import ${repo} failed (${started.status}) ${started.text.slice(0, 400)}`);
-    await this.waitImport(id);
-    return { id, name: repo, svnUrl: `https://svn:8443/svn/${repo}`, gitRepo: `lab/${repo}` };
+    const operation = (started.json as {operation_id?: string} | null)?.operation_id;
+    if (!operation) throw new Error(`import ${repo} returned no operation id`);
+    await this.waitImport(id, operation);
+    const pair = {id, name: repo, svnUrl: `https://svn:8443/svn/${repo}`, gitRepo: `lab/${repo}`};
+    const baseline = await this.snap(pair);
+    if (baseline.svn !== "1" || baseline.watermark !== "1" || baseline.maps !== "1" || baseline.records !== "1"
+      || !/^[0-9a-f]{40}$/.test(baseline.git) || baseline.gitWatermark !== baseline.git || baseline.gitColumn !== baseline.git) {
+      this.observation(`${repo}-import-baseline`, {pair, operation, baseline, setup_failed: true});
+      throw new Error(`fixture ${repo} import did not establish the exact r1 baseline`);
+    }
+    await this.assertSingleReceipt(pair, "svn_to_git", "1");
+    await this.enableFixturePair(pair);
+    this.observation(`${repo}-import-ready`, {pair, operation, provider_status: provider.status, baseline, scheduler_enabled_after_import: true});
+    return pair;
   }
 
   async createChildPair(parent: Pair, branchName: string): Promise<Pair> {

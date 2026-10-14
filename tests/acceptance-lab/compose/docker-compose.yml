@@ -241,7 +241,6 @@ services:
       - ${LAB_RUN_DIR}/certs:/certs:ro
     ports:
       - 127.0.0.1:${LAB_FAULT_PORT}:8443
-      - 127.0.0.1:${LAB_FAULT_CONTROL_PORT}:8090
     networks: [lab]
     depends_on:
       svn:
@@ -249,6 +248,36 @@ services:
     labels:
       acceptance-lab.run-id: ${RUN_ID}
       acceptance-lab.disposable: "true"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/stats', timeout=2).read()"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  # Internal bridges do not accept host connections to published ports.
+  # Forward only the controller; the fault proxy keeps its internal network.
+  fault-control-forwarder:
+    image: ${FORWARDER_IMAGE}
+    command: ["TCP-LISTEN:8090,bind=0.0.0.0,fork,reuseaddr", "TCP:fault:8090"]
+    init: true
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [lab, publish]
+    ports:
+      - 127.0.0.1:${LAB_FAULT_CONTROL_PORT}:8090
+    depends_on:
+      fault:
+        condition: service_healthy
+    labels:
+      acceptance-lab.run-id: ${RUN_ID}
+      acceptance-lab.disposable: "true"
+    security_opt: [no-new-privileges:true]
+    cap_drop: [NET_RAW, SYS_ADMIN, SYS_MODULE]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8090/stats"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
   observer:
     build:
@@ -369,8 +398,8 @@ networks:
     labels:
       acceptance-lab.run-id: ${RUN_ID}
       acceptance-lab.disposable: "true"
-  # Host loopback publish only. Masquerade stays off. Lab services are not
-  # attached, so they still have no route out of the internal network.
+  # Host loopback forwarders only. Masquerade stays off. Provider services
+  # stay on the internal lab network and have no route out through this bridge.
   publish:
     name: ${COMPOSE_PROJECT_NAME}-publish
     driver_opts:

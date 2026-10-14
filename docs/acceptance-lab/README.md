@@ -99,6 +99,22 @@ Syntax, type, and harness-detector checks do not qualify the services, the brows
 
 ## Reading a failure
 
+Fault control is published by its own loopback forwarder across the internal
+and publish bridges. The fault proxy remains on the internal bridge. Startup
+requires a healthy controller and retains its stats and both services' logs.
+The read-loss cases require a healthy scoped OPTIONS request, a new one-response
+drop, and unchanged snapshots. They remain PARTIAL: a lost response to a read
+does not qualify a post-write recovery, held restart, or full WebDAV commit.
+
+Fresh fixture targets must be accessible, private, empty Git repositories.
+Their RepoSync registrations start disabled. The harness supplies credentials,
+starts exactly one full import, matches its durable operation ID and completion,
+and verifies the r1 mappings, receipt and directional checkpoints before enabling
+polling. It does not replay or reset a failed import. Terminal status and outcome
+details are captured immediately; complete service logs are scrubbed and retained.
+The earlier import failures lacked terminal cause evidence, so the fixture ordering
+fix must be checked by a new hosted run; it is not a production import repair claim.
+
 The follow-up to the `78a06db` review exercises SVN revision gaps with actual
 sibling-path commits between two confirmed content revisions. Empty-to-project
 qualification additionally requires an explicit no-target receipt and cursor;
