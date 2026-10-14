@@ -531,6 +531,31 @@ fi
     return child;
   }
 
+  async gitRemoteHeads(pair: Pair): Promise<Record<string, string>> {
+    if (!/^lab\/[A-Za-z0-9_.-]+$/.test(pair.gitRepo)) throw new Error("unsafe fixture Git repository");
+    const output = await this.observer(`set -eu\nauth=$(printf '%s:%s' "$GIT_USER" "$GIT_TOKEN" | base64 | tr -d '\\n')\ngit -c http.extraHeader="Authorization: Basic $auth" -c http.sslCAInfo=/certs/ca.crt ls-remote --heads https://gitea:3000/${pair.gitRepo}.git\n`);
+    const heads: Record<string, string> = {};
+    for (const line of output.trim().split("\n").filter(Boolean)) {
+      const match = line.match(/^([0-9a-f]{40})\t(refs\/heads\/[A-Za-z0-9_.\/-]+)$/);
+      if (!match || heads[match[2]]) throw new Error("invalid or duplicate remote Git head");
+      heads[match[2]] = match[1];
+    }
+    return heads;
+  }
+
+  async svnBranchNames(parent: Pair): Promise<string[]> {
+    if (!/^https:\/\/svn:8443\/svn\/[A-Za-z0-9_.-]+$/.test(parent.svnUrl)) throw new Error("unsafe fixture SVN repository");
+    // Read the existing branches directory successfully. A transport/auth error
+    // or missing repository is never converted into target-path absence.
+    const output = await this.observer(`set -eu\nexport LC_ALL=C\nsvn list --non-interactive --config-dir "$HOME/.svn" --username svc-sync --password "$SVN_PASSWORD" ${parent.svnUrl}/branches\n`);
+    const names = output.trim().split("\n").filter(Boolean).map(line => {
+      if (!/^[A-Za-z0-9_.-]+\/$/.test(line)) throw new Error("unexpected SVN branches entry");
+      return line.slice(0, -1);
+    });
+    if (new Set(names).size !== names.length) throw new Error("duplicate SVN branch entry");
+    return names.sort();
+  }
+
   // A Gitea user who can write only this repository. The token is not the lab admin token.
   async issueScopedGitToken(repoName: string, otherRepo: string): Promise<{ token: string; user: string; tokenName: string }> {
     const repo = safe(repoName, "repo");

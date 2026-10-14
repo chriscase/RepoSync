@@ -131,6 +131,16 @@ drain both pending commits. Per-commit receipts and the intermediate SVN tree
 prove individual replay. Historical SVN reads pin both the operative and peg
 revision so absence and bytes come from that path at that revision, including
 after deletion or recreation at HEAD. Observer errors remain fatal.
+
+The remote-delete oracle uses three real managed child pairs. Explicit false
+flags remove only one registration and must preserve its Git ref and SVN path.
+Explicit true flags must return a successful, warning-free response and remove
+exactly the selected child ref/path and registration. Full remote head and SVN
+branch inventories, retained parent/sibling/kept bytes, directional checkpoints
+and the exact SVN deletion revision prove preservation. Provider read errors,
+root/busy refusals, missing preconditions and retained targets are failures.
+The case retains both API responses and before/after observations; a refusal
+or an unchanged SVN tip alone cannot qualify remote deletion.
 SVN-read and outbound Git checkpoints remain separate;
 a verified Git-to-SVN echo does not have to advance the SVN-read cursor.
 Late-pair publish remains PARTIAL unless crash and pre-final activation timing are also

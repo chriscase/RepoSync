@@ -13,6 +13,75 @@ async function own(lab: Lab, op: LabOp): Promise<Pair> {
   return sharedPair(lab, `p${slug(op.id)}`);
 }
 
+async function remoteDeleteCase(lab: Lab, op: LabOp): Promise<void> {
+  const parent = await own(lab, op);
+  const suffix = slug(op.id);
+  const kept = await lab.createChildPair(parent, `keep${suffix}`);
+  const target = await lab.createChildPair(parent, `drop${suffix}`);
+  const sibling = await lab.createChildPair(parent, `peer${suffix}`);
+  const children = [kept, target, sibling];
+  for (const child of children) {
+    expect(child.parentId).toBe(parent.id);
+    expect(child.gitRepo).toBe(parent.gitRepo);
+    expect(child.svnUrl).toBe(parent.svnUrl);
+    expect(child.svnBranch).toBe(`branches/${child.gitBranch}`);
+    expect(child.id).not.toBe(parent.id);
+  }
+  expect(new Set(children.map(child => child.id)).size).toBe(3);
+  expect(new Set(children.map(child => child.gitBranch)).size).toBe(3);
+  const read = async () => ({
+    heads: await lab.gitRemoteHeads(parent), branches: await lab.svnBranchNames(parent),
+    parent: await lab.snap(parent), sibling: await lab.snap(sibling),
+    bytes: await Promise.all([parent, sibling, kept].map(async pair => ({
+      id: pair.id, svn: await lab.svnBytes(pair, "README.txt"), git: await lab.gitBytes(pair, "README.txt"),
+    }))),
+    registrations: (await lab.repos()).filter(row => row.id === parent.id || row.parent_id === parent.id).map(row => ({id: row.id, parent_id: row.parent_id, git_repo: row.git_repo,
+      svn_url: row.svn_url, git_branch: row.git_branch, svn_branch: row.svn_branch})).sort((a, b) => a.id.localeCompare(b.id)),
+  });
+  const before = await read();
+  expect(before.heads[`refs/heads/${parent.gitBranch || "main"}`]).toBe(before.parent.git);
+  for (const child of children) {
+    expect(before.heads[`refs/heads/${child.gitBranch}`]).toMatch(/^[0-9a-f]{40}$/);
+    expect(before.branches).toContain(child.gitBranch);
+    expect(before.registrations.find(row => row.id === child.id)).toMatchObject({parent_id: parent.id,
+      git_branch: child.gitBranch, svn_branch: child.svnBranch, git_repo: parent.gitRepo, svn_url: parent.svnUrl});
+  }
+  const remove = async (pair: Pair, requested: boolean) => {
+    const response = await lab.api("DELETE", `/api/repos/${pair.id}/branch-pair?explicit_remote_deletion_opts=true&delete_git=${requested}&delete_svn=${requested}`);
+    lab.observation(`${parent.name}-delete-response-${requested ? "opted-in" : "opted-out"}`, {pair, requested, response});
+    expect(response.status).toBe(200);
+    expect(response.json).toMatchObject({ok: true, registration_listed: false, warnings: [], remote_deletion: {
+      explicit_opts: true, delete_git_requested: requested, delete_svn_requested: requested,
+      git_ref: requested ? pair.gitBranch : "", svn_path: requested ? pair.svnBranch : "",
+    }});
+  };
+  // First hard-remove one managed registration while explicitly keeping both
+  // remotes. The later opted-in deletion must preserve these orphaned remotes too.
+  await remove(kept, false);
+  const optedOut = await read();
+  lab.observation(`${parent.name}-delete-opted-out`, {parent, kept, target, sibling, before, after: optedOut});
+  expect(optedOut).toEqual({...before, registrations: before.registrations.filter(row => row.id !== kept.id)});
+  await remove(target, true);
+  const after = await read();
+  const revision = String(Number(optedOut.parent.svn) + 1);
+  const svnLog = await lab.svnRevisionLog(parent, revision);
+  lab.observation(`${parent.name}-delete-opted-in`, {parent, kept, target, sibling, before: optedOut, after, revision, svnLog});
+  const expectedHeads = {...optedOut.heads}; delete expectedHeads[`refs/heads/${target.gitBranch}`];
+  expect(after.heads).toEqual(expectedHeads);
+  expect(after.branches).toEqual(optedOut.branches.filter(branch => branch !== target.gitBranch));
+  expect(after.registrations).toEqual(optedOut.registrations.filter(row => row.id !== target.id));
+  expect(after.bytes).toEqual(optedOut.bytes);
+  // Deleting an SVN path creates one repository revision; protected content,
+  // Git pins, mappings and directional checkpoints must remain unchanged.
+  expect(after.parent).toEqual({...optedOut.parent, svn: revision});
+  expect(after.sibling).toEqual({...optedOut.sibling, svn: revision});
+  const changes = [...svnLog.matchAll(/<path\b([^>]*)>([^<]+)<\/path>/g)].map(match => ({
+    action: match[1].match(/\baction="([A-Z])"/)?.[1], path: match[2],
+  }));
+  expect(changes).toEqual([{action: "D", path: `/${target.svnBranch}`}]);
+  lab.pass("Managed child deletion kept Git/SVN remotes when opted out, then removed exactly the opted-in ref/path; parent, sibling, kept remotes and checkpoints stayed intact");
+}
+
 async function syncedGitFile(lab: Lab, op: LabOp, body: string): Promise<void> {
   const pair = await team(lab);
   const path = `${slug(op.id)}.txt`;
@@ -657,7 +726,6 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     case "PAIR-DISABLE":
     case "PAIR-LEGACY-ROOT-DELETE":
     case "PAIR-MANAGED-REMOVE":
-    case "PAIR-REMOTE-DELETE-EXPLICIT":
     case "WEB-DELETE-NAV":
     case "WEB-BACK-RELOAD-DEEPLINK": {
       const pair = await own(lab, op);
@@ -671,9 +739,6 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       } else if (op.id === "PAIR-MANAGED-REMOVE" || op.id === "WEB-DELETE-NAV" || op.id === "WEB-BACK-RELOAD-DEEPLINK") {
         const removed = await lab.api("POST", `/api/repos/${pair.id}/remove?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=false`, {});
         if (removed.status >= 400) throw new Error(`remove ${removed.status} ${removed.text.slice(0, 200)}`);
-      } else {
-        const keep = await lab.api("DELETE", `/api/repos/${pair.id}/branch-pair?explicit_remote_deletion_opts=true&delete_git=false&delete_svn=false`);
-        if (keep.status >= 500) throw new Error(`branch delete ${keep.status}`);
       }
       const after = await lab.snap(pair);
       if (after.svn !== before.svn) throw new Error("remote svn revision changed during disable/remove");
@@ -686,6 +751,9 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       lab.pass(`${op.id} left the SVN revision at ${after.svn}`);
       return;
     }
+    case "PAIR-REMOTE-DELETE-EXPLICIT":
+      await remoteDeleteCase(lab, op);
+      return;
     case "PAIR-CONCURRENT-REPOS": {
       const a = await own(lab, { ...op, id: "PAIR-CONCURRENT-A" });
       const b = await own(lab, { ...op, id: "PAIR-CONCURRENT-B" });
