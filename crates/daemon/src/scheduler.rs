@@ -25,6 +25,61 @@ use reposync_core::import::{ImportPhase, ImportProgress};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
+/// True when the admitted database has a non-terminal import or late-pair
+/// publish. A read error also blocks, so a sync cycle does not open another
+/// database in order to persist or discover that failure.
+fn admitted_hold_blocks_replacement_open(db: &Database) -> bool {
+    let repos = match db.list_repositories() {
+        Ok(repos) => repos,
+        Err(error) => {
+            error!(
+                %error,
+                "cannot read repositories; refusing per-repo sync that would open another database"
+            );
+            return true;
+        }
+    };
+    for repo in repos {
+        match db.active_import_operation(&repo.id) {
+            Ok(Some(op)) if !op.state.is_terminal() => {
+                debug!(
+                    repo_id = %repo.id,
+                    "skipping per-repo sync while import work is held"
+                );
+                return true;
+            }
+            Err(error) => {
+                error!(
+                    repo_id = %repo.id,
+                    %error,
+                    "cannot establish import hold; refusing per-repo sync"
+                );
+                return true;
+            }
+            _ => {}
+        }
+        match db.latest_late_pair_publish_operation(&repo.id) {
+            Ok(Some(op)) if !op.state.is_terminal() => {
+                debug!(
+                    repo_id = %repo.id,
+                    "skipping per-repo sync while child admission publish is held"
+                );
+                return true;
+            }
+            Err(error) => {
+                error!(
+                    repo_id = %repo.id,
+                    %error,
+                    "cannot read child admission publish; refusing per-repo sync"
+                );
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Tracks aggregate statistics across sync cycles.
 #[allow(dead_code)]
 pub struct SchedulerStats {
@@ -467,6 +522,12 @@ impl Scheduler {
                 debug!("skipping per-repo sync: import in progress");
                 return;
             }
+        }
+        // A non-terminal import or child-admission publish still owns the
+        // admitted database. Do not open a replacement connection for a
+        // sync engine while that hold exists.
+        if admitted_hold_blocks_replacement_open(&self.db) {
+            return;
         }
 
         let repos = match self.db.list_repositories() {
@@ -1053,6 +1114,66 @@ mod cancellation_tests {
             serde_json::json!({"case":"64A_SCHEDULER",
             "operation_id":operation.id,"checkpoint":2,"worker_spawned":false,"workdir_created":false})
         );
+    }
+
+    #[tokio::test]
+    async fn nonterminal_import_hold_does_not_open_a_replacement_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, "other-repo", "2000-01-01T00:00:00Z");
+        let now = Utc::now().to_rfc3339();
+        scheduler
+            .db
+            .insert_repository(&Repository {
+                id: "importing".into(),
+                name: "importing".into(),
+                svn_url: "file:///nonexistent".into(),
+                svn_branch: "trunk".into(),
+                svn_username: "fixture".into(),
+                git_provider: "gitea".into(),
+                git_api_url: "file:///nonexistent".into(),
+                git_repo: "local/importing".into(),
+                git_branch: "main".into(),
+                sync_mode: "team".into(),
+                poll_interval_secs: 1,
+                lfs_threshold_mb: 0,
+                auto_merge: false,
+                enabled: true,
+                created_by: None,
+                parent_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+                last_svn_rev: 0,
+                last_git_sha: String::new(),
+                last_sync_at: Some("2000-01-01T00:00:00Z".into()),
+                sync_status: "idle".into(),
+                total_syncs: 0,
+                total_errors: 0,
+                allowed_paths: None,
+                blocked_patterns: None,
+                consecutive_errors: 0,
+                teams_webhook_url: None,
+            })
+            .unwrap();
+        let operation = scheduler
+            .db
+            .create_import_operation("importing", "user", "request", "fingerprint")
+            .unwrap();
+        assert!(super::admitted_hold_blocks_replacement_open(&scheduler.db));
+
+        scheduler.maybe_run_repo_cycles().await;
+
+        assert!(scheduler.sync_handles.lock().await.is_empty());
+        assert!(!tmp.path().join("repos/other-repo/git-repo").exists());
+        let stored = scheduler
+            .db
+            .get_import_operation("importing", &operation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.state,
+            reposync_core::db::import_operations::ImportOperationState::Queued
+        );
+        assert!(stored.outcome_detail.is_none());
     }
 
     fn scheduler_fixture(

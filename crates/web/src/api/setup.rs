@@ -678,6 +678,58 @@ fn import_write_error(error: DatabaseError) -> AppError {
     }
 }
 
+/// Record a terminal setup-import outcome on the database that already
+/// admitted the operation. Returns the original detail when that write fails.
+/// Does not open another database or acquire a lease.
+fn persist_admitted_setup_outcome(
+    db: &Database,
+    repo_id: &str,
+    operation_id: &str,
+    state: ImportOperationState,
+    detail: &str,
+) -> Option<String> {
+    match db.finish_import_operation(repo_id, operation_id, state, detail) {
+        Ok(_) => None,
+        Err(error) => {
+            error!(
+                repo_id,
+                first_error = detail,
+                error = %error,
+                "setup failure persistence failed"
+            );
+            Some(detail.to_string())
+        }
+    }
+}
+
+fn note_unpersisted_setup_failure(slot: &mut Option<String>, missed: Option<String>) {
+    if slot.is_none() {
+        *slot = missed;
+    }
+}
+
+fn apply_setup_import_failure_evidence(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    outcome_detail: Option<&str>,
+    errors: &[String],
+) {
+    if let Some(detail) = outcome_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        object.insert("outcome_detail".into(), serde_json::json!(detail));
+        return;
+    }
+    if let Some(first) = errors
+        .iter()
+        .map(|detail| detail.trim())
+        .find(|detail| !detail.is_empty())
+    {
+        object.insert("outcome_detail".into(), serde_json::json!(first));
+        object.insert("error".into(), serde_json::json!(first));
+    }
+}
+
 fn action_response(
     ok: bool,
     message: impl Into<String>,
@@ -750,6 +802,7 @@ fn overlay_setup_import_status(
             "outcome_detail".into(),
             serde_json::json!(op.outcome_detail),
         );
+        apply_setup_import_failure_evidence(object, op.outcome_detail.as_deref(), &progress.errors);
         object.insert("started_at".into(), serde_json::json!(op.created_at));
         if op.state.is_terminal() {
             object.insert("completed_at".into(), serde_json::json!(op.updated_at));
@@ -1172,10 +1225,6 @@ async fn spawn_import_task(
     let identity_mapper = IdentityMapper::new(&config.identity)
         .map_err(|e| AppError::Internal(format!("failed to init identity mapper: {}", e)))?;
     let file_policy = FilePolicy::from(&config.sync);
-    let db_path = config.daemon.data_dir.join("reposync.db");
-    let import_db = Database::new(&db_path)
-        .map_err(|e| AppError::Internal(format!("failed to open db: {}", e)))?;
-
     let import_config = ImportConfig {
         committer_name: "RepoSync".into(),
         committer_email: "reposync@localhost".into(),
@@ -1192,8 +1241,11 @@ async fn spawn_import_task(
     let worker_operation_id = operation_id;
     let worker_cancel = cancel_signal;
 
+    let worker_state = state.clone();
     tokio::spawn(async move {
+        let import_db = &worker_state.db;
         let _busy_guard = busy_guard;
+        let mut unpersisted_detail = None;
         let current = import_db.get_import_operation(&worker_repo_id, &worker_operation_id);
         let result = match current {
             Ok(Some(op)) if op.cancel_requested => {
@@ -1244,11 +1296,16 @@ async fn spawn_import_task(
                     }
                     Err(e) => {
                         error!(repo_id = %worker_repo_id, error = %e, "setup import finalization failed");
-                        let _ = import_db.finish_import_operation(
-                            &worker_repo_id,
-                            &worker_operation_id,
-                            ImportOperationState::ReconciliationRequired,
-                            &format!("finalization failed: {e}"),
+                        let detail = format!("finalization failed: {e}");
+                        note_unpersisted_setup_failure(
+                            &mut unpersisted_detail,
+                            persist_admitted_setup_outcome(
+                                import_db,
+                                &worker_repo_id,
+                                &worker_operation_id,
+                                ImportOperationState::ReconciliationRequired,
+                                &detail,
+                            ),
                         );
                         ImportPhase::Failed
                     }
@@ -1268,13 +1325,15 @@ async fn spawn_import_task(
                 let detail = format!(
                     "stopped after {commits} local commits; published history is not undone"
                 );
-                if let Err(e) = import_db.finish_import_operation(
+                if let Some(missed) = persist_admitted_setup_outcome(
+                    import_db,
                     &worker_repo_id,
                     &worker_operation_id,
                     state,
                     &detail,
                 ) {
-                    error!(repo_id = %worker_repo_id, error = %e, "setup cancel finalization failed");
+                    error!(repo_id = %worker_repo_id, first_error = %detail, "setup cancel finalization failed");
+                    note_unpersisted_setup_failure(&mut unpersisted_detail, Some(missed));
                     ImportPhase::Failed
                 } else if uncertain {
                     ImportPhase::Failed
@@ -1283,32 +1342,42 @@ async fn spawn_import_task(
                 }
             }
             Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
-                if let Err(e) = import_db.finish_import_operation(
-                    &worker_repo_id,
-                    &worker_operation_id,
-                    ImportOperationState::ReconciliationRequired,
-                    &reason,
-                ) {
-                    error!(repo_id = %worker_repo_id, error = %e, "uncertain setup outcome persistence failed");
-                }
+                note_unpersisted_setup_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_setup_outcome(
+                        import_db,
+                        &worker_repo_id,
+                        &worker_operation_id,
+                        ImportOperationState::ReconciliationRequired,
+                        &reason,
+                    ),
+                );
                 ImportPhase::Failed
             }
             Err(e) => {
+                error!(repo_id = %worker_repo_id, error = %e, "setup import failed");
                 let detail = format!("import stopped with error; inspect local work: {e:#}");
-                if let Err(write_error) = import_db.finish_import_operation(
-                    &worker_repo_id,
-                    &worker_operation_id,
-                    ImportOperationState::Failed,
-                    &detail,
-                ) {
-                    error!(repo_id = %worker_repo_id, error = %write_error, "setup failure persistence failed");
-                }
+                note_unpersisted_setup_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_setup_outcome(
+                        import_db,
+                        &worker_repo_id,
+                        &worker_operation_id,
+                        ImportOperationState::Failed,
+                        &detail,
+                    ),
+                );
                 ImportPhase::Failed
             }
         };
 
         let mut p = progress.write().await;
         p.phase = terminal;
+        if let Some(detail) = unpersisted_detail {
+            if !p.errors.iter().any(|existing| existing == &detail) {
+                p.errors.push(detail);
+            }
+        }
         p.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
         if let Err(e) = import_db.persist_import_progress(&p) {
@@ -1548,4 +1617,41 @@ async fn reset_and_reimport(
         operation_id: Some(operation_id),
         lifecycle: Some(ImportOperationState::Queued),
     }))
+}
+
+#[cfg(test)]
+mod setup_import_failure_tests {
+    use super::apply_setup_import_failure_evidence;
+
+    #[test]
+    fn empty_durable_detail_keeps_the_first_setup_failure() {
+        let mut object = serde_json::Map::new();
+        object.insert("lifecycle".into(), serde_json::json!("queued"));
+        apply_setup_import_failure_evidence(
+            &mut object,
+            None,
+            &["import stopped with error; inspect local work: setup first".into()],
+        );
+        assert_eq!(object["lifecycle"], "queued");
+        assert_eq!(
+            object["outcome_detail"],
+            "import stopped with error; inspect local work: setup first"
+        );
+        assert_eq!(object["error"], object["outcome_detail"]);
+    }
+
+    #[test]
+    fn durable_setup_detail_is_not_replaced() {
+        let mut object = serde_json::Map::new();
+        apply_setup_import_failure_evidence(
+            &mut object,
+            Some("import stopped with error; inspect local work: setup first"),
+            &["database error: database is locked".into()],
+        );
+        assert_eq!(
+            object["outcome_detail"],
+            "import stopped with error; inspect local work: setup first"
+        );
+        assert!(object.get("error").is_none());
+    }
 }
