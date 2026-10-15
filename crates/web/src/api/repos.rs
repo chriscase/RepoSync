@@ -1241,25 +1241,36 @@ fn note_unpersisted_import_failure(slot: &mut Option<String>, missed: Option<Str
     }
 }
 
-/// Durable detail wins. An empty durable detail keeps the first in-memory
-/// failure visible without changing lifecycle.
+/// Stored by `resume_import_operation` while the resumed run is still
+/// non-terminal. It is not a failure, so it must not hide an unpersisted one.
+const RESUME_CHECKPOINT_DETAIL: &str = "Resuming import from durable checkpoint";
+
+/// A stored failure detail wins. The resume checkpoint note does not: an
+/// unpersisted failure is shown instead. This does not rewrite lifecycle.
 fn apply_import_failure_evidence(
     object: &mut serde_json::Map<String, serde_json::Value>,
     outcome_detail: Option<&str>,
     errors: &[String],
 ) {
-    if let Some(detail) = outcome_detail
+    let durable = outcome_detail
         .map(str::trim)
-        .filter(|detail| !detail.is_empty())
-    {
+        .filter(|detail| !detail.is_empty());
+    let unpersisted = errors
+        .iter()
+        .map(|detail| detail.trim())
+        .find(|detail| !detail.is_empty());
+    if let Some(detail) = durable {
+        if detail == RESUME_CHECKPOINT_DETAIL {
+            if let Some(first) = unpersisted {
+                object.insert("outcome_detail".into(), serde_json::json!(first));
+                object.insert("error".into(), serde_json::json!(first));
+                return;
+            }
+        }
         object.insert("outcome_detail".into(), serde_json::json!(detail));
         return;
     }
-    if let Some(first) = errors
-        .iter()
-        .map(|detail| detail.trim())
-        .find(|detail| !detail.is_empty())
-    {
+    if let Some(first) = unpersisted {
         object.insert("outcome_detail".into(), serde_json::json!(first));
         object.insert("error".into(), serde_json::json!(first));
     }
