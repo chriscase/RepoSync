@@ -31,7 +31,7 @@ use reposync_core::late_pair::{
 };
 use reposync_core::late_pair_publish::{
     publish_admitted_late_pair, resolve_publish_child_id, take_pending_publish_refusal,
-    PublishCredentials,
+    LatePairPublishRefusal, PublishCredentials,
 };
 use reposync_core::pair_refresh::{
     analyze_git_preview, branch_svn_url, build_preview, execute_refusal, execution_requested,
@@ -44,6 +44,10 @@ use reposync_core::svn::SvnClient;
 use crate::api::auth::{validate_session, validate_session_with_role};
 use crate::api::status::AppError;
 use crate::AppState;
+
+#[cfg(test)]
+#[path = "import_failure_persistence.rs"]
+mod import_failure_persistence;
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -1207,6 +1211,106 @@ fn import_write_error(error: DatabaseError) -> AppError {
     }
 }
 
+/// Record a terminal import outcome on the database that already admitted the
+/// operation. Returns the original detail when that write fails. Does not open
+/// another database or acquire a lease.
+fn persist_admitted_outcome(
+    db: &Database,
+    repo_id: &str,
+    operation_id: &str,
+    state: ImportOperationState,
+    detail: &str,
+) -> Option<String> {
+    match db.finish_import_operation(repo_id, operation_id, state, detail) {
+        Ok(_) => None,
+        Err(error) => {
+            error!(
+                repo_id,
+                first_error = detail,
+                error = %error,
+                "failure persistence failed"
+            );
+            Some(detail.to_string())
+        }
+    }
+}
+
+fn note_unpersisted_import_failure(slot: &mut Option<String>, missed: Option<String>) {
+    if slot.is_none() {
+        *slot = missed;
+    }
+}
+
+/// Durable detail wins. An empty durable detail keeps the first in-memory
+/// failure visible without changing lifecycle.
+fn apply_import_failure_evidence(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    outcome_detail: Option<&str>,
+    errors: &[String],
+) {
+    if let Some(detail) = outcome_detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+    {
+        object.insert("outcome_detail".into(), serde_json::json!(detail));
+        return;
+    }
+    if let Some(first) = errors
+        .iter()
+        .map(|detail| detail.trim())
+        .find(|detail| !detail.is_empty())
+    {
+        object.insert("outcome_detail".into(), serde_json::json!(first));
+        object.insert("error".into(), serde_json::json!(first));
+    }
+}
+
+struct ChildAdmissionIdentity<'a> {
+    fingerprint: &'a str,
+    git_branch: &'a str,
+    svn_branch: &'a str,
+}
+
+/// Propagate a child-admission refusal from the admitted handle. A stored
+/// first detail is included only when the latest operation matches this
+/// request's fingerprint, branches, and non-terminal lifecycle. A missing
+/// identity, or a completed operation for another branch, returns only the
+/// current refusal. This does not open a database or repair a lease.
+fn propagate_child_admission_refusal(
+    db: &Database,
+    parent_id: &str,
+    refusal: &LatePairPublishRefusal,
+    identity: Option<ChildAdmissionIdentity<'_>>,
+) -> AppError {
+    let reported = refusal.error_message();
+    let Some(identity) = identity else {
+        return AppError::BadRequest(reported);
+    };
+    if refusal.reason == "database_error" {
+        if let Ok(Some(op)) = db.latest_late_pair_publish_operation(parent_id) {
+            let same_operation = op.target_fingerprint == identity.fingerprint
+                && op.git_branch == identity.git_branch
+                && op.svn_branch == identity.svn_branch
+                && !op.state.is_terminal();
+            if same_operation {
+                if let Some(first) = op
+                    .outcome_detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|detail| !detail.is_empty())
+                {
+                    if first != refusal.detail.trim() && !reported.contains(first) {
+                        return AppError::BadRequest(format!(
+                            "{first}; persistence reported {reported}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    AppError::BadRequest(reported)
+}
+
 struct ImportPreparationGuard<'a> {
     db: &'a Database,
     repo_id: String,
@@ -1687,11 +1791,6 @@ async fn start_repo_import(
     };
     let file_policy = FilePolicy::with_lfs(0, vec![], lfs_threshold_bytes, &[]);
 
-    // 10. Open a separate DB connection for the import task
-    let db_path = data_dir.join("reposync.db");
-    let import_db = Database::new(&db_path)
-        .map_err(|e| AppError::Internal(format!("failed to open db: {}", e)))?;
-
     // 11. Build ImportConfig from repo settings
     let import_config = ImportConfig {
         committer_name: "RepoSync".into(),
@@ -1709,12 +1808,16 @@ async fn start_repo_import(
     let cancel_signal = progress.read().await.cancel_signal.clone();
     let worker_pin = snapshot_pin.clone();
 
-    // 12. Spawn the import task (tracked for graceful shutdown)
+    // 12. Spawn the import task (tracked for graceful shutdown).
+    // The worker uses the database that admitted this operation.
     let state_for_handle = state.clone();
+    let worker_state = state.clone();
     let handle = tokio::spawn(async move {
+        let import_db = &worker_state.db;
         // Hold the busy guard for the entire lifetime of the import so
         // the scheduler skips this repo until we're done.
         let _busy_guard = busy_guard;
+        let mut unpersisted_detail = None;
         let current = import_db.get_import_operation(&repo_id_clone, &worker_operation_id);
         let result = match current {
             Ok(Some(op)) if op.cancel_requested => {
@@ -1734,7 +1837,7 @@ async fn start_repo_import(
                             import::run_snapshot_import(
                                 &svn_client,
                                 &git_client,
-                                &import_db,
+                                import_db,
                                 &file_policy,
                                 &import_config,
                                 &pin,
@@ -1746,7 +1849,7 @@ async fn start_repo_import(
                                 &svn_client,
                                 &git_client,
                                 &identity_mapper,
-                                &import_db,
+                                import_db,
                                 &file_policy,
                                 &import_config,
                                 run_state,
@@ -1778,11 +1881,16 @@ async fn start_repo_import(
                     }
                     Err(e) => {
                         error!(repo_id = %repo_id_clone, error = %e, "import finalization failed");
-                        let _ = import_db.finish_import_operation(
-                            &repo_id_clone,
-                            &worker_operation_id,
-                            ImportOperationState::ReconciliationRequired,
-                            &format!("finalization failed: {e}"),
+                        let detail = format!("finalization failed: {e}");
+                        note_unpersisted_import_failure(
+                            &mut unpersisted_detail,
+                            persist_admitted_outcome(
+                                import_db,
+                                &repo_id_clone,
+                                &worker_operation_id,
+                                ImportOperationState::ReconciliationRequired,
+                                &detail,
+                            ),
                         );
                         ImportPhase::Failed
                     }
@@ -1802,13 +1910,15 @@ async fn start_repo_import(
                 let detail = format!(
                     "stopped after {commits} local commits; published history is not undone"
                 );
-                if let Err(e) = import_db.finish_import_operation(
+                if let Some(missed) = persist_admitted_outcome(
+                    import_db,
                     &repo_id_clone,
                     &worker_operation_id,
                     state,
                     &detail,
                 ) {
-                    error!(repo_id = %repo_id_clone, error = %e, "cancel finalization failed");
+                    error!(repo_id = %repo_id_clone, first_error = %detail, "cancel finalization failed");
+                    note_unpersisted_import_failure(&mut unpersisted_detail, Some(missed));
                     ImportPhase::Failed
                 } else if uncertain {
                     ImportPhase::Failed
@@ -1817,31 +1927,41 @@ async fn start_repo_import(
                 }
             }
             Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
-                if let Err(e) = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::ReconciliationRequired,
-                    &reason,
-                ) {
-                    error!(repo_id = %repo_id_clone, error = %e, "uncertain outcome persistence failed");
-                }
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::ReconciliationRequired,
+                        &reason,
+                    ),
+                );
                 ImportPhase::Failed
             }
             Err(e) => {
+                error!(repo_id = %repo_id_clone, error = %e, "per-repo import failed");
                 let detail = format!("import stopped with error; inspect local work: {e:#}");
-                if let Err(write_error) = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::Failed,
-                    &detail,
-                ) {
-                    error!(repo_id = %repo_id_clone, error = %write_error, "failure persistence failed");
-                }
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::Failed,
+                        &detail,
+                    ),
+                );
                 ImportPhase::Failed
             }
         };
         let mut p = progress.write().await;
         p.phase = terminal;
+        if let Some(detail) = unpersisted_detail {
+            if !p.errors.iter().any(|existing| existing == &detail) {
+                p.errors.push(detail);
+            }
+        }
         p.completed_at = Some(chrono::Utc::now().to_rfc3339());
 
         if let Err(e) = import_db.persist_import_progress(&p) {
@@ -1987,6 +2107,7 @@ async fn repo_import_status(
             "outcome_detail".into(),
             serde_json::json!(op.outcome_detail),
         );
+        apply_import_failure_evidence(object, op.outcome_detail.as_deref(), &p.errors);
         object.insert(
             "resume_authorized".into(),
             serde_json::json!(op.resume_authorized),
@@ -2340,17 +2461,17 @@ async fn resume_repo_import(
         trunk_path: repo.svn_branch.clone(),
     };
 
-    let db_path = data_dir.join("reposync.db");
-    let import_db = Database::new(&db_path)
-        .map_err(|e| AppError::Internal(format!("failed to open db: {e}")))?;
     let ws_broadcast = Some(state.ws_broadcast.clone());
     let repo_id_clone = id.clone();
     let worker_operation_id = operation_id.clone();
     let cancel_signal = progress.read().await.cancel_signal.clone();
     let state_for_handle = state.clone();
+    let worker_state = state.clone();
 
     let handle = tokio::spawn(async move {
+        let import_db = &worker_state.db;
         let _busy_guard = busy_guard;
+        let mut unpersisted_detail = None;
         let result = {
             let run_state = ImportRunState {
                 progress: progress.clone(),
@@ -2363,7 +2484,7 @@ async fn resume_repo_import(
                 &svn_client,
                 &git_client,
                 &identity_mapper,
-                &import_db,
+                import_db,
                 &file_policy,
                 &import_config,
                 run_state,
@@ -2388,11 +2509,16 @@ async fn resume_repo_import(
                     }
                     Err(e) => {
                         error!(repo_id = %repo_id_clone, error = %e, "import resume finalization failed");
-                        let _ = import_db.finish_import_operation(
-                            &repo_id_clone,
-                            &worker_operation_id,
-                            ImportOperationState::ReconciliationRequired,
-                            &format!("finalization failed: {e}"),
+                        let detail = format!("finalization failed: {e}");
+                        note_unpersisted_import_failure(
+                            &mut unpersisted_detail,
+                            persist_admitted_outcome(
+                                import_db,
+                                &repo_id_clone,
+                                &worker_operation_id,
+                                ImportOperationState::ReconciliationRequired,
+                                &detail,
+                            ),
                         );
                         ImportPhase::Failed
                     }
@@ -2412,38 +2538,57 @@ async fn resume_repo_import(
                 let detail = format!(
                     "stopped after {commits} local commits; published history is not undone"
                 );
-                if import_db
-                    .finish_import_operation(&repo_id_clone, &worker_operation_id, state, &detail)
-                    .is_err()
-                    || uncertain
-                {
+                if let Some(missed) = persist_admitted_outcome(
+                    import_db,
+                    &repo_id_clone,
+                    &worker_operation_id,
+                    state,
+                    &detail,
+                ) {
+                    note_unpersisted_import_failure(&mut unpersisted_detail, Some(missed));
+                    ImportPhase::Failed
+                } else if uncertain {
                     ImportPhase::Failed
                 } else {
                     ImportPhase::Cancelled
                 }
             }
             Ok(import::ImportOutcome::ReconciliationRequired { reason, .. }) => {
-                let _ = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::ReconciliationRequired,
-                    &reason,
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::ReconciliationRequired,
+                        &reason,
+                    ),
                 );
                 ImportPhase::Failed
             }
             Err(e) => {
+                error!(repo_id = %repo_id_clone, error = %e, "per-repo import resume failed");
                 let detail = format!("import resume stopped with error: {e:#}");
-                let _ = import_db.finish_import_operation(
-                    &repo_id_clone,
-                    &worker_operation_id,
-                    ImportOperationState::Failed,
-                    &detail,
+                note_unpersisted_import_failure(
+                    &mut unpersisted_detail,
+                    persist_admitted_outcome(
+                        import_db,
+                        &repo_id_clone,
+                        &worker_operation_id,
+                        ImportOperationState::Failed,
+                        &detail,
+                    ),
                 );
                 ImportPhase::Failed
             }
         };
         let mut p = progress.write().await;
         p.phase = terminal;
+        if let Some(detail) = unpersisted_detail {
+            if !p.errors.iter().any(|existing| existing == &detail) {
+                p.errors.push(detail);
+            }
+        }
         p.completed_at = Some(chrono::Utc::now().to_rfc3339());
         let _ = import_db.persist_import_progress(&p);
         if let Some(ref sender) = ws_broadcast {
@@ -3262,7 +3407,18 @@ async fn create_branch_pair(
         &Arc::new(identity_mapper),
     )
     .await
-    .map_err(|refuse| AppError::BadRequest(refuse.error_message()))?;
+    .map_err(|refuse| {
+        propagate_child_admission_refusal(
+            db,
+            &parent.id,
+            &refuse,
+            Some(ChildAdmissionIdentity {
+                fingerprint: &fingerprint,
+                git_branch: &git_branch,
+                svn_branch: &svn_branch,
+            }),
+        )
+    })?;
     if let Some(pending) = take_pending_publish_refusal(&parent.id) {
         return Err(AppError::BadRequest(pending.error_message()));
     }
