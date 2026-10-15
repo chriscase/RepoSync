@@ -4,7 +4,7 @@ import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {test, expect} from "@playwright/test";
 import {assertCompletedPublishRefusal, assertReplayEndpoints, Lab, loginError, type Pair, type Snap} from "../../playwright/runtime.ts";
-import {runCase} from "../../playwright/handlers.ts";
+import {labPairKey, runCase} from "../../playwright/handlers.ts";
 
 const initial: Snap = {svn: "1", git: "a".repeat(40), maps: "1", records: "1", watermark: "1", gitWatermark: "a".repeat(40), gitColumn: "a".repeat(40)};
 const pair: Pair = {id: "fixture", name: "fixture", svnUrl: "https://unused/svn/fixture", gitRepo: "lab/fixture"};
@@ -262,6 +262,75 @@ for (const fault of ["delayed", "duplicate"]) {
     else {await expect(run).rejects.toThrow(); expect(passed).toBe(false);}
   });
 }
+
+test("observed and unobserved rebase ids get different repositories", () => {
+  const observed = labPairKey("GIT-PUBLISHED-REBASE-UNSYNCED-OBSERVED");
+  const unobserved = labPairKey("GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED");
+  expect(observed).not.toBe(unobserved);
+  expect(observed).not.toBe("pgitpublishedrebaseunsync");
+  expect(unobserved).not.toBe("pgitpublishedrebaseunsync");
+  expect(labPairKey("GIT-REVERT-NEW")).toBe("pgitrevertnew");
+});
+
+test("unobserved rebase wait rejects a paused or already-published pair", async () => {
+  const ancestor = "a".repeat(40);
+  const tip = "b".repeat(40);
+  const published = "c".repeat(40);
+  const fresh: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
+  let phase = "fresh";
+  let passed = false;
+  const keys: string[] = [];
+  const snap = (): Snap => {
+    if (phase === "paused") return {...fresh};
+    if (phase === "already-published") return {svn: "5", git: published, maps: "1", records: "4", watermark: "5", gitWatermark: published, gitColumn: published};
+    if (phase === "settled") return {svn: "2", git: tip, maps: "1", records: "2", watermark: "1", gitWatermark: tip, gitColumn: tip};
+    return {...fresh};
+  };
+  const fake: any = {
+    createPair: async (name: string) => {keys.push(name); return {...pair, name, gitRepo: `lab/${name}`, svnUrl: `https://svn:8443/svn/${name}`};},
+    snap: async () => snap(),
+    commitGit: async () => tip,
+    gitCommitsSince: async (_p: Pair, ancestorSha: string) => {expect(ancestorSha).toBe(ancestor); return [tip];},
+    triggerGit: async () => 200,
+    svnBytesOrMissing: async () => phase === "settled" ? "B\n" : phase === "already-published" ? "base\n" : null,
+    sh: async (_service: string, sql: string) => phase === "settled" && sql.includes(tip) ? "1" : "0",
+    waitUntil: async (read: () => Promise<boolean>) => {
+      phase = "paused";
+      expect(await read()).toBe(false);
+      phase = "already-published";
+      expect(await read()).toBe(false);
+      phase = "settled";
+      expect(await read()).toBe(true);
+    },
+    expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {
+      expect(phase).toBe("settled");
+      const baseline = snap();
+      await action();
+      expect(snap()).toEqual(baseline);
+    },
+    pass: () => {passed = true;},
+  };
+  fake.waitOutboundGitHistory = (...args: unknown[]) => Lab.prototype.waitOutboundGitHistory.call(fake, ...(args as [Pair, Snap, string[], string, string]));
+  await runCase(fake, {id: "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED", title: "fixture", suite: "full"});
+  expect(passed).toBe(true);
+  expect(keys).toEqual([labPairKey("GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED")]);
+});
+
+test("an already-published pair cannot start the unobserved rebase", async () => {
+  const published = "c".repeat(40);
+  let waited = false;
+  let passed = false;
+  const fake: any = {
+    createPair: async (name: string) => ({...pair, name}),
+    snap: async () => ({svn: "5", git: published, maps: "1", records: "4", watermark: "5", gitWatermark: published, gitColumn: published}),
+    commitGit: async () => {throw new Error("commit on a reused pair");},
+    waitUntil: async () => {waited = true;},
+    pass: () => {passed = true;},
+  };
+  await expect(runCase(fake, {id: "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED", title: "fixture", suite: "full"})).rejects.toThrow(/fresh import/);
+  expect(waited).toBe(false);
+  expect(passed).toBe(false);
+});
 
 test("login error locator excludes the LDAP domain and requires an actual form error", async ({page}) => {
   await page.setContent(`<div><span>(lab.invalid)</span></div><form><div class="border-red-700"><div><svg></svg><span>invalid username or password</span></div></div><input name="username"><input type="password"><button>Sign in</button></form>`);

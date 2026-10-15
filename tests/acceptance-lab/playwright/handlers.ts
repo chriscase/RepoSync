@@ -5,12 +5,23 @@ function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
 }
 
+// These two ids share the 24-character slug pgitpublishedrebaseunsync. The
+// remainder stays on the pair name so each gets its own repository.
+const ambiguousPairHeads = new Set(["gitpublishedrebaseunsync"]);
+
+export function labPairKey(id: string): string {
+  const body = id.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const head = body.slice(0, 24);
+  if (ambiguousPairHeads.has(head) && body.length > head.length) return `p${body}`;
+  return `p${head}`;
+}
+
 async function team(lab: Lab): Promise<Pair> {
   return sharedPair(lab, "team");
 }
 
 async function own(lab: Lab, op: LabOp): Promise<Pair> {
-  return sharedPair(lab, `p${slug(op.id)}`);
+  return sharedPair(lab, labPairKey(op.id));
 }
 
 async function remoteDeleteCase(lab: Lab, op: LabOp): Promise<void> {
@@ -475,7 +486,18 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
           await lab.waitUntil(async () => (await lab.snap(pair)).svn !== before.svn);
           await lab.commitGit(pair, "git checkout -b pick HEAD~1 || git checkout -b pick\ngit cherry-pick HEAD@{1} || git cherry-pick main\n");
         } else if (op.id === "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED") {
+          if (before.svn !== "1" || before.watermark !== "1" || before.records !== "1" || before.gitWatermark !== before.git || before.gitColumn !== before.git) {
+            throw new Error("unobserved rebase requires a fresh import pair");
+          }
           await lab.commitGit(pair, "printf 'B\\n' > rebase.txt\ngit add rebase.txt\ngit commit -m B\ngit commit --amend -m B2\n");
+          const status = await lab.triggerGit(pair.gitRepo, false);
+          if (status !== 200) throw new Error(`unobserved rebase webhook ${status}`);
+          const commits = await lab.gitCommitsSince(pair, before.git);
+          if (commits.length !== 1) throw new Error(`unobserved rebase published ${commits.length} commits after ${before.git}`);
+          await lab.waitOutboundGitHistory(pair, before, commits, "rebase.txt", "B\n");
+          await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
+          lab.pass("amended unobserved tip published once and the repeat was idle");
+          return;
         } else if (op.id === "GIT-SQUASH-NEW-DESCENDANT") {
           await lab.commitGit(pair, "printf '1\\n' > squash.txt\ngit add squash.txt\ngit commit -m one\nprintf '2\\n' > squash.txt\ngit commit -am two\ngit reset --soft HEAD~2\ngit commit -m squashed\n");
         } else if (op.id === "GIT-REVERT-NEW") {
