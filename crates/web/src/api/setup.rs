@@ -1621,7 +1621,78 @@ async fn reset_and_reimport(
 
 #[cfg(test)]
 mod setup_import_failure_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::apply_setup_import_failure_evidence;
+    use super::spawn_import_task;
+    use crate::AppState;
+    use reposync_core::config::AppConfig;
+    use reposync_core::db::import_operations::ImportOperationState;
+    use reposync_core::db::Database;
+    use reposync_core::git::GitClient;
+    use reposync_core::identity::IdentityMapper;
+    use reposync_core::import::ImportProgress;
+    use reposync_core::models::Repository;
+    use reposync_core::svn::SvnClient;
+    use reposync_core::sync_engine::SyncEngine;
+
+    fn app_error_text(error: crate::api::status::AppError) -> String {
+        match error {
+            crate::api::status::AppError::BadRequest(message)
+            | crate::api::status::AppError::NotFound(message)
+            | crate::api::status::AppError::Unauthorized(message)
+            | crate::api::status::AppError::Forbidden(message)
+            | crate::api::status::AppError::Conflict(message)
+            | crate::api::status::AppError::Internal(message) => message,
+        }
+    }
+
+    struct OpenSubscriber {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl tracing::Subscriber for OpenSubscriber {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "reposync_core::db"
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor { message: None };
+            event.record(&mut visitor);
+            if visitor
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("opening database"))
+            {
+                self.opens.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    struct MessageVisitor {
+        message: Option<String>,
+    }
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            }
+        }
+    }
 
     #[test]
     fn empty_durable_detail_keeps_the_first_setup_failure() {
@@ -1653,5 +1724,140 @@ mod setup_import_failure_tests {
             "import stopped with error; inspect local work: setup first"
         );
         assert!(object.get("error").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn setup_worker_reuses_admitted_database_when_cancel_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reposync.db");
+        let db = Database::new(&db_path).unwrap();
+        db.initialize().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: "setup-repo".into(),
+            name: "setup".into(),
+            svn_url: "file:///nonexistent".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "gitea".into(),
+            git_api_url: "file:///nonexistent".into(),
+            git_repo: "local/setup".into(),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 30,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled: false,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 0,
+            last_git_sha: String::new(),
+            last_sync_at: None,
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        let operation = db
+            .create_import_operation("setup-repo", "setup-wizard", "request", "fingerprint")
+            .unwrap();
+        db.request_import_cancel("setup-repo", &operation.id)
+            .unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"file:///nonexistent\"\nusername = \"fixture\"\n[github]\nrepo = \"local/setup\"\n",
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+        let config = AppConfig::load_from_file(&config_path).unwrap();
+        let git_repo = dir.path().join("git-repo");
+        std::fs::create_dir_all(&git_repo).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&git_repo)
+            .status()
+            .unwrap()
+            .success());
+        let dummy = dir.path().join("dummy-git");
+        std::fs::create_dir_all(&dummy).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dummy)
+            .status()
+            .unwrap()
+            .success());
+        let engine = SyncEngine::new(
+            config.clone(),
+            Database::in_memory().unwrap(),
+            SvnClient::new("file:///nonexistent", "fixture", ""),
+            GitClient::new(&dummy).unwrap(),
+            Arc::new(
+                IdentityMapper::new(&reposync_core::config::IdentityConfig::default()).unwrap(),
+            ),
+        );
+        let (trigger, _rx) = tokio::sync::mpsc::channel(1);
+        let (ws, _) = tokio::sync::broadcast::channel(1);
+        let state = Arc::new(AppState {
+            db,
+            sync_engine: Arc::new(engine),
+            config,
+            sync_trigger: trigger,
+            ws_broadcast: ws,
+            sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+            config_path,
+            prev_net_snapshot: std::sync::Mutex::new(None),
+            repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            import_handles: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let opens = Arc::new(AtomicUsize::new(0));
+        let _tracing = tracing::subscriber::set_default(OpenSubscriber {
+            opens: opens.clone(),
+        });
+        let busy = reposync_core::busy::try_acquire("setup-repo").unwrap();
+        if let Err(error) =
+            spawn_import_task(&state, "setup-repo".into(), operation.id.clone(), busy).await
+        {
+            panic!(
+                "setup import worker was not started: {}",
+                app_error_text(error)
+            );
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let stored = loop {
+            let current = state
+                .db
+                .get_import_operation("setup-repo", &operation.id)
+                .unwrap()
+                .unwrap();
+            if current.state == ImportOperationState::Cancelled {
+                break current;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "setup worker did not persist cancellation on the admitted database: {:?}",
+                current.state
+            );
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(
+            stored.outcome_detail.as_deref(),
+            Some("stopped after 0 local commits; published history is not undone")
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            0,
+            "failure persistence must reuse the admitted database instead of opening another"
+        );
     }
 }

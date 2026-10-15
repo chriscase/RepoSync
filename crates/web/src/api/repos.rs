@@ -1265,27 +1265,45 @@ fn apply_import_failure_evidence(
     }
 }
 
+struct ChildAdmissionIdentity<'a> {
+    fingerprint: &'a str,
+    git_branch: &'a str,
+    svn_branch: &'a str,
+}
+
 /// Propagate a child-admission refusal from the admitted handle. A stored
-/// first detail stays in front of a later database-lock refusal. This does
-/// not open a database or repair a lease.
+/// first detail is included only when the latest operation matches this
+/// request's fingerprint, branches, and non-terminal lifecycle. A missing
+/// identity, or a completed operation for another branch, returns only the
+/// current refusal. This does not open a database or repair a lease.
 fn propagate_child_admission_refusal(
     db: &Database,
     parent_id: &str,
     refusal: &LatePairPublishRefusal,
+    identity: Option<ChildAdmissionIdentity<'_>>,
 ) -> AppError {
     let reported = refusal.error_message();
+    let Some(identity) = identity else {
+        return AppError::BadRequest(reported);
+    };
     if refusal.reason == "database_error" {
         if let Ok(Some(op)) = db.latest_late_pair_publish_operation(parent_id) {
-            if let Some(first) = op
-                .outcome_detail
-                .as_deref()
-                .map(str::trim)
-                .filter(|detail| !detail.is_empty())
-            {
-                if first != refusal.detail.trim() && !reported.contains(first) {
-                    return AppError::BadRequest(format!(
-                        "{first}; persistence reported {reported}"
-                    ));
+            let same_operation = op.target_fingerprint == identity.fingerprint
+                && op.git_branch == identity.git_branch
+                && op.svn_branch == identity.svn_branch
+                && !op.state.is_terminal();
+            if same_operation {
+                if let Some(first) = op
+                    .outcome_detail
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|detail| !detail.is_empty())
+                {
+                    if first != refusal.detail.trim() && !reported.contains(first) {
+                        return AppError::BadRequest(format!(
+                            "{first}; persistence reported {reported}"
+                        ));
+                    }
                 }
             }
         }
@@ -3389,7 +3407,18 @@ async fn create_branch_pair(
         &Arc::new(identity_mapper),
     )
     .await
-    .map_err(|refuse| propagate_child_admission_refusal(db, &parent.id, &refuse))?;
+    .map_err(|refuse| {
+        propagate_child_admission_refusal(
+            db,
+            &parent.id,
+            &refuse,
+            Some(ChildAdmissionIdentity {
+                fingerprint: &fingerprint,
+                git_branch: &git_branch,
+                svn_branch: &svn_branch,
+            }),
+        )
+    })?;
     if let Some(pending) = take_pending_publish_refusal(&parent.id) {
         return Err(AppError::BadRequest(pending.error_message()));
     }
