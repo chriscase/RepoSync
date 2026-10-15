@@ -1258,7 +1258,7 @@ async fn spawn_import_task(
                             &svn_client,
                             &git_client,
                             &identity_mapper,
-                            &import_db,
+                            import_db,
                             &file_policy,
                             &import_config,
                             import::ImportRunState {
