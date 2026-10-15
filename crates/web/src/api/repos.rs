@@ -1246,7 +1246,9 @@ fn note_unpersisted_import_failure(slot: &mut Option<String>, missed: Option<Str
 const RESUME_CHECKPOINT_DETAIL: &str = "Resuming import from durable checkpoint";
 
 /// A stored failure detail wins. The resume checkpoint note does not: an
-/// unpersisted failure is shown instead. This does not rewrite lifecycle.
+/// unpersisted failure from `errors` is shown instead. `errors` must be this
+/// attempt only; resume clears the reused progress list when it starts.
+/// Lifecycle on `object` is left unchanged.
 fn apply_import_failure_evidence(
     object: &mut serde_json::Map<String, serde_json::Value>,
     outcome_detail: Option<&str>,
@@ -2414,6 +2416,11 @@ async fn resume_repo_import(
         p.commits_created = resumed.local_commits;
         p.batches_pushed = resumed.confirmed_batches;
         p.current_rev = resumed.processed_revisions as i64;
+        // This Arc outlives the previous attempt. Drop its errors so a healthy
+        // resume is not labeled with that history, and so a new unpersisted
+        // failure is the first error for this attempt. Durable outcome detail
+        // is unchanged here.
+        p.errors.clear();
     }
 
     let svn_password_repo = db

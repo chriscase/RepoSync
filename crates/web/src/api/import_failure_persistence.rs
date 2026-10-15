@@ -1,7 +1,7 @@
 use super::{
     apply_import_failure_evidence, persist_admitted_outcome, propagate_child_admission_refusal,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::api::status::AppError;
@@ -655,16 +655,21 @@ fn authorize_partial_resume(db: &Database, repo_id: &str) -> String {
     operation.id
 }
 
-fn fail_resume_terminal_write_once(db: &Database, operation_id: &str) {
+/// Abort every update that would store the resume failure detail.
+///
+/// The trigger stays installed. It is not removed after it fires, and a later
+/// write of that detail would abort too. The handler attempts the terminal
+/// write once. This does not show that a later write would succeed.
+fn abort_resume_failure_terminal_writes(db: &Database, operation_id: &str) {
     let key = format!("import_operation_v1:document:{operation_id}");
     db.conn()
         .execute_batch(&format!(
-            "CREATE TRIGGER fail_resume_terminal_write_once
+            "CREATE TRIGGER abort_resume_failure_terminal_writes
              BEFORE UPDATE ON kv_state
              WHEN NEW.key = '{key}'
               AND instr(NEW.value, 'import resume stopped with error') > 0
              BEGIN
-               SELECT RAISE(ABORT, 'terminal write failed once');
+               SELECT RAISE(ABORT, 'resume failure terminal write aborted');
              END;"
         ))
         .unwrap();
@@ -710,7 +715,7 @@ async fn resume_handler_shows_unpersisted_failure_when_terminal_write_fails_once
     })
     .unwrap();
     let operation_id = authorize_partial_resume(&db, repo_id);
-    fail_resume_terminal_write_once(&db, &operation_id);
+    abort_resume_failure_terminal_writes(&db, &operation_id);
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
@@ -830,6 +835,275 @@ async fn resume_handler_shows_unpersisted_failure_when_terminal_write_fails_once
         "{detail}"
     );
     assert_eq!(status.0["error"], status.0["outcome_detail"]);
+    assert_eq!(status.0["phase"], "failed");
+    assert_eq!(status.0["lifecycle"], "running");
+    let stored = state
+        .db
+        .get_import_operation(repo_id, &operation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, ImportOperationState::Running);
+    assert_eq!(
+        stored.outcome_detail.as_deref(),
+        Some("Resuming import from durable checkpoint")
+    );
+}
+
+/// Accept one SVN connection and hold it until `release` is signaled.
+/// Dropping the socket then makes that attempt fail.
+struct HeldSvn {
+    port: u16,
+    release: std::sync::mpsc::Sender<()>,
+    accepted: Arc<AtomicBool>,
+}
+
+impl HeldSvn {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let flag = accepted.clone();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            if release_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    flag.store(true, Ordering::SeqCst);
+                    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                    let mut buf = [0_u8; 2048];
+                    let _ = std::io::Read::read(&mut sock, &mut buf);
+                    let _ = release_rx.recv();
+                    let _ = sock.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        });
+        Self {
+            port,
+            release,
+            accepted,
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resume_status_ignores_previous_attempt_error_then_shows_current_failure() {
+    const PREVIOUS: &str = "previous-attempt-error: stale checkpoint export";
+    let held = HeldSvn::start();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reposync.db");
+    let db = Database::new(&db_path).unwrap();
+    db.initialize().unwrap();
+    let repo_id = "repo-resume-current";
+    let svn_url = format!("http://127.0.0.1:{}/import", held.port);
+    let now = chrono::Utc::now().to_rfc3339();
+    db.insert_repository(&Repository {
+        id: repo_id.into(),
+        name: "resume".into(),
+        svn_url: svn_url.clone(),
+        svn_branch: "trunk".into(),
+        svn_username: "fixture".into(),
+        git_provider: "gitea".into(),
+        git_api_url: format!("file://{}", dir.path().display()),
+        git_repo: "empty".into(),
+        git_branch: "main".into(),
+        sync_mode: "team".into(),
+        poll_interval_secs: 30,
+        lfs_threshold_mb: 0,
+        auto_merge: false,
+        enabled: false,
+        created_by: None,
+        parent_id: None,
+        created_at: now.clone(),
+        updated_at: now,
+        last_svn_rev: 0,
+        last_git_sha: String::new(),
+        last_sync_at: None,
+        sync_status: "idle".into(),
+        total_syncs: 0,
+        total_errors: 0,
+        allowed_paths: None,
+        blocked_patterns: None,
+        consecutive_errors: 0,
+        teams_webhook_url: None,
+    })
+    .unwrap();
+    let operation_id = authorize_partial_resume(&db, repo_id);
+    abort_resume_failure_terminal_writes(&db, &operation_id);
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[daemon]\ndata_dir = \"{}\"\n[svn]\nurl = \"{svn_url}\"\nusername = \"fixture\"\n[github]\nrepo = \"local/resume\"\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let mut config = AppConfig::load_from_file(&config_path).unwrap();
+    config.web.admin_password = Some("secret".into());
+    let bare = dir.path().join("empty.git");
+    assert!(std::process::Command::new("git")
+        .args(["init", "--bare", bare.to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    let git_repo = dir.path().join("repos").join(repo_id).join("git-repo");
+    std::fs::create_dir_all(&git_repo).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "--initial-branch", "main"])
+        .current_dir(&git_repo)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .args(["remote", "add", "origin", bare.to_str().unwrap()])
+        .current_dir(&git_repo)
+        .status()
+        .unwrap()
+        .success());
+    let dummy = dir.path().join("dummy-git");
+    std::fs::create_dir_all(&dummy).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&dummy)
+        .status()
+        .unwrap()
+        .success());
+    let engine = SyncEngine::new(
+        config.clone(),
+        Database::in_memory().unwrap(),
+        SvnClient::new(&svn_url, "fixture", ""),
+        GitClient::new(&dummy).unwrap(),
+        Arc::new(IdentityMapper::new(&reposync_core::config::IdentityConfig::default()).unwrap()),
+    );
+    let (trigger, _rx) = tokio::sync::mpsc::channel(1);
+    let (ws, _) = tokio::sync::broadcast::channel(1);
+    let state = Arc::new(AppState {
+        db,
+        sync_engine: Arc::new(engine),
+        config,
+        sync_trigger: trigger,
+        ws_broadcast: ws,
+        sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+        config_path,
+        prev_net_snapshot: std::sync::Mutex::new(None),
+        repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+        import_handles: tokio::sync::Mutex::new(Vec::new()),
+    });
+    {
+        let progress = state.get_repo_import_progress(repo_id).await;
+        let mut current = progress.write().await;
+        current.phase = ImportPhase::Failed;
+        current.errors.push(PREVIOUS.into());
+    }
+    state.sessions.write().await.insert(
+        "token".into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer token"),
+    );
+    let resumed = super::resume_repo_import(
+        State(state.clone()),
+        headers.clone(),
+        Path((repo_id.into(), operation_id.clone())),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("resume handler refused: {}", app_error_message(error)));
+    assert_eq!(resumed.0["ok"], true);
+    assert_eq!(resumed.0["lifecycle"], "running");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if held.accepted.load(Ordering::SeqCst) {
+            break;
+        }
+        let progress = state.get_repo_import_progress(repo_id).await;
+        let current = progress.read().await;
+        assert!(
+            current.phase != ImportPhase::Failed,
+            "resumed worker failed before the healthy status check: {:?}",
+            current.errors
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "svn client did not connect during the healthy resume"
+        );
+        drop(current);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let healthy =
+        super::repo_import_status(State(state.clone()), headers.clone(), Path(repo_id.into()))
+            .await
+            .unwrap_or_else(|error| panic!("status handler failed: {}", app_error_message(error)));
+    assert_eq!(
+        healthy.0["outcome_detail"],
+        "Resuming import from durable checkpoint"
+    );
+    assert!(healthy.0.get("error").is_none());
+    assert_eq!(healthy.0["errors"].as_array().map(Vec::len), Some(0));
+    assert_eq!(healthy.0["lifecycle"], "running");
+    assert_eq!(healthy.0["phase"], "importing");
+    assert!(
+        !healthy.0.to_string().contains(PREVIOUS),
+        "healthy resume showed the previous attempt: {}",
+        healthy.0
+    );
+    held.release.send(()).unwrap();
+    let failure_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let current_failure = loop {
+        let progress = state.get_repo_import_progress(repo_id).await;
+        let current = progress.read().await;
+        if current.phase == ImportPhase::Failed {
+            let detail = current
+                .errors
+                .iter()
+                .find(|detail| detail.starts_with("import resume stopped with error:"))
+                .cloned()
+                .unwrap_or_else(|| panic!("current failure missing: {:?}", current.errors));
+            assert!(
+                !current
+                    .errors
+                    .iter()
+                    .any(|detail| detail.contains(PREVIOUS)),
+                "previous attempt still in progress errors: {:?}",
+                current.errors
+            );
+            break detail;
+        }
+        assert!(
+            tokio::time::Instant::now() < failure_deadline,
+            "current resume did not fail: {:?}",
+            current.phase
+        );
+        drop(current);
+        tokio::task::yield_now().await;
+    };
+    let status = super::repo_import_status(State(state.clone()), headers, Path(repo_id.into()))
+        .await
+        .unwrap_or_else(|error| panic!("status handler failed: {}", app_error_message(error)));
+    assert_eq!(status.0["outcome_detail"], current_failure.trim());
+    assert!(current_failure.trim().contains("failed to get SVN info"));
+    assert_eq!(status.0["error"], status.0["outcome_detail"]);
+    assert!(
+        !status.0.to_string().contains(PREVIOUS),
+        "current failure status showed the previous attempt: {}",
+        status.0
+    );
+    assert_ne!(
+        status.0["outcome_detail"],
+        "Resuming import from durable checkpoint"
+    );
     assert_eq!(status.0["phase"], "failed");
     assert_eq!(status.0["lifecycle"], "running");
     let stored = state
