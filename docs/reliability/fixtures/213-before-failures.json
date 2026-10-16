@@ -1,0 +1,897 @@
+{
+  "before": {
+    "artifact_id": 12047251189,
+    "catalog_count": 2263,
+    "checkout": "adde0a2a763b4ac510f1f7261e9a4091f7068ae4",
+    "run": 38899116945,
+    "source_head": "af5b169644590cd59f8e09f3932909e3247c9dc0",
+    "source_tree": "0d9d37853e0df188bb5ec84752d0c78adda46caf",
+    "totals": {
+      "failed": 173,
+      "filtered_out": 0,
+      "ignored": 2,
+      "passed": 2088
+    },
+    "zip_sha256": "b6d63be5ab01dba2403ee02897b9c93fc20ae38b73959b14ecacd582b0e3d45c"
+  },
+  "classification_counts": {
+    "auth_fixture_and_application_paths": 9,
+    "git_author_identity": 1,
+    "native_machine_identity": 2,
+    "pair_refresh_http_fixture": 154,
+    "svn_author_identity": 1,
+    "unresolved_assertion": 6
+  },
+  "entries": [
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "adversarial_188_personal_auth::authenticated_personal_clone_must_remain_usable_by_history_gate"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "cli_fresh_clone_revocation::cli_import_respects_fresh_clone_revocation"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "cli_initial_writer_window::cli_import_holds_exclusion_before_clone_and_existing_checkout_authentication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "fresh_clone_revocation::personal_import_respects_fresh_clone_revocation"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "fresh_clone_revocation::personal_sync_respects_fresh_clone_revocation"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "git_author_identity",
+      "test": "integration::test_personal_git_to_svn_rename_removes_source"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "svn_author_identity",
+      "test": "managed_import_commit_map::managed_imports_tag_commit_map_repo_id"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "unresolved_assertion",
+      "test": "pair_refresh_import_exclusion::rejected_legacy_publication_retains_exclusion_without_retry_or_checkpoint_advance"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "unresolved_assertion",
+      "test": "pair_refresh_legacy_batches::cancellation_during_final_push_confirms_its_exact_tip_and_checkpoints_before_release"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "unresolved_assertion",
+      "test": "pair_refresh_legacy_batches::rejected_intermediate_batch_is_an_error_with_one_attempt_and_no_managed_receipt"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "unresolved_assertion",
+      "test": "pair_refresh_publication::receiver_rejection_is_not_a_publication_receipt"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "unresolved_assertion",
+      "test": "pair_refresh_publication::ref_move_after_advertisement_is_rejected_by_receive_pack"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "personal_initial_writer_window::personal_import_holds_exclusion_before_clone_and_existing_checkout_authentication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "personal_initial_writer_window::personal_sync_holds_exclusion_before_clone_and_existing_checkout_authentication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "replay_publish_67::clean_path_inspect_fetched_history_authenticates_http_git"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "auth_fixture_and_application_paths",
+      "test": "replay_publish_67::replay_pending_git_inspect_team_history_http_auth"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::git_sources::tests::either_ref_drift_and_missing_ref_refuse_the_registered_checkpoint"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::git_sources::tests::explicit_child_access_never_substitutes_the_parent_token_or_downloaded_objects"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::git_sources::tests::production_client_keeps_normal_certificate_verification"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::git_sources::tests::redirects_refuse_without_contacting_the_substituted_endpoint"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::git_sources::tests::registered_sources_download_complete_graphs_without_refs_or_receive_pack"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::actual_owned_preparation_enrolls_atomically_and_blocks_every_logical_writer"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::altered_missing_and_orphan_authority_cannot_downgrade_the_global_hold"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::authenticated_pre_intent_cancellation_returns_a_signed_durable_idempotent_receipt"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::authenticated_recovery_claim_refuses_live_or_unknown_owner_and_foreign_lock"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::authenticated_request_lookup_is_read_only_scoped_and_rejects_corruption_and_logout"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::complete_owned_refresh_preserves_histories_and_atomically_advances_only_child"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::denied_svn_intent_and_absence_observation_never_authorize_a_retry"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::exact_copied_authenticated_storage_cannot_inherit_the_original_hold_authority"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::failed_authority_insert_rolls_back_key_and_every_enrollment_row"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::first_copy_noop_is_atomic_authenticated_and_cannot_become_a_publication_job"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::independent_journal_key_survives_session_and_fingerprint_rotation_but_never_repairs_itself"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::known_refusals_leave_key_job_request_and_holds_absent"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::native_claim_crash_tests::native_recovery_refuses_unbound_or_foreign_native_lease_even_with_matching_epoch_pid"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::native_claim_crash_tests::native_recovery_survives_two_interrupted_claims_before_transfer"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::native_worker_exit_recovers_prepared_and_both_uncertain_publication_intents"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::new_epoch_and_unknown_or_live_native_owner_cannot_adopt_signed_resources"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::next_owned_refresh_uses_its_signed_completed_baseline_and_preserves_copy_origin"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::noop_refuses_git_and_svn_drift_without_establishing_receipt_authority"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::noop_refuses_revocation_session_loss_competing_window_unknown_history_and_foreign_busy"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::ordinary_startup_and_unproved_claim_preserve_a_valid_authenticated_hold"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::original_owner_observes_lost_svn_and_git_receipts_without_republication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_finishes_a_disconnected_request_without_republication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_native_restart_handles_prepared_and_uncertain_svn_git"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_recovery_refuses_live_owner_without_claim_or_transfer"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_releases_busy_after_revoked_credentials_refuse_before_admission"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_retains_preparation_and_returns_exact_publication_and_noop_receipts"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_shutdown_joins_an_authorized_publication_before_returning"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_single_flights_requests_and_binds_terminal_receipts_to_approval"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_svn_stage_commits_once_and_keeps_global_exclusion_for_git_completion"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::protected_git_ref_retains_the_svn_result_without_retrying_a_push"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::qualified_engine_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::qualified_git_origin_engine_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::receipt_restart::qualified_real_engine_receipt_restart_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::restart::qualified_real_engine_restart_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::recovery_server_fence_lifetime_preserves_held_epoch_and_cleans_only_terminal_state"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::signed_noop_history_does_not_replace_the_copy_baseline_for_a_later_real_integration"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::unchanged_parent_after_completion_returns_a_distinct_signed_noop_without_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::unfinished_unregistered_journal_and_unknown_family_version_refuse_without_key_repair"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::unhandled_svn_drift_before_first_intent_keeps_a_cancellable_prepared_job"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::authenticated_enrollment_tests::unrelated_ordinary_window_refuses_authenticated_enrollment"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::tests::first_preparation_computes_both_results_without_publication_or_admission"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::tests::first_preparation_refuses_child_commit_after_original_copy_even_with_equal_bytes"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::tests::first_preparation_refuses_equal_tree_child_without_shared_current_commit"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::tests::full_preparation_refuses_cross_scm_tree_disagreement_and_registration_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::tests::newly_admitted_ordinary_writer_refuses_preparation_without_releasing_its_hold"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::tests::next_preparation_uses_real_completed_receipt_and_preserves_original_copy"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::workspace_tests::prepared_objects_and_working_copy_share_one_owned_retained_resource_root"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::workspace_tests::replaced_git_resource_role_is_not_used_retained_or_deleted"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::live_preparation::workspace_tests::source_drift_refuses_owned_preparation_without_a_job_or_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "native_machine_identity",
+      "test": "reposync-core::pair_refresh::native_owner::tests::actual_native_child_requires_esrch_in_the_same_stable_namespace"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::fixture_trust_requires_exact_certificate_pin"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::git_to_http_rewrite_does_not_contact_server_or_present_token"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::http_advertisement_race"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::http_ancestor_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::http_endpoint_rewrite_refuses_before_contacting_either_server"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::http_exact_tip"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::http_missing_credential_refuses_without_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::http_second_parent_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_advertisement_race"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_ancestor_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_exact_tip"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_recovery_observes_old_and_published_tips_without_receive_pack_or_token_persistence"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_recovery_redirect_refuses_without_contacting_destination"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_second_parent_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::https_token_uses_pinned_client_without_persisting_credentials"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::initial_redirect_refuses_before_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::noncanonical_url_cannot_publish_another_repository_or_present_token"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::production_cleartext_http_refuses_before_contact_or_token_disclosure"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::production_https_ignores_inherited_proxy_with_observed_positive_control"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::production_recovery_refuses_cleartext_and_untrusted_tls_without_token_contact"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::production_tls_rejects_untrusted_fixture_certificate"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::recovery_refuses_aliases_and_rewrites_before_contact_or_token"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync-core::pair_refresh::publication::http_tests::verification_redirect_reports_uncertain_published_outcome"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::git_sources::tests::either_ref_drift_and_missing_ref_refuse_the_registered_checkpoint"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::git_sources::tests::explicit_child_access_never_substitutes_the_parent_token_or_downloaded_objects"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::git_sources::tests::production_client_keeps_normal_certificate_verification"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::git_sources::tests::redirects_refuse_without_contacting_the_substituted_endpoint"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::git_sources::tests::registered_sources_download_complete_graphs_without_refs_or_receive_pack"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::actual_owned_preparation_enrolls_atomically_and_blocks_every_logical_writer"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::altered_missing_and_orphan_authority_cannot_downgrade_the_global_hold"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::authenticated_pre_intent_cancellation_returns_a_signed_durable_idempotent_receipt"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::authenticated_recovery_claim_refuses_live_or_unknown_owner_and_foreign_lock"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::authenticated_request_lookup_is_read_only_scoped_and_rejects_corruption_and_logout"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::complete_owned_refresh_preserves_histories_and_atomically_advances_only_child"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::denied_svn_intent_and_absence_observation_never_authorize_a_retry"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::exact_copied_authenticated_storage_cannot_inherit_the_original_hold_authority"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::failed_authority_insert_rolls_back_key_and_every_enrollment_row"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::first_copy_noop_is_atomic_authenticated_and_cannot_become_a_publication_job"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::independent_journal_key_survives_session_and_fingerprint_rotation_but_never_repairs_itself"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::known_refusals_leave_key_job_request_and_holds_absent"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::native_claim_crash_tests::native_recovery_refuses_unbound_or_foreign_native_lease_even_with_matching_epoch_pid"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::native_claim_crash_tests::native_recovery_survives_two_interrupted_claims_before_transfer"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::native_worker_exit_recovers_prepared_and_both_uncertain_publication_intents"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::new_epoch_and_unknown_or_live_native_owner_cannot_adopt_signed_resources"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::next_owned_refresh_uses_its_signed_completed_baseline_and_preserves_copy_origin"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::noop_refuses_git_and_svn_drift_without_establishing_receipt_authority"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::noop_refuses_revocation_session_loss_competing_window_unknown_history_and_foreign_busy"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::ordinary_startup_and_unproved_claim_preserve_a_valid_authenticated_hold"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::original_owner_observes_lost_svn_and_git_receipts_without_republication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_finishes_a_disconnected_request_without_republication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_native_restart_handles_prepared_and_uncertain_svn_git"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_recovery_refuses_live_owner_without_claim_or_transfer"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_releases_busy_after_revoked_credentials_refuse_before_admission"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_retains_preparation_and_returns_exact_publication_and_noop_receipts"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_shutdown_joins_an_authorized_publication_before_returning"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_service_single_flights_requests_and_binds_terminal_receipts_to_approval"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::owned_svn_stage_commits_once_and_keeps_global_exclusion_for_git_completion"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::protected_git_ref_retains_the_svn_result_without_retrying_a_push"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::qualified_engine_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::qualified_git_origin_engine_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::receipt_restart::qualified_real_engine_receipt_restart_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::real_engine_refresh_tests::restart::qualified_real_engine_restart_driver"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::recovery_server_fence_lifetime_preserves_held_epoch_and_cleans_only_terminal_state"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::signed_noop_history_does_not_replace_the_copy_baseline_for_a_later_real_integration"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::unchanged_parent_after_completion_returns_a_distinct_signed_noop_without_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::unfinished_unregistered_journal_and_unknown_family_version_refuse_without_key_repair"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::unhandled_svn_drift_before_first_intent_keeps_a_cancellable_prepared_job"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::authenticated_enrollment_tests::unrelated_ordinary_window_refuses_authenticated_enrollment"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::tests::first_preparation_computes_both_results_without_publication_or_admission"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::tests::first_preparation_refuses_child_commit_after_original_copy_even_with_equal_bytes"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::tests::first_preparation_refuses_equal_tree_child_without_shared_current_commit"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::tests::full_preparation_refuses_cross_scm_tree_disagreement_and_registration_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::tests::newly_admitted_ordinary_writer_refuses_preparation_without_releasing_its_hold"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::tests::next_preparation_uses_real_completed_receipt_and_preserves_original_copy"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::workspace_tests::prepared_objects_and_working_copy_share_one_owned_retained_resource_root"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::workspace_tests::replaced_git_resource_role_is_not_used_retained_or_deleted"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::live_preparation::workspace_tests::source_drift_refuses_owned_preparation_without_a_job_or_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "native_machine_identity",
+      "test": "reposync_core::pair_refresh::native_owner::tests::actual_native_child_requires_esrch_in_the_same_stable_namespace"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::fixture_trust_requires_exact_certificate_pin"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::git_to_http_rewrite_does_not_contact_server_or_present_token"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::http_advertisement_race"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::http_ancestor_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::http_endpoint_rewrite_refuses_before_contacting_either_server"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::http_exact_tip"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::http_missing_credential_refuses_without_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::http_second_parent_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_advertisement_race"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_ancestor_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_exact_tip"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_recovery_observes_old_and_published_tips_without_receive_pack_or_token_persistence"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_recovery_redirect_refuses_without_contacting_destination"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_second_parent_drift"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::https_token_uses_pinned_client_without_persisting_credentials"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::initial_redirect_refuses_before_publication"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::noncanonical_url_cannot_publish_another_repository_or_present_token"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::production_cleartext_http_refuses_before_contact_or_token_disclosure"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::production_https_ignores_inherited_proxy_with_observed_positive_control"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::production_recovery_refuses_cleartext_and_untrusted_tls_without_token_contact"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::production_tls_rejects_untrusted_fixture_certificate"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::recovery_refuses_aliases_and_rewrites_before_contact_or_token"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "pair_refresh_http_fixture",
+      "test": "reposync_core::pair_refresh::publication::http_tests::verification_redirect_reports_uncertain_published_outcome"
+    },
+    {
+      "before": "FAILED",
+      "prerequisite": "unresolved_assertion",
+      "test": "setup_wizard_busy::candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds"
+    }
+  ],
+  "qualification": "Before classifications describe observed failures, not proof of correction. All six unresolved assertions remain FAIL until fresh execution establishes their behavior. Exact names and all historical MISSING identities are preserved.",
+  "refs": [
+    213,
+    62
+  ]
+}

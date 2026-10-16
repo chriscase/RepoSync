@@ -105,20 +105,98 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def assert_runtime_source_isolation(src=Path("/src")):
-    """Allow UI assets and empty compile-path ancestors, never Rust source."""
-    if not src.exists():
-        return
-    assert not src.is_symlink(), "runtime source root is a symlink"
-    top_level = sorted(p.name for p in src.iterdir())
-    assert top_level == ["crates", "web-ui"], f"unexpected /src in runtime: {top_level}"
-    crates, web = src / "crates", src / "crates/web"
-    assert not crates.is_symlink() and crates.is_dir(), "invalid empty crate ancestor"
-    assert sorted(p.name for p in crates.iterdir()) == ["web"], "runtime contains another crate"
-    assert not web.is_symlink() and web.is_dir() and not list(web.iterdir()), "runtime web ancestor is not empty"
-    forbidden = ("Cargo.toml", "Dockerfile.reliability", "scripts", "docs")
-    for name in forbidden:
-        assert not (src / name).exists(), "full source checkout was mounted into runtime"
+def assert_runtime_source_isolation(src=Path("/src"), tests=TESTS):
+    """Permit only UI assets, two fixture scripts and two executable aliases."""
+    fixtures = ("git_http_auth_server.py", "pair_refresh_http_server.py")
+    applications = ("reposync", "reposync-personal")
+    def directory(path, names):
+        assert not path.is_symlink() and path.is_dir(), f"invalid runtime directory: {path}"
+        assert sorted(p.name for p in path.iterdir()) == sorted(names), f"unexpected runtime content: {path}"
+    directory(src, ("crates", "target", "web-ui"))
+    directory(src / "crates", ("cli", "core", "personal", "web"))
+    for name in ("cli", "personal", "web"):
+        directory(src / "crates" / name, ())
+    directory(src / "crates/core", ("tests",))
+    directory(src / "crates/core/tests", ("fixtures",))
+    fixture_root = src / "crates/core/tests/fixtures"
+    directory(fixture_root, fixtures)
+    directory(src / "target", ("debug",))
+    directory(src / "target/debug", applications)
+    assert not tests.is_symlink() and tests.is_dir(), "invalid application package root"
+    inputs = json.loads((tests / "runtime-inputs.json").read_text())
+    assert set(inputs) == {"applications", "fixtures"}, "unknown runtime input group"
+    assert set(inputs["applications"]) == set(applications), "missing/extra runtime application"
+    assert set(inputs["fixtures"]) == set(fixtures), "missing/extra runtime fixture"
+    for name in fixtures:
+        path = fixture_root / name
+        assert not path.is_symlink() and path.is_file(), f"invalid fixture: {name}"
+        assert digest(path.read_bytes()) == inputs["fixtures"][name]["sha256"], f"fixture digest mismatch: {name}"
+    for name in applications:
+        item = inputs["applications"][name]
+        binary = tests / name
+        assert item["path"] == name, "application path escaped package"
+        assert not binary.is_symlink() and binary.is_file(), f"invalid packaged application: {name}"
+        assert os.access(binary, os.X_OK), f"application is not executable: {name}"
+        assert digest(binary.read_bytes()) == item["sha256"], f"application digest mismatch: {name}"
+        alias = src / "target/debug" / name
+        assert alias.is_symlink() and os.readlink(alias) == str(binary), f"application alias escaped package: {name}"
+    return inputs
+
+
+def runtime_prerequisites(inputs):
+    """Record owned execution and real native identity without weakening mounts."""
+    import pwd
+    import stat
+    import uuid
+    import shutil
+    identity = pwd.getpwuid(os.getuid())
+    assert (os.getuid(), os.getgid(), identity.pw_name) == (65532, 65532, "fixture")
+    machine = Path("/etc/machine-id")
+    info = machine.lstat()
+    value = machine.read_text().strip()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+    assert value == "21300000000040008000000000000001", "synthetic native identity unavailable"
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    assert uuid.UUID(boot).int != 0
+    namespace = Path("/proc/self/ns/pid").stat()
+    required_tools = ("git", "svn", "svnadmin", "svnserve", "openssl", "python3", "node")
+    tools = {name: shutil.which(name) for name in required_tools}
+    assert all(tools.values()), f"missing runtime tool: {tools}"
+    result = {"inputs": inputs, "tools": tools,
+              "identity": {"uid": os.getuid(), "gid": os.getgid(), "name": identity.pw_name,
+                           "machine_id_sha256": digest(value.encode()), "boot_id_sha256": digest(boot.encode()),
+                           "pid_namespace_device": namespace.st_dev, "pid_namespace_inode": namespace.st_ino},
+              "fixture_mounts": [line for line in Path("/proc/mounts").read_text().splitlines()
+                                 if line.split()[1] in ("/fixture", "/tmp")]}
+    with tempfile.TemporaryDirectory(prefix="prerequisite-probe-", dir=FIXTURE / "tmp") as temporary:
+        root = Path(temporary)
+        def run(args, **kwargs):
+            try:
+                child = subprocess.run(args, capture_output=True, text=True, timeout=15, **kwargs)
+                return {"exit_code": child.returncode, "stdout": child.stdout, "stderr": child.stderr}
+            except (OSError, subprocess.TimeoutExpired) as error:
+                return {"error": str(error), "error_type": type(error).__name__}
+        script = root / "fixture-exec-probe"
+        script.write_text("#!/bin/sh\nprintf 'owned-execution-probe\n'\nexit 23\n")
+        script.chmod(0o755)
+        direct = run([str(script)])
+        shell = run(["/bin/sh", str(script)])
+        assert shell.get("exit_code") == 23, "shell execution control failed"
+        path = run([script.name], env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]})
+        bare, work = root / "bare.git", root / "work"
+        for command in (["git", "init", "--bare", str(bare)], ["git", "init", str(work)],
+                        ["git", "-C", str(work), "commit", "--allow-empty", "-m", "synthetic prerequisite control"]):
+            receipt = run(command)
+            assert receipt.get("exit_code") == 0, f"Git fixture setup failed: {receipt}"
+        marker = root / "hook-ran"
+        hook = bare / "hooks/pre-receive"
+        hook.write_text(f"#!/bin/sh\nprintf 'rejected\n' > '{marker}'\nexit 1\n")
+        hook.chmod(0o755)
+        push = run(["git", "-C", str(work), "push", str(bare), "HEAD:refs/heads/main"])
+        result["execution_probe"] = {"direct": direct, "path": path, "shell_control": shell,
+                                     "git_rejection": push, "hook_ran": marker.exists(),
+                                     "hook_rejection_effective": marker.exists() and push.get("exit_code") not in (None, 0)}
+    (OUTPUT / "runtime-prerequisites.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 
 
 def probe_connection(address):
@@ -448,31 +526,60 @@ def baseline_self_test():
         assert (evidence / "baseline-fixture.log").read_text() == stdout + stderr
         assert (evidence / "baseline-fixture.stdout.log").read_text() == stdout
         assert (evidence / "baseline-fixture.stderr.log").read_text() == stderr
-        # Only empty traversal ancestors are permitted; Rust files, other crate
-        # trees and symlink substitutions still fail the runtime boundary.
+        # The allowlist admits exactly two fixture scripts and executable aliases.
         src = root / "src"
         (src / "web-ui").mkdir(parents=True)
-        web = src / "crates/web"
-        web.mkdir(parents=True)
-        assert_runtime_source_isolation(src)
-        for forbidden in (web / "lib.rs", src / "Cargo.toml", src / "crates/core"):
-            forbidden.write_text("forbidden runtime content")
+        for directory in ("crates/web", "crates/cli", "crates/personal", "crates/core/tests/fixtures", "target/debug"):
+            (src / directory).mkdir(parents=True, exist_ok=True)
+        inputs = {"applications": {}, "fixtures": {}}
+        for name in ("reposync", "reposync-personal"):
+            (root / name).write_text("synthetic application control")
+            (root / name).chmod(0o755)
+            (src / "target/debug" / name).symlink_to(root / name)
+            inputs["applications"][name] = {"path": name, "sha256": digest((root / name).read_bytes())}
+        for name in ("git_http_auth_server.py", "pair_refresh_http_server.py"):
+            path = src / "crates/core/tests/fixtures" / name
+            path.write_text("# synthetic fixture control")
+            inputs["fixtures"][name] = {"sha256": digest(path.read_bytes())}
+        (root / "runtime-inputs.json").write_text(json.dumps(inputs))
+        assert_runtime_source_isolation(src, root)
+        def reject_layout():
             try:
-                assert_runtime_source_isolation(src)
-            except AssertionError:
-                pass
-            else:
-                raise AssertionError("runtime source content accepted")
+                assert_runtime_source_isolation(src, root)
+            except (AssertionError, FileNotFoundError):
+                return
+            raise AssertionError("invalid runtime source/package accepted")
+        for forbidden in (src / "crates/web/lib.rs", src / "Cargo.toml", src / "crates/core/tests/fixtures/owned_process_group.rs"):
+            forbidden.write_text("forbidden runtime content")
+            reject_layout()
             forbidden.unlink()
+        fixture = src / "crates/core/tests/fixtures/git_http_auth_server.py"
+        original = fixture.read_bytes()
+        fixture.write_text("wrong digest")
+        reject_layout()
+        fixture.unlink()
+        reject_layout()
+        fixture.symlink_to(root / "reposync")
+        reject_layout()
+        fixture.unlink()
+        fixture.write_bytes(original)
+        app = root / "reposync"
+        original = app.read_bytes()
+        app.write_text("wrong application digest")
+        reject_layout()
+        app.write_bytes(original)
+        alias = src / "target/debug/reposync"
+        alias.unlink()
+        alias.symlink_to("/bin/sh")
+        reject_layout()
+        alias.unlink()
+        alias.symlink_to(app)
+        web = src / "crates/web"
         web.rmdir()
         web.symlink_to(src / "web-ui", target_is_directory=True)
-        try:
-            assert_runtime_source_isolation(src)
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("runtime ancestor symlink accepted")
-    print("Parent parser/writer and empty UI ancestor controls: PASS")
+        reject_layout()
+
+    print("Parent parser/writer and runtime prerequisite boundary controls: PASS")
 
 
 def main():
@@ -483,10 +590,11 @@ def main():
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
     assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
     assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
-    assert_runtime_source_isolation()
+    inputs = assert_runtime_source_isolation()
     assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
     canaries = boundary_canaries()
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")
+    runtime_prerequisites(inputs)
     manifest = json.loads(Path("/opt/reliability/required-cases.json").read_text())
     binaries = json.loads((TESTS / "binaries.json").read_text())
     if mode == "baseline":
