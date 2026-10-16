@@ -202,6 +202,12 @@ def runtime_prerequisites(inputs, checks=None):
     def mounts(data):
         data["fixture_mounts"] = [line for line in Path("/proc/mounts").read_text().splitlines()
                                   if line.split()[1] in ("/fixture", "/tmp")]
+    def failure_mounts():
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            return {"proc_mounts": raw.decode("utf-8"), "sha256": digest(raw)}
+        except Exception as error:
+            return {"error_type": type(error).__name__, "error": str(error)}
     def execution(data):
         with tempfile.TemporaryDirectory(prefix="prerequisite-probe-", dir=FIXTURE / "tmp") as temporary:
             root = Path(temporary)
@@ -210,13 +216,28 @@ def runtime_prerequisites(inputs, checks=None):
                     child = subprocess.run(args, capture_output=True, text=True, timeout=15, **kwargs)
                     return {"exit_code": child.returncode, "stdout": child.stdout, "stderr": child.stderr}
                 except (OSError, subprocess.TimeoutExpired) as error:
-                    return {"error": str(error), "error_type": type(error).__name__}
+                    details = {"error": str(error), "error_type": type(error).__name__,
+                               "failure_mounts": failure_mounts()}
+                    if isinstance(error, OSError):
+                        details.update(errno=error.errno, strerror=error.strerror,
+                                       filename=error.filename, filename2=error.filename2)
+                    else:
+                        details.update(command=error.cmd, timeout=error.timeout)
+                    return details
             script = root / "fixture-exec-probe"
             script.write_text("#!/bin/sh\nprintf 'owned-execution-probe\n'\nexit 23\n")
             script.chmod(0o755)
             data["direct"] = run([str(script)])
             data["shell_control"] = run(["/bin/sh", str(script)])
             data["path"] = run([script.name], env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]})
+            # Invoke the hook's Python shebang through the kernel at the same
+            # owned path/mode; its result is diagnostic and never gates cases.
+            hook_script = "#!/usr/bin/env python3\nraise SystemExit(29)\n"
+            script.write_text(hook_script)
+            data["hook_shebang"] = {"shebang": hook_script.splitlines()[0],
+                                     "script_sha256": digest(script.read_bytes()),
+                                     "mode": stat.S_IMODE(script.stat().st_mode),
+                                     "expected_exit_code": 29, "result": run([str(script)])}
             data["git_setup"] = []
             bare, work = root / "bare.git", root / "work"
             for command in (["git", "init", "--bare", str(bare)], ["git", "init", str(work)],
@@ -236,6 +257,8 @@ def runtime_prerequisites(inputs, checks=None):
             data["git_rejection"] = run(["git", "-C", str(work), "push", str(bare), "HEAD:refs/heads/main"])
             data["hook_ran"] = marker.exists()
             data["hook_rejection_effective"] = marker.exists() and data["git_rejection"].get("exit_code") not in (None, 0)
+            if not data["hook_rejection_effective"]:
+                data["ineffective_hook_mounts"] = failure_mounts()
             persist_prerequisites(receipt)
             assert data["shell_control"].get("exit_code") == 23, "shell execution control failed"
             assert data["default_identity"].get("stdout", "").startswith("Fixture <fixture@example.invalid>"), "default Git identity missing"
@@ -250,7 +273,8 @@ def runtime_prerequisites(inputs, checks=None):
         try:
             check(observation["data"])
         except Exception as error:
-            observation.update(status="FAIL", error_type=type(error).__name__, error=str(error))
+            observation.update(status="FAIL", error_type=type(error).__name__, error=str(error),
+                               failure_mounts=failure_mounts())
         else:
             observation["status"] = "PASS"
         persist_prerequisites(receipt)
@@ -340,19 +364,42 @@ def boundary_canaries():
 def run_case(case, binaries):
     if case["binary"] == "evidence_scan":
         return run_scan_case(case)
+    def capture_failure_mounts(label):
+        diagnostic = {}
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            filename = label + ".failure-mounts.log"
+            (OUTPUT / filename).write_bytes(raw)
+            diagnostic.update(proc_mounts_file=filename, sha256=digest(raw))
+        except Exception as error:
+            diagnostic.update(error_type=type(error).__name__, error=str(error))
+        try:
+            (OUTPUT / (label + ".failure-diagnostics.json")).write_text(json.dumps(diagnostic, indent=2) + "\n")
+        except Exception as error:
+            print(f"Diagnostic mount capture failed: {type(error).__name__}: {error}", file=sys.stderr)
     binary = TESTS / binaries[case["binary"]]
     test_name = case["test"]
-    listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True)
+    environment = {**os.environ, "RUST_BACKTRACE": "1"}
+    try:
+        listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True, env=environment)
+    except Exception:
+        capture_failure_mounts(case["id"])
+        raise
     matches = [line for line in listing.stdout.splitlines() if line.startswith(test_name + ": test")]
     if len(matches) != 1:
         raise AssertionError(f"required test missing or ambiguous: {case['id']} {test_name}")
     cmd = [str(binary), test_name, "--exact", "--nocapture", "--test-threads=1"]
-    environment = os.environ.copy()
     if case["id"] == "S54_HTTP_COPY":
         environment["REPOSYNC_COPY_WIRE_OUTPUT"] = str(OUTPUT / "S54_HTTP_COPY-wire.json")
     if case["id"] == "S54_SCOPED_HTTP":
         environment["REPOSYNC_SCOPED_WIRE_OUTPUT"] = str(OUTPUT / "S54_SCOPED_HTTP-wire.json")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
+    except Exception:
+        capture_failure_mounts(case["id"])
+        raise
+    if result.returncode != 0:
+        capture_failure_mounts(case["id"])
     output = result.stdout + result.stderr
     if SECRET in output:
         raise AssertionError(f"synthetic fixture secret leaked in {case['id']} output")
@@ -382,6 +429,8 @@ def run_case(case, binaries):
                     else "CANDIDATE_SUBCASE_PASS"),
         "proofs": proofs,
     }
+    if evidence["outcome"] == "FAIL" and result.returncode == 0:
+        capture_failure_mounts(case["id"])
     (OUTPUT / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
     return evidence
@@ -484,13 +533,33 @@ def parse_baseline_stdout(name, stdout, returncode):
 
 
 def run_baseline(binaries):
+    def capture_failure_mounts(label):
+        diagnostic = {}
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            filename = label + ".failure-mounts.log"
+            (OUTPUT / filename).write_bytes(raw)
+            diagnostic.update(proc_mounts_file=filename, sha256=digest(raw))
+        except Exception as error:
+            diagnostic.update(error_type=type(error).__name__, error=str(error))
+        try:
+            (OUTPUT / (label + ".failure-diagnostics.json")).write_text(json.dumps(diagnostic, indent=2) + "\n")
+        except Exception as error:
+            print(f"Diagnostic mount capture failed: {type(error).__name__}: {error}", file=sys.stderr)
+    environment = {**os.environ, "RUST_BACKTRACE": "1"}
     results = {}
     totals = {"passed": 0, "failed": 0, "ignored": 0, "filtered_out": 0}
     processes = {}
     for name, filename in sorted(binaries.items()):
         binary = TESTS / filename
-        result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
-                                capture_output=True, text=True, timeout=300)
+        try:
+            result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
+                                    capture_output=True, text=True, timeout=300, env=environment)
+        except Exception:
+            capture_failure_mounts("baseline-" + name)
+            raise
+        if result.returncode != 0:
+            capture_failure_mounts("baseline-" + name)
         output = result.stdout + result.stderr
         if SECRET in output:
             raise AssertionError(f"synthetic fixture secret leaked in {name} output")
