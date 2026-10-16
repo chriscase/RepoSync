@@ -36,6 +36,476 @@ use reposync_core::models::{Repository, SyncState};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
+// #196 uses the same verified SVN-origin fixture and real engine as the other
+// team tests. Keep it here rather than introducing a parallel bootstrap model.
+mod svn_trunk_projection_196 {
+    use super::*;
+    use std::sync::Mutex;
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            write!(&mut self.0, " {}={value:?}", field.name()).unwrap();
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Fields(format!("{}", event.metadata().level()));
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    fn configure(
+        pair: &mut QualifiedPair,
+        layout: reposync_core::config::SvnLayout,
+        trunk: &str,
+        trailing_slash: bool,
+    ) {
+        let mut config = make_app_config(&pair.svn_repo_root, pair.tmp.path());
+        config.svn.layout = layout;
+        config.svn.trunk_path = trunk.into();
+        config.sync.auto_merge = false;
+        let url = format!("{}{}", pair.svn_url, if trailing_slash { "/" } else { "" });
+        let mut engine = SyncEngine::new(
+            config,
+            Database::new(&pair.db_path).unwrap(),
+            SvnClient::new(url, "", ""),
+            GitClient::new(&pair.bridge).unwrap(),
+            Arc::new(make_identity_mapper()),
+        );
+        engine.set_repo_id(pair.repo_id.clone());
+        pair.engine = engine;
+    }
+
+    async fn cycle(
+        pair: &QualifiedPair,
+    ) -> (
+        Result<reposync_core::sync_engine::SyncStats, SyncError>,
+        Vec<String>,
+    ) {
+        let capture = Capture::default();
+        let result = pair
+            .engine
+            .run_sync_cycle()
+            .with_subscriber(capture.clone())
+            .await;
+        let events = capture.0.lock().unwrap().clone();
+        (result, events)
+    }
+
+    fn assert_no_path_warnings(events: &[String]) {
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.starts_with("WARN")
+                    && (event.contains("NOT at expected path")
+                        || event.contains("path differs from branch-relative")
+                        || event.contains("path diagnostics unavailable"))
+            })
+            .collect();
+        assert!(
+            warnings.is_empty(),
+            "erroneous post-apply diagnostics: {warnings:#?}"
+        );
+    }
+
+    fn svn(wc: &Path, args: &[&str]) {
+        let output = Command::new("svn")
+            .args(args)
+            .arg("--non-interactive")
+            .current_dir(wc)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "svn {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write(wc: &Path, path: &str, bytes: &str) {
+        let target = wc.join(path);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, bytes).unwrap();
+    }
+
+    fn commit_all(wc: &Path, url: &str) -> i64 {
+        svn(wc, &["add", "--force", "."]);
+        svn(wc, &["commit", "-m", "196 projection fixture"]);
+        // svnlook's filesystem helper accepts only a repository root, while
+        // these fixtures deliberately select trunk and nested branch URLs.
+        let output = Command::new("svn")
+            .args(["info", "--show-item", "revision", url, "--non-interactive"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "svn info {url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn assert_mapping(pair: &QualifiedPair, revision: i64, sha: &str) {
+        assert_eq!(
+            pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+            (revision, sha.into())
+        );
+        let count: i64 = pair.engine.db().conn().query_row(
+            "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND svn_rev=?2 AND git_sha=?3",
+            rusqlite::params![&pair.repo_id, revision, sha], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "exact durable SVN-to-Git mapping required");
+        let operation = pair
+            .engine
+            .db()
+            .latest_git_push_operation(&pair.repo_id)
+            .unwrap()
+            .expect("durable publication intent");
+        assert_eq!(operation.source_svn_rev, revision);
+        assert_eq!(
+            operation.state,
+            reposync_core::db::git_push_operations::GitPushOperationState::Completed
+        );
+        assert_eq!(operation.intended_local_git_sha, sha);
+        assert_eq!(
+            operation.intended_local_git_tree,
+            git_output(&pair.bare, &["rev-parse", "refs/heads/main^{tree}"])
+        );
+    }
+
+    async fn sync_one(pair: &QualifiedPair, revision: i64) -> Vec<String> {
+        let (result, events) = cycle(pair).await;
+        let stats = result.unwrap();
+        assert_eq!(stats.svn_to_git_count, 1);
+        assert_eq!(stats.git_to_svn_count, 0);
+        let sha = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
+        assert_mapping(pair, revision, &sha);
+        assert_no_path_warnings(&events);
+        let repeated = pair.engine.run_sync_cycle().await.unwrap();
+        assert_eq!(
+            (repeated.svn_to_git_count, repeated.git_to_svn_count),
+            (0, 0)
+        );
+        assert_eq!(
+            git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            sha
+        );
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_trunk_branch_and_nested_urls_use_one_relative_namespace() {
+        for branch in ["trunk", "branches/custom", "projects/nested/trunk"] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-custom", branch).await;
+            configure(
+                &mut pair,
+                reposync_core::config::SvnLayout::Custom,
+                "",
+                true,
+            );
+            let revision =
+                svn_commit_file(&pair.wc, "feature.txt", "canonical root\n", "196 custom");
+            let events = sync_one(&pair, revision).await;
+            assert!(
+                events.iter().any(|event| event.contains("path=feature.txt")
+                    && event.contains("path matches branch-relative")),
+                "{events:#?}"
+            );
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            assert_eq!(tree.get("feature.txt").unwrap(), b"canonical root\n");
+            assert!(!tree
+                .keys()
+                .any(|path| path.starts_with(&format!("{branch}/"))));
+        }
+    }
+
+    /// Ordinary Standard/trunk transfer is an unchanged positive on both versions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_trunk_ordinary_file_is_an_unchanged_positive() {
+        let mut pair = QualifiedPair::new_with_svn_branch("196-standard", "trunk").await;
+        configure(
+            &mut pair,
+            reposync_core::config::SvnLayout::Standard,
+            "/trunk/",
+            false,
+        );
+        let revision = svn_commit_file(&pair.wc, "feature.txt", "standard root\n", "196 standard");
+        sync_one(&pair, revision).await;
+        assert_eq!(
+            tracked_tree_at(&pair.bare, "refs/heads/main")
+                .get("feature.txt")
+                .unwrap(),
+            b"standard root\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_literal_trunk_paths_and_payloads_survive_without_rewriting() {
+        let pair = QualifiedPair::new_with_svn_branch("196-literal", "trunk").await;
+        let payload = "a/trunk/payload\nb/trunk/payload\n";
+        for path in [
+            "a/trunk/literal.txt",
+            "trunk/keep.txt",
+            "Trunk/case.txt",
+            "trunk-other/peer.txt",
+        ] {
+            write(&pair.wc, path, payload);
+        }
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        for path in [
+            "a/trunk/literal.txt",
+            "trunk/keep.txt",
+            "Trunk/case.txt",
+            "trunk-other/peer.txt",
+        ] {
+            assert_eq!(tree.get(path).unwrap(), payload.as_bytes(), "{path}");
+        }
+        assert!(!tree.contains_key("a/literal.txt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_mixed_revision_excludes_outside_and_sibling_prefix_paths() {
+        let mut pair = QualifiedPair::new_with_svn_branch("196-outside", "trunk").await;
+        configure(
+            &mut pair,
+            reposync_core::config::SvnLayout::Custom,
+            "",
+            false,
+        );
+        let root_wc = pair.tmp.path().join("root-wc");
+        svn_checkout(&pair.svn_repo_root, &root_wc);
+        write(&root_wc, "trunk/inside.txt", "inside\n");
+        write(&root_wc, "trunk-other/outside.txt", "outside\n");
+        write(&root_wc, "branches/other/outside.txt", "outside\n");
+        let revision = commit_all(&root_wc, &pair.svn_repo_root);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("inside.txt").unwrap(), b"inside\n");
+        assert!(!tree.keys().any(|path| path.contains("outside.txt")));
+        let checkpoint = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+        write(&root_wc, "trunk-other/outside.txt", "later outside\n");
+        commit_all(&root_wc, &pair.svn_repo_root);
+        let (result, events) = cycle(&pair).await;
+        let stats = result.unwrap();
+        assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (0, 0));
+        assert_eq!(
+            pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+            checkpoint
+        );
+        assert_no_path_warnings(&events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deletes_renames_and_empty_directories_do_not_emit_missing_file_warnings() {
+        let mut pair = QualifiedPair::new_with_svn_branch("196-actions", "branches/custom").await;
+        configure(
+            &mut pair,
+            reposync_core::config::SvnLayout::Custom,
+            "",
+            false,
+        );
+        write(&pair.wc, "dir/old.txt", "rename me\n");
+        write(&pair.wc, "gone.txt", "delete me\n");
+        std::fs::create_dir(pair.wc.join("empty")).unwrap();
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        svn(&pair.wc, &["mv", "dir/old.txt", "dir/new.txt"]);
+        svn(&pair.wc, &["rm", "gone.txt", "empty"]);
+        svn(&pair.wc, &["mkdir", "another-empty"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("dir/new.txt").unwrap(), b"rename me\n");
+        for absent in ["dir/old.txt", "gone.txt", "empty", "another-empty"] {
+            assert!(!tree.contains_key(absent));
+        }
+        svn(&pair.wc, &["update"]);
+        svn(&pair.wc, &["mv", "dir", "relocated"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("relocated/new.txt").unwrap(), b"rename me\n");
+        assert!(!tree.keys().any(|path| path.starts_with("dir/")));
+        svn(&pair.wc, &["rm", "relocated"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        assert!(!tracked_tree_at(&pair.bare, "refs/heads/main")
+            .keys()
+            .any(|path| path.starts_with("relocated/")));
+        // An empty-directory-only revision has no Git content but still needs a durable receipt.
+        let before_sha = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
+        svn(&pair.wc, &["mkdir", "only-empty"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        let (result, events) = cycle(&pair).await;
+        assert_eq!(result.unwrap().svn_to_git_count, 0);
+        assert_eq!(
+            pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+            (revision, before_sha.clone())
+        );
+        assert_eq!(
+            git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            before_sha
+        );
+        let count: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM audit_log WHERE repo_id=?1 AND action='svn_to_git_no_target' AND svn_rev=?2 AND success=1", rusqlite::params![&pair.repo_id, revision], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        assert_no_path_warnings(&events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_file_deletion_reports_expected_absence() {
+        let pair = QualifiedPair::new_with_svn_branch("196-delete", "trunk").await;
+        svn(&pair.wc, &["rm", "origin.txt"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        assert!(!tracked_tree_at(&pair.bare, "refs/heads/main").contains_key("origin.txt"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn custom_same_relative_path_conflict_is_not_falsely_accepted() {
+        for branch in ["trunk", "branches/custom"] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-conflict", branch).await;
+            configure(
+                &mut pair,
+                reposync_core::config::SvnLayout::Custom,
+                "",
+                false,
+            );
+            let before = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+            svn_commit_file(&pair.wc, "origin.txt", "SVN edit\n", "196 svn overlap");
+            let git_sha = pair.developer_commit("origin.txt", "Git edit\n", "196 git overlap");
+            git_cli(&pair.developer, &["push", "origin", "main"]);
+            let (result, _) = cycle(&pair).await;
+            assert!(
+                matches!(result, Err(SyncError::UnresolvableConflict { ref file_path, .. }) if file_path == "origin.txt"),
+                "{result:?}"
+            );
+            let conflicts = pair.engine.db().list_conflicts(None, 10).unwrap();
+            assert!(conflicts
+                .iter()
+                .any(|conflict| conflict.file_path == "origin.txt"
+                    && conflict.repo_id.as_deref() == Some(pair.repo_id.as_str())));
+            assert_eq!(
+                pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+                before
+            );
+            assert_eq!(
+                git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+                git_sha
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn literal_trunk_and_sibling_prefixes_do_not_falsely_reject_disjoint_changes() {
+        for (svn_path, git_path) in [
+            ("trunk/shared.txt", "shared.txt"),
+            ("trunk-other/shared.txt", "-other/shared.txt"),
+        ] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-disjoint", "trunk").await;
+            configure(
+                &mut pair,
+                reposync_core::config::SvnLayout::Standard,
+                "trunk",
+                false,
+            );
+            write(&pair.wc, svn_path, "base svn\n");
+            write(&pair.wc, git_path, "base git\n");
+            let revision = commit_all(&pair.wc, &pair.svn_url);
+            sync_one(&pair, revision).await;
+            git_cli(&pair.developer, &["pull", "--ff-only"]);
+            svn_commit_file(&pair.wc, svn_path, "SVN edit\n", "196 disjoint svn");
+            pair.developer_commit(&format!("./{git_path}"), "Git edit\n", "196 disjoint git");
+            git_cli(&pair.developer, &["push", "origin", "main"]);
+            let (result, events) = cycle(&pair).await;
+            let stats = result.unwrap();
+            assert_eq!(stats.conflicts_detected, 0);
+            assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 1));
+            assert!(pair
+                .engine
+                .db()
+                .list_conflicts(None, 10)
+                .unwrap()
+                .is_empty());
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            assert_eq!(tree.get(svn_path).unwrap(), b"SVN edit\n");
+            assert_eq!(tree.get(git_path).unwrap(), b"Git edit\n");
+            assert_no_path_warnings(&events);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lfs_scan_uses_literal_trunk_path_without_a_second_strip() {
+        for layout in [
+            reposync_core::config::SvnLayout::Standard,
+            reposync_core::config::SvnLayout::Custom,
+        ] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-lfs", "trunk").await;
+            let trunk = if layout == reposync_core::config::SvnLayout::Standard {
+                "trunk"
+            } else {
+                ""
+            };
+            configure(&mut pair, layout, trunk, false);
+            pair.engine.set_lfs_threshold_bytes(512);
+            let revision = svn_commit_file(
+                &pair.wc,
+                "trunk/asset",
+                &"fixture data\n".repeat(100),
+                "196 lfs path",
+            );
+            let (result, events) = cycle(&pair).await;
+            assert_eq!(result.unwrap().svn_to_git_count, 1);
+            assert_no_path_warnings(&events);
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            let attributes = String::from_utf8(
+                tree.get(".gitattributes")
+                    .expect("canonical file must be scanned for LFS")
+                    .clone(),
+            )
+            .unwrap();
+            assert!(
+                attributes
+                    .lines()
+                    .any(|line| line.starts_with("trunk/asset ") && line.contains("filter=lfs")),
+                "{attributes}"
+            );
+            assert!(
+                !attributes.lines().any(|line| line.starts_with("trunk ")),
+                "a directory must not be tracked as an LFS file: {attributes}"
+            );
+            assert!(tree.contains_key("trunk/asset"));
+            assert!(!tree.contains_key("asset"));
+            assert_mapping(
+                &pair,
+                revision,
+                &git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // Helpers
 // ===========================================================================

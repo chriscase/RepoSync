@@ -105,6 +105,17 @@ pub fn svn_path_identity(root_url: &str, target_url: &str) -> SvnPathIdentity {
     }
 }
 
+/// Derive a branch identity only when the canonical target belongs to the root.
+/// An unrelated URL must not fall back to the unrestricted repository namespace.
+pub fn checked_svn_path_identity(root_url: &str, target_url: &str) -> Option<SvnPathIdentity> {
+    let root = normalize_svn_url(root_url);
+    let target = normalize_svn_url(target_url);
+    if root.is_empty() || (target != root && !target.starts_with(&format!("{root}/"))) {
+        return None;
+    }
+    Some(svn_path_identity(&root, &target))
+}
+
 /// Git intent paths are already branch-relative; normalize separators only.
 pub fn git_intent_path(path: &str) -> String {
     normalize_policy_path(path)
@@ -745,6 +756,94 @@ mod tests {
             svn_log_path_to_branch_relative("/feature.txt", &root),
             Some("feature.txt".into())
         );
+    }
+
+    #[test]
+    fn checked_svn_identity_196_rejects_outside_and_sibling_urls() {
+        for target in [
+            "file:///repo-other/trunk",
+            "file:///elsewhere/trunk",
+            "file:///Repo/trunk",
+        ] {
+            assert!(
+                checked_svn_path_identity("file:///repo", target).is_none(),
+                "{target}"
+            );
+        }
+        assert!(checked_svn_path_identity("", "file:///repo").is_none());
+        assert!(checked_svn_path_identity("", "").is_none());
+        let root = checked_svn_path_identity("file:///repo/", "file:///repo///").unwrap();
+        assert_eq!(root.branch_path, "");
+        let branch =
+            checked_svn_path_identity("file:///repo/", "file:///repo/branches/team/").unwrap();
+        assert_eq!(branch.branch_path, "branches/team");
+    }
+
+    #[test]
+    fn svn_projection_196_is_component_aware_case_sensitive_and_strips_once() {
+        let identity = checked_svn_path_identity("file:///repo", "file:///repo/trunk/").unwrap();
+        for (raw, expected) in [
+            ("/trunk/a.txt", Some("a.txt")),
+            ("trunk/a.txt", Some("a.txt")),
+            ("///trunk/a.txt", Some("a.txt")),
+            ("/trunk", Some("")),
+            ("/trunk/", Some("")),
+            ("/trunk/trunk/a.txt", Some("trunk/a.txt")),
+            ("/trunk/a/trunk/a.txt", Some("a/trunk/a.txt")),
+            ("/trunk/Trunk/a.txt", Some("Trunk/a.txt")),
+            ("/trunk-other/a.txt", None),
+            ("/trunkish/a.txt", None),
+            ("/Trunk/a.txt", None),
+            ("/branches/trunk/a.txt", None),
+            ("/a.txt", None),
+            ("", None),
+            ("/", None),
+        ] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(raw, &identity).as_deref(),
+                expected,
+                "{raw}"
+            );
+        }
+        let branch =
+            checked_svn_path_identity("file:///repo", "file:///repo/branches/team").unwrap();
+        assert_eq!(
+            svn_log_path_to_branch_relative("/branches/team/trunk/a.txt", &branch).as_deref(),
+            Some("trunk/a.txt")
+        );
+        for outside in [
+            "/branches/team-other/a.txt",
+            "/branches/Team/a.txt",
+            "/other/branches/team/a.txt",
+        ] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(outside, &branch),
+                None,
+                "{outside}"
+            );
+        }
+    }
+
+    #[test]
+    fn svn_projection_196_empty_root_preserves_literal_paths() {
+        let root = checked_svn_path_identity("file:///repo/", "file:///repo").unwrap();
+        for path in [
+            "trunk/a.txt",
+            "a/trunk/a.txt",
+            "Trunk/a.txt",
+            "trunk-other/a.txt",
+        ] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(&format!("/{path}"), &root).as_deref(),
+                Some(path)
+            );
+        }
+        for path in ["", "/", "///"] {
+            assert_eq!(
+                svn_log_path_to_branch_relative(path, &root).as_deref(),
+                Some("")
+            );
+        }
     }
 
     #[test]
