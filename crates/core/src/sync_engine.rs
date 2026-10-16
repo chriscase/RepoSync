@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-use crate::config::{AppConfig, SvnLayout};
+use crate::config::AppConfig;
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
@@ -64,7 +64,10 @@ use crate::history_inspect::{
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
 use crate::pair_refresh::PAIR_GENERATION;
-use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+use crate::path_projection::{
+    checked_svn_path_identity, project_git_to_svn_changeset, svn_log_path_to_branch_relative,
+    GitToSvnInputChange,
+};
 use crate::pending_frontier::{pending_frontier_is_merge_dag, GitReplayContinuation};
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
@@ -2392,29 +2395,19 @@ impl SyncEngine {
             // Try git apply first; fall back to export-based copy if the diff
             // is empty or in a format git cannot parse (e.g. SVN property-only
             // changes or initial adds).
-            // When using standard layout, strip the trunk prefix from diff paths
-            // so they match the git repository structure.
-            let processed_diff = if self.config.svn.layout == SvnLayout::Standard {
-                let tp = self.config.svn.trunk_path.trim_matches('/');
-                if !tp.is_empty() {
-                    diff.replace(&format!("a/{}/", tp), "a/")
-                        .replace(&format!("b/{}/", tp), "b/")
-                } else {
-                    diff
-                }
-            } else {
-                diff
-            };
+            // diff_full is already relative to the SVN client's target URL,
+            // just like the exported Git root. Never strip a layout prefix
+            // again or rewrite matching substrings inside patch payloads.
             // Convert SVN diff format to git-compatible format:
             // - SVN uses "(nonexistent)" for deleted files; git needs "/dev/null"
             // - SVN uses "(revision N)" for existing files; git needs actual paths
             // Without this, git apply treats deletions as "truncate to empty"
             // instead of removing the file.
-            let git_diff = convert_svn_diff_to_git(&processed_diff);
+            let git_diff = convert_svn_diff_to_git(&diff);
 
             debug!(
                 rev = change.revision,
-                raw_diff_lines = processed_diff.lines().count(),
+                raw_diff_lines = diff.lines().count(),
                 converted_diff_preview = %git_diff.lines().take(6).collect::<Vec<_>>().join(" | "),
                 "SVN diff converted for git apply"
             );
@@ -2435,13 +2428,33 @@ impl SyncEngine {
                 )
                 .await;
                 if result.is_ok() {
-                    // Verify: check that files were created at the correct paths
-                    for cf in &change.changed_files {
-                        let expected = repo_path.join(&cf.path);
-                        if expected.exists() {
-                            info!(path = %cf.path, "git apply created file at correct path");
-                        } else {
-                            warn!(path = %cf.path, "git apply succeeded but file NOT at expected path");
+                    // Diagnostic only: publication/ref/tree verification below
+                    // remains authoritative. The applied index distinguishes
+                    // Git files from SVN directory/property-only entries.
+                    match git2::Repository::open(&repo_path).and_then(|repo| repo.index()) {
+                        Ok(index) => {
+                            for cf in &change.changed_files {
+                                let expected_present = cf.action != "D";
+                                if expected_present
+                                    && index.get_path(Path::new(&cf.path), 0).is_none()
+                                {
+                                    continue; // Git does not represent empty directories.
+                                }
+                                let actual_present =
+                                    std::fs::symlink_metadata(repo_path.join(&cf.path))
+                                        .is_ok_and(|metadata| !metadata.is_dir());
+                                if expected_present == actual_present {
+                                    info!(path = %cf.path, action = %cf.action,
+                                    "git apply path matches branch-relative SVN change");
+                                } else {
+                                    warn!(path = %cf.path, action = %cf.action,
+                                    expected_present, actual_present,
+                                    "git apply path differs from branch-relative SVN change");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "post-apply path diagnostics unavailable");
                         }
                     }
                 } else if let Err(error) = &result {
@@ -2567,28 +2580,8 @@ impl SyncEngine {
                 let changed_files: Vec<String> = change
                     .changed_files
                     .iter()
-                    .filter_map(|cf| {
-                        // Strip trunk prefix for standard layout
-                        let path = if self.config.svn.layout == SvnLayout::Standard {
-                            let tp = self.config.svn.trunk_path.trim_matches('/');
-                            if !tp.is_empty() {
-                                cf.path
-                                    .strip_prefix(&format!("/{}/", tp))
-                                    .or_else(|| cf.path.strip_prefix(&format!("{}/", tp)))
-                                    .unwrap_or(&cf.path)
-                            } else {
-                                &cf.path
-                            }
-                        } else {
-                            &cf.path
-                        };
-                        let clean = path.trim_start_matches('/');
-                        if clean.is_empty() {
-                            None
-                        } else {
-                            Some(clean.to_string())
-                        }
-                    })
+                    .filter(|cf| cf.action != "D" && !cf.path.is_empty())
+                    .map(|cf| cf.path.clone())
                     .collect();
 
                 for rel_path in &changed_files {
@@ -4325,17 +4318,17 @@ impl SyncEngine {
             .await
             .map_err(SyncError::SvnError)?;
 
-        // Determine the trunk prefix to filter/strip when using standard layout.
-        let trunk_prefix = if self.config.svn.layout == SvnLayout::Standard {
-            let tp = self.config.svn.trunk_path.trim_matches('/');
-            if tp.is_empty() {
-                None
-            } else {
-                Some(format!("{}/", tp))
-            }
-        } else {
-            None
-        };
+        // Verbose SVN logs use repository-relative paths even when the client
+        // targets trunk or a custom branch. Project exactly once from canonical
+        // SVN identity; diff/export and every downstream consumer use that root.
+        let identity =
+            checked_svn_path_identity(&svn_info.root_url, &svn_info.url).ok_or_else(|| {
+                SyncError::SvnError(crate::errors::SvnError::LineageRefused {
+                    reason: "svn_target_outside_repository_root".into(),
+                    detail: "canonical SVN target is not within its reported repository root"
+                        .into(),
+                })
+            })?;
 
         let mut change_sets: Vec<SvnChangeSet> = Vec::new();
         for e in entries {
@@ -4351,29 +4344,15 @@ impl SyncEngine {
                     .changed_paths
                     .iter()
                     .filter_map(|p| {
-                        let raw = p.path.strip_prefix('/').unwrap_or(&p.path);
-                        // When using standard layout, only sync files under trunk/
-                        // and strip the trunk prefix so git paths are repo-relative.
-                        let mapped_path = if let Some(ref prefix) = trunk_prefix {
-                            let rest = raw.strip_prefix(prefix.as_str())?;
-                            if rest.is_empty() {
-                                return None; // skip bare trunk/ directory entry
-                            }
-                            rest.to_string()
-                        } else {
-                            raw.to_string()
-                        };
-                        let map_copy_from = |raw_path: &str| -> Option<String> {
-                            let raw = raw_path.strip_prefix('/').unwrap_or(raw_path);
-                            if let Some(ref prefix) = trunk_prefix {
-                                raw.strip_prefix(prefix.as_str())
-                                    .map(|rest| rest.to_string())
-                                    .filter(|rest| !rest.is_empty())
-                            } else {
-                                Some(raw.to_string())
-                            }
-                        };
-                        let rename_from = p.copy_from_path.as_deref().and_then(map_copy_from);
+                        let mapped_path = svn_log_path_to_branch_relative(&p.path, &identity)?;
+                        if mapped_path.is_empty() {
+                            return None; // The selected root itself has no Git file path.
+                        }
+                        let rename_from = p
+                            .copy_from_path
+                            .as_deref()
+                            .and_then(|path| svn_log_path_to_branch_relative(path, &identity))
+                            .filter(|path| !path.is_empty());
                         let action = if rename_from.is_some() {
                             "R".to_string()
                         } else {
@@ -4888,41 +4867,19 @@ impl SyncEngine {
         svn_changes: &[SvnChangeSet],
         git_changes: &[GitChangeSet],
     ) -> Result<Vec<Conflict>, SyncError> {
-        // SVN paths from the changeset include the branch prefix
-        // (e.g. `trunk/README.md`), but Git paths are relative to the repo
-        // root (e.g. `README.md`). Strip the SVN branch prefix so the
-        // detector can match paths correctly.
-        let trunk_path = self.config.svn.trunk_path.trim_matches('/');
-        let strip_prefix = |p: &str| -> String {
-            let p = p.trim_start_matches('/');
-            if !trunk_path.is_empty() {
-                if let Some(rest) = p.strip_prefix(trunk_path) {
-                    return rest.trim_start_matches('/').to_string();
-                }
-            }
-            // Also handle hard-coded "trunk/" prefix as fallback for repos
-            // configured with empty trunk_path but synced from a trunk URL.
-            if let Some(rest) = p.strip_prefix("trunk/") {
-                return rest.to_string();
-            }
-            p.to_string()
-        };
-
+        // fetch_svn_changes already projected both rename endpoints into the
+        // Git root. A second strip would alias literal trunk/ paths or siblings.
         let svn_file_changes: Vec<FileChange> = svn_changes
             .iter()
             .flat_map(|cs| {
-                cs.changed_files.iter().map(|f| {
-                    let path = strip_prefix(&f.path);
-                    let rename_from = f.rename_from.as_deref().map(strip_prefix);
-                    FileChange {
-                        path,
-                        change_kind: Self::svn_action_to_change_kind(
-                            f.action.as_str(),
-                            rename_from.as_deref(),
-                        ),
-                        content: f.content.clone(),
-                        is_binary: f.is_binary,
-                    }
+                cs.changed_files.iter().map(|f| FileChange {
+                    path: f.path.clone(),
+                    change_kind: Self::svn_action_to_change_kind(
+                        f.action.as_str(),
+                        f.rename_from.as_deref(),
+                    ),
+                    content: f.content.clone(),
+                    is_binary: f.is_binary,
                 })
             })
             .collect();
