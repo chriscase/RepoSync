@@ -11,7 +11,9 @@ COPY docs/reliability/legacy-evidence-vocabulary.json ./docs/reliability/legacy-
 COPY docs/reliability/fixtures/Cargo.lock ./Cargo.lock
 COPY scripts/reliability-prep.py /usr/local/bin/reliability-prep
 ARG RELIABILITY_INCLUDE_OLD=1
-RUN if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
+RUN --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cargo test --workspace --no-run --locked --features reposync-core/reliability-fixture,reposync-web/reliability-fixture --message-format=json > /tmp/cargo-preparation.jsonl; \
     else \
       cargo test --workspace --no-run --locked --message-format=json > /tmp/cargo-preparation.jsonl; \
@@ -21,13 +23,16 @@ RUN if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
     cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
 COPY legacy-old /old-src
-RUN mkdir -p /opt/reliability-old-tests && \
+RUN --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    mkdir -p /opt/reliability-old-tests && \
     if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cd /old-src && cargo test -p reposync-web --test legacy_import_generator --no-run --locked --message-format=json \
         > /tmp/old-preparation.jsonl && \
       python3 /usr/local/bin/reliability-prep /tmp/old-preparation.jsonl /opt/reliability-old-tests && \
       sha256sum /opt/reliability-old-tests/legacy_import_generator-* > /opt/reliability-old-tests/generator.sha256 && \
-      sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256; \
+      sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256 && \
+      sha256sum Cargo.lock > /opt/reliability-old-tests/lock.sha256; \
     fi
 
 FROM python:3.12-slim-bookworm

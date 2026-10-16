@@ -8,6 +8,9 @@ case "$mode" in
   --diagnostics|--candidate|--all|--baseline) ;;
   *) echo "Usage: $0 [--diagnostics|--candidate|--all|--baseline]" >&2; exit 2 ;;
 esac
+artifact_dir="${REPOSYNC_ARTIFACT_DIR:-$repo_root/artifacts/reliability-phase0/$(date -u +%Y%m%dT%H%M%SZ)-${mode#--}}"
+mkdir -p "$artifact_dir"
+chmod 1777 "$artifact_dir"
 command -v docker >/dev/null || { echo "NOT RUN: Docker unavailable" >&2; exit 2; }
 docker info >/dev/null || { echo "NOT RUN: Docker daemon unavailable" >&2; exit 2; }
 source_head="${REPOSYNC_SOURCE_HEAD_OVERRIDE:-$(git rev-parse HEAD)}"
@@ -17,24 +20,37 @@ prepared_context="$(mktemp -d "${TMPDIR:-/tmp}/reposync-build-context.XXXXXX")"
 trap 'rm -rf "$prepared_context"' EXIT
 cp "$context_root/Cargo.toml" "$context_root/Dockerfile.reliability" "$context_root/.dockerignore" "$prepared_context/"
 cp -R "$context_root/crates" "$context_root/docs" "$context_root/scripts" "$context_root/web-ui" "$prepared_context/"
+if [[ -n "${REPOSYNC_BUILD_CONTEXT:-}" && -z "${REPOSYNC_LOCK_SOURCE:-}" ]]; then
+  echo "FAIL: archived build context requires an explicit pinned lock source" >&2; exit 1
+fi
+lock_source="${REPOSYNC_LOCK_SOURCE:-candidate}"
+python3 "$repo_root/scripts/reliability-lock-overlay.py" stage "$prepared_context" \
+  --source "$lock_source" --receipt "$artifact_dir/build-lock.json"
+cp "$prepared_context/Cargo.lock" "$prepared_context/docs/reliability/fixtures/Cargo.lock"
 mkdir "$prepared_context/legacy-old"
 git archive 87379741779a6259f7eeb52a68cc6f061174e5ef | tar -x -C "$prepared_context/legacy-old"
-python3 "$repo_root/scripts/reliability-lock-overlay.py" "$prepared_context/legacy-old"
-cp "$repo_root/docs/reliability/fixtures/Cargo.lock" "$prepared_context/legacy-old/Cargo.lock"
+python3 "$repo_root/scripts/reliability-lock-overlay.py" stage "$prepared_context/legacy-old" \
+  --source 87379741779a6259f7eeb52a68cc6f061174e5ef \
+  --receipt "$artifact_dir/old-generator-build-lock.json"
 cp "$repo_root/scripts/legacy_import_generator.rs" "$prepared_context/legacy-old/crates/web/tests/legacy_import_generator.rs"
 goal_hash="$(shasum -a 256 docs/reliability/GOAL.md | awk '{print $1}')"
-lock_hash="$(shasum -a 256 docs/reliability/fixtures/Cargo.lock | awk '{print $1}')"
+lock_hash="$(shasum -a 256 "$prepared_context/Cargo.lock" | awk '{print $1}')"
 [[ "$goal_hash" == 16003181005349892c486d92ac980951c7cb564ab6d45742588df581955eaec8 ]] || {
   echo "FAIL: original GOAL.md changed" >&2; exit 1;
 }
 image="reposync-reliability:$source_head"
 include_old=1
 [[ "$mode" == --baseline ]] && include_old=0
+build_status=0
 docker build --build-arg "RELIABILITY_INCLUDE_OLD=$include_old" \
-  --file "$prepared_context/Dockerfile.reliability" --tag "$image" "$prepared_context"
-artifact_dir="${REPOSYNC_ARTIFACT_DIR:-$repo_root/artifacts/reliability-phase0/$(date -u +%Y%m%dT%H%M%SZ)-${mode#--}}"
-mkdir -p "$artifact_dir"
-chmod 1777 "$artifact_dir"
+  --file "$prepared_context/Dockerfile.reliability" --tag "$image" "$prepared_context" || build_status=$?
+printf '%s\n' "$build_status" > "$artifact_dir/build-exit-code.txt"
+if [[ "$build_status" -ne 0 ]]; then
+  if [[ "$mode" == --all ]]; then
+    scripts/reliability-compare.sh || echo "Comparison execution also reported failure"
+  fi
+  exit "$build_status"
+fi
 host_private="$(mktemp -d "${TMPDIR:-/tmp}/reposync-host-private.XXXXXX")"
 trap 'rm -rf "$host_private" "$prepared_context"' EXIT
 printf 'synthetic host-private file\n' > "$host_private/canary"
@@ -75,12 +91,22 @@ docker run --rm --network none --read-only --cap-drop ALL \
   --env REPOSYNC_SOURCE_HEAD="$source_head" --env REPOSYNC_SOURCE_TREE="$source_tree" \
   --env REPOSYNC_GOAL_SHA256="$goal_hash" --env REPOSYNC_LOCK_SHA256="$lock_hash" \
   "$image" "${mode#--}" || runtime_status=$?
+printf '%s\n' "$runtime_status" > "$artifact_dir/runtime-exit-code.txt"
 [[ "$(cat "$host_private/canary")" == 'synthetic host-private file' ]] || {
   echo "FAIL: host-private canary changed" >&2; exit 1;
 }
 command -v python3 >/dev/null || { echo "FAIL: evidence scanner interpreter unavailable" >&2; exit 1; }
 [[ -f scripts/reliability_scan.py ]] || { echo "FAIL: evidence scanner unavailable" >&2; exit 1; }
+scan_status=0
 python3 scripts/reliability_scan.py --scan "$artifact_dir" \
-  --status-file "$artifact_dir/scan-status.json"
+  --status-file "$artifact_dir/scan-status.json" || scan_status=$?
+if [[ "$mode" == --all && ( "$runtime_status" -ne 0 || "$scan_status" -ne 0 ) ]]; then
+  # The unchanged workflow stops after a failing diagnostic command. Still
+  # collect every comparison before returning the original diagnostic failure.
+  comparison_status=0
+  scripts/reliability-compare.sh || comparison_status=$?
+  echo "Diagnostics exit: $runtime_status; comparison exit: $comparison_status"
+fi
 [[ "$runtime_status" -eq 0 ]] || exit "$runtime_status"
+[[ "$scan_status" -eq 0 ]] || exit "$scan_status"
 echo "Artifact: $artifact_dir"
