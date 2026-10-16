@@ -2587,7 +2587,7 @@ impl SyncEngine {
                 for rel_path in &changed_files {
                     let full_path = repo_path.join(rel_path);
                     if let Ok(meta) = std::fs::metadata(&full_path) {
-                        if meta.len() > self.lfs_threshold_bytes {
+                        if meta.is_file() && meta.len() > self.lfs_threshold_bytes {
                             let pattern = crate::lfs::pattern_for_path(rel_path);
                             if let Err(e) = crate::lfs::ensure_lfs_tracked(&repo_path, &pattern) {
                                 warn!(

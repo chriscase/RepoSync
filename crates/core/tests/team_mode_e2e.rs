@@ -457,37 +457,52 @@ mod svn_trunk_projection_196 {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lfs_scan_uses_literal_trunk_path_without_a_second_strip() {
-        let mut pair = QualifiedPair::new_with_svn_branch("196-lfs", "trunk").await;
-        pair.engine.set_lfs_threshold_bytes(512);
-        let revision = svn_commit_file(
-            &pair.wc,
-            "trunk/asset",
-            &"fixture data\n".repeat(100),
-            "196 lfs path",
-        );
-        let (result, events) = cycle(&pair).await;
-        assert_eq!(result.unwrap().svn_to_git_count, 1);
-        assert_no_path_warnings(&events);
-        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
-        let attributes = String::from_utf8(
-            tree.get(".gitattributes")
-                .expect("canonical file must be scanned for LFS")
-                .clone(),
-        )
-        .unwrap();
-        assert!(
-            attributes
-                .lines()
-                .any(|line| line.starts_with("trunk/asset ") && line.contains("filter=lfs")),
-            "{attributes}"
-        );
-        assert!(tree.contains_key("trunk/asset"));
-        assert!(!tree.contains_key("asset"));
-        assert_mapping(
-            &pair,
-            revision,
-            &git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
-        );
+        for layout in [
+            reposync_core::config::SvnLayout::Standard,
+            reposync_core::config::SvnLayout::Custom,
+        ] {
+            let mut pair = QualifiedPair::new_with_svn_branch("196-lfs", "trunk").await;
+            let trunk = if layout == reposync_core::config::SvnLayout::Standard {
+                "trunk"
+            } else {
+                ""
+            };
+            configure(&mut pair, layout, trunk, false);
+            pair.engine.set_lfs_threshold_bytes(512);
+            let revision = svn_commit_file(
+                &pair.wc,
+                "trunk/asset",
+                &"fixture data\n".repeat(100),
+                "196 lfs path",
+            );
+            let (result, events) = cycle(&pair).await;
+            assert_eq!(result.unwrap().svn_to_git_count, 1);
+            assert_no_path_warnings(&events);
+            let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+            let attributes = String::from_utf8(
+                tree.get(".gitattributes")
+                    .expect("canonical file must be scanned for LFS")
+                    .clone(),
+            )
+            .unwrap();
+            assert!(
+                attributes
+                    .lines()
+                    .any(|line| line.starts_with("trunk/asset ") && line.contains("filter=lfs")),
+                "{attributes}"
+            );
+            assert!(
+                !attributes.lines().any(|line| line.starts_with("trunk ")),
+                "a directory must not be tracked as an LFS file: {attributes}"
+            );
+            assert!(tree.contains_key("trunk/asset"));
+            assert!(!tree.contains_key("asset"));
+            assert_mapping(
+                &pair,
+                revision,
+                &git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+            );
+        }
     }
 }
 
