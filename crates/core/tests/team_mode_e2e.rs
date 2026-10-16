@@ -148,7 +148,22 @@ mod svn_trunk_projection_196 {
     fn commit_all(wc: &Path, url: &str) -> i64 {
         svn(wc, &["add", "--force", "."]);
         svn(wc, &["commit", "-m", "196 projection fixture"]);
-        svn_youngest(url)
+        // svnlook's filesystem helper accepts only a repository root, while
+        // these fixtures deliberately select trunk and nested branch URLs.
+        let output = Command::new("svn")
+            .args(["info", "--show-item", "revision", url, "--non-interactive"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "svn info {url}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     }
 
     fn assert_mapping(pair: &QualifiedPair, revision: i64, sha: &str) {
@@ -326,6 +341,18 @@ mod svn_trunk_projection_196 {
         for absent in ["dir/old.txt", "gone.txt", "empty", "another-empty"] {
             assert!(!tree.contains_key(absent));
         }
+        svn(&pair.wc, &["mv", "dir", "relocated"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        let tree = tracked_tree_at(&pair.bare, "refs/heads/main");
+        assert_eq!(tree.get("relocated/new.txt").unwrap(), b"rename me\n");
+        assert!(!tree.keys().any(|path| path.starts_with("dir/")));
+        svn(&pair.wc, &["rm", "relocated"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        assert!(!tracked_tree_at(&pair.bare, "refs/heads/main")
+            .keys()
+            .any(|path| path.starts_with("relocated/")));
         // An empty-directory-only revision has no Git content but still needs a durable receipt.
         let before_sha = git_output(&pair.bare, &["rev-parse", "refs/heads/main"]);
         svn(&pair.wc, &["mkdir", "only-empty"]);
@@ -343,6 +370,15 @@ mod svn_trunk_projection_196 {
         let count: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM audit_log WHERE repo_id=?1 AND action='svn_to_git_no_target' AND svn_rev=?2 AND success=1", rusqlite::params![&pair.repo_id, revision], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
         assert_no_path_warnings(&events);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standard_file_deletion_reports_expected_absence() {
+        let pair = QualifiedPair::new_with_svn_branch("196-delete", "trunk").await;
+        svn(&pair.wc, &["rm", "origin.txt"]);
+        let revision = commit_all(&pair.wc, &pair.svn_url);
+        sync_one(&pair, revision).await;
+        assert!(!tracked_tree_at(&pair.bare, "refs/heads/main").contains_key("origin.txt"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
