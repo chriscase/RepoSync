@@ -13,6 +13,17 @@
       "tier": "baseline_observation"
     }
   ],
+  "browser": [
+    {
+      "id": "R70_DELETE_NAVIGATION",
+      "binary": "server_freeze",
+      "test": "candidate_70_delete_viewed_pair_redirects_without_detail_polling",
+      "tier": "browser_regression",
+      "command": "cargo test -p reposync-web --test server_freeze candidate_70_delete_viewed_pair_redirects_without_detail_polling -- --ignored --exact --nocapture",
+      "workflow": ".github/workflows/e2e.yml",
+      "scope": "Hosted E2E with Chrome and npm; includes branchPairRemoval helper tests. Separate from the sealed diagnostics/candidate runtime. Source wiring is not an execution receipt."
+    }
+  ],
   "candidate": [
     {
       "id": "R09_ORIGINAL",

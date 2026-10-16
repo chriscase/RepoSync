@@ -160,7 +160,7 @@
       "baseline": "NOT RUN",
       "candidate": "NOT RUN",
       "tier": "browser",
-      "evidence": "No required exact case for deleting the currently viewed pair. Existing mounted Chrome fixtures exercise ImportProgressCard cancel/reconcile only and run in ordinary E2E, not the sealed runtime.",
+      "evidence": "R70_DELETE_NAVIGATION names candidate_70_delete_viewed_pair_redirects_without_detail_polling, explicitly run with --ignored --exact in the hosted E2E Branch-pair delete navigation step. It covers real local API deletion, replacement history, stopped removed-detail polling, cancellation, failure/permission/busy rejection, absent parent, delayed/queued completion, stale URLs, and child deletion with cleanup warnings while preserving the parent and sibling. The wrapper also runs branchPairRemoval.test.ts. Browser cases are cataloged separately from the sealed diagnostics/candidate runtime, which lacks Chrome/npm. This is test discovery wiring; candidate remains NOT RUN until an exact-head browser receipt is recorded, and no earlier or synthetic-merge result qualifies a new head.",
       "diagnostic_expected_baseline_failure": false
     },
     {

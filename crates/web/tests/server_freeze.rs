@@ -7802,6 +7802,19 @@ async fn candidate_70_delete_viewed_pair_redirects_without_detail_polling() {
         .unwrap();
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // The existing E2E browser step installs web-ui dependencies. Run the
+    // helper suite here as well so CI cannot silently omit the new unit tests.
+    let helpers = Command::new("npm")
+        .args(["test", "--", "src/branchPairRemoval.test.ts"])
+        .current_dir(root.join("web-ui"))
+        .output()
+        .expect("spawn branch-pair removal helper tests");
+    eprintln!("{}", String::from_utf8_lossy(&helpers.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&helpers.stderr));
+    assert!(
+        helpers.status.success(),
+        "branch-pair removal helpers failed"
+    );
     let output = Command::new("node")
         .arg(root.join("scripts/branch-pair-delete-browser.mjs"))
         .env("REPOSYNC_REAL_API", format!("http://{addr}"))
@@ -7819,6 +7832,16 @@ async fn candidate_70_delete_viewed_pair_redirects_without_detail_polling() {
     assert!(state.db.get_repository(viewed_id).unwrap().is_none());
     assert!(state.db.get_repository(listed_id).unwrap().is_none());
     assert!(state.db.get_repository(parent_id).unwrap().is_some());
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case": "R70_DELETE_NAVIGATION",
+            "real_api_removal_confirmed": true,
+            "parent_preserved": true,
+            "helper_tests_passed": true,
+            "browser_scenarios_passed": true
+        })
+    );
     server.abort();
     drop(tmp);
 }
