@@ -30,6 +30,11 @@ fixture bytes when present. Missing scripts are supplied from this reviewed
 harness, with origin and digest in `fixture-inputs.json` before the prepared
 context is hashed. No archived Rust source or Cargo manifest is changed.
 
+OpenSSL is an explicit runtime package because the existing HTTPS fixture tests
+invoke its executable to generate synthetic certificates. It was previously
+available transitively through `ca-certificates`; this makes the prerequisite
+explicit rather than claiming a newly observed OpenSSL failure.
+
 The build explicitly compiles ordinary applications before test preparation,
 using the same locked graph and feature selection. The final Cargo test artifact
 at the same application path wins if test feature unification rebuilt it.
@@ -79,3 +84,56 @@ and enumerate new failures and missing identities. All six unresolved assertions
 remain FAIL without actual evidence. Historical MISSING identities remain
 blockers: this slice neither maps nor waives them. Assertion lineage, the 1,001
 commit scale requirement and live refusal coverage remain separate work.
+
+## Required source-review corrections
+
+The initial source review at `2388c7c` was NOT-ACCEPTED. Its two required findings
+are addressed in this slice; a new exact-head review remains required.
+
+Prerequisite receipt creation now precedes integrity checks and observations.
+The numeric UID/GID, declared fixture paths, package/fixture allowlists and
+hashes, Docker-socket refusal, host/private-network boundaries, cwd and owned
+home/tmp requirements remain necessary integrity stops. A refusal persists
+`integrity: FAIL` and its exception before propagating; no case catalog is
+invented for an integrity refusal. Named-account/native-identity availability,
+tool availability and owned shell/Git setup are observations. Their errors and
+partial steps are retained, later probes still run, and actual tests retain
+responsibility for their results. In particular a failed shell/Git setup probe
+cannot suppress the six unresolved assertions. New controls inject native,
+tool, shell and Git setup errors, verify durable partial errors and later probe
+execution, and then prove the same real fixture harness catalog is still
+accounted. A separate control proves an integrity refusal still stops and is
+recorded. Evidence persistence requires the existing writable evidence mount.
+
+All four actual historical refs lack **both** scripts:
+`87379741779a6259f7eeb52a68cc6f061174e5ef`,
+`f74fce855a1f1d80dd631397f436ba33906272e6`,
+`ab097580d9415ae2f8df44bed4041f740a1b38f2`, and
+`54e183484961bd9ad12bd03505b3b00610de7cd9`.
+For each, both inputs therefore have origin `reviewed_harness_fallback`.
+The “preserve existing historical bytes” branch is exercised only by a synthetic
+local control in this cohort; no historical execution of that branch is claimed.
+
+The fallback anchor is the previously qualified base main
+`7d4c8f81a6faeb664956bbe4c56c4a0da2fb1c65`, tree
+`0d9d37853e0df188bb5ec84752d0c78adda46caf`. These blobs are unchanged by this PR:
+
+| Fixture | Reviewed Git blob SHA-1 | Expected content SHA-256 |
+| --- | --- | --- |
+| `git_http_auth_server.py` | `3b856fdd546e005613eb73e7e60d2a9470ec224b` | `ed5eed6797a2ca2b35cac5645293a44e90d1f77e409b95353c1465ae15083f33` |
+| `pair_refresh_http_server.py` | `e690a127cd40b5172ef9ea86d5e4379a6576fc6e` | `5417a82fa1e72a65b5e43d74aaca45cf61ba471a10583dfe17c15d5d94521bd9` |
+
+The prep script pins these expected identities. Fallback bytes must match both
+before copying. The complete expected/actual origin and blob receipt is retained
+on the host and in the prepared build context; packaging rechecks it against the
+same pinned anchor and actual files. Runtime validation rechecks the staged and
+packaged content identities. Controls reject changed fallback bytes, changed
+staged bytes and an unreviewed anchor. Application digests identify the actual
+compiled executable bytes, with Cargo feature metadata, hosted checkout/tree,
+lock, recipe, cache and toolchain receipts providing their build provenance;
+a generated binary digest alone is not source attestation.
+
+The setup-wizard assertion exercises a PATH wrapper and reset/reimport flow,
+including SVN/import setup. It is not classified as a proven Git-hook failure.
+The other five assertions use rejection/barrier hooks. All six remain unresolved
+FAILs in the before ledger until actual container execution explains them.
