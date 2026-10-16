@@ -17,6 +17,32 @@ pub(crate) struct OpenedDatabaseFile {
 }
 
 impl OpenedDatabaseFile {
+    pub(crate) fn require_unaliased_owner(
+        &self,
+        conn: &Connection,
+    ) -> Result<(), crate::errors::DatabaseError> {
+        let refused = || {
+            crate::errors::DatabaseError::WriterFenced(
+                "ordinary database requires its owned singly linked native file".into(),
+            )
+        };
+        let named = std::fs::symlink_metadata(&self.path).map_err(|_| refused())?;
+        let held = connected_main_file_stat(conn).ok_or_else(refused)?;
+        if !named.is_file()
+            || named.nlink() != 1
+            || named.uid() != rustix::process::geteuid().as_raw()
+            || native_number(held.st_nlink) != Some(1)
+            || held.st_uid != named.uid()
+            || named.dev() != self.device
+            || named.ino() != self.inode
+            || native_number(held.st_dev) != Some(self.device)
+            || native_number(held.st_ino) != Some(self.inode)
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
     pub(crate) fn capture(path: &Path) -> Option<Self> {
         let metadata = std::fs::symlink_metadata(path).ok()?;
         let parent = path

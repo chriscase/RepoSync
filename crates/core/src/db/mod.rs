@@ -17,6 +17,8 @@ pub mod personal_scope;
 pub mod queries;
 pub mod repo_scope_identity;
 pub mod schema;
+pub(crate) mod startup;
+mod startup_rollback;
 pub mod svn_commit_operations;
 pub mod team_cycle_mapping_operations;
 pub mod watermark_recovery;
@@ -51,8 +53,17 @@ use opened_file::OpenedDatabaseFile;
 pub struct Database {
     conn: Mutex<Connection>,
     opened_file: Option<OpenedDatabaseFile>,
+    startup_owner: Option<startup::StartupOwner>,
     #[cfg(test)]
     test_force_echo_split_fail: Mutex<bool>,
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        if let Some(owner) = self.startup_owner.take() {
+            owner.retire(self);
+        }
+    }
 }
 
 impl Database {
@@ -103,6 +114,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file,
+            startup_owner: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -145,6 +157,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file: Some(opened_file),
+            startup_owner: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -157,6 +170,7 @@ impl Database {
         Ok(Self {
             conn: Mutex::new(conn),
             opened_file: None,
+            startup_owner: None,
             #[cfg(test)]
             test_force_echo_split_fail: Mutex::new(false),
         })
@@ -206,8 +220,8 @@ impl Database {
     /// process lifetime. Additional SQLite connections to the same file are
     /// allowed in-process; a second process cannot take the owner.
     ///
-    /// CLI and personal `Database::new`/`initialize` paths do not take this
-    /// lock. Non-daemon writers stay out of scope until a later slice.
+    /// CLI and Personal writers use the owned `open_cli_writer` and
+    /// `open_personal_writer` entrances. `Database::new` is an unowned handle.
     pub fn open_with_exclusive_owner(
         data_dir: impl AsRef<Path>,
     ) -> Result<(Self, crate::data_dir::DataDirOwner), DatabaseError> {

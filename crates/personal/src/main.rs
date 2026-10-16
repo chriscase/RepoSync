@@ -182,8 +182,8 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
         .with_context(|| format!("failed to create data directory: {}", data_dir.display()))?;
 
     // Initialize database.
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to initialize database")?;
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal sync startup writer admission refused")?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal sync startup writer admission refused")?;
@@ -242,9 +242,8 @@ async fn cmd_start(config_path: &str, foreground: bool) -> Result<()> {
 
     if foreground {
         info!("starting personal sync daemon in foreground mode");
-        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
-
         let shutdown = signals::setup_signal_handlers();
+        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
         let interval = Duration::from_secs(config.personal.poll_interval_secs);
 
         let result = scheduler::run_polling_loop(&engine, interval, shutdown).await;
@@ -258,9 +257,8 @@ async fn cmd_start(config_path: &str, foreground: bool) -> Result<()> {
         eprintln!("         Or use the provided systemd service file.");
         eprintln!();
         info!("starting personal sync daemon (note: not truly daemonized, use systemd for production)");
-        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
-
         let shutdown = signals::setup_signal_handlers();
+        daemon::write_pid_file(&daemon::pid_file_path(data_dir))?;
         let interval = Duration::from_secs(config.personal.poll_interval_secs);
 
         let result = scheduler::run_polling_loop(&engine, interval, shutdown).await;
@@ -326,8 +324,8 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
         .with_context(|| format!("failed to create data directory: {}", data_dir.display()))?;
 
     // Initialize database.
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to initialize database")?;
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal import startup writer admission refused")?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal import startup writer admission refused")?;
@@ -374,6 +372,11 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
             }
         }
     };
+    if git_client.repo().is_empty()? {
+        git_client
+            .ensure_head_on_branch(&config.github.default_branch)
+            .context("failed to select configured branch for fresh import")?;
+    }
     let git_client = std::sync::Arc::new(std::sync::Mutex::new(git_client));
 
     let commit_format =
