@@ -56,14 +56,14 @@ RUN ln -s /usr/local/bin/node /usr/bin/nodejs && \
     ln -s /opt/reliability-tests/reposync /src/target/debug/reposync && \
     ln -s /opt/reliability-tests/reposync-personal /src/target/debug/reposync-personal && \
     test -z "$(getent passwd 65532)" && test -z "$(getent group 65532)" && \
-    printf 'fixture:x:65532:65532:Synthetic fixture identity:/fixture/home:/usr/sbin/nologin\n' >> /etc/passwd && \
+    printf 'fixture:x:65532:65532:Fixture:/fixture/home:/usr/sbin/nologin\n' >> /etc/passwd && \
     printf 'fixture:x:65532:\n' >> /etc/group && \
     test ! -L /etc/machine-id && printf '21300000000040008000000000000001\n' > /etc/machine-id
 ENV PATH="/usr/local/bin:/usr/bin:/bin"
 ENV REPOSYNC_NODE_BIN=/usr/bin/nodejs
 # Synthetic identity is confined to this image; native boot/PID observations stay real.
-ENV GIT_AUTHOR_NAME=Fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
-ENV GIT_COMMITTER_NAME=Fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+# EMAIL is a fallback; explicit test user.name/user.email and author env win.
+ENV EMAIL=fixture@example.invalid
 # Web UI contract tests resolve web-ui via compile-time CARGO_MANIFEST_DIR (/src/crates/web).
 COPY --from=build /src/web-ui /src/web-ui
 COPY --from=build /opt/reliability-tests /opt/reliability-tests

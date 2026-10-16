@@ -42,7 +42,10 @@ flat packaging remains unchanged. Runtime guards check the precise directory,
 script, application and alias allowlists and their digests.
 
 The synthetic passwd/group entries name the existing container UID/GID without
-changing it. The machine ID is a constant synthetic image input, owned by root
+changing it. Git takes its default name from that synthetic account and its
+fallback email from `EMAIL`; explicit test Git configuration and author variables
+retain precedence. The owned probe checks both default and explicit identities.
+The machine ID is a constant synthetic image input, owned by root
 with ordinary image creation mode. Native boot, namespace and PID death checks
 remain real. No host identity is copied, no credential is introduced, and no
 mount flag, capability, numeric user or host access policy changes.

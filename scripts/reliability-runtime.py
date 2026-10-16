@@ -188,6 +188,12 @@ def runtime_prerequisites(inputs):
                         ["git", "-C", str(work), "commit", "--allow-empty", "-m", "synthetic prerequisite control"]):
             receipt = run(command)
             assert receipt.get("exit_code") == 0, f"Git fixture setup failed: {receipt}"
+        default_identity = run(["git", "-C", str(work), "var", "GIT_AUTHOR_IDENT"])
+        explicit_identity = run(["git", "-C", str(work), "-c", "user.name=Explicit Fixture", "-c",
+                                 "user.email=explicit@example.invalid", "var", "GIT_AUTHOR_IDENT"])
+        assert default_identity.get("stdout", "").startswith("Fixture <fixture@example.invalid>"), "default Git fixture identity missing"
+        assert explicit_identity.get("stdout", "").startswith("Explicit Fixture <explicit@example.invalid>"), "fixture default overrode explicit test identity"
+        result["git_identity_controls"] = {"default": default_identity, "explicit": explicit_identity}
         marker = root / "hook-ran"
         hook = bare / "hooks/pre-receive"
         hook.write_text(f"#!/bin/sh\nprintf 'rejected\n' > '{marker}'\nexit 1\n")
