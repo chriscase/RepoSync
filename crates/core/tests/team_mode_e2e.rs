@@ -341,6 +341,7 @@ mod svn_trunk_projection_196 {
         for absent in ["dir/old.txt", "gone.txt", "empty", "another-empty"] {
             assert!(!tree.contains_key(absent));
         }
+        svn(&pair.wc, &["update"]);
         svn(&pair.wc, &["mv", "dir", "relocated"]);
         let revision = commit_all(&pair.wc, &pair.svn_url);
         sync_one(&pair, revision).await;
