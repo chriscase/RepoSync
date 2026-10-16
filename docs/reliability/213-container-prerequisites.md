@@ -101,8 +101,8 @@ partial steps are retained, later probes still run, and actual tests retain
 responsibility for their results. In particular a failed shell/Git setup probe
 cannot suppress the six unresolved assertions. New controls inject native,
 tool, shell and Git setup errors, verify durable partial errors and later probe
-execution, and then prove the same real fixture harness catalog is still
-accounted. A separate control proves an integrity refusal still stops and is
+execution, and then prove the same three-entry synthetic process catalog is still
+accounted. This is owner control evidence, with no Rust compilation or execution. A separate control proves an integrity refusal still stops and is
 recorded. Evidence persistence requires the existing writable evidence mount.
 
 All four actual historical refs lack **both** scripts:
