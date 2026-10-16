@@ -158,9 +158,9 @@
     {
       "id": "R20",
       "baseline": "NOT RUN",
-      "candidate": "NOT RUN",
+      "candidate": "PASS",
       "tier": "browser",
-      "evidence": "No required exact case for deleting the currently viewed pair. Existing mounted Chrome fixtures exercise ImportProgressCard cancel/reconcile only and run in ordinary E2E, not the sealed runtime.",
+      "evidence": "Reviewed deletion-navigation code PASS (Refs #70): E2E https://github.com/chriscase/RepoSync/actions/runs/38865124037 executed R70_DELETE_NAVIGATION, 35 helper cases and 14 browser scenarios, including real local API removal and deterministic error/warning variants. Reviewed head 3f96f8b1a50a456ceceb5e09257bb9a09c022712 and actual PR merge checkout 0007b5ac22faf3229e84d6be88c0d9e4a813baef share immutable tree 4d76b31c3af84e49c31135860750c5478cce529b; commits and compiled revision metadata remain distinct. Independent direct review accepted the source and labeled identical-tree qualification (SHIP-WITH-NITS). Capture/destination, confirmed removal, Back/history, stopped detail polling, child-on-parent list/warnings, cancel/error/permission/busy, queued/delayed completion, parent fallback, stale links and explicit remote options are covered. Detailed workflow/dependency provenance, acceptance mapping, six mutation receipts and first-failure/retry disclosure are in docs/reliability/evidence/r70/README.md and acceptance.json. Browser execution remains separate from the sealed runtime. The original-base receipt is not relabeled as a later checkout; current-main closeout checks are recorded separately. No binary identity, whole-epic, enterprise or live PASS is claimed.",
       "diagnostic_expected_baseline_failure": false
     },
     {

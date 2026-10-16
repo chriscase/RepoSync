@@ -1,0 +1,151 @@
+{
+  "case_id": "R70_DELETE_NAVIGATION",
+  "scenario": "R20",
+  "qualification_scope": "Reviewed deletion-navigation candidate code; real local API happy paths and deterministic browser failure/warning variants. Not enterprise, deployed-install, whole-epic or release-binary qualification.",
+  "reviewed_head": "3f96f8b1a50a456ceceb5e09257bb9a09c022712",
+  "reviewed_tree": "4d76b31c3af84e49c31135860750c5478cce529b",
+  "original_review_base": "43087e8501be56b04549472ddd0dad24b980055e",
+  "actual_tested_commit": "0007b5ac22faf3229e84d6be88c0d9e4a813baef",
+  "actual_checkout_ref": "refs/remotes/pull/208/merge",
+  "merge_parents": [
+    "43087e8501be56b04549472ddd0dad24b980055e",
+    "3f96f8b1a50a456ceceb5e09257bb9a09c022712"
+  ],
+  "tree_equivalence": {
+    "candidate_and_tested_tree_identical": true,
+    "git_diff_exit_code": 0,
+    "commit_identity_equal": false
+  },
+  "e2e": {
+    "url": "https://github.com/chriscase/RepoSync/actions/runs/38865124037",
+    "run_id": 38865124037,
+    "job_id": 116856045262,
+    "event": "pull_request",
+    "attempt": 1,
+    "conclusion": "success",
+    "helper_cases": 35,
+    "browser_scenarios": 14,
+    "browser_results": [
+      "busy-rejection",
+      "cancel-modal",
+      "delayed-completion",
+      "delete-child-with-warnings-stays-on-parent",
+      "missing-parent-list-fallback",
+      "mock-delete-child-stays-on-parent",
+      "permission-rejection",
+      "queued-gone-leaves-without-claiming-completion",
+      "queued-not-complete",
+      "real-delete-child-stays-on-parent",
+      "real-delete-viewed-replaces-history",
+      "server-error",
+      "stale-url-not-found",
+      "warnings-remain-visible"
+    ],
+    "full_downloaded_log_sha256": "74658fd10edbac29b7e2f563d9fbe8c9bc2163b3100cf997cdfc4d2d16d8a874",
+    "committed_excerpt": "execution.log",
+    "excerpt_sha256": "b0590133a707b35d4a226d933f7b316db2dde771943e098de65f3655132010f8"
+  },
+  "workflow": {
+    "path": ".github/workflows/e2e.yml",
+    "blob_id": "b8dc495fc8d0d285005569c21949d3855fbf40b9",
+    "sha256": "5a0d18b8398fa97a57638e35f13c2675983fa58bd99eab6780adc010f29ecd14",
+    "identical_at_original_base_candidate_and_tested_merge": true,
+    "resolved_actions": [
+      "actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)",
+      "dtolnay/rust-toolchain@stable' (SHA:b725eda525362e7cf34af9a7243cac1e3f01a7ec)",
+      "Swatinem/rust-cache@v2' (SHA:6323deb102c322ba6fcbdcafc7e3dddab59af2b6)",
+      "actions/setup-node@v4' (SHA:49933ea5288caeca8642d1e84afbd3f7d6820020)",
+      "actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)"
+    ]
+  },
+  "dependencies": {
+    "environment": {
+      "runner": "ubuntu-24.04 image 20261012.334.1",
+      "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+      "node": "v22.23.3",
+      "npm": "10.9.9",
+      "chrome": "155.0.8059.39",
+      "ui_dependency_install": "npm ci --prefix web-ui; 317 installed packages; tracked package-lock and integrity entries",
+      "rust_dependency_limit": "Root Cargo.lock is untracked; workflow uses cargo build/test without --locked. Its generated lock digest and test binary digest were not retained. This is observed candidate-code behavior evidence, not a reproducible/release-binary identity claim."
+    },
+    "ui_lock_blob": "974c4b2cc7cfc780a7b3c9bf0461f25179a87fa9",
+    "ui_lock_sha256": "06c02317aefe50bbc8f2c5d66a53616b9fc03ea856025f1f973880b250b2d0bc",
+    "ui_locked_versions": {
+      "vitest": "2.1.9",
+      "vite": "5.4.21",
+      "typescript": "5.9.3",
+      "react": "18.3.1",
+      "react-dom": "18.3.1",
+      "@tanstack/react-query": "5.90.21"
+    }
+  },
+  "artifact_identity_limit": "crates/web/build.rs embeds git rev-parse --short HEAD and dirty status as GIT_COMMIT_SHA; status health response exposes it. Commit/binary metadata can differ despite identical tracked code. R70 removal logic and browser assertions do not depend on that field. Generated Rust lock and test-binary digests were not retained. No commit/binary identity or reproducible release claim is made.",
+  "review": {
+    "outcome": "SHIP-WITH-NITS",
+    "reviewed_head": "3f96f8b1a50a456ceceb5e09257bb9a09c022712",
+    "reviewed_tree": "4d76b31c3af84e49c31135860750c5478cce529b",
+    "scope": "Independent direct Grok review accepted source behavior, labeled identical-tree evidence, Back/history assertions, and mocked warning variants with real API happy paths.",
+    "new_mutation_receipts": "Prepared for the separate final evidence-delta review; not claimed verified by the source review."
+  },
+  "mutation_receipts": "mutation-controls.json",
+  "ci": {
+    "exact_head_push": {
+      "url": "https://github.com/chriscase/RepoSync/actions/runs/38865063541",
+      "checkout": "3f96f8b1a50a456ceceb5e09257bb9a09c022712",
+      "conclusion": "success",
+      "r70_default_job": "ignored; not presented as browser execution"
+    },
+    "pr_build_and_test": {
+      "url": "https://github.com/chriscase/RepoSync/actions/runs/38865124188",
+      "checkout": "0007b5ac22faf3229e84d6be88c0d9e4a813baef",
+      "attempt_1": "failed unchanged process-wide FD test, 37 to 90 descriptors (+53)",
+      "attempt_2": "success without source changes",
+      "failed_test_source_sha256": "688142767f68374952aa63a1e8d6a020b3a9fd1053fd0f91627a6ca371ecf6ae",
+      "cause_assessment": "Intermittent result is consistent with parallel process-wide measurement interference; no repeatable product leak established; assertion unchanged."
+    },
+    "failure_excerpt": "ci-failures.log",
+    "failure_excerpt_sha256": "8bb863ad34d3bd92af741677819b77cde5a957c0e121c2cfe44a36f6f3a61216"
+  },
+  "whole_epic_debt": {
+    "phase0_url": "https://github.com/chriscase/RepoSync/actions/runs/38865124040",
+    "outcome": "FAIL before runtime",
+    "cause": "Pinned legacy fixture Cargo.lock requires update under --locked; later evidence copy fails because artifacts/ was not created.",
+    "matching_prior_run": "https://github.com/chriscase/RepoSync/actions/runs/38807266554",
+    "ordinary_pr_merge": "nongating; retained as full-epic qualification debt, not converted to PASS"
+  },
+  "integration_scope": {
+    "advanced_main": "1221b92b64669ec953e711df7079c6a05510c53a",
+    "original_receipt_applies_to": "Original reviewed head and original-base identical-tree merge only.",
+    "closeout_commit": "Acceptance documentation/evidence only; fresh current-main head/merge checks are reported separately in the PR and final handoff. No future run is claimed by this receipt."
+  },
+  "acceptance_criteria": [
+    {
+      "criterion": "Capture viewed ID and destination before removal",
+      "coverage": "Existing mutation snapshots target/parent before DELETE; removalDestination unit cases."
+    },
+    {
+      "criterion": "Confirmed removal replaces dead detail history and stops polling",
+      "coverage": "real-delete-viewed-replaces-history; Rust DB assertions confirm removal and parent preservation; Back and post-settlement polling assertions."
+    },
+    {
+      "criterion": "Child deletion refreshes parent without leaving it",
+      "coverage": "real-delete-child-stays-on-parent; delete-child-with-warnings-stays-on-parent checks list refresh, parent, sibling, unchanged history and warning after polling."
+    },
+    {
+      "criterion": "Cancelled/failed/unauthorized/busy deletion stays usable; warnings remain visible",
+      "coverage": "cancel-modal; server-error; permission-rejection; busy-rejection; warnings-remain-visible."
+    },
+    {
+      "criterion": "Queued/delayed removal does not pretend completion",
+      "coverage": "queued-not-complete; delayed-completion; queued-gone-leaves-without-claiming-completion; helper lifecycle cases."
+    },
+    {
+      "criterion": "Missing-parent fallback and friendly stale links",
+      "coverage": "missing-parent-list-fallback; stale-url-not-found with navigation and stopped polling."
+    },
+    {
+      "criterion": "Preserve defaults, authorization and lifecycle; explicit options",
+      "coverage": "Production behavior unchanged in this PR. Real API paths request false options; mocked warning path explicitly selects true and asserts the query."
+    }
+  ]
+}

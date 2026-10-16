@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Host-side #62 acceptance-matrix checker.
 
-Validates that every isolated required-case ID is classified against the
-stable R01–R24 scenario list, that GOAL.md is unchanged, and that no
+Validates isolated and separately hosted browser required-case IDs against
+the stable R01–R24 scenario list, that GOAL.md is unchanged, and that no
 scenario is marked PASS while criteria remain open. Also checks that the
 #41 qualification-gate docs still separate local evidence from enterprise
 qualification and do not recommend a blind watermark reset. This is a
@@ -48,7 +48,7 @@ def load_json(path: Path):
 
 def required_ids(manifest: dict) -> set[str]:
     ids = set()
-    for tier in ("diagnostics", "candidate"):
+    for tier in ("diagnostics", "candidate", "browser"):
         for case in manifest[tier]:
             if case["id"] in ids:
                 raise SystemExit(f"FAIL: duplicate required-case id {case['id']}")
@@ -170,6 +170,7 @@ def validate(matrix: dict, manifest: dict) -> list[str]:
     if seen != SCENARIO_IDS:
         errors.append(f"scenarios must be exactly {SCENARIO_IDS}, got {seen}")
     expected = required_ids(manifest)
+    browser_ids = {case["id"] for case in manifest.get("browser", [])}
     owners = classified_ids(matrix)
     missing = sorted(expected - set(owners))
     extra = sorted(set(owners) - expected)
@@ -191,7 +192,11 @@ def validate(matrix: dict, manifest: dict) -> list[str]:
                 errors.append(f"{sid} cannot be PASS while open criteria remain")
             if not required:
                 errors.append(f"{sid} cannot be PASS with zero required_case_ids")
-        if row.get("candidate") == "NOT RUN" and required:
+        # Browser discovery is separate from the sealed runtime. Registering a
+        # required browser case must not imply that this head was executed.
+        if row.get("candidate") == "NOT RUN" and required and (
+            row.get("tier") != "browser" or set(required) - browser_ids
+        ):
             errors.append(
                 f"{sid} is NOT RUN but lists required_case_ids {required}; "
                 "use PARTIAL or move those IDs"
@@ -309,6 +314,22 @@ def self_test() -> None:
     errors = validate(matrix, manifest)
     if errors:
         raise SystemExit("SELF-TEST FAIL:\n- " + "\n- ".join(errors))
+
+    r70 = next((case for case in manifest.get("browser", [])
+                if case["id"] == "R70_DELETE_NAVIGATION"), None)
+    if not r70:
+        raise SystemExit("SELF-TEST FAIL: missing R70 browser case")
+    workflow = (ROOT / r70["workflow"]).read_text()
+    if r70["command"] not in workflow or "-- --ignored --exact --nocapture" not in r70["command"]:
+        raise SystemExit("SELF-TEST FAIL: R70 browser case is not explicitly executed by E2E")
+    source = (ROOT / "crates/web/tests/server_freeze.rs").read_text()
+    if f"async fn {r70['test']}()" not in source:
+        raise SystemExit("SELF-TEST FAIL: R70 browser test is missing")
+    unwired_browser = json.loads(json.dumps(matrix))
+    r20 = next(row for row in unwired_browser["scenarios"] if row["id"] == "R20")
+    r20["required_case_ids"] = []
+    if not any("R70_DELETE_NAVIGATION" in error for error in validate(unwired_browser, manifest)):
+        raise SystemExit("SELF-TEST FAIL: unwired R70 browser case was not rejected")
 
     broken = json.loads(json.dumps(matrix))
     r09 = next(row for row in broken["scenarios"] if row["id"] == "R09")

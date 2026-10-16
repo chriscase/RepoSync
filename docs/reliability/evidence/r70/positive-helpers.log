@@ -1,0 +1,17 @@
+STDOUT
+
+> reposync-web-ui@0.1.0 test
+> vitest run src/branchPairRemoval.test.ts
+
+
+ RUN  v2.1.9 <fixture>/web-ui
+
+ ✓ src/branchPairRemoval.test.ts (35 tests) 3ms
+
+ Test Files  1 passed (1)
+      Tests  35 passed (35)
+   Start at  02:45:04
+   Duration  400ms (transform 23ms, setup 0ms, collect 20ms, tests 3ms, environment 0ms, prepare 38ms)
+
+
+STDERR
