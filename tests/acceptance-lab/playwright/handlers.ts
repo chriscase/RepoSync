@@ -24,6 +24,13 @@ async function own(lab: Lab, op: LabOp): Promise<Pair> {
   return sharedPair(lab, labPairKey(op.id));
 }
 
+export async function requireRepeatIdle(lab: Lab, pair: Pair): Promise<void> {
+  await lab.expectNoWrite(pair, async () => {
+    const status = await lab.triggerGit(pair.gitRepo);
+    if (status !== 200) throw new Error(`repeat webhook ${status}`);
+  });
+}
+
 async function remoteDeleteCase(lab: Lab, op: LabOp): Promise<void> {
   const parent = await own(lab, op);
   const suffix = slug(op.id);
@@ -361,7 +368,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       await lab.syncGitChange(pair, "printf 'notes\\n' > .notes\ngit add .notes\ngit commit -m 'dot'\n");
       const svn = await lab.svnBytes(pair, ".notes");
       if (svn.trim() !== "notes") throw new Error("dotfile missing");
-      await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
+      await requireRepeatIdle(lab, pair);
       lab.pass("dotfile synced; repeat trigger was idle");
       return;
     }
@@ -373,7 +380,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       await lab.waitUntil(async () => (await lab.svnBytesOrMissing(pair, "seq.txt"))?.includes("C") || false);
       const after = await lab.snap(pair);
       if (Number(after.svn) < Number(before.svn) + 1) throw new Error("no svn revision for the sequence");
-      await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
+      await requireRepeatIdle(lab, pair);
       lab.pass("three commits reached the final tree and the repeat was idle");
       return;
     }
@@ -481,22 +488,57 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         if (op.id === "GIT-MERGE-DAG") {
           await lab.commitGit(pair, "git checkout -b side\nprintf 'side\\n' > side.txt\ngit add side.txt\ngit commit -m side\ngit checkout main\nprintf 'main\\n' > main.txt\ngit add main.txt\ngit commit -m main\ngit merge --no-ff side -m merge\n");
         } else if (op.id === "GIT-CHERRY-PICK-NEW") {
-          await lab.commitGit(pair, "printf 'base\\n' > cherry.txt\ngit add cherry.txt\ngit commit -m base\n");
-          await lab.triggerGit(pair.gitRepo);
-          await lab.waitUntil(async () => (await lab.snap(pair)).svn !== before.svn);
-          await lab.commitGit(pair, "git checkout -b pick HEAD~1 || git checkout -b pick\ngit cherry-pick HEAD@{1} || git cherry-pick main\n");
+          const baseTip = await lab.commitGit(pair, "printf 'picked\\n' > cherry.txt\ngit add cherry.txt\ngit commit -m base\n");
+          const baseStatus = await lab.triggerGit(pair.gitRepo, false);
+          if (baseStatus !== 200) throw new Error(`cherry-pick base webhook ${baseStatus}`);
+          const baseCommits = await lab.gitCommitsSince(pair, before.git);
+          if (baseCommits.length !== 1 || baseCommits[0] !== baseTip) throw new Error("synced cherry-pick base was not the tracked tip");
+          await lab.waitOutboundGitHistory(pair, before, baseCommits, "cherry.txt", "picked\n");
+          const synced = await lab.snap(pair);
+          const descendant = await lab.commitGit(pair, "git rm cherry.txt\ngit commit -m later\ngit cherry-pick --no-edit HEAD~1\n");
+          if (descendant === baseTip || descendant === synced.git) throw new Error("tracked branch did not advance to the cherry-pick descendant");
+          const descendantStatus = await lab.triggerGit(pair.gitRepo, false);
+          if (descendantStatus !== 200) throw new Error(`cherry-pick descendant webhook ${descendantStatus}`);
+          const commits = await lab.gitCommitsSince(pair, synced.git);
+          if (commits.length !== 2 || commits[commits.length - 1] !== descendant) throw new Error("cherry-pick descendant missing from the tracked history");
+          await lab.waitOutboundGitHistory(pair, synced, commits, "cherry.txt", "picked\n");
+          await requireRepeatIdle(lab, pair);
+          lab.pass("cherry-pick descendant reached the tracked branch with its receipt; the repeat was idle");
+          return;
         } else if (op.id === "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED") {
           if (before.svn !== "1" || before.watermark !== "1" || before.records !== "1" || before.gitWatermark !== before.git || before.gitColumn !== before.git) {
             throw new Error("unobserved rebase requires a fresh import pair");
           }
-          await lab.commitGit(pair, "printf 'B\\n' > rebase.txt\ngit add rebase.txt\ngit commit -m B\ngit commit --amend -m B2\n");
+          const held = await lab.api("PUT", `/api/repos/${pair.id}`, {enabled: false});
+          if (held.status !== 200) throw new Error(`could not hold the poller (${held.status})`);
+          let tipB = "";
+          let tipB2 = "";
+          try {
+            tipB = await lab.commitGit(pair, "printf 'B\\n' > rebase.txt\ngit add rebase.txt\ngit commit -m B\n");
+            const remoteB = await lab.snap(pair);
+            if (remoteB.git !== tipB) throw new Error("remote tip B was not recorded");
+            if (remoteB.svn !== before.svn || remoteB.records !== before.records || remoteB.watermark !== before.watermark || remoteB.gitWatermark !== before.gitWatermark || remoteB.gitColumn !== before.gitColumn) {
+              throw new Error("B was observed during the unobserved interval");
+            }
+            tipB2 = await lab.commitGitLocal(pair, "git commit --amend -m B2\ngit push --force-with-lease origin main || git push --force origin main\n");
+            if (tipB2 === tipB) throw new Error("amend did not change the remote tip");
+            const remoteB2 = await lab.snap(pair);
+            if (remoteB2.git !== tipB2) throw new Error("remote tip B2 was not recorded");
+            if (remoteB2.svn !== before.svn || remoteB2.records !== before.records || remoteB2.watermark !== before.watermark || remoteB2.gitWatermark !== before.gitWatermark || remoteB2.gitColumn !== before.gitColumn) {
+              throw new Error("checkpoint moved before the single poll");
+            }
+          } finally {
+            const resumed = await lab.api("PUT", `/api/repos/${pair.id}`, {enabled: true});
+            if (resumed.status !== 200) throw new Error(`could not resume the poller (${resumed.status})`);
+          }
           const status = await lab.triggerGit(pair.gitRepo, false);
           if (status !== 200) throw new Error(`unobserved rebase webhook ${status}`);
           const commits = await lab.gitCommitsSince(pair, before.git);
-          if (commits.length !== 1) throw new Error(`unobserved rebase published ${commits.length} commits after ${before.git}`);
-          await lab.waitOutboundGitHistory(pair, before, commits, "rebase.txt", "B\n");
-          await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
-          lab.pass("amended unobserved tip published once and the repeat was idle");
+          if (commits.length !== 1 || commits[0] !== tipB2) throw new Error("unobserved rebase did not leave B2 as the only pending tip");
+          if (await lab.appliedReceiptCount(pair, "git_to_svn", tipB) !== "0") throw new Error("unobserved tip B was published");
+          await lab.waitOutboundGitHistory(pair, before, [tipB2], "rebase.txt", "B\n");
+          await requireRepeatIdle(lab, pair);
+          lab.pass("unobserved tips B and B2 were recorded before one publication of B2; the repeat was idle");
           return;
         } else if (op.id === "GIT-SQUASH-NEW-DESCENDANT") {
           await lab.commitGit(pair, "printf '1\\n' > squash.txt\ngit add squash.txt\ngit commit -m one\nprintf '2\\n' > squash.txt\ngit commit -am two\ngit reset --soft HEAD~2\ngit commit -m squashed\n");
@@ -507,7 +549,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
           const commits = await lab.gitCommitsSince(pair, before.git);
           if (commits.length !== 3) throw new Error(`revert history has ${commits.length} commits after ${before.git}`);
           await lab.waitOutboundGitHistory(pair, before, commits, "revert.txt", "v1\n");
-          await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
+          await requireRepeatIdle(lab, pair);
           lab.pass("three revert commits reached v1 bytes and the repeat was idle");
           return;
         } else {
@@ -515,9 +557,8 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         }
         await lab.triggerGit(pair.gitRepo, false);
         await lab.waitUntil(async () => (await lab.snap(pair)).svn !== before.svn);
-        await lab.expectNoWrite(pair, () => lab.triggerGit(pair.gitRepo).then(() => undefined));
-        const note = op.id === "GIT-CHERRY-PICK-NEW" ? "second revision is duplication-by-contract and is reported to owners" : "history case published and the repeat was idle";
-        lab.pass(note);
+        await requireRepeatIdle(lab, pair);
+        lab.pass("history case published and the repeat was idle");
         return;
       }
       await lab.commitGit(pair, "printf 'base\\n' > base.txt\ngit add base.txt\ngit commit -m base\n");

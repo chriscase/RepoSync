@@ -4,7 +4,7 @@ import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {test, expect} from "@playwright/test";
 import {assertCompletedPublishRefusal, assertReplayEndpoints, Lab, loginError, type Pair, type Snap} from "../../playwright/runtime.ts";
-import {labPairKey, runCase} from "../../playwright/handlers.ts";
+import {labPairKey, requireRepeatIdle, runCase} from "../../playwright/handlers.ts";
 
 const initial: Snap = {svn: "1", git: "a".repeat(40), maps: "1", records: "1", watermark: "1", gitWatermark: "a".repeat(40), gitColumn: "a".repeat(40)};
 const pair: Pair = {id: "fixture", name: "fixture", svnUrl: "https://unused/svn/fixture", gitRepo: "lab/fixture"};
@@ -272,28 +272,33 @@ test("observed and unobserved rebase ids get different repositories", () => {
   expect(labPairKey("GIT-REVERT-NEW")).toBe("pgitrevertnew");
 });
 
-test("unobserved rebase wait rejects a paused or already-published pair", async () => {
+test("unobserved rebase records both remote tips before one publication", async () => {
   const ancestor = "a".repeat(40);
-  const tip = "b".repeat(40);
+  const tipB = "b".repeat(40);
+  const tipB2 = "d".repeat(40);
   const published = "c".repeat(40);
   const fresh: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
   let phase = "fresh";
   let passed = false;
-  const keys: string[] = [];
+  const toggles: boolean[] = [];
   const snap = (): Snap => {
-    if (phase === "paused") return {...fresh};
+    if (phase === "remote-b") return {...fresh, git: tipB};
+    if (phase === "remote-b2") return {...fresh, git: tipB2};
+    if (phase === "paused") return {...fresh, git: tipB2};
     if (phase === "already-published") return {svn: "5", git: published, maps: "1", records: "4", watermark: "5", gitWatermark: published, gitColumn: published};
-    if (phase === "settled") return {svn: "2", git: tip, maps: "1", records: "2", watermark: "1", gitWatermark: tip, gitColumn: tip};
+    if (phase === "settled") return {svn: "2", git: tipB2, maps: "1", records: "2", watermark: "1", gitWatermark: tipB2, gitColumn: tipB2};
     return {...fresh};
   };
   const fake: any = {
-    createPair: async (name: string) => {keys.push(name); return {...pair, name, gitRepo: `lab/${name}`, svnUrl: `https://svn:8443/svn/${name}`};},
+    createPair: async (name: string) => ({...pair, name, gitRepo: `lab/${name}`, svnUrl: `https://svn:8443/svn/${name}`}),
+    api: async (_method: string, _path: string, body: {enabled: boolean}) => {toggles.push(body.enabled); return {status: 200, json: {}};},
     snap: async () => snap(),
-    commitGit: async () => tip,
-    gitCommitsSince: async (_p: Pair, ancestorSha: string) => {expect(ancestorSha).toBe(ancestor); return [tip];},
+    commitGit: async (_p: Pair, script: string) => {expect(script).not.toContain("--amend"); phase = "remote-b"; return tipB;},
+    commitGitLocal: async (_p: Pair, script: string) => {expect(script).toContain("--amend"); expect(script).toContain("push --force"); phase = "remote-b2"; return tipB2;},
+    gitCommitsSince: async (_p: Pair, ancestorSha: string) => {expect(ancestorSha).toBe(ancestor); return [tipB2];},
     triggerGit: async () => 200,
     svnBytesOrMissing: async () => phase === "settled" ? "B\n" : phase === "already-published" ? "base\n" : null,
-    sh: async (_service: string, sql: string) => phase === "settled" && sql.includes(tip) ? "1" : "0",
+    sh: async (_service: string, sql: string) => phase === "settled" && sql.includes(tipB2) ? "1" : "0",
     waitUntil: async (read: () => Promise<boolean>) => {
       phase = "paused";
       expect(await read()).toBe(false);
@@ -310,10 +315,95 @@ test("unobserved rebase wait rejects a paused or already-published pair", async 
     },
     pass: () => {passed = true;},
   };
+  fake.appliedReceiptCount = (...args: unknown[]) => Lab.prototype.appliedReceiptCount.call(fake, ...(args as [Pair, "git_to_svn", string]));
   fake.waitOutboundGitHistory = (...args: unknown[]) => Lab.prototype.waitOutboundGitHistory.call(fake, ...(args as [Pair, Snap, string[], string, string]));
   await runCase(fake, {id: "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED", title: "fixture", suite: "full"});
   expect(passed).toBe(true);
-  expect(keys).toEqual([labPairKey("GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED")]);
+  expect(toggles).toEqual([false, true]);
+  expect(tipB).not.toBe(tipB2);
+});
+
+test("cherry-pick publishes the descendant on the tracked branch", async () => {
+  const ancestor = "a".repeat(40);
+  const baseTip = "b".repeat(40);
+  const later = "c".repeat(40);
+  const descendant = "d".repeat(40);
+  const fresh: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
+  let phase = "fresh";
+  let passed = false;
+  const scripts: string[] = [];
+  const snap = (): Snap => {
+    if (phase === "base-synced") return {svn: "2", git: baseTip, maps: "1", records: "2", watermark: "1", gitWatermark: baseTip, gitColumn: baseTip};
+    if (phase === "descendant-synced") return {svn: "4", git: descendant, maps: "1", records: "4", watermark: "1", gitWatermark: descendant, gitColumn: descendant};
+    return {...fresh};
+  };
+  const fake: any = {
+    createPair: async () => pair,
+    snap: async () => snap(),
+    commitGit: async (_p: Pair, script: string) => {
+      scripts.push(script);
+      if (script.includes("cherry-pick")) {
+        expect(script).not.toContain("checkout -b pick");
+        phase = "descendant-remote";
+        return descendant;
+      }
+      phase = "base-remote";
+      return baseTip;
+    },
+    gitCommitsSince: async (_p: Pair, ancestorSha: string) => ancestorSha === ancestor ? [baseTip] : [later, descendant],
+    triggerGit: async () => 200,
+    svnBytesOrMissing: async () => "picked\n",
+    sh: async (_service: string, sql: string) => (phase === "base-synced" && sql.includes(baseTip)) || (phase === "descendant-synced" && (sql.includes(later) || sql.includes(descendant))) ? "1" : "0",
+    waitUntil: async (read: () => Promise<boolean>) => {
+      if (phase === "base-remote") {
+        phase = "unchanged-main";
+        expect(await read()).toBe(false);
+        phase = "base-synced";
+      } else {
+        phase = "unchanged-main";
+        expect(await read()).toBe(false);
+        phase = "descendant-synced";
+      }
+      expect(await read()).toBe(true);
+    },
+    expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {await action();},
+    pass: () => {passed = true;},
+  };
+  fake.appliedReceiptCount = (...args: unknown[]) => Lab.prototype.appliedReceiptCount.call(fake, ...(args as [Pair, "git_to_svn", string]));
+  fake.waitOutboundGitHistory = (...args: unknown[]) => Lab.prototype.waitOutboundGitHistory.call(fake, ...(args as [Pair, Snap, string[], string, string]));
+  await runCase(fake, {id: "GIT-CHERRY-PICK-NEW", title: "fixture", suite: "full"});
+  expect(passed).toBe(true);
+  expect(scripts.some(script => script.includes("cherry-pick") && script.includes("HEAD~1"))).toBe(true);
+});
+
+test("an unchanged tracked branch is not a cherry-pick publication", async () => {
+  const ancestor = "a".repeat(40);
+  const baseTip = "b".repeat(40);
+  const fresh: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
+  let passed = false;
+  let calls = 0;
+  const fake: any = {
+    createPair: async () => pair,
+    snap: async () => calls < 2 ? {...fresh, svn: "2", git: baseTip, records: "2", gitWatermark: baseTip, gitColumn: baseTip} : {...fresh, git: baseTip, svn: "2", records: "2", gitWatermark: baseTip, gitColumn: baseTip},
+    commitGit: async () => {calls++; return baseTip;},
+    gitCommitsSince: async () => [baseTip],
+    triggerGit: async () => 200,
+    svnBytesOrMissing: async () => "picked\n",
+    sh: async () => "1",
+    waitUntil: async (read: () => Promise<boolean>) => {expect(await read()).toBe(true);},
+    pass: () => {passed = true;},
+  };
+  fake.appliedReceiptCount = (...args: unknown[]) => Lab.prototype.appliedReceiptCount.call(fake, ...(args as [Pair, "git_to_svn", string]));
+  fake.waitOutboundGitHistory = async () => fake.snap();
+  await expect(runCase(fake, {id: "GIT-CHERRY-PICK-NEW", title: "fixture", suite: "full"})).rejects.toThrow(/did not advance/);
+  expect(passed).toBe(false);
+});
+
+test("rejected repeat webhook is not an idle result", async () => {
+  await expect(requireRepeatIdle({triggerGit: async () => 500, expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {await action();}} as unknown as Lab, pair)).rejects.toThrow(/repeat webhook 500/);
+  let status = 0;
+  await requireRepeatIdle({triggerGit: async () => {status = 200; return 200;}, expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {await action();}} as unknown as Lab, pair);
+  expect(status).toBe(200);
 });
 
 test("an already-published pair cannot start the unobserved rebase", async () => {
