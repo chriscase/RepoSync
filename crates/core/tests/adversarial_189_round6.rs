@@ -1,4 +1,4 @@
-//! Grok round-6 (#189): atomic removal on deferred v12, scoped KV mirror gating.
+//! Grok round-6 (#189): atomic removal across deferred and ordinary storage, scoped KV mirror gating.
 
 use reposync_core::db::repo_scope_identity::last_git_sha_kv_key;
 use reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key;
@@ -9,9 +9,49 @@ use reposync_core::echo_receipt_scope::{
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
+fn seed_removal_history(conn: &Connection, repo_id: &str) {
+    let sha = "a".repeat(40);
+    conn.execute(
+        "INSERT INTO commit_map (svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id)
+         VALUES (2,?1,'svn_to_git','t','','',?2)",
+        params![sha, repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_records (id,repo_id,svn_rev,git_sha,direction,timestamp,synced_at,status)
+         VALUES (?1,?2,2,?3,'svn_to_git','t','t','applied')",
+        params![format!("{repo_id}-sync"), repo_id, sha],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conflicts (id,repo_id,file_path,conflict_type,created_at)
+         VALUES (?1,?2,'fixture.txt','content','t')",
+        params![format!("{repo_id}-conflict"), repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO audit_log (repo_id,action,details,created_at)
+         VALUES (?1,'fixture','preserve this audit','t')",
+        [repo_id],
+    )
+    .unwrap();
+    for (key, value) in [
+        (legacy_last_git_sha_kv_key(repo_id), sha),
+        (
+            format!("secret_git_token_{repo_id}"),
+            "fixture-secret".into(),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, 't')",
+            params![key, value],
+        )
+        .unwrap();
+    }
+}
+
 fn deferred_lone_v12_file_db(tmp: &TempDir) -> Database {
     let path = tmp.path().join("reposync.db");
-    let sha = "a".repeat(40);
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
@@ -22,23 +62,7 @@ fn deferred_lone_v12_file_db(tmp: &TempDir) -> Database {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO commit_map (svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id)
-             VALUES (2,?1,'svn_to_git','t','','','pair')",
-            params![sha],
-        )
-        .unwrap();
-        let now = "t";
-        conn.execute(
-            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![legacy_last_git_sha_kv_key("pair"), sha, now],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params!["secret_git_token_pair", "fixture-secret", now],
-        )
-        .unwrap();
+        seed_removal_history(&conn, "pair");
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
@@ -46,6 +70,27 @@ fn deferred_lone_v12_file_db(tmp: &TempDir) -> Database {
         );
     }
     Database::new(&path).unwrap()
+}
+
+fn ordinary_file_db(tmp: &TempDir, multiple_repositories: bool) -> Database {
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    for repo_id in if multiple_repositories {
+        vec!["pair", "pair_g2"]
+    } else {
+        vec!["pair"]
+    } {
+        let scope = reposync_core::db::repo_scope_identity::new_scope_uuid();
+        db.conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha,scope_uuid)
+             VALUES (?1,?1,'file:///fixture','trunk','','','','main',1,'t','t',2,'abc',?2)",
+            params![repo_id, scope],
+        ).unwrap();
+        seed_removal_history(&db.conn(), repo_id);
+        db.set_state(&last_git_sha_kv_key(&scope), &"b".repeat(40))
+            .unwrap();
+    }
+    db
 }
 
 fn in_transaction(conn: &rusqlite::Connection) -> bool {
@@ -86,18 +131,29 @@ fn removal_snapshot(conn: &Connection) -> (u32, Vec<Vec<Vec<rusqlite::types::Val
     (version, rows)
 }
 
-#[test]
-fn deferred_v12_hard_delete_rolls_back_partial_history_on_targeted_failure() {
-    let tmp = TempDir::new().unwrap();
-    let db = deferred_lone_v12_file_db(&tmp);
-    db.conn().execute_batch(
-        "INSERT INTO sync_records (id,repo_id,svn_rev,git_sha,direction,timestamp,synced_at,status)
-         VALUES ('fixture-sync','pair',2,'fixture-sha','svn_to_git','t','t','applied');
-         INSERT INTO conflicts (id,repo_id,file_path,conflict_type,created_at)
-         VALUES ('fixture-conflict','pair','fixture.txt','content','t');
-         INSERT INTO audit_log (repo_id,action,details,created_at)
-         VALUES ('pair','fixture','preserve this audit','t');
-         CREATE TRIGGER fail_pair_removal BEFORE DELETE ON repositories
+fn assert_hard_delete_rolls_back_partial_history(
+    tmp: &TempDir,
+    db: &Database,
+    expected_version: u32,
+) {
+    for table in ["commit_map", "sync_records", "conflicts", "audit_log"] {
+        let count: i64 = db
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE repo_id = 'pair'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "targeted fixture row missing from {table}");
+    }
+    assert_eq!(
+        db.get_state("secret_git_token_pair").unwrap().as_deref(),
+        Some("fixture-secret")
+    );
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_pair_removal BEFORE DELETE ON repositories
          WHEN OLD.id = 'pair'
          BEGIN
              SELECT CASE WHEN
@@ -108,11 +164,12 @@ fn deferred_v12_hard_delete_rolls_back_partial_history_on_targeted_failure() {
                  EXISTS (SELECT 1 FROM kv_state WHERE key = 'secret_git_token_pair')
              THEN RAISE(ABORT, 'failure injected before targeted data deletion')
              ELSE RAISE(ABORT, 'injected failure after targeted data deletion') END;
-         END;"
-    ).unwrap();
+         END;",
+        )
+        .unwrap();
     let observer = Connection::open(tmp.path().join("reposync.db")).unwrap();
     let before = removal_snapshot(&db.conn());
-    assert_eq!(before.0, 12);
+    assert_eq!(before.0, expected_version);
     assert_eq!(removal_snapshot(&observer), before);
 
     let err = db.hard_delete_repository("pair").unwrap_err();
@@ -127,13 +184,35 @@ fn deferred_v12_hard_delete_rolls_back_partial_history_on_targeted_failure() {
     assert_eq!(
         removal_snapshot(&db.conn()),
         before,
-        "writer must see restored registration, history, credentials and v12 schema"
+        "writer must see restored registration, history, credentials and schema"
     );
     assert_eq!(
         removal_snapshot(&observer),
         before,
         "second connection must see the same preserved durable state"
     );
+}
+
+#[test]
+fn deferred_v12_hard_delete_rolls_back_partial_history_on_targeted_failure() {
+    let tmp = TempDir::new().unwrap();
+    let db = deferred_lone_v12_file_db(&tmp);
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 12);
+}
+
+#[test]
+fn ordinary_v13_hard_delete_rolls_back_partial_history_on_targeted_failure() {
+    let tmp = TempDir::new().unwrap();
+    let db = ordinary_file_db(&tmp, false);
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 13);
+}
+
+#[test]
+fn multi_repository_hard_delete_rolls_back_partial_history_on_targeted_failure() {
+    let tmp = TempDir::new().unwrap();
+    let db = ordinary_file_db(&tmp, true);
+    assert!(db.get_repository("pair_g2").unwrap().is_some());
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 13);
 }
 
 #[test]

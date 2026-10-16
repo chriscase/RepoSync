@@ -6515,6 +6515,134 @@ repo = "test/test-repo"
         );
     }
 
+    // Multi-repository reader admission revokes legacy authority before its
+    // collision arm. Exercise the ownership predicate directly so revocation
+    // cannot hide a broken exact-match or owning-row exclusion check.
+    #[test]
+    fn checkpoint_collision_guard_identifies_foreign_uuid_without_revoking_latch() {
+        use crate::db::repo_scope_identity::{
+            human_legacy_kv_token_conflicts_with_foreign_scope_uuid, repository_scope_uuid,
+        };
+
+        let repo_id = "abcdef01-2345-4678-9123-456789abcdef";
+        let (engine, _git_dir) = team_echo_engine_with_git_dir(repo_id);
+        let own_scope = repository_scope_uuid(&engine.db().conn(), repo_id).unwrap();
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('victim','victim','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [repo_id],
+        ).unwrap();
+        engine
+            .db()
+            .set_state(&format!("last_git_sha_{repo_id}"), &"e".repeat(40))
+            .unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        {
+            let conn = engine.db().conn();
+            for (token, owner, expected) in [
+                (repo_id.to_string(), repo_id, true),
+                (repo_id.to_string(), "victim", false),
+                (format!("{repo_id}x"), repo_id, false),
+                (own_scope, repo_id, false),
+            ] {
+                assert_eq!(
+                    human_legacy_kv_token_conflicts_with_foreign_scope_uuid(&conn, &token, owner)
+                        .unwrap(),
+                    expected,
+                    "wrong ownership verdict for token {token} and owner {owner}",
+                );
+            }
+        }
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+        assert_eq!(
+            engine
+                .db()
+                .get_state("reposync_v13_legacy_repo_id_kv_reads")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_collision_guard_distinguishes_human_id_prefixes_from_foreign_scopes() {
+        use crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let neighbor_scope = crate::db::repo_scope_identity::new_scope_uuid();
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('pair_g2','pair_g2','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [&neighbor_scope],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        {
+            let conn = engine.db().conn();
+            for (token, owner, expected) in [
+                ("pair", "pair", false),
+                ("pair_g2", "pair", false),
+                ("pair_g2", "pair_g2", false),
+                (neighbor_scope.as_str(), "pair", true),
+                (neighbor_scope.as_str(), "pair_g2", false),
+            ] {
+                assert_eq!(
+                    human_legacy_kv_token_conflicts_with_foreign_scope_uuid(&conn, token, owner)
+                        .unwrap(),
+                    expected,
+                    "wrong ownership verdict for token {token} and owner {owner}",
+                );
+            }
+        }
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+        assert_eq!(
+            engine
+                .db()
+                .get_state("reposync_v13_legacy_repo_id_kv_reads")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_collision_guard_reports_query_errors_instead_of_no_collision() {
+        let db = Database::in_memory().unwrap();
+        crate::db::schema::run_migrations_up_to(&db.conn(), 12).unwrap();
+        db.set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let conn = db.conn();
+        let error = crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+            &conn, "pair", "pair",
+        ).expect_err("missing scope schema must not be reported as no collision");
+        assert!(
+            error.to_string().contains("no such column: scope_uuid"),
+            "unexpected query error: {error}"
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM kv_state WHERE key = 'reposync_v13_legacy_repo_id_kv_reads'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "1"
+        );
+    }
+
     #[test]
     fn team_git_checkpoint_revoked_legacy_tip_preserves_existing_baseline() {
         use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
