@@ -1,0 +1,81 @@
+{
+  "policy": "Historical workspace dependency edges differ; shared registry packages must retain identical versions and checksums. No runtime source overlay.",
+  "schema": 1,
+  "sources": {
+    "54e183484961bd9ad12bd03505b3b00610de7cd9": {
+      "label": "merged",
+      "lock": "Cargo.54e1834.lock",
+      "lock_sha256": "eca9dfdc221c31be47daad874924ce09dd621ed686ecdad78426458b482591c9",
+      "manifests": {
+        "Cargo.toml": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "crates/cli/Cargo.toml": "f44d68ccc6c97a948d0dac0a703521e8c32cbec488b705429817ac19ddcea245",
+        "crates/core/Cargo.toml": "5da33e973a454cdeefee42078c79ca6dedc307a613885b2821a92298b9821cb2",
+        "crates/daemon/Cargo.toml": "662b6e4d1d04757acaf6ea49883695fd7b111b41f3afa7a0528657440dc07ac4",
+        "crates/personal/Cargo.toml": "a00de44a31f1552cbeafb505f2021ae3a2d88b26ed339bc3fb6510b124dbe4f8",
+        "crates/web/Cargo.toml": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178"
+      },
+      "reviewed_source": "54e183484961bd9ad12bd03505b3b00610de7cd9",
+      "source_tree": "8d1c7a38239634e8ac830588cb6b09a93badd635"
+    },
+    "87379741779a6259f7eeb52a68cc6f061174e5ef": {
+      "label": "base",
+      "lock": "Cargo.8737974.lock",
+      "lock_sha256": "9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05",
+      "manifests": {
+        "Cargo.toml": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "crates/cli/Cargo.toml": "f44d68ccc6c97a948d0dac0a703521e8c32cbec488b705429817ac19ddcea245",
+        "crates/core/Cargo.toml": "4d2c18840d8483c66e98f5677b08720ef256a2276b3dadcd236006abeb569062",
+        "crates/daemon/Cargo.toml": "662b6e4d1d04757acaf6ea49883695fd7b111b41f3afa7a0528657440dc07ac4",
+        "crates/personal/Cargo.toml": "a00de44a31f1552cbeafb505f2021ae3a2d88b26ed339bc3fb6510b124dbe4f8",
+        "crates/web/Cargo.toml": "63027000c942f16ac3f5ed2f2e39ef0df359483e0c7453203161a633b9e82541"
+      },
+      "reviewed_source": "87379741779a6259f7eeb52a68cc6f061174e5ef",
+      "source_tree": "f383bb9b123f3f75b2dde7f17f7311a264946abd"
+    },
+    "ab097580d9415ae2f8df44bed4041f740a1b38f2": {
+      "label": "immediate",
+      "lock": "Cargo.ab09758.lock",
+      "lock_sha256": "9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05",
+      "manifests": {
+        "Cargo.toml": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "crates/cli/Cargo.toml": "f44d68ccc6c97a948d0dac0a703521e8c32cbec488b705429817ac19ddcea245",
+        "crates/core/Cargo.toml": "b8db5f7ab033d375c4e5b1acc679b171b24666add7fbf773266b7f668363aab4",
+        "crates/daemon/Cargo.toml": "662b6e4d1d04757acaf6ea49883695fd7b111b41f3afa7a0528657440dc07ac4",
+        "crates/personal/Cargo.toml": "a00de44a31f1552cbeafb505f2021ae3a2d88b26ed339bc3fb6510b124dbe4f8",
+        "crates/web/Cargo.toml": "a8698785c5ce87216bfc782f2bd9d21f0e625347c4edbeb4aa543964094a72ae"
+      },
+      "reviewed_source": "ab097580d9415ae2f8df44bed4041f740a1b38f2",
+      "source_tree": "355bba3f3bd37009183c490f41a52cbea2ac68f9"
+    },
+    "candidate": {
+      "label": "candidate",
+      "lock": "Cargo.lock",
+      "lock_sha256": "295583faf31523be3fb43d729e1777d45751cda900439f6ae6b0e682fe6605c6",
+      "manifests": {
+        "Cargo.toml": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "crates/cli/Cargo.toml": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
+        "crates/core/Cargo.toml": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
+        "crates/daemon/Cargo.toml": "17eaf441301e4adbaa0e4dbc50f716011a5a0ac276f905e514bb4a041a1691d1",
+        "crates/personal/Cargo.toml": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
+        "crates/web/Cargo.toml": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178"
+      },
+      "reviewed_source": "a8f814aff7d87e5a3c3215c21b3d3eaf5186f2e5",
+      "source_tree": "dc1f8337c70916e67ae320d67f4b56e0949b11aa"
+    },
+    "f74fce855a1f1d80dd631397f436ba33906272e6": {
+      "label": "previous",
+      "lock": "Cargo.f74fce8.lock",
+      "lock_sha256": "9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05",
+      "manifests": {
+        "Cargo.toml": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "crates/cli/Cargo.toml": "f44d68ccc6c97a948d0dac0a703521e8c32cbec488b705429817ac19ddcea245",
+        "crates/core/Cargo.toml": "4d2c18840d8483c66e98f5677b08720ef256a2276b3dadcd236006abeb569062",
+        "crates/daemon/Cargo.toml": "662b6e4d1d04757acaf6ea49883695fd7b111b41f3afa7a0528657440dc07ac4",
+        "crates/personal/Cargo.toml": "a00de44a31f1552cbeafb505f2021ae3a2d88b26ed339bc3fb6510b124dbe4f8",
+        "crates/web/Cargo.toml": "63027000c942f16ac3f5ed2f2e39ef0df359483e0c7453203161a633b9e82541"
+      },
+      "reviewed_source": "f74fce855a1f1d80dd631397f436ba33906272e6",
+      "source_tree": "2819ed3cd27d0dad13847e481e18f550aac15d06"
+    }
+  }
+}

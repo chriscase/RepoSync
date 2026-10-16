@@ -1,6 +1,10 @@
+FROM node:22-bookworm-slim AS node-runtime
 FROM rust:1.98.1-bookworm AS build
 ENV CARGO_BUILD_JOBS=2
 ENV CARGO_TARGET_DIR=/src/target
+# Bound cache growth across five isolated source builds; no incremental objects
+# or debug symbols. Assertions and unoptimized test behavior remain enabled.
+ENV CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git subversion pkg-config libssl-dev python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -11,7 +15,14 @@ COPY docs/reliability/legacy-evidence-vocabulary.json ./docs/reliability/legacy-
 COPY docs/reliability/fixtures/Cargo.lock ./Cargo.lock
 COPY scripts/reliability-prep.py /usr/local/bin/reliability-prep
 ARG RELIABILITY_INCLUDE_OLD=1
-RUN if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
+ARG RELIABILITY_TARGET_CACHE
+ARG RELIABILITY_OLD_TARGET_CACHE
+# The script binds these IDs to exact source/tree, lock, recipe and build mode.
+# The toolchain tag is explicit; Cargo also fingerprints the actual compiler.
+RUN --mount=type=cache,id=rust-1.98.1-bookworm-${RELIABILITY_TARGET_CACHE},target=/src/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    test -n "$RELIABILITY_TARGET_CACHE" && \
+    if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cargo test --workspace --no-run --locked --features reposync-core/reliability-fixture,reposync-web/reliability-fixture --message-format=json > /tmp/cargo-preparation.jsonl; \
     else \
       cargo test --workspace --no-run --locked --message-format=json > /tmp/cargo-preparation.jsonl; \
@@ -21,24 +32,30 @@ RUN if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
     cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
 COPY legacy-old /old-src
-RUN mkdir -p /opt/reliability-old-tests && \
+RUN --mount=type=cache,id=rust-1.98.1-bookworm-old-${RELIABILITY_OLD_TARGET_CACHE},target=/src/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    test -n "$RELIABILITY_OLD_TARGET_CACHE" && mkdir -p /opt/reliability-old-tests && \
     if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cd /old-src && cargo test -p reposync-web --test legacy_import_generator --no-run --locked --message-format=json \
         > /tmp/old-preparation.jsonl && \
       python3 /usr/local/bin/reliability-prep /tmp/old-preparation.jsonl /opt/reliability-old-tests && \
       sha256sum /opt/reliability-old-tests/legacy_import_generator-* > /opt/reliability-old-tests/generator.sha256 && \
-      sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256; \
+      sha256sum crates/web/tests/legacy_import_generator.rs > /opt/reliability-old-tests/overlay.sha256 && \
+      sha256sum Cargo.lock > /opt/reliability-old-tests/lock.sha256; \
     fi
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs subversion libssl3 ca-certificates nodejs && rm -rf /var/lib/apt/lists/* \
-    && if ! command -v node >/dev/null; then ln -sf /usr/bin/nodejs /usr/local/bin/node; fi
+    git git-lfs subversion libssl3 libstdc++6 libatomic1 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+RUN ln -s /usr/local/bin/node /usr/bin/nodejs && mkdir -p /src/crates/web
 ENV PATH="/usr/local/bin:/usr/bin:/bin"
 ENV REPOSYNC_NODE_BIN=/usr/bin/nodejs
 # Web UI contract tests resolve web-ui via compile-time CARGO_MANIFEST_DIR (/src/crates/web).
 COPY --from=build /src/web-ui /src/web-ui
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
+RUN node --version >> /opt/reliability-tests/build-toolchain.txt && \
+    sha256sum /usr/local/bin/node >> /opt/reliability-tests/build-toolchain.txt
 COPY --from=build /opt/reliability-old-tests /opt/reliability-old-tests
 COPY scripts/reliability-runtime.py /usr/local/bin/reliability-runtime
 COPY scripts/reliability-copy-consumer.mjs /opt/reliability-copy-consumer.mjs
