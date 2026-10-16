@@ -1,3 +1,4 @@
+FROM node:22-bookworm-slim AS node-runtime
 FROM rust:1.98.1-bookworm AS build
 ENV CARGO_BUILD_JOBS=2
 ENV CARGO_TARGET_DIR=/src/target
@@ -45,13 +46,16 @@ RUN --mount=type=cache,id=rust-1.98.1-bookworm-old-${RELIABILITY_OLD_TARGET_CACH
 
 FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs subversion libssl3 ca-certificates nodejs && rm -rf /var/lib/apt/lists/* \
-    && if ! command -v node >/dev/null; then ln -sf /usr/bin/nodejs /usr/local/bin/node; fi
+    git git-lfs subversion libssl3 libstdc++6 libatomic1 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+RUN ln -s /usr/local/bin/node /usr/bin/nodejs && mkdir -p /src/crates/web
 ENV PATH="/usr/local/bin:/usr/bin:/bin"
 ENV REPOSYNC_NODE_BIN=/usr/bin/nodejs
 # Web UI contract tests resolve web-ui via compile-time CARGO_MANIFEST_DIR (/src/crates/web).
 COPY --from=build /src/web-ui /src/web-ui
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
+RUN node --version >> /opt/reliability-tests/build-toolchain.txt && \
+    sha256sum /usr/local/bin/node >> /opt/reliability-tests/build-toolchain.txt
 COPY --from=build /opt/reliability-old-tests /opt/reliability-old-tests
 COPY scripts/reliability-runtime.py /usr/local/bin/reliability-runtime
 COPY scripts/reliability-copy-consumer.mjs /opt/reliability-copy-consumer.mjs

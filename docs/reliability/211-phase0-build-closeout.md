@@ -97,8 +97,53 @@ as complete execution/publication.
 
 ## Hosted qualification
 
-Pending exact final-source execution and independent source review. The previous
-run `38885178085` stopped in the historical generator's locked build; diagnostics
-and comparisons were NOT_RUN. Its result is retained as the before evidence.
-No full qualification, release or broader issue completion follows from this
-build restoration.
+Exact source/checkout identities, review decisions, current qualification status
+and immutable artifact receipts are recorded on [PR #212](https://github.com/chriscase/RepoSync/pull/212).
+The before run `38885178085` stopped in the historical generator's locked build;
+diagnostics and comparisons were NOT_RUN. Head `9438aeb` run `38893831737` built
+all six images, executed all 325 required IDs (323 passed / 2 failed), and ran
+all four historical suites. Its candidate catalog was blocked by the runner
+combining a parent summary with four nested child summaries in stderr. Its
+published artifact is `12043893392`, SHA-256
+`c58c23ae9732cca45f533b69f25c1caec04e05a8188da821fc7e4cc4cf7c4f14`.
+All four comparisons in that cohort remain NOT_RUN.
+
+## Authorized runner and UI layout extension
+
+PM reserved the narrow extension to this same implementation owner: authoritative
+Rust parent parsing/writer inputs in `scripts/reliability-runtime.py`, and the
+UI runtime layout in the Dockerfile plus the existing runtime's source-isolation
+check. Production crates, workflows, #195/#204 and unrelated harness changes
+remain excluded.
+
+Baseline parsing now uses stdout as the authoritative parent channel, retaining
+complete combined output and separate stdout/stderr logs. A process receipt binds
+the actual exit code and both input hashes to each parsed catalog. The parser
+requires one complete parent header/summary, consistent announced totals,
+unique names, exact per-status counts, no filtered/measured selection, and a
+matching Rust harness exit code. Child summaries in stderr cannot replace parent
+results; duplicate summaries on stdout remain rejected.
+
+Replay of the retained core log preserves all 701 names/statuses exactly:
+623 PASS / 78 FAIL, catalog SHA-256
+`4d4a42f0bad258ba3bb0df99ac4433f5bdb5e9e524be9147d3805d6970a73e18`.
+The combined raw log stays identical. This replay uses a synthetic executable
+and is parser sensitivity evidence, not a hosted qualification receipt.
+`python3 scripts/reliability-runtime.py --self-test` also covers malformed,
+missing, truncated and inconsistent output, mismatched exits, duplicate names,
+child stderr preservation, and forbidden runtime source content.
+
+The UI tests require `/src/crates/web/../..` as their working directory.
+Only empty `/src/crates/web` traversal directories are added; Rust source,
+manifests, other crates and symlink substitutions remain forbidden. Node 22 is
+copied from the official Bookworm image, with its version and executable digest
+retained beside compiler provenance. Its built-in type stripping supports the
+existing test invocations ([Node documentation](https://nodejs.org/docs/latest-v22.x/api/typescript.html)).
+The two required UI failures remain FAIL in earlier cohorts; only fresh hosted
+execution can establish their correction. Missing core HTTP fixture scripts
+remain explicit failures and are not packaged by this UI layout repair.
+
+Every published source delta requires its own hosted diagnostics, populated
+candidate catalog, all four executed comparisons, artifact publication and narrow
+independent review. No full scenario qualification, release or broader issue
+completion follows from build restoration or parser replay.

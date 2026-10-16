@@ -105,14 +105,18 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def assert_runtime_source_isolation():
-    """Reject a full checkout in the fixture namespace; allow web-ui slice only."""
-    src = Path("/src")
+def assert_runtime_source_isolation(src=Path("/src")):
+    """Allow UI assets and empty compile-path ancestors, never Rust source."""
     if not src.exists():
         return
+    assert not src.is_symlink(), "runtime source root is a symlink"
     top_level = sorted(p.name for p in src.iterdir())
-    assert top_level == ["web-ui"], f"unexpected /src in runtime: {top_level}"
-    forbidden = ("crates", "Cargo.toml", "Dockerfile.reliability", "scripts", "docs")
+    assert top_level == ["crates", "web-ui"], f"unexpected /src in runtime: {top_level}"
+    crates, web = src / "crates", src / "crates/web"
+    assert not crates.is_symlink() and crates.is_dir(), "invalid empty crate ancestor"
+    assert sorted(p.name for p in crates.iterdir()) == ["web"], "runtime contains another crate"
+    assert not web.is_symlink() and web.is_dir() and not list(web.iterdir()), "runtime web ancestor is not empty"
+    forbidden = ("Cargo.toml", "Dockerfile.reliability", "scripts", "docs")
     for name in forbidden:
         assert not (src / name).exists(), "full source checkout was mounted into runtime"
 
@@ -312,10 +316,41 @@ def run_scan_case(case):
     return result
 
 
-def run_baseline(binaries):
+def parse_baseline_stdout(name, stdout, returncode):
+    """Validate the authoritative parent harness channel, including failures."""
     import re
+    from collections import Counter
+    headers = list(re.finditer(r"(?m)^running (\d+) tests?\n", stdout))
+    summaries = list(re.finditer(
+        r"(?m)^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+        r"(\d+) measured; (\d+) filtered out; finished in [0-9]+(?:\.[0-9]+)?s\n", stdout))
+    assert len(headers) == len(summaries) == 1, f"missing or ambiguous parent harness for {name}"
+    header, summary = headers[0], summaries[0]
+    assert header.end() <= summary.start() and not stdout[summary.end():].strip(), f"truncated or trailing parent output for {name}"
+    outcome, *counts = summary.groups()
+    passed, failed, ignored, measured, filtered = map(int, counts)
+    assert measured == filtered == 0, f"incomplete baseline selection for {name}"
+    assert int(header[1]) == passed + failed + ignored, f"parent announced/count mismatch for {name}"
+    assert (outcome == "ok" and failed == 0 and returncode == 0) or (
+        outcome == "FAILED" and failed > 0 and returncode == 101), f"parent exit/count mismatch for {name}"
+    starts = list(re.finditer(r"(?m)^test (\S+) \.\.\. ", stdout))
+    matched = {}
+    for index, start in enumerate(starts):
+        assert header.end() <= start.start() < summary.start(), f"test outside parent catalog for {name}"
+        end = starts[index + 1].start() if index + 1 < len(starts) else summary.start()
+        statuses = re.findall(r"(?m)^(ok|FAILED|ignored)(?:, [^\n]*)?$", stdout[start.end():end])
+        assert len(statuses) == 1 and start[1] not in matched, f"ambiguous baseline result for {name}::{start[1]}"
+        matched[start[1]] = statuses[0]
+    actual = Counter(matched.values())
+    assert len(matched) == passed + failed + ignored and (actual["ok"], actual["FAILED"], actual["ignored"]) == (
+        passed, failed, ignored), f"baseline catalog/status/count mismatch for {name}"
+    return dict(passed=passed, failed=failed, ignored=ignored, filtered_out=filtered), matched
+
+
+def run_baseline(binaries):
     results = {}
     totals = {"passed": 0, "failed": 0, "ignored": 0, "filtered_out": 0}
+    processes = {}
     for name, filename in sorted(binaries.items()):
         binary = TESTS / filename
         result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
@@ -324,45 +359,120 @@ def run_baseline(binaries):
         if SECRET in output:
             raise AssertionError(f"synthetic fixture secret leaked in {name} output")
         (OUTPUT / f"baseline-{name}.log").write_text(output)
-        count_rows = re.findall(
-            r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out",
-            output,
-        )
-        if len(count_rows) != 1:
-            raise AssertionError(f"missing baseline counts for {name}")
-        passed, failed, ignored, _, filtered = map(int, count_rows[0])
-        for key, count in zip(("passed", "failed", "ignored", "filtered_out"),
-                              (passed, failed, ignored, filtered)):
+        (OUTPUT / f"baseline-{name}.stdout.log").write_text(result.stdout)
+        (OUTPUT / f"baseline-{name}.stderr.log").write_text(result.stderr)
+        process = {"exit_code": result.returncode, "authoritative_channel": "stdout",
+                   "stdout_sha256": digest(result.stdout.encode()),
+                   "stderr_sha256": digest(result.stderr.encode())}
+        (OUTPUT / f"baseline-{name}.process.json").write_text(json.dumps(process, indent=2) + "\n")
+        counts, matched = parse_baseline_stdout(name, result.stdout, result.returncode)
+        processes[name] = {**process, "counts": counts, "catalog_count": len(matched)}
+        for key, count in counts.items():
             totals[key] += count
-        # With --nocapture, SVN/Git fixture output can appear between the
-        # harness's `test name ... ` prefix and its result (sometimes on the
-        # following line). The run is single-threaded, so delimit by the next
-        # test prefix and require one standalone harness status in each chunk.
-        starts = list(re.finditer(r"^test (\S+) \.\.\. ", output, re.M))
-        matched = []
-        for index, start in enumerate(starts):
-            end = starts[index + 1].start() if index + 1 < len(starts) else output.find("test result:", start.end())
-            chunk = output[start.end():end]
-            statuses = re.findall(r"(?m)^(ok|FAILED|ignored)(?:, [^\n]*)?$", chunk)
-            if len(statuses) != 1:
-                raise AssertionError(f"ambiguous baseline result for {name}::{start.group(1)}")
-            matched.append((start.group(1), statuses[0]))
-        if len(matched) != passed + failed + ignored:
-            raise AssertionError(f"baseline test catalog/count mismatch for {name}: {len(matched)} vs {passed + failed + ignored}")
-        for test_name, status in matched:
+        for test_name, status in matched.items():
             results[f"{name}::{test_name}"] = status
         print(json.dumps({"binary": name, "exit_code": result.returncode,
-                          "passed": passed, "failed": failed, "ignored": ignored}), flush=True)
+                          **counts}), flush=True)
     if totals["passed"] + totals["failed"] == 0:
         raise AssertionError("baseline executed zero tests")
     report = {"mode": "baseline", "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
               "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
               "lock_sha256": os.environ["REPOSYNC_LOCK_SHA256"],
               "goal_sha256": os.environ["REPOSYNC_GOAL_SHA256"],
-              "totals": totals, "tests": results}
+              "totals": totals, "tests": results, "processes": processes}
     (OUTPUT / "baseline-results.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"mode": "baseline", "source_head": report["source_head"],
                       "totals": totals, "catalog_count": len(results)}), flush=True)
+
+
+def baseline_self_test():
+    """Parent-channel, writer-input and empty-UI-layout controls; no Rust build."""
+    import contextlib
+    import io
+    from unittest.mock import patch
+    stdout = ("\nrunning 3 tests\n"
+              "test first ... ok\n"
+              "test second ... fixture output\nFAILED\n"
+              "test third ... ignored, fixture reason\n\n"
+              "test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n")
+    stderr = ("child stderr:\nrunning 1 test\ntest child ... FAILED\n"
+              "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n")
+    counts, tests = parse_baseline_stdout("fixture", stdout, 101)
+    assert counts == dict(passed=1, failed=1, ignored=1, filtered_out=0)
+    assert tests == {"first": "ok", "second": "FAILED", "third": "ignored"}
+    healthy = stdout.replace("running 3 tests", "running 1 test").replace(
+        "test second ... fixture output\nFAILED\n", "").replace("test third ... ignored, fixture reason\n", "").replace(
+        "FAILED. 1 passed; 1 failed; 1 ignored", "ok. 1 passed; 0 failed; 0 ignored")
+    assert parse_baseline_stdout("healthy", healthy, 0)[1] == {"first": "ok"}
+    def reject(text, code=101):
+        try:
+            parse_baseline_stdout("invalid", text, code)
+        except AssertionError:
+            return
+        raise AssertionError("malformed/inconsistent parent execution accepted")
+    for text in (
+        stdout.split("test result:")[0],
+        stdout.rstrip("\n"),
+        stdout + stderr,
+        stdout + "trailing output\n",
+        stdout.replace("running 3 tests", "running 4 tests"),
+        stdout.replace("test first ... ok\n", ""),
+        stdout.replace("test third ...", "test first ..."),
+        stdout.replace("fixture output\nFAILED", "fixture output\nok"),
+        stdout.replace("0 filtered out", "1 filtered out"),
+        stdout.replace("0 measured", "1 measured"),
+        stdout.replace("running 3 tests\n", ""),
+        stdout.replace("1 failed", "malformed failed"),
+        stdout.replace("; finished in 0.01s", ""),
+        stdout.replace("0.01s", "...s"),
+    ):
+        reject(text)
+    reject(stdout, 0)
+    reject(stdout, -15)
+    reject(healthy, 101)
+    with tempfile.TemporaryDirectory(prefix="reposync-parent-catalog-") as temporary:
+        root = Path(temporary)
+        binary = root / "fixture"
+        binary.write_text(f"#!{sys.executable}\nimport sys\nsys.stdout.write({stdout!r})\nsys.stderr.write({stderr!r})\nraise SystemExit(101)\n")
+        binary.chmod(0o755)
+        evidence = root / "evidence"
+        evidence.mkdir()
+        with patch.dict(globals(), TESTS=root, OUTPUT=evidence), patch.dict(os.environ, {
+            "REPOSYNC_SOURCE_HEAD": "fixture", "REPOSYNC_SOURCE_TREE": "fixture",
+            "REPOSYNC_LOCK_SHA256": "fixture", "REPOSYNC_GOAL_SHA256": "fixture",
+        }), contextlib.redirect_stdout(io.StringIO()):
+            run_baseline({"fixture": "fixture"})
+        report = json.loads((evidence / "baseline-results.json").read_text())
+        assert report["totals"] == counts and report["tests"] == {f"fixture::{n}": s for n, s in tests.items()}
+        assert report["processes"]["fixture"]["exit_code"] == 101
+        assert (evidence / "baseline-fixture.log").read_text() == stdout + stderr
+        assert (evidence / "baseline-fixture.stdout.log").read_text() == stdout
+        assert (evidence / "baseline-fixture.stderr.log").read_text() == stderr
+        # Only empty traversal ancestors are permitted; Rust files, other crate
+        # trees and symlink substitutions still fail the runtime boundary.
+        src = root / "src"
+        (src / "web-ui").mkdir(parents=True)
+        web = src / "crates/web"
+        web.mkdir(parents=True)
+        assert_runtime_source_isolation(src)
+        for forbidden in (web / "lib.rs", src / "Cargo.toml", src / "crates/core"):
+            forbidden.write_text("forbidden runtime content")
+            try:
+                assert_runtime_source_isolation(src)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("runtime source content accepted")
+            forbidden.unlink()
+        web.rmdir()
+        web.symlink_to(src / "web-ui", target_is_directory=True)
+        try:
+            assert_runtime_source_isolation(src)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("runtime ancestor symlink accepted")
+    print("Parent parser/writer and empty UI ancestor controls: PASS")
 
 
 def main():
@@ -448,7 +558,10 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:] == ["--self-test"]:
+            baseline_self_test()
+        else:
+            main()
     except Exception as error:
         print(f"FAIL: {error}", file=sys.stderr)
         raise
