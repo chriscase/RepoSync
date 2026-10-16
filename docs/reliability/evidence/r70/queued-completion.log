@@ -1,0 +1,55 @@
+STDOUT
+
+> reposync-web-ui@0.1.0 test
+> vitest run src/branchPairRemoval.test.ts
+
+
+ RUN  v2.1.9 <fixture>/web-ui
+
+ ❯ src/branchPairRemoval.test.ts (35 tests | 7 failed) 11ms
+   × branchPairRemovalOutcome > keeps queued operations unfinished even with ok: true 4ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+   × branchPairRemovalOutcome > keeps running operations unfinished even with ok: true 1ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+   × branchPairRemovalOutcome > keeps cancelling operations unfinished even with ok: true 0ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+   × branchPairRemovalOutcome > keeps canceling operations unfinished even with ok: true 0ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+   × branchPairRemovalOutcome > keeps accepted operations unfinished even with ok: true 0ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+   × branchPairRemovalOutcome > keeps pending operations unfinished even with ok: true 0ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+   × branchPairRemovalOutcome > keeps in_progress operations unfinished even with ok: true 0ms
+     → expected 'completed' to be 'in_progress' // Object.is equality
+
+ Test Files  1 failed (1)
+      Tests  7 failed | 28 passed (35)
+   Start at  02:45:27
+   Duration  465ms (transform 20ms, setup 0ms, collect 20ms, tests 11ms, environment 0ms, prepare 51ms)
+
+
+STDERR
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 7 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps queued operations unfinished even with ok: true
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps running operations unfinished even with ok: true
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps cancelling operations unfinished even with ok: true
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps canceling operations unfinished even with ok: true
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps accepted operations unfinished even with ok: true
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps pending operations unfinished even with ok: true
+ FAIL  src/branchPairRemoval.test.ts > branchPairRemovalOutcome > keeps in_progress operations unfinished even with ok: true
+AssertionError: expected 'completed' to be 'in_progress' // Object.is equality
+
+Expected: "in_progress"
+Received: "completed"
+
+ ❯ src/branchPairRemoval.test.ts:18:89
+     16|     'keeps %s operations unfinished even with ok: true',
+     17|     (state) => {
+     18|       expect(branchPairRemovalOutcome({ ok: true, state: ` ${state.toU…
+       |                                                                                         ^
+     19|       expect(branchPairRemovalOutcome({ ok: true, lifecycle: state }))…
+     20|     },
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/7]⎯
+

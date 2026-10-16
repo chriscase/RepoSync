@@ -1,0 +1,20 @@
+STDOUT
+{
+  "ok": true,
+  "results": [
+    "cancel-modal",
+    "server-error",
+    "permission-rejection",
+    "busy-rejection",
+    "missing-parent-list-fallback",
+    "warnings-remain-visible",
+    "queued-not-complete",
+    "delayed-completion",
+    "queued-gone-leaves-without-claiming-completion",
+    "mock-delete-child-stays-on-parent",
+    "delete-child-with-warnings-stays-on-parent",
+    "stale-url-not-found"
+  ]
+}
+
+STDERR
