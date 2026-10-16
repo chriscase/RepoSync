@@ -1,6 +1,9 @@
 FROM rust:1.98.1-bookworm AS build
 ENV CARGO_BUILD_JOBS=2
 ENV CARGO_TARGET_DIR=/src/target
+# Bound cache growth across five isolated source builds; no incremental objects
+# or debug symbols. Assertions and unoptimized test behavior remain enabled.
+ENV CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git subversion pkg-config libssl-dev python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -11,8 +14,13 @@ COPY docs/reliability/legacy-evidence-vocabulary.json ./docs/reliability/legacy-
 COPY docs/reliability/fixtures/Cargo.lock ./Cargo.lock
 COPY scripts/reliability-prep.py /usr/local/bin/reliability-prep
 ARG RELIABILITY_INCLUDE_OLD=1
-RUN --mount=type=cache,target=/src/target \
+ARG RELIABILITY_TARGET_CACHE
+ARG RELIABILITY_OLD_TARGET_CACHE
+# The script binds these IDs to exact source/tree, lock, recipe and build mode.
+# The toolchain tag is explicit; Cargo also fingerprints the actual compiler.
+RUN --mount=type=cache,id=rust-1.98.1-bookworm-${RELIABILITY_TARGET_CACHE},target=/src/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
+    test -n "$RELIABILITY_TARGET_CACHE" && \
     if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cargo test --workspace --no-run --locked --features reposync-core/reliability-fixture,reposync-web/reliability-fixture --message-format=json > /tmp/cargo-preparation.jsonl; \
     else \
@@ -23,9 +31,9 @@ RUN --mount=type=cache,target=/src/target \
     cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
 COPY legacy-old /old-src
-RUN --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,id=rust-1.98.1-bookworm-old-${RELIABILITY_OLD_TARGET_CACHE},target=/src/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
-    mkdir -p /opt/reliability-old-tests && \
+    test -n "$RELIABILITY_OLD_TARGET_CACHE" && mkdir -p /opt/reliability-old-tests && \
     if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
       cd /old-src && cargo test -p reposync-web --test legacy_import_generator --no-run --locked --message-format=json \
         > /tmp/old-preparation.jsonl && \

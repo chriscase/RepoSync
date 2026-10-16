@@ -12,17 +12,18 @@ trap 'rm -rf "$contexts"' EXIT
 labels=(base previous immediate merged)
 sources=(87379741779a6259f7eeb52a68cc6f061174e5ef f74fce855a1f1d80dd631397f436ba33906272e6 ab097580d9415ae2f8df44bed4041f740a1b38f2 54e183484961bd9ad12bd03505b3b00610de7cd9)
 
-for index in "${!sources[@]}"; do
-  source="${sources[$index]}"
-  label="${labels[$index]}"
-  context="$contexts/$label"
-  mkdir -p "$context" "$comparison_dir/$label"
-  git archive "$source" | tar -x -C "$context"
+prepare_source() {
+  local source="$1" label="$2" context="$contexts/$2"
+  mkdir -p "$context" || return $?
+  printf '%s\n' archive > "$comparison_dir/$label-setup-stage.txt" || return $?
+  git archive "$source" | tar -x -C "$context" || return $?
+  printf '%s\n' lock_staging > "$comparison_dir/$label-setup-stage.txt" || return $?
   python3 scripts/reliability-lock-overlay.py stage "$context" --source "$source" \
-    --receipt "$comparison_dir/$label-lock.json"
+    --receipt "$comparison_dir/$label-lock.json" || return $?
+  printf '%s\n' harness_overlay > "$comparison_dir/$label-setup-stage.txt" || return $?
   # Keep the reviewed synthetic author adapter; no production source changes.
   if [[ "$label" == base ]]; then
-    python3 - "$context/crates/core/tests/team_mode_e2e.rs" <<'PY'
+    python3 - "$context/crates/core/tests/team_mode_e2e.rs" <<'PY' || return $?
 from pathlib import Path
 import sys
 p = Path(sys.argv[1])
@@ -32,27 +33,32 @@ assert source.count(needle) == 1, 'reviewed-base fixture shape changed'
 p.write_text(source.replace(needle,
     '            message,\n            wc_path.to_str().unwrap(),\n            "--username",\n            "fixture",\n            "--non-interactive",'))
 PY
-    shasum -a 256 "$context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256"
+    shasum -a 256 "$context/crates/core/tests/team_mode_e2e.rs" | awk '{print $1}' > "$comparison_dir/base-test-overlay.sha256" || return $?
   fi
-  cp Dockerfile.reliability .dockerignore "$context/"
+  cp Dockerfile.reliability .dockerignore "$context/" || return $?
   cp scripts/reliability-prep.py scripts/reliability-runtime.py scripts/reliability_scan.py \
     scripts/reliability-inventory.py scripts/reliability-inventory-probes.py \
-    scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$context/scripts/"
-  mkdir -p "$context/docs/reliability/fixtures"
-  cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$context/docs/reliability/"
-done
+    scripts/reliability-copy-consumer.mjs scripts/reliability-scoped-consumer.mjs "$context/scripts/" || return $?
+  mkdir -p "$context/docs/reliability/fixtures" || return $?
+  cp docs/reliability/required-cases.json docs/reliability/legacy-evidence-vocabulary.json "$context/docs/reliability/" || return $?
+}
 
 aggregate_status=0
 for index in "${!sources[@]}"; do
   source="${sources[$index]}"
   label="${labels[$index]}"
+  mkdir -p "$comparison_dir/$label"
   status=0
-  REPOSYNC_BUILD_CONTEXT="$contexts/$label" \
-  REPOSYNC_LOCK_SOURCE="$source" \
-  REPOSYNC_SOURCE_HEAD_OVERRIDE="$source" \
-  REPOSYNC_SOURCE_TREE_OVERRIDE="$(git rev-parse "$source^{tree}")" \
-  REPOSYNC_ARTIFACT_DIR="$comparison_dir/$label" \
-    scripts/reliability-container.sh --baseline || status=$?
+  prepare_source "$source" "$label" > "$comparison_dir/$label-setup.log" 2>&1 || status=$?
+  printf '%s\n' "$status" > "$comparison_dir/$label-setup-exit-code.txt"
+  if [[ "$status" -eq 0 ]]; then
+    REPOSYNC_BUILD_CONTEXT="$contexts/$label" \
+    REPOSYNC_LOCK_SOURCE="$source" \
+    REPOSYNC_SOURCE_HEAD_OVERRIDE="$source" \
+    REPOSYNC_SOURCE_TREE_OVERRIDE="$(git rev-parse "$source^{tree}")" \
+    REPOSYNC_ARTIFACT_DIR="$comparison_dir/$label" \
+      scripts/reliability-container.sh --baseline || status=$?
+  fi
   printf '%s\n' "$status" > "$comparison_dir/$label-exit-code.txt"
   [[ "$status" -eq 0 ]] || aggregate_status=1
 done

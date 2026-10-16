@@ -41,22 +41,38 @@ qualification-runner change.
 
 ## Execution and failure collection
 
-`reliability-compare.sh` attempts all four historical builds/runs plus the
+`reliability-compare.sh` attempts setup for all four historical sources plus the
 candidate, then emits all four comparison reports before aggregating failure.
+An archive, lock-staging or harness-overlay error records that source's setup
+failure and leaves its execution NOT_RUN; later sources are still attempted.
 Reports retain both actual lock hashes. Exact old passing test identities must
 remain passing; missing/renamed identities remain blockers. Candidate failures,
 including candidate-only failures, also fail the aggregate. This does not supply
 the separately owned reviewed assertion-lineage mapping.
 
-If the diagnostic command fails, its wrapper collects comparisons before
-returning the original failure. This is necessary because the unchanged workflow
+If diagnostic setup, build or runtime fails, an EXIT handler collects comparisons
+before returning the original failure. This is necessary because the unchanged workflow
 skips subsequent ordinary steps after a failure. Artifact directories and build
 lock receipts exist before compilation, allowing the existing always-run scan
 and artifact publisher to retain failure evidence.
 
-BuildKit cache mounts share compiled dependencies between these sequential
-source builds on the hosted runner. Each Cargo invocation still validates its
-source graph with its selected lock and packages the executables it produced.
+BuildKit target cache identities are isolated per exact source/tree, prepared
+context content hash (including the test adapter), selected lock, Dockerfile
+recipe and build mode, with an explicit Rust 1.98.1 image tag.
+The archived generator uses a separate namespace/key bound to its original
+source, historical lock, adapter and recipe. Changing candidate source changes
+its target cache; baselines cannot see a different source's compiled outputs.
+Only checksum-verified registry downloads are shared. Actual compiler/Cargo
+versions remain in each runtime's tool-version receipt. `build-identity.json`
+records cache/input identities and `image-id.txt` records the built image.
+The profile uses no incremental compilation or
+debug symbols, with ordinary unoptimized test assertions still enabled. This
+limits hosted disk consumption across the five isolated builds.
+
+Evidence retention requires a writable artifact root and temporary storage,
+and the driver must remain running. Runner cancellation, resource exhaustion or
+an unavailable global tool can still leave partial evidence; they cannot count
+as complete execution/publication.
 
 ## Local validation
 
@@ -67,9 +83,14 @@ source graph with its selected lock and packages the executables it produced.
 - Each exact historical archive: pinned staging and
   `cargo metadata --offline --locked --format-version 1 --no-deps`: PASS, with
   unchanged lock hash. Metadata validation is not compilation proof.
-- Driver fault control using a stub Docker command returning exit 41: all five
-  builds attempted, four explicit NOT_RUN reports retained, aggregate nonzero.
-  No Docker container or Rust compiler ran for this control.
+- Persisted driver controls in the same self-test inject build, archive and
+  lock-staging failures, plus wrapper archive/staging/context-copy failures.
+  Later sources are attempted, all five source exit receipts and all four
+  explicit NOT_RUN reports survive, and original/aggregate failures stay nonzero.
+  The build-only fault case reaches all five stub builds. Cache controls prove
+  five distinct source keys and a changed candidate key when only its declared
+  source changes; Docker mount declarations use those keys and a separate old
+  generator namespace. No Docker container or Rust compiler runs in these controls.
 - Existing acceptance matrix self-test/check: PASS. Catalog remains 1 PASS,
   21 PARTIAL and 2 NOT RUN; these classifications are not execution receipts.
 - Shell syntax and `git diff --check`: PASS.

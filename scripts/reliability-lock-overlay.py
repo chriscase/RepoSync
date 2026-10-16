@@ -7,7 +7,10 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
@@ -158,7 +161,111 @@ def self_test():
         require(not compare(old, new, source, "candidate-source", output), "candidate-only failure escaped")
         candidate["tests"] = {"different::test": "ok"}; new.write_text(json.dumps(candidate))
         require(not compare(old, new, source, "candidate-source", output), "missing old test escaped")
-    print("Pinned-lock controls: PASS (no Cargo compilation)")
+    driver_self_test()
+    print("Pinned-lock and driver controls: PASS (Docker stub only; no Cargo compilation)")
+
+
+def driver_self_test():
+    """Exercise shell failure retention and cache identities without Docker."""
+    repo = FIXTURES.parents[2]
+    previous = "f74fce855a1f1d80dd631397f436ba33906272e6"
+    with tempfile.TemporaryDirectory(prefix="reposync-driver-controls-") as temporary:
+        root = Path(temporary)
+        binaries = root / "bin"
+        binaries.mkdir()
+        real_git = shutil.which("git")
+        require(real_git is not None, "git unavailable for driver controls")
+        stubs = {
+            "docker": '''import json, os, sys
+if sys.argv[1] == "info":
+    raise SystemExit(0)
+with open(os.environ["REPOSYNC_CONTROL_CALLS"], "a") as output:
+    output.write(json.dumps(sys.argv[1:]) + "\\n")
+raise SystemExit(41)
+''',
+            "git": f'''import os, sys
+if len(sys.argv) > 2 and sys.argv[1] == "archive" and sys.argv[2] == os.environ.get("REPOSYNC_CONTROL_ARCHIVE"):
+    print("CONTROL: archive failure", file=sys.stderr)
+    raise SystemExit(42)
+os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])
+''',
+            "python3": f'''import os, sys
+if len(sys.argv) > 5 and sys.argv[1].endswith("reliability-lock-overlay.py") and sys.argv[2] == "stage":
+    if "--source" in sys.argv and sys.argv[sys.argv.index("--source") + 1] == os.environ.get("REPOSYNC_CONTROL_STAGE"):
+        print("CONTROL: lock staging failure", file=sys.stderr)
+        raise SystemExit(43)
+os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+''',
+        }
+        for name, code in stubs.items():
+            path = binaries / name
+            path.write_text(f"#!{sys.executable}\n" + code)
+            path.chmod(0o755)
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("REPOSYNC_")}
+        env = {**clean, "PATH": str(binaries) + os.pathsep + os.environ["PATH"]}
+        cases = [
+            ("build", {}, "scripts/reliability-compare.sh", 1, 5),
+            ("archive", {"REPOSYNC_CONTROL_ARCHIVE": previous}, "scripts/reliability-compare.sh", 1, 4),
+            ("staging", {"REPOSYNC_CONTROL_STAGE": previous}, "scripts/reliability-compare.sh", 1, 4),
+            ("wrapper-archive", {"REPOSYNC_CONTROL_ARCHIVE": "87379741779a6259f7eeb52a68cc6f061174e5ef"},
+             "scripts/reliability-container.sh", 42, 0),
+            ("wrapper-staging", {"REPOSYNC_CONTROL_STAGE": "candidate"}, "scripts/reliability-container.sh", 43, 4),
+            ("wrapper-copy", {"REPOSYNC_BUILD_CONTEXT": str(root / "missing"), "REPOSYNC_LOCK_SOURCE": "candidate"},
+             "scripts/reliability-container.sh", 1, 4),
+        ]
+        first_cache = None
+        for name, extra, script, expected_status, expected_builds in cases:
+            case = root / name
+            case.mkdir()
+            calls, evidence = case / "calls.jsonl", case / "comparison"
+            case_env = {**env, "REPOSYNC_CONTROL_CALLS": str(calls),
+                        "REPOSYNC_COMPARISON_DIR": str(evidence),
+                        "REPOSYNC_ARTIFACT_DIR": str(case / "diagnostic"), **extra}
+            args = ["bash", script] + (["--all"] if script.endswith("container.sh") else [])
+            result = subprocess.run(args, cwd=repo, env=case_env, capture_output=True, text=True, timeout=45)
+            require(result.returncode == expected_status,
+                    f"{name}: unexpected driver status {result.returncode}: {result.stderr}")
+            builds = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+            require(len(builds) == expected_builds and all(b[0] == "build" for b in builds),
+                    f"{name}: missing later build attempts")
+            reports = list(evidence.glob("*-comparison.json"))
+            require(len(reports) == 4 and all(json.loads(p.read_text())["outcome"] == "NOT_RUN" for p in reports),
+                    f"{name}: missing NOT_RUN reports")
+            require(all((evidence / f"{label}-exit-code.txt").exists()
+                        for label in ("base", "previous", "immediate", "merged", "candidate")),
+                    f"{name}: missing source exit receipts")
+            if name in ("archive", "staging"):
+                expected = 42 if name == "archive" else 43
+                require((evidence / "previous-setup-exit-code.txt").read_text().strip() == str(expected),
+                        f"{name}: setup failure hidden")
+            if script.endswith("container.sh"):
+                receipt = json.loads((case / "diagnostic/driver-exit.json").read_text())
+                require(receipt["exit_code"] == expected_status, f"{name}: original error hidden")
+            if name == "build":
+                identities = [json.loads((evidence / label / "build-identity.json").read_text())
+                              for label in ("base", "previous", "immediate", "merged", "candidate")]
+                keys = {i["target_cache"] for i in identities}
+                require(len(keys) == 5, "different source builds share a target cache")
+                require(len({i["old_target_cache"] for i in identities}) == 1,
+                        "pinned old generator identity unexpectedly changed")
+                first_cache = identities[-1]["target_cache"]
+            print(f"PASS: {name} failure retained; later sources attempted; four NOT_RUN reports")
+        # Changing only the declared source must change the candidate cache ID.
+        case = root / "different-source"
+        case.mkdir()
+        result = subprocess.run(["bash", "scripts/reliability-container.sh", "--baseline"], cwd=repo,
+            env={**env, "REPOSYNC_CONTROL_CALLS": str(case / "calls.jsonl"),
+                 "REPOSYNC_ARTIFACT_DIR": str(case), "REPOSYNC_SOURCE_HEAD_OVERRIDE": "0" * 40},
+            capture_output=True, text=True, timeout=45)
+        require(result.returncode == 41, "different-source control did not reach stub build")
+        require(json.loads((case / "build-identity.json").read_text())["target_cache"] != first_cache,
+                "a different candidate source reused the target cache")
+        dockerfile = (repo / "Dockerfile.reliability").read_text()
+        require("id=rust-1.98.1-bookworm-${RELIABILITY_TARGET_CACHE},target=/src/target" in dockerfile,
+                "candidate target cache identity not used by Docker")
+        require("id=rust-1.98.1-bookworm-old-${RELIABILITY_OLD_TARGET_CACHE},target=/src/target" in dockerfile,
+                "old generator target cache not isolated by Docker")
+        print("PASS: five source-specific target cache IDs; changed candidate source changes ID; generator cache is separate")
 
 
 def main():
