@@ -272,56 +272,66 @@ test("observed and unobserved rebase ids get different repositories", () => {
   expect(labPairKey("GIT-REVERT-NEW")).toBe("pgitrevertnew");
 });
 
-test("unobserved rebase records both remote tips before one publication", async () => {
-  const ancestor = "a".repeat(40);
-  const tipB = "b".repeat(40);
-  const tipB2 = "d".repeat(40);
-  const published = "c".repeat(40);
-  const fresh: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
-  let phase = "fresh";
-  let passed = false;
-  const toggles: boolean[] = [];
-  const snap = (): Snap => {
-    if (phase === "remote-b") return {...fresh, git: tipB};
-    if (phase === "remote-b2") return {...fresh, git: tipB2};
-    if (phase === "paused") return {...fresh, git: tipB2};
-    if (phase === "already-published") return {svn: "5", git: published, maps: "1", records: "4", watermark: "5", gitWatermark: published, gitColumn: published};
-    if (phase === "settled") return {svn: "2", git: tipB2, maps: "1", records: "2", watermark: "1", gitWatermark: tipB2, gitColumn: tipB2};
-    return {...fresh};
-  };
-  const fake: any = {
-    createPair: async (name: string) => ({...pair, name, gitRepo: `lab/${name}`, svnUrl: `https://svn:8443/svn/${name}`}),
-    api: async (_method: string, _path: string, body: {enabled: boolean}) => {toggles.push(body.enabled); return {status: 200, json: {}};},
-    snap: async () => snap(),
-    commitGit: async (_p: Pair, script: string) => {expect(script).not.toContain("--amend"); phase = "remote-b"; return tipB;},
-    commitGitLocal: async (_p: Pair, script: string) => {expect(script).toContain("--amend"); expect(script).toContain("push --force"); phase = "remote-b2"; return tipB2;},
-    gitCommitsSince: async (_p: Pair, ancestorSha: string) => {expect(ancestorSha).toBe(ancestor); return [tipB2];},
-    triggerGit: async () => 200,
-    svnBytesOrMissing: async () => phase === "settled" ? "B\n" : phase === "already-published" ? "base\n" : null,
-    sh: async (_service: string, sql: string) => phase === "settled" && sql.includes(tipB2) ? "1" : "0",
-    waitUntil: async (read: () => Promise<boolean>) => {
-      phase = "paused";
-      expect(await read()).toBe(false);
-      phase = "already-published";
-      expect(await read()).toBe(false);
-      phase = "settled";
-      expect(await read()).toBe(true);
-    },
-    expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {
-      expect(phase).toBe("settled");
-      const baseline = snap();
-      await action();
-      expect(snap()).toEqual(baseline);
-    },
-    pass: () => {passed = true;},
-  };
-  fake.appliedReceiptCount = (...args: unknown[]) => Lab.prototype.appliedReceiptCount.call(fake, ...(args as [Pair, "git_to_svn", string]));
-  fake.waitOutboundGitHistory = (...args: unknown[]) => Lab.prototype.waitOutboundGitHistory.call(fake, ...(args as [Pair, Snap, string[], string, string]));
-  await runCase(fake, {id: "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED", title: "fixture", suite: "full"});
-  expect(passed).toBe(true);
-  expect(toggles).toEqual([false, true]);
-  expect(tipB).not.toBe(tipB2);
-});
+for (const fault of ["none", "observed-tip", "late-b"]) {
+  test(`unobserved rebase stays disabled until both tips and rejects ${fault}`, async () => {
+    const ancestor = "a".repeat(40);
+    const tipB = "b".repeat(40);
+    const tipB2 = "d".repeat(40);
+    const published = "c".repeat(40);
+    const fresh: Snap = {...initial, git: ancestor, gitWatermark: ancestor, gitColumn: ancestor};
+    let phase = "fresh";
+    let passed = false;
+    let enabled = false;
+    let afterIdle = false;
+    const snap = (): Snap => {
+      if (phase === "remote-b") return {...fresh, git: tipB};
+      if (phase === "remote-b2" || phase === "paused") return {...fresh, git: tipB2};
+      if (phase === "already-published") return {svn: "5", git: published, maps: "1", records: "4", watermark: "5", gitWatermark: published, gitColumn: published};
+      if (phase === "settled") return {svn: "2", git: tipB2, maps: "1", records: "2", watermark: "1", gitWatermark: tipB2, gitColumn: tipB2};
+      return {...fresh};
+    };
+    const fake: any = {
+      createPair: async (name: string, options?: {enable?: boolean}) => {
+        expect(options).toEqual({enable: false});
+        expect(enabled).toBe(false);
+        return {...pair, name, gitRepo: `lab/${name}`, svnUrl: `https://svn:8443/svn/${name}`};
+      },
+      api: async (method: string) => method === "GET" ? {status: 200, json: {enabled: false}} : {status: 200, json: {}},
+      observedInspectionTip: async () => fault === "observed-tip" && (phase === "remote-b" || phase === "remote-b2") ? tipB : "absent",
+      enableFixturePair: async () => {expect(phase).toBe("remote-b2"); enabled = true;},
+      snap: async () => snap(),
+      commitGit: async (_p: Pair, script: string) => {expect(enabled).toBe(false); expect(script).not.toContain("--amend"); phase = "remote-b"; return tipB;},
+      commitGitLocal: async (_p: Pair, script: string) => {expect(enabled).toBe(false); expect(script).toContain("--amend"); phase = "remote-b2"; return tipB2;},
+      gitCommitsSince: async (_p: Pair, ancestorSha: string) => {expect(ancestorSha).toBe(ancestor); return [tipB2];},
+      triggerGit: async () => {expect(enabled).toBe(true); return 200;},
+      svnBytes: async () => phase === "settled" ? "B\n" : "other\n",
+      svnBytesOrMissing: async () => phase === "settled" ? "B\n" : null,
+      sh: async (_service: string, sql: string) => {
+        if (sql.includes(tipB) && !sql.includes(tipB2)) return fault === "late-b" && afterIdle ? "1" : "0";
+        return phase === "settled" && sql.includes(tipB2) ? "1" : "0";
+      },
+      waitUntil: async (read: () => Promise<boolean>) => {
+        phase = "paused";
+        expect(await read()).toBe(false);
+        phase = "already-published";
+        expect(await read()).toBe(false);
+        phase = "settled";
+        expect(await read()).toBe(true);
+      },
+      expectNoWrite: async (_p: Pair, action: () => Promise<void>) => {
+        expect(phase).toBe("settled");
+        await action();
+        afterIdle = true;
+      },
+      pass: () => {passed = true;},
+    };
+    fake.appliedReceiptCount = (...args: unknown[]) => Lab.prototype.appliedReceiptCount.call(fake, ...(args as [Pair, "git_to_svn", string]));
+    fake.waitOutboundGitHistory = (...args: unknown[]) => Lab.prototype.waitOutboundGitHistory.call(fake, ...(args as [Pair, Snap, string[], string, string]));
+    const run = runCase(fake, {id: "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED", title: "fixture", suite: "full"});
+    if (fault === "none") {await run; expect(passed).toBe(true); expect(enabled).toBe(true);}
+    else {await expect(run).rejects.toThrow(fault === "observed-tip" ? /inspection tip/ : /late receipt/); expect(passed).toBe(false);}
+  });
+}
 
 test("cherry-pick publishes the descendant on the tracked branch", async () => {
   const ancestor = "a".repeat(40);

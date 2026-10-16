@@ -430,7 +430,27 @@ curl --silent --show-error --connect-timeout 5 --max-time 30 --cacert /certs/ca.
     return response.json();
   }
 
-  async createPair(name: string): Promise<Pair> {
+  async observedInspectionTip(pair: Pair): Promise<string> {
+    // history_inspect fetches the remote tip into this ref before publication.
+    // Publication checkpoints can stay put while this ref already names B.
+    const id = safe(pair.id, "repo id");
+    const output = await this.sh("reposync", `
+set -eu
+repo=/var/lib/reposync/repos/${id}/git-repo
+if [ ! -d "$repo/.git" ] && [ ! -d "$repo" ]; then
+  printf 'absent\\n'
+  exit 0
+fi
+tip=$(git -C "$repo" rev-parse --verify --end-of-options 'refs/reposync/inspection/incoming^{commit}' 2>/dev/null || true)
+if [ -z "$tip" ]; then printf 'absent\\n'; else printf '%s\\n' "$tip"; fi
+`, "reposync");
+    const tip = output.trim().split("\n").filter(line => line.length > 0).pop() || "absent";
+    if (tip !== "absent" && !/^[0-9a-f]{40}$/.test(tip)) throw new Error(`invalid inspection tip ${tip}`);
+    return tip;
+  }
+
+  async createPair(name: string, options?: {enable?: boolean}): Promise<Pair> {
+    const enable = options?.enable !== false;
     const repo = safe(name, "repo");
     // Playwright restarts its worker after a failed case. Find the persisted
     // pair instead of registering a duplicate when the in-memory cache is gone.
@@ -441,7 +461,8 @@ curl --silent --show-error --connect-timeout 5 --max-time 30 --cacert /certs/ca.
       if (row.name !== repo || row.git_repo !== `lab/${repo}` || row.svn_url !== `https://svn:8443/svn/${repo}`) throw new Error(`existing lab pair ${repo} has different remotes`);
       await this.waitImport(row.id);
       const pair = {id: row.id, name: repo, svnUrl: row.svn_url, gitRepo: row.git_repo};
-      if (row.enabled === false) await this.enableFixturePair(pair);
+      if (row.enabled === true && !enable) throw new Error("scheduled pair cannot prove an unobserved interval");
+      if (row.enabled === false && enable) await this.enableFixturePair(pair);
       return pair;
     }
     await this.sh("svn", `
@@ -504,8 +525,8 @@ fi
       throw new Error(`fixture ${repo} import did not establish the exact r1 baseline`);
     }
     await this.assertSingleReceipt(pair, "svn_to_git", "1");
-    await this.enableFixturePair(pair);
-    this.observation(`${repo}-import-ready`, {pair, operation, provider_status: provider.status, baseline, scheduler_enabled_after_import: true});
+    if (enable) await this.enableFixturePair(pair);
+    this.observation(`${repo}-import-ready`, {pair, operation, provider_status: provider.status, baseline, scheduler_enabled_after_import: enable});
     return pair;
   }
 

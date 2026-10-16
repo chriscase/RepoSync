@@ -462,6 +462,52 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
       await latePairCase(lab, op);
       return;
     }
+    case "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED": {
+      // createPair enables scheduling before it returns. A later enabled:false
+      // flag does not drain a cycle that already fetched the inspection ref.
+      // This fixture stays disabled until both remote tips are recorded.
+      const pair = await lab.createPair(labPairKey(op.id), {enable: false});
+      const before = await lab.snap(pair);
+      if (before.svn !== "1" || before.watermark !== "1" || before.records !== "1" || before.gitWatermark !== before.git || before.gitColumn !== before.git) {
+        throw new Error("unobserved rebase requires a fresh import pair");
+      }
+      const scheduling = await lab.api("GET", `/api/repos/${pair.id}`);
+      if (scheduling.status !== 200 || (scheduling.json as {enabled?: boolean} | null)?.enabled !== false) {
+        throw new Error("unobserved fixture was scheduled before both remote tips were recorded");
+      }
+      const observed = await lab.observedInspectionTip(pair);
+      const tipB = await lab.commitGit(pair, "printf 'B\\n' > rebase.txt\ngit add rebase.txt\ngit commit -m B\n");
+      const remoteB = await lab.snap(pair);
+      const observedB = await lab.observedInspectionTip(pair);
+      if (remoteB.git !== tipB) throw new Error("remote tip B was not recorded");
+      if (observedB !== observed || observedB === tipB) throw new Error("observed inspection tip advanced when B was pushed");
+      if (remoteB.svn !== before.svn || remoteB.records !== before.records || remoteB.watermark !== before.watermark || remoteB.gitWatermark !== before.gitWatermark || remoteB.gitColumn !== before.gitColumn) {
+        throw new Error("publication checkpoint moved when B was pushed");
+      }
+      const tipB2 = await lab.commitGitLocal(pair, "git commit --amend -m B2\ngit push --force-with-lease origin main || git push --force origin main\n");
+      if (tipB2 === tipB) throw new Error("amend did not change the remote tip");
+      const remoteB2 = await lab.snap(pair);
+      const observedB2 = await lab.observedInspectionTip(pair);
+      if (remoteB2.git !== tipB2) throw new Error("remote tip B2 was not recorded");
+      if (observedB2 !== observed || observedB2 === tipB || observedB2 === tipB2) throw new Error("observed inspection tip advanced before the single poll");
+      if (remoteB2.svn !== before.svn || remoteB2.records !== before.records || remoteB2.watermark !== before.watermark || remoteB2.gitWatermark !== before.gitWatermark || remoteB2.gitColumn !== before.gitColumn) {
+        throw new Error("publication checkpoint moved before the single poll");
+      }
+      await lab.enableFixturePair(pair);
+      const status = await lab.triggerGit(pair.gitRepo, false);
+      if (status !== 200) throw new Error(`unobserved rebase webhook ${status}`);
+      const commits = await lab.gitCommitsSince(pair, before.git);
+      if (commits.length !== 1 || commits[0] !== tipB2) throw new Error("unobserved rebase did not leave B2 as the only pending tip");
+      await lab.waitOutboundGitHistory(pair, before, [tipB2], "rebase.txt", "B\n");
+      await requireRepeatIdle(lab, pair);
+      if (await lab.appliedReceiptCount(pair, "git_to_svn", tipB) !== "0") throw new Error("late receipt for unobserved tip B");
+      const settled = await lab.snap(pair);
+      if (settled.git !== tipB2 || settled.gitWatermark !== tipB2 || settled.gitColumn !== tipB2) throw new Error("B2 checkpoints were not the settled tip");
+      if (await lab.svnBytes(pair, "rebase.txt") !== "B\n") throw new Error("B2 bytes were not the settled tree");
+      if (await lab.appliedReceiptCount(pair, "git_to_svn", tipB2) !== "1") throw new Error("B2 receipt was not singular after the repeat");
+      lab.pass("disabled fixture recorded remote tips B and B2 before one publication of B2; the repeat was idle");
+      return;
+    }
     case "GIT-BRANCH-CREATE-UNRELATED":
     case "GIT-BRANCH-DELETE":
     case "GIT-BRANCH-RECREATE":
@@ -475,7 +521,6 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     case "GIT-RESET-LOCAL":
     case "GIT-LOCAL-REBASE-UNPUBLISHED":
     case "GIT-WEBHOOK-ABSENT-DELAY-DUP":
-    case "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED":
     case "GIT-SQUASH-NEW-DESCENDANT":
     case "GIT-CHERRY-PICK-NEW":
     case "GIT-REVERT-NEW":
@@ -484,7 +529,7 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     case "GIT-FETCH-PULL": {
       const pair = await own(lab, op);
       const before = await lab.snap(pair);
-      if (op.id === "GIT-FETCH-PULL" || op.id === "GIT-REVERT-NEW" || op.id === "GIT-SQUASH-NEW-DESCENDANT" || op.id === "GIT-CHERRY-PICK-NEW" || op.id === "GIT-MERGE-DAG" || op.id === "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED") {
+      if (op.id === "GIT-FETCH-PULL" || op.id === "GIT-REVERT-NEW" || op.id === "GIT-SQUASH-NEW-DESCENDANT" || op.id === "GIT-CHERRY-PICK-NEW" || op.id === "GIT-MERGE-DAG") {
         if (op.id === "GIT-MERGE-DAG") {
           await lab.commitGit(pair, "git checkout -b side\nprintf 'side\\n' > side.txt\ngit add side.txt\ngit commit -m side\ngit checkout main\nprintf 'main\\n' > main.txt\ngit add main.txt\ngit commit -m main\ngit merge --no-ff side -m merge\n");
         } else if (op.id === "GIT-CHERRY-PICK-NEW") {
@@ -504,41 +549,6 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
           await lab.waitOutboundGitHistory(pair, synced, commits, "cherry.txt", "picked\n");
           await requireRepeatIdle(lab, pair);
           lab.pass("cherry-pick descendant reached the tracked branch with its receipt; the repeat was idle");
-          return;
-        } else if (op.id === "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED") {
-          if (before.svn !== "1" || before.watermark !== "1" || before.records !== "1" || before.gitWatermark !== before.git || before.gitColumn !== before.git) {
-            throw new Error("unobserved rebase requires a fresh import pair");
-          }
-          const held = await lab.api("PUT", `/api/repos/${pair.id}`, {enabled: false});
-          if (held.status !== 200) throw new Error(`could not hold the poller (${held.status})`);
-          let tipB = "";
-          let tipB2 = "";
-          try {
-            tipB = await lab.commitGit(pair, "printf 'B\\n' > rebase.txt\ngit add rebase.txt\ngit commit -m B\n");
-            const remoteB = await lab.snap(pair);
-            if (remoteB.git !== tipB) throw new Error("remote tip B was not recorded");
-            if (remoteB.svn !== before.svn || remoteB.records !== before.records || remoteB.watermark !== before.watermark || remoteB.gitWatermark !== before.gitWatermark || remoteB.gitColumn !== before.gitColumn) {
-              throw new Error("B was observed during the unobserved interval");
-            }
-            tipB2 = await lab.commitGitLocal(pair, "git commit --amend -m B2\ngit push --force-with-lease origin main || git push --force origin main\n");
-            if (tipB2 === tipB) throw new Error("amend did not change the remote tip");
-            const remoteB2 = await lab.snap(pair);
-            if (remoteB2.git !== tipB2) throw new Error("remote tip B2 was not recorded");
-            if (remoteB2.svn !== before.svn || remoteB2.records !== before.records || remoteB2.watermark !== before.watermark || remoteB2.gitWatermark !== before.gitWatermark || remoteB2.gitColumn !== before.gitColumn) {
-              throw new Error("checkpoint moved before the single poll");
-            }
-          } finally {
-            const resumed = await lab.api("PUT", `/api/repos/${pair.id}`, {enabled: true});
-            if (resumed.status !== 200) throw new Error(`could not resume the poller (${resumed.status})`);
-          }
-          const status = await lab.triggerGit(pair.gitRepo, false);
-          if (status !== 200) throw new Error(`unobserved rebase webhook ${status}`);
-          const commits = await lab.gitCommitsSince(pair, before.git);
-          if (commits.length !== 1 || commits[0] !== tipB2) throw new Error("unobserved rebase did not leave B2 as the only pending tip");
-          if (await lab.appliedReceiptCount(pair, "git_to_svn", tipB) !== "0") throw new Error("unobserved tip B was published");
-          await lab.waitOutboundGitHistory(pair, before, [tipB2], "rebase.txt", "B\n");
-          await requireRepeatIdle(lab, pair);
-          lab.pass("unobserved tips B and B2 were recorded before one publication of B2; the repeat was idle");
           return;
         } else if (op.id === "GIT-SQUASH-NEW-DESCENDANT") {
           await lab.commitGit(pair, "printf '1\\n' > squash.txt\ngit add squash.txt\ngit commit -m one\nprintf '2\\n' > squash.txt\ngit commit -am two\ngit reset --soft HEAD~2\ngit commit -m squashed\n");
