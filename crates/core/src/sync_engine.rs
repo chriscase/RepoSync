@@ -1126,20 +1126,20 @@ impl SyncEngine {
                     if emitted > 0 {
                         // A retained first row is not a baseline: maintenance
                         // may already have deleted earlier applied rows.
-                        let mut baseline = self
+                        let baseline = self
                             .db
                             .get_state(&format!("handled_git_baseline_{}", rid))
                             .map_err(SyncError::DatabaseError)?
                             .and_then(|value| {
                                 serde_json::from_str::<serde_json::Value>(&value).ok()
                             });
-                        let mut baseline_sha = baseline
+                        let baseline_sha = baseline
                             .as_ref()
                             .and_then(|record| record["git_sha"].as_str());
-                        let mut baseline_revision = baseline
+                        let baseline_revision = baseline
                             .as_ref()
                             .and_then(|record| record["svn_rev"].as_i64());
-                        let mut baseline_valid = baseline.as_ref().is_some_and(|record| {
+                        let baseline_valid = baseline.as_ref().is_some_and(|record| {
                             record["version"] == 1
                                 && record["repo_id"] == rid
                                 && self
@@ -1147,79 +1147,17 @@ impl SyncEngine {
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
-                            let legacy_seed_bootstrap = {
-                                let conn = self.db.conn();
-                                let legacy = conn
-                                    .query_row(
-                                        "SELECT value FROM kv_state WHERE key = ?1",
-                                        [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
-                                            rid
-                                        )],
-                                        |row| row.get::<_, String>(0),
-                                    )
-                                    .optional()
-                                    .map_err(crate::errors::DatabaseError::from)?
-                                    .filter(|value| !value.is_empty());
-                                legacy.as_deref() == Some(emitted_tip.as_str())
-                            };
-                            if !legacy_seed_bootstrap {
-                                return Err(self.record_history_block(
-                                    "ambiguous_checkpoint",
-                                    "missing durable handled Git baseline for absent repository cursor",
-                                    None,
-                                    None,
-                                    None,
-                                    Some(emitted_tip),
-                                ));
-                            }
-                            let column_svn_rev: i64 = {
-                                let conn = self.db.conn();
-                                conn.query_row(
-                                    "SELECT last_svn_rev FROM repositories WHERE id = ?1",
-                                    [rid],
-                                    |row| row.get(0),
-                                )
-                                .map_err(crate::errors::DatabaseError::from)?
-                            };
-                            let _ = self.materialize_git_baseline(emitted_tip, column_svn_rev);
-                            baseline = self
-                                .db
-                                .get_state(&format!("handled_git_baseline_{}", rid))
-                                .map_err(SyncError::DatabaseError)?
-                                .and_then(|value| {
-                                    serde_json::from_str::<serde_json::Value>(&value).ok()
-                                });
-                            baseline_sha = baseline
-                                .as_ref()
-                                .and_then(|record| record["git_sha"].as_str());
-                            baseline_revision = baseline
-                                .as_ref()
-                                .and_then(|record| record["svn_rev"].as_i64());
-                            baseline_valid = baseline.as_ref().is_some_and(|record| {
-                                record["version"] == 1
-                                    && record["repo_id"] == rid
-                                    && self.handled_git_baseline_projection_matches(
-                                        &record["projection"],
-                                    )
-                            }) && baseline_sha.is_some_and(is_full_git_oid)
-                                && baseline_revision.is_some_and(|rev| rev > 0);
-                            if !baseline_valid {
-                                return Err(self.record_history_block(
-                                    "ambiguous_checkpoint",
-                                    "missing durable handled Git baseline for absent repository cursor",
-                                    None,
-                                    None,
-                                    None,
-                                    Some(emitted_tip),
-                                ));
-                            }
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let _ = crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
-                                &self.db.conn(),
-                                rid,
-                                emitted_tip,
-                                &now,
-                            );
+                            // The authority/collision-checked reader already found no
+                            // inbound cursor. A raw human-id mirror cannot authorize
+                            // adopting the SVN-emitted column as handled Git work.
+                            return Err(self.record_history_block(
+                                "ambiguous_checkpoint",
+                                "missing durable handled Git baseline for absent repository cursor",
+                                None,
+                                None,
+                                None,
+                                Some(emitted_tip),
+                            ));
                         }
                         let baseline_sha = baseline_sha.unwrap();
                         let baseline_revision = baseline_revision.unwrap();
@@ -6400,6 +6338,351 @@ repo = "test/test-repo"
             Some(bootstrap),
             "install bootstrap may seed only the emitted-tip column"
         );
+    }
+
+    fn emitted_tip_without_inbound_checkpoint(
+        repo_id: &str,
+    ) -> (SyncEngine, tempfile::TempDir, String, String) {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+
+        let (engine, git_dir) = team_echo_engine_with_git_dir(repo_id);
+        let earlier = git_fixture_commit(git_dir.path(), "earlier.txt", "earlier\n", "earlier");
+        git_fixture_commit(
+            git_dir.path(),
+            "pending.txt",
+            "pending\n",
+            "unhandled Git work",
+        );
+        let emitted = git_fixture_commit(git_dir.path(), "emitted.txt", "emitted\n", "SVN emit");
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev = 3, last_git_sha = ?1 WHERE id = ?2",
+                rusqlite::params![emitted, repo_id],
+            )
+            .unwrap();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: Some(repo_id.into()),
+                svn_revision: Some(3),
+                git_hash: Some(emitted.clone()),
+                direction: SyncDirection::SvnToGit,
+                author: "fixture".into(),
+                message: "verified SVN emit".into(),
+                timestamp: chrono::Utc::now(),
+                synced_at: chrono::Utc::now(),
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        engine
+            .db()
+            .set_state(
+                &crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(repo_id),
+                &emitted,
+            )
+            .unwrap();
+        (engine, git_dir, earlier, emitted)
+    }
+
+    // History-block diagnostics are the only permitted writes on refusal.
+    fn checkpoint_authority_snapshot(engine: &SyncEngine) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let history_key = engine.history_block_key();
+        let legacy_history_key = history_block_key(engine.effective_repo_id());
+        let conn = engine.db().conn();
+        [
+            "SELECT * FROM repositories ORDER BY id",
+            "SELECT * FROM sync_records ORDER BY id",
+            "SELECT * FROM commit_map ORDER BY id",
+            "SELECT * FROM kv_state WHERE key != ?1 AND key != ?2 ORDER BY key",
+        ]
+        .iter()
+        .map(|sql| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            let history_parameters: [&dyn rusqlite::ToSql; 2] = [&history_key, &legacy_history_key];
+            let parameters: &[&dyn rusqlite::ToSql] = if statement.parameter_count() == 0 {
+                &[]
+            } else {
+                &history_parameters
+            };
+            let rows = statement
+                .query_map(parameters, |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        })
+        .collect()
+    }
+
+    fn assert_unowned_legacy_tip_refused(engine: &SyncEngine, repo_id: &str) {
+        assert_eq!(
+            crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(engine.db(), repo_id)
+                .unwrap(),
+            None,
+        );
+        let before = checkpoint_authority_snapshot(engine);
+        assert!(matches!(
+            engine.team_git_checkpoint(),
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
+        ));
+        assert_eq!(
+            checkpoint_authority_snapshot(engine),
+            before,
+            "refusal must preserve checkpoints, baselines, mappings and foreign state"
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_state(&scoped_last_git_sha_key(engine, repo_id))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_state(&format!("handled_git_baseline_{repo_id}"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn team_git_checkpoint_revoked_legacy_tip_cannot_seed_baseline() {
+        let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, "pair");
+    }
+
+    #[test]
+    fn team_git_checkpoint_unset_legacy_authority_cannot_seed_baseline() {
+        let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .delete_kv_state("reposync_v13_legacy_repo_id_kv_reads")
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, "pair");
+    }
+
+    #[test]
+    fn team_git_checkpoint_colliding_human_ids_cannot_seed_baseline() {
+        let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('pair_g2','pair_g2','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [crate::db::repo_scope_identity::new_scope_uuid()],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
+            .unwrap();
+        engine
+            .db()
+            .set_state("last_git_sha_pair_g2", &"f".repeat(40))
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, "pair");
+    }
+
+    #[test]
+    fn team_git_checkpoint_foreign_uuid_collision_cannot_seed_baseline() {
+        let repo_id = "abcdef01-2345-4678-9123-456789abcdef";
+        let (engine, _git_dir, _, emitted) = emitted_tip_without_inbound_checkpoint(repo_id);
+        // This human-id key is another repository's canonical inbound checkpoint.
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('victim','victim','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [repo_id],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, repo_id);
+        assert_eq!(
+            crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(engine.db(), "victim")
+                .unwrap(),
+            Some(emitted),
+        );
+    }
+
+    // Multi-repository reader admission revokes legacy authority before its
+    // collision arm. Exercise the ownership predicate directly so revocation
+    // cannot hide a broken exact-match or owning-row exclusion check.
+    #[test]
+    fn checkpoint_collision_guard_identifies_foreign_uuid_without_revoking_latch() {
+        use crate::db::repo_scope_identity::{
+            human_legacy_kv_token_conflicts_with_foreign_scope_uuid, repository_scope_uuid,
+        };
+
+        let repo_id = "abcdef01-2345-4678-9123-456789abcdef";
+        let (engine, _git_dir) = team_echo_engine_with_git_dir(repo_id);
+        let own_scope = repository_scope_uuid(&engine.db().conn(), repo_id).unwrap();
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('victim','victim','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [repo_id],
+        ).unwrap();
+        engine
+            .db()
+            .set_state(&format!("last_git_sha_{repo_id}"), &"e".repeat(40))
+            .unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        {
+            let conn = engine.db().conn();
+            for (token, owner, expected) in [
+                (repo_id.to_string(), repo_id, true),
+                (repo_id.to_string(), "victim", false),
+                (format!("{repo_id}x"), repo_id, false),
+                (own_scope, repo_id, false),
+            ] {
+                assert_eq!(
+                    human_legacy_kv_token_conflicts_with_foreign_scope_uuid(&conn, &token, owner)
+                        .unwrap(),
+                    expected,
+                    "wrong ownership verdict for token {token} and owner {owner}",
+                );
+            }
+        }
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+        assert_eq!(
+            engine
+                .db()
+                .get_state("reposync_v13_legacy_repo_id_kv_reads")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_collision_guard_distinguishes_human_id_prefixes_from_foreign_scopes() {
+        use crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let neighbor_scope = crate::db::repo_scope_identity::new_scope_uuid();
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('pair_g2','pair_g2','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [&neighbor_scope],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        {
+            let conn = engine.db().conn();
+            for (token, owner, expected) in [
+                ("pair", "pair", false),
+                ("pair_g2", "pair", false),
+                ("pair_g2", "pair_g2", false),
+                (neighbor_scope.as_str(), "pair", true),
+                (neighbor_scope.as_str(), "pair_g2", false),
+            ] {
+                assert_eq!(
+                    human_legacy_kv_token_conflicts_with_foreign_scope_uuid(&conn, token, owner)
+                        .unwrap(),
+                    expected,
+                    "wrong ownership verdict for token {token} and owner {owner}",
+                );
+            }
+        }
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+        assert_eq!(
+            engine
+                .db()
+                .get_state("reposync_v13_legacy_repo_id_kv_reads")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_collision_guard_reports_query_errors_instead_of_no_collision() {
+        let db = Database::in_memory().unwrap();
+        crate::db::schema::run_migrations_up_to(&db.conn(), 12).unwrap();
+        db.set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let conn = db.conn();
+        let error = crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+            &conn, "pair", "pair",
+        ).expect_err("missing scope schema must not be reported as no collision");
+        assert!(
+            error.to_string().contains("no such column: scope_uuid"),
+            "unexpected query error: {error}"
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM kv_state WHERE key = 'reposync_v13_legacy_repo_id_kv_reads'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn team_git_checkpoint_revoked_legacy_tip_preserves_existing_baseline() {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+
+        let (engine, _git_dir, earlier, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
+            .unwrap();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: Some("pair".into()),
+                svn_revision: Some(2),
+                git_hash: Some(earlier.clone()),
+                direction: SyncDirection::SvnToGit,
+                author: "fixture".into(),
+                message: "baseline".into(),
+                timestamp: chrono::Utc::now(),
+                synced_at: chrono::Utc::now(),
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        engine.materialize_git_baseline(&earlier, 2).unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        assert_eq!(engine.team_git_checkpoint().unwrap(), Some(earlier));
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+    }
+
+    #[test]
+    fn team_git_checkpoint_authorized_legacy_tip_uses_guarded_reader() {
+        let (engine, _git_dir, _, emitted) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        assert_eq!(engine.team_git_checkpoint().unwrap(), Some(emitted));
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
     }
 
     #[test]
