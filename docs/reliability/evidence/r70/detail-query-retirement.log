@@ -1,0 +1,72 @@
+STDOUT
+
+> reposync-web-ui@0.1.0 test
+> vitest run src/branchPairRemoval.test.ts
+
+
+ RUN  v2.1.9 <fixture>/web-ui
+
+ ❯ src/branchPairRemoval.test.ts (35 tests | 1 failed) 7ms
+   × detail retirement and not-found classification > includes every detail query and scopes cancellation to the removed pair 3ms
+     → expected [ [ 'repo', 'child' ], …(6) ] to deeply equal [ [ 'repo', 'child' ], …(7) ]
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 34 passed (35)
+   Start at  02:45:30
+   Duration  366ms (transform 19ms, setup 0ms, collect 18ms, tests 7ms, environment 0ms, prepare 32ms)
+
+
+STDERR
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/branchPairRemoval.test.ts > detail retirement and not-found classification > includes every detail query and scopes cancellation to the removed pair
+AssertionError: expected [ [ 'repo', 'child' ], …(6) ] to deeply equal [ [ 'repo', 'child' ], …(7) ]
+
+- Expected
++ Received
+
+  Array [
+    Array [
+      "repo",
+      "child",
+    ],
+    Array [
+      "status",
+      "child",
+    ],
+    Array [
+      "sync-records",
+      "child",
+    ],
+    Array [
+      "commit-map",
+      "child",
+    ],
+    Array [
+      "audit",
+      "child",
+    ],
+    Array [
+      "repo-credentials",
+      "child",
+    ],
+    Array [
+      "branch-pairs",
+      "child",
+    ],
+-   Array [
+-     "import-status",
+-     "child",
+-   ],
+  ]
+
+ ❯ src/branchPairRemoval.test.ts:52:42
+     50| describe('detail retirement and not-found classification', () => {
+     51|   it('includes every detail query and scopes cancellation to the remov…
+     52|     expect(repoDetailQueryKeys('child')).toEqual([
+       |                                          ^
+     53|       ['repo', 'child'], ['status', 'child'], ['sync-records', 'child'…
+     54|       ['commit-map', 'child'], ['audit', 'child'], ['repo-credentials'…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
