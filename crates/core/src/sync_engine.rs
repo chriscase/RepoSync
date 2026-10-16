@@ -1126,20 +1126,20 @@ impl SyncEngine {
                     if emitted > 0 {
                         // A retained first row is not a baseline: maintenance
                         // may already have deleted earlier applied rows.
-                        let baseline = self
+                        let mut baseline = self
                             .db
                             .get_state(&format!("handled_git_baseline_{}", rid))
                             .map_err(SyncError::DatabaseError)?
                             .and_then(|value| {
                                 serde_json::from_str::<serde_json::Value>(&value).ok()
                             });
-                        let baseline_sha = baseline
+                        let mut baseline_sha = baseline
                             .as_ref()
                             .and_then(|record| record["git_sha"].as_str());
-                        let baseline_revision = baseline
+                        let mut baseline_revision = baseline
                             .as_ref()
                             .and_then(|record| record["svn_rev"].as_i64());
-                        let baseline_valid = baseline.as_ref().is_some_and(|record| {
+                        let mut baseline_valid = baseline.as_ref().is_some_and(|record| {
                             record["version"] == 1
                                 && record["repo_id"] == rid
                                 && self
@@ -1147,17 +1147,79 @@ impl SyncEngine {
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
-                            // The authority/collision-checked reader already found no
-                            // inbound cursor. A raw human-id mirror cannot authorize
-                            // adopting the SVN-emitted column as handled Git work.
-                            return Err(self.record_history_block(
-                                "ambiguous_checkpoint",
-                                "missing durable handled Git baseline for absent repository cursor",
-                                None,
-                                None,
-                                None,
-                                Some(emitted_tip),
-                            ));
+                            let legacy_seed_bootstrap = {
+                                let conn = self.db.conn();
+                                let legacy = conn
+                                    .query_row(
+                                        "SELECT value FROM kv_state WHERE key = ?1",
+                                        [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
+                                            rid
+                                        )],
+                                        |row| row.get::<_, String>(0),
+                                    )
+                                    .optional()
+                                    .map_err(crate::errors::DatabaseError::from)?
+                                    .filter(|value| !value.is_empty());
+                                legacy.as_deref() == Some(emitted_tip.as_str())
+                            };
+                            if !legacy_seed_bootstrap {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "missing durable handled Git baseline for absent repository cursor",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ));
+                            }
+                            let column_svn_rev: i64 = {
+                                let conn = self.db.conn();
+                                conn.query_row(
+                                    "SELECT last_svn_rev FROM repositories WHERE id = ?1",
+                                    [rid],
+                                    |row| row.get(0),
+                                )
+                                .map_err(crate::errors::DatabaseError::from)?
+                            };
+                            let _ = self.materialize_git_baseline(emitted_tip, column_svn_rev);
+                            baseline = self
+                                .db
+                                .get_state(&format!("handled_git_baseline_{}", rid))
+                                .map_err(SyncError::DatabaseError)?
+                                .and_then(|value| {
+                                    serde_json::from_str::<serde_json::Value>(&value).ok()
+                                });
+                            baseline_sha = baseline
+                                .as_ref()
+                                .and_then(|record| record["git_sha"].as_str());
+                            baseline_revision = baseline
+                                .as_ref()
+                                .and_then(|record| record["svn_rev"].as_i64());
+                            baseline_valid = baseline.as_ref().is_some_and(|record| {
+                                record["version"] == 1
+                                    && record["repo_id"] == rid
+                                    && self.handled_git_baseline_projection_matches(
+                                        &record["projection"],
+                                    )
+                            }) && baseline_sha.is_some_and(is_full_git_oid)
+                                && baseline_revision.is_some_and(|rev| rev > 0);
+                            if !baseline_valid {
+                                return Err(self.record_history_block(
+                                    "ambiguous_checkpoint",
+                                    "missing durable handled Git baseline for absent repository cursor",
+                                    None,
+                                    None,
+                                    None,
+                                    Some(emitted_tip),
+                                ));
+                            }
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let _ = crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+                                &self.db.conn(),
+                                rid,
+                                emitted_tip,
+                                &now,
+                            );
                         }
                         let baseline_sha = baseline_sha.unwrap();
                         let baseline_revision = baseline_revision.unwrap();
@@ -6454,28 +6516,80 @@ repo = "test/test-repo"
         );
     }
 
+    // Qualification control: run the unchanged candidate regression against
+    // baseline production, then require its specific rejection and actual writes.
+    fn assert_baseline_legacy_tip_adoption_detected(engine: &SyncEngine, repo_id: &str) {
+        let repo = engine.db().get_repository(repo_id).unwrap().unwrap();
+        let scoped_key = scoped_last_git_sha_key(engine, repo_id);
+        let baseline_key = format!("handled_git_baseline_{repo_id}");
+        assert_eq!(engine.db().get_state(&scoped_key).unwrap(), None);
+        assert_eq!(engine.db().get_state(&baseline_key).unwrap(), None);
+
+        let rejection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_unowned_legacy_tip_refused(engine, repo_id);
+        }))
+        .expect_err("baseline unexpectedly satisfied the candidate regression");
+        let message = rejection
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| rejection.downcast_ref::<&str>().copied())
+            .expect("unexpected non-string panic payload");
+        let expected = format!(
+            "assertion failed: {}",
+            stringify!(matches!(
+                engine.team_git_checkpoint(),
+                Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
+            ))
+        );
+        let normalize = |text: &str| {
+            text.chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>()
+        };
+        assert_eq!(normalize(message), normalize(&expected), "unexpected panic");
+
+        assert_eq!(
+            engine.db().get_state(&scoped_key).unwrap(),
+            Some(repo.last_git_sha.clone()),
+            "baseline must have adopted the stale emitted tip as the inbound checkpoint"
+        );
+        let baseline: serde_json::Value =
+            serde_json::from_str(&engine.db().get_state(&baseline_key).unwrap().unwrap()).unwrap();
+        assert_eq!(baseline["version"], 1);
+        assert_eq!(baseline["repo_id"].as_str(), Some(repo_id));
+        assert_eq!(
+            baseline["git_sha"].as_str(),
+            Some(repo.last_git_sha.as_str())
+        );
+        assert_eq!(baseline["svn_rev"].as_i64(), Some(repo.last_svn_rev));
+        assert_eq!(
+            baseline["projection"].as_str(),
+            Some(engine.no_target_projection().as_str())
+        );
+    }
+
     #[test]
-    fn team_git_checkpoint_revoked_legacy_tip_cannot_seed_baseline() {
+    fn baseline_sensitivity_revoked_legacy_tip_adoption_is_detected() {
         let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
         engine
             .db()
             .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
             .unwrap();
-        assert_unowned_legacy_tip_refused(&engine, "pair");
+        assert_baseline_legacy_tip_adoption_detected(&engine, "pair");
     }
 
     #[test]
-    fn team_git_checkpoint_unset_legacy_authority_cannot_seed_baseline() {
+    fn baseline_sensitivity_unset_legacy_authority_adoption_is_detected() {
         let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
         engine
             .db()
             .delete_kv_state("reposync_v13_legacy_repo_id_kv_reads")
             .unwrap();
-        assert_unowned_legacy_tip_refused(&engine, "pair");
+        assert_baseline_legacy_tip_adoption_detected(&engine, "pair");
     }
 
     #[test]
-    fn team_git_checkpoint_colliding_human_ids_cannot_seed_baseline() {
+    fn baseline_sensitivity_colliding_human_ids_adoption_is_detected() {
         let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
         engine.db().conn().execute(
             "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
@@ -6490,11 +6604,11 @@ repo = "test/test-repo"
             .db()
             .set_state("last_git_sha_pair_g2", &"f".repeat(40))
             .unwrap();
-        assert_unowned_legacy_tip_refused(&engine, "pair");
+        assert_baseline_legacy_tip_adoption_detected(&engine, "pair");
     }
 
     #[test]
-    fn team_git_checkpoint_foreign_uuid_collision_cannot_seed_baseline() {
+    fn baseline_sensitivity_foreign_uuid_collision_adoption_is_detected() {
         let repo_id = "abcdef01-2345-4678-9123-456789abcdef";
         let (engine, _git_dir, _, emitted) = emitted_tip_without_inbound_checkpoint(repo_id);
         // This human-id key is another repository's canonical inbound checkpoint.
@@ -6507,7 +6621,7 @@ repo = "test/test-repo"
             .db()
             .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
             .unwrap();
-        assert_unowned_legacy_tip_refused(&engine, repo_id);
+        assert_baseline_legacy_tip_adoption_detected(&engine, repo_id);
         assert_eq!(
             crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(engine.db(), "victim")
                 .unwrap(),
