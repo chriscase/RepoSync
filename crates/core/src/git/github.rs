@@ -442,12 +442,24 @@ impl GitHubClient {
         Ok(commit)
     }
 
-    /// Check whether a repository exists.
+    /// Check whether a repository exists, falling back to GET when HEAD is unsupported.
+    ///
+    /// Only 404 means absent; 410 and other failures retain the API error.
+    /// Redirects use the client's existing bounded policy and final response status.
     #[instrument(skip(self))]
     pub async fn repo_exists(&self, repo: &str) -> Result<bool, GitHubError> {
         let url = format!("{}/repos/{}", self.api_url, repo);
         let resp = self.auth(self.http.head(&url)).send().await?;
-        Ok(resp.status().is_success())
+        let resp = if resp.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            self.auth(self.http.get(&url)).send().await?
+        } else {
+            resp
+        };
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        self.check_response(resp).await?;
+        Ok(true)
     }
 
     /// Create a new GitHub repository.
