@@ -3,6 +3,7 @@ import { readFile, writeFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { assessBrowser, assessServices, compareTrees, directoryUsable, duplicateMappings, missingMappings } from "./oracle.mjs";
+import { accountReport, operationSelected, validateQualificationPlan } from "./report-accounting.mjs";
 
 const PASS = "PASS";
 const FAIL = "FAIL";
@@ -164,6 +165,8 @@ export async function buildReport(options) {
   const catalog = JSON.parse(await readFile(options.catalogPath, "utf8"));
   const matrix = JSON.parse(await readFile(options.matrixPath, "utf8"));
   const rules = JSON.parse(await readFile(options.rulesPath, "utf8"));
+  const planText = await readFile(options.qualificationPlanPath || new URL("../catalog/qualification-plan.json", import.meta.url), "utf8");
+  const plan = validateQualificationPlan(JSON.parse(planText));
   let playwright = { suites: [] };
   let playwrightParseError = "";
   if (options.playwrightPath) {
@@ -312,9 +315,16 @@ export async function buildReport(options) {
     });
   }
 
+  // Keep accepted obligations visible even if a catalog edit removes their
+  // executor/matrix entry. New catalog obligations remain included as before.
+  for (const id of plan.required_case_ids) {
+    if (!byId.has(id)) put({
+      id, title: id, status: NOT_RUN, qualification: "UNQUALIFIED",
+      supports_workflow: false, source: "qualification-plan",
+      reason: "Required by the retained qualification plan but no catalog or execution row was recorded.",
+    });
+  }
   const rows = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
-  const counts = { PASS: 0, FAIL: 0, PARTIAL: 0, NOT_RUN: 0, SKIP: 0 };
-  for (const row of rows) counts[row.status] = (counts[row.status] || 0) + 1;
   const omitted = rows.filter((row) => row.omitted);
   const unexpectedSkips = walked.skipped.filter((item) => item.reason === "unexpected_skip");
   const requiredGate = [
@@ -343,21 +353,18 @@ export async function buildReport(options) {
   const zeroDiscovery = suite !== "self-test" && options.playwrightPath && walked.discovered === 0;
   const flaky = walked.attempts.filter((item) => item.flaky);
 
-  const smokeRows = rows.filter((row) => (catalog.operations || []).some((op) => op.id === row.id && op.suite === "smoke" && op.disposition === "execute"));
-  const smokeFail = smokeRows.filter((row) => row.status !== PASS);
-  let suiteResult = PASS;
-  if (gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery || walked.runner_error || walked.cases.some((row) => row.status === FAIL)) suiteResult = FAIL;
-  if (suite === "smoke" && smokeFail.length) suiteResult = FAIL;
-  if (suite === "full") {
-    const blocking = rows.filter((row) => row.supports_workflow && row.status !== PASS);
-    const incomplete = rows.filter((row) => row.status === NOT_RUN || row.status === PARTIAL || row.status === FAIL || row.status === "SKIP");
-    if (blocking.length || incomplete.length || suiteResult === FAIL) suiteResult = FAIL;
-  }
-  if (suite === "soak") {
-    const soakRows = rows.filter((row) => (catalog.operations || []).some((op) => op.id === row.id && op.suite === "soak"));
-    if (soakRows.some((row) => row.status !== PASS) || gateFailed.length) suiteResult = FAIL;
-  }
-
+  const selectedIds = suite === "self-test" ? requiredGate : (catalog.operations || [])
+    .filter((op) => (op.disposition === "execute" && operationSelected(suite, op))
+      || (op.disposition === "engine" && suite === "full"))
+    .map((op) => op.id);
+  const accounting = accountReport({
+    rows, selectedIds, requiredIds: plan.required_case_ids,
+    blocked: Boolean(gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery
+      || walked.runner_error || playwrightParseError || walked.cases.some((row) => row.status === FAIL)),
+  });
+  // Preserve report.v1 consumers and CLI/CI exit semantics: full still requires
+  // every obligation; smoke and soak gate their selected executors plus controls.
+  const suiteResult = suite === "full" ? accounting.overall : accounting.selected_suite_result;
   const fullQualification = suite !== "full" ? NOT_RUN : suiteResult === PASS ? PASS : FAIL;
   const inspectedSha = catalog.inspected_sha || "";
   const candidate = options.candidate || "";
@@ -375,6 +382,12 @@ export async function buildReport(options) {
     suite,
     suite_result: suiteResult,
     full_qualification: fullQualification,
+    ...accounting,
+    qualification_plan: {
+      schema: plan.schema,
+      sha256: createHash("sha256").update(planText).digest("hex"),
+      required_count: plan.required_case_ids.length,
+    },
     partial_is_not_pass: true,
     catalog_status: audit.status === "INGESTED" ? "audit_ingested" : catalog.catalog_status,
     frozen_catalog_sha256: frozenCatalogSha256,
@@ -385,7 +398,6 @@ export async function buildReport(options) {
     candidate,
     seed: options.seed ?? null,
     run_id: options.runId || "",
-    counts,
     gate_failed: gateFailed.map((row) => row.id),
     unexpected_skips: unexpectedSkips,
     omitted: omitted.map((row) => row.id),
@@ -402,14 +414,6 @@ export async function buildReport(options) {
   if (options.outPath) await writeFile(options.outPath, JSON.stringify(report, null, 2));
   if (options.markdownPath) await writeFile(options.markdownPath, renderMarkdown(report));
   return report;
-}
-
-function operationSelected(suite, operation) {
-  if (operation.suite === "soak") return suite === "soak";
-  if (suite === "smoke") return operation.suite === "smoke";
-  if (suite === "full") return operation.suite === "smoke" || operation.suite === "full";
-  if (suite === "soak") return false;
-  return false;
 }
 
 function rank(status) {
@@ -449,7 +453,10 @@ function renderMarkdown(report) {
     ``,
     `Suite: ${report.suite}`,
     `Suite result: ${report.suite_result}`,
+    `Selected-suite result: ${report.selected_suite_result} (executor subset; not release qualification)`,
+    `Whole-plan overall: ${report.overall}`,
     `Full qualification: ${report.full_qualification}`,
+    `Required qualification obligations: ${report.qualification_plan.required_count}`,
     `Candidate: ${report.candidate || "(unset)"}`,
     `Audit inspected: ${report.audit_inspected_sha || "(unset)"}`,
     `Audit covers candidate: ${report.audit_covers_candidate ? "yes" : "no"}`,
@@ -458,17 +465,21 @@ function renderMarkdown(report) {
     ``,
     report.qualification_gap ? `Qualification gap: ${report.qualification_gap}` : `Audit catalog: ${report.audit.status}`,
     ``,
-    `Counts: PASS ${report.counts.PASS || 0}, FAIL ${report.counts.FAIL || 0}, PARTIAL ${report.counts.PARTIAL || 0}, NOT_RUN ${report.counts.NOT_RUN || 0}`,
+    `Whole-plan counts: ${formatCounts(report.counts)}`,
+    `Selected executor counts (harness controls reported separately by gate_failed): ${formatCounts(report.selected_suite_counts)}`,
     ``,
     `| ID | Status | Source | Workflow |`,
     `| --- | --- | --- | --- |`,
   ];
   for (const row of report.rows) {
-    if (row.source === "acceptance-matrix") continue;
     lines.push(`| ${row.id} | ${row.status} | ${row.source} | ${row.supports_workflow ? "yes" : "no"} |`);
   }
-  lines.push(``, `Matrix subcases are included in the JSON rows and are not repeated here.`, ``);
+  lines.push(``, `All JSON rows, including matrix-only and unavailable obligations, are listed above. Synthetic controls do not establish product runtime qualification.`, ``);
   return lines.join("\n");
+}
+
+function formatCounts(counts) {
+  return ["PASS", "FAIL", "PARTIAL", "NOT_RUN", "SKIP"].map((status) => `${status} ${counts[status] || 0}`).join(", ");
 }
 
 export function detectorSelfTest(fixture) {

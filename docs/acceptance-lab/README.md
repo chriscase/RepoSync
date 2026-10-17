@@ -156,6 +156,50 @@ negative controls remain implementation checks, not runtime qualification.
 
 `publish/report.md` lists the suite result, whether the audit SHA covers the candidate, and each operation. Infrastructure failures stay infrastructure failures. Product failures stay on their existing owners. This branch already contains four Personal production files, `crates/cli/src/personal/mod.rs`, `import.rs`, `daemon_ctl.rs`, and `crates/personal/src/engine.rs`, so that a fresh personal database is initialized, import commits on the configured branch, and Git-to-SVN errors keep their cause. Those files are part of this draft. The harness repair does not add further production Rust. It does not patch the web UI, shared lockfiles, or PR 194 to make a red case green.
 
+### Accounting correction design
+
+The following additive fields are this correction's design. No enumerated
+historical 40-test accounting contract was recovered. The report schema remains
+`reposync.acceptance-lab.report.v1` and existing fields and consumers remain.
+
+`selected_suite_result`, `selected_suite_counts`, and `selected_suite_ids`
+describe the selected executors: smoke selects 16 browser cases; full selects
+141 browser cases plus 21 engine cases; soak selects its 2 browser cases.
+Harness controls are excluded from these executor counts and still gate the
+result through `gate_failed`. A selected executor result also fails on omission,
+unexpected skip, zero discovery, runner/parse errors, retries or assertion failure.
+This subset result does not qualify the whole release.
+
+`counts`, `rows`, and `r_coverage` continue to include the whole obligation union,
+including the 18 synthetic harness controls. `overall` is PASS only when every
+retained obligation and every additional reported row is PASS, no row is
+UNQUALIFIED, and all controls above pass. FAIL, PARTIAL, NOT_RUN, SKIP, unknown
+status, missing required rows, or duplicate row identities prevent that PASS.
+`full_qualification` remains NOT_RUN for smoke/soak and follows the whole-plan
+result for full. The legacy `suite_result` and CLI/CI exit still require the
+whole plan for full; smoke/soak gate their selected executors and harness controls.
+The launcher continues to stamp these existing fields into run identity.
+
+`catalog/qualification-plan.json` retains all 519 obligations from source
+`1e4de1de99012c5c879d4e73d3700e6ea39df81d`: the operation catalog, acceptance
+matrix, frozen audit and mandatory harness controls. Missing catalog entries
+become visible NOT_RUN rows rather than disappearing. New catalog entries are
+also included. Retiring/replacing an accepted obligation requires an explicit
+reviewed plan amendment. Reports include the plan schema, SHA-256 and required
+count. Markdown lists every JSON row, including the 325 matrix-only obligations.
+
+If all full executors and controls passed, the counterfactual result would be
+180 PASS / 339 NOT_RUN / overall FAIL. That is not an actual historical run.
+The verified historical `05fe87bb` full run instead recorded 131 PASS / 34 FAIL /
+15 PARTIAL / 339 NOT_RUN, overall FAIL, with 141 browser cases attempted once
+and engine 16 PASS / 5 PARTIAL. It does not qualify the current source head.
+
+Run the accounting regressions with
+`node --test tests/acceptance-lab/src/report-accounting.test.mjs`. They process
+synthetic JSON in temporary directories without invoking fixture executables,
+the launcher, browser, Docker, SVN, Git or the production engine. Their success
+is implementation evidence; hosted full seed-1 qualification remains NOT_RUN.
+
 
 ### Repair verification after the 418ed374 review
 

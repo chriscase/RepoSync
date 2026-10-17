@@ -46,6 +46,7 @@ jobs:
           node-version: '22'
       - run: npm --prefix tests/acceptance-lab ci --ignore-scripts
       - run: npm --prefix tests/acceptance-lab run typecheck
+      - run: node --test tests/acceptance-lab/src/report-accounting.test.mjs
       - run: node tests/acceptance-lab/src/self-test.mjs
       - run: node tests/acceptance-lab/src/ci-gate.mjs self-check --scratch "${RUNNER_TEMP}/lab-artifacts/ci-gate-check"
       - run: node tests/acceptance-lab/src/engine-lock-check.mjs
