@@ -72,6 +72,7 @@ test("an UNQUALIFIED PASS annotation cannot qualify a workflow", () => {
 test("empty selection, absent selected row, duplicate rows and empty required set fail closed", () => {
   const rows = [pass("selected"), pass("other")];
   assert.equal(account(rows, { selectedIds: [] }).selected_suite_result, "FAIL");
+  assert.equal(account(rows, { selectedIds: [] }).overall, "FAIL");
   assert.equal(account(rows, { selectedIds: ["missing"] }).selected_suite_result, "FAIL");
   assert.equal(account([...rows, pass("selected")]).overall, "FAIL");
   assert.equal(account(rows, { requiredIds: [] }).overall, "FAIL");
@@ -108,21 +109,21 @@ async function syntheticReport(suite, options = {}) {
   const scratch = await mkdtemp(join(tmpdir(), "rs-accounting-"));
   try {
     const input = options.catalog || catalog;
-    const selected = input.operations.filter((op) => op.disposition === "execute" && operationSelected(suite, op));
+    const selected = input.operations.filter((op) => op?.disposition === "execute" && operationSelected(suite, op));
     const playwright = options.playwright || playwrightFor(selected, options.change);
-    const engine = options.engineRows || input.operations.filter((op) => op.disposition === "engine").map((op) => pass(op.id));
+    const engine = options.engineRows || input.operations.filter((op) => op?.disposition === "engine").map((op) => pass(op.id));
     const selfTest = options.selfTestRows || controls.filter((id) => id !== options.missingControl).map((id) => pass(id, options.failedControl === id ? { status: "FAIL" } : {}));
     const paths = { playwrightPath: join(scratch, "playwright.json"), selfTestPath: join(scratch, "self-test.json"), markdownPath: join(scratch, "report.md") };
     await writeFile(paths.playwrightPath, options.malformed ? "{broken" : JSON.stringify(playwright));
-    await writeFile(paths.selfTestPath, JSON.stringify({ cases: selfTest }));
-    if (suite === "full" || options.engineRows) {
+    await writeFile(paths.selfTestPath, JSON.stringify(Object.hasOwn(options, "selfTestDocument") ? options.selfTestDocument : { cases: selfTest }));
+    if (suite === "full" || options.engineRows || Object.hasOwn(options, "engineDocument")) {
       paths.enginePath = join(scratch, "engine.json");
-      await writeFile(paths.enginePath, JSON.stringify({ scenarios: engine }));
+      await writeFile(paths.enginePath, JSON.stringify(Object.hasOwn(options, "engineDocument") ? options.engineDocument : { scenarios: engine }));
     }
     let inputCatalog = catalogPath;
     if (options.removeOperation || options.catalog) {
       inputCatalog = join(scratch, "operations.json");
-      await writeFile(inputCatalog, JSON.stringify({ ...input, operations: input.operations.filter((op) => op.id !== options.removeOperation) }));
+      await writeFile(inputCatalog, JSON.stringify({ ...input, operations: options.removeOperation ? input.operations.filter((op) => op?.id !== options.removeOperation) : input.operations }));
     }
     let inputMatrix = matrixPath;
     if (options.matrix) {
@@ -133,6 +134,11 @@ async function syntheticReport(suite, options = {}) {
       paths.qualificationPlanPath = join(scratch, "qualification-plan.json");
       await writeFile(paths.qualificationPlanPath, JSON.stringify(options.qualificationPlan));
     }
+    if (options.auditDocuments) {
+      paths.auditDir = join(scratch, "audit");
+      await mkdir(paths.auditDir);
+      for (const [name, data] of Object.entries(options.auditDocuments)) await writeFile(join(paths.auditDir, name), JSON.stringify(data));
+    } else if (options.auditDir) paths.auditDir = options.auditDir;
     const report = await buildReport({ catalogPath: inputCatalog, matrixPath: inputMatrix, rulesPath, ...paths, suite,
       candidate: "a".repeat(40), seed: 1, runId: "syntheticaccounting1" });
     return { report, markdown: await readFile(paths.markdownPath, "utf8") };
@@ -323,6 +329,139 @@ test("removing a matrix criterion and its subcases preserves their retained crit
   });
   assert.equal(report.rows.length, 519);
   assert.deepEqual(report.r_coverage.R21, baseline.report.r_coverage.R21);
+});
+
+for (const actual of ["failed", "passed", "skipped", "timedOut", "interrupted"]) {
+  test(`an extra unannotated Playwright ${actual} test blocks an otherwise passing buildReport`, async () => {
+    const data = playwrightFor([minimalOperations[0]]);
+    data.suites[0].specs.push({ title: "unannotated extra", tests: [{ annotations: [], results: [{ status: actual, retry: 0 }] }] });
+    const { report, markdown } = await syntheticReport("full", { ...minimalOptions, playwright: data });
+    assert.equal(report.suite_result, "FAIL");
+    assert.equal(report.selected_suite_result, "FAIL");
+    assert.equal(report.counts.FAIL, 1);
+    assert.equal(report.discovered_results, 19);
+    assert.ok(report.input_validation_errors.some((error) => error.code === "missing_labCase_annotation"));
+    assert.ok(report.attempts.some((attempt) => attempt.ids.length === 0 && attempt.final_status === actual));
+    assert.match(markdown, /\| INPUT_INVALID_ID_\d+ \| FAIL \| playwright/);
+  });
+}
+
+test("duplicate catalog operation ids fail despite only one passing execution", async () => {
+  const { report } = await syntheticReport("full", {
+    ...minimalOptions,
+    catalog: { operations: [...minimalOperations, { ...minimalOperations[0] }] },
+    playwright: playwrightFor([minimalOperations[0]]),
+  });
+  assert.equal(report.discovered_results, 19);
+  assert.equal(report.suite_result, "FAIL");
+  assert.ok(report.input_validation_errors.some((error) => error.source === "operation-catalog" && error.id === "BROWSER_CASE" && error.code === "duplicate_identity"));
+});
+
+for (const operation of [
+  { ...minimalOperations[0], id: "" },
+  { ...minimalOperations[0], id: 42 },
+  { ...minimalOperations[0], suite: "unknown" },
+  { ...minimalOperations[0], disposition: "unknown" },
+]) {
+  test(`malformed catalog declaration ${JSON.stringify(operation)} cannot join a passing report`, async () => {
+    const { report } = await syntheticReport("full", {
+      ...minimalOptions, catalog: { operations: [...minimalOperations, operation] },
+      playwright: playwrightFor([minimalOperations[0]]),
+    });
+    assert.equal(report.suite_result, "FAIL");
+    assert.ok(report.input_validation_errors.some((error) => error.source === "operation-catalog"));
+  });
+}
+
+for (const [name, mutate, code] of [
+  ["conflicting PASS/UNKNOWN annotations", (d) => d.suites[0].specs[0].tests[0].annotations.push({ type: "labStatus", description: "PASS" }, { type: "labStatus", description: "UNKNOWN" }), "invalid_status"],
+  ["empty status annotation", (d) => d.suites[0].specs[0].tests[0].annotations.push({ type: "labStatus", description: "" }), "invalid_status"],
+  ["failed first result then unnumbered PASS", (d) => d.suites[0].specs[0].tests[0].results.unshift({ status: "failed", retry: 0 }), "multiple_attempts"],
+  ["multiple case identities", (d) => d.suites[0].specs[0].tests[0].annotations.push({ type: "labCase", description: "EXTRA_CASE" }), "ambiguous_labCase_annotation"],
+  ["declaration without tests", (d) => d.suites[0].specs.push({ title: "empty test declaration", tests: [] }), "missing_tests"],
+  ["malformed errors collection", (d) => { d.errors = "runner failure"; }, "invalid_collection"],
+  ["malformed annotation", (d) => d.suites[0].specs[0].tests[0].annotations.push(null), "invalid_annotation"],
+  ["reported runner failure", (d) => { d.stats = { unexpected: 1, flaky: 0 }; }, "reported_runner_failure"],
+  ["reported spec failure", (d) => { d.suites[0].specs[0].ok = false; }, "reported_spec_failure"],
+  ["reported unexpected test outcome", (d) => { d.suites[0].specs[0].tests[0].status = "unexpected"; }, "reported_test_failure"],
+  ["unexpected positive result", (d) => { d.suites[0].specs[0].tests[0].expectedStatus = "failed"; }, "unexpected_pass"],
+  ["reported result error", (d) => { d.suites[0].specs[0].tests[0].results[0].error = { message: "hidden failure" }; }, "reported_result_error"],
+  ["conflicting result annotation", (d) => { d.suites[0].specs[0].tests[0].results[0].annotations = [{ type: "labStatus", description: "FAIL" }]; }, "inconsistent_result_annotation"],
+  ["malformed result annotation", (d) => { d.suites[0].specs[0].tests[0].results[0].annotations = [{}]; }, "invalid_annotation"],
+  ["wrong-source harness identity", (d) => d.suites[0].specs.push(...playwrightFor([{ id: controls[0] }]).suites[0].specs), "unexpected_execution_identity"],
+]) {
+  test(`adjacent Playwright ${name} cannot be silently dropped`, async () => {
+    const data = playwrightFor([minimalOperations[0]]);
+    mutate(data);
+    const { report } = await syntheticReport("full", { ...minimalOptions, playwright: data });
+    assert.equal(report.suite_result, "FAIL");
+    assert.ok(report.input_validation_errors.some((error) => error.code === code), JSON.stringify(report.input_validation_errors));
+  });
+}
+
+for (const [name, options, code] of [
+  ["engine alias hides a failure", { engineDocument: { scenarios: [pass("ENGINE_CASE")], results: [pass("HIDDEN_ENGINE_FAIL", { status: "FAIL" })] } }, "ambiguous_result_collections"],
+  ["engine malformed primary alias", { engineDocument: { scenarios: null, results: [pass("ENGINE_CASE")] } }, "invalid_collection"],
+  ["engine failed overall with passing rows", { engineDocument: { scenarios: [pass("ENGINE_CASE")], overall: "FAIL" } }, "reported_overall_not_pass"],
+  ["engine inconsistent counts", { engineDocument: { scenarios: [pass("ENGINE_CASE")], counts: { PASS: 1, FAIL: 1 } } }, "reported_counts_mismatch"],
+  ["engine unavailable toolchain", { engineDocument: { scenarios: [pass("ENGINE_CASE")], toolchain: { status: "NOT RUN" } } }, "reported_toolchain_not_pass"],
+  ["self-test malformed document", { selfTestDocument: [] }, "invalid_document"],
+  ["self-test contradictory overall", { selfTestDocument: { cases: controls.map((id) => pass(id)), overall: "FAIL" } }, "reported_overall_not_pass"],
+  ["unknown self-test identity", { selfTestRows: [...controls.map((id) => pass(id)), pass("UNDECLARED_CONTROL")] }, "unexpected_execution_identity"],
+  ["negative PASS qualification", { selfTestRows: controls.map((id) => pass(id, id === controls[0] ? { qualification: "PARTIAL" } : {})) }, "invalid_qualification"],
+]) {
+  test(`adjacent ${name} blocks full qualification`, async () => {
+    const { report } = await syntheticReport("full", { ...minimalOptions, ...options });
+    assert.equal(report.suite_result, "FAIL");
+    assert.ok(report.input_validation_errors.some((error) => error.code === code), JSON.stringify(report.input_validation_errors));
+    if (name === "engine alias hides a failure") assert.ok(report.rows.some((row) => row.id === "HIDDEN_ENGINE_FAIL" && row.status === "FAIL"));
+  });
+}
+
+test("valid legacy engine alias and summary counts retain the passing baseline", async () => {
+  const { report } = await syntheticReport("full", { ...minimalOptions,
+    engineDocument: { results: [pass("ENGINE_CASE")], overall: "PASS", toolchain: { status: "PASS" }, counts: { PASS: 1, FAIL: 0, PARTIAL: 0, "NOT RUN": 0, SKIP: 0 } },
+  });
+  assert.equal(report.suite_result, "PASS");
+  assert.deepEqual(report.input_validation_errors, []);
+});
+
+test("valid Playwright outcome fields and mirrored result annotations retain PASS", async () => {
+  const data = playwrightFor([minimalOperations[0]]);
+  const spec = data.suites[0].specs[0];
+  spec.ok = true;
+  const observed = spec.tests[0];
+  observed.status = "expected";
+  observed.expectedStatus = "passed";
+  observed.results[0].errors = [];
+  observed.results[0].annotations = [...observed.annotations];
+  data.errors = [];
+  data.stats = { unexpected: 0, flaky: 0 };
+  const { report } = await syntheticReport("full", { ...minimalOptions, playwright: data });
+  assert.equal(report.suite_result, "PASS");
+  assert.deepEqual(report.input_validation_errors, []);
+});
+
+test("matrix declaration duplicates block while legitimate cross-criterion references remain allowed", async () => {
+  const { report } = await syntheticReport("full", { ...minimalOptions,
+    matrix: { harness_case_ids: [], scenarios: [{ id: "BROWSER_CASE" }, { id: "BROWSER_CASE" }] },
+  });
+  assert.equal(report.suite_result, "FAIL");
+  assert.ok(report.input_validation_errors.some((error) => error.source === "acceptance-matrix:scenarios" && error.code === "duplicate_identity"));
+  const valid = await syntheticReport("full", { auditDir: join(labRoot, "catalog") });
+  assert.deepEqual(valid.report.input_validation_errors, []);
+  assert.equal(valid.report.rows.length, 519);
+});
+
+test("audit declaration duplicates and ambiguous aliases cannot disappear before the join", async () => {
+  for (const document of [
+    { operations: [{ id: "BROWSER_CASE" }, { id: "BROWSER_CASE" }] },
+    { operations: [{ id: "BROWSER_CASE" }], cases: [{ id: "EXTRA_AUDIT_CASE" }] },
+  ]) {
+    const { report } = await syntheticReport("full", { ...minimalOptions, auditDocuments: { "audit.json": document } });
+    assert.equal(report.suite_result, "FAIL");
+    assert.ok(report.input_validation_errors.some((error) => error.source.startsWith("audit:") && ["duplicate_identity", "ambiguous_catalog_collections"].includes(error.code)));
+  }
 });
 
 for (const [name, options, predicate] of [

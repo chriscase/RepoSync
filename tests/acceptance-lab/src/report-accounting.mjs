@@ -21,6 +21,78 @@ export function validateQualificationPlan(plan) {
   return plan;
 }
 
+// Declaration identities need validation before joins/sets too. References may
+// repeat across different matrix criteria, but not within one declaration list.
+export function validateIdentityList(items, source, getId = (item) => item?.id) {
+  const values = [], errors = [], seen = new Set();
+  if (!Array.isArray(items)) return { values, errors: [{ source, code: "invalid_collection" }] };
+  for (const [index, item] of items.entries()) {
+    const id = getId(item);
+    if (typeof id !== "string" || !id || id.trim() !== id) {
+      errors.push({ source, index, code: "invalid_identity", id });
+      continue;
+    }
+    if (seen.has(id)) errors.push({ source, index, id, code: "duplicate_identity" });
+    seen.add(id);
+    values.push(item);
+  }
+  return { values, errors };
+}
+
+export function validateCatalogOperations(catalog) {
+  const checked = validateIdentityList(catalog?.operations, "operation-catalog");
+  const operations = checked.values.map((operation) => {
+    if (!["execute", "engine", "not_run"].includes(operation.disposition)
+        || !["smoke", "full", "soak"].includes(operation.suite)) {
+      checked.errors.push({ source: "operation-catalog", id: operation.id, code: "invalid_executor_declaration" });
+    }
+    if (operation.r_criteria !== undefined && (!Array.isArray(operation.r_criteria)
+        || operation.r_criteria.some((criterion) => typeof criterion !== "string"))) {
+      checked.errors.push({ source: "operation-catalog", id: operation.id, code: "invalid_criteria" });
+      return { ...operation, r_criteria: [] };
+    }
+    return operation;
+  });
+  return { operations, errors: checked.errors };
+}
+
+export function collectExecutionRows(document, source, fields, provided) {
+  const rows = [], errors = [];
+  if (!provided) return { rows, errors };
+  if (!document || typeof document !== "object" || Array.isArray(document)) {
+    return { rows, errors: [{ source, code: "invalid_document" }] };
+  }
+  const present = fields.filter((field) => Object.hasOwn(document, field));
+  if (present.length !== 1) errors.push({ source, code: present.length ? "ambiguous_result_collections" : "missing_result_collection" });
+  for (const field of present) {
+    if (Array.isArray(document[field])) rows.push(...document[field]);
+    else errors.push({ source, field, code: "invalid_collection" });
+  }
+  const normalize = (value) => source === "real-engine-suite" && typeof value === "string" ? value.toUpperCase().replace(" ", "_") : value;
+  if (Object.hasOwn(document, "overall") && normalize(document.overall) !== "PASS") {
+    errors.push({ source, code: "reported_overall_not_pass", reported_status: document.overall });
+  }
+  if (source === "real-engine-suite" && Object.hasOwn(document, "toolchain")
+      && normalize(document.toolchain?.status) !== "PASS") {
+    errors.push({ source, code: "reported_toolchain_not_pass", reported_status: document.toolchain?.status });
+  }
+  if (Object.hasOwn(document, "counts")) {
+    const actual = { PASS: 0, FAIL: 0, PARTIAL: 0, NOT_RUN: 0, SKIP: 0 };
+    for (const row of rows) if (Object.hasOwn(actual, normalize(row?.status))) actual[normalize(row.status)]++;
+    const reported = {};
+    let valid = Boolean(document.counts) && typeof document.counts === "object" && !Array.isArray(document.counts);
+    for (const [key, value] of Object.entries(valid ? document.counts : {})) {
+      const status = normalize(key);
+      if (!Object.hasOwn(actual, status) || Object.hasOwn(reported, status) || !Number.isSafeInteger(value) || value < 0) valid = false;
+      else reported[status] = value;
+    }
+    if (!valid || Object.entries(actual).some(([key, value]) => (reported[key] ?? 0) !== value)) {
+      errors.push({ source, code: "reported_counts_mismatch" });
+    }
+  }
+  return { rows, errors };
+}
+
 // Validate observations before any Map merges them. Invalid or duplicate raw
 // observations become FAIL rows and diagnostics, regardless of arrival order.
 export function validateExecutionInputs(groups) {
@@ -47,6 +119,7 @@ export function validateExecutionInputs(groups) {
       const status = source === "real-engine-suite" && typeof row?.status === "string"
         ? row.status.toUpperCase().replace(" ", "_") : row?.status;
       if (!statuses.has(status)) problems.push("invalid_status");
+      if (status === "PASS" && row?.qualification !== undefined && !["PASS", "executed"].includes(row.qualification)) problems.push("invalid_qualification");
       for (const code of problems) errors.push({ source, id, code, reported_status: row?.status });
       counts.set(id, (counts.get(id) || 0) + 1);
       observations.push({ ...row, id, source, status, problems });
@@ -81,7 +154,7 @@ export function accountReport({ rows, selectedIds, requiredIds, blocked = false 
   const selectedRows = selected.map((id) => byId.get(id)).filter(Boolean);
   const unique = byId.size === rows.length;
   const selectedPass = unique && !blocked && selected.length > 0 && selected.every((id) => passes(byId.get(id)));
-  const wholePass = unique && !blocked && requiredIds.length > 0 && rows.length > 0
+  const wholePass = selectedPass && requiredIds.length > 0 && rows.length > 0
     && requiredIds.every((id) => passes(byId.get(id))) && rows.every(passes);
   return {
     counts: countsFor(rows),

@@ -198,6 +198,18 @@ until its mapping is reviewed. These corrections address the reserved verifier's
 three P2 findings on `8011806`; that review was BLOCK and did not execute a
 candidate or establish hosted qualification.
 
+Re-review of `adaf2fb` remained BLOCK on unannotated Playwright tests and
+duplicate operation declarations. Missing/malformed identities now remain
+blocking diagnostics; an unannotated observation is retained as a FAIL row.
+Catalog IDs are checked before joining executions, and matrix/audit declarations
+are checked within each declaration list while shared references across criteria
+remain valid. The adjacent audit also rejects conflicting status metadata,
+hidden first-attempt failures, contradictory outcome/error fields, ambiguous
+result containers, reported unavailable engine tools and overall/count discrepancies. Playwright and
+self-test identities must belong to their declared evidence source. Valid
+legacy engine aliases, normal Playwright outcome fields and mirrored annotations
+remain accepted. Empty executor selections cannot qualify the whole plan.
+
 If all full executors and controls passed, the counterfactual result would be
 180 PASS / 339 NOT_RUN / overall FAIL. That is not an actual historical run.
 The verified historical `05fe87bb` full run instead recorded 131 PASS / 34 FAIL /

@@ -3,7 +3,7 @@ import { readFile, writeFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { assessBrowser, assessServices, compareTrees, directoryUsable, duplicateMappings, missingMappings } from "./oracle.mjs";
-import { accountReport, operationSelected, validateExecutionInputs, validateQualificationPlan } from "./report-accounting.mjs";
+import { accountReport, collectExecutionRows, operationSelected, validateCatalogOperations, validateExecutionInputs, validateIdentityList, validateQualificationPlan } from "./report-accounting.mjs";
 
 const PASS = "PASS";
 const FAIL = "FAIL";
@@ -14,16 +14,60 @@ export function walkPlaywright(report) {
   const cases = [];
   const skipped = [];
   const attempts = [];
+  const validationErrors = [];
+  const issue = (code, detail = {}) => validationErrors.push({ source: "playwright", code, ...detail });
+  const list = (value, field, required = false) => {
+    if (value === undefined && !required) return [];
+    if (Array.isArray(value)) return value;
+    issue("invalid_collection", { field });
+    return [];
+  };
   function visitSuite(suite) {
-    for (const spec of suite.specs || []) {
-      for (const test of spec.tests || []) {
-        const annotations = [...(spec.annotations || []), ...(test.annotations || [])];
+    if (!suite || typeof suite !== "object" || Array.isArray(suite)) { issue("invalid_suite"); return; }
+    for (const spec of list(suite.specs, "suite.specs")) {
+      if (!spec || typeof spec !== "object" || Array.isArray(spec)) { issue("invalid_spec"); continue; }
+      const tests = list(spec.tests, "spec.tests", true);
+      if (!tests.length) issue("missing_tests", { title: spec.title });
+      for (const test of tests) {
+        if (!test || typeof test !== "object" || Array.isArray(test)) { issue("invalid_test", { title: spec.title }); continue; }
+        const annotations = [...list(spec.annotations, "spec.annotations"), ...list(test.annotations, "test.annotations")]
+          .filter((annotation) => {
+            if (annotation && typeof annotation === "object" && typeof annotation.type === "string") return true;
+            issue("invalid_annotation", { title: spec.title }); return false;
+          });
         const ids = annotations.filter((item) => item.type === "labCase").map((item) => item.description);
+        const before = validationErrors.length;
+        const detail = { title: spec.title, id: ids[0] };
+        if (spec.ok !== undefined && spec.ok !== true) issue("reported_spec_failure", detail);
+        if (test.status !== undefined && !["expected", "skipped"].includes(test.status)) issue("reported_test_failure", detail);
+        if (ids.length !== 1) issue(ids.length ? "ambiguous_labCase_annotation" : "missing_labCase_annotation", detail);
+        const statusAnnotations = annotations.filter((item) => item.type === "labStatus");
+        for (const item of statusAnnotations) {
+          if (![PASS, FAIL, PARTIAL, NOT_RUN, "SKIP"].includes(item.description)) issue("invalid_status", { ...detail, reported_status: item.description });
+        }
+        if (new Set(statusAnnotations.map((item) => item.description)).size > 1) issue("ambiguous_status_annotation", detail);
+        const qualifications = annotations.filter((item) => item.type === "labQualification").map((item) => item.description);
+        if (qualifications.some((value) => typeof value !== "string") || new Set(qualifications).size > 1) issue("ambiguous_qualification_annotation", detail);
         const statusAnn = annotations.find((item) => item.type === "labStatus")?.description;
         const reason = annotations.find((item) => item.type === "labReason")?.description || "";
         const qualification = annotations.find((item) => item.type === "labQualification")?.description || "";
-        const results = test.results || [];
-        const retries = results.filter((result) => result.retry > 0).length;
+        const results = list(test.results, "test.results", true);
+        if (!results.length) issue("missing_results", detail);
+        for (const result of results) {
+          if (!result || !["passed", "failed", "skipped", "timedOut", "interrupted"].includes(result.status)) issue("invalid_result_status", detail);
+          if (result?.retry !== undefined && (!Number.isSafeInteger(result.retry) || result.retry < 0)) issue("invalid_retry", detail);
+          if (result?.error !== undefined && result.error !== null) issue("reported_result_error", detail);
+          if (list(result?.errors, "result.errors").length) issue("reported_result_error", detail);
+          for (const annotation of list(result?.annotations, "result.annotations")) {
+            if (!annotation || typeof annotation !== "object" || typeof annotation.type !== "string") { issue("invalid_annotation", detail); continue; }
+            if (["labCase", "labStatus", "labQualification"].includes(annotation.type)
+                && !annotations.some((item) => item.type === annotation.type && item.description === annotation.description)) {
+              issue("inconsistent_result_annotation", detail);
+            }
+          }
+        }
+        if (results.length > 1) issue("multiple_attempts", detail);
+        const retries = Math.max(results.length - 1, results.filter((result) => result?.retry > 0).length);
         const final = results[results.length - 1];
         const first = results[0];
         attempts.push({
@@ -34,21 +78,21 @@ export function walkPlaywright(report) {
           retries,
           flaky: retries > 0 && final?.status === "passed",
         });
-        const discovered = ids.length > 0;
-        if (!discovered) {
+        if (!ids.length) {
           skipped.push({ title: spec.title, reason: "missing_labCase_annotation" });
-          continue;
         }
         const actual = final?.status || "missing";
+        if (actual === "passed" && test.expectedStatus !== undefined && test.expectedStatus !== "passed") issue("unexpected_pass", detail);
+        if (test.status === "skipped" && actual !== "skipped") issue("inconsistent_test_status", detail);
         const blocksPass = actual === "failed" || actual === "timedOut" || actual === "interrupted" || actual === "missing";
         let status = PASS;
         if (blocksPass) status = FAIL;
         else if (actual === "skipped") status = statusAnn === NOT_RUN ? NOT_RUN : FAIL;
         else if (actual !== "passed") status = FAIL;
         else if (statusAnn && statusAnn !== PASS) status = statusAnn;
-        if (retries > 0 && status === PASS) status = FAIL;
+        if (validationErrors.length > before || (retries > 0 && status === PASS)) status = FAIL;
         if (Array.isArray(report?.errors) && report.errors.length > 0 && status === PASS) status = FAIL;
-        for (const id of ids) {
+        for (const id of ids.length ? ids : [undefined]) {
           cases.push({
             id,
             status,
@@ -66,24 +110,39 @@ export function walkPlaywright(report) {
         }
       }
     }
-    for (const child of suite.suites || []) visitSuite(child);
+    for (const child of list(suite.suites, "suite.suites")) visitSuite(child);
   }
-  for (const suite of report.suites || []) visitSuite(suite);
+  if (!report || typeof report !== "object" || Array.isArray(report)) issue("invalid_document");
+  for (const suite of list(report?.suites, "report.suites", true)) visitSuite(suite);
+  list(report?.errors, "report.errors");
+  if (report?.stats !== undefined) {
+    if (!report.stats || typeof report.stats !== "object" || Array.isArray(report.stats)) issue("invalid_stats");
+    else for (const key of ["unexpected", "flaky"]) {
+      if (report.stats[key] !== undefined && (!Number.isSafeInteger(report.stats[key]) || report.stats[key] !== 0)) issue("reported_runner_failure", { field: key });
+    }
+  }
   return {
     cases,
     skipped,
     attempts,
-    discovered: cases.length,
+    discovered: cases.filter((row) => typeof row.id === "string" && row.id && row.id.trim() === row.id).length,
     runner_error: Array.isArray(report?.errors) && report.errors.length > 0,
+    validation_errors: validationErrors,
   };
 }
 
-function matrixIds(matrix) {
-  const ids = new Set(matrix.harness_case_ids || []);
-  for (const scenario of matrix.scenarios || []) {
+function matrixIds(matrix, errors) {
+  const checked = (values, source, getId) => {
+    const result = validateIdentityList(values, source, getId);
+    errors.push(...result.errors);
+    return result.values;
+  };
+  const ids = new Set(checked(matrix?.harness_case_ids === undefined ? [] : matrix.harness_case_ids, "acceptance-matrix:harness", (id) => id));
+  for (const scenario of checked(matrix?.scenarios, "acceptance-matrix:scenarios")) {
     ids.add(scenario.id);
-    for (const id of scenario.required_case_ids || []) ids.add(id);
-    for (const id of scenario.supporting_case_ids || []) ids.add(id);
+    const required = checked(scenario.required_case_ids === undefined ? [] : scenario.required_case_ids, `acceptance-matrix:${scenario.id}:required`, (id) => id);
+    const supporting = checked(scenario.supporting_case_ids === undefined ? [] : scenario.supporting_case_ids, `acceptance-matrix:${scenario.id}:supporting`, (id) => id);
+    for (const id of checked([...required, ...supporting], `acceptance-matrix:${scenario.id}:all-cases`, (id) => id)) ids.add(id);
   }
   return [...ids];
 }
@@ -104,31 +163,36 @@ function engineIndex(rows) {
 }
 
 async function loadAudit(dir) {
-  if (!dir) return { status: "NOT_AVAILABLE", operations: [], files: [] };
+  if (!dir) return { status: "NOT_AVAILABLE", operations: [], files: [], errors: [] };
   let names = [];
   try {
     names = await readdir(dir);
   } catch {
-    return { status: "NOT_AVAILABLE", operations: [], files: [] };
+    return { status: "NOT_AVAILABLE", operations: [], files: [], errors: [] };
   }
   const files = names.filter((name) => name.endsWith(".json"));
   const operations = [];
+  const errors = [];
   let recognized = false;
   for (const name of files) {
     let parsed;
     try {
       parsed = JSON.parse(await readFile(join(dir, name), "utf8"));
     } catch {
+      errors.push({ source: `audit:${name}`, code: "invalid_json" });
       continue;
     }
-    const rows = Array.isArray(parsed)
-      ? parsed
-      : parsed.operations || parsed.cases || parsed.catalog || null;
-    if (!Array.isArray(rows)) continue;
+    const collections = Array.isArray(parsed) ? [{ field: "array", rows: parsed }]
+      : ["operations", "cases", "catalog"].filter((field) => parsed && Object.hasOwn(parsed, field))
+        .map((field) => ({ field, rows: parsed[field] }));
+    if (!collections.length) continue;
+    if (collections.length > 1) errors.push({ source: `audit:${name}`, code: "ambiguous_catalog_collections" });
     recognized = true;
-    for (const row of rows) {
-      const id = typeof row === "string" ? row : row.id;
-      if (id) {
+    for (const { field, rows } of collections) {
+      const checked = validateIdentityList(rows, `audit:${name}:${field}`, (row) => typeof row === "string" ? row : row?.id);
+      errors.push(...checked.errors);
+      for (const row of checked.values) {
+        const id = typeof row === "string" ? row : row.id;
         operations.push({
           id,
           title: row.title || row.operation || id,
@@ -138,16 +202,17 @@ async function loadAudit(dir) {
       }
     }
   }
-  if (!files.length) return { status: "NOT_AVAILABLE", operations: [], files };
+  if (!files.length) return { status: "NOT_AVAILABLE", operations: [], files, errors };
   if (!recognized) {
     return {
       status: "UNRECOGNIZED",
       operations: [],
       files,
+      errors,
       gap: "Audit report files were present but none matched an operation catalog schema. They were not treated as the frozen catalog.",
     };
   }
-  return { status: "INGESTED", operations, files };
+  return { status: "INGESTED", operations, files, errors };
 }
 
 async function readGeneratedJson(path) {
@@ -160,7 +225,10 @@ async function readGeneratedJson(path) {
 }
 
 export async function buildReport(options) {
-  const catalog = JSON.parse(await readFile(options.catalogPath, "utf8"));
+  const catalogDocument = JSON.parse(await readFile(options.catalogPath, "utf8"));
+  const catalogInput = validateCatalogOperations(catalogDocument);
+  const catalog = { ...catalogDocument, operations: catalogInput.operations };
+  const declarationErrors = [...catalogInput.errors];
   const matrix = JSON.parse(await readFile(options.matrixPath, "utf8"));
   const rules = JSON.parse(await readFile(options.rulesPath, "utf8"));
   const planText = await readFile(options.qualificationPlanPath || new URL("../catalog/qualification-plan.json", import.meta.url), "utf8");
@@ -169,11 +237,13 @@ export async function buildReport(options) {
   let playwrightParseError = "";
   if (options.playwrightPath) {
     const loaded = await readGeneratedJson(options.playwrightPath);
-    if (loaded.value) playwright = loaded.value;
+    if (!loaded.error) playwright = loaded.value;
     else playwrightParseError = `playwright.json: ${loaded.error}`;
   }
   const engine = options.enginePath ? JSON.parse(await readFile(options.enginePath, "utf8")) : null;
   const selfTest = options.selfTestPath ? JSON.parse(await readFile(options.selfTestPath, "utf8")) : { cases: [] };
+  const selfInput = collectExecutionRows(selfTest, "self-test", ["cases"], Boolean(options.selfTestPath));
+  const engineInput = collectExecutionRows(engine, "real-engine-suite", ["scenarios", "results"], Boolean(options.enginePath));
   const audit = await loadAudit(options.auditDir);
   let frozenCatalogSha256 = "";
   try {
@@ -183,11 +253,28 @@ export async function buildReport(options) {
     frozenCatalogSha256 = "";
   }
   const walked = walkPlaywright(playwright);
+  const requiredGate = [
+    "HARNESS_BAD_BASELINE", "HARNESS_DUPLICATE_CONTENT", "HARNESS_MISSING_MAPPING",
+    "HARNESS_FAILED_DIRECTORY", "HARNESS_ZERO_DISCOVERY", "HARNESS_OMITTED_CASE",
+    "HARNESS_UNEXPECTED_SKIP", "HARNESS_MISSING_BROWSER", "HARNESS_STARTUP_FAILURE",
+    "HARNESS_SCAN_FAILURE", "HARNESS_CLEANUP_FAILURE", "HARNESS_OMITTED_NOT_PASS",
+    "HARNESS_RETRY_IS_FAIL", "HARNESS_REDACTED_REPORT", "HARNESS_APP_PROFILE_CLEANUP",
+    "HARNESS_FALSE_PASS_ANNOTATION", "HARNESS_RUNNER_ERROR", "HARNESS_BASIC_REDACTION",
+  ];
   const inputs = validateExecutionInputs([
-    { source: "self-test", rows: selfTest.cases || [] },
+    { source: "self-test", rows: selfInput.rows },
     { source: "playwright", rows: walked.cases },
-    { source: "real-engine-suite", rows: engine?.scenarios || engine?.results || [] },
+    { source: "real-engine-suite", rows: engineInput.rows },
   ]);
+  const operationById = new Map(catalog.operations.map((operation) => [operation.id, operation]));
+  for (const row of inputs.rows) {
+    if ((row.source === "playwright" && operationById.get(row.id)?.disposition !== "execute")
+        || (row.source === "self-test" && !requiredGate.includes(row.id))) {
+      inputs.errors.push({ source: row.source, id: row.id, code: "unexpected_execution_identity" });
+      row.status = FAIL; row.qualification = FAIL;
+      row.reason = "Execution identity is not declared for this evidence source.";
+    }
+  }
   const engines = engineIndex(inputs.rows.filter((row) => row.source === "real-engine-suite"));
   const byId = new Map();
 
@@ -275,7 +362,7 @@ export async function buildReport(options) {
     });
   }
 
-  for (const id of matrixIds(matrix)) {
+  for (const id of matrixIds(matrix, declarationErrors)) {
     if (byId.has(id)) continue;
     const engineRow = engines.get(id);
     if (engineRow) {
@@ -351,29 +438,9 @@ export async function buildReport(options) {
   const rows = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
   const omitted = rows.filter((row) => row.omitted);
   const unexpectedSkips = walked.skipped.filter((item) => item.reason === "unexpected_skip");
-  const requiredGate = [
-    "HARNESS_BAD_BASELINE",
-    "HARNESS_DUPLICATE_CONTENT",
-    "HARNESS_MISSING_MAPPING",
-    "HARNESS_FAILED_DIRECTORY",
-    "HARNESS_ZERO_DISCOVERY",
-    "HARNESS_OMITTED_CASE",
-    "HARNESS_UNEXPECTED_SKIP",
-    "HARNESS_MISSING_BROWSER",
-    "HARNESS_STARTUP_FAILURE",
-    "HARNESS_SCAN_FAILURE",
-    "HARNESS_CLEANUP_FAILURE",
-    "HARNESS_OMITTED_NOT_PASS",
-    "HARNESS_RETRY_IS_FAIL",
-    "HARNESS_REDACTED_REPORT",
-    "HARNESS_APP_PROFILE_CLEANUP",
-    "HARNESS_FALSE_PASS_ANNOTATION",
-    "HARNESS_RUNNER_ERROR",
-    "HARNESS_BASIC_REDACTION",
-  ];
   const gate = requiredGate.map((id) => byId.get(id) || { id, status: FAIL, reason: "gate case missing" });
   const gateFailed = gate.filter((row) => row.status !== PASS);
-  const discovered = walked.discovered + (selfTest.cases || []).length;
+  const discovered = walked.discovered + selfInput.rows.length;
   const zeroDiscovery = suite !== "self-test" && options.playwrightPath && walked.discovered === 0;
   const flaky = walked.attempts.filter((item) => item.flaky);
 
@@ -381,10 +448,12 @@ export async function buildReport(options) {
     .filter((op) => (op.disposition === "execute" && operationSelected(suite, op))
       || (op.disposition === "engine" && suite === "full"))
     .map((op) => op.id);
+  const inputErrors = [...declarationErrors, ...audit.errors, ...walked.validation_errors,
+    ...selfInput.errors, ...engineInput.errors, ...inputs.errors];
   const accounting = accountReport({
     rows, selectedIds, requiredIds: plan.required_case_ids,
     blocked: Boolean(gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery
-      || walked.runner_error || playwrightParseError || inputs.errors.length || walked.cases.some((row) => row.status === FAIL)),
+      || walked.runner_error || playwrightParseError || inputErrors.length || walked.cases.some((row) => row.status === FAIL)),
   });
   // Preserve report.v1 consumers and CLI/CI exit semantics: full still requires
   // every obligation; smoke and soak gate their selected executors plus controls.
@@ -412,7 +481,7 @@ export async function buildReport(options) {
       sha256: createHash("sha256").update(planText).digest("hex"),
       required_count: plan.required_case_ids.length,
     },
-    input_validation_errors: inputs.errors,
+    input_validation_errors: inputErrors,
     partial_is_not_pass: true,
     catalog_status: audit.status === "INGESTED" ? "audit_ingested" : catalog.catalog_status,
     frozen_catalog_sha256: frozenCatalogSha256,
