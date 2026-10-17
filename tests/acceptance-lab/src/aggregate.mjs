@@ -3,7 +3,7 @@ import { readFile, writeFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { assessBrowser, assessServices, compareTrees, directoryUsable, duplicateMappings, missingMappings } from "./oracle.mjs";
-import { accountReport, operationSelected, validateQualificationPlan } from "./report-accounting.mjs";
+import { accountReport, operationSelected, validateExecutionInputs, validateQualificationPlan } from "./report-accounting.mjs";
 
 const PASS = "PASS";
 const FAIL = "FAIL";
@@ -95,10 +95,8 @@ function reasonFor(id, rules) {
   return "No acceptance-lab executor is mapped to this id. It is recorded and is not a PASS.";
 }
 
-function engineIndex(summary) {
+function engineIndex(rows) {
   const map = new Map();
-  if (!summary) return map;
-  const rows = summary.scenarios || summary.results || [];
   for (const row of rows) {
     if (row && row.id) map.set(row.id, row);
   }
@@ -185,15 +183,19 @@ export async function buildReport(options) {
     frozenCatalogSha256 = "";
   }
   const walked = walkPlaywright(playwright);
-  const engines = engineIndex(engine);
+  const inputs = validateExecutionInputs([
+    { source: "self-test", rows: selfTest.cases || [] },
+    { source: "playwright", rows: walked.cases },
+    { source: "real-engine-suite", rows: engine?.scenarios || engine?.results || [] },
+  ]);
+  const engines = engineIndex(inputs.rows.filter((row) => row.source === "real-engine-suite"));
   const byId = new Map();
 
   function put(row) {
     const existing = byId.get(row.id);
     if (!existing || rank(row.status) > rank(existing.status)) byId.set(row.id, row);
   }
-  for (const row of selfTest.cases || []) put({ ...row, source: row.source || "self-test" });
-  for (const row of walked.cases) put(row);
+  for (const row of inputs.rows) if (row.source !== "real-engine-suite") put(row);
 
   const suite = options.suite || "smoke";
   for (const operation of catalog.operations || []) {
@@ -315,14 +317,36 @@ export async function buildReport(options) {
     });
   }
 
+  // A new/unmapped engine id is still observed evidence. Preserve its failure
+  // even when no catalog or matrix entry names it. An unmapped PASS remains
+  // unqualified until its obligation/executor mapping is reviewed.
+  for (const found of engines.values()) {
+    const existing = byId.get(found.id);
+    const status = normalizeEngine(found.status);
+    put({
+      ...existing, id: found.id, title: existing?.title || found.id, status,
+      reason: found.detail?.reason || found.reason || "Engine id has no reviewed catalog or matrix mapping.",
+      qualification: status === PASS ? existing?.qualification || "UNQUALIFIED" : status,
+      supports_workflow: existing?.supports_workflow || false,
+      r_criteria: existing?.r_criteria || plan.r_criteria_by_case[found.id] || [],
+      source: "real-engine-suite",
+    });
+  }
+
   // Keep accepted obligations visible even if a catalog edit removes their
   // executor/matrix entry. New catalog obligations remain included as before.
   for (const id of plan.required_case_ids) {
     if (!byId.has(id)) put({
       id, title: id, status: NOT_RUN, qualification: "UNQUALIFIED",
       supports_workflow: false, source: "qualification-plan",
+      r_criteria: plan.r_criteria_by_case[id],
       reason: "Required by the retained qualification plan but no catalog or execution row was recorded.",
     });
+  }
+  // Retain accepted associations even when another evidence source supplies a
+  // row after its catalog mapping was removed or narrowed.
+  for (const row of byId.values()) {
+    row.r_criteria = [...new Set([...(row.r_criteria || []), ...(plan.r_criteria_by_case[row.id] || [])])];
   }
   const rows = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
   const omitted = rows.filter((row) => row.omitted);
@@ -360,7 +384,7 @@ export async function buildReport(options) {
   const accounting = accountReport({
     rows, selectedIds, requiredIds: plan.required_case_ids,
     blocked: Boolean(gateFailed.length || unexpectedSkips.length || omitted.length || zeroDiscovery
-      || walked.runner_error || playwrightParseError || walked.cases.some((row) => row.status === FAIL)),
+      || walked.runner_error || playwrightParseError || inputs.errors.length || walked.cases.some((row) => row.status === FAIL)),
   });
   // Preserve report.v1 consumers and CLI/CI exit semantics: full still requires
   // every obligation; smoke and soak gate their selected executors plus controls.
@@ -388,6 +412,7 @@ export async function buildReport(options) {
       sha256: createHash("sha256").update(planText).digest("hex"),
       required_count: plan.required_case_ids.length,
     },
+    input_validation_errors: inputs.errors,
     partial_is_not_pass: true,
     catalog_status: audit.status === "INGESTED" ? "audit_ingested" : catalog.catalog_status,
     frozen_catalog_sha256: frozenCatalogSha256,
@@ -457,6 +482,7 @@ function renderMarkdown(report) {
     `Whole-plan overall: ${report.overall}`,
     `Full qualification: ${report.full_qualification}`,
     `Required qualification obligations: ${report.qualification_plan.required_count}`,
+    `Input validation errors: ${report.input_validation_errors.length}`,
     `Candidate: ${report.candidate || "(unset)"}`,
     `Audit inspected: ${report.audit_inspected_sha || "(unset)"}`,
     `Audit covers candidate: ${report.audit_covers_candidate ? "yes" : "no"}`,

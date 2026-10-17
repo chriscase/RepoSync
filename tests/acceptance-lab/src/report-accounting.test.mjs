@@ -86,7 +86,9 @@ test("a control failure blocks both results even when every row is PASS", () => 
 test("invalid, empty or duplicate qualification plans are rejected", () => {
   for (const invalid of [null, {}, { ...plan, schema: "unknown" },
     { ...plan, required_case_ids: [] }, { ...plan, required_case_ids: ["id", "id"] },
-    { ...plan, required_case_ids: [" "] }, { ...plan, required_case_ids: [42] }]) {
+    { ...plan, required_case_ids: [" "] }, { ...plan, required_case_ids: [42] },
+    { ...plan, r_criteria_by_case: undefined }, { ...plan, r_criteria_by_case: {} },
+    { ...plan, r_criteria_by_case: { ...plan.r_criteria_by_case, LIVE_ENTERPRISE: [42] } }]) {
     assert.throws(() => validateQualificationPlan(invalid), /qualification plan/);
   }
 });
@@ -105,23 +107,33 @@ function playwrightFor(operations, change = {}) {
 async function syntheticReport(suite, options = {}) {
   const scratch = await mkdtemp(join(tmpdir(), "rs-accounting-"));
   try {
-    const selected = catalog.operations.filter((op) => op.disposition === "execute" && operationSelected(suite, op));
+    const input = options.catalog || catalog;
+    const selected = input.operations.filter((op) => op.disposition === "execute" && operationSelected(suite, op));
     const playwright = options.playwright || playwrightFor(selected, options.change);
-    const engine = catalog.operations.filter((op) => op.disposition === "engine").map((op) => pass(op.id));
-    const selfTest = controls.filter((id) => id !== options.missingControl).map((id) => pass(id, options.failedControl === id ? { status: "FAIL" } : {}));
+    const engine = options.engineRows || input.operations.filter((op) => op.disposition === "engine").map((op) => pass(op.id));
+    const selfTest = options.selfTestRows || controls.filter((id) => id !== options.missingControl).map((id) => pass(id, options.failedControl === id ? { status: "FAIL" } : {}));
     const paths = { playwrightPath: join(scratch, "playwright.json"), selfTestPath: join(scratch, "self-test.json"), markdownPath: join(scratch, "report.md") };
     await writeFile(paths.playwrightPath, options.malformed ? "{broken" : JSON.stringify(playwright));
     await writeFile(paths.selfTestPath, JSON.stringify({ cases: selfTest }));
-    if (suite === "full") {
+    if (suite === "full" || options.engineRows) {
       paths.enginePath = join(scratch, "engine.json");
       await writeFile(paths.enginePath, JSON.stringify({ scenarios: engine }));
     }
     let inputCatalog = catalogPath;
-    if (options.removeOperation) {
+    if (options.removeOperation || options.catalog) {
       inputCatalog = join(scratch, "operations.json");
-      await writeFile(inputCatalog, JSON.stringify({ ...catalog, operations: catalog.operations.filter((op) => op.id !== options.removeOperation) }));
+      await writeFile(inputCatalog, JSON.stringify({ ...input, operations: input.operations.filter((op) => op.id !== options.removeOperation) }));
     }
-    const report = await buildReport({ catalogPath: inputCatalog, matrixPath, rulesPath, ...paths, suite,
+    let inputMatrix = matrixPath;
+    if (options.matrix) {
+      inputMatrix = join(scratch, "matrix.json");
+      await writeFile(inputMatrix, JSON.stringify(options.matrix));
+    }
+    if (options.qualificationPlan) {
+      paths.qualificationPlanPath = join(scratch, "qualification-plan.json");
+      await writeFile(paths.qualificationPlanPath, JSON.stringify(options.qualificationPlan));
+    }
+    const report = await buildReport({ catalogPath: inputCatalog, matrixPath: inputMatrix, rulesPath, ...paths, suite,
       candidate: "a".repeat(40), seed: 1, runId: "syntheticaccounting1" });
     return { report, markdown: await readFile(paths.markdownPath, "utf8") };
   } finally {
@@ -198,13 +210,119 @@ test("existing CI enforcement still accepts smoke and rejects incomplete full re
 });
 
 test("deleting an unavailable operation cannot delete its accepted obligation", async () => {
+  const baseline = await syntheticReport("full");
   const { report, markdown } = await syntheticReport("full", { removeOperation: "LIVE_ENTERPRISE" });
   const retained = report.rows.find((row) => row.id === "LIVE_ENTERPRISE");
   assert.equal(report.rows.length, 519);
   assert.equal(retained.status, "NOT_RUN");
   assert.equal(retained.source, "qualification-plan");
+  assert.deepEqual(retained.r_criteria, ["R21"]);
+  assert.deepEqual(report.r_coverage.R21, baseline.report.r_coverage.R21);
   assert.match(markdown, /\| LIVE_ENTERPRISE \| NOT_RUN \| qualification-plan/);
   assert.equal(report.full_qualification, "FAIL");
+});
+
+// A minimal complete plan makes an ignored extra/invalid input observable as a
+// false PASS, rather than letting the production plan's339NOT_RUN hide it.
+const minimalOperations = [
+  { id: "BROWSER_CASE", suite: "smoke", disposition: "execute", r_criteria: ["R01"] },
+  { id: "ENGINE_CASE", suite: "full", disposition: "engine", r_criteria: ["R01"] },
+];
+const minimalIds = [...controls, ...minimalOperations.map((op) => op.id)];
+const minimalOptions = {
+  catalog: { operations: minimalOperations }, matrix: { scenarios: [], harness_case_ids: [] },
+  qualificationPlan: { ...plan, required_case_ids: minimalIds,
+    r_criteria_by_case: Object.fromEntries(minimalIds.map((id) => [id, id.startsWith("HARNESS_") ? [] : ["R01"]])) },
+};
+
+test("the minimal buildReport baseline is fully passing before raw-input mutations", async () => {
+  const { report } = await syntheticReport("full", minimalOptions);
+  assert.equal(report.overall, "PASS");
+  assert.equal(report.suite_result, "PASS");
+  assert.deepEqual(report.input_validation_errors, []);
+});
+
+for (const source of ["playwright", "self-test", "real-engine-suite"]) {
+  for (const reverse of [false, true]) {
+    test(`buildReport rejects ${source} duplicate PASS/UNKNOWN in ${reverse ? "reverse" : "forward"} order`, async () => {
+      const options = { ...minimalOptions };
+      let id;
+      if (source === "playwright") {
+        id = "BROWSER_CASE";
+        const data = playwrightFor([minimalOperations[0], minimalOperations[0]]);
+        data.suites[0].specs[reverse ? 0 : 1].tests[0].annotations.push({ type: "labStatus", description: "UNKNOWN" });
+        options.playwright = data;
+      } else if (source === "self-test") {
+        id = controls[0];
+        options.selfTestRows = controls.slice(1).map((control) => pass(control));
+        const duplicates = [pass(id), pass(id, { status: "UNKNOWN" })];
+        options.selfTestRows.push(...(reverse ? duplicates.reverse() : duplicates));
+      } else {
+        id = "ENGINE_CASE";
+        const duplicates = [pass(id), pass(id, { status: "UNKNOWN" })];
+        options.engineRows = reverse ? duplicates.reverse() : duplicates;
+      }
+      const { report, markdown } = await syntheticReport("full", options);
+      assert.equal(report.rows.find((row) => row.id === id).status, "FAIL");
+      assert.equal(report.overall, "FAIL");
+      assert.equal(report.suite_result, "FAIL");
+      assert.equal(report.selected_suite_result, "FAIL");
+      assert.ok(report.input_validation_errors.some((error) => error.id === id && error.code === "duplicate_identity"));
+      assert.ok(report.input_validation_errors.some((error) => error.id === id && error.code === "invalid_status"));
+      assert.match(markdown, /Input validation errors: [1-9]/);
+    });
+  }
+  test(`buildReport rejects a single invalid ${source} status before canonicalization`, async () => {
+    const options = { ...minimalOptions };
+    if (source === "playwright") options.playwright = playwrightFor([minimalOperations[0]], { id: "BROWSER_CASE", annotation: "UNKNOWN" });
+    else if (source === "self-test") options.selfTestRows = controls.map((id) => pass(id, id === controls[0] ? { status: "UNKNOWN" } : {}));
+    else options.engineRows = [pass("ENGINE_CASE", { status: "UNKNOWN" })];
+    const { report } = await syntheticReport("full", options);
+    assert.equal(report.overall, "FAIL");
+    assert.equal(report.suite_result, "FAIL");
+    assert.ok(report.input_validation_errors.some((error) => error.source === source && error.code === "invalid_status"));
+  });
+}
+
+for (const status of ["FAIL", "PARTIAL", "PASS"]) {
+  test(`buildReport retains an uncatalogued engine ${status} in rows, counts and Markdown`, async () => {
+    const { report, markdown } = await syntheticReport("full", {
+      ...minimalOptions, engineRows: [pass("ENGINE_CASE"), pass("UNMAPPED_ENGINE_CASE", { status })],
+    });
+    const found = report.rows.find((row) => row.id === "UNMAPPED_ENGINE_CASE");
+    assert.equal(found.status, status);
+    assert.equal(found.source, "real-engine-suite");
+    assert.equal(found.supports_workflow, false);
+    assert.equal(report.rows.length, minimalIds.length + 1);
+    assert.equal(report.counts[status], status === "PASS" ? minimalIds.length + 1 : 1);
+    assert.equal(report.selected_suite_result, "PASS");
+    assert.equal(report.overall, "FAIL");
+    assert.equal(report.full_qualification, "FAIL");
+    if (status === "PASS") assert.equal(found.qualification, "UNQUALIFIED");
+    assert.ok(markdown.includes(`| UNMAPPED_ENGINE_CASE | ${status} | real-engine-suite |`));
+  });
+}
+
+test("duplicate PASS observations fail buildReport even without an invalid status", async () => {
+  for (const options of [
+    { ...minimalOptions, playwright: playwrightFor([minimalOperations[0], minimalOperations[0]]) },
+    { ...minimalOptions, selfTestRows: [...controls.map((id) => pass(id)), pass(controls[0])] },
+    { ...minimalOptions, engineRows: [pass("ENGINE_CASE"), pass("ENGINE_CASE")] },
+  ]) {
+    const { report } = await syntheticReport("full", options);
+    assert.equal(report.suite_result, "FAIL");
+    assert.ok(report.input_validation_errors.some((error) => error.code === "duplicate_identity"));
+    assert.ok(!report.input_validation_errors.some((error) => error.code === "invalid_status"));
+  }
+});
+
+test("removing a matrix criterion and its subcases preserves their retained criterion coverage", async () => {
+  const baseline = await syntheticReport("full");
+  const { report } = await syntheticReport("full", {
+    matrix: { ...matrix, scenarios: matrix.scenarios.filter((row) => row.id !== "R21") },
+  });
+  assert.equal(report.rows.length, 519);
+  assert.deepEqual(report.r_coverage.R21, baseline.report.r_coverage.R21);
 });
 
 for (const [name, options, predicate] of [

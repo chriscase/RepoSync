@@ -188,6 +188,16 @@ also included. Retiring/replacing an accepted obligation requires an explicit
 reviewed plan amendment. Reports include the plan schema, SHA-256 and required
 count. Markdown lists every JSON row, including the 325 matrix-only obligations.
 
+The qualification plan also retains each case's criterion associations. Removing
+a catalog/matrix entry cannot remove its R-criterion coverage. Raw self-test,
+Playwright and engine observations are validated before merging identities:
+duplicate identities and invalid statuses become FAIL observations and visible
+`input_validation_errors`, independent of input order. Unmapped engine results
+remain in rows, counts and Markdown; an unmapped engine PASS stays UNQUALIFIED
+until its mapping is reviewed. These corrections address the reserved verifier's
+three P2 findings on `8011806`; that review was BLOCK and did not execute a
+candidate or establish hosted qualification.
+
 If all full executors and controls passed, the counterfactual result would be
 180 PASS / 339 NOT_RUN / overall FAIL. That is not an actual historical run.
 The verified historical `05fe87bb` full run instead recorded 131 PASS / 34 FAIL /

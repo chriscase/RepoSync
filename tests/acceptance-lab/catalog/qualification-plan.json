@@ -522,5 +522,1562 @@
     "WEB-SETUP",
     "WEB-SKIP-COMMIT",
     "WEB-STALE-ERROR-PERMISSION"
-  ]
+  ],
+  "r_criteria_by_case": {
+    "64A_AUTH": [
+      ""
+    ],
+    "64A_CANCEL_WRITE": [
+      ""
+    ],
+    "64A_CONNECTING": [
+      ""
+    ],
+    "64A_EXISTING_TARGET": [
+      ""
+    ],
+    "64A_FINALIZER": [
+      ""
+    ],
+    "64A_JOURNAL": [
+      ""
+    ],
+    "64A_LOST_PUSH": [
+      ""
+    ],
+    "64A_MID_IMPORT": [
+      ""
+    ],
+    "64A_ORDINARY": [
+      ""
+    ],
+    "64A_PROCESS_TREE": [
+      ""
+    ],
+    "64A_SCHEDULER": [
+      ""
+    ],
+    "64A_SVN_CHILD": [
+      ""
+    ],
+    "64B_ATOMIC_FAILURE": [
+      ""
+    ],
+    "64B_AUTH": [
+      ""
+    ],
+    "64B_CONFIG_CHANGED": [
+      ""
+    ],
+    "64B_CURSOR_CONFLICT": [
+      ""
+    ],
+    "64B_FINALIZER_RECOVERY": [
+      ""
+    ],
+    "64B_INSPECTION_FAILURE": [
+      ""
+    ],
+    "64B_LOCAL_MISSING": [
+      ""
+    ],
+    "64B_LOST_REPLY_COMPLETE": [
+      ""
+    ],
+    "64B_MALFORMED": [
+      ""
+    ],
+    "64B_PARTIAL_CONFIRMED": [
+      ""
+    ],
+    "64B_RACE": [
+      ""
+    ],
+    "64B_REMOTE_ADVANCED": [
+      ""
+    ],
+    "64B_REMOTE_MISMATCH": [
+      ""
+    ],
+    "64B_REMOTE_MISSING": [
+      ""
+    ],
+    "64B_STALE_ID": [
+      ""
+    ],
+    "64C_AUTH": [
+      ""
+    ],
+    "64C_CONFLICT_HELD": [
+      ""
+    ],
+    "64C_HTTP_UNIQUE_MATCH": [
+      ""
+    ],
+    "64C_JOURNAL": [
+      ""
+    ],
+    "64C_LOST_REPLY": [
+      ""
+    ],
+    "64C_ORDINARY": [
+      ""
+    ],
+    "64C_RESUME_INTENT": [
+      ""
+    ],
+    "64C_RESUME_ONE_WRITE": [
+      ""
+    ],
+    "64C_UNIQUE_MATCH": [
+      ""
+    ],
+    "64FENC_BEGIN_REFUSE": [
+      ""
+    ],
+    "64FENC_CLEAN_RELEASE": [
+      ""
+    ],
+    "64FENC_FOREIGN_TTL_INERT": [
+      ""
+    ],
+    "64FENC_IMPORT_FINALIZE": [
+      ""
+    ],
+    "64FENC_NO_IDENTITY_REFUSE": [
+      ""
+    ],
+    "64FENC_REFUSE_SECOND_HOST": [
+      ""
+    ],
+    "64FENC_STALE_TAKEOVER": [
+      ""
+    ],
+    "64FENC_SUPERSEDED_FINALIZE": [
+      ""
+    ],
+    "64FENC_SYNC_CONFIRM": [
+      ""
+    ],
+    "74_APPLY_POSITIVE": [
+      ""
+    ],
+    "74_CLEANUP_CLASSIFIER": [
+      ""
+    ],
+    "74_FINISHED_PATCH_FALLBACK": [
+      ""
+    ],
+    "74_GIT_APPLY_STOP": [
+      ""
+    ],
+    "74_LFS_POSITIVE": [
+      ""
+    ],
+    "74_LFS_STOP": [
+      ""
+    ],
+    "74_RESET_REFUSAL": [
+      ""
+    ],
+    "74_STDIN_FILE": [
+      ""
+    ],
+    "74_UNCERTAIN_APPLY_TIMEOUT": [
+      ""
+    ],
+    "74_UNCERTAIN_PREPARATION": [
+      ""
+    ],
+    "74_UNCERTAIN_SVN_CANCEL": [
+      ""
+    ],
+    "74_UNCERTAIN_SVN_EARLY": [
+      ""
+    ],
+    "COPY_BOUNDARY": [
+      ""
+    ],
+    "CURSOR_CLOUD_QUALIFICATION": [],
+    "ECHO_COLUMN_BOOTSTRAP_BOUNDED": [
+      ""
+    ],
+    "ECHO_GENERATION_STALE_RECEIPT": [
+      ""
+    ],
+    "ECHO_GENERATION_STALE_RECEIPT_SAME_SHA": [
+      ""
+    ],
+    "ECHO_IDENTITY_PATH_RECREATION": [
+      ""
+    ],
+    "ECHO_IDENTITY_REIMPORT_RESET": [
+      ""
+    ],
+    "ECHO_IDENTITY_SVN_UUID_AUTO": [
+      ""
+    ],
+    "ECHO_LEGACY_UNIFIED_CURSOR_UNPROVEN": [
+      ""
+    ],
+    "ECHO_MARKER_DUPLICATE": [
+      ""
+    ],
+    "ECHO_MARKER_EDITED": [
+      ""
+    ],
+    "ECHO_MARKER_FORGED": [
+      ""
+    ],
+    "ECHO_SHAPE1_COLUMN_ONLY_UNPROVED": [
+      ""
+    ],
+    "ECHO_SPLIT_CURSOR_UNPROVED_COLUMN": [
+      ""
+    ],
+    "EVIDENCE_SCAN_CANARY": [
+      ""
+    ],
+    "EVIDENCE_SCAN_CLEAN": [
+      ""
+    ],
+    "EVIDENCE_SCAN_ERROR": [
+      ""
+    ],
+    "GHE_QUALIFICATION": [
+      "R24"
+    ],
+    "GIT-ADD-REGULAR": [
+      "R01",
+      "R19"
+    ],
+    "GIT-AMEND-SYNCED": [
+      "R09"
+    ],
+    "GIT-AMEND-UNSYNCED": [
+      "R09"
+    ],
+    "GIT-AUTH-REJECT": [
+      "R16"
+    ],
+    "GIT-BINARY-REGULAR": [
+      "R19",
+      "R01"
+    ],
+    "GIT-BRANCH-CREATE-DERIVED": [
+      "R06",
+      "R08"
+    ],
+    "GIT-BRANCH-CREATE-UNRELATED": [
+      "R08"
+    ],
+    "GIT-BRANCH-DELETE": [
+      "R02",
+      "R16"
+    ],
+    "GIT-BRANCH-RECREATE": [
+      "R15",
+      "R16",
+      "R09"
+    ],
+    "GIT-CHERRY-PICK-NEW": [
+      "R01",
+      "R09"
+    ],
+    "GIT-CONCURRENT-TIP": [
+      "R10",
+      "R09"
+    ],
+    "GIT-CONFLICT-BOTH": [
+      "R07",
+      "R13",
+      "R19"
+    ],
+    "GIT-COPY-EQUIVALENT-ADD": [
+      "R01"
+    ],
+    "GIT-DELETE-REGULAR": [
+      "R01",
+      "R19"
+    ],
+    "GIT-DOTFILE": [
+      "R19"
+    ],
+    "GIT-EDIT-REGULAR": [
+      "R01",
+      "R19"
+    ],
+    "GIT-EOL": [
+      "R19"
+    ],
+    "GIT-EXECUTABLE": [
+      "R19",
+      "R01"
+    ],
+    "GIT-FETCH-PULL": [
+      "R01",
+      "R16"
+    ],
+    "GIT-FORCE-PUSH-SYNCED": [
+      "R09",
+      "R24"
+    ],
+    "GIT-FORCE-WITH-LEASE": [
+      "R09",
+      "R11"
+    ],
+    "GIT-HOST-PROTECTION": [
+      "R24",
+      "R16"
+    ],
+    "GIT-LFS-ONGOING": [
+      "R19"
+    ],
+    "GIT-LOCAL-REBASE-UNPUBLISHED": [
+      "R09"
+    ],
+    "GIT-MERGE-DAG": [
+      "R10",
+      "R09"
+    ],
+    "GIT-MERGE-DAG-OVER-CAP": [
+      "R10"
+    ],
+    "GIT-MISSING-OBJECT": [
+      "R10"
+    ],
+    "GIT-MULTI-COMMIT-LINEAR": [
+      "R01",
+      "R10"
+    ],
+    "GIT-OVER-1000": [
+      "R10"
+    ],
+    "GIT-PUBLISHED-REBASE-SYNCED": [
+      "R09"
+    ],
+    "GIT-PUBLISHED-REBASE-UNSYNCED-OBSERVED": [
+      "R09"
+    ],
+    "GIT-PUBLISHED-REBASE-UNSYNCED-UNOBSERVED": [
+      "R09"
+    ],
+    "GIT-PUSH-FF": [
+      "R01"
+    ],
+    "GIT-RENAME-REGULAR": [
+      "R19",
+      "R01"
+    ],
+    "GIT-RESET-LOCAL": [
+      "R09"
+    ],
+    "GIT-REVERT-NEW": [
+      "R01"
+    ],
+    "GIT-SQUASH-FORCE-SYNCED": [
+      "R09"
+    ],
+    "GIT-SQUASH-NEW-DESCENDANT": [
+      "R01",
+      "R09"
+    ],
+    "GIT-SYMLINK": [
+      "R19"
+    ],
+    "GIT-TAG-LIFECYCLE": [
+      "R01"
+    ],
+    "GIT-WEBHOOK-ABSENT-DELAY-DUP": [
+      "R09",
+      "R24"
+    ],
+    "HARNESS_APP_PROFILE_CLEANUP": [],
+    "HARNESS_BAD_BASELINE": [],
+    "HARNESS_BASIC_REDACTION": [],
+    "HARNESS_CLEANUP_FAILURE": [],
+    "HARNESS_DUPLICATE_CONTENT": [],
+    "HARNESS_FAILED_DIRECTORY": [],
+    "HARNESS_FALSE_PASS_ANNOTATION": [],
+    "HARNESS_MISSING_BROWSER": [],
+    "HARNESS_MISSING_MAPPING": [],
+    "HARNESS_OMITTED_CASE": [],
+    "HARNESS_OMITTED_NOT_PASS": [],
+    "HARNESS_REDACTED_REPORT": [],
+    "HARNESS_RETRY_IS_FAIL": [],
+    "HARNESS_RUNNER_ERROR": [],
+    "HARNESS_SCAN_FAILURE": [],
+    "HARNESS_STARTUP_FAILURE": [],
+    "HARNESS_UNEXPECTED_SKIP": [],
+    "HARNESS_ZERO_DISCOVERY": [],
+    "HOST-ACTIONS-CLIENT": [
+      "R24"
+    ],
+    "HOST-WEBHOOK-LIVE": [
+      "R24"
+    ],
+    "K01_REJECTION": [
+      ""
+    ],
+    "K01_VALID": [
+      ""
+    ],
+    "K03_ORIGIN": [
+      ""
+    ],
+    "L01_STORAGE": [
+      ""
+    ],
+    "L02_ADMISSION": [
+      ""
+    ],
+    "L03_HISTORY": [
+      ""
+    ],
+    "LAB_BARE_GIT_HTTP": [
+      "R01"
+    ],
+    "LAB_BROWSER_LDAP_LOGIN": [
+      "R18"
+    ],
+    "LAB_BROWSER_LOCAL_LOGIN": [
+      "R20"
+    ],
+    "LAB_CANARY_DETECTS_CONTACT": [
+      "R16"
+    ],
+    "LAB_DAEMON_RESTART": [
+      "R04",
+      "R22"
+    ],
+    "LAB_DENIED_AUTH": [
+      "R18"
+    ],
+    "LAB_DENIED_TARGET_NO_CONTACT": [
+      "R08",
+      "R16"
+    ],
+    "LAB_EARLY_CHILD_FAILURE": [
+      "R16"
+    ],
+    "LAB_EGRESS_REJECTED": [
+      "R16"
+    ],
+    "LAB_GITEA_API_NOT_GHE": [
+      "R24"
+    ],
+    "LAB_GITEA_LDAP_LOGIN": [
+      "R18"
+    ],
+    "LAB_INVALID_INPUT": [
+      "R16"
+    ],
+    "LAB_ISOLATION_TWO_REPOS": [
+      "R01",
+      "R17"
+    ],
+    "LAB_LOST_REPLY": [
+      "R05",
+      "R23"
+    ],
+    "LAB_MISSING_ARTIFACT": [
+      "R16"
+    ],
+    "LAB_NOTIFICATION_SINK_ONLY": [
+      "R17"
+    ],
+    "LAB_PERSONAL_IMPORT": [
+      "R01",
+      "R12"
+    ],
+    "LAB_PERSONAL_MULTICOMMIT": [
+      "R01"
+    ],
+    "LAB_PERSONAL_ROUNDTRIP": [
+      "R01"
+    ],
+    "LAB_SCOPES": [
+      "R19"
+    ],
+    "LAB_SMOKE_STACK": [
+      "R16"
+    ],
+    "LAB_SOAK_REPEAT": [
+      "R01"
+    ],
+    "LAB_SVNSERVE_TRANSPORT": [
+      "R01"
+    ],
+    "LAB_SVN_LDAP_AUTH": [
+      "R16",
+      "R18"
+    ],
+    "LAB_TEAM_GIT_TO_SVN": [
+      "R01"
+    ],
+    "LAB_TEAM_RESTART_STATE": [
+      "R01"
+    ],
+    "LAB_TEAM_SECOND_SYNC_NOOP": [
+      "R01"
+    ],
+    "LAB_TEAM_SVN_TO_GIT": [
+      "R01",
+      "R12"
+    ],
+    "LAB_WEBHOOK_TAMPER": [
+      "R24"
+    ],
+    "LDAP-AUTH-INVALID": [],
+    "LDAP-AUTH-VALID": [
+      "R24"
+    ],
+    "LDAP-BIND-ROTATION": [],
+    "LDAP-DUP-OR-MISSING-ATTR": [],
+    "LDAP-FALLTHROUGH": [],
+    "LDAP-FILTER-ESCAPE": [],
+    "LDAP-GROUP-ROLE": [],
+    "LDAP-IDENTITY-MAP": [],
+    "LDAP-MISSING-USER": [],
+    "LDAP-OUTAGE": [],
+    "LDAP-SERVICE-BIND-SEARCH": [],
+    "LDAP-SESSION-EXPIRY-LOGOUT": [],
+    "LDAP-TLS": [],
+    "LIVE_ENTERPRISE": [
+      "R21"
+    ],
+    "M01_HISTORY": [
+      ""
+    ],
+    "MAPPING_NULL": [
+      ""
+    ],
+    "MIGRATION_CRASH": [
+      ""
+    ],
+    "MIGRATION_FORGED": [
+      ""
+    ],
+    "MIGRATION_WRITE_FAILURE": [
+      ""
+    ],
+    "N01_FRONTIER": [
+      ""
+    ],
+    "OMARCHY_VM_QUALIFICATION": [],
+    "PAIR-BOTH-DIVERGED": [
+      "R07",
+      "R13"
+    ],
+    "PAIR-CANCEL-IMPORT": [
+      "R03",
+      "R04"
+    ],
+    "PAIR-CANCEL-RESTART-GENERATION": [
+      "R04"
+    ],
+    "PAIR-CHILD-AHEAD": [
+      "R06",
+      "R13"
+    ],
+    "PAIR-CONCURRENT-REPOS": [
+      "R17"
+    ],
+    "PAIR-DISABLE": [
+      "R02",
+      "R18"
+    ],
+    "PAIR-GENERATION": [
+      "R15",
+      "R22"
+    ],
+    "PAIR-IMPORT-FULL": [
+      "R12",
+      "R01",
+      "R03"
+    ],
+    "PAIR-IMPORT-SNAPSHOT": [
+      "R11",
+      "R12"
+    ],
+    "PAIR-LATE-EXISTING-SVN": [
+      "R07",
+      "R06"
+    ],
+    "PAIR-LATE-PREVIEW": [
+      "R06",
+      "R08"
+    ],
+    "PAIR-LATE-PUBLISH": [
+      "R06"
+    ],
+    "PAIR-LEGACY-ROOT-DELETE": [
+      "R02"
+    ],
+    "PAIR-MANAGED-REMOVE": [
+      "R02",
+      "R18"
+    ],
+    "PAIR-PARENT-AHEAD": [
+      "R07",
+      "R13"
+    ],
+    "PAIR-REANCHOR": [
+      "R14",
+      "R13"
+    ],
+    "PAIR-RECOVERY-POSTWRITE": [
+      "R05",
+      "R23",
+      "R01"
+    ],
+    "PAIR-REFRESH-EXECUTE": [
+      "R13",
+      "R14"
+    ],
+    "PAIR-REFRESH-PREVIEW": [
+      "R13"
+    ],
+    "PAIR-REFRESH-STALE-AND-REPEAT": [
+      "R13",
+      "R24"
+    ],
+    "PAIR-REMOTE-DELETE-EXPLICIT": [
+      "R02",
+      "R20"
+    ],
+    "PAIR-RESTART-HELD": [
+      "R04",
+      "R05",
+      "R23"
+    ],
+    "PAIR-RESTORE-PREWRITE": [
+      "R22",
+      "R23"
+    ],
+    "PAIR-UPGRADE-SYNTHETIC": [
+      "R21",
+      "R22"
+    ],
+    "PINNED_UNQUALIFIED": [
+      ""
+    ],
+    "PRODUCTION_FAULT_HOOKS": [
+      "R05"
+    ],
+    "R01": [
+      "R01"
+    ],
+    "R01_ALTERNATING_DUAL_CURSOR": [
+      "R01"
+    ],
+    "R01_FAILED_APPLY_BARRIER": [
+      "R01"
+    ],
+    "R01_FAILED_APPLY_RETRY": [
+      "R01"
+    ],
+    "R01_IGNORED_NONCOLLISION": [
+      "R01"
+    ],
+    "R01_LINEAR": [
+      "R01"
+    ],
+    "R01_METADATA_ONLY": [
+      "R01"
+    ],
+    "R01_NO_TARGET_GIT_CURSOR": [
+      "R01"
+    ],
+    "R01_NO_TARGET_READ_FAILURE": [
+      "R01"
+    ],
+    "R01_NO_TARGET_STAGE_FAILURE": [
+      "R01"
+    ],
+    "R01_OLD_INSTALL_UPGRADE": [
+      "R01"
+    ],
+    "R01_PENDING_BOTH_DIRECTIONS": [
+      "R01"
+    ],
+    "R01_REPRESENTED_CONTENT": [
+      "R01"
+    ],
+    "R01_SVNSERVE_BIDIRECTIONAL_ROUNDTRIP": [
+      "R01"
+    ],
+    "R01_SVNSERVE_FAILED_APPLY_BARRIER": [
+      "R01"
+    ],
+    "R01_SVNSERVE_FAILED_APPLY_RETRY": [
+      "R01"
+    ],
+    "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN": [
+      "R01"
+    ],
+    "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT": [
+      "R01"
+    ],
+    "R01_SVNSERVE_PERSONAL_ROUNDTRIP": [
+      "R01"
+    ],
+    "R01_SVNSERVE_POST_WRITE_RECOVERY": [
+      "R01"
+    ],
+    "R01_SVN_PENDING": [
+      "R01"
+    ],
+    "R01_TARGET_MISMATCH": [
+      "R01"
+    ],
+    "R01_VERIFIED_NO_DELTA": [
+      "R01"
+    ],
+    "R02": [
+      "R02"
+    ],
+    "R02_JOURNAL_RETRY": [
+      "R02"
+    ],
+    "R02_LEGACY_DELETE": [
+      "R02"
+    ],
+    "R02_MANAGED_REMOVE": [
+      "R02"
+    ],
+    "R02_PATH_CONFINEMENT": [
+      "R02"
+    ],
+    "R02_R03_ROUTE": [
+      "R02"
+    ],
+    "R02_REMOVE_RETRY": [
+      "R02"
+    ],
+    "R03": [
+      "R03"
+    ],
+    "R04": [
+      "R04"
+    ],
+    "R05": [
+      "R05"
+    ],
+    "R06": [
+      "R06"
+    ],
+    "R06_CHECKPOINT": [
+      "R06"
+    ],
+    "R06_EXISTING_TARGET_NOT_EQUIVALENT": [
+      "R06"
+    ],
+    "R06_LATE_PAIR_PUBLISH_HTTPS_CREDENTIALS_REFUSE": [
+      "R06"
+    ],
+    "R06_LATE_PAIR_PUBLISH_REPLAY": [
+      "R06"
+    ],
+    "R06_NO_ACTIVE_ON_PARTIAL": [
+      "R06"
+    ],
+    "R06_SKIP_IMPORT_BLOCKED": [
+      "R06"
+    ],
+    "R06_SNAPSHOT_BASELINE": [
+      "R06"
+    ],
+    "R06_SVN_DERIVED_PREVIEW": [
+      "R06"
+    ],
+    "R07": [
+      "R07"
+    ],
+    "R08": [
+      "R08"
+    ],
+    "R08_REFUSE_GIT_FIRST": [
+      "R08"
+    ],
+    "R09": [
+      "R09"
+    ],
+    "R09_AMEND": [
+      "R09"
+    ],
+    "R09_DURABLE_BLOCK": [
+      "R09"
+    ],
+    "R09_IGNORED_DIRECTORY_COLLISION": [
+      "R09"
+    ],
+    "R09_IGNORED_FILE_COLLISION": [
+      "R09"
+    ],
+    "R09_LOCAL": [
+      "R09"
+    ],
+    "R09_OBSERVED_REMOTE_REWRITE": [
+      "R09"
+    ],
+    "R09_OBSERVED_REMOTE_REWRITE_DURABLE": [
+      "R09"
+    ],
+    "R09_ORIGINAL": [
+      "R09"
+    ],
+    "R09_PERSONAL": [
+      "R09"
+    ],
+    "R09_POLLING_ONLY": [
+      "R09"
+    ],
+    "R09_READONLY_INDEX": [
+      "R09"
+    ],
+    "R09_REPLACEMENT": [
+      "R09"
+    ],
+    "R09_WEBHOOK_FORCED_HINT": [
+      "R09"
+    ],
+    "R10": [
+      "R10"
+    ],
+    "R10_AMBIGUOUS": [
+      "R10"
+    ],
+    "R10_ANCESTRY_ERROR": [
+      "R10"
+    ],
+    "R10_DURABLE_BACKLOG_BLOCK": [
+      "R10"
+    ],
+    "R10_DURABLE_UNSUPPORTED_BLOCK": [
+      "R10"
+    ],
+    "R10_FETCH_HISTORY_BLOCK": [
+      "R10"
+    ],
+    "R10_INVENTORY_AUTHORITY_CONFINEMENT": [
+      "R10"
+    ],
+    "R10_LEGACY_STALE_COPY": [
+      "R10"
+    ],
+    "R10_L_EQUALS_R": [
+      "R10"
+    ],
+    "R10_MERGE": [
+      "R10"
+    ],
+    "R10_MISSING_CURSOR": [
+      "R10"
+    ],
+    "R10_MISSING_OBJECT": [
+      "R10"
+    ],
+    "R10_OVERFLOW": [
+      "R10"
+    ],
+    "R10_PINNED_OLD_TOPOLOGY_INVENTORY": [
+      "R10"
+    ],
+    "R10_POLICY_EQUAL_CURSOR": [
+      "R10"
+    ],
+    "R10_POLICY_KV_ONLY": [
+      "R10"
+    ],
+    "R10_POLICY_SPLIT_CURSOR": [
+      "R10"
+    ],
+    "R10_PRIOR_PRUNED_BASELINE": [
+      "R10"
+    ],
+    "R10_RETENTION_FRONTIER": [
+      "R10"
+    ],
+    "R10_RETENTION_PRESENT_KV": [
+      "R10"
+    ],
+    "R10_SHALLOW": [
+      "R10"
+    ],
+    "R11": [
+      "R11"
+    ],
+    "R11_INVALID_REV": [
+      "R11"
+    ],
+    "R11_MISMATCHED_TARGET": [
+      "R11"
+    ],
+    "R11_PIN_HOLDS_AFTER_ADVANCE": [
+      "R11"
+    ],
+    "R11_SNAPSHOT_FIXED_R": [
+      "R11"
+    ],
+    "R11_SNAPSHOT_LFS": [
+      "R11"
+    ],
+    "R11_SNAPSHOT_RECONCILE": [
+      "R11"
+    ],
+    "R12": [
+      "R12"
+    ],
+    "R12_FULL_DEFAULT": [
+      "R12"
+    ],
+    "R13": [
+      "R13"
+    ],
+    "R13_DIGEST_BINDS_INPUTS": [
+      "R13"
+    ],
+    "R13_EXECUTE_REFUSED": [
+      "R13"
+    ],
+    "R13_PENDING_BOTH_SIDES": [
+      "R13"
+    ],
+    "R13_PREVIEW_PINS_INPUTS": [
+      "R13"
+    ],
+    "R13_REANCHOR_NOT_IMPLEMENTED": [
+      "R13"
+    ],
+    "R13_REWRITTEN_LINEAGE": [
+      "R13"
+    ],
+    "R13_UPDATE_FROM_PARENT_SUCCESS": [
+      "R13"
+    ],
+    "R14": [
+      "R14"
+    ],
+    "R14_REANCHOR_SUCCESS": [
+      "R14"
+    ],
+    "R15": [
+      "R15"
+    ],
+    "R16": [
+      "R16"
+    ],
+    "R16_AUTH": [
+      "R16"
+    ],
+    "R16_FETCH": [
+      "R16"
+    ],
+    "R16_MISSING_BRANCH": [
+      "R16"
+    ],
+    "R16_SVNSERVE_CREDENTIAL_ROTATION": [
+      "R16"
+    ],
+    "R16_SVNSERVE_GIT_REMOTE_RECREATION": [
+      "R16"
+    ],
+    "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE": [
+      "R16"
+    ],
+    "R16_SVNSERVE_MISSING_GIT_BRANCH": [
+      "R16"
+    ],
+    "R16_SVNSERVE_PARENT_CHILD_CREDENTIAL_CHAIN_ROTATION": [
+      "R16"
+    ],
+    "R16_SVNSERVE_SVN_AUTH_DENIED": [
+      "R16"
+    ],
+    "R16_SVNSERVE_SVN_REMOTE_RECREATION": [
+      "R16"
+    ],
+    "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE": [
+      "R16"
+    ],
+    "R16_TRANSPORT": [
+      "R16"
+    ],
+    "R17": [
+      "R17"
+    ],
+    "R17_SCOPE": [
+      "R17"
+    ],
+    "R17_SVNSERVE_CHECKPOINT_ISOLATION": [
+      "R17"
+    ],
+    "R17_SVNSERVE_CONCURRENT_CREDENTIAL_RELOAD": [
+      "R17"
+    ],
+    "R17_SVNSERVE_CONCURRENT_OVERLAP": [
+      "R17"
+    ],
+    "R17_SVNSERVE_CREDENTIAL_ISOLATION": [
+      "R17"
+    ],
+    "R17_SVNSERVE_JOB_ISOLATION": [
+      "R17"
+    ],
+    "R17_SVNSERVE_NOTIFICATION_ISOLATION": [
+      "R17"
+    ],
+    "R17_SVNSERVE_PARENT_CHILD_CONCURRENT_CREDENTIAL_RELOAD": [
+      "R17"
+    ],
+    "R18": [
+      "R18"
+    ],
+    "R19": [
+      "R19"
+    ],
+    "R19_EXPLICIT_DELETE": [
+      "R19"
+    ],
+    "R19_UNTOUCHED_TREE": [
+      "R19"
+    ],
+    "R20": [
+      "R20"
+    ],
+    "R21": [
+      "R21"
+    ],
+    "R21_COMPANY_INSTALLED_VERSION": [
+      "R21"
+    ],
+    "R21_PINNED_OLD_BINARY": [
+      "R21"
+    ],
+    "R22": [
+      "R22"
+    ],
+    "R23": [
+      "R23"
+    ],
+    "R24": [
+      "R24"
+    ],
+    "R65_BLANK_GIT_REMOTE": [
+      "R65"
+    ],
+    "R65_BRANCH_PAIR_QUERY": [
+      "R65"
+    ],
+    "R65_BRANCH_REMOTE_OPTS": [
+      "R65"
+    ],
+    "R65_CHILD_SHARED_CREDENTIAL": [
+      "R65"
+    ],
+    "R65_CHILD_SIBLING_PATH": [
+      "R65"
+    ],
+    "R65_CREDENTIAL_CHAIN_INHERIT": [
+      "R65"
+    ],
+    "R65_EXPLICIT_DISABLE": [
+      "R65"
+    ],
+    "R65_MANAGED_RESTORE": [
+      "R65"
+    ],
+    "R65_MANAGED_RESTORE_SYNC": [
+      "R65"
+    ],
+    "R65_REMOVAL_BY_OPERATION_ID": [
+      "R65"
+    ],
+    "R65_REMOVAL_PREVIEW_PARENT": [
+      "R65"
+    ],
+    "R65_REMOVAL_PREVIEW_STATUS": [
+      "R65"
+    ],
+    "R65_REMOVE_RECONCILIATION": [
+      "R65"
+    ],
+    "R65_REMOVE_RESTORE_CYCLE": [
+      "R65"
+    ],
+    "R65_REMOVE_RETRY_REMOTE": [
+      "R65"
+    ],
+    "R65_REMOVE_RETRY_UNREQUESTED_FAIL": [
+      "R65"
+    ],
+    "R65_SCOPED_SECRET_REVOKE_CAPTURE": [
+      "R65"
+    ],
+    "R65_SPLIT_SCOPED_SVN": [
+      "R65"
+    ],
+    "R65_UI_DISABLE_REMOVE": [
+      "R65"
+    ],
+    "R65_UI_REMOVAL_RECEIPT": [
+      "R65"
+    ],
+    "R66_CONTINUATION_MIXED_PENDING": [
+      "R66"
+    ],
+    "R66_DRAIN_PAST_SVN_ONLY": [
+      "R66"
+    ],
+    "R66_INCOMPLETE_CONFLICT_COVERAGE": [
+      "R66"
+    ],
+    "R66_MERGE_DAG_CONTINUATION_DISTINCT_CAP1": [
+      "R66"
+    ],
+    "R66_MERGE_DAG_CONTINUATION_DISTINCT_CAP3": [
+      "R66"
+    ],
+    "R66_MERGE_DAG_CONTINUATION_MISSING_ROW": [
+      "R66"
+    ],
+    "R66_MERGE_DAG_CONTINUATION_RESTART": [
+      "R66"
+    ],
+    "R66_PERSONAL_BACKLOG_RESTART": [
+      "R66"
+    ],
+    "R66_PERSONAL_LINEAR_ADMIT": [
+      "R66"
+    ],
+    "R66_PERSONAL_LINEAR_OVER_1000": [
+      "R66"
+    ],
+    "R66_PERSONAL_MERGE_DAG": [
+      "R66"
+    ],
+    "R66_TEAM_CONTINUATION_RESTART": [
+      "R66"
+    ],
+    "RS05_DIRECT_FINALIZE_ADVANCES_GLOBAL": [
+      "RS0"
+    ],
+    "RS05_ERROR_PAUSED_STATUS_ROUNDTRIP": [
+      "RS0"
+    ],
+    "RS05_LATE_PAIR_BC_PENDING": [
+      "RS0"
+    ],
+    "RS05_LEGACY_UNSCOPED_STATUS_GIT_TIP": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_AMBIGUOUS_CHECKPOINT": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_ANCESTRY_COMMAND_FAILED": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_CHECKPOINT_PROGRESS": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_INITIAL_IMPORT": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_LFS_ABORT_RETRY_IN_ORDER": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_LFS_ABORT_STOPS_BATCH": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_MISSING_CHECKPOINT": [
+      "RS0"
+    ],
+    "RS05_PERSONAL_MISSING_ORIGIN": [
+      "RS0"
+    ],
+    "RS05_SINGLE_REPO_FETCH_GIT_GLOBAL_FALLBACK": [
+      "RS0"
+    ],
+    "RS05_SINGLE_REPO_FETCH_SVN_GLOBAL_FALLBACK": [
+      "RS0"
+    ],
+    "RS05_SINGLE_REPO_SYNC_STATE_GLOBAL": [
+      "RS0"
+    ],
+    "RS05_TEAM_ADVANCE_GIT_SCOPED": [
+      "RS0"
+    ],
+    "RS05_TEAM_ADVANCE_SVN_ONLY_SCOPED": [
+      "RS0"
+    ],
+    "RS05_TEAM_COLUMNS_ONLY_BACKFILL": [
+      "RS0"
+    ],
+    "RS05_TEAM_EQUAL_REVISION_SCOPED": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_GIT_GLOBAL_FAIL_CLOSED": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_GIT_INCREMENTAL_NO_REPLAY": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_GIT_SCOPED_IGNORES_GLOBAL": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_GIT_SCOPED_ISOLATION": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_SVN_GLOBAL_FAIL_CLOSED": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_SVN_SCOPED_IGNORES_GLOBAL": [
+      "RS0"
+    ],
+    "RS05_TEAM_FETCH_SVN_SCOPED_ISOLATION": [
+      "RS0"
+    ],
+    "RS05_TEAM_GET_STATUS_GIT_SHA_AFTER_BIDIRECTIONAL": [
+      "RS0"
+    ],
+    "RS05_TEAM_GET_STATUS_SCOPED_GIT_CURSOR": [
+      "RS0"
+    ],
+    "RS05_TEAM_GET_STATUS_SCOPED_SVN_CURSOR": [
+      "RS0"
+    ],
+    "RS05_TEAM_GLOBAL_NOT_ADOPTED": [
+      "RS0"
+    ],
+    "RS05_TEAM_GLOBAL_RECOVERY_COLUMNS_ONLY": [
+      "RS0"
+    ],
+    "RS05_TEAM_IMPORT_PENDING_STATUS_ISOLATION": [
+      "RS0"
+    ],
+    "RS05_TEAM_POST_IMPORT_SVN_TO_GIT": [
+      "RS0"
+    ],
+    "RS05_TEAM_RECONCILIATION_STATUS_HONEST": [
+      "RS0"
+    ],
+    "RS05_TEAM_SCOPED_SVN_DISAGREEMENT": [
+      "RS0"
+    ],
+    "RS05_TEAM_SINGLE_IMPORT_NOOP": [
+      "RS0"
+    ],
+    "RS05_TEAM_SVN_TO_GIT_FINALIZE_PRESERVES_INBOUND_KV": [
+      "RS0"
+    ],
+    "RS05_TEAM_TERMINAL_STATUS_ISOLATION": [
+      "RS0"
+    ],
+    "RS05_UNSCOPED_STATUS_WORST_WINS": [
+      "RS0"
+    ],
+    "RS05_WEB_RECONCILIATION_REFUSES_IMPORT": [
+      "RS0"
+    ],
+    "RS05_WEB_UNSCOPED_STATUS_AGGREGATION": [
+      "RS0"
+    ],
+    "RS05_WEB_UNSCOPED_STATUS_NO_GLOBAL_GIT_TIP": [
+      "RS0"
+    ],
+    "RS11_CHAIN_DB_ERROR_PRESERVES_EMBEDDED_GIT": [
+      "RS1"
+    ],
+    "RS11_CLI_SYNC_NOW_NO_FOREIGN_CONFIG_TOKEN": [
+      "RS1"
+    ],
+    "RS11_IMPORT_CHAIN_MISS_PRESERVES_EMBEDDED_GIT": [
+      "RS1"
+    ],
+    "RS11_PARENT_REVOCATION_BLOCKS_CHILD_GLOBAL": [
+      "RS1"
+    ],
+    "RS11_SCHEDULER_CHAIN_MISS_PRESERVES_EMBEDDED_GIT": [
+      "RS1"
+    ],
+    "RS11_SCHEDULER_REVOCATION_STRIPS_EMBEDDED_GIT": [
+      "RS1"
+    ],
+    "RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN": [
+      "RS1"
+    ],
+    "RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION": [
+      "RS1"
+    ],
+    "RS11_STARTUP_CHILD_REVOCATION_PRESERVED": [
+      "RS1"
+    ],
+    "RS11_STARTUP_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN": [
+      "RS1"
+    ],
+    "RS11_TEAM_CREDENTIAL_CONFIG_SURVIVES_RELOAD": [
+      "RS1"
+    ],
+    "RS11_TEAM_CREDENTIAL_ISOLATION": [
+      "RS1"
+    ],
+    "RS11_TEAM_CREDENTIAL_MISSED_LOOKUP_PRESERVED": [
+      "RS1"
+    ],
+    "RS11_TEAM_CREDENTIAL_REVOCATION": [
+      "RS1"
+    ],
+    "RS11_TEAM_CREDENTIAL_ROTATION_RELOAD": [
+      "RS1"
+    ],
+    "RS_C02_CONTENT_CONFLICT_STOP": [
+      "RS_"
+    ],
+    "RS_C02_EMPTY_RULES_RENAME_CONFLICT_STOP": [
+      "RS_"
+    ],
+    "RS_C02_FILTERED_THEN_ALLOWED": [
+      "RS_"
+    ],
+    "RS_C02_MIXED_AND_SIBLING": [
+      "RS_"
+    ],
+    "RS_C02_NULL_REPO_ID_AMBIGUOUS_SURFACES_IDS": [
+      "RS_"
+    ],
+    "RS_C02_NULL_REPO_ID_SINGLE_REPO_ATTRIBUTION": [
+      "RS_"
+    ],
+    "RS_C02_OUT_OF_SCOPE_DELETE": [
+      "RS_"
+    ],
+    "RS_C02_PERSISTED_GATE_FORCE_PUSH_BACK": [
+      "RS_"
+    ],
+    "RS_C02_PERSISTED_GATE_SVN_ONLY_HANDLED_TIP": [
+      "RS_"
+    ],
+    "RS_C02_RENAME_ALLOWED_TO_BLOCKED": [
+      "RS_"
+    ],
+    "RS_C02_RENAME_BLOCKED_TO_ALLOWED": [
+      "RS_"
+    ],
+    "RS_C02_RENAME_BOTH_ALLOWED": [
+      "RS_"
+    ],
+    "RS_C02_RENAME_BOTH_BLOCKED": [
+      "RS_"
+    ],
+    "RS_C02_RENAME_NO_PATH_RULES": [
+      "RS_"
+    ],
+    "RS_C02_RENAME_SOURCE_PATH_CONFLICT": [
+      "RS_"
+    ],
+    "RS_C02_RESUME_BLOCKED_BY_PERSISTED_CONFLICT": [
+      "RS_"
+    ],
+    "RS_C02_SVN_DELETE_GIT_RENAME_CONFLICT_STOP": [
+      "RS_"
+    ],
+    "RS_C02_SVN_RENAME_GIT_RENAME_CONFLICT_STOP": [
+      "RS_"
+    ],
+    "RS_C88_IMPORT_COPY_DEST_HARDLINK": [
+      "RS_"
+    ],
+    "RS_C88_IMPORT_COPY_GITATTRIBUTES_HARDLINK": [
+      "RS_"
+    ],
+    "RS_C88_IMPORT_COPY_PARENT_SYMLINK": [
+      "RS_"
+    ],
+    "S54_HTTP_COPY": [
+      ""
+    ],
+    "S54_JSON_HISTORY": [
+      ""
+    ],
+    "S54_JSON_LOOKUP": [
+      ""
+    ],
+    "S54_JSON_PAGE": [
+      ""
+    ],
+    "S54_JSON_READONLY": [
+      ""
+    ],
+    "S54_SCOPED_HTTP": [
+      ""
+    ],
+    "STARTUP_V12": [
+      ""
+    ],
+    "SVN-ADD": [
+      "R01",
+      "R19"
+    ],
+    "SVN-AUTH": [
+      "R16"
+    ],
+    "SVN-BINARY-CONFLICT": [
+      "R07"
+    ],
+    "SVN-BRANCH-COPY": [
+      "R06",
+      "R11"
+    ],
+    "SVN-COPY": [
+      "R15",
+      "R06"
+    ],
+    "SVN-DELETE": [
+      "R19"
+    ],
+    "SVN-EDIT": [
+      "R01"
+    ],
+    "SVN-EMPTY-REV": [
+      "R01",
+      "R15"
+    ],
+    "SVN-EXTERNALS": [
+      "R19"
+    ],
+    "SVN-MERGE-CHERRY": [
+      "R15"
+    ],
+    "SVN-MERGE-NORMAL": [
+      "R15",
+      "R13"
+    ],
+    "SVN-MERGE-REVERSE": [
+      "R15"
+    ],
+    "SVN-MERGEINFO-ONLY": [
+      "R15"
+    ],
+    "SVN-MOVE": [
+      "R15",
+      "R19"
+    ],
+    "SVN-PATH-INCARNATION": [
+      "R15",
+      "R08"
+    ],
+    "SVN-PERMISSION": [
+      "R16"
+    ],
+    "SVN-PROP-ONLY-REV": [
+      "R01",
+      "R15"
+    ],
+    "SVN-PROPS-EOL-KEYWORDS-EXECUTABLE": [
+      "R19",
+      "R15"
+    ],
+    "SVN-REPLACE": [
+      "R15"
+    ],
+    "SVN-REV-GAP": [
+      "R15",
+      "R10"
+    ],
+    "SVN-SYMLINK": [
+      "R19"
+    ],
+    "SVN-TAG-COPY": [
+      "R11"
+    ],
+    "SVN-TRANSPORT": [
+      "R16"
+    ],
+    "SVN-TREE-CONFLICT": [
+      "R07",
+      "R19"
+    ],
+    "SVN-UUID-REPLACE": [
+      "R15",
+      "R16"
+    ],
+    "T54_EMITTED": [
+      ""
+    ],
+    "T54_LIST": [
+      ""
+    ],
+    "T54_LOOKUP": [
+      ""
+    ],
+    "T54_READONLY": [
+      ""
+    ],
+    "T54_STATUS": [
+      ""
+    ],
+    "V13_EMPTY_USED": [
+      ""
+    ],
+    "V13_LARGE_SEQUENCE": [
+      ""
+    ],
+    "V13_NEVER_USED": [
+      ""
+    ],
+    "V13_ROLLBACK": [
+      ""
+    ],
+    "V13_ROWS": [
+      ""
+    ],
+    "V13_SPARSE_HIGH": [
+      ""
+    ],
+    "V14_OLD_TOPOLOGY": [
+      ""
+    ],
+    "V14_RESTART": [
+      ""
+    ],
+    "V14_UNQUALIFIED": [
+      ""
+    ],
+    "WEB-ADMIN-CONFIG-LDAP": [],
+    "WEB-AUDIT-HISTORY": [
+      "R01"
+    ],
+    "WEB-BACK-RELOAD-DEEPLINK": [
+      "R20"
+    ],
+    "WEB-CONFLICTS": [
+      "R07"
+    ],
+    "WEB-DELETE-NAV": [
+      "R20"
+    ],
+    "WEB-LOGIN": [],
+    "WEB-PAIR-AND-REFRESH": [
+      "R06",
+      "R13"
+    ],
+    "WEB-RECONNECT": [],
+    "WEB-REGISTER-IMPORT-STATUS": [
+      "R03",
+      "R11",
+      "R12"
+    ],
+    "WEB-SETUP": [
+      "R12",
+      "R03"
+    ],
+    "WEB-SKIP-COMMIT": [
+      "R01"
+    ],
+    "WEB-STALE-ERROR-PERMISSION": [
+      "R18",
+      "R24"
+    ]
+  }
 }
