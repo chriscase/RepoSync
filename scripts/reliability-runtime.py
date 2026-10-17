@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -105,11 +106,48 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def assert_runtime_source_isolation(src=Path("/src")):
-    """Allow UI assets and empty compile-path ancestors, never Rust source."""
+def assert_runtime_source_isolation(src=Path("/src"), runtime_inputs=None):
+    """Allow UI assets and exact enrolled inputs, never a source checkout."""
     if not src.exists():
+        assert runtime_inputs is None, "runtime input root missing"
         return
     assert not src.is_symlink(), "runtime source root is a symlink"
+    if runtime_inputs is not None:
+        applications = {"target/debug/reposync", "target/debug/reposync-personal"}
+        fixtures = {
+            "crates/core/tests/fixtures/pair_refresh_http_server.py",
+            "crates/core/tests/fixtures/git_http_auth_server.py",
+            "crates/cli/tests/fixtures/startup_provider.py",
+        }
+        assert set(runtime_inputs) == {"schema", "files", "absent_fixtures"}, "invalid runtime input manifest"
+        assert runtime_inputs["schema"] == 1, "unknown runtime input schema"
+        files, absent = runtime_inputs["files"], runtime_inputs["absent_fixtures"]
+        assert isinstance(files, dict) and isinstance(absent, list), "invalid runtime input inventory"
+        assert applications <= files.keys() <= applications | fixtures, "unexpected or missing runtime input"
+        assert len(absent) == len(set(absent)) and set(absent) == fixtures - files.keys(), "incomplete source fixture inventory"
+        directories = {"", "crates", "crates/core", "crates/cli",
+                       "crates/personal", "crates/web", "web-ui"}
+        for relative in files:
+            directories.update(str(p) for p in Path(relative).parents if str(p) != ".")
+        for relative in sorted(directories):
+            directory = src / relative
+            assert not directory.is_symlink() and directory.is_dir(), f"invalid runtime ancestor: {relative}"
+            if relative == "web-ui":
+                continue
+            expected = {Path(p).name for p in directories | files.keys()
+                        if p and Path(p).parent == Path(relative)}
+            assert {p.name for p in directory.iterdir()} == expected, f"unexpected runtime content: {relative}"
+        for relative, entry in files.items():
+            path = src / relative
+            assert not path.is_symlink() and path.is_file(), f"invalid runtime input: {relative}"
+            assert entry["kind"] == ("application" if relative in applications else "fixture"), "wrong input kind"
+            data = path.read_bytes()
+            assert len(data) == entry["bytes"] and digest(data) == entry["sha256"], f"runtime input digest mismatch: {relative}"
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == entry["mode"], f"runtime input mode mismatch: {relative}"
+            assert relative not in applications or mode & 0o111, f"non-executable application: {relative}"
+        return
+    # Keep the empty-layout controls for callers without an input manifest.
     top_level = sorted(p.name for p in src.iterdir())
     assert top_level == ["crates", "web-ui"], f"unexpected /src in runtime: {top_level}"
     crates, web = src / "crates", src / "crates/web"
@@ -483,7 +521,14 @@ def main():
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
     assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
     assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
-    assert_runtime_source_isolation()
+    input_manifest = (TESTS / "runtime-inputs.json").read_bytes()
+    runtime_inputs = json.loads(input_manifest)
+    assert_runtime_source_isolation(runtime_inputs=runtime_inputs)
+    (OUTPUT / "runtime-inputs.json").write_text(json.dumps({
+        "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
+        "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
+        "manifest_sha256": digest(input_manifest), "inputs": runtime_inputs,
+    }, indent=2) + "\n")
     assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
     canaries = boundary_canaries()
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")
