@@ -402,3 +402,73 @@ fn personal_doctor_labels_failed_watermark_reads_without_checkpointing() {
     assert_eq!(std::fs::read(&wal_path).unwrap(), wal);
     assert!(!data.join("reposync.lock").exists());
 }
+
+#[test]
+fn personal_inspections_preserve_stale_and_invalid_pid_evidence() {
+    for value in ["1073741824", "invalid PID"] {
+        for action in ["status", "doctor"] {
+            let root = tempfile::tempdir().unwrap();
+            let data = root.path().join("data");
+            std::fs::create_dir(&data).unwrap();
+            let pid = data.join("personal.pid");
+            std::fs::write(&pid, value).unwrap();
+            let config = config(root.path(), &data);
+            let mut process = spawn(root.path(), &config, &[action]);
+            let status = wait(&mut process, root.path());
+            assert_eq!(
+                status.success(),
+                action == "doctor" || value != "invalid PID"
+            );
+            let stdout = std::fs::read_to_string(root.path().join("stdout")).unwrap();
+            if value != "invalid PID" {
+                assert!(stdout.contains("stale PID"), "{stdout}");
+            }
+            if value == "invalid PID" && action == "doctor" {
+                assert!(stdout.contains("Error:"), "{stdout}");
+            }
+            assert_eq!(std::fs::read_to_string(&pid).unwrap(), value);
+            assert!(!data.join("personal.db").exists());
+            assert!(!data.join("reposync.lock").exists());
+        }
+    }
+}
+
+#[test]
+fn personal_doctor_never_advises_destroying_refused_storage() {
+    for pending_journal in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let path = data.join("personal.db");
+        let db = Database::new(&path).unwrap();
+        db.initialize().unwrap();
+        db.conn()
+            .execute_batch("PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        let journal = path.with_extension("db-journal");
+        if pending_journal {
+            std::fs::write(&journal, [1u8; 1024]).unwrap();
+        } else {
+            db.conn().execute_batch("DROP TABLE watermarks;").unwrap();
+        }
+        let main = std::fs::read(&path).unwrap();
+        let wal_path = path.with_extension("db-wal");
+        let wal = std::fs::read(&wal_path).unwrap();
+        let config = config(root.path(), &data);
+        let mut process = spawn(root.path(), &config, &["doctor"]);
+        assert!(wait(&mut process, root.path()).success());
+        let stdout = std::fs::read_to_string(root.path().join("stdout")).unwrap();
+        assert!(!stdout.contains("Delete and re-import"), "{stdout}");
+        assert!(
+            !stdout.contains("Re-run import to update database schema"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("Preserve storage"), "{stdout}");
+        assert_eq!(std::fs::read(&path).unwrap(), main);
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal);
+        if pending_journal {
+            assert_eq!(std::fs::read(&journal).unwrap(), [1u8; 1024]);
+        }
+        assert!(!data.join("reposync.lock").exists());
+    }
+}

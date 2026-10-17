@@ -1,0 +1,37 @@
+STDOUT
+
+> reposync-web-ui@0.1.0 test
+> vitest run src/branchPairRemoval.test.ts
+
+
+ RUN  v2.1.9 <fixture>/web-ui
+
+ ❯ src/branchPairRemoval.test.ts (35 tests | 1 failed) 6ms
+   × removalDestination > uses the captured parent unless its absence is confirmed 3ms
+     → expected '/repos/parent' to be '/repos' // Object.is equality
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 34 passed (35)
+   Start at  02:45:29
+   Duration  329ms (transform 19ms, setup 0ms, collect 18ms, tests 6ms, environment 0ms, prepare 33ms)
+
+
+STDERR
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/branchPairRemoval.test.ts > removalDestination > uses the captured parent unless its absence is confirmed
+AssertionError: expected '/repos/parent' to be '/repos' // Object.is equality
+
+Expected: "/repos"
+Received: "/repos/parent"
+
+ ❯ src/branchPairRemoval.test.ts:45:68
+     43|     expect(removalDestination(viewed)).toBe('/repos/parent');
+     44|     expect(removalDestination({ ...viewed, parentExists: null })).toBe…
+     45|     expect(removalDestination({ ...viewed, parentExists: false })).toB…
+       |                                                                    ^
+     46|     expect(removalDestination({ ...viewed, parentId: null })).toBe('/r…
+     47|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+

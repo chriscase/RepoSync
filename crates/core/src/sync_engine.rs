@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-use crate::config::{AppConfig, SvnLayout};
+use crate::config::AppConfig;
 use crate::conflict::detector::{ChangeKind, ConflictDetector, FileChange};
 use crate::conflict::merger::Merger;
 use crate::conflict::Conflict;
@@ -64,7 +64,10 @@ use crate::history_inspect::{
 use crate::identity::IdentityMapper;
 use crate::models::AuditEntry;
 use crate::pair_refresh::PAIR_GENERATION;
-use crate::path_projection::{project_git_to_svn_changeset, GitToSvnInputChange};
+use crate::path_projection::{
+    checked_svn_path_identity, project_git_to_svn_changeset, svn_log_path_to_branch_relative,
+    GitToSvnInputChange,
+};
 use crate::pending_frontier::{pending_frontier_is_merge_dag, GitReplayContinuation};
 use crate::svn::client::SvnClient;
 use crate::svn_commit::{
@@ -1126,20 +1129,20 @@ impl SyncEngine {
                     if emitted > 0 {
                         // A retained first row is not a baseline: maintenance
                         // may already have deleted earlier applied rows.
-                        let mut baseline = self
+                        let baseline = self
                             .db
                             .get_state(&format!("handled_git_baseline_{}", rid))
                             .map_err(SyncError::DatabaseError)?
                             .and_then(|value| {
                                 serde_json::from_str::<serde_json::Value>(&value).ok()
                             });
-                        let mut baseline_sha = baseline
+                        let baseline_sha = baseline
                             .as_ref()
                             .and_then(|record| record["git_sha"].as_str());
-                        let mut baseline_revision = baseline
+                        let baseline_revision = baseline
                             .as_ref()
                             .and_then(|record| record["svn_rev"].as_i64());
-                        let mut baseline_valid = baseline.as_ref().is_some_and(|record| {
+                        let baseline_valid = baseline.as_ref().is_some_and(|record| {
                             record["version"] == 1
                                 && record["repo_id"] == rid
                                 && self
@@ -1147,79 +1150,17 @@ impl SyncEngine {
                         }) && baseline_sha.is_some_and(is_full_git_oid)
                             && baseline_revision.is_some_and(|rev| rev > 0);
                         if !baseline_valid {
-                            let legacy_seed_bootstrap = {
-                                let conn = self.db.conn();
-                                let legacy = conn
-                                    .query_row(
-                                        "SELECT value FROM kv_state WHERE key = ?1",
-                                        [crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(
-                                            rid
-                                        )],
-                                        |row| row.get::<_, String>(0),
-                                    )
-                                    .optional()
-                                    .map_err(crate::errors::DatabaseError::from)?
-                                    .filter(|value| !value.is_empty());
-                                legacy.as_deref() == Some(emitted_tip.as_str())
-                            };
-                            if !legacy_seed_bootstrap {
-                                return Err(self.record_history_block(
-                                    "ambiguous_checkpoint",
-                                    "missing durable handled Git baseline for absent repository cursor",
-                                    None,
-                                    None,
-                                    None,
-                                    Some(emitted_tip),
-                                ));
-                            }
-                            let column_svn_rev: i64 = {
-                                let conn = self.db.conn();
-                                conn.query_row(
-                                    "SELECT last_svn_rev FROM repositories WHERE id = ?1",
-                                    [rid],
-                                    |row| row.get(0),
-                                )
-                                .map_err(crate::errors::DatabaseError::from)?
-                            };
-                            let _ = self.materialize_git_baseline(emitted_tip, column_svn_rev);
-                            baseline = self
-                                .db
-                                .get_state(&format!("handled_git_baseline_{}", rid))
-                                .map_err(SyncError::DatabaseError)?
-                                .and_then(|value| {
-                                    serde_json::from_str::<serde_json::Value>(&value).ok()
-                                });
-                            baseline_sha = baseline
-                                .as_ref()
-                                .and_then(|record| record["git_sha"].as_str());
-                            baseline_revision = baseline
-                                .as_ref()
-                                .and_then(|record| record["svn_rev"].as_i64());
-                            baseline_valid = baseline.as_ref().is_some_and(|record| {
-                                record["version"] == 1
-                                    && record["repo_id"] == rid
-                                    && self.handled_git_baseline_projection_matches(
-                                        &record["projection"],
-                                    )
-                            }) && baseline_sha.is_some_and(is_full_git_oid)
-                                && baseline_revision.is_some_and(|rev| rev > 0);
-                            if !baseline_valid {
-                                return Err(self.record_history_block(
-                                    "ambiguous_checkpoint",
-                                    "missing durable handled Git baseline for absent repository cursor",
-                                    None,
-                                    None,
-                                    None,
-                                    Some(emitted_tip),
-                                ));
-                            }
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let _ = crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
-                                &self.db.conn(),
-                                rid,
-                                emitted_tip,
-                                &now,
-                            );
+                            // The authority/collision-checked reader already found no
+                            // inbound cursor. A raw human-id mirror cannot authorize
+                            // adopting the SVN-emitted column as handled Git work.
+                            return Err(self.record_history_block(
+                                "ambiguous_checkpoint",
+                                "missing durable handled Git baseline for absent repository cursor",
+                                None,
+                                None,
+                                None,
+                                Some(emitted_tip),
+                            ));
                         }
                         let baseline_sha = baseline_sha.unwrap();
                         let baseline_revision = baseline_revision.unwrap();
@@ -2454,29 +2395,19 @@ impl SyncEngine {
             // Try git apply first; fall back to export-based copy if the diff
             // is empty or in a format git cannot parse (e.g. SVN property-only
             // changes or initial adds).
-            // When using standard layout, strip the trunk prefix from diff paths
-            // so they match the git repository structure.
-            let processed_diff = if self.config.svn.layout == SvnLayout::Standard {
-                let tp = self.config.svn.trunk_path.trim_matches('/');
-                if !tp.is_empty() {
-                    diff.replace(&format!("a/{}/", tp), "a/")
-                        .replace(&format!("b/{}/", tp), "b/")
-                } else {
-                    diff
-                }
-            } else {
-                diff
-            };
+            // diff_full is already relative to the SVN client's target URL,
+            // just like the exported Git root. Never strip a layout prefix
+            // again or rewrite matching substrings inside patch payloads.
             // Convert SVN diff format to git-compatible format:
             // - SVN uses "(nonexistent)" for deleted files; git needs "/dev/null"
             // - SVN uses "(revision N)" for existing files; git needs actual paths
             // Without this, git apply treats deletions as "truncate to empty"
             // instead of removing the file.
-            let git_diff = convert_svn_diff_to_git(&processed_diff);
+            let git_diff = convert_svn_diff_to_git(&diff);
 
             debug!(
                 rev = change.revision,
-                raw_diff_lines = processed_diff.lines().count(),
+                raw_diff_lines = diff.lines().count(),
                 converted_diff_preview = %git_diff.lines().take(6).collect::<Vec<_>>().join(" | "),
                 "SVN diff converted for git apply"
             );
@@ -2497,13 +2428,33 @@ impl SyncEngine {
                 )
                 .await;
                 if result.is_ok() {
-                    // Verify: check that files were created at the correct paths
-                    for cf in &change.changed_files {
-                        let expected = repo_path.join(&cf.path);
-                        if expected.exists() {
-                            info!(path = %cf.path, "git apply created file at correct path");
-                        } else {
-                            warn!(path = %cf.path, "git apply succeeded but file NOT at expected path");
+                    // Diagnostic only: publication/ref/tree verification below
+                    // remains authoritative. The applied index distinguishes
+                    // Git files from SVN directory/property-only entries.
+                    match git2::Repository::open(&repo_path).and_then(|repo| repo.index()) {
+                        Ok(index) => {
+                            for cf in &change.changed_files {
+                                let expected_present = cf.action != "D";
+                                if expected_present
+                                    && index.get_path(Path::new(&cf.path), 0).is_none()
+                                {
+                                    continue; // Git does not represent empty directories.
+                                }
+                                let actual_present =
+                                    std::fs::symlink_metadata(repo_path.join(&cf.path))
+                                        .is_ok_and(|metadata| !metadata.is_dir());
+                                if expected_present == actual_present {
+                                    info!(path = %cf.path, action = %cf.action,
+                                    "git apply path matches branch-relative SVN change");
+                                } else {
+                                    warn!(path = %cf.path, action = %cf.action,
+                                    expected_present, actual_present,
+                                    "git apply path differs from branch-relative SVN change");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, "post-apply path diagnostics unavailable");
                         }
                     }
                 } else if let Err(error) = &result {
@@ -2629,34 +2580,14 @@ impl SyncEngine {
                 let changed_files: Vec<String> = change
                     .changed_files
                     .iter()
-                    .filter_map(|cf| {
-                        // Strip trunk prefix for standard layout
-                        let path = if self.config.svn.layout == SvnLayout::Standard {
-                            let tp = self.config.svn.trunk_path.trim_matches('/');
-                            if !tp.is_empty() {
-                                cf.path
-                                    .strip_prefix(&format!("/{}/", tp))
-                                    .or_else(|| cf.path.strip_prefix(&format!("{}/", tp)))
-                                    .unwrap_or(&cf.path)
-                            } else {
-                                &cf.path
-                            }
-                        } else {
-                            &cf.path
-                        };
-                        let clean = path.trim_start_matches('/');
-                        if clean.is_empty() {
-                            None
-                        } else {
-                            Some(clean.to_string())
-                        }
-                    })
+                    .filter(|cf| cf.action != "D" && !cf.path.is_empty())
+                    .map(|cf| cf.path.clone())
                     .collect();
 
                 for rel_path in &changed_files {
                     let full_path = repo_path.join(rel_path);
                     if let Ok(meta) = std::fs::metadata(&full_path) {
-                        if meta.len() > self.lfs_threshold_bytes {
+                        if meta.is_file() && meta.len() > self.lfs_threshold_bytes {
                             let pattern = crate::lfs::pattern_for_path(rel_path);
                             if let Err(e) = crate::lfs::ensure_lfs_tracked(&repo_path, &pattern) {
                                 warn!(
@@ -4387,17 +4318,17 @@ impl SyncEngine {
             .await
             .map_err(SyncError::SvnError)?;
 
-        // Determine the trunk prefix to filter/strip when using standard layout.
-        let trunk_prefix = if self.config.svn.layout == SvnLayout::Standard {
-            let tp = self.config.svn.trunk_path.trim_matches('/');
-            if tp.is_empty() {
-                None
-            } else {
-                Some(format!("{}/", tp))
-            }
-        } else {
-            None
-        };
+        // Verbose SVN logs use repository-relative paths even when the client
+        // targets trunk or a custom branch. Project exactly once from canonical
+        // SVN identity; diff/export and every downstream consumer use that root.
+        let identity =
+            checked_svn_path_identity(&svn_info.root_url, &svn_info.url).ok_or_else(|| {
+                SyncError::SvnError(crate::errors::SvnError::LineageRefused {
+                    reason: "svn_target_outside_repository_root".into(),
+                    detail: "canonical SVN target is not within its reported repository root"
+                        .into(),
+                })
+            })?;
 
         let mut change_sets: Vec<SvnChangeSet> = Vec::new();
         for e in entries {
@@ -4413,29 +4344,15 @@ impl SyncEngine {
                     .changed_paths
                     .iter()
                     .filter_map(|p| {
-                        let raw = p.path.strip_prefix('/').unwrap_or(&p.path);
-                        // When using standard layout, only sync files under trunk/
-                        // and strip the trunk prefix so git paths are repo-relative.
-                        let mapped_path = if let Some(ref prefix) = trunk_prefix {
-                            let rest = raw.strip_prefix(prefix.as_str())?;
-                            if rest.is_empty() {
-                                return None; // skip bare trunk/ directory entry
-                            }
-                            rest.to_string()
-                        } else {
-                            raw.to_string()
-                        };
-                        let map_copy_from = |raw_path: &str| -> Option<String> {
-                            let raw = raw_path.strip_prefix('/').unwrap_or(raw_path);
-                            if let Some(ref prefix) = trunk_prefix {
-                                raw.strip_prefix(prefix.as_str())
-                                    .map(|rest| rest.to_string())
-                                    .filter(|rest| !rest.is_empty())
-                            } else {
-                                Some(raw.to_string())
-                            }
-                        };
-                        let rename_from = p.copy_from_path.as_deref().and_then(map_copy_from);
+                        let mapped_path = svn_log_path_to_branch_relative(&p.path, &identity)?;
+                        if mapped_path.is_empty() {
+                            return None; // The selected root itself has no Git file path.
+                        }
+                        let rename_from = p
+                            .copy_from_path
+                            .as_deref()
+                            .and_then(|path| svn_log_path_to_branch_relative(path, &identity))
+                            .filter(|path| !path.is_empty());
                         let action = if rename_from.is_some() {
                             "R".to_string()
                         } else {
@@ -4950,41 +4867,19 @@ impl SyncEngine {
         svn_changes: &[SvnChangeSet],
         git_changes: &[GitChangeSet],
     ) -> Result<Vec<Conflict>, SyncError> {
-        // SVN paths from the changeset include the branch prefix
-        // (e.g. `trunk/README.md`), but Git paths are relative to the repo
-        // root (e.g. `README.md`). Strip the SVN branch prefix so the
-        // detector can match paths correctly.
-        let trunk_path = self.config.svn.trunk_path.trim_matches('/');
-        let strip_prefix = |p: &str| -> String {
-            let p = p.trim_start_matches('/');
-            if !trunk_path.is_empty() {
-                if let Some(rest) = p.strip_prefix(trunk_path) {
-                    return rest.trim_start_matches('/').to_string();
-                }
-            }
-            // Also handle hard-coded "trunk/" prefix as fallback for repos
-            // configured with empty trunk_path but synced from a trunk URL.
-            if let Some(rest) = p.strip_prefix("trunk/") {
-                return rest.to_string();
-            }
-            p.to_string()
-        };
-
+        // fetch_svn_changes already projected both rename endpoints into the
+        // Git root. A second strip would alias literal trunk/ paths or siblings.
         let svn_file_changes: Vec<FileChange> = svn_changes
             .iter()
             .flat_map(|cs| {
-                cs.changed_files.iter().map(|f| {
-                    let path = strip_prefix(&f.path);
-                    let rename_from = f.rename_from.as_deref().map(strip_prefix);
-                    FileChange {
-                        path,
-                        change_kind: Self::svn_action_to_change_kind(
-                            f.action.as_str(),
-                            rename_from.as_deref(),
-                        ),
-                        content: f.content.clone(),
-                        is_binary: f.is_binary,
-                    }
+                cs.changed_files.iter().map(|f| FileChange {
+                    path: f.path.clone(),
+                    change_kind: Self::svn_action_to_change_kind(
+                        f.action.as_str(),
+                        f.rename_from.as_deref(),
+                    ),
+                    content: f.content.clone(),
+                    is_binary: f.is_binary,
                 })
             })
             .collect();
@@ -6400,6 +6295,351 @@ repo = "test/test-repo"
             Some(bootstrap),
             "install bootstrap may seed only the emitted-tip column"
         );
+    }
+
+    fn emitted_tip_without_inbound_checkpoint(
+        repo_id: &str,
+    ) -> (SyncEngine, tempfile::TempDir, String, String) {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+
+        let (engine, git_dir) = team_echo_engine_with_git_dir(repo_id);
+        let earlier = git_fixture_commit(git_dir.path(), "earlier.txt", "earlier\n", "earlier");
+        git_fixture_commit(
+            git_dir.path(),
+            "pending.txt",
+            "pending\n",
+            "unhandled Git work",
+        );
+        let emitted = git_fixture_commit(git_dir.path(), "emitted.txt", "emitted\n", "SVN emit");
+        engine
+            .db()
+            .conn()
+            .execute(
+                "UPDATE repositories SET last_svn_rev = 3, last_git_sha = ?1 WHERE id = ?2",
+                rusqlite::params![emitted, repo_id],
+            )
+            .unwrap();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: Some(repo_id.into()),
+                svn_revision: Some(3),
+                git_hash: Some(emitted.clone()),
+                direction: SyncDirection::SvnToGit,
+                author: "fixture".into(),
+                message: "verified SVN emit".into(),
+                timestamp: chrono::Utc::now(),
+                synced_at: chrono::Utc::now(),
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        engine
+            .db()
+            .set_state(
+                &crate::db::repo_scope_identity::legacy_last_git_sha_kv_key(repo_id),
+                &emitted,
+            )
+            .unwrap();
+        (engine, git_dir, earlier, emitted)
+    }
+
+    // History-block diagnostics are the only permitted writes on refusal.
+    fn checkpoint_authority_snapshot(engine: &SyncEngine) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let history_key = engine.history_block_key();
+        let legacy_history_key = history_block_key(engine.effective_repo_id());
+        let conn = engine.db().conn();
+        [
+            "SELECT * FROM repositories ORDER BY id",
+            "SELECT * FROM sync_records ORDER BY id",
+            "SELECT * FROM commit_map ORDER BY id",
+            "SELECT * FROM kv_state WHERE key != ?1 AND key != ?2 ORDER BY key",
+        ]
+        .iter()
+        .map(|sql| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            let history_parameters: [&dyn rusqlite::ToSql; 2] = [&history_key, &legacy_history_key];
+            let parameters: &[&dyn rusqlite::ToSql] = if statement.parameter_count() == 0 {
+                &[]
+            } else {
+                &history_parameters
+            };
+            let rows = statement
+                .query_map(parameters, |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        })
+        .collect()
+    }
+
+    fn assert_unowned_legacy_tip_refused(engine: &SyncEngine, repo_id: &str) {
+        assert_eq!(
+            crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(engine.db(), repo_id)
+                .unwrap(),
+            None,
+        );
+        let before = checkpoint_authority_snapshot(engine);
+        assert!(matches!(
+            engine.team_git_checkpoint(),
+            Err(SyncError::HistoryBlocked { reason, .. }) if reason == "ambiguous_checkpoint"
+        ));
+        assert_eq!(
+            checkpoint_authority_snapshot(engine),
+            before,
+            "refusal must preserve checkpoints, baselines, mappings and foreign state"
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_state(&scoped_last_git_sha_key(engine, repo_id))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            engine
+                .db()
+                .get_state(&format!("handled_git_baseline_{repo_id}"))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn team_git_checkpoint_revoked_legacy_tip_cannot_seed_baseline() {
+        let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, "pair");
+    }
+
+    #[test]
+    fn team_git_checkpoint_unset_legacy_authority_cannot_seed_baseline() {
+        let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .delete_kv_state("reposync_v13_legacy_repo_id_kv_reads")
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, "pair");
+    }
+
+    #[test]
+    fn team_git_checkpoint_colliding_human_ids_cannot_seed_baseline() {
+        let (engine, _git_dir, _, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('pair_g2','pair_g2','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [crate::db::repo_scope_identity::new_scope_uuid()],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
+            .unwrap();
+        engine
+            .db()
+            .set_state("last_git_sha_pair_g2", &"f".repeat(40))
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, "pair");
+    }
+
+    #[test]
+    fn team_git_checkpoint_foreign_uuid_collision_cannot_seed_baseline() {
+        let repo_id = "abcdef01-2345-4678-9123-456789abcdef";
+        let (engine, _git_dir, _, emitted) = emitted_tip_without_inbound_checkpoint(repo_id);
+        // This human-id key is another repository's canonical inbound checkpoint.
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('victim','victim','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [repo_id],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        assert_unowned_legacy_tip_refused(&engine, repo_id);
+        assert_eq!(
+            crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(engine.db(), "victim")
+                .unwrap(),
+            Some(emitted),
+        );
+    }
+
+    // Multi-repository reader admission revokes legacy authority before its
+    // collision arm. Exercise the ownership predicate directly so revocation
+    // cannot hide a broken exact-match or owning-row exclusion check.
+    #[test]
+    fn checkpoint_collision_guard_identifies_foreign_uuid_without_revoking_latch() {
+        use crate::db::repo_scope_identity::{
+            human_legacy_kv_token_conflicts_with_foreign_scope_uuid, repository_scope_uuid,
+        };
+
+        let repo_id = "abcdef01-2345-4678-9123-456789abcdef";
+        let (engine, _git_dir) = team_echo_engine_with_git_dir(repo_id);
+        let own_scope = repository_scope_uuid(&engine.db().conn(), repo_id).unwrap();
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('victim','victim','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [repo_id],
+        ).unwrap();
+        engine
+            .db()
+            .set_state(&format!("last_git_sha_{repo_id}"), &"e".repeat(40))
+            .unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        {
+            let conn = engine.db().conn();
+            for (token, owner, expected) in [
+                (repo_id.to_string(), repo_id, true),
+                (repo_id.to_string(), "victim", false),
+                (format!("{repo_id}x"), repo_id, false),
+                (own_scope, repo_id, false),
+            ] {
+                assert_eq!(
+                    human_legacy_kv_token_conflicts_with_foreign_scope_uuid(&conn, &token, owner)
+                        .unwrap(),
+                    expected,
+                    "wrong ownership verdict for token {token} and owner {owner}",
+                );
+            }
+        }
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+        assert_eq!(
+            engine
+                .db()
+                .get_state("reposync_v13_legacy_repo_id_kv_reads")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_collision_guard_distinguishes_human_id_prefixes_from_foreign_scopes() {
+        use crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid;
+
+        let (engine, _git_dir) = team_echo_engine_with_git_dir("pair");
+        let neighbor_scope = crate::db::repo_scope_identity::new_scope_uuid();
+        engine.db().conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,scope_uuid)
+             VALUES ('pair_g2','pair_g2','file:///fixture','trunk','','','','main',1,'t','t',?1)",
+            [&neighbor_scope],
+        ).unwrap();
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        {
+            let conn = engine.db().conn();
+            for (token, owner, expected) in [
+                ("pair", "pair", false),
+                ("pair_g2", "pair", false),
+                ("pair_g2", "pair_g2", false),
+                (neighbor_scope.as_str(), "pair", true),
+                (neighbor_scope.as_str(), "pair_g2", false),
+            ] {
+                assert_eq!(
+                    human_legacy_kv_token_conflicts_with_foreign_scope_uuid(&conn, token, owner)
+                        .unwrap(),
+                    expected,
+                    "wrong ownership verdict for token {token} and owner {owner}",
+                );
+            }
+        }
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+        assert_eq!(
+            engine
+                .db()
+                .get_state("reposync_v13_legacy_repo_id_kv_reads")
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn checkpoint_collision_guard_reports_query_errors_instead_of_no_collision() {
+        let db = Database::in_memory().unwrap();
+        crate::db::schema::run_migrations_up_to(&db.conn(), 12).unwrap();
+        db.set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let conn = db.conn();
+        let error = crate::db::repo_scope_identity::human_legacy_kv_token_conflicts_with_foreign_scope_uuid(
+            &conn, "pair", "pair",
+        ).expect_err("missing scope schema must not be reported as no collision");
+        assert!(
+            error.to_string().contains("no such column: scope_uuid"),
+            "unexpected query error: {error}"
+        );
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM kv_state WHERE key = 'reposync_v13_legacy_repo_id_kv_reads'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn team_git_checkpoint_revoked_legacy_tip_preserves_existing_baseline() {
+        use crate::models::{SyncDirection, SyncRecord, SyncRecordStatus};
+
+        let (engine, _git_dir, earlier, _) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "0")
+            .unwrap();
+        engine
+            .db()
+            .insert_sync_record(&SyncRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: Some("pair".into()),
+                svn_revision: Some(2),
+                git_hash: Some(earlier.clone()),
+                direction: SyncDirection::SvnToGit,
+                author: "fixture".into(),
+                message: "baseline".into(),
+                timestamp: chrono::Utc::now(),
+                synced_at: chrono::Utc::now(),
+                status: SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        engine.materialize_git_baseline(&earlier, 2).unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        assert_eq!(engine.team_git_checkpoint().unwrap(), Some(earlier));
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
+    }
+
+    #[test]
+    fn team_git_checkpoint_authorized_legacy_tip_uses_guarded_reader() {
+        let (engine, _git_dir, _, emitted) = emitted_tip_without_inbound_checkpoint("pair");
+        engine
+            .db()
+            .set_state("reposync_v13_legacy_repo_id_kv_reads", "1")
+            .unwrap();
+        let before = checkpoint_authority_snapshot(&engine);
+        assert_eq!(engine.team_git_checkpoint().unwrap(), Some(emitted));
+        assert_eq!(checkpoint_authority_snapshot(&engine), before);
     }
 
     #[test]

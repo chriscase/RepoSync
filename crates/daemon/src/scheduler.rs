@@ -25,6 +25,78 @@ use reposync_core::import::{ImportPhase, ImportProgress};
 use reposync_core::svn::SvnClient;
 use reposync_core::sync_engine::SyncEngine;
 
+/// This repository, or a late-pair child it records, still owns a non-terminal
+/// import or publish. That scope must not open a replacement database. A read
+/// failure closes only this scope. Other repositories stay eligible.
+fn held_scope_blocks_replacement_open(
+    db: &Database,
+    repo_id: &str,
+    parent_id: Option<&str>,
+) -> bool {
+    match db.active_import_operation(repo_id) {
+        Ok(Some(op)) if !op.state.is_terminal() => return true,
+        Err(error) => {
+            error!(
+                repo_id,
+                %error,
+                "cannot establish import hold; refusing this repository's replacement database"
+            );
+            return true;
+        }
+        _ => {}
+    }
+    match db.latest_late_pair_publish_operation(repo_id) {
+        Ok(Some(op)) if !op.state.is_terminal() => return true,
+        Err(error) => {
+            error!(
+                repo_id,
+                %error,
+                "cannot read child admission publish; refusing this repository's replacement database"
+            );
+            return true;
+        }
+        _ => {}
+    }
+    let Some(parent_id) = parent_id else {
+        return false;
+    };
+    match db.latest_late_pair_publish_operation(parent_id) {
+        Ok(Some(op)) if !op.state.is_terminal() && op.child_repo_id.as_deref() == Some(repo_id) => {
+            true
+        }
+        Err(error) => {
+            error!(
+                repo_id,
+                parent_id,
+                %error,
+                "cannot read parent child-admission publish; refusing this repository's replacement database"
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `Database::new` checkpoints WAL. Skip that open while a held scope still
+/// owns the in-process writer. A durable journal whose writer was released
+/// does not block unrelated repositories.
+fn busy_held_writer_blocks_replacement_open(db: &Database) -> bool {
+    let repos = match db.list_repositories() {
+        Ok(repos) => repos,
+        Err(error) => {
+            error!(
+                %error,
+                "cannot read repositories; refusing replacement database opens"
+            );
+            return true;
+        }
+    };
+    repos.iter().any(|repo| {
+        held_scope_blocks_replacement_open(db, &repo.id, repo.parent_id.as_deref())
+            && reposync_core::busy::is_busy(&repo.id)
+    })
+}
+
 /// Tracks aggregate statistics across sync cycles.
 #[allow(dead_code)]
 pub struct SchedulerStats {
@@ -468,7 +540,6 @@ impl Scheduler {
                 return;
             }
         }
-
         let repos = match self.db.list_repositories() {
             Ok(r) => r,
             Err(e) => {
@@ -619,6 +690,17 @@ impl Scheduler {
 
             let repo_id = repo.id.clone();
             let repo_name = repo.name.clone();
+
+            // Keep this repository's held import or late-pair scope. Do not
+            // take its writer capability or open a replacement database for it.
+            // Unrelated repositories continue on the admitted handle's checks.
+            if held_scope_blocks_replacement_open(&self.db, &repo_id, repo.parent_id.as_deref()) {
+                debug!(
+                    repo_id = %repo_id,
+                    "skipping held scope without opening a replacement database"
+                );
+                continue;
+            }
 
             // RS-C07 (#64): acquire exclusive writer ownership before any
             // mutable prep that touches this repo's Git/SVN working tree.
@@ -789,6 +871,17 @@ impl Scheduler {
                     }
                 },
             };
+
+            // A held writer still in this process makes Database::new's startup
+            // WAL checkpoint unsafe. Unrelated work waits for that release
+            // instead of being suppressed by a durable journal alone.
+            if busy_held_writer_blocks_replacement_open(&self.db) {
+                debug!(
+                    repo_id = %repo_id,
+                    "refusing replacement database open while a held writer is busy"
+                );
+                continue;
+            }
 
             // Open a per-engine DB connection.
             let db_path = self.app_config.daemon.data_dir.join("reposync.db");
@@ -1053,6 +1146,143 @@ mod cancellation_tests {
             serde_json::json!({"case":"64A_SCHEDULER",
             "operation_id":operation.id,"checkpoint":2,"worker_spawned":false,"workdir_created":false})
         );
+    }
+
+    fn insert_due_repo(db: &Database, repo_id: &str, enabled: bool) {
+        let now = Utc::now().to_rfc3339();
+        db.insert_repository(&Repository {
+            id: repo_id.into(),
+            name: repo_id.into(),
+            svn_url: "file:///nonexistent".into(),
+            svn_branch: "trunk".into(),
+            svn_username: "fixture".into(),
+            git_provider: "gitea".into(),
+            git_api_url: "file:///nonexistent".into(),
+            git_repo: format!("local/{repo_id}"),
+            git_branch: "main".into(),
+            sync_mode: "team".into(),
+            poll_interval_secs: 1,
+            lfs_threshold_mb: 0,
+            auto_merge: false,
+            enabled,
+            created_by: None,
+            parent_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            last_svn_rev: 2,
+            last_git_sha: "verified-old".into(),
+            last_sync_at: Some("2000-01-01T00:00:00Z".into()),
+            sync_status: "idle".into(),
+            total_syncs: 0,
+            total_errors: 0,
+            allowed_paths: None,
+            blocked_patterns: None,
+            consecutive_errors: 0,
+            teams_webhook_url: None,
+        })
+        .unwrap();
+        db.set_state(&format!("last_svn_rev_{repo_id}"), "2")
+            .unwrap();
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        std::fs::create_dir_all(path).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    async fn replay_hold_lets_unrelated_repo_run(enabled_a: bool) {
+        let suffix = if enabled_a { "on" } else { "off" };
+        let repo_a = format!("repo-a-{suffix}");
+        let repo_b = format!("repo-b-{suffix}");
+        let tmp = tempfile::tempdir().unwrap();
+        let (scheduler, _) = scheduler_fixture(&tmp, &repo_b, "2000-01-01T00:00:00Z");
+        init_git_repo(&tmp.path().join("repos").join(&repo_b).join("git-repo"));
+        insert_due_repo(&scheduler.db, &repo_a, enabled_a);
+        init_git_repo(&tmp.path().join("repos").join(&repo_a).join("git-repo"));
+        let mut operation = scheduler
+            .db
+            .create_late_pair_publish_operation(
+                &repo_a,
+                "user",
+                "request-a",
+                "fingerprint-a",
+                "feature-a",
+                "branches/feature-a",
+                &"a".repeat(40),
+                &"b".repeat(40),
+                1,
+                1,
+                "v1",
+            )
+            .unwrap();
+        operation.state =
+            reposync_core::db::late_pair_publish_operations::LatePairPublishState::ReplayInProgress;
+        operation.outcome_detail = Some("replay failed before writer release".into());
+        let operation = scheduler
+            .db
+            .update_late_pair_publish_operation(operation)
+            .unwrap();
+        assert!(reposync_core::busy::try_acquire(&repo_a).is_some());
+        assert!(!super::busy_held_writer_blocks_replacement_open(
+            &scheduler.db
+        ));
+        assert!(super::held_scope_blocks_replacement_open(
+            &scheduler.db,
+            &repo_a,
+            None
+        ));
+
+        for _ in 0..2 {
+            scheduler
+                .db
+                .conn()
+                .execute(
+                    "UPDATE repositories SET last_sync_at=?1, sync_status='idle', consecutive_errors=0 WHERE id=?2",
+                    rusqlite::params!["2000-01-01T00:00:00Z", repo_b],
+                )
+                .unwrap();
+            scheduler.maybe_auto_reconcile_held_operations().await;
+            scheduler.maybe_run_repo_cycles().await;
+            let handles: Vec<_> = scheduler.sync_handles.lock().await.drain(..).collect();
+            assert_eq!(
+                handles.len(),
+                1,
+                "initialized due B should reach execution while A stays held"
+            );
+            for handle in handles {
+                let _ = handle.await;
+            }
+            let held = scheduler
+                .db
+                .latest_late_pair_publish_operation(&repo_a)
+                .unwrap()
+                .unwrap();
+            assert_eq!(held.id, operation.id);
+            assert_eq!(
+                held.state,
+                reposync_core::db::late_pair_publish_operations::LatePairPublishState::ReplayInProgress
+            );
+            assert_eq!(
+                held.outcome_detail.as_deref(),
+                Some("replay failed before writer release")
+            );
+            assert!(reposync_core::busy::try_acquire(&repo_a).is_some());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn released_replay_hold_lets_unrelated_due_repo_execute() {
+        replay_hold_lets_unrelated_repo_run(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabled_replay_hold_does_not_block_unrelated_due_repo() {
+        replay_hold_lets_unrelated_repo_run(false).await;
     }
 
     fn scheduler_fixture(

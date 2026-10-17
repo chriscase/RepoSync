@@ -50,18 +50,23 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     let db_path = data_dir.join("personal.db");
     if db_path.exists() {
         match Database::open_existing_read_only(&db_path) {
-            Ok(db) => {
-                let schema_ok = db.get_watermark("svn_rev").is_ok();
-                if schema_ok {
-                    println!("  {}", style::success("Database          OK"));
-                } else {
-                    println!("  {}", style::error("Database          Schema outdated"));
-                    issues.push("Re-run import to update database schema".to_string());
+            Ok(db) => match db.get_watermark("svn_rev") {
+                Ok(_) => println!("  {}", style::success("Database          OK")),
+                Err(error) => {
+                    println!(
+                        "  {}",
+                        style::error(&format!("Database          Read failed: {}", error))
+                    );
+                    issues.push(
+                        "Preserve storage and diagnose the failed database read.".to_string(),
+                    );
                 }
-            }
+            },
             Err(e) => {
                 println!("  {}", style::error(&format!("Database          {}", e)));
-                issues.push("Database is corrupted. Delete and re-import.".to_string());
+                issues.push(
+                    "Preserve storage and diagnose the refused database inspection.".to_string(),
+                );
             }
         }
     } else {
@@ -99,10 +104,17 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     }
 
     // 6. Daemon status
-    match reposync_personal::daemon::is_running(data_dir) {
-        Ok(Some(pid)) => println!(
+    match reposync_personal::daemon::inspect_pid_file(data_dir) {
+        Ok(Some((pid, true))) => println!(
             "  {}",
             style::success(&format!("Daemon            Running (PID {})", pid))
+        ),
+        Ok(Some((pid, false))) => println!(
+            "  {}",
+            style::warn(&format!(
+                "Daemon            Not running (stale PID {})",
+                pid
+            ))
         ),
         Ok(None) => {
             println!("  {}", style::warn("Daemon            Not running"));

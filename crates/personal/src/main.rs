@@ -236,7 +236,7 @@ async fn cmd_start(config_path: &str, foreground: bool) -> Result<()> {
     let data_dir = &config.personal.data_dir;
 
     // Check if already running.
-    if let Some(pid) = daemon::is_running(data_dir)? {
+    if let Some((pid, true)) = daemon::inspect_pid_file(data_dir)? {
         anyhow::bail!("daemon is already running (PID {})", pid);
     }
 
@@ -292,8 +292,9 @@ fn cmd_status(config_path: &str) -> Result<()> {
         PersonalConfig::load_and_resolve(config_path).context("failed to load personal config")?;
     let data_dir = &config.personal.data_dir;
 
-    match daemon::is_running(data_dir)? {
-        Some(pid) => println!("● Running (PID {})", pid),
+    match daemon::inspect_pid_file(data_dir)? {
+        Some((pid, true)) => println!("● Running (PID {})", pid),
+        Some((pid, false)) => println!("○ Not running (stale PID {})", pid),
         None => println!("○ Not running"),
     }
     Ok(())

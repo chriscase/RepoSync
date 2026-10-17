@@ -26,6 +26,18 @@ impl OpenedDatabaseFile {
                 "ordinary database requires its owned singly linked native file".into(),
             )
         };
+        // This path was canonicalized before the connection was opened.
+        // Recheck with lstat/fstat only: opening and closing another descriptor
+        // to the main inode could release SQLite's process-scoped fcntl locks.
+        if self.aliased || !self.path.is_absolute() {
+            return Err(refused());
+        }
+        for ancestor in self.path.ancestors().skip(1) {
+            let metadata = std::fs::symlink_metadata(ancestor).map_err(|_| refused())?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(refused());
+            }
+        }
         let named = std::fs::symlink_metadata(&self.path).map_err(|_| refused())?;
         let held = connected_main_file_stat(conn).ok_or_else(refused)?;
         if !named.is_file()

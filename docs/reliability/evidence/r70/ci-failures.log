@@ -1,0 +1,20 @@
+First failure is retained; successful retry does not erase it. Phase 0 is separate full-epic qualification debt.
+
+PR CI attempt 1
+Build & Test	Test	2026-10-16T07:12:09.3275504Z thread 'test_no_resource_leak_after_many_requests' (70687) panicked at crates/web/tests/server_freeze.rs:1238:9:
+Build & Test	Test	2026-10-16T07:12:09.3276036Z file descriptor leak: grew by 53 (before=37, after=90)
+Build & Test	Test	2026-10-16T07:12:09.3287763Z test result: FAILED. 59 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 23.07s
+
+PR CI attempt 2
+Build & Test	Run actions/checkout@v4	2026-10-16T07:15:59.7781714Z HEAD is now at 0007b5a Merge 3f96f8b1a50a456ceceb5e09257bb9a09c022712 into 43087e8501be56b04549472ddd0dad24b980055e
+Build & Test	Test	2026-10-16T07:22:07.3043442Z test test_no_resource_leak_after_many_requests ... ok
+
+Phase 0
+isolated-diagnostics	Run fixture-only real-engine and API diagnostics	2026-10-16T07:11:43.2085405Z #21 0.506 error: cannot update the lock file /old-src/Cargo.lock because --locked was passed to prevent this
+isolated-diagnostics	Run fixture-only real-engine and API diagnostics	2026-10-16T07:11:43.3026493Z 0.506 error: cannot update the lock file /old-src/Cargo.lock because --locked was passed to prevent this
+isolated-diagnostics	Verify complete evidence before publication	2026-10-16T07:11:43.6207366Z cp: cannot create regular file 'artifacts/review8-reproductions.json': No such file or directory
+
+Prior unrelated-branch Phase 0
+isolated-diagnostics	UNKNOWN STEP	2026-10-15T21:11:27.8681688Z #21 0.460 error: cannot update the lock file /old-src/Cargo.lock because --locked was passed to prevent this
+isolated-diagnostics	UNKNOWN STEP	2026-10-15T21:11:27.9403111Z 0.460 error: cannot update the lock file /old-src/Cargo.lock because --locked was passed to prevent this
+isolated-diagnostics	UNKNOWN STEP	2026-10-15T21:11:28.1722331Z cp: cannot create regular file 'artifacts/review8-reproductions.json': No such file or directory

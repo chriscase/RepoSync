@@ -18,9 +18,12 @@ pub fn run_status(config: &PersonalConfig) -> Result<()> {
     println!();
 
     // Daemon status
-    let daemon_status = match reposync_personal::daemon::is_running(data_dir) {
-        Ok(Some(pid)) => format!("{} (PID {})", style::status_running(), pid),
-        _ => style::status_stopped(),
+    let daemon_status = match reposync_personal::daemon::inspect_pid_file(data_dir)
+        .context("failed to inspect Personal PID file; preserve its evidence")?
+    {
+        Some((pid, true)) => format!("{} (PID {})", style::status_running(), pid),
+        Some((pid, false)) => format!("{} (stale PID {})", style::status_stopped(), pid),
+        None => style::status_stopped(),
     };
     println!("  Status     {}", daemon_status);
 

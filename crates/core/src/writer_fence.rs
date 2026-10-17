@@ -122,16 +122,8 @@ impl RecoveryWriterFence {
             db.immediate_transaction(|tx| {
                 let saved = db.opened_file()?;
                 saved.require_unaliased_owner(tx)?;
-                let actual = crate::db::opened_file::OpenedDatabaseFile::attest(
-                    tx,
-                    &saved.path,
-                    crate::db::opened_file::OpenedDatabaseFile::capture(&saved.path),
-                );
-                if actual.as_ref() != Some(saved) {
-                    return Err(DatabaseError::WriterFenced(
-                        "startup release database identity changed".into(),
-                    ));
-                }
+                #[cfg(test)]
+                crate::db::startup::reservation_tests::observe(&saved.path, "retire");
                 crate::db::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
                 crate::db::ordinary_writer_windows::require_globally_quiet_for_refresh(tx)?;
                 let epoch = require_owned_current_readonly(tx)?;
@@ -537,16 +529,8 @@ pub(crate) fn claim_for_ordinary_startup(
         lock.require_current(data_dir)?;
         let saved = db.opened_file()?;
         saved.require_unaliased_owner(tx)?;
-        let actual = crate::db::opened_file::OpenedDatabaseFile::attest(
-            tx,
-            &saved.path,
-            crate::db::opened_file::OpenedDatabaseFile::capture(&saved.path),
-        );
-        if actual.as_ref() != Some(saved) {
-            return Err(DatabaseError::WriterFenced(
-                "startup claim database identity changed".into(),
-            ));
-        }
+        #[cfg(test)]
+        crate::db::startup::reservation_tests::observe(&saved.path, "claim");
         if !crate::db::startup::require_quiet(tx)? {
             crate::db::schema::initialize_empty_startup_in_transaction(tx)?;
         }

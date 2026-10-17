@@ -110,10 +110,57 @@ fn transfer(
     Ok(digest.finalize().into())
 }
 
-pub(super) fn journal_path(path: &Path) -> PathBuf {
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
-    name.push("-journal");
+    name.push(suffix);
     PathBuf::from(name)
+}
+
+pub(super) fn journal_path(path: &Path) -> PathBuf {
+    sibling(path, "-journal")
+}
+
+/// SQLite can delete journal/WAL evidence for zero-page storage even when
+/// opened read-only. Entrances without verified preimage recovery must refuse
+/// before giving SQLite that main file or creating it over orphaned siblings.
+pub(super) fn require_safe_unrecovered_open(path: &Path) -> Result<(), DatabaseError> {
+    let empty = match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.uid() == rustix::process::geteuid().as_raw() =>
+        {
+            metadata.len() == 0
+        }
+        Ok(_) => {
+            return Err(DatabaseError::WriterFenced(
+                "startup requires owned singly linked regular main storage".into(),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    for suffix in ["-journal", "-wal", "-shm"] {
+        match std::fs::symlink_metadata(sibling(path, suffix)) {
+            Ok(_) if empty || suffix == "-journal" => {
+                return Err(DatabaseError::WriterFenced(
+                    "startup refuses unverified rollback or orphaned sibling storage".into(),
+                ));
+            }
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.nlink() == 1
+                    && metadata.uid() == rustix::process::geteuid().as_raw() => {}
+            Ok(_) => {
+                return Err(DatabaseError::WriterFenced(
+                    "startup requires owned singly linked regular SQLite siblings".into(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn has_journal(path: &Path) -> Result<bool, DatabaseError> {

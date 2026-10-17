@@ -63,8 +63,10 @@ impl Database {
     /// Open existing storage for inspection without creating it, checkpointing,
     /// migrating, claiming ownership or seeding credentials.
     pub fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
+        super::startup_rollback::require_safe_unrecovered_open(path.as_ref())?;
         let canonical = path.as_ref().canonicalize()?;
         let path = canonical.as_path();
+        super::startup_rollback::require_safe_unrecovered_open(path)?;
         if super::startup_rollback::has_journal(path)? || std::fs::metadata(path)?.len() == 0 {
             return Err(DatabaseError::WriterFenced(
                 "read-only inspection refuses pending or empty rollback storage".into(),
@@ -128,6 +130,7 @@ impl Database {
             // read-only connection. Inspect raw frozen inputs first.
             Some(super::startup_rollback::require_quiet_preimage(&path)?)
         } else {
+            super::startup_rollback::require_safe_unrecovered_open(&path)?;
             None
         };
         if path.try_exists()? && std::fs::metadata(&path)?.len() != 0 && preimage.is_none() {
@@ -148,10 +151,8 @@ impl Database {
         let prior = super::OpenedDatabaseFile::capture(&path);
         if let Some(preimage) = &preimage {
             preimage.require_current()?;
-        } else if super::startup_rollback::has_journal(&path)? {
-            return Err(DatabaseError::WriterFenced(
-                "rollback journal appeared after startup inspection".into(),
-            ));
+        } else {
+            super::startup_rollback::require_safe_unrecovered_open(&path)?;
         }
         let conn = Connection::open_with_flags(
             &path,
@@ -182,5 +183,85 @@ impl Database {
         db.conn().execute_batch("PRAGMA journal_mode=WAL;")?;
         db.initialize()?;
         Ok(db)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod reservation_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    type Callback = Box<dyn FnOnce() + Send>;
+    type Hook = (PathBuf, &'static str, Callback);
+    static HOOKS: OnceLock<Mutex<Vec<Hook>>> = OnceLock::new();
+    fn hooks() -> &'static Mutex<Vec<Hook>> {
+        HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    struct HookOwner(PathBuf);
+    impl Drop for HookOwner {
+        fn drop(&mut self) {
+            hooks().lock().unwrap().retain(|hook| hook.0 != self.0);
+        }
+    }
+
+    pub(crate) fn observe(path: &Path, stage: &str) {
+        let callback = {
+            let mut hooks = hooks().lock().unwrap();
+            hooks
+                .iter()
+                .position(|hook| hook.0 == path && hook.1 == stage)
+                .map(|i| hooks.remove(i).2)
+        };
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
+    #[test]
+    fn actual_claim_and_retirement_keep_the_sqlite_writer_reservation() {
+        let _serial = crate::writer_fence::tests::TEST_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().canonicalize().unwrap().join("personal.db");
+        let results = Arc::new(Mutex::new(Vec::<(String, bool, String)>::new()));
+        for stage in ["claim", "retire"] {
+            let child_path = path.clone();
+            let results = results.clone();
+            hooks().lock().unwrap().push((path.clone(), stage, Box::new(move || {
+                let script = "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1],timeout=0)\ntry: c.execute('BEGIN IMMEDIATE')\nexcept sqlite3.OperationalError as e:\n assert e.sqlite_errorcode == sqlite3.SQLITE_BUSY\n print('reserved')\nelse:\n c.rollback()\n raise AssertionError('writer reservation was lost')\n";
+                let mut child = std::process::Command::new("python3").args(["-c", script]).arg(&child_path)
+                    .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if child.try_wait().unwrap().is_some() { break; }
+                    if Instant::now() >= deadline { let _ = child.kill(); break; }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let output = child.wait_with_output().unwrap();
+                let detail = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                results.lock().unwrap().push((stage.to_owned(), output.status.success(), detail));
+            })));
+        }
+        let _hooks = HookOwner(path.clone());
+        let db = super::Database::open_personal_writer(directory.path()).unwrap();
+        db.set_state("reservation-marker", "kept").unwrap();
+        drop(db);
+        let observed = results.lock().unwrap();
+        assert_eq!(observed.len(), 2, "{observed:?}");
+        assert_eq!(
+            observed.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["claim", "retire"]
+        );
+        assert!(
+            observed.iter().all(|r| r.1 && r.2.contains("reserved")),
+            "{observed:?}"
+        );
+        let reader = super::Database::open_existing_read_only(&path).unwrap();
+        assert_eq!(
+            reader.get_state("reservation-marker").unwrap().as_deref(),
+            Some("kept")
+        );
+        assert!(reader.get_state("writer_fence_v1:lease").unwrap().is_none());
     }
 }

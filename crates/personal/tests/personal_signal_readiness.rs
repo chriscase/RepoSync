@@ -77,3 +77,72 @@ fn unix_shutdown_signals_are_registered_before_receiver_task_polling() {
         );
     }
 }
+
+#[test]
+fn standalone_status_preserves_stale_and_invalid_pid_evidence() {
+    for value in ["1073741824", "invalid PID"] {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let pid_path = data.join("personal.pid");
+        std::fs::write(&pid_path, value).unwrap();
+        let config = root.path().join("personal.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+[personal]
+data_dir = {data:?}
+[svn]
+url = "file:///reposync-status-disposable-missing"
+username = "fixture"
+password_env = "REPOSYNC_STATUS_SVN_PASSWORD"
+[github]
+repo = "fixture/repo"
+token_env = "REPOSYNC_STATUS_GIT_TOKEN"
+[developer]
+name = "Status Fixture"
+email = "fixture@example.invalid"
+svn_username = "fixture"
+"#
+            ),
+        )
+        .unwrap();
+        let stdout = root.path().join("stdout");
+        let stderr = root.path().join("stderr");
+        let mut child = ChildOwner(
+            Command::new(env!("CARGO_BIN_EXE_reposync-personal"))
+                .arg("--config")
+                .arg(&config)
+                .arg("status")
+                .env("REPOSYNC_STATUS_SVN_PASSWORD", "disposable-password")
+                .env("REPOSYNC_STATUS_GIT_TOKEN", "disposable-token")
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "standalone status did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            status.success(),
+            value != "invalid PID",
+            "{}",
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        if value != "invalid PID" {
+            assert!(std::fs::read_to_string(&stdout)
+                .unwrap()
+                .contains("stale PID"));
+        }
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap(), value);
+        assert!(!data.join("personal.db").exists());
+        assert!(!data.join("reposync.lock").exists());
+    }
+}

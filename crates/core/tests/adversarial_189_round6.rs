@@ -1,4 +1,4 @@
-//! Grok round-6 (#189): atomic removal on deferred v12, scoped KV mirror gating.
+//! Grok round-6 (#189): atomic removal across deferred and ordinary storage, scoped KV mirror gating.
 
 use reposync_core::db::repo_scope_identity::last_git_sha_kv_key;
 use reposync_core::db::repo_scope_identity::legacy_last_git_sha_kv_key;
@@ -6,13 +6,52 @@ use reposync_core::db::{schema, Database};
 use reposync_core::echo_receipt_scope::{
     read_scoped_last_git_sha_kv, read_team_inbound_git_checkpoint_kv, write_scoped_last_git_sha_kv,
 };
-use reposync_core::errors::DatabaseError;
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
+fn seed_removal_history(conn: &Connection, repo_id: &str) {
+    let sha = "a".repeat(40);
+    conn.execute(
+        "INSERT INTO commit_map (svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id)
+         VALUES (2,?1,'svn_to_git','t','','',?2)",
+        params![sha, repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_records (id,repo_id,svn_rev,git_sha,direction,timestamp,synced_at,status)
+         VALUES (?1,?2,2,?3,'svn_to_git','t','t','applied')",
+        params![format!("{repo_id}-sync"), repo_id, sha],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO conflicts (id,repo_id,file_path,conflict_type,created_at)
+         VALUES (?1,?2,'fixture.txt','content','t')",
+        params![format!("{repo_id}-conflict"), repo_id],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO audit_log (repo_id,action,details,created_at)
+         VALUES (?1,'fixture','preserve this audit','t')",
+        [repo_id],
+    )
+    .unwrap();
+    for (key, value) in [
+        (legacy_last_git_sha_kv_key(repo_id), sha),
+        (
+            format!("secret_git_token_{repo_id}"),
+            "fixture-secret".into(),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, 't')",
+            params![key, value],
+        )
+        .unwrap();
+    }
+}
+
 fn deferred_lone_v12_file_db(tmp: &TempDir) -> Database {
     let path = tmp.path().join("reposync.db");
-    let sha = "a".repeat(40);
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
@@ -23,23 +62,7 @@ fn deferred_lone_v12_file_db(tmp: &TempDir) -> Database {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO commit_map (svn_rev,git_sha,direction,synced_at,svn_author,git_author,repo_id)
-             VALUES (2,?1,'svn_to_git','t','','','pair')",
-            params![sha],
-        )
-        .unwrap();
-        let now = "t";
-        conn.execute(
-            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params![legacy_last_git_sha_kv_key("pair"), sha, now],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-            params!["secret_git_token_pair", "fixture-secret", now],
-        )
-        .unwrap();
+        seed_removal_history(&conn, "pair");
         assert_eq!(
             conn.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
@@ -49,42 +72,157 @@ fn deferred_lone_v12_file_db(tmp: &TempDir) -> Database {
     Database::new(&path).unwrap()
 }
 
+fn ordinary_file_db(tmp: &TempDir, multiple_repositories: bool) -> Database {
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    for repo_id in if multiple_repositories {
+        vec!["pair", "pair_g2"]
+    } else {
+        vec!["pair"]
+    } {
+        let scope = reposync_core::db::repo_scope_identity::new_scope_uuid();
+        db.conn().execute(
+            "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_api_url,git_repo,git_branch,enabled,created_at,updated_at,last_svn_rev,last_git_sha,scope_uuid)
+             VALUES (?1,?1,'file:///fixture','trunk','','','','main',1,'t','t',2,'abc',?2)",
+            params![repo_id, scope],
+        ).unwrap();
+        seed_removal_history(&db.conn(), repo_id);
+        db.set_state(&last_git_sha_kv_key(&scope), &"b".repeat(40))
+            .unwrap();
+    }
+    db
+}
+
 fn in_transaction(conn: &rusqlite::Connection) -> bool {
-    conn.pragma_query_value(None, "transaction_state", |row| row.get::<_, String>(0))
-        .map(|state| state != "none")
-        .unwrap_or(false)
+    // Use SQLite's infallible connection state: an unsupported/erroring PRAGMA
+    // must never be interpreted as proof that a transaction was rolled back.
+    !conn.is_autocommit()
+}
+
+fn removal_snapshot(conn: &Connection) -> (u32, Vec<Vec<Vec<rusqlite::types::Value>>>) {
+    let version = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let rows = [
+        "SELECT * FROM repositories ORDER BY id",
+        "SELECT * FROM commit_map ORDER BY id",
+        "SELECT * FROM sync_records ORDER BY id",
+        "SELECT * FROM conflicts ORDER BY id",
+        "SELECT * FROM audit_log ORDER BY id",
+        "SELECT * FROM kv_state ORDER BY key",
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name",
+    ]
+    .iter()
+    .map(|sql| {
+        let mut statement = conn.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get(column))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    })
+    .collect();
+    (version, rows)
+}
+
+fn assert_hard_delete_rolls_back_partial_history(
+    tmp: &TempDir,
+    db: &Database,
+    expected_version: u32,
+) {
+    for table in ["commit_map", "sync_records", "conflicts", "audit_log"] {
+        let count: i64 = db
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE repo_id = 'pair'"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "targeted fixture row missing from {table}");
+    }
+    assert_eq!(
+        db.get_state("secret_git_token_pair").unwrap().as_deref(),
+        Some("fixture-secret")
+    );
+    db.conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_pair_removal BEFORE DELETE ON repositories
+         WHEN OLD.id = 'pair'
+         BEGIN
+             SELECT CASE WHEN
+                 EXISTS (SELECT 1 FROM commit_map WHERE repo_id = 'pair') OR
+                 EXISTS (SELECT 1 FROM sync_records WHERE repo_id = 'pair') OR
+                 EXISTS (SELECT 1 FROM conflicts WHERE repo_id = 'pair') OR
+                 EXISTS (SELECT 1 FROM audit_log WHERE repo_id = 'pair') OR
+                 EXISTS (SELECT 1 FROM kv_state WHERE key = 'secret_git_token_pair')
+             THEN RAISE(ABORT, 'failure injected before targeted data deletion')
+             ELSE RAISE(ABORT, 'injected failure after targeted data deletion') END;
+         END;",
+        )
+        .unwrap();
+    let observer = Connection::open(tmp.path().join("reposync.db")).unwrap();
+    let before = removal_snapshot(&db.conn());
+    assert_eq!(before.0, expected_version);
+    assert_eq!(removal_snapshot(&observer), before);
+
+    let err = db.hard_delete_repository("pair").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("injected failure after targeted data deletion"),
+        "the failure must occur after real history/credential mutations: {err}"
+    );
+
+    assert!(!in_transaction(&db.conn()));
+    assert!(!in_transaction(&observer));
+    assert_eq!(
+        removal_snapshot(&db.conn()),
+        before,
+        "writer must see restored registration, history, credentials and schema"
+    );
+    assert_eq!(
+        removal_snapshot(&observer),
+        before,
+        "second connection must see the same preserved durable state"
+    );
 }
 
 #[test]
-fn deferred_v12_hard_delete_rolls_back_partial_history_on_missing_repo() {
+fn deferred_v12_hard_delete_rolls_back_partial_history_on_targeted_failure() {
     let tmp = TempDir::new().unwrap();
     let db = deferred_lone_v12_file_db(&tmp);
-    let map_before: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM commit_map WHERE repo_id = 'pair'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(map_before, 1);
-    assert!(db.get_state("secret_git_token_pair").unwrap().is_some());
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 12);
+}
 
-    let err = db.hard_delete_repository("missing").unwrap_err();
-    assert!(matches!(err, DatabaseError::NotFound { .. }));
+#[test]
+fn ordinary_v13_hard_delete_rolls_back_partial_history_on_targeted_failure() {
+    let tmp = TempDir::new().unwrap();
+    let db = ordinary_file_db(&tmp, false);
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 13);
+}
 
-    assert!(!in_transaction(&db.conn()));
-    let map_after: i64 = db
-        .conn()
-        .query_row(
-            "SELECT COUNT(*) FROM commit_map WHERE repo_id = 'pair'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(map_after, map_before);
-    assert!(db.get_state("secret_git_token_pair").unwrap().is_some());
-    assert!(db.get_repository("pair").unwrap().is_some());
+#[test]
+fn multi_repository_hard_delete_rolls_back_partial_history_on_targeted_failure() {
+    let tmp = TempDir::new().unwrap();
+    let db = ordinary_file_db(&tmp, true);
+    assert!(db.get_repository("pair_g2").unwrap().is_some());
+    assert_hard_delete_rolls_back_partial_history(&tmp, &db, 13);
+}
+
+#[test]
+fn transaction_probe_detects_active_transaction() {
+    let conn = Connection::open_in_memory().unwrap();
+    assert!(!in_transaction(&conn));
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(in_transaction(&conn));
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert!(!in_transaction(&conn));
 }
 
 #[test]
