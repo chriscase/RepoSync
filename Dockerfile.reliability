@@ -53,8 +53,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git git-lfs subversion procps libssl3 libstdc++6 libatomic1 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 RUN ln -s /usr/local/bin/node /usr/bin/nodejs && mkdir -p /src/crates/web
+RUN test -z "$(getent passwd 65532)" && test -z "$(getent group 65532)" && \
+    printf 'fixture:x:65532:65532:Fixture:/fixture/home:/usr/sbin/nologin\n' >> /etc/passwd && \
+    printf 'fixture:x:65532:\n' >> /etc/group && \
+    test ! -L /etc/machine-id && printf '21300000000040008000000000000001\n' > /etc/machine-id
 ENV PATH="/usr/local/bin:/usr/bin:/bin"
 ENV REPOSYNC_NODE_BIN=/usr/bin/nodejs
+# Synthetic identity is confined to this image; native boot/PID observations stay real.
+# EMAIL is a fallback; explicit test user.name/user.email and author env win.
+ENV EMAIL=fixture@example.invalid
 # Web UI contract tests resolve web-ui via compile-time CARGO_MANIFEST_DIR (/src/crates/web).
 COPY --from=build /src/web-ui /src/web-ui
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
