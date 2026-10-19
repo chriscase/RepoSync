@@ -242,19 +242,42 @@ def boundary_canaries():
 def run_case(case, binaries):
     if case["binary"] == "evidence_scan":
         return run_scan_case(case)
+    def capture_failure_mounts(label):
+        diagnostic = {}
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            filename = label + ".failure-mounts.log"
+            (OUTPUT / filename).write_bytes(raw)
+            diagnostic.update(proc_mounts_file=filename, sha256=digest(raw))
+        except Exception as error:
+            diagnostic.update(error_type=type(error).__name__, error=str(error))
+        try:
+            (OUTPUT / (label + ".failure-diagnostics.json")).write_text(json.dumps(diagnostic, indent=2) + "\n")
+        except Exception as error:
+            print(f"Diagnostic mount capture failed: {type(error).__name__}: {error}", file=sys.stderr)
     binary = TESTS / binaries[case["binary"]]
     test_name = case["test"]
-    listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True)
+    environment = {**os.environ, "RUST_BACKTRACE": "1"}
+    try:
+        listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True, env=environment)
+    except Exception:
+        capture_failure_mounts(case["id"])
+        raise
     matches = [line for line in listing.stdout.splitlines() if line.startswith(test_name + ": test")]
     if len(matches) != 1:
         raise AssertionError(f"required test missing or ambiguous: {case['id']} {test_name}")
     cmd = [str(binary), test_name, "--exact", "--nocapture", "--test-threads=1"]
-    environment = os.environ.copy()
     if case["id"] == "S54_HTTP_COPY":
         environment["REPOSYNC_COPY_WIRE_OUTPUT"] = str(OUTPUT / "S54_HTTP_COPY-wire.json")
     if case["id"] == "S54_SCOPED_HTTP":
         environment["REPOSYNC_SCOPED_WIRE_OUTPUT"] = str(OUTPUT / "S54_SCOPED_HTTP-wire.json")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
+    except Exception:
+        capture_failure_mounts(case["id"])
+        raise
+    if result.returncode != 0:
+        capture_failure_mounts(case["id"])
     output = result.stdout + result.stderr
     if SECRET in output:
         raise AssertionError(f"synthetic fixture secret leaked in {case['id']} output")
@@ -284,6 +307,8 @@ def run_case(case, binaries):
                     else "CANDIDATE_SUBCASE_PASS"),
         "proofs": proofs,
     }
+    if evidence["outcome"] == "FAIL" and result.returncode == 0:
+        capture_failure_mounts(case["id"])
     (OUTPUT / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
     return evidence
@@ -386,13 +411,33 @@ def parse_baseline_stdout(name, stdout, returncode):
 
 
 def run_baseline(binaries):
+    def capture_failure_mounts(label):
+        diagnostic = {}
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            filename = label + ".failure-mounts.log"
+            (OUTPUT / filename).write_bytes(raw)
+            diagnostic.update(proc_mounts_file=filename, sha256=digest(raw))
+        except Exception as error:
+            diagnostic.update(error_type=type(error).__name__, error=str(error))
+        try:
+            (OUTPUT / (label + ".failure-diagnostics.json")).write_text(json.dumps(diagnostic, indent=2) + "\n")
+        except Exception as error:
+            print(f"Diagnostic mount capture failed: {type(error).__name__}: {error}", file=sys.stderr)
+    environment = {**os.environ, "RUST_BACKTRACE": "1"}
     results = {}
     totals = {"passed": 0, "failed": 0, "ignored": 0, "filtered_out": 0}
     processes = {}
     for name, filename in sorted(binaries.items()):
         binary = TESTS / filename
-        result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
-                                capture_output=True, text=True, timeout=300)
+        try:
+            result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
+                                    capture_output=True, text=True, timeout=300, env=environment)
+        except Exception:
+            capture_failure_mounts("baseline-" + name)
+            raise
+        if result.returncode != 0:
+            capture_failure_mounts("baseline-" + name)
         output = result.stdout + result.stderr
         if SECRET in output:
             raise AssertionError(f"synthetic fixture secret leaked in {name} output")
