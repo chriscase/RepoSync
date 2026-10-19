@@ -2994,8 +2994,9 @@ raise SystemExit(1)
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let handle = approval.preparation_id;
     let digest = approval.approval_digest.clone();
+    let diagnostic_digest = digest.clone();
     let request_service = service.clone();
-    let request = tokio::spawn(async move {
+    let mut request = tokio::spawn(async move {
         request_service
             .act(
                 token.into(),
@@ -3011,7 +3012,23 @@ raise SystemExit(1)
         while !f.temp.path().join("http-disconnect-ready").is_file() {
             assert!(
                 !request.is_finished(),
-                "request ended before entering actual SVN publication"
+                "request ended before entering actual SVN publication: {}",
+                {
+                    let detail = match (&mut request).await {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Ok(Ok(_)) => "success-before-barrier".to_owned(),
+                        Err(error) => format!("request join failed: {error}"),
+                    };
+                    let mut detail = crate::errors::redact_vcs_error_detail(&detail);
+                    for secret in [
+                        token,
+                        "disposable-preparation-token",
+                        diagnostic_digest.as_str(),
+                    ] {
+                        detail = detail.replace(secret, "[REDACTED_FIXTURE_SECRET]");
+                    }
+                    detail
+                }
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -3595,7 +3612,8 @@ raise SystemExit(1)
     let request_service = service.clone();
     let handle = approval.preparation_id;
     let digest = approval.approval_digest;
-    let request = tokio::spawn(async move {
+    let diagnostic_digest = digest.clone();
+    let mut request = tokio::spawn(async move {
         request_service
             .act(
                 token.into(),
@@ -3609,7 +3627,26 @@ raise SystemExit(1)
     });
     tokio::time::timeout(std::time::Duration::from_secs(45), async {
         while !f.temp.path().join("shutdown-ready").is_file() {
-            assert!(!request.is_finished());
+            assert!(
+                !request.is_finished(),
+                "request ended before entering actual shutdown SVN publication: {}",
+                {
+                    let detail = match (&mut request).await {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Ok(Ok(_)) => "success-before-barrier".to_owned(),
+                        Err(error) => format!("request join failed: {error}"),
+                    };
+                    let mut detail = crate::errors::redact_vcs_error_detail(&detail);
+                    for secret in [
+                        token,
+                        "disposable-preparation-token",
+                        diagnostic_digest.as_str(),
+                    ] {
+                        detail = detail.replace(secret, "[REDACTED_FIXTURE_SECRET]");
+                    }
+                    detail
+                }
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
