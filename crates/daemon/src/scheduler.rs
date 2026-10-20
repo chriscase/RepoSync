@@ -104,6 +104,11 @@ pub struct SchedulerStats {
     pub total_conflicts: AtomicU64,
     pub total_errors: AtomicU64,
     pub consecutive_errors: AtomicU64,
+    /// Completed poll-interval ticks (sync attempts), including those that
+    /// skip work under the memory guard.
+    pub poll_ticks: AtomicU64,
+    /// Periodic DB maintenance passes (retention + audit prune).
+    pub maintenance_runs: AtomicU64,
 }
 
 impl SchedulerStats {
@@ -113,8 +118,23 @@ impl SchedulerStats {
             total_conflicts: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
             consecutive_errors: AtomicU64::new(0),
+            poll_ticks: AtomicU64::new(0),
+            maintenance_runs: AtomicU64::new(0),
         }
     }
+}
+
+/// Target spacing for periodic DB maintenance (~10 minutes).
+const MAINTENANCE_CADENCE: Duration = Duration::from_secs(600);
+
+/// True when enough monotonic time has passed since the last maintenance pass.
+///
+/// Callers check this on each poll tick. Intervals longer than the cadence
+/// therefore run maintenance at least once per tick, and shorter intervals
+/// stay bounded near ten minutes. Never divides by the poll interval, so a
+/// valid interval above 600 seconds cannot become a zero divisor.
+fn maintenance_due(elapsed_since_last: Duration) -> bool {
+    elapsed_since_last >= MAINTENANCE_CADENCE
 }
 
 /// The sync scheduler.
@@ -184,9 +204,10 @@ impl Scheduler {
         // time to fully start before the first sync.
         interval.tick().await;
 
-        // Run maintenance (audit pruning, retention) every ~10 minutes.
-        let maintenance_ticks = 600 / self.poll_interval.as_secs().max(1);
-        let mut tick_count: u64 = 0;
+        // Maintenance is driven by a monotonic deadline, not tick-count
+        // division of 600 / poll_interval (that truncated to zero for any
+        // valid interval above ten minutes and panicked on checked_rem).
+        let mut last_maintenance_at = time::Instant::now();
 
         loop {
             tokio::select! {
@@ -197,36 +218,7 @@ impl Scheduler {
                 }
                 // Regular polling interval
                 _ = interval.tick() => {
-                    tick_count += 1;
-
-                    // Memory guard: skip sync cycles if RSS exceeds limit
-                    if self.memory_limit_bytes > 0 {
-                        let rss = crate::memory::process_rss_bytes();
-                        if rss > self.memory_limit_bytes {
-                            warn!(
-                                rss_mb = rss / 1024 / 1024,
-                                limit_mb = self.memory_limit_bytes / 1024 / 1024,
-                                "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
-                                rss / 1024 / 1024,
-                                self.memory_limit_bytes / 1024 / 1024,
-                            );
-                            continue;
-                        }
-                    }
-
-                    // Observe-first auto-reconcile for held import and external-write
-                    // journals, then per-repo sync cycles.
-                    self.maybe_auto_reconcile_held_operations().await;
-                    self.maybe_run_repo_cycles().await;
-                    // Periodic maintenance (every ~10 minutes)
-                    if tick_count.checked_rem(maintenance_ticks).unwrap() == 0 {
-                        if let Err(e) = self.db.run_maintenance(90) {
-                            warn!("periodic maintenance failed: {}", e);
-                        }
-                        if let Err(e) = self.db.prune_audit_log(1000) {
-                            warn!("audit log pruning failed: {}", e);
-                        }
-                    }
+                    self.handle_interval_tick(&mut last_maintenance_at).await;
                 }
                 // Webhook-triggered immediate sync. GitHub `forced` is only a
                 // hint on the webhook; this runs the same inspection as polling.
@@ -241,6 +233,51 @@ impl Scheduler {
         }
 
         info!("scheduler stopped");
+    }
+
+    /// One poll-interval tick: optional memory skip, sync, then maintenance
+    /// if the monotonic deadline has been reached.
+    async fn handle_interval_tick(&self, last_maintenance_at: &mut time::Instant) {
+        self.stats.poll_ticks.fetch_add(1, Ordering::SeqCst);
+
+        // Memory guard: skip sync cycles if RSS exceeds limit
+        if self.memory_limit_bytes > 0 {
+            let rss = crate::memory::process_rss_bytes();
+            if rss > self.memory_limit_bytes {
+                warn!(
+                    rss_mb = rss / 1024 / 1024,
+                    limit_mb = self.memory_limit_bytes / 1024 / 1024,
+                    "memory limit exceeded ({} MB > {} MB), skipping sync cycle",
+                    rss / 1024 / 1024,
+                    self.memory_limit_bytes / 1024 / 1024,
+                );
+                return;
+            }
+        }
+
+        // Observe-first auto-reconcile for held import and external-write
+        // journals, then per-repo sync cycles.
+        self.maybe_auto_reconcile_held_operations().await;
+        self.maybe_run_repo_cycles().await;
+
+        let now = time::Instant::now();
+        let elapsed = now
+            .checked_duration_since(*last_maintenance_at)
+            .unwrap_or(MAINTENANCE_CADENCE);
+        if maintenance_due(elapsed) {
+            self.run_periodic_maintenance();
+            *last_maintenance_at = now;
+        }
+    }
+
+    fn run_periodic_maintenance(&self) {
+        self.stats.maintenance_runs.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.db.run_maintenance(90) {
+            warn!("periodic maintenance failed: {}", e);
+        }
+        if let Err(e) = self.db.prune_audit_log(1000) {
+            warn!("audit log pruning failed: {}", e);
+        }
     }
 
     /// Attempt to run a sync cycle for the global engine.
@@ -1792,3 +1829,7 @@ mod cancellation_tests {
 #[cfg(test)]
 #[path = "scheduler/pair_refresh_tests.rs"]
 mod pair_refresh_tests;
+
+#[cfg(test)]
+#[path = "scheduler/maintenance_cadence_tests.rs"]
+mod maintenance_cadence_tests;
