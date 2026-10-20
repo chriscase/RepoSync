@@ -432,6 +432,69 @@ test("an already-published pair cannot start the unobserved rebase", async () =>
   expect(passed).toBe(false);
 });
 
+for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
+  for (const fault of ["none", "missing-operation", "mismatch", "terminal", "retained-message", "http", "restart-started", "restart-baseline"]) {
+    test(`${id} cancels only its started operation: ${fault}`, async () => {
+      const calls: string[] = [];
+      let passed = "";
+      let marked = "";
+      const fake: any = {
+        createPair: async (name: string, options: unknown) => {
+          expect(name).toBe(labPairKey(id));
+          expect(options).toEqual({enable: false, settle: false});
+          return fault === "missing-operation" ? {...pair, name} : {...pair, name, importOperationId: "op-live"};
+        },
+        api: async (method: string, path: string) => {
+          calls.push(`${method} ${path}`);
+          if (path === `/api/repos/${pair.id}/import/op-live/cancel`) {
+            if (fault === "mismatch") return {status: 200, text: "", json: {ok: true, operation_id: "op-other", lifecycle: "cancel_requested", message: "cancellation durably requested; worker still stopping"}};
+            if (fault === "terminal") return {status: 200, text: "", json: {ok: true, operation_id: "op-live", lifecycle: "completed", message: "terminal outcome retained"}};
+            if (fault === "retained-message") return {status: 200, text: "", json: {ok: true, operation_id: "op-live", lifecycle: "cancel_requested", message: "terminal outcome retained"}};
+            if (fault === "http") return {status: 400, text: "exact operation ID required", json: {error: "exact operation ID required"}};
+            return {status: 200, text: "", json: {ok: true, operation_id: "op-live", lifecycle: "cancel_requested", message: "cancellation durably requested; worker still stopping"}};
+          }
+          if (path === `/api/repos/${pair.id}/import`) {
+            if (fault === "restart-started") return {status: 200, text: "", json: {operation_id: "op-new", lifecycle: "queued"}};
+            if (fault === "restart-baseline") return {status: 400, text: "repository import baseline is not pending", json: {error: "repository import baseline is not pending"}};
+            return {status: 400, text: "repository import is active or held for reconciliation", json: {error: "repository import is active or held for reconciliation"}};
+          }
+          return {status: 400, text: "exact operation ID required", json: {error: "exact operation ID required"}};
+        },
+        pass: (reason: string) => {passed = reason;},
+        mark: (status: string, reason: string) => {marked = `${status} ${reason}`;},
+      };
+      const run = runCase(fake, {id, title: "fixture", suite: "full"});
+      if (fault === "missing-operation") {
+        await expect(run).rejects.toThrow(/no import operation id/);
+        expect(calls).toEqual([]);
+        expect(passed).toBe("");
+        expect(marked).toBe("");
+      } else if (fault === "none" && id === "PAIR-CANCEL-IMPORT") {
+        await run;
+        expect(calls).toEqual([`POST /api/repos/${pair.id}/import/op-live/cancel`]);
+        expect(passed).toBe("cancelled import op-live");
+        expect(marked).toBe("");
+      } else if (fault === "none" && id === "PAIR-CANCEL-RESTART-GENERATION") {
+        await run;
+        expect(calls).toEqual([`POST /api/repos/${pair.id}/import/op-live/cancel`, `POST /api/repos/${pair.id}/import`]);
+        expect(passed).toContain("op-live");
+        expect(passed).toContain("refused");
+        expect(marked).toBe("");
+      } else if (id === "PAIR-CANCEL-IMPORT" && fault.startsWith("restart-")) {
+        await run;
+        expect(calls).toEqual([`POST /api/repos/${pair.id}/import/op-live/cancel`]);
+        expect(passed).toBe("cancelled import op-live");
+      } else {
+        await expect(run).rejects.toThrow();
+        expect(passed).toBe("");
+        expect(marked).toBe("");
+        expect(calls[0]).toBe(`POST /api/repos/${pair.id}/import/op-live/cancel`);
+      }
+      expect(calls.some(call => /\/import\/cancel$/.test(call))).toBe(false);
+    });
+  }
+}
+
 test("login error locator excludes the LDAP domain and requires an actual form error", async ({page}) => {
   await page.setContent(`<div><span>(lab.invalid)</span></div><form><div class="border-red-700"><div><svg></svg><span>invalid username or password</span></div></div><input name="username"><input type="password"><button>Sign in</button></form>`);
   await expect(page.getByText(/invalid|failed|unauthorized|incorrect/i)).toHaveCount(2);

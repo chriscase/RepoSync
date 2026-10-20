@@ -23,7 +23,13 @@ export type Pair = {
   svnBranch?: string;
   gitBranch?: string;
   parentId?: string;
+  importOperationId?: string;
 };
+
+export function importOperationId(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) return undefined;
+  return value;
+}
 
 export type Snap = { svn: string; git: string; maps: string; records: string; watermark: string; gitWatermark: string; gitColumn: string };
 export type FaultStats = {drop_responses_remaining: number; client_connections: number; upstream_connections: number; dropped_responses: number; forwarded_responses: number};
@@ -449,8 +455,10 @@ if [ -z "$tip" ]; then printf 'absent\\n'; else printf '%s\\n' "$tip"; fi
     return tip;
   }
 
-  async createPair(name: string, options?: {enable?: boolean}): Promise<Pair> {
+  async createPair(name: string, options?: {enable?: boolean; settle?: boolean}): Promise<Pair> {
     const enable = options?.enable !== false;
+    const settle = options?.settle !== false;
+    if (!settle && enable) throw new Error("unsettled import cannot be enabled");
     const repo = safe(name, "repo");
     // Playwright restarts its worker after a failed case. Find the persisted
     // pair instead of registering a duplicate when the in-memory cache is gone.
@@ -459,6 +467,17 @@ if [ -z "$tip" ]; then printf 'absent\\n'; else printf '%s\\n' "$tip"; fi
     if (existing.length === 1) {
       const row = existing[0];
       if (row.name !== repo || row.git_repo !== `lab/${repo}` || row.svn_url !== `https://svn:8443/svn/${repo}`) throw new Error(`existing lab pair ${repo} has different remotes`);
+      if (!settle) {
+        if (row.enabled !== false) throw new Error("scheduled pair cannot prove an in-flight import cancel");
+        const status = await this.api("GET", `/api/repos/${row.id}/import/status`);
+        const body = status.json as {operation_id?: unknown; lifecycle?: unknown} | null;
+        const operation = importOperationId(body?.operation_id);
+        const lifecycle = typeof body?.lifecycle === "string" ? body.lifecycle : "";
+        if (status.status !== 200 || !operation || !/^(queued|running|cancel_requested|cancelling)$/.test(lifecycle)) {
+          throw new Error(`existing lab pair ${repo} has no in-flight import operation to cancel`);
+        }
+        return {id: row.id, name: repo, svnUrl: row.svn_url, gitRepo: row.git_repo, importOperationId: operation};
+      }
       await this.waitImport(row.id);
       const pair = {id: row.id, name: repo, svnUrl: row.svn_url, gitRepo: row.git_repo};
       if (row.enabled === true && !enable) throw new Error("scheduled pair cannot prove an unobserved interval");
@@ -514,10 +533,15 @@ fi
     if (creds.status !== 200) throw new Error(`credentials for ${repo} failed`);
     const started = await this.api("POST", `/api/repos/${id}/import`, { import_mode: "full" });
     if (started.status !== 200) throw new Error(`import ${repo} failed (${started.status}) ${started.text.slice(0, 400)}`);
-    const operation = (started.json as {operation_id?: string} | null)?.operation_id;
+    const operation = importOperationId((started.json as {operation_id?: unknown} | null)?.operation_id);
     if (!operation) throw new Error(`import ${repo} returned no operation id`);
-    await this.waitImport(id, operation);
     const pair = {id, name: repo, svnUrl: `https://svn:8443/svn/${repo}`, gitRepo: `lab/${repo}`};
+    if (!settle) {
+      const startedPair = {...pair, importOperationId: operation};
+      this.observation(`${repo}-import-started`, {pair: startedPair, operation, scheduler_enabled_after_import: false});
+      return startedPair;
+    }
+    await this.waitImport(id, operation);
     const baseline = await this.snap(pair);
     if (baseline.svn !== "1" || baseline.watermark !== "1" || baseline.maps !== "1" || baseline.records !== "1"
       || !/^[0-9a-f]{40}$/.test(baseline.git) || baseline.gitWatermark !== baseline.git || baseline.gitColumn !== baseline.git) {

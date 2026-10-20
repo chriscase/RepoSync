@@ -1,5 +1,5 @@
 import { expect } from "@playwright/test";
-import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, loginError, readFaultStats, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
+import { assertAuthRefusal, assertCompletedPublishRefusal, assertLdapUser, assertReplayEndpoints, importOperationId, loginError, readFaultStats, Lab, sharedPair, type LabOp, type Pair } from "./runtime.ts";
 
 function slug(id: string): string {
   return id.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 24);
@@ -29,6 +29,25 @@ export async function requireRepeatIdle(lab: Lab, pair: Pair): Promise<void> {
     const status = await lab.triggerGit(pair.gitRepo);
     if (status !== 200) throw new Error(`repeat webhook ${status}`);
   });
+}
+
+async function cancelLiveImport(lab: Lab, op: LabOp): Promise<{pair: Pair; operation: string}> {
+  const pair = await lab.createPair(labPairKey(op.id), {enable: false, settle: false});
+  const operation = importOperationId(pair.importOperationId);
+  if (!operation) throw new Error(`${op.id} has no import operation id; cancel was not sent`);
+  const cancel = await lab.api("POST", `/api/repos/${pair.id}/import/${operation}/cancel`, {});
+  const body = cancel.json as {operation_id?: unknown; lifecycle?: unknown; message?: unknown} | null;
+  const echoed = importOperationId(body?.operation_id);
+  const detail = typeof cancel.text === "string" && cancel.text ? cancel.text : JSON.stringify(body ?? {});
+  if (cancel.status !== 200 || echoed !== operation) {
+    throw new Error(`${op.id} cancel targeted ${operation} but returned ${cancel.status} for ${echoed ?? "no operation id"}: ${detail.slice(0, 220)}`);
+  }
+  const lifecycle = typeof body?.lifecycle === "string" ? body.lifecycle : "";
+  const message = typeof body?.message === "string" ? body.message : "";
+  if (message === "terminal outcome retained" || !/^(cancel_requested|cancelling)$/.test(lifecycle)) {
+    throw new Error(`${op.id} cancel of ${operation} retained terminal lifecycle ${lifecycle || "missing"}: ${message || detail.slice(0, 180)}`);
+  }
+  return {pair, operation};
 }
 
 async function remoteDeleteCase(lab: Lab, op: LabOp): Promise<void> {
@@ -761,17 +780,21 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
     }
     case "PAIR-CANCEL-IMPORT":
     case "PAIR-CANCEL-RESTART-GENERATION": {
-      const pair = await own(lab, op);
-      const started = await lab.api("POST", `/api/repos/${pair.id}/import`, { import_mode: "full" });
-      const operation = (started.json as { operation_id?: string } | null)?.operation_id;
-      const cancel = operation
-        ? await lab.api("POST", `/api/repos/${pair.id}/import/${operation}/cancel`, {})
-        : await lab.api("POST", `/api/repos/${pair.id}/import/cancel`, {});
-      if (cancel.status === 200) {
-        lab.pass(`cancel returned ${cancel.status}`);
+      const cancelled = await cancelLiveImport(lab, op);
+      if (op.id === "PAIR-CANCEL-IMPORT") {
+        lab.pass(`cancelled import ${cancelled.operation}`);
         return;
       }
-      lab.mark("PARTIAL", `cancel returned ${cancel.status}: ${cancel.text.slice(0, 220)}. The fixture import was already terminal, so this is not a mid-export cancel.`, "UNQUALIFIED");
+      const again = await lab.api("POST", `/api/repos/${cancelled.pair.id}/import`, {import_mode: "full"});
+      const restarted = importOperationId((again.json as {operation_id?: unknown} | null)?.operation_id);
+      const detail = typeof again.text === "string" && again.text ? again.text : JSON.stringify(again.json ?? {});
+      if (again.status === 200 || restarted) {
+        throw new Error(`${op.id} started ${restarted ?? "an import"} while ${cancelled.operation} was still stopping`);
+      }
+      if (!/active or held/i.test(detail)) {
+        throw new Error(`${op.id} did not refuse a new import while ${cancelled.operation} was still stopping: ${again.status} ${detail.slice(0, 220)}`);
+      }
+      lab.pass(`cancelled ${cancelled.operation}; a new import was refused while that operation was still stopping`);
       return;
     }
     case "PAIR-REFRESH-PREVIEW":

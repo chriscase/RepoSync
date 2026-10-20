@@ -93,6 +93,76 @@ for (const fault of ["none", "missing-lifecycle", "missing-operation", "changed-
   });
 }
 
+test("unsettled fixture returns the started operation and does not wait or enable", async () => {
+  const events: string[] = [];
+  const fake: any = {
+    repos: async () => [], admin: async () => "synthetic", sh: async () => {events.push("svn-seed"); return "";}, observer: async () => "",
+    giteaApi: async (method: string, path: string) => {
+      if (path.endsWith("/orgs/lab")) return {status: 200, json: {}};
+      if (method === "POST") return {status: 201, json: {}};
+      return {status: 200, json: {full_name: pair.gitRepo, private: true, default_branch: "main"}};
+    },
+    api: async (_method: string, path: string, body: any) => {
+      if (path === "/api/repos") {expect(body.enabled).toBe(false); events.push("register"); return {status: 200, json: {id: pair.id}};}
+      if (path.endsWith("/credentials")) {events.push("credentials"); return {status: 200};}
+      if (path.endsWith("/import")) {events.push("import"); return {status: 200, json: {operation_id: "op-live"}, text: ""};}
+      events.push(`unexpected ${path}`); return {status: 500, text: "", json: {}};
+    },
+    waitImport: async () => {events.push("wait");}, snap: async () => {events.push("snap"); return baseline;},
+    assertSingleReceipt: async () => {events.push("receipt");}, enableFixturePair: async () => {events.push("enable");}, observation: () => {events.push("observed");},
+  };
+  expect(await Lab.prototype.createPair.call(fake, pair.name, {enable: false, settle: false})).toEqual({...pair, importOperationId: "op-live"});
+  expect(events).toEqual(["svn-seed", "register", "credentials", "import", "observed"]);
+});
+
+test("unsettled fixture does not continue after a start with no operation id", async () => {
+  const events: string[] = [];
+  const fake: any = {
+    repos: async () => [], admin: async () => "synthetic", sh: async () => "", observer: async () => "",
+    giteaApi: async (method: string, path: string) => path.endsWith("/orgs/lab") ? {status: 200, json: {}} : method === "POST" ? {status: 201, json: {}} : {status: 200, json: {full_name: pair.gitRepo, private: true, default_branch: "main"}},
+    api: async (_method: string, path: string) => {
+      events.push(path);
+      if (path === "/api/repos") return {status: 200, json: {id: pair.id}};
+      if (path.endsWith("/credentials")) return {status: 200};
+      return {status: 200, json: {}, text: ""};
+    },
+    waitImport: async () => {events.push("wait");}, enableFixturePair: async () => {events.push("enable");}, observation: () => {},
+  };
+  await expect(Lab.prototype.createPair.call(fake, pair.name, {enable: false, settle: false})).rejects.toThrow(/no operation id/);
+  expect(events).not.toContain("wait");
+  expect(events).not.toContain("enable");
+  expect(events.some(path => path.endsWith("/import/cancel"))).toBe(false);
+});
+
+test("unsettled import cannot be enabled before it is cancelled", async () => {
+  const fake: any = {repos: async () => {throw new Error("must not look up repos");}};
+  await expect(Lab.prototype.createPair.call(fake, pair.name, {settle: false})).rejects.toThrow(/cannot be enabled/);
+});
+
+for (const fault of ["running", "missing-operation", "completed", "scheduled"]) {
+  test(`unsettled reuse keeps only an in-flight operation id: ${fault}`, async () => {
+    const calls: string[] = [];
+    const row = {id: pair.id, name: pair.name, git_repo: pair.gitRepo, svn_url: pair.svnUrl, enabled: fault === "scheduled" ? true : false};
+    const fake: any = {
+      repos: async () => [row], waitImport: async () => {calls.push("wait");}, enableFixturePair: async () => {calls.push("enable");},
+      api: async (method: string, path: string) => {
+        calls.push(`${method} ${path}`);
+        return {status: 200, json: {operation_id: fault === "missing-operation" ? undefined : "op-live", lifecycle: fault === "completed" ? "completed" : "running"}};
+      },
+    };
+    const run = Lab.prototype.createPair.call(fake, pair.name, {enable: false, settle: false});
+    if (fault === "running") {
+      expect(await run).toEqual({...pair, importOperationId: "op-live"});
+      expect(calls).toEqual([`GET /api/repos/${pair.id}/import/status`]);
+    } else {
+      await expect(run).rejects.toThrow();
+      expect(calls).not.toContain("wait");
+      expect(calls).not.toContain("enable");
+      expect(calls.some(call => /\/import\/cancel$/.test(call))).toBe(false);
+    }
+  });
+}
+
 for (const fault of ["none", "control", "stale", "healthy", "arm", "no-current-drop", "no-forward", "moved"]) {
   test(`actual fault handler requires healthy forwarding and a new drop, remains partial: ${fault}`, async () => {
     let stage = 0, marked = "";
