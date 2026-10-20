@@ -24,8 +24,8 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
     std::fs::create_dir_all(data_dir).context("failed to create data directory")?;
 
     // Initialize database
-    let db_path = data_dir.join("personal.db");
-    let db = Database::new(&db_path).context("failed to initialize database")?;
+    let db = Database::open_personal_writer(data_dir)
+        .context("Personal import startup writer admission refused")?;
     let writer_window = db
         .begin_personal_startup_writer_window()
         .context("Personal import startup writer admission refused")?;
@@ -70,6 +70,12 @@ pub async fn run_import(config: &PersonalConfig, mode: &str) -> Result<()> {
             Err(_) => GitClient::init(&git_repo_path).context("failed to init git repository")?,
         }
     };
+
+    if git_client.repo().is_empty()? {
+        git_client
+            .ensure_head_on_branch(&config.github.default_branch)
+            .context("failed to select configured branch for fresh import")?;
+    }
 
     let git_client = std::sync::Arc::new(std::sync::Mutex::new(git_client));
     let formatter = reposync_personal::commit_format::CommitFormatter::new(&config.commit_format);

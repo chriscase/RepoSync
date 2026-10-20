@@ -5,12 +5,13 @@
 //! A second daemon on the same host is blocked by `flock`; a second host on
 //! shared storage is refused or fenced by the epoch lease checked at finalize.
 //!
-//! Ordinary daemon startup acquires this owner. CLI/personal
-//! `Database::new`/`initialize` paths do not; wiring those writers is a later
-//! slice.
+//! Ordinary daemon startup acquires this owner. CLI/Personal writer handles
+//! retain the same local lock and a durable epoch through their database's
+//! lifetime; inspection commands open existing storage read-only.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,8 @@ impl LockGuard {
         if self.creator_pid != std::process::id()
             || self.path.canonicalize().map_err(|_| refused())? != path
             || !named.is_file()
+            || named.nlink() != 1
+            || held.nlink() != 1
             || named.uid() != rustix::process::geteuid().as_raw()
             || named.dev() != held.dev()
             || named.ino() != held.ino()
@@ -69,11 +72,30 @@ impl Drop for LockGuard {
 pub fn acquire(data_dir: &Path) -> Result<LockGuard, DatabaseError> {
     let lock_path = data_dir.join("reposync.lock");
 
+    // Refuse aliases before opening or writing their target. O_NOFOLLOW also
+    // prevents a symlink replacement between this check and open.
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) => {
+            use std::os::unix::fs::MetadataExt;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+            {
+                return Err(DatabaseError::WriterFenced(
+                    "local lock must be an owned regular file without aliases".into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&lock_path)
         .map_err(|e| {
             DatabaseError::Other(format!(
@@ -82,6 +104,8 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, DatabaseError> {
                 e
             ))
         })?;
+
+    require_named_lock(&file, &lock_path)?;
 
     match try_lock_exclusive(&file) {
         Ok(()) => {
@@ -148,7 +172,30 @@ fn try_lock_exclusive(file: &File) -> Result<(), ()> {
     }
 }
 
+fn require_named_lock(file: &File, path: &Path) -> Result<(), DatabaseError> {
+    use std::os::unix::fs::MetadataExt;
+    let named = std::fs::symlink_metadata(path)?;
+    let held = file.metadata()?;
+    if !named.is_file()
+        || !held.is_file()
+        || named.nlink() != 1
+        || held.nlink() != 1
+        || named.uid() != rustix::process::geteuid().as_raw()
+        || named.dev() != held.dev()
+        || named.ino() != held.ino()
+        || named.uid() != held.uid()
+    {
+        return Err(DatabaseError::WriterFenced(
+            "local lock identity changed before PID publication".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn write_pid(file: &File, path: &Path) -> Result<(), DatabaseError> {
+    // Both initial acquisition and stale-PID retry must still own the named
+    // regular file before truncating it.
+    require_named_lock(file, path)?;
     file.set_len(0)
         .map_err(|e| DatabaseError::Other(format!("failed to truncate lock file: {}", e)))?;
     let mut f = file;

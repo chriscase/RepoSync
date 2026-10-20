@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -105,11 +106,48 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def assert_runtime_source_isolation(src=Path("/src")):
-    """Allow UI assets and empty compile-path ancestors, never Rust source."""
+def assert_runtime_source_isolation(src=Path("/src"), runtime_inputs=None):
+    """Allow UI assets and exact enrolled inputs, never a source checkout."""
     if not src.exists():
+        assert runtime_inputs is None, "runtime input root missing"
         return
     assert not src.is_symlink(), "runtime source root is a symlink"
+    if runtime_inputs is not None:
+        applications = {"target/debug/reposync", "target/debug/reposync-personal"}
+        fixtures = {
+            "crates/core/tests/fixtures/pair_refresh_http_server.py",
+            "crates/core/tests/fixtures/git_http_auth_server.py",
+            "crates/cli/tests/fixtures/startup_provider.py",
+        }
+        assert set(runtime_inputs) == {"schema", "files", "absent_fixtures"}, "invalid runtime input manifest"
+        assert runtime_inputs["schema"] == 1, "unknown runtime input schema"
+        files, absent = runtime_inputs["files"], runtime_inputs["absent_fixtures"]
+        assert isinstance(files, dict) and isinstance(absent, list), "invalid runtime input inventory"
+        assert applications <= files.keys() <= applications | fixtures, "unexpected or missing runtime input"
+        assert len(absent) == len(set(absent)) and set(absent) == fixtures - files.keys(), "incomplete source fixture inventory"
+        directories = {"", "crates", "crates/core", "crates/cli",
+                       "crates/personal", "crates/web", "web-ui"}
+        for relative in files:
+            directories.update(str(p) for p in Path(relative).parents if str(p) != ".")
+        for relative in sorted(directories):
+            directory = src / relative
+            assert not directory.is_symlink() and directory.is_dir(), f"invalid runtime ancestor: {relative}"
+            if relative == "web-ui":
+                continue
+            expected = {Path(p).name for p in directories | files.keys()
+                        if p and Path(p).parent == Path(relative)}
+            assert {p.name for p in directory.iterdir()} == expected, f"unexpected runtime content: {relative}"
+        for relative, entry in files.items():
+            path = src / relative
+            assert not path.is_symlink() and path.is_file(), f"invalid runtime input: {relative}"
+            assert entry["kind"] == ("application" if relative in applications else "fixture"), "wrong input kind"
+            data = path.read_bytes()
+            assert len(data) == entry["bytes"] and digest(data) == entry["sha256"], f"runtime input digest mismatch: {relative}"
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == entry["mode"], f"runtime input mode mismatch: {relative}"
+            assert relative not in applications or mode & 0o111, f"non-executable application: {relative}"
+        return
+    # Keep the empty-layout controls for callers without an input manifest.
     top_level = sorted(p.name for p in src.iterdir())
     assert top_level == ["crates", "web-ui"], f"unexpected /src in runtime: {top_level}"
     crates, web = src / "crates", src / "crates/web"
@@ -204,19 +242,42 @@ def boundary_canaries():
 def run_case(case, binaries):
     if case["binary"] == "evidence_scan":
         return run_scan_case(case)
+    def capture_failure_mounts(label):
+        diagnostic = {}
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            filename = label + ".failure-mounts.log"
+            (OUTPUT / filename).write_bytes(raw)
+            diagnostic.update(proc_mounts_file=filename, sha256=digest(raw))
+        except Exception as error:
+            diagnostic.update(error_type=type(error).__name__, error=str(error))
+        try:
+            (OUTPUT / (label + ".failure-diagnostics.json")).write_text(json.dumps(diagnostic, indent=2) + "\n")
+        except Exception as error:
+            print(f"Diagnostic mount capture failed: {type(error).__name__}: {error}", file=sys.stderr)
     binary = TESTS / binaries[case["binary"]]
     test_name = case["test"]
-    listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True)
+    environment = {**os.environ, "RUST_BACKTRACE": "1"}
+    try:
+        listing = subprocess.run([str(binary), "--list"], capture_output=True, text=True, check=True, env=environment)
+    except Exception:
+        capture_failure_mounts(case["id"])
+        raise
     matches = [line for line in listing.stdout.splitlines() if line.startswith(test_name + ": test")]
     if len(matches) != 1:
         raise AssertionError(f"required test missing or ambiguous: {case['id']} {test_name}")
     cmd = [str(binary), test_name, "--exact", "--nocapture", "--test-threads=1"]
-    environment = os.environ.copy()
     if case["id"] == "S54_HTTP_COPY":
         environment["REPOSYNC_COPY_WIRE_OUTPUT"] = str(OUTPUT / "S54_HTTP_COPY-wire.json")
     if case["id"] == "S54_SCOPED_HTTP":
         environment["REPOSYNC_SCOPED_WIRE_OUTPUT"] = str(OUTPUT / "S54_SCOPED_HTTP-wire.json")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=240, env=environment)
+    except Exception:
+        capture_failure_mounts(case["id"])
+        raise
+    if result.returncode != 0:
+        capture_failure_mounts(case["id"])
     output = result.stdout + result.stderr
     if SECRET in output:
         raise AssertionError(f"synthetic fixture secret leaked in {case['id']} output")
@@ -246,6 +307,8 @@ def run_case(case, binaries):
                     else "CANDIDATE_SUBCASE_PASS"),
         "proofs": proofs,
     }
+    if evidence["outcome"] == "FAIL" and result.returncode == 0:
+        capture_failure_mounts(case["id"])
     (OUTPUT / f"{case['id']}.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence), flush=True)
     return evidence
@@ -348,13 +411,33 @@ def parse_baseline_stdout(name, stdout, returncode):
 
 
 def run_baseline(binaries):
+    def capture_failure_mounts(label):
+        diagnostic = {}
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            filename = label + ".failure-mounts.log"
+            (OUTPUT / filename).write_bytes(raw)
+            diagnostic.update(proc_mounts_file=filename, sha256=digest(raw))
+        except Exception as error:
+            diagnostic.update(error_type=type(error).__name__, error=str(error))
+        try:
+            (OUTPUT / (label + ".failure-diagnostics.json")).write_text(json.dumps(diagnostic, indent=2) + "\n")
+        except Exception as error:
+            print(f"Diagnostic mount capture failed: {type(error).__name__}: {error}", file=sys.stderr)
+    environment = {**os.environ, "RUST_BACKTRACE": "1"}
     results = {}
     totals = {"passed": 0, "failed": 0, "ignored": 0, "filtered_out": 0}
     processes = {}
     for name, filename in sorted(binaries.items()):
         binary = TESTS / filename
-        result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
-                                capture_output=True, text=True, timeout=300)
+        try:
+            result = subprocess.run([str(binary), "--nocapture", "--test-threads=1"],
+                                    capture_output=True, text=True, timeout=300, env=environment)
+        except Exception:
+            capture_failure_mounts("baseline-" + name)
+            raise
+        if result.returncode != 0:
+            capture_failure_mounts("baseline-" + name)
         output = result.stdout + result.stderr
         if SECRET in output:
             raise AssertionError(f"synthetic fixture secret leaked in {name} output")
@@ -483,7 +566,14 @@ def main():
     assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
     assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
     assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
-    assert_runtime_source_isolation()
+    input_manifest = (TESTS / "runtime-inputs.json").read_bytes()
+    runtime_inputs = json.loads(input_manifest)
+    assert_runtime_source_isolation(runtime_inputs=runtime_inputs)
+    (OUTPUT / "runtime-inputs.json").write_text(json.dumps({
+        "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
+        "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
+        "manifest_sha256": digest(input_manifest), "inputs": runtime_inputs,
+    }, indent=2) + "\n")
     assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
     canaries = boundary_canaries()
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")

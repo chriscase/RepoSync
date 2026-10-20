@@ -15,17 +15,22 @@ pub fn setup_signal_handlers() -> ShutdownFlag {
     let flag = Arc::new(AtomicBool::new(false));
     let flag_clone = flag.clone();
 
-    tokio::spawn(async move {
-        let ctrl_c = tokio::signal::ctrl_c();
+    // Register both Unix listeners before callers publish their ready PID. A
+    // spawned task may not be polled before the first shutdown signal arrives.
+    #[cfg(unix)]
+    let (mut sigint, mut sigterm) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::interrupt()).expect("failed to register SIGINT handler"),
+            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler"),
+        )
+    };
 
+    tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-
             tokio::select! {
-                _ = ctrl_c => {
+                _ = sigint.recv() => {
                     info!("received SIGINT (Ctrl+C), initiating shutdown");
                 }
                 _ = sigterm.recv() => {
@@ -36,7 +41,9 @@ pub fn setup_signal_handlers() -> ShutdownFlag {
 
         #[cfg(not(unix))]
         {
-            ctrl_c.await.expect("failed to listen for Ctrl+C");
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to listen for Ctrl+C");
             info!("received Ctrl+C, initiating shutdown");
         }
 
