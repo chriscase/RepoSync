@@ -57,6 +57,9 @@ pub struct AppState {
     pub login_attempts: std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
     /// Handles for in-flight import tasks, for graceful shutdown.
     pub import_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Scheduler supervision owned by this state. `Arc` clones share the mutex.
+    /// Health copies the value out and drops the guard before any await.
+    pub scheduler_service: std::sync::Mutex<SchedulerServiceState>,
 }
 
 /// How the scheduler task ended, as seen from its `JoinHandle`.
@@ -165,50 +168,6 @@ pub fn scheduler_failure_from_stop_timeout() -> (SchedulerServiceLevel, String) 
     )
 }
 
-fn scheduler_service_records() -> &'static std::sync::Mutex<HashMap<usize, SchedulerServiceState>> {
-    static RECORDS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, SchedulerServiceState>>> =
-        std::sync::OnceLock::new();
-    RECORDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-fn lock_scheduler_service_records(
-) -> std::sync::MutexGuard<'static, HashMap<usize, SchedulerServiceState>> {
-    scheduler_service_records()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Test and method helper. Keys are `AppState` addresses in production.
-pub(crate) fn record_scheduler_service(
-    key: usize,
-    level: SchedulerServiceLevel,
-    reason: impl Into<String>,
-) {
-    let mut records = lock_scheduler_service_records();
-    if level == SchedulerServiceLevel::Running {
-        records.remove(&key);
-        return;
-    }
-    records.insert(
-        key,
-        SchedulerServiceState {
-            level,
-            reason: Some(reason.into()),
-        },
-    );
-}
-
-pub(crate) fn scheduler_service_for_key(key: usize) -> SchedulerServiceState {
-    lock_scheduler_service_records()
-        .get(&key)
-        .cloned()
-        .unwrap_or_else(SchedulerServiceState::running)
-}
-
-pub(crate) fn clear_scheduler_service(key: usize) {
-    lock_scheduler_service_records().remove(&key);
-}
-
 impl AppState {
     /// Get or create the import progress tracker for a specific repository.
     pub async fn get_repo_import_progress(
@@ -228,32 +187,35 @@ impl AppState {
             .clone()
     }
 
-    fn service_key(&self) -> usize {
-        std::ptr::from_ref(self) as usize
-    }
-
     /// Record a degraded or fatal scheduler outcome for this state.
     ///
-    /// `Arc` clones share the record. `Running` clears it. The record is not a
-    /// struct field: other modules construct `AppState` with struct literals
-    /// this change cannot edit, and a new field would fail those crates.
+    /// `Arc` clones share `scheduler_service`. `Running` restores the initial
+    /// value, including a cleared reason.
     pub fn record_scheduler_failure(
         &self,
         level: SchedulerServiceLevel,
         reason: impl Into<String>,
     ) {
-        record_scheduler_service(self.service_key(), level, reason);
+        let mut service = self
+            .scheduler_service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if level == SchedulerServiceLevel::Running {
+            *service = SchedulerServiceState::running();
+            return;
+        }
+        *service = SchedulerServiceState {
+            level,
+            reason: Some(reason.into()),
+        };
     }
 
-    /// Current scheduler supervision. Missing means the scheduler is running.
+    /// Current scheduler supervision. The initial value is running.
     pub fn scheduler_service_state(&self) -> SchedulerServiceState {
-        scheduler_service_for_key(self.service_key())
-    }
-}
-
-impl Drop for AppState {
-    fn drop(&mut self) {
-        clear_scheduler_service(self.service_key());
+        self.scheduler_service
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -313,6 +275,7 @@ impl WebServer {
             repo_import_progress: tokio::sync::RwLock::new(HashMap::new()),
             login_attempts: std::sync::Mutex::new(HashMap::new()),
             import_handles: tokio::sync::Mutex::new(Vec::new()),
+            scheduler_service: std::sync::Mutex::new(SchedulerServiceState::running()),
         });
         Self {
             state,
@@ -530,38 +493,77 @@ mod scheduler_service_tests {
         assert!(reason.contains("during shutdown"));
     }
 
-    #[test]
-    fn service_records_are_isolated_per_key_and_clear() {
-        let fatal = usize::MAX - 112;
-        let degraded = usize::MAX - 113;
-        clear_scheduler_service(fatal);
-        clear_scheduler_service(degraded);
-
-        assert!(scheduler_service_for_key(fatal).is_running());
-        record_scheduler_service(
-            fatal,
-            SchedulerServiceLevel::Fatal,
-            "scheduler task panicked",
+    fn supervision_fixture(dir: &std::path::Path) -> AppState {
+        std::fs::create_dir_all(dir).unwrap();
+        let git_path = dir.join("git");
+        git2::Repository::init(&git_path).unwrap();
+        let toml = format!(
+            "[daemon]\ndata_dir = {:?}\n[svn]\nurl = 'https://svn.test.invalid/repo'\nusername = 'fixture'\npassword_env = ''\n[github]\nrepo = 'test/repo'\ntoken_env = ''\n",
+            dir.display().to_string()
         );
-        record_scheduler_service(degraded, SchedulerServiceLevel::Degraded, "sync lagging");
+        let config: AppConfig = toml::from_str(&toml).unwrap();
+        let engine = SyncEngine::new(
+            config.clone(),
+            Database::in_memory().unwrap(),
+            reposync_core::svn::SvnClient::new("https://svn.test.invalid/repo", "fixture", ""),
+            reposync_core::git::GitClient::new(&git_path).unwrap(),
+            Arc::new(
+                reposync_core::identity::IdentityMapper::new(
+                    &reposync_core::config::IdentityConfig::default(),
+                )
+                .unwrap(),
+            ),
+        );
+        let (sync_trigger, _rx) = tokio::sync::mpsc::channel(1);
+        let (ws_broadcast, _) = broadcast::channel(8);
+        AppState {
+            db: Database::in_memory().unwrap(),
+            sync_engine: Arc::new(engine),
+            config,
+            sync_trigger,
+            ws_broadcast,
+            sessions: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            import_progress: Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+            config_path: dir.join("config.toml"),
+            prev_net_snapshot: std::sync::Mutex::new(None),
+            repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            import_handles: tokio::sync::Mutex::new(Vec::new()),
+            scheduler_service: std::sync::Mutex::new(SchedulerServiceState::running()),
+        }
+    }
 
-        let fatal_state = scheduler_service_for_key(fatal);
+    #[test]
+    fn service_records_are_isolated_per_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let fatal = Arc::new(supervision_fixture(&dir.path().join("fatal")));
+        let degraded = supervision_fixture(&dir.path().join("degraded"));
+        assert!(fatal.scheduler_service_state().is_running());
+        assert!(degraded.scheduler_service_state().is_running());
+
+        Arc::clone(&fatal)
+            .record_scheduler_failure(SchedulerServiceLevel::Fatal, "scheduler task panicked");
+        degraded.record_scheduler_failure(SchedulerServiceLevel::Degraded, "sync lagging");
+
+        let fatal_state = fatal.scheduler_service_state();
         assert_eq!(fatal_state.level, SchedulerServiceLevel::Fatal);
         assert_eq!(
             fatal_state.reason.as_deref(),
             Some("scheduler task panicked")
         );
-        let degraded_state = scheduler_service_for_key(degraded);
+        let degraded_state = degraded.scheduler_service_state();
         assert_eq!(degraded_state.level, SchedulerServiceLevel::Degraded);
         assert_eq!(degraded_state.reason.as_deref(), Some("sync lagging"));
 
-        record_scheduler_service(fatal, SchedulerServiceLevel::Running, "");
-        assert!(scheduler_service_for_key(fatal).is_running());
+        fatal.record_scheduler_failure(SchedulerServiceLevel::Running, "");
+        assert!(fatal.scheduler_service_state().is_running());
+        assert!(fatal.scheduler_service_state().reason.is_none());
         assert_eq!(
-            scheduler_service_for_key(degraded).level,
+            degraded.scheduler_service_state().level,
             SchedulerServiceLevel::Degraded
         );
-        clear_scheduler_service(degraded);
+        drop(degraded);
+        assert!(fatal.scheduler_service_state().is_running());
     }
 
     #[tokio::test]

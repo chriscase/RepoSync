@@ -1819,6 +1819,7 @@ mod setup_import_failure_tests {
             repo_import_progress: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             login_attempts: std::sync::Mutex::new(std::collections::HashMap::new()),
             import_handles: tokio::sync::Mutex::new(Vec::new()),
+            scheduler_service: std::sync::Mutex::new(crate::SchedulerServiceState::running()),
         });
         let opens = Arc::new(AtomicUsize::new(0));
         let _tracing = tracing::subscriber::set_default(OpenSubscriber {
