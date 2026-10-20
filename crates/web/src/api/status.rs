@@ -17,11 +17,18 @@ struct RepoQuery {
 }
 
 /// Health check response.
+///
+/// A running scheduler omits `status` and `reason`, so the healthy body stays
+/// `{ok, version, git_commit}`. A degraded or fatal scheduler adds both.
 #[derive(Serialize)]
 struct HealthResponse {
     ok: bool,
     version: String,
     git_commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 /// Status response wrapping the core SyncStatus.
@@ -77,12 +84,36 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/status/reset-errors", post(reset_errors))
 }
 
-async fn health_check() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        git_commit: env!("GIT_COMMIT_SHA").to_string(),
-    })
+fn health_http(service: &crate::SchedulerServiceState) -> (axum::http::StatusCode, HealthResponse) {
+    let ok = service.is_running();
+    let (status_code, status) = match service.level {
+        crate::SchedulerServiceLevel::Running => (axum::http::StatusCode::OK, None),
+        crate::SchedulerServiceLevel::Degraded => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Some("degraded".to_string()),
+        ),
+        crate::SchedulerServiceLevel::Fatal => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Some("fatal".to_string()),
+        ),
+    };
+    (
+        status_code,
+        HealthResponse {
+            ok,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            git_commit: env!("GIT_COMMIT_SHA").to_string(),
+            status,
+            reason: if ok { None } else { service.reason.clone() },
+        },
+    )
+}
+
+async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> (axum::http::StatusCode, Json<HealthResponse>) {
+    let (status, body) = health_http(&state.scheduler_service_state());
+    (status, Json(body))
 }
 
 async fn get_status(
@@ -630,5 +661,51 @@ impl axum::response::IntoResponse for AppError {
 
         let body = serde_json::json!({ "error": client_message });
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    use crate::{SchedulerServiceLevel, SchedulerServiceState};
+
+    #[test]
+    fn running_scheduler_stays_ok_without_a_reason() {
+        let (code, body) = health_http(&SchedulerServiceState::running());
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert!(body.ok);
+        assert!(body.status.is_none());
+        assert!(body.reason.is_none());
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        assert!(json.get("reason").is_none());
+        assert!(json.get("status").is_none());
+    }
+
+    #[test]
+    fn fatal_scheduler_is_not_ok_and_includes_the_reason() {
+        let (code, body) = health_http(&SchedulerServiceState {
+            level: SchedulerServiceLevel::Fatal,
+            reason: Some("scheduler task panicked: boom".into()),
+        });
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ok);
+        assert_eq!(body.status.as_deref(), Some("fatal"));
+        assert_eq!(
+            body.reason.as_deref(),
+            Some("scheduler task panicked: boom")
+        );
+    }
+
+    #[test]
+    fn degraded_scheduler_is_not_ok_and_includes_the_reason() {
+        let (code, body) = health_http(&SchedulerServiceState {
+            level: SchedulerServiceLevel::Degraded,
+            reason: Some("scheduler missed maintenance".into()),
+        });
+        assert_eq!(code, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body.ok);
+        assert_eq!(body.status.as_deref(), Some("degraded"));
+        assert_eq!(body.reason.as_deref(), Some("scheduler missed maintenance"));
     }
 }
