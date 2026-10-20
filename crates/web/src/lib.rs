@@ -146,6 +146,25 @@ pub fn scheduler_failure_from_task_end(
     }
 }
 
+/// How long shutdown waits for the scheduler task to finish its current cycle.
+///
+/// Expiry is fatal (`scheduler_failure_from_stop_timeout`). This budget is
+/// not a liveness limit on poll intervals: a 601s or 3600s poll that is
+/// still inside `run` before shutdown is requested stays running.
+pub const SCHEDULER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The scheduler `JoinHandle` was still pending when [`SCHEDULER_STOP_TIMEOUT`]
+/// elapsed after shutdown was requested.
+pub fn scheduler_failure_from_stop_timeout() -> (SchedulerServiceLevel, String) {
+    (
+        SchedulerServiceLevel::Fatal,
+        format!(
+            "scheduler did not stop within {}s of shutdown",
+            SCHEDULER_STOP_TIMEOUT.as_secs()
+        ),
+    )
+}
+
 fn scheduler_service_records() -> &'static std::sync::Mutex<HashMap<usize, SchedulerServiceState>> {
     static RECORDS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, SchedulerServiceState>>> =
         std::sync::OnceLock::new();
@@ -487,6 +506,14 @@ mod scheduler_service_tests {
         .expect("join error");
         assert_eq!(level, SchedulerServiceLevel::Fatal);
         assert!(reason.contains("cancelled"));
+    }
+
+    #[test]
+    fn stop_timeout_expiry_is_fatal() {
+        assert_eq!(SCHEDULER_STOP_TIMEOUT, std::time::Duration::from_secs(10));
+        let (level, reason) = scheduler_failure_from_stop_timeout();
+        assert_eq!(level, SchedulerServiceLevel::Fatal);
+        assert_eq!(reason, "scheduler did not stop within 10s of shutdown");
     }
 
     #[test]

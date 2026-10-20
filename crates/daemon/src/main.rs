@@ -670,10 +670,14 @@ async fn main() -> Result<()> {
     // Signal cooperative shutdown to the scheduler (no-op if it already ended).
     shutdown.notify_waiters();
 
-    // Wait for the scheduler to finish its current cycle (up to 10s) when
-    // shutdown won the race and the task is still running.
+    // Wait for the scheduler to finish its current cycle when shutdown won
+    // the race and the task is still running. The budget is
+    // `SCHEDULER_STOP_TIMEOUT` (10s). Expiry is fatal: shutdown was already
+    // requested and the task did not return. This is not a poll-interval
+    // hang check. A long poll stays running until shutdown is requested.
     if scheduler_failure.is_none() {
-        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut scheduler_handle).await
+        match tokio::time::timeout(reposync_web::SCHEDULER_STOP_TIMEOUT, &mut scheduler_handle)
+            .await
         {
             Ok(Ok(())) => info!("scheduler stopped gracefully"),
             Ok(Err(error)) => {
@@ -686,7 +690,12 @@ async fn main() -> Result<()> {
                     scheduler_failure = Some(reason);
                 }
             }
-            Err(_) => warn!("scheduler did not stop within 10s, forcing shutdown"),
+            Err(_) => {
+                let (level, reason) = reposync_web::scheduler_failure_from_stop_timeout();
+                error!(%reason, "scheduler stop timeout expired; marking service fatal");
+                scheduler_state.record_scheduler_failure(level, reason.clone());
+                scheduler_failure = Some(reason);
+            }
         }
     }
 
