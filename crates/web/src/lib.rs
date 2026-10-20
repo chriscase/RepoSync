@@ -59,6 +59,137 @@ pub struct AppState {
     pub import_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// How the scheduler task ended, as seen from its `JoinHandle`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulerTaskEnd {
+    /// `run` returned. A clean shutdown only when a shutdown signal was requested.
+    Completed,
+    /// The task panicked.
+    Panicked { message: String },
+    /// The task failed without a panic payload (for example, it was cancelled).
+    Failed { message: String },
+}
+
+impl SchedulerTaskEnd {
+    pub fn from_join(result: Result<(), tokio::task::JoinError>) -> Self {
+        match result {
+            Ok(()) => Self::Completed,
+            Err(err) if err.is_panic() => Self::Panicked {
+                message: err.to_string(),
+            },
+            Err(err) => Self::Failed {
+                message: err.to_string(),
+            },
+        }
+    }
+}
+
+/// Service level exposed to `/api/status/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerServiceLevel {
+    Running,
+    Degraded,
+    Fatal,
+}
+
+/// Shared scheduler supervision for one `AppState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerServiceState {
+    pub level: SchedulerServiceLevel,
+    pub reason: Option<String>,
+}
+
+impl SchedulerServiceState {
+    pub fn running() -> Self {
+        Self {
+            level: SchedulerServiceLevel::Running,
+            reason: None,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.level == SchedulerServiceLevel::Running
+    }
+}
+
+/// Failure to record when the scheduler `JoinHandle` resolves.
+///
+/// A requested shutdown that returns `Completed` is not a failure. Any other
+/// end (exit before shutdown, panic, or join error), including a panic while
+/// shutting down, is fatal: the scheduler is no longer running.
+pub fn scheduler_failure_from_task_end(
+    shutdown_requested: bool,
+    end: &SchedulerTaskEnd,
+) -> Option<(SchedulerServiceLevel, String)> {
+    match (shutdown_requested, end) {
+        (true, SchedulerTaskEnd::Completed) => None,
+        (true, SchedulerTaskEnd::Panicked { message }) => Some((
+            SchedulerServiceLevel::Fatal,
+            format!("scheduler task panicked during shutdown: {message}"),
+        )),
+        (true, SchedulerTaskEnd::Failed { message }) => Some((
+            SchedulerServiceLevel::Fatal,
+            format!("scheduler task failed during shutdown: {message}"),
+        )),
+        (false, SchedulerTaskEnd::Completed) => Some((
+            SchedulerServiceLevel::Fatal,
+            "scheduler task exited before shutdown".into(),
+        )),
+        (false, SchedulerTaskEnd::Panicked { message }) => Some((
+            SchedulerServiceLevel::Fatal,
+            format!("scheduler task panicked: {message}"),
+        )),
+        (false, SchedulerTaskEnd::Failed { message }) => Some((
+            SchedulerServiceLevel::Fatal,
+            format!("scheduler task failed: {message}"),
+        )),
+    }
+}
+
+fn scheduler_service_records() -> &'static std::sync::Mutex<HashMap<usize, SchedulerServiceState>> {
+    static RECORDS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, SchedulerServiceState>>> =
+        std::sync::OnceLock::new();
+    RECORDS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn lock_scheduler_service_records(
+) -> std::sync::MutexGuard<'static, HashMap<usize, SchedulerServiceState>> {
+    scheduler_service_records()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Test and method helper. Keys are `AppState` addresses in production.
+pub(crate) fn record_scheduler_service(
+    key: usize,
+    level: SchedulerServiceLevel,
+    reason: impl Into<String>,
+) {
+    let mut records = lock_scheduler_service_records();
+    if level == SchedulerServiceLevel::Running {
+        records.remove(&key);
+        return;
+    }
+    records.insert(
+        key,
+        SchedulerServiceState {
+            level,
+            reason: Some(reason.into()),
+        },
+    );
+}
+
+pub(crate) fn scheduler_service_for_key(key: usize) -> SchedulerServiceState {
+    lock_scheduler_service_records()
+        .get(&key)
+        .cloned()
+        .unwrap_or_else(SchedulerServiceState::running)
+}
+
+pub(crate) fn clear_scheduler_service(key: usize) {
+    lock_scheduler_service_records().remove(&key);
+}
+
 impl AppState {
     /// Get or create the import progress tracker for a specific repository.
     pub async fn get_repo_import_progress(
@@ -76,6 +207,34 @@ impl AppState {
         map.entry(repo_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(ImportProgress::default())))
             .clone()
+    }
+
+    fn service_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Record a degraded or fatal scheduler outcome for this state.
+    ///
+    /// `Arc` clones share the record. `Running` clears it. The record is not a
+    /// struct field: other modules construct `AppState` with struct literals
+    /// this change cannot edit, and a new field would fail those crates.
+    pub fn record_scheduler_failure(
+        &self,
+        level: SchedulerServiceLevel,
+        reason: impl Into<String>,
+    ) {
+        record_scheduler_service(self.service_key(), level, reason);
+    }
+
+    /// Current scheduler supervision. Missing means the scheduler is running.
+    pub fn scheduler_service_state(&self) -> SchedulerServiceState {
+        scheduler_service_for_key(self.service_key())
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        clear_scheduler_service(self.service_key());
     }
 }
 
@@ -294,5 +453,98 @@ impl WebServer {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scheduler_service_tests {
+    use super::*;
+
+    #[test]
+    fn task_end_before_shutdown_is_fatal() {
+        let (level, reason) = scheduler_failure_from_task_end(false, &SchedulerTaskEnd::Completed)
+            .expect("early exit");
+        assert_eq!(level, SchedulerServiceLevel::Fatal);
+        assert_eq!(reason, "scheduler task exited before shutdown");
+
+        let (level, reason) = scheduler_failure_from_task_end(
+            false,
+            &SchedulerTaskEnd::Panicked {
+                message: "boom".into(),
+            },
+        )
+        .expect("panic");
+        assert_eq!(level, SchedulerServiceLevel::Fatal);
+        assert!(reason.contains("panicked"));
+        assert!(reason.contains("boom"));
+
+        let (level, reason) = scheduler_failure_from_task_end(
+            false,
+            &SchedulerTaskEnd::Failed {
+                message: "cancelled".into(),
+            },
+        )
+        .expect("join error");
+        assert_eq!(level, SchedulerServiceLevel::Fatal);
+        assert!(reason.contains("cancelled"));
+    }
+
+    #[test]
+    fn completed_shutdown_is_not_a_failure() {
+        assert!(scheduler_failure_from_task_end(true, &SchedulerTaskEnd::Completed).is_none());
+        let (level, reason) = scheduler_failure_from_task_end(
+            true,
+            &SchedulerTaskEnd::Panicked {
+                message: "boom".into(),
+            },
+        )
+        .expect("panic during shutdown");
+        assert_eq!(level, SchedulerServiceLevel::Fatal);
+        assert!(reason.contains("during shutdown"));
+    }
+
+    #[test]
+    fn service_records_are_isolated_per_key_and_clear() {
+        let fatal = usize::MAX - 112;
+        let degraded = usize::MAX - 113;
+        clear_scheduler_service(fatal);
+        clear_scheduler_service(degraded);
+
+        assert!(scheduler_service_for_key(fatal).is_running());
+        record_scheduler_service(
+            fatal,
+            SchedulerServiceLevel::Fatal,
+            "scheduler task panicked",
+        );
+        record_scheduler_service(degraded, SchedulerServiceLevel::Degraded, "sync lagging");
+
+        let fatal_state = scheduler_service_for_key(fatal);
+        assert_eq!(fatal_state.level, SchedulerServiceLevel::Fatal);
+        assert_eq!(
+            fatal_state.reason.as_deref(),
+            Some("scheduler task panicked")
+        );
+        let degraded_state = scheduler_service_for_key(degraded);
+        assert_eq!(degraded_state.level, SchedulerServiceLevel::Degraded);
+        assert_eq!(degraded_state.reason.as_deref(), Some("sync lagging"));
+
+        record_scheduler_service(fatal, SchedulerServiceLevel::Running, "");
+        assert!(scheduler_service_for_key(fatal).is_running());
+        assert_eq!(
+            scheduler_service_for_key(degraded).level,
+            SchedulerServiceLevel::Degraded
+        );
+        clear_scheduler_service(degraded);
+    }
+
+    #[tokio::test]
+    async fn join_panic_is_classified_as_panicked() {
+        let handle = tokio::spawn(async { panic!("scheduler-boom") });
+        match SchedulerTaskEnd::from_join(handle.await) {
+            SchedulerTaskEnd::Panicked { message } => {
+                assert!(message.contains("panic"), "{message}");
+            }
+            other => panic!("expected a panicked join, got {other:?}"),
+        }
     }
 }

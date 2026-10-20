@@ -17,12 +17,12 @@ struct CadenceSample {
 /// Walk whole-second poll ticks over a horizon using the same `maintenance_due`
 /// helper as the run loop. Time is virtual: no wall-clock sleeps.
 fn sample_cadence(poll_interval_secs: u64, horizon_secs: u64) -> CadenceSample {
-    let poll = poll_interval_secs.max(1);
-    let mut sync_ticks = 0;
-    let mut maintenance_runs = 0;
-    let mut last_maint = 0;
-    let mut max_gap = 0;
-    let mut elapsed = 0;
+    let poll: u64 = poll_interval_secs.max(1);
+    let mut sync_ticks: u64 = 0;
+    let mut maintenance_runs: u64 = 0;
+    let mut last_maint: u64 = 0;
+    let mut max_gap: u64 = 0;
+    let mut elapsed: u64 = 0;
     loop {
         match elapsed.checked_add(poll) {
             Some(next) if next <= horizon_secs => elapsed = next,

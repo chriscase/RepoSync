@@ -638,25 +638,56 @@ async fn main() -> Result<()> {
 
     // Capture sync handles for graceful shutdown before moving sched
     let sync_handles = sched.sync_handles.clone();
+    let scheduler_state = app_state_for_shutdown.clone();
 
-    // Start the scheduler in a background task
-    let scheduler_handle = tokio::spawn(async move {
+    // Start the scheduler in a background task. The JoinHandle is raced
+    // against shutdown so a panic, join error, or early exit is recorded
+    // on AppState immediately instead of being ignored until SIGTERM.
+    let mut scheduler_handle = tokio::spawn(async move {
         sched.run(scheduler_shutdown).await;
     });
+    let mut scheduler_failure: Option<String> = None;
 
-    // Wait for shutdown signal
-    signals::wait_for_shutdown().await;
+    tokio::select! {
+        _ = signals::wait_for_shutdown() => {
+            info!("Shutdown signal received, stopping...");
+        }
+        end = &mut scheduler_handle => {
+            if let Some((level, reason)) = reposync_web::scheduler_failure_from_task_end(
+                false,
+                &reposync_web::SchedulerTaskEnd::from_join(end),
+            ) {
+                error!(%reason, "scheduler ended before shutdown; marking service fatal");
+                scheduler_state.record_scheduler_failure(level, reason.clone());
+                scheduler_failure = Some(reason);
+            }
+            info!("scheduler is stopped; waiting for shutdown so health can report it");
+            signals::wait_for_shutdown().await;
+            info!("Shutdown signal received after scheduler failure, stopping...");
+        }
+    }
 
-    info!("Shutdown signal received, stopping...");
-
-    // Signal cooperative shutdown to the scheduler
+    // Signal cooperative shutdown to the scheduler (no-op if it already ended).
     shutdown.notify_waiters();
 
-    // Wait for the scheduler to finish its current cycle (up to 10s)
-    match tokio::time::timeout(std::time::Duration::from_secs(10), scheduler_handle).await {
-        Ok(Ok(())) => info!("scheduler stopped gracefully"),
-        Ok(Err(e)) => warn!("scheduler task error: {}", e),
-        Err(_) => warn!("scheduler did not stop within 10s, forcing shutdown"),
+    // Wait for the scheduler to finish its current cycle (up to 10s) when
+    // shutdown won the race and the task is still running.
+    if scheduler_failure.is_none() {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut scheduler_handle).await
+        {
+            Ok(Ok(())) => info!("scheduler stopped gracefully"),
+            Ok(Err(error)) => {
+                if let Some((level, reason)) = reposync_web::scheduler_failure_from_task_end(
+                    true,
+                    &reposync_web::SchedulerTaskEnd::from_join(Err(error)),
+                ) {
+                    warn!(%reason, "scheduler failed while stopping");
+                    scheduler_state.record_scheduler_failure(level, reason.clone());
+                    scheduler_failure = Some(reason);
+                }
+            }
+            Err(_) => warn!("scheduler did not stop within 10s, forcing shutdown"),
+        }
     }
 
     // Wait for in-flight sync tasks (up to 30s)
@@ -729,5 +760,8 @@ async fn main() -> Result<()> {
     }
 
     info!("RepoSync daemon stopped.");
+    if let Some(reason) = scheduler_failure {
+        anyhow::bail!("scheduler failed: {reason}");
+    }
     Ok(())
 }
