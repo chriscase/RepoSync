@@ -433,7 +433,7 @@ test("an already-published pair cannot start the unobserved rebase", async () =>
 });
 
 for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
-  for (const fault of ["none", "missing-operation", "mismatch", "terminal", "retained-message", "http", "restart-started", "restart-baseline"]) {
+  for (const fault of ["none", "missing-operation", "mismatch", "terminal", "retained-message", "http", "restart-started", "restart-unexpected-success", "restart-server-error", "restart-baseline", "restart-missing-hold", "restart-changed-operation", "restart-completed", "restart-hold-moved"]) {
     test(`${id} cancels only its started operation: ${fault}`, async () => {
       const calls: string[] = [];
       let passed = "";
@@ -453,8 +453,18 @@ for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
             if (fault === "http") return {status: 400, text: "exact operation ID required", json: {error: "exact operation ID required"}};
             return {status: 200, text: "", json: {ok: true, operation_id: "op-live", lifecycle: "cancel_requested", message: "cancellation durably requested; worker still stopping"}};
           }
+          if (method === "GET" && path === `/api/repos/${pair.id}/import/status`) {
+            const afterRestart = calls.some(call => call === `POST /api/repos/${pair.id}/import`);
+            if (!afterRestart && fault === "restart-missing-hold") return {status: 200, text: "", json: {lifecycle: "cancel_requested"}};
+            if (!afterRestart && fault === "restart-changed-operation") return {status: 200, text: "", json: {operation_id: "op-other", lifecycle: "cancel_requested"}};
+            if (!afterRestart && fault === "restart-completed") return {status: 200, text: "", json: {operation_id: "op-live", lifecycle: "completed"}};
+            if (afterRestart && fault === "restart-hold-moved") return {status: 200, text: "", json: {operation_id: "op-other", lifecycle: "cancel_requested"}};
+            return {status: 200, text: "", json: {operation_id: "op-live", lifecycle: "cancel_requested"}};
+          }
           if (path === `/api/repos/${pair.id}/import`) {
             if (fault === "restart-started") return {status: 200, text: "", json: {operation_id: "op-new", lifecycle: "queued"}};
+            if (fault === "restart-unexpected-success") return {status: 200, text: "repository import is active or held for reconciliation", json: {error: "repository import is active or held for reconciliation"}};
+            if (fault === "restart-server-error") return {status: 500, text: "repository import is active or held for reconciliation", json: {error: "repository import is active or held for reconciliation"}};
             if (fault === "restart-baseline") return {status: 400, text: "repository import baseline is not pending", json: {error: "repository import baseline is not pending"}};
             return {status: 400, text: "repository import is active or held for reconciliation", json: {error: "repository import is active or held for reconciliation"}};
           }
@@ -476,9 +486,15 @@ for (const id of ["PAIR-CANCEL-IMPORT", "PAIR-CANCEL-RESTART-GENERATION"]) {
         expect(marked).toBe("");
       } else if (fault === "none" && id === "PAIR-CANCEL-RESTART-GENERATION") {
         await run;
-        expect(calls).toEqual([`POST /api/repos/${pair.id}/import/op-live/cancel`, `POST /api/repos/${pair.id}/import`]);
+        expect(calls).toEqual([
+          `POST /api/repos/${pair.id}/import/op-live/cancel`,
+          `GET /api/repos/${pair.id}/import/status`,
+          `POST /api/repos/${pair.id}/import`,
+          `GET /api/repos/${pair.id}/import/status`,
+        ]);
         expect(passed).toContain("op-live");
         expect(passed).toContain("refused");
+        expect(passed).toContain("400");
         expect(marked).toBe("");
       } else if (id === "PAIR-CANCEL-IMPORT" && fault.startsWith("restart-")) {
         await run;

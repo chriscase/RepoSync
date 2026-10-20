@@ -785,16 +785,26 @@ export async function runCase(lab: Lab, op: LabOp): Promise<void> {
         lab.pass(`cancelled import ${cancelled.operation}`);
         return;
       }
+      const heldByOriginal = async (when: string) => {
+        const status = await lab.api("GET", `/api/repos/${cancelled.pair.id}/import/status`);
+        const body = status.json as {operation_id?: unknown; lifecycle?: unknown} | null;
+        const operation = importOperationId(body?.operation_id);
+        const lifecycle = typeof body?.lifecycle === "string" ? body.lifecycle : "";
+        if (status.status !== 200 || operation !== cancelled.operation || !/^(cancel_requested|cancelling)$/.test(lifecycle)) {
+          throw new Error(`${op.id} ${when} restart saw ${operation ?? "no operation id"} in ${lifecycle || "no lifecycle"} instead of active hold ${cancelled.operation}`);
+        }
+      };
+      await heldByOriginal("before");
       const again = await lab.api("POST", `/api/repos/${cancelled.pair.id}/import`, {import_mode: "full"});
-      const restarted = importOperationId((again.json as {operation_id?: unknown} | null)?.operation_id);
-      const detail = typeof again.text === "string" && again.text ? again.text : JSON.stringify(again.json ?? {});
-      if (again.status === 200 || restarted) {
-        throw new Error(`${op.id} started ${restarted ?? "an import"} while ${cancelled.operation} was still stopping`);
+      const refusal = again.json as {error?: unknown; operation_id?: unknown} | null;
+      const restarted = importOperationId(refusal?.operation_id);
+      const error = typeof refusal?.error === "string" ? refusal.error : "";
+      if (again.status !== 400 || restarted || !/^repository import is active or held( for reconciliation)?$/.test(error)) {
+        const detail = error || (typeof again.text === "string" && again.text ? again.text : JSON.stringify(refusal ?? {}));
+        throw new Error(`${op.id} restart of ${cancelled.operation} returned ${again.status} without the documented 400 refusal: ${detail.slice(0, 220)}`);
       }
-      if (!/active or held/i.test(detail)) {
-        throw new Error(`${op.id} did not refuse a new import while ${cancelled.operation} was still stopping: ${again.status} ${detail.slice(0, 220)}`);
-      }
-      lab.pass(`cancelled ${cancelled.operation}; a new import was refused while that operation was still stopping`);
+      await heldByOriginal("after");
+      lab.pass(`cancelled ${cancelled.operation}; a new import was refused with 400 while ${cancelled.operation} still held the active import`);
       return;
     }
     case "PAIR-REFRESH-PREVIEW":
