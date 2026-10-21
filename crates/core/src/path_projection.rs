@@ -726,8 +726,14 @@ mod tests {
         // `/secret-*` and `\secret-*` both normalize to `secret-*`.
         for pattern in ["/secret-*", "\\secret-*"] {
             assert_eq!(bash_blocked_pattern_case_arm(pattern), "'secret-'*");
-            assert!(path_matches_blocked("secret-note.txt", pattern), "{pattern}");
-            assert!(path_matches_blocked("secret-note/child", pattern), "{pattern}");
+            assert!(
+                path_matches_blocked("secret-note.txt", pattern),
+                "{pattern}"
+            );
+            assert!(
+                path_matches_blocked("secret-note/child", pattern),
+                "{pattern}"
+            );
             let script = render_pre_commit_hook_script(&[], &[pattern.into()]);
             assert!(
                 !run_hook_on_staged_paths(&script, &[("secret-note.txt", "x\n")]).success(),

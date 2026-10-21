@@ -339,11 +339,11 @@ fn assert_admitted_worker_did_not_sync(scheduler: &Scheduler, repo_id: &str) {
         }),
         "{repo_id} must record the local_dirty history refusal"
     );
-    let key = match reposync_core::history_inspect::history_block_key_for_repo(&scheduler.db, repo_id)
-    {
-        Ok(key) => key,
-        Err(_) => reposync_core::history_inspect::history_block_key(Some(repo_id)),
-    };
+    let key =
+        match reposync_core::history_inspect::history_block_key_for_repo(&scheduler.db, repo_id) {
+            Ok(key) => key,
+            Err(_) => reposync_core::history_inspect::history_block_key(Some(repo_id)),
+        };
     let raw = scheduler
         .db
         .get_state(&key)
@@ -799,7 +799,10 @@ async fn block_in_place_keeps_running_after_bounded_abort() {
     assert!(error.contains("did not finish"), "{error}");
     assert!(error.contains("0 drained"), "{error}");
     assert!(error.contains("still running"), "{error}");
-    assert!(error.contains("block_in_place cannot be cancelled"), "{error}");
+    assert!(
+        error.contains("block_in_place cannot be cancelled"),
+        "{error}"
+    );
     assert!(error.contains("detaches"), "{error}");
     assert!(error.contains("outer process bound required"), "{error}");
     let _ = release_tx.send(());

@@ -354,11 +354,11 @@ fn assert_admitted_worker_did_not_sync(scheduler: &Scheduler, repo_id: &str) {
         }),
         "{repo_id} must record the local_dirty history refusal"
     );
-    let key = match reposync_core::history_inspect::history_block_key_for_repo(&scheduler.db, repo_id)
-    {
-        Ok(key) => key,
-        Err(_) => reposync_core::history_inspect::history_block_key(Some(repo_id)),
-    };
+    let key =
+        match reposync_core::history_inspect::history_block_key_for_repo(&scheduler.db, repo_id) {
+            Ok(key) => key,
+            Err(_) => reposync_core::history_inspect::history_block_key(Some(repo_id)),
+        };
     let raw = scheduler
         .db
         .get_state(&key)
@@ -414,20 +414,18 @@ async fn assert_allowed_refused(id: &'static str, raw: &'static str) {
         "{raw} must refuse before blocked_patterns is applied"
     );
     assert!(
-        logged(
-            &log,
-            "allowed_paths must be a JSON array of strings",
-            id
-        ),
+        logged(&log, "allowed_paths must be a JSON array of strings", id),
         "{raw}"
     );
     assert!(
-        logged(&log, "setting=allowed_paths", id)
-            || logged(&log, "setting=\"allowed_paths\"", id),
+        logged(&log, "setting=allowed_paths", id) || logged(&log, "setting=\"allowed_paths\"", id),
         "{raw}"
     );
     assert!(!logged(&log, "starting per-repo sync cycle", id), "{raw}");
-    assert!(!logged(&log, "path validation rules configured", id), "{raw}");
+    assert!(
+        !logged(&log, "path validation rules configured", id),
+        "{raw}"
+    );
     assert_eq!(
         spawned(&scheduler)
             .await
@@ -484,7 +482,10 @@ async fn empty_allowed_paths_array_starts_without_a_restriction() {
     let (buf, _guard) = capture();
     scheduler.maybe_run_repo_cycles().await;
     let log = buf.lock().expect("log buffer").clone();
-    assert_eq!(parsed_allowed("empty-allow-repo"), vec![Vec::<String>::new()]);
+    assert_eq!(
+        parsed_allowed("empty-allow-repo"),
+        vec![Vec::<String>::new()]
+    );
     assert!(!logged(
         &log,
         "path validation rules configured",
@@ -774,7 +775,10 @@ async fn block_in_place_keeps_running_after_bounded_abort() {
     assert!(error.contains("did not finish"), "{error}");
     assert!(error.contains("0 drained"), "{error}");
     assert!(error.contains("still running"), "{error}");
-    assert!(error.contains("block_in_place cannot be cancelled"), "{error}");
+    assert!(
+        error.contains("block_in_place cannot be cancelled"),
+        "{error}"
+    );
     assert!(error.contains("detaches"), "{error}");
     assert!(error.contains("outer process bound required"), "{error}");
     let _ = release_tx.send(());
