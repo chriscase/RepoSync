@@ -966,11 +966,30 @@ impl Scheduler {
                 .as_ref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
-            let blocked_patterns: Vec<String> = repo
-                .blocked_patterns
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
+            let blocked_patterns: Vec<String> = match repo.blocked_patterns.as_deref() {
+                None => Vec::new(),
+                Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
+                    Ok(patterns) => {
+                        #[cfg(test)]
+                        if let Some(seen) = PARSED_BLOCKED_PATTERNS.get() {
+                            if let Ok(mut seen) = seen.lock() {
+                                seen.push((repo.id.clone(), patterns.clone()));
+                            }
+                        }
+                        patterns
+                    }
+                    Err(error) => {
+                        error!(
+                            repo_name = %repo.name,
+                            repo_id = %repo.id,
+                            setting = "blocked_patterns",
+                            error = %error,
+                            "blocked_patterns must be a JSON array of strings ([] means no blocked patterns); refusing repository sync"
+                        );
+                        continue;
+                    }
+                },
+            };
             if !allowed_paths.is_empty() || !blocked_patterns.is_empty() {
                 engine.set_path_rules(allowed_paths, blocked_patterns);
                 debug!(repo_name = %repo.name, "path validation rules configured");
@@ -1089,6 +1108,12 @@ impl Scheduler {
         }
     }
 }
+
+/// Successful `blocked_patterns` parses observed by the loader tests.
+/// Absent unless a test installs it, so other scheduler tests are unchanged.
+#[cfg(test)]
+static PARSED_BLOCKED_PATTERNS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod cancellation_tests {
@@ -1833,3 +1858,7 @@ mod pair_refresh_tests;
 #[cfg(test)]
 #[path = "scheduler/maintenance_cadence_tests.rs"]
 mod maintenance_cadence_tests;
+
+#[cfg(test)]
+#[path = "scheduler/blocked_patterns_tests.rs"]
+mod blocked_patterns_tests;
