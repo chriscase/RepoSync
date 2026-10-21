@@ -188,6 +188,13 @@ pub fn bash_blocked_pattern_case_arm(pattern: &str) -> String {
     if let Some(suffix) = pattern.strip_prefix('*') {
         return format!("*{}", bash_single_quoted_literal(suffix));
     }
+    // A trailing star is a same-segment prefix. Quote the stem and leave the
+    // star unquoted so the case arm agrees with path_matches_blocked.
+    if let Some(stem) = pattern.strip_suffix('*') {
+        if !stem.is_empty() {
+            return format!("{}*", bash_single_quoted_literal(stem));
+        }
+    }
     let prefix = pattern.trim_end_matches('/');
     if prefix.is_empty() {
         return String::new();
@@ -271,14 +278,21 @@ pub fn render_pre_commit_hook_script(allowed: &[String], blocked: &[String]) -> 
 /// Blocked-pattern match (suffix glob, directory prefix, or exact/component path).
 pub fn path_matches_blocked(path: &str, pattern: &str) -> bool {
     let path = normalize_policy_path(path);
+    let pattern = normalize_policy_path(pattern);
     if pattern.is_empty() {
         return false;
     }
     if let Some(suffix) = pattern.strip_prefix('*') {
-        path.ends_with(suffix)
-    } else {
-        path_matches_prefix(&path, pattern)
+        return path.ends_with(suffix);
     }
+    // A trailing star completes the current segment and any descendant of it.
+    // `secret-*` matches `secret-note.txt` and `secret-note/child`, not `secret/leak.txt`.
+    if let Some(stem) = pattern.strip_suffix('*') {
+        if !stem.is_empty() {
+            return path.starts_with(stem);
+        }
+    }
+    path_matches_prefix(&path, &pattern)
 }
 
 /// Whether `path` is inside the active Git→SVN projection.
@@ -644,6 +658,40 @@ mod tests {
         assert!(path_matches_blocked("secret/leak.txt", "secret"));
         assert!(!path_matches_blocked("secret-other/leak.txt", "secret"));
         assert!(!path_matches_blocked("secret-other/leak.txt", "secret/"));
+    }
+
+    #[test]
+    fn blocked_trailing_star_matches_same_segment_and_bash_arm() {
+        let pattern = "secret-*";
+        assert_eq!(bash_blocked_pattern_case_arm(pattern), "'secret-'*");
+        for path in [
+            "secret-note.txt",
+            "secret-note/child",
+            "secret-note/child/deep",
+            "secret-other/leak.txt",
+        ] {
+            assert!(path_matches_blocked(path, pattern), "{path}");
+        }
+        assert!(!path_matches_blocked("secret-other/leak.txt", "secret"));
+        for path in [
+            "secret/leak.txt",
+            "notsecret-note.txt",
+            "other/secret-note.txt",
+        ] {
+            assert!(!path_matches_blocked(path, pattern), "{path}");
+        }
+        let script = render_pre_commit_hook_script(&[], &[pattern.into()]);
+        assert!(script.contains("'secret-'*"));
+        for path in ["secret-note.txt", "secret-note/child"] {
+            assert!(
+                !run_hook_on_staged_paths(&script, &[(path, "x\n")]).success(),
+                "{path} must be blocked by the same arm"
+            );
+        }
+        assert!(
+            run_hook_on_staged_paths(&script, &[("secret/leak.txt", "x\n")]).success(),
+            "secret/leak.txt is not a secret-* path"
+        );
     }
 
     #[test]
