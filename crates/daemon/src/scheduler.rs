@@ -960,12 +960,33 @@ impl Scheduler {
                 );
             }
 
-            // Parse and set path validation rules
-            let allowed_paths: Vec<String> = repo
-                .allowed_paths
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
+            // Parse and set path validation rules. NULL and [] are no
+            // restriction. A value that is not a JSON array of strings must
+            // not become that empty unrestricted list.
+            let allowed_paths: Vec<String> = match repo.allowed_paths.as_deref() {
+                None => Vec::new(),
+                Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
+                    Ok(paths) => {
+                        #[cfg(test)]
+                        if let Some(seen) = PARSED_ALLOWED_PATHS.get() {
+                            if let Ok(mut seen) = seen.lock() {
+                                seen.push((repo.id.clone(), paths.clone()));
+                            }
+                        }
+                        paths
+                    }
+                    Err(error) => {
+                        error!(
+                            repo_name = %repo.name,
+                            repo_id = %repo.id,
+                            setting = "allowed_paths",
+                            error = %error,
+                            "allowed_paths must be a JSON array of strings ([] means no path restriction); refusing repository sync"
+                        );
+                        continue;
+                    }
+                },
+            };
             let blocked_patterns: Vec<String> = match repo.blocked_patterns.as_deref() {
                 None => Vec::new(),
                 Some(raw) => match serde_json::from_str::<Vec<String>>(raw) {
@@ -1113,6 +1134,11 @@ impl Scheduler {
 /// Absent unless a test installs it, so other scheduler tests are unchanged.
 #[cfg(test)]
 static PARSED_BLOCKED_PATTERNS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
+    std::sync::OnceLock::new();
+
+/// Successful `allowed_paths` parses observed by the loader tests.
+#[cfg(test)]
+static PARSED_ALLOWED_PATHS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -1862,3 +1888,7 @@ mod maintenance_cadence_tests;
 #[cfg(test)]
 #[path = "scheduler/blocked_patterns_tests.rs"]
 mod blocked_patterns_tests;
+
+#[cfg(test)]
+#[path = "scheduler/allowed_paths_tests.rs"]
+mod allowed_paths_tests;

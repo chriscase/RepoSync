@@ -1,6 +1,17 @@
 //! Fail-closed `blocked_patterns` loader. Fixtures are local temp dirs and
 //! `file://` URLs only: no credentials and no remote services.
+//! These cases are authored source. They are NOT_RUN in this change.
+//!
+//! Admitted workers use a two-thread runtime. `block_in_place` panics on a
+//! current-thread runtime before the cycle body runs, and a timeout-only
+//! join treats that panic as success. Joining the worker proves the task
+//! finished. It does not prove the sync succeeded.
+//!
+//! Dropping a Tokio 1.53.1 `JoinHandle` detaches the task. It does not abort
+//! it. A join therefore polls `&mut JoinHandle`, which is cancel-safe, and
+//! aborts only after a failure. `block_in_place` still runs to completion.
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -108,13 +119,7 @@ fn due_scheduler(repos: &[DueRepo]) -> (tempfile::TempDir, Scheduler) {
         db.set_state(&format!("last_svn_rev_{}", repo.id), "2")
             .unwrap();
         let git_repo = tmp.path().join("repos").join(repo.id).join("git-repo");
-        std::fs::create_dir_all(&git_repo).unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&git_repo)
-            .status()
-            .unwrap()
-            .success());
+        prepare_owned_git_repo(&git_repo);
     }
     let dummy_git = tmp.path().join("dummy-git");
     assert!(std::process::Command::new("git")
@@ -157,14 +162,212 @@ fn parsed_for(repo_id: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-async fn spawned(scheduler: &Scheduler) -> usize {
-    let handles: Vec<_> = scheduler.sync_handles.lock().await.drain(..).collect();
-    let count = handles.len();
-    for handle in handles {
-        let finished = tokio::time::timeout(Duration::from_secs(30), handle).await;
-        assert!(finished.is_ok(), "spawned sync cycle did not finish");
+fn join_failure(error: tokio::task::JoinError) -> String {
+    let panicked = error.is_panic();
+    let detail = match error.try_into_panic() {
+        Ok(payload) => {
+            if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "non-string panic payload".to_string()
+            }
+        }
+        Err(error) => error.to_string(),
+    };
+    format!("spawned sync cycle failed: panicked={panicked}: {detail}")
+}
+
+const SPAWN_JOIN_LIMIT: Duration = Duration::from_secs(30);
+const SPAWN_DRAIN_LIMIT: Duration = Duration::from_secs(1);
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
-    count
+}
+
+fn cleanup_note(drained: usize, still_running: usize) -> String {
+    if still_running == 0 {
+        format!("{drained} drained, aborted and drained")
+    } else {
+        format!(
+            "{drained} drained, abort requested but {still_running} task(s) still running after bounded drain; block_in_place cannot be cancelled and dropping the JoinHandle detaches; outer process bound required"
+        )
+    }
+}
+
+/// `JoinHandle::abort` asks the runtime to cancel. A closure already inside
+/// `block_in_place` does not observe that request. Tokio 1.53.1
+/// `task::block_in_place` documents that this code cannot be cancelled.
+async fn abort_and_drain<I>(handles: I, drain_limit: Duration) -> (usize, usize)
+where
+    I: IntoIterator<Item = tokio::task::JoinHandle<()>>,
+{
+    let mut drained = 0usize;
+    let mut still_running = 0usize;
+    for mut handle in handles {
+        handle.abort();
+        match tokio::time::timeout(drain_limit, &mut handle).await {
+            Ok(_) => drained += 1,
+            Err(_elapsed) => still_running += 1,
+        }
+    }
+    (drained, still_running)
+}
+
+/// Poll each handle by mutable reference. `timeout` dropping that future
+/// must not drop the `JoinHandle`: Tokio 1.53.1 detaches on `Drop` and does
+/// not abort. `&mut JoinHandle` is cancel-safe, so a timeout leaves the
+/// output owned by the handle. On failure the current handle, when it has
+/// not already completed, and every remaining handle are aborted and then
+/// awaited until `drain_limit`. A task still inside `block_in_place` is
+/// counted as still running; dropping it afterwards detaches it, and the
+/// outer process bound is what stops it.
+async fn join_spawned_within(
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    join_limit: Duration,
+    drain_limit: Duration,
+) -> Result<usize, String> {
+    let count = handles.len();
+    let mut pending = handles.into_iter();
+    while let Some(mut handle) = pending.next() {
+        match tokio::time::timeout(join_limit, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let failure = join_failure(error);
+                // The output was taken. Polling this handle again is not safe.
+                handle.abort();
+                let (drained, still_running) = abort_and_drain(pending, drain_limit).await;
+                return Err(format!(
+                    "{failure}; cleanup: {}",
+                    cleanup_note(drained, still_running)
+                ));
+            }
+            Err(_elapsed) => {
+                let (drained, still_running) =
+                    abort_and_drain(std::iter::once(handle).chain(pending), drain_limit).await;
+                return Err(format!(
+                    "spawned sync cycle did not finish; cleanup: {}",
+                    cleanup_note(drained, still_running)
+                ));
+            }
+        }
+    }
+    Ok(count)
+}
+
+async fn join_spawned(handles: Vec<tokio::task::JoinHandle<()>>) -> Result<usize, String> {
+    join_spawned_within(handles, SPAWN_JOIN_LIMIT, SPAWN_DRAIN_LIMIT).await
+}
+
+async fn spawned(scheduler: &Scheduler) -> Result<usize, String> {
+    let handles = scheduler.sync_handles.lock().await.drain(..).collect();
+    join_spawned(handles).await
+}
+
+fn prepare_owned_git_repo(path: &std::path::Path) {
+    std::fs::create_dir_all(path).expect("git repo dir");
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+    // The configured branch is main. An unborn HEAD makes head_sha fail
+    // before history inspection, and that GitError is persisted as error.
+    run(&["init", "--initial-branch", "main"]);
+    std::fs::write(path.join("README"), b"fixture\n").expect("readme");
+    run(&["add", "README"]);
+    run(&[
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "fixture",
+    ]);
+    // A clean born HEAD continues to git ls-remote. This untracked file is
+    // refused as local_dirty before that command.
+    std::fs::write(path.join("unpublished.txt"), b"not committed\n").expect("dirty file");
+}
+
+fn assert_admitted_worker_did_not_sync(scheduler: &Scheduler, repo_id: &str) {
+    let repo = stored(scheduler, repo_id);
+    assert_eq!(
+        repo.sync_status, "reconciliation_required",
+        "{repo_id} was admitted, so the worker must record a blocked cycle"
+    );
+    assert_eq!(repo.consecutive_errors, 1, "{repo_id}");
+    assert_eq!(repo.total_errors, 1, "{repo_id}");
+    assert_eq!(repo.total_syncs, 0, "{repo_id}");
+    assert_eq!(repo.last_svn_rev, 2, "{repo_id}");
+    assert_eq!(repo.last_git_sha, "verified-old", "{repo_id}");
+    let audits = scheduler.db.list_audit_log(20, 0).expect("audit log");
+    assert_eq!(
+        audits
+            .iter()
+            .filter(|entry| entry.action == "sync_cycle" && !entry.success)
+            .count(),
+        1,
+        "{repo_id}"
+    );
+    assert_eq!(
+        audits
+            .iter()
+            .filter(|entry| entry.action == "sync_cycle" && entry.success)
+            .count(),
+        0,
+        "{repo_id} admission must not be recorded as a successful sync"
+    );
+    assert!(
+        audits.iter().any(|entry| {
+            entry.action == "sync_cycle"
+                && !entry.success
+                && entry.details.as_deref().is_some_and(|details| {
+                    details.contains("team history reconciliation required (local_dirty)")
+                        && details.contains("bridge index or worktree has unpublished changes")
+                })
+        }),
+        "{repo_id} must record the local_dirty history refusal"
+    );
+    let key = match reposync_core::history_inspect::history_block_key_for_repo(&scheduler.db, repo_id)
+    {
+        Ok(key) => key,
+        Err(_) => reposync_core::history_inspect::history_block_key(Some(repo_id)),
+    };
+    let raw = scheduler
+        .db
+        .get_state(&key)
+        .expect("history block read")
+        .unwrap_or_else(|| panic!("{repo_id} missing history block {key}"));
+    let block: serde_json::Value = serde_json::from_str(&raw).expect("history block json");
+    assert_eq!(block["state"], "reconciliation_required", "{repo_id}");
+    assert_eq!(block["reason"], "local_dirty", "{repo_id}");
+    assert_eq!(
+        block["detail"], "bridge index or worktree has unpublished changes",
+        "{repo_id}"
+    );
+    assert!(
+        block["r_fresh_remote"].is_null(),
+        "{repo_id} refusal must happen before a remote tip"
+    );
+    let bridge = block["l_bridge"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{repo_id} missing local HEAD"));
+    assert_eq!(bridge.len(), 40, "{repo_id} {bridge}");
+    assert!(
+        bridge.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{repo_id} {bridge}"
+    );
 }
 
 fn stored<'a>(scheduler: &'a Scheduler, repo_id: &str) -> Repository {
@@ -175,7 +378,7 @@ fn stored<'a>(scheduler: &'a Scheduler, repo_id: &str) -> Repository {
         .expect("repository")
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn valid_blocked_pattern_array_configures_rules_and_starts_the_cycle() {
     install_parse_observer();
     let (_tmp, scheduler) = due_scheduler(&[DueRepo {
@@ -205,13 +408,19 @@ async fn valid_blocked_pattern_array_configures_rules_and_starts_the_cycle() {
         "refusing repository sync",
         "valid-array-repo"
     ));
-    assert_eq!(spawned(&scheduler).await, 1);
+    assert_eq!(
+        spawned(&scheduler)
+            .await
+            .expect("admitted worker must finish without panic"),
+        1
+    );
+    assert_admitted_worker_did_not_sync(&scheduler, "valid-array-repo");
     let repo = stored(&scheduler, "valid-array-repo");
     assert_eq!(repo.allowed_paths, None);
     assert_eq!(repo.blocked_patterns.as_deref(), Some("[\"secret-*\"]"));
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_blocked_pattern_array_starts_with_no_blocked_patterns() {
     install_parse_observer();
     let (_tmp, scheduler) = due_scheduler(&[DueRepo {
@@ -238,7 +447,13 @@ async fn empty_blocked_pattern_array_starts_with_no_blocked_patterns() {
         "refusing repository sync",
         "empty-array-repo"
     ));
-    assert_eq!(spawned(&scheduler).await, 1);
+    assert_eq!(
+        spawned(&scheduler)
+            .await
+            .expect("admitted worker must finish without panic"),
+        1
+    );
+    assert_admitted_worker_did_not_sync(&scheduler, "empty-array-repo");
     let repo = stored(&scheduler, "empty-array-repo");
     assert_eq!(repo.blocked_patterns.as_deref(), Some("[]"));
     assert_eq!(repo.allowed_paths, None);
@@ -277,7 +492,12 @@ async fn non_json_blocked_pattern_refuses_that_repository() {
         "path validation rules configured",
         "raw-secret-repo"
     ));
-    assert_eq!(spawned(&scheduler).await, 0);
+    assert_eq!(
+        spawned(&scheduler)
+            .await
+            .expect("refused repository must not spawn a worker"),
+        0
+    );
     let repo = stored(&scheduler, "raw-secret-repo");
     assert_eq!(repo.sync_status, "idle");
     assert_eq!(repo.consecutive_errors, 0);
@@ -313,7 +533,13 @@ async fn malformed_and_non_array_blocked_patterns_refuse_that_repository() {
             !logged(&log, "path validation rules configured", id),
             "{raw}"
         );
-        assert_eq!(spawned(&scheduler).await, 0, "{raw}");
+        assert_eq!(
+            spawned(&scheduler)
+                .await
+                .expect("refused repository must not spawn a worker"),
+            0,
+            "{raw}"
+        );
         let repo = stored(&scheduler, id);
         assert_eq!(repo.sync_status, "idle");
         assert_eq!(repo.consecutive_errors, 0);
@@ -322,7 +548,7 @@ async fn malformed_and_non_array_blocked_patterns_refuse_that_repository() {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_blocked_patterns_leave_the_other_repository_running() {
     install_parse_observer();
     let (_tmp, scheduler) = due_scheduler(&[
@@ -358,18 +584,26 @@ async fn malformed_blocked_patterns_leave_the_other_repository_running() {
         "path validation rules configured",
         "b-good-repo"
     ));
-    assert_eq!(spawned(&scheduler).await, 1);
+    assert_eq!(
+        spawned(&scheduler)
+            .await
+            .expect("admitted worker must finish without panic"),
+        1
+    );
     let bad = stored(&scheduler, "a-bad-patterns");
     assert_eq!(bad.sync_status, "idle");
     assert_eq!(bad.consecutive_errors, 0);
+    assert_eq!(bad.total_errors, 0);
+    assert_eq!(bad.total_syncs, 0);
     assert_eq!(bad.blocked_patterns.as_deref(), Some("secret-*"));
+    assert_admitted_worker_did_not_sync(&scheduler, "b-good-repo");
     let good = stored(&scheduler, "b-good-repo");
     assert_eq!(good.blocked_patterns.as_deref(), Some("[]"));
     assert_eq!(good.allowed_paths, None);
     assert_eq!(bad.allowed_paths, None);
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_blocked_patterns_start_without_configuring_rules() {
     install_parse_observer();
     let (_tmp, scheduler) = due_scheduler(&[DueRepo {
@@ -396,7 +630,13 @@ async fn absent_blocked_patterns_start_without_configuring_rules() {
         "refusing repository sync",
         "absent-patterns-repo"
     ));
-    assert_eq!(spawned(&scheduler).await, 1);
+    assert_eq!(
+        spawned(&scheduler)
+            .await
+            .expect("admitted worker must finish without panic"),
+        1
+    );
+    assert_admitted_worker_did_not_sync(&scheduler, "absent-patterns-repo");
     let repo = stored(&scheduler, "absent-patterns-repo");
     assert_eq!(repo.blocked_patterns, None);
     assert_eq!(repo.allowed_paths, None);
@@ -433,10 +673,134 @@ async fn non_string_json_array_refuses_that_repository() {
         "path validation rules configured",
         "numeric-array-repo"
     ));
-    assert_eq!(spawned(&scheduler).await, 0);
+    assert_eq!(
+        spawned(&scheduler)
+            .await
+            .expect("refused repository must not spawn a worker"),
+        0
+    );
     let repo = stored(&scheduler, "numeric-array-repo");
     assert_eq!(repo.sync_status, "idle");
     assert_eq!(repo.consecutive_errors, 0);
     assert_eq!(repo.blocked_patterns.as_deref(), Some("[1]"));
     assert_eq!(repo.allowed_paths, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_panic_cannot_satisfy_the_spawn_helper() {
+    let finished = tokio::spawn(async {});
+    assert_eq!(
+        join_spawned(vec![finished])
+            .await
+            .expect("a finished worker counts"),
+        1
+    );
+    let panicked = tokio::spawn(async {
+        panic!("synthetic worker panic");
+    });
+    let error = join_spawned(vec![panicked])
+        .await
+        .expect_err("a panicked worker must not count as a finished cycle");
+    assert!(error.contains("panicked=true"), "{error}");
+    assert!(error.contains("synthetic worker panic"), "{error}");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn worker_timeout_aborts_and_drains_the_current_task_and_sibling() {
+    let current_dropped = Arc::new(AtomicBool::new(false));
+    let sibling_dropped = Arc::new(AtomicBool::new(false));
+    let current_flag = DropFlag(current_dropped.clone());
+    let sibling_flag = DropFlag(sibling_dropped.clone());
+    let (current_tx, current_rx) = tokio::sync::oneshot::channel();
+    let (sibling_tx, sibling_rx) = tokio::sync::oneshot::channel();
+    let current = tokio::spawn(async move {
+        let _flag = current_flag;
+        let _ = current_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    let sibling = tokio::spawn(async move {
+        let _flag = sibling_flag;
+        let _ = sibling_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    current_rx.await.expect("current task entered");
+    sibling_rx.await.expect("sibling task entered");
+    let error = join_spawned_within(
+        vec![current, sibling],
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect_err("timeout must not count as a finished cycle");
+    assert!(error.contains("did not finish"), "{error}");
+    assert!(error.contains("2 drained"), "{error}");
+    assert!(error.contains("aborted and drained"), "{error}");
+    assert!(!error.contains("still running"), "{error}");
+    assert!(
+        current_dropped.load(Ordering::SeqCst),
+        "the timed-out task must be aborted and dropped"
+    );
+    assert!(
+        sibling_dropped.load(Ordering::SeqCst),
+        "a later sibling must be aborted and dropped, not detached"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_panic_aborts_and_drains_remaining_siblings() {
+    let sibling_dropped = Arc::new(AtomicBool::new(false));
+    let sibling_flag = DropFlag(sibling_dropped.clone());
+    let (sibling_tx, sibling_rx) = tokio::sync::oneshot::channel();
+    let sibling = tokio::spawn(async move {
+        let _flag = sibling_flag;
+        let _ = sibling_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    sibling_rx.await.expect("sibling task entered");
+    let panicked = tokio::spawn(async {
+        panic!("synthetic worker panic");
+    });
+    tokio::task::yield_now().await;
+    let error = join_spawned_within(
+        vec![panicked, sibling],
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+    )
+    .await
+    .expect_err("a panicked worker must not count as a finished cycle");
+    assert!(error.contains("panicked=true"), "{error}");
+    assert!(error.contains("synthetic worker panic"), "{error}");
+    assert!(error.contains("1 drained"), "{error}");
+    assert!(error.contains("aborted and drained"), "{error}");
+    assert!(
+        sibling_dropped.load(Ordering::SeqCst),
+        "a sibling must be aborted after a panic, not detached"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_in_place_keeps_running_after_bounded_abort() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = tokio::spawn(async move {
+        tokio::task::block_in_place(|| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+    });
+    entered_rx.await.expect("closure entered block_in_place");
+    let error = join_spawned_within(
+        vec![handle],
+        Duration::from_millis(50),
+        Duration::from_millis(50),
+    )
+    .await
+    .expect_err("block_in_place must outlive abort");
+    assert!(error.contains("did not finish"), "{error}");
+    assert!(error.contains("0 drained"), "{error}");
+    assert!(error.contains("still running"), "{error}");
+    assert!(error.contains("block_in_place cannot be cancelled"), "{error}");
+    assert!(error.contains("detaches"), "{error}");
+    assert!(error.contains("outer process bound required"), "{error}");
+    let _ = release_tx.send(());
 }
