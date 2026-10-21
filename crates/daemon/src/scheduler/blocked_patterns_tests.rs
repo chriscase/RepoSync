@@ -368,3 +368,75 @@ async fn malformed_blocked_patterns_leave_the_other_repository_running() {
     assert_eq!(good.allowed_paths, None);
     assert_eq!(bad.allowed_paths, None);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn absent_blocked_patterns_start_without_configuring_rules() {
+    install_parse_observer();
+    let (_tmp, scheduler) = due_scheduler(&[DueRepo {
+        id: "absent-patterns-repo",
+        name: "absent-patterns-repo",
+        blocked_patterns: None,
+    }]);
+    let (buf, _guard) = capture();
+    scheduler.maybe_run_repo_cycles().await;
+    let log = buf.lock().expect("log buffer").clone();
+    assert!(parsed_for("absent-patterns-repo").is_empty());
+    assert!(!logged(
+        &log,
+        "path validation rules configured",
+        "absent-patterns-repo"
+    ));
+    assert!(logged(
+        &log,
+        "starting per-repo sync cycle",
+        "absent-patterns-repo"
+    ));
+    assert!(!logged(
+        &log,
+        "refusing repository sync",
+        "absent-patterns-repo"
+    ));
+    assert_eq!(spawned(&scheduler).await, 1);
+    let repo = stored(&scheduler, "absent-patterns-repo");
+    assert_eq!(repo.blocked_patterns, None);
+    assert_eq!(repo.allowed_paths, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_string_json_array_refuses_that_repository() {
+    install_parse_observer();
+    let (_tmp, scheduler) = due_scheduler(&[DueRepo {
+        id: "numeric-array-repo",
+        name: "numeric-array-repo",
+        blocked_patterns: Some("[1]"),
+    }]);
+    let (buf, _guard) = capture();
+    scheduler.maybe_run_repo_cycles().await;
+    let log = buf.lock().expect("log buffer").clone();
+    assert!(parsed_for("numeric-array-repo").is_empty());
+    assert!(logged(
+        &log,
+        "blocked_patterns must be a JSON array of strings",
+        "numeric-array-repo"
+    ));
+    assert!(
+        logged(&log, "setting=blocked_patterns", "numeric-array-repo")
+            || logged(&log, "setting=\"blocked_patterns\"", "numeric-array-repo")
+    );
+    assert!(!logged(
+        &log,
+        "starting per-repo sync cycle",
+        "numeric-array-repo"
+    ));
+    assert!(!logged(
+        &log,
+        "path validation rules configured",
+        "numeric-array-repo"
+    ));
+    assert_eq!(spawned(&scheduler).await, 0);
+    let repo = stored(&scheduler, "numeric-array-repo");
+    assert_eq!(repo.sync_status, "idle");
+    assert_eq!(repo.consecutive_errors, 0);
+    assert_eq!(repo.blocked_patterns.as_deref(), Some("[1]"));
+    assert_eq!(repo.allowed_paths, None);
+}
