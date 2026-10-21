@@ -102,8 +102,128 @@ SCANNER_CASES = {
 }
 
 
+# Exact reviewed native sources; these records never authorize fixture substitution.
+NATIVE_ABSENCE_REGISTRY = [{'policy': 'native-absence-213-v1',
+  'prepared_crates_file_count': 85,
+  'prepared_crates_inventory_sha256': 'afd5bf52410391a409c08cc75cb178e4301db3b14c9d48b03ec80ceafe4804d7',
+  'reviewed_overlay': {'files': [{'archive_sha256': '0663170a667903bd0ee2fd99f0e0d43c81c682029d1072cdb5eeae1cd0fdd65e',
+                                  'path': 'crates/core/tests/team_mode_e2e.rs',
+                                  'prepared_git_blob_sha1': '274fca0ba7d348fba1445ca49fc9ae0709bbfcd3',
+                                  'prepared_sha256': 'fa8b4c40a6eee781cd19b8ab0056b0352656eaa04b3a133b6cc8d9615dc09904'}],
+                       'id': 'svn-author-fixture-v1'},
+  'role': 'base',
+  'runtime_mode': 'baseline',
+  'source_head': '87379741779a6259f7eeb52a68cc6f061174e5ef',
+  'source_tree': 'f383bb9b123f3f75b2dde7f17f7311a264946abd'},
+ {'policy': 'native-absence-213-v1',
+  'prepared_crates_file_count': 85,
+  'prepared_crates_inventory_sha256': '7624114405fa67ba108adf87f5f5c2129014c8ccde4be4a07e62f9c6f8c8d37b',
+  'reviewed_overlay': {'files': [], 'id': 'none'},
+  'role': 'previous',
+  'runtime_mode': 'baseline',
+  'source_head': 'f74fce855a1f1d80dd631397f436ba33906272e6',
+  'source_tree': '2819ed3cd27d0dad13847e481e18f550aac15d06'},
+ {'policy': 'native-absence-213-v1',
+  'prepared_crates_file_count': 96,
+  'prepared_crates_inventory_sha256': '9899774b12d7a0ef1a07755f9c2c6bde2ae9e2865366522819a2fb1318ff8877',
+  'reviewed_overlay': {'files': [], 'id': 'none'},
+  'role': 'immediate',
+  'runtime_mode': 'baseline',
+  'source_head': 'ab097580d9415ae2f8df44bed4041f740a1b38f2',
+  'source_tree': '355bba3f3bd37009183c490f41a52cbea2ac68f9'},
+ {'policy': 'native-absence-213-v1',
+  'prepared_crates_file_count': 98,
+  'prepared_crates_inventory_sha256': 'b2322560f1c0477fce31782d95a41b7a820ca9a189e3dd1807d53e62d3189e30',
+  'reviewed_overlay': {'files': [], 'id': 'none'},
+  'role': 'merged',
+  'runtime_mode': 'baseline',
+  'source_head': '54e183484961bd9ad12bd03505b3b00610de7cd9',
+  'source_tree': '8d1c7a38239634e8ac830588cb6b09a93badd635'}]
+CORE_FIXTURE_PATHS = (
+    "crates/core/tests/fixtures/git_http_auth_server.py",
+    "crates/core/tests/fixtures/pair_refresh_http_server.py",
+)
+STARTUP_FIXTURE_PATH = "crates/cli/tests/fixtures/startup_provider.py"
+
+
+def strict_json_loads(text):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate input JSON key: {key}")
+            result[key] = value
+        return result
+    def invalid_constant(value):
+        raise ValueError(f"invalid input JSON constant: {value}")
+    return json.loads(text, object_pairs_hook=unique, parse_constant=invalid_constant)
+
+
+def native_admission(value):
+    if value is None:
+        return None
+    # Canonical comparison also rejects numeric type changes such as 85 -> 85.0.
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    for record in NATIVE_ABSENCE_REGISTRY:
+        if encoded == json.dumps(record, sort_keys=True, separators=(",", ":")):
+            return record
+    raise ValueError("unknown historical source/role/overlay admission")
+
+
+def absent_record(relative):
+    return {"path": relative, "origin": "source_absent",
+            "archive": {"state": "absent"}, "fallback_allowed": False}
+
+
+def require_absent(root, relative):
+    path = root / relative
+    for ancestor in (path, *path.parents):
+        if ancestor == root.parent:
+            break
+        if ancestor.is_symlink():
+            raise ValueError(f"absent fixture path is a symlink: {ancestor}")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    raise ValueError(f"source-absent fixture is present: {relative}")
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def runtime_absences(inputs):
+    if (not isinstance(inputs, dict)
+            or set(inputs) != {"schema", "files", "absent_fixtures", "historical_admission"}
+            or type(inputs["schema"]) is not int or inputs["schema"] != 2 or not isinstance(inputs["files"], dict)
+            or not isinstance(inputs["absent_fixtures"], list)):
+        raise ValueError("invalid runtime input schema")
+    known = set(CORE_FIXTURE_PATHS) | {STARTUP_FIXTURE_PATH}
+    absent = {}
+    for item in inputs["absent_fixtures"]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise ValueError("invalid runtime absence record")
+        relative = item["path"]
+        if (relative not in known or relative in absent or item != absent_record(relative)
+                or item["fallback_allowed"] is not False):
+            raise ValueError("invalid/duplicate runtime absence provenance")
+        absent[relative] = item
+    if list(absent) != sorted(absent):
+        raise ValueError("runtime absences are not sorted")
+    applications = {"target/debug/reposync", "target/debug/reposync-personal"}
+    present = set(inputs["files"])
+    if (not applications <= present <= applications | known
+            or set(absent) != known - present):
+        raise ValueError("inconsistent runtime present/absent partition")
+    admission = native_admission(inputs["historical_admission"])
+    core_absent = set(absent) & set(CORE_FIXTURE_PATHS)
+    if core_absent:
+        if core_absent != set(CORE_FIXTURE_PATHS) or admission is None:
+            raise ValueError("incomplete/unadmitted native core absence")
+    elif admission is not None:
+        raise ValueError("historical admission without core absence")
+    return absent, admission
 
 
 def assert_runtime_source_isolation(src=Path("/src"), runtime_inputs=None):
@@ -114,17 +234,10 @@ def assert_runtime_source_isolation(src=Path("/src"), runtime_inputs=None):
     assert not src.is_symlink(), "runtime source root is a symlink"
     if runtime_inputs is not None:
         applications = {"target/debug/reposync", "target/debug/reposync-personal"}
-        fixtures = {
-            "crates/core/tests/fixtures/pair_refresh_http_server.py",
-            "crates/core/tests/fixtures/git_http_auth_server.py",
-            "crates/cli/tests/fixtures/startup_provider.py",
-        }
-        assert set(runtime_inputs) == {"schema", "files", "absent_fixtures"}, "invalid runtime input manifest"
-        assert runtime_inputs["schema"] == 1, "unknown runtime input schema"
-        files, absent = runtime_inputs["files"], runtime_inputs["absent_fixtures"]
-        assert isinstance(files, dict) and isinstance(absent, list), "invalid runtime input inventory"
-        assert applications <= files.keys() <= applications | fixtures, "unexpected or missing runtime input"
-        assert len(absent) == len(set(absent)) and set(absent) == fixtures - files.keys(), "incomplete source fixture inventory"
+        absent, _ = runtime_absences(runtime_inputs)
+        files = runtime_inputs["files"]
+        for relative in absent:
+            require_absent(src, relative)
         directories = {"", "crates", "crates/core", "crates/cli",
                        "crates/personal", "crates/web", "web-ui"}
         for relative in files:
@@ -159,15 +272,23 @@ def assert_runtime_source_isolation(src=Path("/src"), runtime_inputs=None):
         assert not (src / name).exists(), "full source checkout was mounted into runtime"
 
 
-def validate_runtime_inputs(src=Path("/src"), tests=TESTS, runtime_inputs=None):
+def validate_runtime_inputs(src=Path("/src"), tests=TESTS, runtime_inputs=None, *,
+                            source_head=None, source_tree=None, mode=None):
     """Compose ed56's exact inventory with PR214's fixture and package binding."""
-    inputs = (json.loads((tests / "runtime-inputs.json").read_text())
+    inputs = (strict_json_loads((tests / "runtime-inputs.json").read_text())
               if runtime_inputs is None else runtime_inputs)
     assert_runtime_source_isolation(src, inputs)
+    absent, admission = runtime_absences(inputs)
+    if admission is not None and ((source_head, source_tree, mode) !=
+            (admission["source_head"], admission["source_tree"], admission["runtime_mode"])):
+        raise ValueError("native absence runtime identity/mode differs from admission")
     assert not tests.is_symlink() and tests.is_dir(), "invalid application package root"
     anchor = {'source_head': '7d4c8f81a6faeb664956bbe4c56c4a0da2fb1c65', 'source_tree': '0d9d37853e0df188bb5ec84752d0c78adda46caf', 'fixtures': {'git_http_auth_server.py': {'git_blob_sha1': '3b856fdd546e005613eb73e7e60d2a9470ec224b', 'sha256': 'ed5eed6797a2ca2b35cac5645293a44e90d1f77e409b95353c1465ae15083f33'}, 'pair_refresh_http_server.py': {'git_blob_sha1': 'e690a127cd40b5172ef9ea86d5e4379a6576fc6e', 'sha256': '5417a82fa1e72a65b5e43d74aaca45cf61ba471a10583dfe17c15d5d94521bd9'}}}
     for name in ("git_http_auth_server.py", "pair_refresh_http_server.py"):
         relative = f"crates/core/tests/fixtures/{name}"
+        if relative in absent:
+            require_absent(src, relative)
+            continue
         entry = inputs["files"][relative]
         staged = entry["fixture_provenance"]
         assert set(staged) == {"reviewed_anchor", "origin", "sha256", "git_blob_sha1", "archive", "fallback_allowed"}, "invalid fixture provenance"
@@ -733,7 +854,8 @@ def baseline_self_test():
         (src / "web-ui").mkdir(parents=True)
         for directory in ("crates/web", "crates/cli", "crates/personal", "crates/core/tests/fixtures", "target/debug"):
             (src / directory).mkdir(parents=True, exist_ok=True)
-        inputs = {"schema": 1, "files": {}, "absent_fixtures": ["crates/cli/tests/fixtures/startup_provider.py"]}
+        inputs = {"schema": 2, "files": {}, "historical_admission": None,
+                  "absent_fixtures": [absent_record(STARTUP_FIXTURE_PATH)]}
         def entry(path, kind, **metadata):
             data = path.read_bytes()
             return {"kind": kind, "bytes": len(data), "sha256": digest(data),
@@ -762,7 +884,7 @@ def baseline_self_test():
         def reject_layout():
             try:
                 validate_runtime_inputs(src, root)
-            except (AssertionError, FileNotFoundError, KeyError):
+            except (AssertionError, FileNotFoundError, KeyError, ValueError):
                 return
             raise AssertionError("invalid runtime source/package accepted")
         for forbidden in (src / "crates/web/lib.rs", src / "Cargo.toml", src / "crates/core/tests/fixtures/owned_process_group.rs"):
@@ -813,7 +935,7 @@ def baseline_self_test():
         startup.parent.rmdir()
         startup.parent.parent.rmdir()
         del inputs["files"][relative]
-        inputs["absent_fixtures"] = [relative]
+        inputs["absent_fixtures"] = [absent_record(relative)]
         write_inputs()
         web = src / "crates/web"
         web.rmdir()
@@ -834,7 +956,9 @@ def main():
         assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
         assert (os.getuid(), os.getgid()) == (65532, 65532), "numeric runtime identity changed"
         input_manifest = (TESTS / "runtime-inputs.json").read_bytes()
-        inputs = validate_runtime_inputs(runtime_inputs=json.loads(input_manifest))
+        inputs = validate_runtime_inputs(runtime_inputs=strict_json_loads(input_manifest),
+            source_head=os.environ["REPOSYNC_SOURCE_HEAD"],
+            source_tree=os.environ["REPOSYNC_SOURCE_TREE"], mode=mode)
         (OUTPUT / "runtime-inputs.json").write_text(json.dumps({
             "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
             "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
