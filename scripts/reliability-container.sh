@@ -51,6 +51,9 @@ phase=lock_staging
 python3 "$repo_root/scripts/reliability-lock-overlay.py" stage "$prepared_context" \
   --source "$lock_source" --receipt "$artifact_dir/build-lock.json"
 cp "$prepared_context/Cargo.lock" "$prepared_context/docs/reliability/fixtures/Cargo.lock"
+phase=runtime_fixture_staging
+python3 "$repo_root/scripts/reliability-prep.py" --stage-fixtures "$prepared_context" \
+  "$repo_root" "$artifact_dir/fixture-inputs.json"
 mkdir "$prepared_context/legacy-old"
 phase=old_source_archive
 git archive 87379741779a6259f7eeb52a68cc6f061174e5ef | tar -x -C "$prepared_context/legacy-old"

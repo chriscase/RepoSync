@@ -159,6 +159,174 @@ def assert_runtime_source_isolation(src=Path("/src"), runtime_inputs=None):
         assert not (src / name).exists(), "full source checkout was mounted into runtime"
 
 
+def validate_runtime_inputs(src=Path("/src"), tests=TESTS, runtime_inputs=None):
+    """Compose ed56's exact inventory with PR214's fixture and package binding."""
+    inputs = (json.loads((tests / "runtime-inputs.json").read_text())
+              if runtime_inputs is None else runtime_inputs)
+    assert_runtime_source_isolation(src, inputs)
+    assert not tests.is_symlink() and tests.is_dir(), "invalid application package root"
+    anchor = {'source_head': '7d4c8f81a6faeb664956bbe4c56c4a0da2fb1c65', 'source_tree': '0d9d37853e0df188bb5ec84752d0c78adda46caf', 'fixtures': {'git_http_auth_server.py': {'git_blob_sha1': '3b856fdd546e005613eb73e7e60d2a9470ec224b', 'sha256': 'ed5eed6797a2ca2b35cac5645293a44e90d1f77e409b95353c1465ae15083f33'}, 'pair_refresh_http_server.py': {'git_blob_sha1': 'e690a127cd40b5172ef9ea86d5e4379a6576fc6e', 'sha256': '5417a82fa1e72a65b5e43d74aaca45cf61ba471a10583dfe17c15d5d94521bd9'}}}
+    for name in ("git_http_auth_server.py", "pair_refresh_http_server.py"):
+        relative = f"crates/core/tests/fixtures/{name}"
+        entry = inputs["files"][relative]
+        staged = entry["fixture_provenance"]
+        assert set(staged) == {"reviewed_anchor", "origin", "sha256", "git_blob_sha1", "archive", "fallback_allowed"}, "invalid fixture provenance"
+        assert staged["reviewed_anchor"] == anchor, "unexpected reviewed fixture anchor"
+        data = (src / relative).read_bytes()
+        identity = {"sha256": digest(data), "git_blob_sha1": hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()}
+        assert identity == {key: staged[key] for key in identity}, "fixture differs from staged bytes"
+        assert type(staged["fallback_allowed"]) is bool, "invalid fallback capability receipt"
+        assert staged["origin"] in ("source_archive", "reviewed_harness_fallback"), "invalid fixture origin"
+        if staged["origin"] == "reviewed_harness_fallback":
+            assert staged["fallback_allowed"] and staged["archive"] == {"state": "absent"}, "fallback has no caller capability or archive absence"
+            assert identity == anchor["fixtures"][name], "fallback differs from reviewed blob"
+        else:
+            assert staged["archive"] == {"state": "present", **identity}, "fixture differs from archived source"
+    startup_relative = "crates/cli/tests/fixtures/startup_provider.py"
+    if startup_relative in inputs["files"]:
+        staged = inputs["files"][startup_relative]["fixture_provenance"]
+        data = (src / startup_relative).read_bytes()
+        identity = {"sha256": digest(data), "git_blob_sha1": hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()}
+        assert staged == {"origin": "source_archive", "archive": {"state": "present", **identity},
+                          "fallback_allowed": False}, "startup provider is not the archived original"
+    for name in ("reposync", "reposync-personal"):
+        entry = inputs["files"][f"target/debug/{name}"]
+        assert entry["packaged_path"] == name, "application path escaped package"
+        binary = tests / name
+        assert not binary.is_symlink() and binary.is_file(), f"invalid packaged application: {name}"
+        data = binary.read_bytes()
+        assert len(data) == entry["bytes"] and digest(data) == entry["sha256"], f"packaged application digest mismatch: {name}"
+        mode = stat.S_IMODE(binary.stat().st_mode)
+        assert mode == entry["mode"] and mode & 0o111, f"packaged application mode mismatch: {name}"
+    return inputs
+
+
+def persist_prerequisites(receipt):
+    (OUTPUT / "runtime-prerequisites.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+
+
+def require_runtime_integrity(check):
+    """Persist an integrity refusal before stopping; never manufacture results."""
+    receipt = {"integrity": "STARTED", "observations": {}}
+    persist_prerequisites(receipt)
+    try:
+        result = check()
+    except Exception as error:
+        receipt.update(integrity="FAIL", error_type=type(error).__name__, error=str(error))
+        persist_prerequisites(receipt)
+        raise
+    receipt["integrity"] = "PASS"
+    persist_prerequisites(receipt)
+    return result
+
+
+def runtime_prerequisites(inputs, checks=None):
+    """Observation failures are durable evidence and never replace test results."""
+    import pwd
+    import stat
+    import uuid
+    import shutil
+    def native(data):
+        identity = pwd.getpwuid(os.getuid())
+        data.update(uid=os.getuid(), gid=os.getgid(), name=identity.pw_name)
+        assert identity.pw_name == "fixture", "synthetic account name unavailable"
+        machine = Path("/etc/machine-id")
+        info = machine.lstat()
+        value = machine.read_text().strip()
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+        assert value == "21300000000040008000000000000001", "synthetic native identity unavailable"
+        data["machine_id_sha256"] = digest(value.encode())
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        assert uuid.UUID(boot).int != 0
+        namespace = Path("/proc/self/ns/pid").stat()
+        data.update(boot_id_sha256=digest(boot.encode()), pid_namespace_device=namespace.st_dev,
+                    pid_namespace_inode=namespace.st_ino)
+    def tools(data):
+        data.update({name: shutil.which(name) for name in
+                     ("git", "svn", "svnadmin", "svnserve", "openssl", "python3", "node")})
+        assert all(data.values()), f"missing runtime tool: {data}"
+    def mounts(data):
+        data["fixture_mounts"] = [line for line in Path("/proc/mounts").read_text().splitlines()
+                                  if line.split()[1] in ("/fixture", "/tmp")]
+    def failure_mounts():
+        try:
+            raw = Path("/proc/mounts").read_bytes()
+            return {"proc_mounts": raw.decode("utf-8"), "sha256": digest(raw)}
+        except Exception as error:
+            return {"error_type": type(error).__name__, "error": str(error)}
+    def execution(data):
+        with tempfile.TemporaryDirectory(prefix="prerequisite-probe-", dir=FIXTURE / "tmp") as temporary:
+            root = Path(temporary)
+            def run(args, **kwargs):
+                try:
+                    child = subprocess.run(args, capture_output=True, text=True, timeout=15, **kwargs)
+                    return {"exit_code": child.returncode, "stdout": child.stdout, "stderr": child.stderr}
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    details = {"error": str(error), "error_type": type(error).__name__,
+                               "failure_mounts": failure_mounts()}
+                    if isinstance(error, OSError):
+                        details.update(errno=error.errno, strerror=error.strerror,
+                                       filename=error.filename, filename2=error.filename2)
+                    else:
+                        details.update(command=error.cmd, timeout=error.timeout)
+                    return details
+            script = root / "fixture-exec-probe"
+            script.write_text("#!/bin/sh\nprintf 'owned-execution-probe\n'\nexit 23\n")
+            script.chmod(0o755)
+            data["direct"] = run([str(script)])
+            data["shell_control"] = run(["/bin/sh", str(script)])
+            data["path"] = run([script.name], env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"]})
+            # Invoke the hook's Python shebang through the kernel at the same
+            # owned path/mode; its result is diagnostic and never gates cases.
+            hook_script = "#!/usr/bin/env python3\nraise SystemExit(29)\n"
+            script.write_text(hook_script)
+            data["hook_shebang"] = {"shebang": hook_script.splitlines()[0],
+                                     "script_sha256": digest(script.read_bytes()),
+                                     "mode": stat.S_IMODE(script.stat().st_mode),
+                                     "expected_exit_code": 29, "result": run([str(script)])}
+            data["git_setup"] = []
+            bare, work = root / "bare.git", root / "work"
+            for command in (["git", "init", "--bare", str(bare)], ["git", "init", str(work)],
+                            ["git", "-C", str(work), "commit", "--allow-empty", "-m", "synthetic prerequisite control"]):
+                step = run(command)
+                data["git_setup"].append(step)
+                persist_prerequisites(receipt)
+                if step.get("exit_code") != 0:
+                    raise RuntimeError("Git fixture setup failed; inspect retained step")
+            data["default_identity"] = run(["git", "-C", str(work), "var", "GIT_AUTHOR_IDENT"])
+            data["explicit_identity"] = run(["git", "-C", str(work), "-c", "user.name=Explicit Fixture", "-c",
+                                             "user.email=explicit@example.invalid", "var", "GIT_AUTHOR_IDENT"])
+            marker = root / "hook-ran"
+            hook = bare / "hooks/pre-receive"
+            hook.write_text(f"#!/bin/sh\nprintf 'rejected\n' > '{marker}'\nexit 1\n")
+            hook.chmod(0o755)
+            data["git_rejection"] = run(["git", "-C", str(work), "push", str(bare), "HEAD:refs/heads/main"])
+            data["hook_ran"] = marker.exists()
+            data["hook_rejection_effective"] = marker.exists() and data["git_rejection"].get("exit_code") not in (None, 0)
+            if not data["hook_rejection_effective"]:
+                data["ineffective_hook_mounts"] = failure_mounts()
+            persist_prerequisites(receipt)
+            assert data["shell_control"].get("exit_code") == 23, "shell execution control failed"
+            assert data["default_identity"].get("stdout", "").startswith("Fixture <fixture@example.invalid>"), "default Git identity missing"
+            assert data["explicit_identity"].get("stdout", "").startswith("Explicit Fixture <explicit@example.invalid>"), "fixture default overrode explicit test identity"
+    receipt = {"integrity": "PASS", "inputs": inputs, "observations": {}}
+    persist_prerequisites(receipt)
+    for name, check in (checks if checks is not None else
+                        (("native_identity", native), ("tools", tools), ("mounts", mounts), ("execution_probe", execution))):
+        observation = {"status": "STARTED", "data": {}}
+        receipt["observations"][name] = observation
+        persist_prerequisites(receipt)
+        try:
+            check(observation["data"])
+        except Exception as error:
+            observation.update(status="FAIL", error_type=type(error).__name__, error=str(error),
+                               failure_mounts=failure_mounts())
+        else:
+            observation["status"] = "PASS"
+        persist_prerequisites(receipt)
+    return receipt
+
+
 def probe_connection(address):
     try:
         with socket.create_connection(address, timeout=1):
@@ -531,31 +699,128 @@ def baseline_self_test():
         assert (evidence / "baseline-fixture.log").read_text() == stdout + stderr
         assert (evidence / "baseline-fixture.stdout.log").read_text() == stdout
         assert (evidence / "baseline-fixture.stderr.log").read_text() == stderr
-        # Only empty traversal ancestors are permitted; Rust files, other crate
-        # trees and symlink substitutions still fail the runtime boundary.
-        src = root / "src"
-        (src / "web-ui").mkdir(parents=True)
-        web = src / "crates/web"
-        web.mkdir(parents=True)
-        assert_runtime_source_isolation(src)
-        for forbidden in (web / "lib.rs", src / "Cargo.toml", src / "crates/core"):
-            forbidden.write_text("forbidden runtime content")
+        # Probe/setup failures stay durable and cannot suppress a real catalog.
+        with patch.dict(globals(), TESTS=root, OUTPUT=evidence), patch.dict(os.environ, {
+            "REPOSYNC_SOURCE_HEAD": "fixture", "REPOSYNC_SOURCE_TREE": "fixture",
+            "REPOSYNC_LOCK_SHA256": "fixture", "REPOSYNC_GOAL_SHA256": "fixture",
+        }), contextlib.redirect_stdout(io.StringIO()):
+            def fail_probe(data):
+                data["partial_step"] = "retained"
+                raise OSError("injected prerequisite setup failure")
+            def final_probe(data):
+                data["later_probe_ran"] = True
+            observed = runtime_prerequisites({}, checks=[(name, fail_probe) for name in
+                ("native_identity", "tools", "shell", "git_setup")] + [("later", final_probe)])
+            stored = json.loads((evidence / "runtime-prerequisites.json").read_text())
+            assert stored == observed
+            assert all(stored["observations"][name]["status"] == "FAIL" for name in
+                       ("native_identity", "tools", "shell", "git_setup"))
+            assert stored["observations"]["git_setup"]["data"]["partial_step"] == "retained"
+            assert stored["observations"]["later"]["data"]["later_probe_ran"]
+            run_baseline({"fixture": "fixture"})
+            assert json.loads((evidence / "baseline-results.json").read_text())["tests"] == report["tests"]
             try:
-                assert_runtime_source_isolation(src)
-            except AssertionError:
+                require_runtime_integrity(lambda: fail_probe({}))
+            except OSError:
                 pass
             else:
-                raise AssertionError("runtime source content accepted")
+                raise AssertionError("integrity stop was downgraded to observation")
+            refusal = json.loads((evidence / "runtime-prerequisites.json").read_text())
+            assert refusal["integrity"] == "FAIL" and refusal["error_type"] == "OSError"
+        # Preserve exact source isolation, now with regular baked-path applications
+        # plus byte/mode-bound sibling copies and the archive-only startup provider.
+        src = root / "src"
+        (src / "web-ui").mkdir(parents=True)
+        for directory in ("crates/web", "crates/cli", "crates/personal", "crates/core/tests/fixtures", "target/debug"):
+            (src / directory).mkdir(parents=True, exist_ok=True)
+        inputs = {"schema": 1, "files": {}, "absent_fixtures": ["crates/cli/tests/fixtures/startup_provider.py"]}
+        def entry(path, kind, **metadata):
+            data = path.read_bytes()
+            return {"kind": kind, "bytes": len(data), "sha256": digest(data),
+                    "mode": stat.S_IMODE(path.stat().st_mode), **metadata}
+        for name in ("reposync", "reposync-personal"):
+            (root / name).write_text("synthetic application control")
+            (root / name).chmod(0o755)
+            baked = src / "target/debug" / name
+            baked.write_bytes((root / name).read_bytes())
+            baked.chmod(0o755)
+            inputs["files"][f"target/debug/{name}"] = entry(baked, "application", packaged_path=name)
+        anchor = {'source_head': '7d4c8f81a6faeb664956bbe4c56c4a0da2fb1c65', 'source_tree': '0d9d37853e0df188bb5ec84752d0c78adda46caf', 'fixtures': {'git_http_auth_server.py': {'git_blob_sha1': '3b856fdd546e005613eb73e7e60d2a9470ec224b', 'sha256': 'ed5eed6797a2ca2b35cac5645293a44e90d1f77e409b95353c1465ae15083f33'}, 'pair_refresh_http_server.py': {'git_blob_sha1': 'e690a127cd40b5172ef9ea86d5e4379a6576fc6e', 'sha256': '5417a82fa1e72a65b5e43d74aaca45cf61ba471a10583dfe17c15d5d94521bd9'}}}
+        for name in ("git_http_auth_server.py", "pair_refresh_http_server.py"):
+            relative = f"crates/core/tests/fixtures/{name}"
+            path = src / relative
+            path.write_text("# synthetic source-archive fixture control")
+            data = path.read_bytes()
+            identity = {"sha256": digest(data), "git_blob_sha1": hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()}
+            provenance = {"reviewed_anchor": anchor, "origin": "source_archive", "archive": {"state": "present", **identity},
+                          "fallback_allowed": False, **identity}
+            inputs["files"][relative] = entry(path, "fixture", fixture_provenance=provenance)
+        def write_inputs():
+            (root / "runtime-inputs.json").write_text(json.dumps(inputs))
+        write_inputs()
+        validate_runtime_inputs(src, root)
+        def reject_layout():
+            try:
+                validate_runtime_inputs(src, root)
+            except (AssertionError, FileNotFoundError, KeyError):
+                return
+            raise AssertionError("invalid runtime source/package accepted")
+        for forbidden in (src / "crates/web/lib.rs", src / "Cargo.toml", src / "crates/core/tests/fixtures/owned_process_group.rs"):
+            forbidden.write_text("forbidden runtime content")
+            reject_layout()
             forbidden.unlink()
+        fixture = src / "crates/core/tests/fixtures/git_http_auth_server.py"
+        original = fixture.read_bytes()
+        fixture.write_text("wrong digest")
+        reject_layout()
+        fixture.unlink()
+        reject_layout()
+        fixture.symlink_to(root / "reposync")
+        reject_layout()
+        fixture.unlink()
+        fixture.write_bytes(original)
+        app = root / "reposync"
+        original = app.read_bytes()
+        app.write_text("wrong application digest")
+        reject_layout()
+        app.write_bytes(original)
+        baked = src / "target/debug/reposync"
+        baked.unlink()
+        baked.symlink_to("/bin/sh")
+        reject_layout()
+        baked.unlink()
+        baked.symlink_to(app)
+        reject_layout()
+        baked.unlink()
+        baked.write_bytes(app.read_bytes())
+        baked.chmod(0o755)
+        relative = "crates/cli/tests/fixtures/startup_provider.py"
+        startup = src / relative
+        startup.parent.mkdir(parents=True)
+        startup.write_text("# original archived startup provider")
+        reject_layout()  # An absent inventory entry must not hide a real file.
+        data = startup.read_bytes()
+        identity = {"sha256": digest(data), "git_blob_sha1": hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()}
+        inputs["files"][relative] = entry(startup, "fixture", fixture_provenance={
+            "origin": "source_archive", "archive": {"state": "present", **identity}, "fallback_allowed": False})
+        inputs["absent_fixtures"] = []
+        write_inputs()
+        validate_runtime_inputs(src, root)
+        startup.chmod(startup.stat().st_mode ^ 0o100)
+        reject_layout()
+        startup.chmod(inputs["files"][relative]["mode"])
+        startup.unlink()
+        startup.parent.rmdir()
+        startup.parent.parent.rmdir()
+        del inputs["files"][relative]
+        inputs["absent_fixtures"] = [relative]
+        write_inputs()
+        web = src / "crates/web"
         web.rmdir()
         web.symlink_to(src / "web-ui", target_is_directory=True)
-        try:
-            assert_runtime_source_isolation(src)
-        except AssertionError:
-            pass
-        else:
-            raise AssertionError("runtime ancestor symlink accepted")
-    print("Parent parser/writer and empty UI ancestor controls: PASS")
+        reject_layout()
+
+    print("Parent parser/writer and runtime prerequisite boundary controls: PASS")
 
 
 def main():
@@ -563,20 +828,23 @@ def main():
     os.environ.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     mode = sys.argv[1]
     assert mode in ("diagnostics", "candidate", "all", "baseline"), mode
-    assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
-    assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
-    assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
-    input_manifest = (TESTS / "runtime-inputs.json").read_bytes()
-    runtime_inputs = json.loads(input_manifest)
-    assert_runtime_source_isolation(runtime_inputs=runtime_inputs)
-    (OUTPUT / "runtime-inputs.json").write_text(json.dumps({
-        "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
-        "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
-        "manifest_sha256": digest(input_manifest), "inputs": runtime_inputs,
-    }, indent=2) + "\n")
-    assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
-    canaries = boundary_canaries()
+    def preflight():
+        assert os.getcwd() == "/fixture", "runtime cwd must be fixture-owned"
+        assert os.environ["TMPDIR"] == "/fixture/tmp", "temporary targets must be fixture-owned"
+        assert os.environ["HOME"] == "/fixture/home", "home must be fixture-owned"
+        assert (os.getuid(), os.getgid()) == (65532, 65532), "numeric runtime identity changed"
+        input_manifest = (TESTS / "runtime-inputs.json").read_bytes()
+        inputs = validate_runtime_inputs(runtime_inputs=json.loads(input_manifest))
+        (OUTPUT / "runtime-inputs.json").write_text(json.dumps({
+            "source_head": os.environ["REPOSYNC_SOURCE_HEAD"],
+            "source_tree": os.environ["REPOSYNC_SOURCE_TREE"],
+            "manifest_sha256": digest(input_manifest), "inputs": inputs,
+        }, indent=2) + "\n")
+        assert not Path("/var/run/docker.sock").exists(), "Docker socket was mounted into runtime"
+        return inputs, boundary_canaries()
+    inputs, canaries = require_runtime_integrity(preflight)
     (OUTPUT / "canaries.json").write_text(json.dumps(canaries, indent=2) + "\n")
+    prerequisites = runtime_prerequisites(inputs)
     manifest = json.loads(Path("/opt/reliability/required-cases.json").read_text())
     binaries = json.loads((TESTS / "binaries.json").read_text())
     if mode == "baseline":
@@ -622,6 +890,7 @@ def main():
         "ignored": sum(c["ignored"] for c in cases),
         "filtered_out": sum(c["filtered_out"] for c in cases),
         "canaries": canaries,
+        "prerequisite_observations": {name: item["status"] for name, item in prerequisites["observations"].items()},
         "required_r09_omission_rejected": True,
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
