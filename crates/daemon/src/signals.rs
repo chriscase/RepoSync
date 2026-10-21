@@ -44,7 +44,10 @@ pub fn ignore_sighup() {}
 ///
 /// Note: SIGHUP is explicitly **not** included here — see `ignore_sighup`.
 ///
-/// This function resolves once any termination signal is received.
+/// This function resolves once any termination signal is received. It does
+/// not observe background tasks. The daemon supervisor must `select` this
+/// future against the scheduler `JoinHandle`; waiting here alone hides a
+/// panicked or exited scheduler until the next signal.
 pub async fn wait_for_shutdown() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
