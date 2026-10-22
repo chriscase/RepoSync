@@ -91,6 +91,11 @@ impl Daemon {
                         // Keep the reserved listener for the entire fixture.
                         // Each connection runs real Git's smart protocol with
                         // the same receive-pack hooks and old-tip checks.
+                        let stderr = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(root.join("receive-pack-stderr.txt"))
+                            .unwrap();
                         let child = OwnedProcessGroup::spawn(
                             Command::new("git")
                                 .args([
@@ -103,7 +108,7 @@ impl Daemon {
                                 .arg(&root)
                                 .stdin(Stdio::from(input))
                                 .stdout(Stdio::from(output))
-                                .stderr(Stdio::null()),
+                                .stderr(Stdio::from(stderr)),
                         )
                         .unwrap();
                         children.push(child);
@@ -210,6 +215,13 @@ impl Fixture {
         self.target.refname_to_id("refs/heads/child").unwrap()
     }
 
+    fn receive_pack_stderr(&self) -> String {
+        match std::fs::read(self._temp.path().join("receive-pack-stderr.txt")) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) => format!("stderr unavailable: {error}"),
+        }
+    }
+
     fn hook(&self, script: &str) {
         let path = self.target.path().join("hooks/pre-receive");
         std::fs::write(&path, script).unwrap();
@@ -263,7 +275,18 @@ fn ref_move_after_advertisement_is_rejected_by_receive_pack() {
         "#!/bin/sh\nenv -u GIT_QUARANTINE_PATH git update-ref refs/heads/child {}\n",
         fixture.initial
     ));
-    assert!(fixture.publish().is_err());
+    let before = fixture.tip();
+    let published = fixture.publish();
+    let after = fixture.tip();
+    assert!(
+        published.is_err(),
+        "publish={published:?} before={before} after={after} {} stderr={}",
+        exec_witness(
+            "hook",
+            &fixture.target.path().join("hooks/pre-receive")
+        ),
+        fixture.receive_pack_stderr()
+    );
     assert_eq!(fixture.tip(), fixture.initial);
 }
 
@@ -271,7 +294,18 @@ fn ref_move_after_advertisement_is_rejected_by_receive_pack() {
 fn receiver_rejection_is_not_a_publication_receipt() {
     let fixture = Fixture::new();
     fixture.hook("#!/bin/sh\nexit 1\n");
-    assert!(fixture.publish().is_err());
+    let before = fixture.tip();
+    let published = fixture.publish();
+    let after = fixture.tip();
+    assert!(
+        published.is_err(),
+        "publish={published:?} before={before} after={after} {} stderr={}",
+        exec_witness(
+            "hook",
+            &fixture.target.path().join("hooks/pre-receive")
+        ),
+        fixture.receive_pack_stderr()
+    );
     assert_eq!(fixture.tip(), fixture.child);
 }
 
@@ -623,4 +657,26 @@ fn recovery_invalid_pins_are_refused_before_dialing() {
         );
         assert_eq!(fixture.tip(), fixture.child);
     }
+}
+
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = std::process::Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
 }

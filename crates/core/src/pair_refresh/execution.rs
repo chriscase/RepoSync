@@ -481,8 +481,12 @@ pub(crate) async fn publish_owned_svn_stage_with_client(
             let _ = engine
                 .db()
                 .retain_authenticated_svn_uncertainty(engine, actor, prepared, busy);
-            if commit_result.is_err() {
-                bail!("SVN commit response was unsuccessful; retained intent requires independent reconciliation");
+            if let Err(error) = commit_result {
+                // The outer sentence and the retained-intent decision stay.
+                // The source chain is the discarded CLI error for diagnosis.
+                return Err(error).context(
+                    "SVN commit response was unsuccessful; retained intent requires independent reconciliation",
+                );
             }
             bail!("complete SVN receipt was not proved; retained intent requires independent reconciliation")
         }

@@ -1540,6 +1540,67 @@ async fn denied_svn_intent_and_absence_observation_never_authorize_a_retry() {
     );
 }
 
+struct SvnDiag {
+    _path: std::path::PathBuf,
+}
+
+impl SvnDiag {
+    fn arm(temp: &std::path::Path) -> Self {
+        let path = temp.join("svn-diag.log");
+        std::env::set_var("REPOSYNC_SVN_DIAG_LOG", &path);
+        Self { _path: path }
+    }
+}
+
+impl Drop for SvnDiag {
+    fn drop(&mut self) {
+        std::env::remove_var("REPOSYNC_SVN_DIAG_LOG");
+    }
+}
+
+fn exec_witness(label: &str, path: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map(|meta| format!("{:o}", meta.permissions().mode()))
+        .unwrap_or_else(|error| format!("metadata {error}"));
+    let test_x = std::process::Command::new("test")
+        .arg("-x")
+        .arg(path)
+        .status()
+        .map(|status| {
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".into())
+        })
+        .unwrap_or_else(|error| format!("spawn {error}"));
+    format!(
+        "{label} path={} mode={mode} test_x={test_x}",
+        path.display()
+    )
+}
+
+fn file_text(path: &std::path::Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => format!(
+            "{} bytes={}",
+            path.display(),
+            String::from_utf8_lossy(&bytes)
+        ),
+        Err(error) => format!("{} absent ({error})", path.display()),
+    }
+}
+
+fn case_diag(temp: &std::path::Path, hook: &std::path::Path, ready: &std::path::Path) -> String {
+    format!(
+        "{} ready={} diag={} backend={}",
+        exec_witness("hook", hook),
+        file_text(ready),
+        file_text(&temp.join("svn-diag.log")),
+        file_text(&temp.join("http-backend-stderr.txt"))
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
     use crate::db::pair_refresh_operations::PairRefreshPhase;
@@ -1561,7 +1622,12 @@ async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(super::super::execution::complete_owned_refresh_with_client(
+    let before = f
+        .target
+        .find_reference("refs/heads/feature")
+        .unwrap()
+        .target();
+    let result = super::super::execution::complete_owned_refresh_with_client(
         &engine,
         &actor,
         &prepared,
@@ -1570,8 +1636,21 @@ async fn protected_git_ref_retains_the_svn_result_without_retrying_a_push() {
         &busy,
         f.client.clone(),
     )
-    .await
-    .is_err());
+    .await;
+    let after = f
+        .target
+        .find_reference("refs/heads/feature")
+        .ok()
+        .and_then(|reference| reference.target());
+    let summary = match &result {
+        Ok(_) => "Ok".to_string(),
+        Err(error) => crate::errors::redact_vcs_error_detail(&format!("{error:#}")),
+    };
+    assert!(
+        result.is_err(),
+        "result={summary} before={before:?} after={after:?} {}",
+        case_diag(f.temp.path(), &hook, &f.temp.path().join("git-hook-ready"))
+    );
     let intent =
         f.db.pair_refresh_operation(prepared.pins().git.operation_id)
             .unwrap();
@@ -2992,6 +3071,7 @@ raise SystemExit(1)
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _svn_diag = SvnDiag::arm(f.temp.path());
     let handle = approval.preparation_id;
     let digest = approval.approval_digest.clone();
     let diagnostic_digest = digest.clone();
@@ -3027,6 +3107,12 @@ raise SystemExit(1)
                     ] {
                         detail = detail.replace(secret, "[REDACTED_FIXTURE_SECRET]");
                     }
+                    detail.push(' ');
+                    detail.push_str(&case_diag(
+                        f.temp.path(),
+                        &hook,
+                        &f.temp.path().join("http-disconnect-ready"),
+                    ));
                     detail
                 }
             );
@@ -3609,6 +3695,7 @@ raise SystemExit(1)
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _svn_diag = SvnDiag::arm(f.temp.path());
     let request_service = service.clone();
     let handle = approval.preparation_id;
     let digest = approval.approval_digest;
@@ -3644,6 +3731,12 @@ raise SystemExit(1)
                     ] {
                         detail = detail.replace(secret, "[REDACTED_FIXTURE_SECRET]");
                     }
+                    detail.push(' ');
+                    detail.push_str(&case_diag(
+                        f.temp.path(),
+                        &hook,
+                        &f.temp.path().join("shutdown-ready"),
+                    ));
                     detail
                 }
             );
