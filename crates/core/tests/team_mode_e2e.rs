@@ -4812,6 +4812,82 @@ async fn candidate_r10_over_1000_pending_commits_batched() {
     );
 }
 
+/// 1001 linear commits drain through team `run_sync_cycle` at
+/// [`DEFAULT_PENDING_COMMIT_CAP`](reposync_core::pending_frontier::DEFAULT_PENDING_COMMIT_CAP)
+/// (1000). No `PendingCapGuard` is installed. The cap-3 test above does not
+/// cover this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_r10_over_1000_pending_commits_default_cap() {
+    assert_eq!(
+        reposync_core::pending_frontier::DEFAULT_PENDING_COMMIT_CAP,
+        1000,
+        "this replay is the default cap of 1000, not a test override"
+    );
+    let fixture = QualifiedPair::new().await;
+    let synced = fixture.developer_commit("feature.txt", "first version\n", "Handled Git baseline");
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        fixture
+            .engine
+            .run_sync_cycle()
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        1
+    );
+    let before = fixture.snapshot().await;
+    let (tip, chain) = build_linear_commit_chain(&fixture, 1001);
+    assert_eq!(chain.len(), 1001);
+
+    let first = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        first.git_to_svn_count, 1000,
+        "first batch must replay the default cap, not a reduced override"
+    );
+    assert_eq!(first.git_pending_total, 1001);
+    assert!(first.git_replay_has_more, "1001 commits leave one commit pending");
+    let after_first = fixture.snapshot().await;
+    assert_eq!(after_first.watermark.1, chain[999]);
+    assert_eq!(after_first.bridge_sha, chain[999]);
+    assert_ne!(after_first.bridge_sha, tip);
+    assert_eq!(after_first.svn_rev, before.svn_rev + 1000);
+
+    let second = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!(second.git_to_svn_count, 1, "final batch drains the last commit");
+    assert!(!second.git_replay_has_more);
+    let after_second = fixture.snapshot().await;
+    assert_eq!(after_second.watermark.1, tip);
+    assert_eq!(after_second.bridge_sha, tip);
+    assert_eq!(after_second.svn_rev, before.svn_rev + 1001);
+    assert_eq!(
+        after_second.mapping_count,
+        before.mapping_count + 1001,
+        "each replayed Git commit must add a mapping"
+    );
+
+    let idle = fixture.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((idle.git_to_svn_count, idle.svn_to_git_count), (0, 0));
+    assert!(!idle.git_replay_has_more);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({
+            "case":"R10_DEFAULT_CAP_1001",
+            "p":synced,
+            "r":tip,
+            "batch_cap":1000,
+            "pending_total":1001,
+            "batches":[1000,1],
+            "cap_override":false,
+            "svn_revision_before_after":before.svn_rev,
+            "svn_revision_final":after_second.svn_rev,
+            "mapping_before":before.mapping_count,
+            "mapping_after":after_second.mapping_count,
+            "mapping_delta":1001,
+            "continuation":true
+        })
+    );
+}
+
 /// While Git replay continuation is incomplete, pending SVN work must defer the
 /// whole cycle with no bridge reset and no opposite-direction writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
