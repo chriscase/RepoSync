@@ -52,7 +52,40 @@ jobs:
         run: cargo build --locked -p reposync-core --release
 
       - name: Test
-        run: cargo test --workspace
+        run: |
+          # This case samples /proc/self/fd for its whole test process. Give
+          # only this case a separate process; retain normal workspace parallelism.
+          fd_case=test_no_resource_leak_after_many_requests
+          inventory_status=0
+          inventory="$(cargo test --workspace -- --list --format pretty --color never)" || inventory_status=$?
+          if [[ "$inventory_status" -ne 0 ]]; then
+            printf '%s\n' "$inventory"
+            exit "$inventory_status"
+          fi
+          matches="$(awk -v wanted="$fd_case: test" '$0 == wanted { count++ } END { print count + 0 }' <<< "$inventory")"
+          if [[ "$matches" -ne 1 ]]; then
+            echo "::error::Expected exactly one workspace FD case; found $matches"
+            exit 1
+          fi
+
+          workspace_status=0
+          cargo test --workspace -- --exact --skip "$fd_case" || workspace_status=$?
+
+          # Run the mandatory case even if another workspace case failed.
+          fd_status=0
+          fd_stdout="$RUNNER_TEMP/reposync-fd-case.stdout.log"
+          cargo test -p reposync-web --test server_freeze "$fd_case" -- --exact --format pretty --color never \
+            > "$fd_stdout" || fd_status=$?
+          cat "$fd_stdout"
+          # Cargo/libtest can exit successfully with zero selected or ignored
+          # tests. Require the exact case's passing result as well as exit zero.
+          if ! awk -v wanted="test $fd_case ... ok" '$0 == wanted { count++ } END { exit(count != 1) }' "$fd_stdout"; then
+            echo "::error::Mandatory FD case did not report exactly one passing result"
+            if [[ "$fd_status" -eq 0 ]]; then fd_status=1; fi
+          fi
+          printf 'Workspace exit: %s; isolated FD case exit: %s\n' "$workspace_status" "$fd_status"
+          if [[ "$workspace_status" -ne 0 ]]; then exit "$workspace_status"; fi
+          exit "$fd_status"
         env:
           RUST_BACKTRACE: 1
           GIT_AUTHOR_NAME: "Test User"

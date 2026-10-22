@@ -23,11 +23,14 @@ RUN --mount=type=cache,id=rust-1.98.1-bookworm-${RELIABILITY_TARGET_CACHE},targe
     --mount=type=cache,target=/usr/local/cargo/registry \
     test -n "$RELIABILITY_TARGET_CACHE" && \
     if [ "$RELIABILITY_INCLUDE_OLD" = 1 ]; then \
+      cargo build --workspace --bins --locked --features reposync-core/reliability-fixture,reposync-web/reliability-fixture --message-format=json > /tmp/cargo-applications.jsonl && \
       cargo test --workspace --no-run --locked --features reposync-core/reliability-fixture,reposync-web/reliability-fixture --message-format=json > /tmp/cargo-preparation.jsonl; \
     else \
+      cargo build --workspace --bins --locked --message-format=json > /tmp/cargo-applications.jsonl && \
       cargo test --workspace --no-run --locked --message-format=json > /tmp/cargo-preparation.jsonl; \
     fi && \
-    python3 /usr/local/bin/reliability-prep /tmp/cargo-preparation.jsonl /opt/reliability-tests && \
+    python3 /usr/local/bin/reliability-prep /tmp/cargo-preparation.jsonl /opt/reliability-tests \
+      --runtime-inputs /src /tmp/cargo-applications.jsonl && \
     rustc --version > /opt/reliability-tests/build-toolchain.txt && \
     cargo --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum Cargo.lock >> /opt/reliability-tests/build-toolchain.txt
@@ -45,15 +48,25 @@ RUN --mount=type=cache,id=rust-1.98.1-bookworm-old-${RELIABILITY_OLD_TARGET_CACH
     fi
 
 FROM python:3.12-slim-bookworm
+# Signal-readiness/startup tests invoke an external kill executable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs subversion libssl3 libstdc++6 libatomic1 ca-certificates && rm -rf /var/lib/apt/lists/*
+    git git-lfs subversion procps openssl libssl3 libstdc++6 libatomic1 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 RUN ln -s /usr/local/bin/node /usr/bin/nodejs && mkdir -p /src/crates/web
+RUN test -z "$(getent passwd 65532)" && test -z "$(getent group 65532)" && \
+    printf 'fixture:x:65532:65532:Fixture:/fixture/home:/usr/sbin/nologin\n' >> /etc/passwd && \
+    printf 'fixture:x:65532:\n' >> /etc/group && \
+    test ! -L /etc/machine-id && printf '21300000000040008000000000000001\n' > /etc/machine-id
 ENV PATH="/usr/local/bin:/usr/bin:/bin"
 ENV REPOSYNC_NODE_BIN=/usr/bin/nodejs
+# Synthetic identity is confined to this image; native boot/PID observations stay real.
+# EMAIL is a fallback; explicit test user.name/user.email and author env win.
+ENV EMAIL=fixture@example.invalid
 # Web UI contract tests resolve web-ui via compile-time CARGO_MANIFEST_DIR (/src/crates/web).
 COPY --from=build /src/web-ui /src/web-ui
 COPY --from=build /opt/reliability-tests /opt/reliability-tests
+# Only enrolled application subjects and fixture scripts, never the source tree.
+COPY --from=build /opt/reliability-runtime-inputs/ /src/
 RUN node --version >> /opt/reliability-tests/build-toolchain.txt && \
     sha256sum /usr/local/bin/node >> /opt/reliability-tests/build-toolchain.txt
 COPY --from=build /opt/reliability-old-tests /opt/reliability-old-tests

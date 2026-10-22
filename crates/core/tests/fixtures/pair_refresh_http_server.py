@@ -90,6 +90,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         })
         result = subprocess.run(['git', 'http-backend'], input=body,
                                 capture_output=True, env=fixture_env, timeout=5)
+        try:
+            with open(os.path.join(args.root, 'http-backend-stderr.txt'), 'ab') as handle:
+                handle.write(result.stderr)
+                if result.stderr and not result.stderr.endswith(b'\n'):
+                    handle.write(b'\n')
+        except OSError:
+            pass
         assert result.returncode == 0, result.stderr.decode(errors='replace')
         if self.command == 'POST' and request.path.endswith('/git-receive-pack'):
             Path(args.root, 'published').touch()

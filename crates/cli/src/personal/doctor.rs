@@ -49,19 +49,24 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     // 3. Database
     let db_path = data_dir.join("personal.db");
     if db_path.exists() {
-        match Database::new(&db_path) {
-            Ok(db) => {
-                let schema_ok = db.get_watermark("svn_rev").is_ok();
-                if schema_ok {
-                    println!("  {}", style::success("Database          OK"));
-                } else {
-                    println!("  {}", style::error("Database          Schema outdated"));
-                    issues.push("Re-run import to update database schema".to_string());
+        match Database::open_existing_read_only(&db_path) {
+            Ok(db) => match db.get_watermark("svn_rev") {
+                Ok(_) => println!("  {}", style::success("Database          OK")),
+                Err(error) => {
+                    println!(
+                        "  {}",
+                        style::error(&format!("Database          Read failed: {}", error))
+                    );
+                    issues.push(
+                        "Preserve storage and diagnose the failed database read.".to_string(),
+                    );
                 }
-            }
+            },
             Err(e) => {
                 println!("  {}", style::error(&format!("Database          {}", e)));
-                issues.push("Database is corrupted. Delete and re-import.".to_string());
+                issues.push(
+                    "Preserve storage and diagnose the refused database inspection.".to_string(),
+                );
             }
         }
     } else {
@@ -99,10 +104,17 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
     }
 
     // 6. Daemon status
-    match reposync_personal::daemon::is_running(data_dir) {
-        Ok(Some(pid)) => println!(
+    match reposync_personal::daemon::inspect_pid_file(data_dir) {
+        Ok(Some((pid, true))) => println!(
             "  {}",
             style::success(&format!("Daemon            Running (PID {})", pid))
+        ),
+        Ok(Some((pid, false))) => println!(
+            "  {}",
+            style::warn(&format!(
+                "Daemon            Not running (stale PID {})",
+                pid
+            ))
         ),
         Ok(None) => {
             println!("  {}", style::warn("Daemon            Not running"));
@@ -118,12 +130,12 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
 
     // 7. Watermark consistency
     let db_path = data_dir.join("personal.db");
-    if let Ok(db) = Database::new(&db_path) {
-        let svn_wm = db.get_watermark("svn_rev").ok().flatten();
-        let git_wm = db.get_watermark("git_sha").ok().flatten();
+    if let Ok(db) = Database::open_existing_read_only(&db_path) {
+        let svn_wm = db.get_watermark("svn_rev");
+        let git_wm = db.get_watermark("git_sha");
 
         match (svn_wm, git_wm) {
-            (Some(svn), Some(git)) => {
+            (Ok(Some(svn)), Ok(Some(git))) => {
                 let git_short = if git.len() > 7 { &git[..7] } else { &git };
                 println!(
                     "  {}",
@@ -133,11 +145,18 @@ pub fn run_doctor(config: &PersonalConfig) -> Result<()> {
                     ))
                 );
             }
-            (None, None) => {
+            (Ok(None), Ok(None)) => {
                 println!(
                     "  {}",
                     style::dim("  ○ Watermarks        Not set (run import first)")
                 );
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                println!(
+                    "  {}",
+                    style::error(&format!("Watermarks        Read failed: {}", error))
+                );
+                issues.push("Preserve storage and diagnose the failed watermark read.".to_string());
             }
             _ => {
                 println!("  {}", style::warn("Watermarks        Inconsistent"));

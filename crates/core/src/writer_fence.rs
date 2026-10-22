@@ -109,6 +109,54 @@ pub(crate) struct RecoveryWriterFence {
 }
 
 impl RecoveryWriterFence {
+    pub(crate) fn retire_ordinary_startup(
+        self,
+        db: &Database,
+        lock: &crate::data_dir::LockGuard,
+        data_dir: &Path,
+        original_lease: &str,
+        original_native: Option<&(String, String)>,
+    ) -> Result<(), DatabaseError> {
+        let result = (|| {
+            lock.require_current(data_dir)?;
+            db.immediate_transaction(|tx| {
+                let saved = db.opened_file()?;
+                saved.require_unaliased_owner(tx)?;
+                #[cfg(test)]
+                crate::db::startup::reservation_tests::observe(&saved.path, "retire");
+                crate::db::pair_refresh_operations::require_no_pair_refresh_hold(tx, None)?;
+                crate::db::ordinary_writer_windows::require_globally_quiet_for_refresh(tx)?;
+                let epoch = require_owned_current_readonly(tx)?;
+                let lease = read_lease(tx)?.ok_or_else(|| {
+                    DatabaseError::WriterFenced("startup release lost its lease".into())
+                })?;
+                let native: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                        [NATIVE_LEASE_KEY],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if epoch != self.epoch
+                    || !same_lease_acquisition(&parse_lease(original_lease)?, &lease)
+                    || native.as_ref() != original_native
+                {
+                    return Err(DatabaseError::WriterFenced(
+                        "startup release acquisition evidence changed".into(),
+                    ));
+                }
+                delete_lease(tx, self.epoch)
+            })
+        })();
+        if result.is_ok()
+            && process_epoch().load(Ordering::Acquire) == self.epoch
+            && current_holder_identity() == Some((self.host.clone(), self.pid))
+        {
+            clear_process_identity();
+        }
+        result
+    }
+
     pub(crate) fn require_current(&self, db: &Database) -> Result<(), DatabaseError> {
         let lease = read_lease(&db.conn())?;
         if !lease.is_some_and(|lease| {
@@ -214,15 +262,35 @@ fn native_lease_matches(captured: &WriterLease, current: &WriterLease) -> bool {
     }
 }
 
+#[cfg(test)]
 fn local_host_id() -> String {
+    ordinary_host_id().expect("test process requires a stable native hostname")
+}
+
+fn ordinary_host_id() -> Result<String, DatabaseError> {
     if let Ok(host) = std::env::var("REPOSYNC_FENCE_HOST") {
         if !host.is_empty() {
-            return host;
+            return Ok(host);
         }
     }
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| format!("host-{}", std::process::id()))
+    let mut name = [0u8; 256];
+    // SAFETY: gethostname writes at most this buffer's length; a missing
+    // terminator or invalid text remains unknown instead of a PID fallback.
+    let result = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    if result == 0 {
+        if let Some(end) = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .filter(|end| *end != 0)
+        {
+            if let Ok(host) = std::str::from_utf8(&name[..end]) {
+                return Ok(host.to_owned());
+            }
+        }
+    }
+    Err(DatabaseError::WriterFenced(
+        "ordinary startup requires a stable native hostname".into(),
+    ))
 }
 
 fn parse_lease(raw: &str) -> Result<WriterLease, DatabaseError> {
@@ -379,7 +447,7 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 fn holder_is_local(lease: &WriterLease) -> bool {
-    lease.holder_host == local_host_id()
+    ordinary_host_id().is_ok_and(|host| lease.holder_host == host)
 }
 
 /// Whether another claimant must refuse because this holder still owns the lease.
@@ -414,7 +482,79 @@ fn in_use_message(lease: &WriterLease) -> String {
 
 /// Claim or renew the durable writer lease after the local flock is held.
 pub fn claim(db: &Database, data_dir: &Path) -> Result<WriterFenceGuard, DatabaseError> {
-    claim_with_identity(db, data_dir, &local_host_id(), std::process::id())
+    claim_with_identity(db, data_dir, &ordinary_host_id()?, std::process::id())
+}
+
+/// Startup checks this through a read-only connection and again under its
+/// SQLite writer reservation. A live or unknown foreign holder is never stolen.
+pub(crate) fn require_claimable_for_startup(tx: &Connection) -> Result<(), DatabaseError> {
+    if let Some(lease) = read_lease(tx)? {
+        if lease.epoch == 0 || lease.holder_pid == 0 || lease.holder_host.is_empty() {
+            return Err(DatabaseError::WriterFenced(
+                "invalid startup writer lease".into(),
+            ));
+        }
+        if lease_is_live(&lease) {
+            return Err(DatabaseError::DataDirInUse(in_use_message(&lease)));
+        }
+    } else {
+        let orphan: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key=?1)",
+            [NATIVE_LEASE_KEY],
+            |row| row.get(0),
+        )?;
+        if orphan {
+            return Err(DatabaseError::WriterFenced(
+                "orphan native lease evidence".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct OrdinaryStartupClaim {
+    pub fence: RecoveryWriterFence,
+    pub lease: String,
+    pub native: Option<(String, String)>,
+}
+
+pub(crate) fn claim_for_ordinary_startup(
+    db: &Database,
+    lock: &crate::data_dir::LockGuard,
+    data_dir: &Path,
+) -> Result<OrdinaryStartupClaim, DatabaseError> {
+    let host = ordinary_host_id()?;
+    let pid = std::process::id();
+    let (epoch, lease, native) = db.immediate_transaction(|tx| {
+        lock.require_current(data_dir)?;
+        let saved = db.opened_file()?;
+        saved.require_unaliased_owner(tx)?;
+        #[cfg(test)]
+        crate::db::startup::reservation_tests::observe(&saved.path, "claim");
+        if !crate::db::startup::require_quiet(tx)? {
+            crate::db::schema::initialize_empty_startup_in_transaction(tx)?;
+        }
+        let epoch = claim_lease_tx(tx, &host, pid)?;
+        let lease = tx.query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [LEASE_KEY],
+            |row| row.get(0),
+        )?;
+        let native = tx
+            .query_row(
+                "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                [NATIVE_LEASE_KEY],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok((epoch, lease, native))
+    })?;
+    set_process_identity(&host, pid, epoch);
+    Ok(OrdinaryStartupClaim {
+        fence: RecoveryWriterFence { epoch, host, pid },
+        lease,
+        native,
+    })
 }
 
 /// Claim or renew with an explicit holder identity (used by tests).

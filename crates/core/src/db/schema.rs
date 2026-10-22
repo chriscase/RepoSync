@@ -307,6 +307,33 @@ static MIGRATIONS: &[(u32, &str, &str)] = &[
 /// not registered here and must not be applied by [`run_migrations`].
 pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 
+/// Bootstrap verified empty storage inside the startup owner's transaction.
+pub(crate) fn initialize_empty_startup_in_transaction(
+    conn: &Connection,
+) -> Result<(), DatabaseError> {
+    if conn.is_autocommit() || get_schema_version(conn)? != 0 {
+        return Err(DatabaseError::Other(
+            "fresh startup schema requires an empty reserved transaction".into(),
+        ));
+    }
+    let has_storage: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_storage {
+        return Err(DatabaseError::Other(
+            "fresh startup refuses existing partial storage".into(),
+        ));
+    }
+    // The first schema and its owner are committed together. Remaining
+    // migrations run only after the admitted handle retains that owner.
+    let (version, _, sql) = MIGRATIONS[0];
+    conn.execute_batch(sql)?;
+    set_schema_version(conn, version)?;
+    Ok(())
+}
+
 /// Run all pending migrations against `conn`.
 ///
 /// Each migration's SQL batch and its `PRAGMA user_version` bump run in one
