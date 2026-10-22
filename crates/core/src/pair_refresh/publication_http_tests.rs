@@ -285,10 +285,7 @@ fn advertisement_race(tls: bool) {
     assert!(
         published.is_err(),
         "publish={published:?} before={before} after={after} {} stderr={}",
-        exec_witness(
-            "hook",
-            &fixture.target.path().join("hooks/pre-receive")
-        ),
+        exec_witness("hook", &fixture.target.path().join("hooks/pre-receive")),
         fixture.backend_stderr()
     );
     assert_eq!(fixture.tip(), fixture.initial);

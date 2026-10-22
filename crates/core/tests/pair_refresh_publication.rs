@@ -281,10 +281,7 @@ fn ref_move_after_advertisement_is_rejected_by_receive_pack() {
     assert!(
         published.is_err(),
         "publish={published:?} before={before} after={after} {} stderr={}",
-        exec_witness(
-            "hook",
-            &fixture.target.path().join("hooks/pre-receive")
-        ),
+        exec_witness("hook", &fixture.target.path().join("hooks/pre-receive")),
         fixture.receive_pack_stderr()
     );
     assert_eq!(fixture.tip(), fixture.initial);
@@ -300,10 +297,7 @@ fn receiver_rejection_is_not_a_publication_receipt() {
     assert!(
         published.is_err(),
         "publish={published:?} before={before} after={after} {} stderr={}",
-        exec_witness(
-            "hook",
-            &fixture.target.path().join("hooks/pre-receive")
-        ),
+        exec_witness("hook", &fixture.target.path().join("hooks/pre-receive")),
         fixture.receive_pack_stderr()
     );
     assert_eq!(fixture.tip(), fixture.child);

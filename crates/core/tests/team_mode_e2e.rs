@@ -4845,7 +4845,10 @@ async fn candidate_r10_over_1000_pending_commits_default_cap() {
         "first batch must replay the default cap, not a reduced override"
     );
     assert_eq!(first.git_pending_total, 1001);
-    assert!(first.git_replay_has_more, "1001 commits leave one commit pending");
+    assert!(
+        first.git_replay_has_more,
+        "1001 commits leave one commit pending"
+    );
     let after_first = fixture.snapshot().await;
     assert_eq!(after_first.watermark.1, chain[999]);
     assert_eq!(after_first.bridge_sha, chain[999]);
@@ -4853,7 +4856,10 @@ async fn candidate_r10_over_1000_pending_commits_default_cap() {
     assert_eq!(after_first.svn_rev, before.svn_rev + 1000);
 
     let second = fixture.engine.run_sync_cycle().await.unwrap();
-    assert_eq!(second.git_to_svn_count, 1, "final batch drains the last commit");
+    assert_eq!(
+        second.git_to_svn_count, 1,
+        "final batch drains the last commit"
+    );
     assert!(!second.git_replay_has_more);
     let after_second = fixture.snapshot().await;
     assert_eq!(after_second.watermark.1, tip);

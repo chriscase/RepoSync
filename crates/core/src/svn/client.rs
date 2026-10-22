@@ -905,7 +905,11 @@ fn record_svn_diag(cmd: &Command) {
         "program={} argv={redacted:?}\n",
         cmd.get_program().to_string_lossy()
     );
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         use std::io::Write;
         let _ = file.write_all(line.as_bytes());
     }
