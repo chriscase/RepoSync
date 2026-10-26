@@ -1,0 +1,349 @@
+{
+  "schema_version": 1,
+  "revision": "rs112-hosted14-metadata-v1",
+  "state": "UNPUBLISHED_UNRUN_REQUIRES_REVIEW_AND_SEPARATE_PUBLICATION_EXECUTION_APPROVAL",
+  "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb",
+  "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
+  "trigger": {
+    "repository": "chriscase/RepoSync",
+    "event": "push",
+    "ref": "refs/tags/rs112-verify-ec4301ef-v1",
+    "first_attempt_only": true
+  },
+  "source": {
+    "parent_commit": "0a96eb027f3208a52f40dbcaca21c96864343b7e",
+    "base_tree": "396004f44d372212c6469d4a6c86f5ef4227d292",
+    "project_tree": "ec4301ef695a34462218cc2f2988dd55562a896f",
+    "project_file_count": 510,
+    "execution_metadata_paths": [
+      ".github/workflows/rs112-targeted.yml",
+      ".github/verification/rs112-profile.json"
+    ],
+    "packet": {
+      "bytes": 78776,
+      "sha256": "54ba621d5562443f2d235b0852f729d7103b220ee1e01d8e1e1a26136be82453"
+    },
+    "source_delta": {
+      "bytes": 52890,
+      "sha256": "29539acd4f83fc9c6c1bfc593b172cf14f0b84441260507c5e7c9a32b0425054"
+    },
+    "changed_files": [
+      {
+        "path": "crates/daemon/src/main.rs",
+        "bytes": 52587,
+        "sha256": "8469daebef32bb2ed2e04076fc2f82083a1f7f58e6e8226515e0c451c0dd1cd6",
+        "blob": "74559a4703ba5efe7bf50d8e16f59cfa21c5b144",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/daemon/src/scheduler.rs",
+        "bytes": 92923,
+        "sha256": "cb1c9a1f34af58004cbc4fce6f0df6d7cdf1a2d6b174d430dc74d6be642c33f3",
+        "blob": "254bc11b3abbfddf5458e7924a8e98b70e5bf879",
+        "git_mode": "100644"
+      }
+    ],
+    "manifests": [
+      {
+        "path": "Cargo.toml",
+        "bytes": 1716,
+        "sha256": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "git_blob": "a7288a3392fc0188252d7eff3148fd5c6230e966"
+      },
+      {
+        "path": "crates/cli/Cargo.toml",
+        "bytes": 743,
+        "sha256": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
+        "git_blob": "855ff09a9808f9e2ae8a352b8d448d50f2540e41"
+      },
+      {
+        "path": "crates/core/Cargo.toml",
+        "bytes": 1405,
+        "sha256": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
+        "git_blob": "a421ee53f4c83a65aec5960f28b8d61cdcfe3834"
+      },
+      {
+        "path": "crates/daemon/Cargo.toml",
+        "bytes": 974,
+        "sha256": "3d371eef846c33fb78713c28d238bfb26cf4e5945d2aa357d9cd2686257bbb57",
+        "git_blob": "4bbd89f25a977795362629a44f401b559eda7c16"
+      },
+      {
+        "path": "crates/personal/Cargo.toml",
+        "bytes": 936,
+        "sha256": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
+        "git_blob": "9b4964431304dd2251c12d915e141efdbcfe3cd1"
+      },
+      {
+        "path": "crates/web/Cargo.toml",
+        "bytes": 1079,
+        "sha256": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178",
+        "git_blob": "6166927f3218c53cc4e8dd51f0d7f21ceaeb2e9a"
+      }
+    ],
+    "unchanged_workflows_sha256": {
+      "ci.yml": "023f2f17373839d1c67919359688191ef6e8e683fc79216cd71dc4c6f116ee24",
+      "e2e.yml": "5a0d18b8398fa97a57638e35f13c2675983fa58bd99eab6780adc010f29ecd14",
+      "git-operation-request.yml": "cf33dc98e1ea73c5b072738c9a74343e0fb6ad9da1e2c7cf2b2038897ba71219",
+      "release.yml": "df0db540139487dddde6e69a1960819b57c8bc1df042f8dab8ea84607a79c689",
+      "reliability-phase0.yml": "0dfe9d8d4d9e8375c7a2cb2d3ea232531c3ce5a3da97d1da614c5f97797b516e"
+    }
+  },
+  "lock": {
+    "kind": "external_prepared_input_not_tracked_root_lock",
+    "fixture_path": "docs/reliability/fixtures/Cargo.lock",
+    "bytes": 82871,
+    "sha256": "295583faf31523be3fb43d729e1777d45751cda900439f6ae6b0e682fe6605c6",
+    "blob": "265e8f191e3427f00a134015bcf4ad9173072242",
+    "registry_packages": 332,
+    "all_packages": 337,
+    "initial_generation_tool": "UNKNOWN; later 1.98.1 consumption and unchanged six manifests are separately recorded"
+  },
+  "toolchain": {
+    "channel": "1.98.1",
+    "target": "x86_64-unknown-linux-gnu",
+    "rustc_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "cargo_commit": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+    "provisioning": "Existing runner rustup, private RUSTUP_HOME, minimal profile, no self-update; stop if exact release unavailable"
+  },
+  "actions": {
+    "checkout": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "upload_artifact": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "runner": {
+    "label": "ubuntu-24.04",
+    "kind": "GitHub-hosted fresh disposable VM; no self-hosted/container fallback",
+    "minimum_cpus": 4,
+    "minimum_available_ram_bytes": 8589934592,
+    "minimum_free_disk_bytes": 8589934592,
+    "target_budget_bytes": 8589934592,
+    "target_budget_enforcement": "Checked between steps, not a continuous kernel or aggregate process disk cap",
+    "shared_cache": false
+  },
+  "limits": {
+    "job_minutes": 50,
+    "setup_fetch_minutes": 10,
+    "compile_minutes": 20,
+    "case_minutes": 1,
+    "evidence_minutes": 2,
+    "upload_minutes": 3,
+    "compile": {
+      "address_space_bytes": 4294967296,
+      "cpu_seconds": 1500,
+      "nofile": 512,
+      "max_file_bytes": 1073741824
+    },
+    "case": {
+      "address_space_bytes": 536870912,
+      "cpu_seconds": 30,
+      "nofile": 128,
+      "max_file_bytes": 16777216
+    },
+    "core_bytes": 0,
+    "artifact_bytes": 1073741824,
+    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap"
+  },
+  "fetch": {
+    "args": [
+      "fetch",
+      "--locked",
+      "--target",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "online": true,
+    "private_cache": true,
+    "lock_regeneration": false
+  },
+  "compile": {
+    "args": [
+      "test",
+      "--no-run",
+      "-p",
+      "reposync-daemon",
+      "--bin",
+      "reposync-daemon",
+      "--locked",
+      "--offline",
+      "--jobs=1",
+      "--features",
+      "reposync-core/reliability-fixture,reposync-web/reliability-fixture",
+      "--message-format=json"
+    ],
+    "package": "reposync-daemon",
+    "binary_target": "reposync-daemon",
+    "attempts": 1
+  },
+  "test": {
+    "count": 14,
+    "ordinary": 11,
+    "expected_injected_panic": 3,
+    "args": [
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--color=never"
+    ],
+    "one_case_per_native_step": true,
+    "stop_on_first_failure": true,
+    "zero_or_ignored_success": false,
+    "retries": 0
+  },
+  "cases": [
+    {
+      "index": 1,
+      "name": "shutdown_ownership_tests::finished_scheduler_panic_is_joined_and_classified",
+      "expected_panic_message": "RS112 expected scheduler panic",
+      "effects": [
+        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+      ],
+      "special_effect": "Injected panic is expected in this exact case only"
+    },
+    {
+      "index": 2,
+      "name": "shutdown_ownership_tests::existing_failure_does_not_skip_an_unobserved_scheduler_join",
+      "expected_panic_message": null,
+      "effects": [
+        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 3,
+      "name": "shutdown_ownership_tests::stop_deadline_aborts_and_observes_scheduler_before_child_drain",
+      "expected_panic_message": null,
+      "effects": [
+        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 4,
+      "name": "shutdown_ownership_tests::abort_timeout_retains_the_same_scheduler_handle_and_closes_child_drain",
+      "expected_panic_message": null,
+      "effects": [
+        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+      ],
+      "special_effect": "Two-worker Tokio runtime and one block_in_place guarded by a command-independent std channel with five-second fixture receive bound; outer process timeout/teardown remains mandatory"
+    },
+    {
+      "index": 5,
+      "name": "shutdown_ownership_tests::child_drain_observes_an_already_finished_panic",
+      "expected_panic_message": "RS112 expected drain panic",
+      "effects": [
+        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+      ],
+      "special_effect": "Injected panic is expected in this exact case only"
+    },
+    {
+      "index": 6,
+      "name": "shutdown_ownership_tests::cancelled_child_drain_retains_current_and_remaining_owners",
+      "expected_panic_message": null,
+      "effects": [
+        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 7,
+      "name": "scheduler::shutdown_admission_tests::shutdown_flag_before_run_admits_nothing",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 8,
+      "name": "scheduler::shutdown_admission_tests::cooperative_shutdown_finishes_before_the_deadline",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 9,
+      "name": "scheduler::shutdown_admission_tests::shutdown_during_reconcile_does_not_admit_and_drains_after_exit",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 10,
+      "name": "scheduler::shutdown_admission_tests::interval_stop_during_inline_reconcile_closes_later_admission",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 11,
+      "name": "scheduler::shutdown_admission_tests::webhook_stop_during_inline_reconcile_closes_later_admission",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 12,
+      "name": "scheduler::shutdown_admission_tests::stop_while_waiting_for_registry_lock_refuses_unpolled_child",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 13,
+      "name": "scheduler::shutdown_admission_tests::admitted_child_is_registered_before_stop_snapshot",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Bounded in-test waits; no test was executed"
+    },
+    {
+      "index": 14,
+      "name": "scheduler::shutdown_admission_tests::finished_sync_panic_is_observed_before_handle_removal",
+      "expected_panic_message": "RS112 expected child panic",
+      "effects": [
+        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
+      ],
+      "special_effect": "Injected panic is expected in this exact case only"
+    }
+  ],
+  "effects": {
+    "compile": "Rust compiler, proc macros/dependency build scripts, C compiler/linker and source-bound git rev-parse/status execute only after separate campaign authorization",
+    "tests": "Six memory/task cases; eight task-local config/SQLite/git-init cases with an empty enabled-repository set; one block_in_place fixture; no daemon/provider/live service launch intended",
+    "network": "Online exact toolchain/dependency preparation; Cargo offline for compile/tests is not OS network isolation",
+    "git": "Private HOME, empty template/hooks, per-command no-system/global config; no credentials forwarded to build/tests",
+    "credentials": "Read-only checkout token not persisted; no repository/environment secrets or OIDC requested; artifact runtime credentials remain confined to action steps"
+  },
+  "completion": {
+    "authority": "GitHub native step/job cancellation and fresh-VM decommission; no custom process supervisor",
+    "cancellation": "Documented SIGINT 7.5s, SIGTERM 2.5s, process-tree kill; server cancellation procedure up to five minutes. No earlier 5+2s guarantee.",
+    "stdout_eof": "Not a completion oracle; logs use regular files and native step conclusion is required",
+    "unknown": "RUNNING without an exit becomes INCOMPLETE; unstarted cases NOT_RUN; no campaign PASS without external terminal job/run readback",
+    "artifact_upload": "Best effort on cancellation; bounded sanitized evidence only; uploaded data inherits public repository access",
+    "rerun": "No retry or manual dispatch/rerun under initial grant"
+  },
+  "open_gates": [
+    "#112",
+    "BOB-RS216-001",
+    "whole H9",
+    "#211",
+    "Phase0",
+    "historical comparisons",
+    "173 catalog",
+    "six behavioral gates",
+    "1001 lineage",
+    "live cycles",
+    "native/isolation qualification",
+    "main/integration/epic application",
+    "merge/deploy"
+  ]
+}
