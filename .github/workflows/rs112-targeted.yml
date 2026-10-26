@@ -3,7 +3,7 @@ name: RS112 targeted 14 cases (partial)
 'on':
   push:
     tags:
-    - rs112-verify-ec4301ef-v1
+    - rs112-verify-4b66a9f0-v1
 permissions:
   contents: read
 concurrency:
@@ -14,7 +14,7 @@ jobs:
     name: RS112 exact 14; whole-story gates remain open
     runs-on: ubuntu-24.04
     timeout-minutes: 50
-    if: github.repository == 'chriscase/RepoSync' && github.event_name == 'push' && github.ref == 'refs/tags/rs112-verify-ec4301ef-v1'
+    if: github.repository == 'chriscase/RepoSync' && github.event_name == 'push' && github.ref == 'refs/tags/rs112-verify-4b66a9f0-v1'
     defaults:
       run:
         shell: bash --noprofile --norc -euo pipefail {0}
@@ -399,7 +399,7 @@ jobs:
       timeout-minutes: 3
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: rs112-ec4301ef-${{ github.run_id }}-${{ github.run_attempt }}
+        name: rs112-4b66a9f0-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ env.RS112_ROOT }}/upload/
         if-no-files-found: error
         retention-days: 14

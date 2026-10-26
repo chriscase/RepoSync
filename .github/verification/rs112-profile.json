@@ -1,38 +1,43 @@
 {
   "schema_version": 1,
-  "revision": "rs112-hosted14-metadata-v1",
+  "revision": "rs112-hosted14-metadata-v2-compiler-repair",
   "state": "UNPUBLISHED_UNRUN_REQUIRES_REVIEW_AND_SEPARATE_PUBLICATION_EXECUTION_APPROVAL",
   "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb",
   "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
   "trigger": {
     "repository": "chriscase/RepoSync",
     "event": "push",
-    "ref": "refs/tags/rs112-verify-ec4301ef-v1",
+    "ref": "refs/tags/rs112-verify-4b66a9f0-v1",
     "first_attempt_only": true
   },
   "source": {
-    "parent_commit": "0a96eb027f3208a52f40dbcaca21c96864343b7e",
-    "base_tree": "396004f44d372212c6469d4a6c86f5ef4227d292",
-    "project_tree": "ec4301ef695a34462218cc2f2988dd55562a896f",
+    "parent_commit": "9b1d17cf5f42ab92fecc7f18db644b95d6be2d96",
+    "base_tree": "aba35132ccf5e413b2279730726df2ca67dc3d2b",
+    "project_tree": "4b66a9f0bdcaef80459778449b3e3b2d2db7963f",
     "project_file_count": 510,
     "execution_metadata_paths": [
       ".github/workflows/rs112-targeted.yml",
       ".github/verification/rs112-profile.json"
     ],
     "packet": {
-      "bytes": 78776,
-      "sha256": "54ba621d5562443f2d235b0852f729d7103b220ee1e01d8e1e1a26136be82453"
+      "bytes": 92817,
+      "sha256": "2653a70243ccd366f429e4f32ff319e5c5ee3ae024e1f660f698ea78c84e4d15"
     },
     "source_delta": {
-      "bytes": 52890,
-      "sha256": "29539acd4f83fc9c6c1bfc593b172cf14f0b84441260507c5e7c9a32b0425054"
+      "bytes": 2839,
+      "sha256": "a63e61fdf8251e9bef6321e64791b92de8e593e0e4caf6f1aa63ce7b134e22ba",
+      "base_commit": "e64ff93b371bc68cac32efa23bdbbfa47d7f6225",
+      "candidate_commit": "9b1d17cf5f42ab92fecc7f18db644b95d6be2d96",
+      "paths": [
+        "crates/daemon/src/main.rs"
+      ]
     },
     "changed_files": [
       {
         "path": "crates/daemon/src/main.rs",
-        "bytes": 52587,
-        "sha256": "8469daebef32bb2ed2e04076fc2f82083a1f7f58e6e8226515e0c451c0dd1cd6",
-        "blob": "74559a4703ba5efe7bf50d8e16f59cfa21c5b144",
+        "bytes": 53370,
+        "sha256": "73ecc12904345babde74494644a68fe37462070f84f90bbefe471d8dfa5d54de",
+        "blob": "2474852b1c2f6b8294ee1570b335229634fe5cfd",
         "git_mode": "100644"
       },
       {
@@ -87,6 +92,34 @@
       "git-operation-request.yml": "cf33dc98e1ea73c5b072738c9a74343e0fb6ad9da1e2c7cf2b2038897ba71219",
       "release.yml": "df0db540139487dddde6e69a1960819b57c8bc1df042f8dab8ea84607a79c689",
       "reliability-phase0.yml": "0dfe9d8d4d9e8375c7a2cb2d3ea232531c3ce5a3da97d1da614c5f97797b516e"
+    },
+    "previous_source_and_campaign": {
+      "source_origin_commit": "0a96eb027f3208a52f40dbcaca21c96864343b7e",
+      "source_origin_tree": "396004f44d372212c6469d4a6c86f5ef4227d292",
+      "project_tree": "ec4301ef695a34462218cc2f2988dd55562a896f",
+      "packet": {
+        "bytes": 78776,
+        "sha256": "54ba621d5562443f2d235b0852f729d7103b220ee1e01d8e1e1a26136be82453"
+      },
+      "source_delta": {
+        "bytes": 52890,
+        "sha256": "29539acd4f83fc9c6c1bfc593b172cf14f0b84441260507c5e7c9a32b0425054"
+      },
+      "published_execution_commit": "e64ff93b371bc68cac32efa23bdbbfa47d7f6225",
+      "tag": "refs/tags/rs112-verify-ec4301ef-v1",
+      "run_id": 40408560843,
+      "attempt": 1,
+      "result": "OFFLINE_COMPILE_EXIT_101_TWO_E0308_ALL14_NOT_RUN",
+      "execution_grant": "CONSUMED_NOT_REUSABLE"
+    },
+    "compiler_repair_review": {
+      "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
+      "run": "run-b8f7a75a-ce27-4671-ab09-a69cc4224d21",
+      "verdict": "APPROVE_WITH_NOTES_SOURCE_ONLY",
+      "report_bytes": 4743,
+      "report_sha256": "5e2defc0a347c7bc9865ba277525217b056c7cabea3891db6d8d4ee4c88a0501",
+      "reviewer_bundle_limit": "Full bundle verification UNRUN because e64 parent missing at reviewer; author identity evidence separate",
+      "runtime": "Corrected source compile and all14 cases UNRUN; no previous campaign approval carried over"
     }
   },
   "lock": {
