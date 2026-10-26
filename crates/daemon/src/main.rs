@@ -66,6 +66,8 @@ static SHUTDOWN_TASK_IDS: AtomicU64 = AtomicU64::new(1);
 static RETAINED_SHUTDOWN_TASKS: OnceLock<Mutex<Vec<RetainedShutdownTask>>> = OnceLock::new();
 static RETAINED_SHUTDOWN_REGISTRIES: OnceLock<Mutex<Vec<(&'static str, TaskHandles)>>> =
     OnceLock::new();
+static RETAINED_IMPORT_STATES: OnceLock<Mutex<Vec<Arc<reposync_web::AppState>>>> =
+    OnceLock::new();
 
 /// A completed task is still owned until its join result has been observed.
 /// Cancellation, timeout and unwind retain the same unconsumed handle.
@@ -163,6 +165,23 @@ impl Drop for TaskRegistryCustody {
     }
 }
 
+/// The import registry is an inline mutex owned by AppState, not its own Arc.
+/// Retaining its owner also retains the database, engine and other state until
+/// process exit. Custody does not establish task completion or cleanup.
+struct ImportRegistryCustody {
+    state: Arc<reposync_web::AppState>,
+}
+
+impl Drop for ImportRegistryCustody {
+    fn drop(&mut self) {
+        RETAINED_IMPORT_STATES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::clone(&self.state));
+    }
+}
+
 #[derive(Default)]
 struct TaskDrainReport {
     owned: usize,
@@ -175,7 +194,7 @@ struct TaskDrainReport {
 /// Both the initial wait and the post-abort wait have shared deadlines, so the
 /// bound does not grow once per child. Dropping any pending owner retains it.
 async fn drain_owned_tasks(
-    handles: &TaskHandles,
+    handles: &tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     role: &'static str,
     drain_bound: Duration,
     abort_join_bound: Duration,
@@ -899,9 +918,8 @@ async fn main() -> Result<()> {
         role: "sync tasks",
         handles: Arc::clone(&sync_handles),
     };
-    let _import_registry_custody = TaskRegistryCustody {
-        role: "import tasks",
-        handles: Arc::clone(&app_state_for_shutdown.import_handles),
+    let _import_registry_custody = ImportRegistryCustody {
+        state: Arc::clone(&app_state_for_shutdown),
     };
     let scheduler_state = app_state_for_shutdown.clone();
 
@@ -1205,7 +1223,8 @@ mod shutdown_ownership_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_child_drain_retains_current_and_remaining_owners() {
-        let handles = empty_handles();
+        // Exercise the inline-mutex shape used by AppState.import_handles.
+        let handles = tokio::sync::Mutex::new(Vec::new());
         let mut releases = Vec::new();
         for _ in 0..2 {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
