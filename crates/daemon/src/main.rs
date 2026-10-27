@@ -260,19 +260,29 @@ pub(crate) struct SchedulerStopReport {
     pub sync_join_failures: usize,
 }
 
+/// Borrowed resources shared by scheduler stop and sync-task drain.
+pub(crate) struct SchedulerStopContext<'a> {
+    pub notify: &'a Arc<tokio::sync::Notify>,
+    pub gate: &'a Arc<scheduler::SchedulerShutdownGate>,
+    pub sync_handles: &'a TaskHandles,
+}
+
 /// Close admission before notification. A fatal deadline remains fatal even if
 /// abort later joins. No child snapshot precedes an observed scheduler join.
 pub(crate) async fn stop_scheduler_and_drain_sync_tasks(
-    notify: &Arc<tokio::sync::Notify>,
-    gate: &Arc<scheduler::SchedulerShutdownGate>,
+    context: SchedulerStopContext<'_>,
     scheduler_task: &mut OwnedShutdownTask,
-    sync_handles: &TaskHandles,
     stop_timeout: Duration,
     mut failure: Option<String>,
     record_failure: &mut dyn FnMut(reposync_web::SchedulerServiceLevel, &str),
     on_stop_deadline: &mut dyn FnMut(),
     sync_drain_bound: Duration,
 ) -> SchedulerStopReport {
+    let SchedulerStopContext {
+        notify,
+        gate,
+        sync_handles,
+    } = context;
     gate.request_stop();
     notify.notify_one();
     let mut stop_timeout_recorded = false;
@@ -965,10 +975,12 @@ async fn main() -> Result<()> {
     }
 
     let scheduler_stop = stop_scheduler_and_drain_sync_tasks(
-        &shutdown,
-        &scheduler_shutdown_gate,
+        SchedulerStopContext {
+            notify: &shutdown,
+            gate: &scheduler_shutdown_gate,
+            sync_handles: &sync_handles,
+        },
         &mut scheduler_handle,
-        &sync_handles,
         reposync_web::SCHEDULER_STOP_TIMEOUT,
         scheduler_failure,
         &mut |level, reason| scheduler_state.record_scheduler_failure(level, reason),
@@ -1079,10 +1091,12 @@ mod shutdown_ownership_tests {
         assert!(!task.join_observed());
         let mut failures = Vec::new();
         let report = stop_scheduler_and_drain_sync_tasks(
-            &notify,
-            &gate,
+            SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &handles,
+            },
             &mut task,
-            &handles,
             Duration::from_secs(2),
             None,
             &mut |level, reason| failures.push((level, reason.to_string())),
@@ -1114,10 +1128,12 @@ mod shutdown_ownership_tests {
             }),
         );
         let report = stop_scheduler_and_drain_sync_tasks(
-            &notify,
-            &gate,
+            SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &empty_handles(),
+            },
             &mut task,
-            &empty_handles(),
             Duration::from_secs(2),
             Some("retained earlier fatal reason".to_string()),
             &mut |_level, _reason| panic!("cooperative join must not add failure"),
@@ -1166,10 +1182,12 @@ mod shutdown_ownership_tests {
         }));
         let mut failures = Vec::new();
         let report = stop_scheduler_and_drain_sync_tasks(
-            &Arc::new(tokio::sync::Notify::new()),
-            &Arc::new(scheduler::SchedulerShutdownGate::default()),
+            SchedulerStopContext {
+                notify: &Arc::new(tokio::sync::Notify::new()),
+                gate: &Arc::new(scheduler::SchedulerShutdownGate::default()),
+                sync_handles: &handles,
+            },
             &mut task,
-            &handles,
             Duration::from_millis(20),
             None,
             &mut |_level, reason| failures.push(reason.to_string()),
@@ -1227,10 +1245,12 @@ mod shutdown_ownership_tests {
             wait.notified().await;
         }));
         let report = stop_scheduler_and_drain_sync_tasks(
-            &Arc::new(tokio::sync::Notify::new()),
-            &Arc::new(scheduler::SchedulerShutdownGate::default()),
+            SchedulerStopContext {
+                notify: &Arc::new(tokio::sync::Notify::new()),
+                gate: &Arc::new(scheduler::SchedulerShutdownGate::default()),
+                sync_handles: &handles,
+            },
             &mut task,
-            &handles,
             Duration::from_millis(20),
             None,
             &mut |_level, _reason| {},

@@ -2143,10 +2143,12 @@ mod shutdown_admission_tests {
         );
         let mut recorded = Vec::new();
         let outcome = crate::stop_scheduler_and_drain_sync_tasks(
-            &notify,
-            &gate,
+            crate::SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &handles,
+            },
             &mut task,
-            &handles,
             Duration::from_secs(2),
             None,
             &mut |_level, reason| recorded.push(reason.to_string()),
@@ -2195,10 +2197,12 @@ mod shutdown_admission_tests {
             .unwrap();
         let mut recorded = Vec::new();
         let outcome = crate::stop_scheduler_and_drain_sync_tasks(
-            &notify,
-            &gate,
+            crate::SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &handles,
+            },
             &mut task,
-            &handles,
             Duration::from_millis(50),
             None,
             &mut |_level, reason| recorded.push(reason.to_string()),
