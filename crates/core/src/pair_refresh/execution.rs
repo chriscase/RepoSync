@@ -54,12 +54,14 @@ impl BlockingCohort {
         }
     }
 
-    async fn scope<F: Future>(&self, future: F) -> F::Output {
-        ORDINARY_COHORT.scope(self.id, future).await
+    fn scope<F: Future>(&self, future: Pin<Box<F>>) -> impl Future<Output = F::Output> {
+        ORDINARY_COHORT.scope(self.id, future)
     }
 
-    pub(crate) async fn run<F: Future>(&self, future: F) -> F::Output {
-        self.scope(future).await
+    pub(crate) fn run<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        let cohort = *self;
+        let future = Box::pin(future);
+        async move { cohort.scope(future).await }
     }
 
     pub(crate) async fn observe(&self) -> Result<()> {
@@ -82,24 +84,29 @@ impl BlockingAssoc {
     }
 }
 
-async fn in_operation_cohort<T>(
+fn in_operation_cohort<T>(
     operation: uuid::Uuid,
     future: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    if let Ok(id) = ORDINARY_COHORT.try_with(|id| *id) {
-        // A real service worker already owns the complete request/recovery
-        // future. Do not replace that owner with an inner operation scope.
-        observe_retained(BlockingAssoc::Owned(id)).await?;
-        return future.await;
+) -> impl Future<Output = Result<T>> {
+    // Box before constructing the cohort state machine. Boxing inside an
+    // async fn would still embed the original payload in its unpolled state.
+    let future = Box::pin(future);
+    async move {
+        if let Ok(id) = ORDINARY_COHORT.try_with(|id| *id) {
+            // A real service worker already owns the complete request/recovery
+            // future. Do not replace that owner with an inner operation scope.
+            observe_retained(BlockingAssoc::Owned(id)).await?;
+            return future.await;
+        }
+        let cohort = BlockingCohort {
+            id: OrdinaryCohortId::Operation(operation),
+        };
+        // A cancelled direct caller leaves a known operation owner. Re-entry must
+        // observe its actual retained cohort before doing any more operation work;
+        // a joined failure stays latched to this operation alone.
+        cohort.observe().await?;
+        cohort.scope(future).await
     }
-    let cohort = BlockingCohort {
-        id: OrdinaryCohortId::Operation(operation),
-    };
-    // A cancelled direct caller leaves a known operation owner. Re-entry must
-    // observe its actual retained cohort before doing any more operation work;
-    // a joined failure stays latched to this operation alone.
-    cohort.observe().await?;
-    cohort.scope(future).await
 }
 
 type BlockingValue = Box<dyn std::any::Any + Send>;
@@ -1839,5 +1846,35 @@ mod lifecycle_tests {
         let table = blocking_table();
         assert!(!table.records.values().any(|r| r.assoc == assoc));
         assert!(!table.collectors.contains_key(&assoc));
+    }
+
+    #[test]
+    fn cohort_wrapper_storage_is_independent_of_operation_payload() {
+        struct Payload<const N: usize>([u8; N]);
+        impl<const N: usize> Future for Payload<N> {
+            type Output = Result<()>;
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+                assert_eq!(self.0.len(), N);
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn future_size<F: Future>(_factory: impl FnOnce() -> F) -> usize {
+            // Never invoke the factory: no operation body is constructed or
+            // polled, and no large payload or blocking work runs in this test.
+            std::mem::size_of::<F>()
+        }
+        let operation = uuid::Uuid::nil();
+        let worker = BlockingCohort::for_worker(operation);
+        assert_eq!(
+            future_size(|| in_operation_cohort(operation, Payload([0u8; 1]))),
+            future_size(|| in_operation_cohort(operation, Payload([0u8; 64 * 1024]))),
+            "the direct-call cohort state must not embed its operation payload"
+        );
+        assert_eq!(
+            future_size(|| worker.run(Payload([0u8; 1]))),
+            future_size(|| worker.run(Payload([0u8; 64 * 1024]))),
+            "the service cohort state must not embed its worker payload"
+        );
     }
 }
