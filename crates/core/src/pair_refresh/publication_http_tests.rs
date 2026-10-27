@@ -2550,6 +2550,223 @@ mod packaged_call_site {
         Ok(())
     }
 
+    #[cfg(test)]
+    mod http_lifecycle_negative_tests {
+        use super::*;
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        // These are native unit probes of ownership/refusal, never packaged
+        // fixture qualification. Each leaf executes once in a fresh libtest
+        // process, because expected failures deliberately retain case state.
+        fn isolated(leaf: &str) -> bool {
+            assert!(std::env::var_os("REPOSYNC_LAUNCH_BINDING_V1").is_none(),
+                "native negative unit refuses a packaged launch channel");
+            assert_eq!(std::env::var("REPOSYNC_FIXTURE_EXEC_MODE").ok().as_deref(),
+                Some("native-generated-v1"), "native negative unit needs explicit native mode");
+            const CHILD: &str = "REPOSYNC_HTTP_NEGATIVE_UNIT_CHILD";
+            let module = module_path!().split_once("::").expect("crate module prefix").1;
+            let full = format!("{module}::{leaf}");
+            if std::env::var(CHILD).ok().as_deref() == Some(full.as_str()) {
+                return false;
+            }
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", full.as_str(), "--nocapture", "--test-threads=1",
+                "--format", "pretty", "--color", "never"])
+                .env(CHILD, &full).env_remove("REPOSYNC_LAUNCH_BINDING_V1");
+            // Existing native admission rejects packaged markers rather than
+            // converting an inherited packaged expectation into native proof.
+            admit_child_environment(&command, ExplicitMode::NativeGenerated)
+                .expect("native negative child admission");
+            command.env("REPOSYNC_FIXTURE_EXEC_MODE", "native-generated-v1");
+            let scratch = tempfile::Builder::new().prefix("rs-http-negative-").tempdir().unwrap();
+            command.env("TMPDIR", scratch.path()).env("TMP", scratch.path()).env("TEMP", scratch.path());
+            let output = match command.output() {
+                Ok(output) => output,
+                Err(error) => {
+                    let path = scratch.path().to_owned();
+                    std::mem::forget(scratch);
+                    panic!("negative child spawn failed; scratch={path:?}: {error}");
+                }
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let passed = format!("test {full} ... ok");
+            if !output.status.success()
+                || stdout.lines().filter(|line| *line == passed.as_str()).count() != 1
+                || !stdout.contains("1 passed; 0 failed; 0 ignored;") {
+                let path = scratch.path().to_owned();
+                std::mem::forget(scratch);
+                panic!("negative child failed or selected zero/ignored tests; scratch={path:?}; stdout={stdout}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            // Keep intentional worker-panic evidence without duplicating the
+            // child's passing stdout row in the parent libtest inventory.
+            if !output.stderr.is_empty() { eprint!("{}", String::from_utf8_lossy(&output.stderr)); }
+            // Child has exited: its retained FDs are closed by process exit,
+            // and this parent owns removal of only its scratch directory.
+            true
+        }
+
+        fn retained_root(context: crate::process::CaseContextId)
+            -> (crate::process::CaseResourceHandle<super::super::CaseHttpRoot>,
+                std::sync::Weak<tempfile::TempDir>) {
+            let root = std::sync::Arc::new(tempfile::tempdir().unwrap());
+            let weak = std::sync::Arc::downgrade(&root);
+            let handle = crate::process::register_case_resource(context,
+                || Ok(super::super::CaseHttpRoot { _root: root })).unwrap();
+            (handle, weak)
+        }
+
+        // Deliberately unadmitted metadata: only failure/Drop paths are used.
+        // No H, S/P/J, executable pin, hook or positive launch is fabricated.
+        fn unadmitted_cleanup_record(context: crate::process::CaseContextId, fd: RawFd) -> PreparedRepo {
+            PreparedRepo {
+                case_fd: fd, repo_fd: fd, config_fd: -1, marker_fd: -1,
+                env: EnvGuard::new(), selected_path: String::new(),
+                selected_sha256: String::new(), selected_len: 0, selected_mode: 0,
+                case_root_id: String::new(), explicitly_completed: false, context,
+                publication: None, blocking: None, server: None,
+                proved_markers: Mutex::new(Vec::new()),
+                selected_installed_relative_path: String::new(), selected_installed_mode: 0,
+                entry_id: String::new(), case_id: String::new(), instance_id: String::new(),
+                manifest_sha256: String::new(), data_sha256: String::new(), initial_oid: None,
+                marker_path: PathBuf::new(), hook_target: None, hook_dev: None, hook_ino: None,
+                hook_link_dev: None, hook_link_ino: None,
+            }
+        }
+
+        #[test]
+        fn http_l1_shared_admission_excludes_a_second_case() {
+            if isolated("http_l1_shared_admission_excludes_a_second_case") { return; }
+            let boundary = enter_process_boundary().unwrap();
+            let first = boundary.context();
+            boundary.assert_held();
+            assert!(crate::process::admit_case_context().is_err(),
+                "HTTP-local serialization must exclude the common admission path");
+            drop(boundary);
+            assert!(!crate::process::case_context_held(first));
+            let next = crate::process::admit_case_context().unwrap();
+            assert_ne!(first, next, "common case identities are not file-local counters");
+            crate::process::close_case_registration(next).unwrap();
+            crate::process::release_case_context(next, false).unwrap();
+        }
+
+        #[test]
+        fn http_l2_lost_observer_keeps_thread_result_and_root() {
+            if isolated("http_l2_lost_observer_keeps_thread_result_and_root") { return; }
+            let context = crate::process::admit_case_context().unwrap();
+            let (root, weak) = retained_root(context);
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, ready) = std::sync::mpsc::channel();
+            {
+                let _local_observer = super::super::spawn_http_work(context, move || {
+                    started.send(()).unwrap();
+                    wait.recv().unwrap();
+                    37u8
+                }).unwrap();
+                ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            assert!(weak.upgrade().is_some(), "case directory lost with its observer");
+            assert!(crate::process::release_case_context(context, true).is_err());
+            let handles = crate::process::case_resource_handles::<super::super::CaseHttpThread<u8>>(context);
+            assert_eq!(handles.len(), 1, "actual thread must remain registered");
+            crate::process::close_case_registration(context).unwrap();
+            release.send(()).unwrap();
+            let (value, proof) = super::super::join_http_work(handles[0], Duration::from_secs(2)).unwrap();
+            assert_eq!(value, 37, "original thread result was lost");
+            assert_eq!(proof.context, context);
+            assert!(weak.upgrade().is_some(), "joined thread is not root release authority");
+            crate::process::finish_case_resource(root).unwrap();
+            assert!(weak.upgrade().is_none());
+            crate::process::release_case_context(context, false).unwrap();
+        }
+
+        #[test]
+        fn http_l3_panic_handle_stays_consumed_and_case_held() {
+            if isolated("http_l3_panic_handle_stays_consumed_and_case_held") { return; }
+            let context = crate::process::admit_case_context().unwrap();
+            let handle = super::super::spawn_http_work(context, || -> u8 {
+                panic!("HTTP-L3 expected owned worker panic");
+            }).unwrap();
+            let first = super::super::join_http_work(handle, Duration::from_secs(2))
+                .map(|_| ()).unwrap_err();
+            assert!(first.contains("panicked"));
+            crate::process::with_case_resource(handle, |slot| {
+                assert!(slot.handle.is_none(), "consumed panic handle must not be polled again");
+                assert!(slot.ready.is_none());
+                assert!(slot.error.is_some());
+            }).unwrap();
+            let again = super::super::join_http_work(handle, Duration::from_secs(2))
+                .map(|_| ()).unwrap_err();
+            assert_eq!(first, again);
+            assert!(!crate::process::case_context_ready(context));
+            assert!(crate::process::release_case_context(context, true).is_err());
+            assert!(crate::process::admit_case_context().is_err());
+        }
+
+        #[test]
+        fn http_l7_other_case_join_cannot_qualify() {
+            if isolated("http_l7_other_case_join_cannot_qualify") { return; }
+            let first = enter_process_boundary().unwrap();
+            let context = first.context();
+            let handle = super::super::spawn_http_work(context, || 5u8).unwrap();
+            let (_, join) = super::super::join_http_work(handle, Duration::from_secs(2)).unwrap();
+            crate::process::close_case_registration(context).unwrap();
+            drop(first);
+            let second = enter_process_boundary().unwrap();
+            let other = second.context();
+            assert_ne!(context, other);
+            let (_root, _weak) = retained_root(other);
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut prepared = unadmitted_cleanup_record(other, stream.into_raw_fd());
+            let error = prepared.record_publication_joined(super::super::CheckedHttpPublication { join })
+                .unwrap_err();
+            assert!(error.contains("changed owner"));
+            assert!(prepared.publication.is_none());
+            prepared.record_blocking_joined();
+            assert!(prepared.blocking.is_none());
+            assert!(prepared.seal().unwrap_err().contains("has not joined"));
+            drop(prepared);
+            assert!(crate::process::release_case_context(other, true).is_err());
+        }
+
+        #[test]
+        fn http_l8_unbound_projection_never_calls_fixture_factory() {
+            if isolated("http_l8_unbound_projection_never_calls_fixture_factory") { return; }
+            let called = std::cell::Cell::new(false);
+            let error = super::super::with_attested_http_entry(|_| {
+                called.set(true);
+                Ok::<_, String>(())
+            }).unwrap_err();
+            assert!(error.contains("derived runtime projection is unbound"));
+            assert!(!called.get(), "unbound projection reached fixture creation");
+        }
+
+        #[test]
+        fn http_l9_aliased_descriptors_stay_owned_until_proof() {
+            if isolated("http_l9_aliased_descriptors_stay_owned_until_proof") { return; }
+            let boundary = enter_process_boundary().unwrap();
+            let context = boundary.context();
+            let (_root, weak) = retained_root(context);
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let fd = stream.into_raw_fd();
+            drop(unadmitted_cleanup_record(context, fd));
+            {
+                let sessions = RETAINED_SESSIONS.lock().unwrap_or_else(|poison| poison.into_inner());
+                let retained = sessions.iter().find(|session| session.context == context).unwrap();
+                assert_eq!(retained.fds.as_slice(), &[fd], "aliased descriptor was retained twice");
+            }
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            assert!(release_retained_session(context.serial_number()).is_err());
+            assert!(release_retained_session(context.serial_number().checked_add(1).unwrap()).is_err());
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+                "refused or foreign release closed this case's descriptor");
+            assert!(weak.upgrade().is_some());
+            assert!(!crate::process::case_context_ready(context));
+            assert!(crate::process::release_case_context(context, true).is_err());
+        }
+    }
+
     impl PreparedRepo {
         pub fn seal(&mut self) -> Result<(), String> {
             if self.explicitly_completed { return Err("HTTP session was already sealed".into()); }
@@ -3567,6 +3784,14 @@ mod child_context_admission {
 }
 
 #[cfg(unix)]
+fn with_attested_http_entry<T>(
+    create_fixture: impl FnOnce(packaged_call_site::SelectedEntry) -> Result<T, String>,
+) -> Result<T, String> {
+    let selected = packaged_call_site::attested_entry_from_validated_metadata("git-ref-move-v1")?;
+    create_fixture(selected)
+}
+
+#[cfg(unix)]
 fn packaged_http_advertisement(
     manifest: packaged_call_site::HarnessValidatedH,
     boundary: &packaged_call_site::ProcessBoundary,
@@ -3576,29 +3801,30 @@ fn packaged_http_advertisement(
     boundary.assert_held();
     // A selected, externally validated projection is still required. Keep the
     // frozen selector refusal ahead of directories, certificates and servers.
-    let selected = packaged_call_site::attested_entry_from_validated_metadata("git-ref-move-v1")?;
     let session = boundary.context();
-    let mut prepared_slot: Option<packaged_call_site::PreparedRepo> = None;
-    let fixture = HttpFixture::open(tls, None, Some(session), Some(&mut |case_root, repository, initial_oid| {
-        let mut prepared = packaged_call_site::prepare_existing_repository(
-            boundary,
-            &manifest,
-            &selected,
-            "git-ref-move-v1",
-            case_id,
-            case_root,
-            Some(repository),
-            false,
-            Some(initial_oid),
-        )?;
-        prepared.install_admitted_hook()?;
-        prepared.recheck_hook()?;
-        let context = packaged_call_site::packaged_spawn_context(&prepared);
-        prepared_slot = Some(prepared);
-        Ok(context)
-    }))?;
-    let mut prepared =
-        prepared_slot.ok_or_else(|| "prepared session missing before launch".to_string())?;
+    let (fixture, mut prepared) = with_attested_http_entry(|selected| {
+        let mut prepared_slot: Option<packaged_call_site::PreparedRepo> = None;
+        let fixture = HttpFixture::open(tls, None, Some(session), Some(&mut |case_root, repository, initial_oid| {
+            let mut prepared = packaged_call_site::prepare_existing_repository(
+                boundary,
+                &manifest,
+                &selected,
+                "git-ref-move-v1",
+                case_id,
+                case_root,
+                Some(repository),
+                false,
+                Some(initial_oid),
+            )?;
+            prepared.install_admitted_hook()?;
+            prepared.recheck_hook()?;
+            let context = packaged_call_site::packaged_spawn_context(&prepared);
+            prepared_slot = Some(prepared);
+            Ok(context)
+        }))?;
+        let prepared = prepared_slot.ok_or_else(|| "prepared session missing before launch".to_string())?;
+        Ok((fixture, prepared))
+    })?;
     let before = fixture.tip();
     // Move the repositories into their owned thread; do not require a shared
     // reference to git2 repositories to be Sync. Registration precedes spawn.
