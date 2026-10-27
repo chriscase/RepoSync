@@ -9,7 +9,9 @@ mod scheduler;
 mod signals;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -50,6 +52,299 @@ struct Args {
     /// Serve only authentication and explicit recovery of a retained pair refresh.
     #[arg(long)]
     pair_refresh_recovery: bool,
+}
+
+type TaskHandles = Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>;
+
+struct RetainedShutdownTask {
+    id: u64,
+    role: &'static str,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+static SHUTDOWN_TASK_IDS: AtomicU64 = AtomicU64::new(1);
+static RETAINED_SHUTDOWN_TASKS: OnceLock<Mutex<Vec<RetainedShutdownTask>>> = OnceLock::new();
+static RETAINED_SHUTDOWN_REGISTRIES: OnceLock<Mutex<Vec<(&'static str, TaskHandles)>>> =
+    OnceLock::new();
+static RETAINED_IMPORT_STATES: OnceLock<Mutex<Vec<Arc<reposync_web::AppState>>>> = OnceLock::new();
+
+/// A completed task is still owned until its join result has been observed.
+/// Cancellation, timeout and unwind retain the same unconsumed handle.
+pub(crate) struct OwnedShutdownTask {
+    id: u64,
+    role: &'static str,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl OwnedShutdownTask {
+    pub(crate) fn new(role: &'static str, handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            id: SHUTDOWN_TASK_IDS.fetch_add(1, Ordering::Relaxed),
+            role,
+            handle: Some(handle),
+        }
+    }
+
+    pub(crate) fn join_observed(&self) -> bool {
+        self.handle.is_none()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
+    }
+
+    /// Reclaim exactly one retained owner for a separately bounded join. No
+    /// implicit retry, join, or success is performed by inspecting custody.
+    #[allow(dead_code)]
+    fn take_retained(id: u64) -> Option<Self> {
+        let mut retained = RETAINED_SHUTDOWN_TASKS
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let index = retained.iter().position(|task| task.id == id)?;
+        let task = retained.swap_remove(index);
+        Some(Self {
+            id: task.id,
+            role: task.role,
+            handle: Some(task.handle),
+        })
+    }
+
+    fn abort(&self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+
+    pub(crate) async fn join(&mut self) -> Result<(), tokio::task::JoinError> {
+        let result = self
+            .handle
+            .as_mut()
+            .expect("shutdown task join was already observed")
+            .await;
+        // There is no await between consuming Ready and removing the handle.
+        self.handle.take();
+        result
+    }
+}
+
+impl Drop for OwnedShutdownTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            error!(
+                task_id = self.id,
+                role = self.role,
+                "retaining unjoined shutdown task"
+            );
+            RETAINED_SHUTDOWN_TASKS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(RetainedShutdownTask {
+                    id: self.id,
+                    role: self.role,
+                    handle,
+                });
+        }
+    }
+}
+
+fn retain_task_registry(role: &'static str, handles: TaskHandles) {
+    // If the scheduler join is unresolved, do not snapshot a registry it could
+    // still be using. Retain its Arc, including handles registered already.
+    RETAINED_SHUTDOWN_REGISTRIES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((role, handles));
+}
+
+/// Keep registry custody even if main unwinds before its shutdown snapshot.
+struct TaskRegistryCustody {
+    role: &'static str,
+    handles: TaskHandles,
+}
+
+impl Drop for TaskRegistryCustody {
+    fn drop(&mut self) {
+        retain_task_registry(self.role, Arc::clone(&self.handles));
+    }
+}
+
+/// The import registry is an inline mutex owned by AppState, not its own Arc.
+/// Retaining its owner also retains the database, engine and other state until
+/// process exit. Custody does not establish task completion or cleanup.
+struct ImportRegistryCustody {
+    state: Arc<reposync_web::AppState>,
+}
+
+impl Drop for ImportRegistryCustody {
+    fn drop(&mut self) {
+        RETAINED_IMPORT_STATES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::clone(&self.state));
+    }
+}
+
+#[derive(Default)]
+struct TaskDrainReport {
+    owned: usize,
+    unresolved: usize,
+    timed_out: bool,
+    join_failures: Vec<String>,
+}
+
+/// Observe every handle, including handles already finished at the snapshot.
+/// Both the initial wait and the post-abort wait have shared deadlines, so the
+/// bound does not grow once per child. Dropping any pending owner retains it.
+async fn drain_owned_tasks(
+    handles: &tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    role: &'static str,
+    drain_bound: Duration,
+    abort_join_bound: Duration,
+) -> TaskDrainReport {
+    let tasks: Vec<_> = {
+        let mut locked = handles.lock().await;
+        locked
+            .drain(..)
+            .map(|handle| OwnedShutdownTask::new(role, handle))
+            .collect()
+    };
+    let mut report = TaskDrainReport {
+        owned: tasks.len(),
+        ..TaskDrainReport::default()
+    };
+    let deadline = tokio::time::Instant::now() + drain_bound;
+    let mut pending = tasks.into_iter();
+    while let Some(mut task) = pending.next() {
+        match tokio::time::timeout_at(deadline, task.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => report.join_failures.push(format!("{role}: {error}")),
+            Err(_) => {
+                report.timed_out = true;
+                let mut aborted = vec![task];
+                aborted.extend(pending);
+                for task in &aborted {
+                    task.abort();
+                }
+                let abort_deadline = tokio::time::Instant::now() + abort_join_bound;
+                for mut task in aborted {
+                    match tokio::time::timeout_at(abort_deadline, task.join()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) if error.is_cancelled() => {}
+                        Ok(Err(error)) => {
+                            report.join_failures.push(format!("{role}: {error}"));
+                        }
+                        Err(_) => report.unresolved += 1,
+                    }
+                    // Unobserved handles move to retained storage on drop.
+                }
+                break;
+            }
+        }
+    }
+    report
+}
+
+pub(crate) struct SchedulerStopReport {
+    pub failure: Option<String>,
+    pub terminated_before_drain: bool,
+    pub drained_sync_tasks: usize,
+    pub stop_timeout_recorded: bool,
+    pub unresolved_sync_tasks: usize,
+    pub sync_join_failures: usize,
+}
+
+/// Borrowed resources shared by scheduler stop and sync-task drain.
+pub(crate) struct SchedulerStopContext<'a> {
+    pub notify: &'a Arc<tokio::sync::Notify>,
+    pub gate: &'a Arc<scheduler::SchedulerShutdownGate>,
+    pub sync_handles: &'a TaskHandles,
+}
+
+/// Close admission before notification. A fatal deadline remains fatal even if
+/// abort later joins. No child snapshot precedes an observed scheduler join.
+pub(crate) async fn stop_scheduler_and_drain_sync_tasks(
+    context: SchedulerStopContext<'_>,
+    scheduler_task: &mut OwnedShutdownTask,
+    stop_timeout: Duration,
+    mut failure: Option<String>,
+    record_failure: &mut dyn FnMut(reposync_web::SchedulerServiceLevel, &str),
+    on_stop_deadline: &mut dyn FnMut(),
+    sync_drain_bound: Duration,
+) -> SchedulerStopReport {
+    let SchedulerStopContext {
+        notify,
+        gate,
+        sync_handles,
+    } = context;
+    gate.request_stop();
+    notify.notify_one();
+    let mut stop_timeout_recorded = false;
+    if !scheduler_task.join_observed() {
+        match tokio::time::timeout(stop_timeout, scheduler_task.join()).await {
+            Ok(end) => {
+                if let Some((level, reason)) = reposync_web::scheduler_failure_from_task_end(
+                    true,
+                    &reposync_web::SchedulerTaskEnd::from_join(end),
+                ) {
+                    record_failure(level, &reason);
+                    failure.get_or_insert(reason);
+                }
+            }
+            Err(_) => {
+                let (level, reason) = reposync_web::scheduler_failure_from_stop_timeout();
+                record_failure(level, &reason);
+                failure.get_or_insert(reason);
+                stop_timeout_recorded = true;
+                on_stop_deadline();
+                scheduler_task.abort();
+                match tokio::time::timeout(stop_timeout, scheduler_task.join()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if error.is_cancelled() => {}
+                    Ok(Err(error)) => error!(%error, "scheduler join failed after stop deadline"),
+                    Err(_) => error!("scheduler join remains unresolved; child drains are closed"),
+                }
+            }
+        }
+    }
+    let terminated = scheduler_task.join_observed();
+    let drain = if terminated {
+        drain_owned_tasks(sync_handles, "sync task", sync_drain_bound, stop_timeout).await
+    } else {
+        TaskDrainReport::default()
+    };
+    let prior_join_failures = gate.sync_join_failures();
+    for reason in drain.join_failures.iter().chain(prior_join_failures.iter()) {
+        error!(%reason, "observed sync task join failure");
+    }
+    if drain.timed_out
+        || drain.unresolved != 0
+        || !drain.join_failures.is_empty()
+        || !prior_join_failures.is_empty()
+    {
+        let reason = format!(
+            "sync task shutdown incomplete: timed_out={}, unresolved={}, join_failures={}",
+            drain.timed_out,
+            drain.unresolved,
+            drain.join_failures.len() + prior_join_failures.len()
+        );
+        record_failure(reposync_web::SchedulerServiceLevel::Fatal, &reason);
+        failure.get_or_insert(reason);
+    }
+    SchedulerStopReport {
+        failure,
+        terminated_before_drain: terminated,
+        drained_sync_tasks: drain.owned,
+        stop_timeout_recorded,
+        unresolved_sync_tasks: drain.unresolved,
+        sync_join_failures: drain.join_failures.len() + prior_join_failures.len(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -636,23 +931,35 @@ async fn main() -> Result<()> {
         config.clone(),
     );
 
-    // Capture sync handles for graceful shutdown before moving sched
+    // Capture owners before moving the scheduler. Registry custody survives
+    // cancellation/unwind even when no shutdown snapshot was possible.
     let sync_handles = sched.sync_handles.clone();
+    let scheduler_shutdown_gate = sched.shutdown_gate();
+    let _sync_registry_custody = TaskRegistryCustody {
+        role: "sync tasks",
+        handles: Arc::clone(&sync_handles),
+    };
+    let _import_registry_custody = ImportRegistryCustody {
+        state: Arc::clone(&app_state_for_shutdown),
+    };
     let scheduler_state = app_state_for_shutdown.clone();
 
     // Start the scheduler in a background task. The JoinHandle is raced
     // against shutdown so a panic, join error, or early exit is recorded
     // on AppState immediately instead of being ignored until SIGTERM.
-    let mut scheduler_handle = tokio::spawn(async move {
-        sched.run(scheduler_shutdown).await;
-    });
+    let mut scheduler_handle = OwnedShutdownTask::new(
+        "scheduler",
+        tokio::spawn(async move {
+            sched.run(scheduler_shutdown).await;
+        }),
+    );
     let mut scheduler_failure: Option<String> = None;
 
     tokio::select! {
         _ = signals::wait_for_shutdown() => {
             info!("Shutdown signal received, stopping...");
         }
-        end = &mut scheduler_handle => {
+        end = scheduler_handle.join() => {
             if let Some((level, reason)) = reposync_web::scheduler_failure_from_task_end(
                 false,
                 &reposync_web::SchedulerTaskEnd::from_join(end),
@@ -667,85 +974,56 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Signal cooperative shutdown to the scheduler (no-op if it already ended).
-    shutdown.notify_waiters();
-
-    // Wait for the scheduler to finish its current cycle when shutdown won
-    // the race and the task is still running. The budget is
-    // `SCHEDULER_STOP_TIMEOUT` (10s). Expiry is fatal: shutdown was already
-    // requested and the task did not return. This is not a poll-interval
-    // hang check. A long poll stays running until shutdown is requested.
-    if scheduler_failure.is_none() {
-        match tokio::time::timeout(reposync_web::SCHEDULER_STOP_TIMEOUT, &mut scheduler_handle)
-            .await
-        {
-            Ok(Ok(())) => info!("scheduler stopped gracefully"),
-            Ok(Err(error)) => {
-                if let Some((level, reason)) = reposync_web::scheduler_failure_from_task_end(
-                    true,
-                    &reposync_web::SchedulerTaskEnd::from_join(Err(error)),
-                ) {
-                    warn!(%reason, "scheduler failed while stopping");
-                    scheduler_state.record_scheduler_failure(level, reason.clone());
-                    scheduler_failure = Some(reason);
-                }
-            }
-            Err(_) => {
-                let (level, reason) = reposync_web::scheduler_failure_from_stop_timeout();
-                error!(%reason, "scheduler stop timeout expired; marking service fatal");
-                scheduler_state.record_scheduler_failure(level, reason.clone());
-                scheduler_failure = Some(reason);
-            }
+    let scheduler_stop = stop_scheduler_and_drain_sync_tasks(
+        SchedulerStopContext {
+            notify: &shutdown,
+            gate: &scheduler_shutdown_gate,
+            sync_handles: &sync_handles,
+        },
+        &mut scheduler_handle,
+        reposync_web::SCHEDULER_STOP_TIMEOUT,
+        scheduler_failure,
+        &mut |level, reason| scheduler_state.record_scheduler_failure(level, reason),
+        &mut || {},
+        Duration::from_secs(30),
+    )
+    .await;
+    scheduler_failure = scheduler_stop.failure;
+    info!(
+        drained = scheduler_stop.drained_sync_tasks,
+        unresolved = scheduler_stop.unresolved_sync_tasks,
+        join_failures = scheduler_stop.sync_join_failures,
+        stop_timeout = scheduler_stop.stop_timeout_recorded,
+        "scheduler shutdown join report"
+    );
+    let mut unresolved_shutdown =
+        !scheduler_stop.terminated_before_drain || scheduler_stop.unresolved_sync_tasks != 0;
+    if scheduler_stop.terminated_before_drain {
+        let imports = drain_owned_tasks(
+            &app_state_for_shutdown.import_handles,
+            "import task",
+            Duration::from_secs(60),
+            reposync_web::SCHEDULER_STOP_TIMEOUT,
+        )
+        .await;
+        unresolved_shutdown |= imports.unresolved != 0;
+        for reason in &imports.join_failures {
+            error!(%reason, "observed import task join failure");
         }
-    }
-
-    // Wait for in-flight sync tasks (up to 30s)
-    {
-        let handles: Vec<_> = {
-            let mut locked = sync_handles.lock().await;
-            locked.drain(..).filter(|h| !h.is_finished()).collect()
-        };
-        if !handles.is_empty() {
-            info!(count = handles.len(), "waiting for in-flight sync tasks...");
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            for handle in handles {
-                match tokio::time::timeout_at(deadline, handle).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("sync task error: {}", e),
-                    Err(_) => {
-                        warn!("remaining sync tasks did not complete within 30s");
-                        break;
-                    }
-                }
-            }
-            info!("in-flight sync task shutdown complete");
-        }
-    }
-
-    // Wait for in-flight import tasks (up to 60s — imports are long-running)
-    {
-        let handles: Vec<_> = {
-            let mut locked = app_state_for_shutdown.import_handles.lock().await;
-            locked.drain(..).filter(|h| !h.is_finished()).collect()
-        };
-        if !handles.is_empty() {
-            info!(
-                count = handles.len(),
-                "waiting for in-flight import tasks..."
+        if imports.timed_out || imports.unresolved != 0 || !imports.join_failures.is_empty() {
+            let reason =
+                format!(
+                "import task shutdown incomplete: timed_out={}, unresolved={}, join_failures={}",
+                imports.timed_out, imports.unresolved, imports.join_failures.len()
             );
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-            for handle in handles {
-                match tokio::time::timeout_at(deadline, handle).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("import task error: {}", e),
-                    Err(_) => {
-                        warn!("remaining import tasks did not complete within 60s");
-                        break;
-                    }
-                }
-            }
-            info!("in-flight import task shutdown complete");
+            scheduler_state.record_scheduler_failure(
+                reposync_web::SchedulerServiceLevel::Fatal,
+                reason.clone(),
+            );
+            scheduler_failure.get_or_insert(reason);
         }
+    } else {
+        error!("scheduler join unresolved; sync/import registries remain owned, not drained");
     }
 
     // The web server uses with_graceful_shutdown and will drain connections
@@ -754,6 +1032,12 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => info!("web server stopped gracefully"),
         Ok(Err(e)) => warn!("web server task error: {}", e),
         Err(_) => info!("web server shutdown timed out, proceeding"),
+    }
+
+    if unresolved_shutdown {
+        // A retained join is not a cleanup proof. Do not checkpoint storage
+        // while a scheduler or child writer may still be running.
+        anyhow::bail!("shutdown retains unjoined work; WAL checkpoint skipped");
     }
 
     // Checkpoint the SQLite WAL to prevent corruption on unclean exit.
@@ -773,4 +1057,315 @@ async fn main() -> Result<()> {
         anyhow::bail!("scheduler failed: {reason}");
     }
     Ok(())
+}
+
+/// AUTHORED UNRUN. These cases exercise ownership and join observations only;
+/// expected injected panic cases are explicitly named and must retain evidence.
+#[cfg(test)]
+mod shutdown_ownership_tests {
+    use super::*;
+
+    fn empty_handles() -> TaskHandles {
+        Arc::new(tokio::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Intentional injected scheduler panic, including the already-finished path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_scheduler_panic_is_joined_and_classified() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(scheduler::SchedulerShutdownGate::default());
+        let handles = empty_handles();
+        let mut task = OwnedShutdownTask::new(
+            "finished scheduler panic regression",
+            tokio::spawn(async {
+                panic!("RS112 expected scheduler panic");
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.join_observed());
+        let mut failures = Vec::new();
+        let report = stop_scheduler_and_drain_sync_tasks(
+            SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &handles,
+            },
+            &mut task,
+            Duration::from_secs(2),
+            None,
+            &mut |level, reason| failures.push((level, reason.to_string())),
+            &mut || panic!("finished scheduler must not time out"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(task.join_observed());
+        assert!(report.terminated_before_drain);
+        assert!(!report.stop_timeout_recorded);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, reposync_web::SchedulerServiceLevel::Fatal);
+        assert!(failures[0].1.contains("panicked during shutdown"));
+        assert_eq!(report.failure.as_deref(), Some(failures[0].1.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn existing_failure_does_not_skip_an_unobserved_scheduler_join() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let wait = Arc::clone(&notify);
+        let gate = Arc::new(scheduler::SchedulerShutdownGate::default());
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark_exit = Arc::clone(&exited);
+        let mut task = OwnedShutdownTask::new(
+            "existing failure regression",
+            tokio::spawn(async move {
+                wait.notified().await;
+                mark_exit.store(true, Ordering::SeqCst);
+            }),
+        );
+        let report = stop_scheduler_and_drain_sync_tasks(
+            SchedulerStopContext {
+                notify: &notify,
+                gate: &gate,
+                sync_handles: &empty_handles(),
+            },
+            &mut task,
+            Duration::from_secs(2),
+            Some("retained earlier fatal reason".to_string()),
+            &mut |_level, _reason| panic!("cooperative join must not add failure"),
+            &mut || panic!("cooperative join must not time out"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(
+            report.failure.as_deref(),
+            Some("retained earlier fatal reason")
+        );
+        assert!(report.terminated_before_drain);
+        assert!(task.join_observed());
+        assert!(exited.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_deadline_aborts_and_observes_scheduler_before_child_drain() {
+        struct MarkExit(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for MarkExit {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mark = MarkExit(Arc::clone(&exited));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let announce = Arc::clone(&entered);
+        let mut task = OwnedShutdownTask::new(
+            "abort join regression",
+            tokio::spawn(async move {
+                let _mark = mark;
+                announce.notify_one();
+                std::future::pending::<()>().await;
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let handles = empty_handles();
+        let seen_exit = Arc::clone(&exited);
+        handles.lock().await.push(tokio::spawn(async move {
+            while !seen_exit.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        }));
+        let mut failures = Vec::new();
+        let report = stop_scheduler_and_drain_sync_tasks(
+            SchedulerStopContext {
+                notify: &Arc::new(tokio::sync::Notify::new()),
+                gate: &Arc::new(scheduler::SchedulerShutdownGate::default()),
+                sync_handles: &handles,
+            },
+            &mut task,
+            Duration::from_millis(20),
+            None,
+            &mut |_level, reason| failures.push(reason.to_string()),
+            &mut || {
+                assert!(!exited.load(Ordering::SeqCst));
+                assert_eq!(handles.try_lock().unwrap().len(), 1);
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        let (_, reason) = reposync_web::scheduler_failure_from_stop_timeout();
+        assert_eq!(failures, vec![reason.clone()]);
+        assert_eq!(report.failure.as_deref(), Some(reason.as_str()));
+        assert!(report.stop_timeout_recorded);
+        assert!(report.terminated_before_drain);
+        assert!(task.join_observed());
+        assert!(exited.load(Ordering::SeqCst));
+        assert_eq!(report.drained_sync_tasks, 1);
+        assert_eq!(report.unresolved_sync_tasks, 0);
+        assert!(handles.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_timeout_retains_the_same_scheduler_handle_and_closes_child_drain() {
+        struct Release(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let release = Release(Some(tx));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let announce = Arc::clone(&entered);
+        let mut task = OwnedShutdownTask::new(
+            "noncancellable scheduler regression",
+            tokio::spawn(async move {
+                tokio::task::block_in_place(|| {
+                    announce.notify_one();
+                    rx.recv_timeout(Duration::from_secs(5))
+                        .expect("fixture release");
+                });
+            }),
+        );
+        let id = task.id;
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let handles = empty_handles();
+        let child_release = Arc::new(tokio::sync::Notify::new());
+        let wait = Arc::clone(&child_release);
+        handles.lock().await.push(tokio::spawn(async move {
+            wait.notified().await;
+        }));
+        let report = stop_scheduler_and_drain_sync_tasks(
+            SchedulerStopContext {
+                notify: &Arc::new(tokio::sync::Notify::new()),
+                gate: &Arc::new(scheduler::SchedulerShutdownGate::default()),
+                sync_handles: &handles,
+            },
+            &mut task,
+            Duration::from_millis(20),
+            None,
+            &mut |_level, _reason| {},
+            &mut || {},
+            Duration::from_millis(20),
+        )
+        .await;
+        let unobserved = !task.join_observed();
+        let still_owned_children = handles.lock().await.len();
+        drop(task);
+        let mut retained = OwnedShutdownTask::take_retained(id).expect("same retained owner");
+        assert_eq!(retained.id, id);
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), retained.join())
+            .await
+            .expect("released blocking work must join")
+            .unwrap();
+        child_release.notify_one();
+        let children = drain_owned_tasks(
+            &handles,
+            "noncancellable regression cleanup",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(report.stop_timeout_recorded);
+        assert!(!report.terminated_before_drain);
+        assert_eq!(report.drained_sync_tasks, 0);
+        assert_eq!(still_owned_children, 1);
+        assert!(unobserved);
+        assert!(retained.join_observed());
+        assert!(OwnedShutdownTask::take_retained(id).is_none());
+        assert_eq!(children.owned, 1);
+        assert_eq!(children.unresolved, 0);
+        assert!(children.join_failures.is_empty());
+    }
+
+    /// Intentional injected child panic; finished is not successful completion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn child_drain_observes_an_already_finished_panic() {
+        let handles = empty_handles();
+        handles.lock().await.push(tokio::spawn(async {
+            panic!("RS112 expected drain panic");
+        }));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handles.lock().await[0].is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let report = drain_owned_tasks(
+            &handles,
+            "finished drain panic regression",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(report.owned, 1);
+        assert_eq!(report.join_failures.len(), 1);
+        assert!(report.join_failures[0].contains("panic"));
+        assert_eq!(report.unresolved, 0);
+        assert!(handles.lock().await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_child_drain_retains_current_and_remaining_owners() {
+        // Exercise the inline-mutex shape used by AppState.import_handles.
+        let handles = tokio::sync::Mutex::new(Vec::new());
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            releases.push(tx);
+            handles.lock().await.push(tokio::spawn(async move {
+                let _ = rx.await;
+            }));
+        }
+        let timeout = tokio::time::timeout(
+            Duration::from_millis(20),
+            drain_owned_tasks(
+                &handles,
+                "cancelled drain regression",
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+            ),
+        )
+        .await;
+        assert!(timeout.is_err());
+        let ids: Vec<_> = RETAINED_SHUTDOWN_TASKS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|task| task.role == "cancelled drain regression")
+            .map(|task| task.id)
+            .collect();
+        for release in releases {
+            let _ = release.send(());
+        }
+        for id in &ids {
+            let mut owner = OwnedShutdownTask::take_retained(*id).expect("retained child owner");
+            tokio::time::timeout(Duration::from_secs(2), owner.join())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(owner.join_observed());
+        }
+        assert_eq!(ids.len(), 2);
+        assert!(handles.lock().await.is_empty());
+        for id in ids {
+            assert!(OwnedShutdownTask::take_retained(id).is_none());
+        }
+    }
 }
