@@ -1,0 +1,425 @@
+# Unpublished candidate: focused composition/metadata review and fresh exact launch admission required.
+name: RS69 owned lifecycle 8 cases (partial)
+'on':
+  push:
+    tags:
+    - rs69-lifecycle-0a0458ac-v1
+permissions:
+  contents: read
+concurrency:
+  group: rs69-hosted8-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  lifecycle8:
+    name: RS69 exact 8; whole issue69 remains open
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    if: github.repository == 'chriscase/RepoSync' && github.event_name == 'push' && github.ref == 'refs/tags/rs69-lifecycle-0a0458ac-v1'
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+    - name: Read-only pinned checkout
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+        fetch-depth: 1
+        submodules: false
+        lfs: false
+    - name: Admit exact source, event, effects profile and private inputs
+      timeout-minutes: 2
+      run: |
+        set -euo pipefail
+        umask 077
+        export RS69_ROOT="$RUNNER_TEMP/rs69-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+        printf 'RS69_ROOT=%s\n' "$RS69_ROOT" >> "$GITHUB_ENV"
+        test ! -e "$RS69_ROOT"
+        mkdir -m 700 "$RS69_ROOT"
+        cat > "$RS69_ROOT/evidence.py" <<'PY_EVIDENCE'
+        import datetime, hashlib, json, os, pathlib, re, shutil, stat, subprocess, sys
+        R = pathlib.Path(os.environ["RS69_ROOT"])
+        E = R / "evidence"
+        P = json.loads((R / "profile.json").read_text()) if (R / "profile.json").exists() else None
+        def now(): return datetime.datetime.now(datetime.timezone.utc).isoformat()
+        def sha(b): return hashlib.sha256(b).hexdigest()
+        def save(path, value):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        def require(ok, message):
+            if not ok: raise RuntimeError(message)
+        def object_id(kind, b): return hashlib.sha1(kind.encode()+b" "+str(len(b)).encode()+b"\0"+b).hexdigest()
+        def tree(entries):
+            children = {}
+            for rel, mode, oid in entries:
+                first, sep, rest = rel.partition("/")
+                if sep: children.setdefault(first, []).append((rest, mode, oid))
+                else: children[first] = (mode, oid)
+            rows = []
+            for name, value in children.items():
+                mode, oid = ("40000", tree(value)) if isinstance(value, list) else value
+                rows.append((name.encode()+ (b"/" if mode == "40000" else b""), mode.encode()+b" "+name.encode()+b"\0"+bytes.fromhex(oid)))
+            return object_id("tree", b"".join(row for _, row in sorted(rows)))
+        def git(src, *args):
+            env = {"PATH": "/usr/bin:/bin", "HOME": str(R/"home"), "GIT_CONFIG_NOSYSTEM":"1", "GIT_CONFIG_GLOBAL":"/dev/null", "GIT_OPTIONAL_LOCKS":"0"}
+            return subprocess.check_output(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath="+str(R/"empty-hooks"), "-C", str(src), *args], env=env)
+        def source_check(src, initial=False):
+            entries = []
+            for row in git(src, "ls-tree", "-rz", "HEAD").split(b"\0"):
+                if not row: continue
+                meta, rel = row.split(b"\t", 1)
+                mode, kind, oid = meta.decode().split()
+                rel = rel.decode()
+                require(kind == "blob" and mode in ("100644","100755"), "unsupported source entry")
+                f = src/rel
+                require(f.is_file() and not f.is_symlink(), "nonregular source "+rel)
+                b = f.read_bytes()
+                require(object_id("blob", b) == oid, "source bytes changed: "+rel)
+                require(bool(f.stat().st_mode & 0o111) == (mode == "100755"), "source mode changed: "+rel)
+                entries.append((rel, mode, oid))
+            expected_paths = {entry[0] for entry in entries} | (set() if initial else {"Cargo.lock"})
+            observed_paths = set()
+            for directory, dirs, files in os.walk(src):
+                if pathlib.Path(directory) == src: dirs[:] = [name for name in dirs if name != ".git"]
+                for name in files: observed_paths.add(str((pathlib.Path(directory)/name).relative_to(src)))
+            require(observed_paths == expected_paths, "unexpected or missing private source input")
+            metadata = set(P["source"]["execution_metadata_paths"])
+            require(metadata.issubset({x[0] for x in entries}), "missing execution metadata")
+            project = [x for x in entries if x[0] not in metadata]
+            require(len(project) == P["source"]["project_file_count"], "source file count")
+            require(tree(project) == P["source"]["project_tree"], "project tree mismatch")
+            require(git(src, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"], "checkout SHA mismatch")
+            parents = [line.split()[1].decode() for line in git(src, "cat-file", "commit", "HEAD").split(b"\n\n",1)[0].splitlines() if line.startswith(b"parent ")]
+            require(parents == [P["source"]["parent_commit"]], "execution commit parent mismatch")
+            for item in P["source"]["changed_files"] + P["source"]["manifests"] + P["source"]["acceptance_context_files"]:
+                b = (src/item["path"]).read_bytes()
+                require(len(b)==item["bytes"] and sha(b)==item["sha256"], "pinned file mismatch: "+item["path"])
+            for name, expected in P["source"]["unchanged_workflows_sha256"].items():
+                require(sha((src/".github/workflows"/name).read_bytes())==expected, "existing workflow changed: "+name)
+            lock = P["lock"]
+            b = (src/lock["fixture_path"]).read_bytes()
+            require(len(b)==lock["bytes"] and sha(b)==lock["sha256"] and object_id("blob",b)==lock["blob"], "external fixture lock mismatch")
+            if not initial: require((src/"Cargo.lock").read_bytes()==b, "external root lock changed")
+            return {"commit":os.environ["GITHUB_SHA"], "full_tree":tree(entries), "project_tree":tree(project), "files":len(entries), "metadata_blobs":{rel:oid for rel,_,oid in entries if rel in metadata}}
+        def capacity():
+            free = shutil.disk_usage(R).free
+            target = sum(f.stat().st_size for f in (R/"target").rglob("*") if f.is_file())
+            available = int(re.search(r"^MemAvailable:\s+(\d+)", pathlib.Path("/proc/meminfo").read_text(), re.M)[1])*1024
+            output = sum(f.stat().st_size for f in E.rglob("*") if f.is_file())
+            require(output <= P["runner"]["output_budget_bytes"], "evidence output budget exceeded")
+            value = {"recorded_utc":now(), "free_disk_bytes":free, "target_bytes":target, "evidence_bytes":output, "available_ram_bytes":available}
+            require(free >= P["runner"]["minimum_free_disk_bytes"], "free disk admission failed")
+            require(target <= P["runner"]["target_budget_bytes"], "target disk budget exceeded")
+            require(available >= P["runner"]["minimum_available_ram_bytes"], "available RAM admission failed")
+            return value
+        def case_path(i): return E/"cases"/("%02d.json"%i)
+        def initialise():
+            global P
+            checkout = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+            P = json.loads((checkout/".github/verification/rs69-lifecycle-profile.json").read_text())
+            require(os.environ["GITHUB_REPOSITORY"]==P["trigger"]["repository"] and os.environ["GITHUB_EVENT_NAME"]==P["trigger"]["event"] and os.environ["GITHUB_REF"]==P["trigger"]["ref"], "wrong publication event")
+            require(os.environ["GITHUB_RUN_ATTEMPT"]=="1", "campaign requires attempt1; correction uses a reviewed head and fresh tag")
+            require(len(P["cases"])==8 and len({c["name"] for c in P["cases"]})==8, "case catalogue mismatch")
+            require([c["expected_panic_message"] for c in P["cases"]]==[None,None,None,None,None,None,"worker",None], "unexpected visible panic catalogue")
+            require([c["index"] for c in P["cases"]]==list(range(1,9)), "case index catalogue mismatch")
+            require([c["target"] for c in P["cases"]]==["core"]*8, "case target catalogue mismatch")
+            require([t["id"] for t in P["compile"]["targets"]]==["core"], "compile target catalogue mismatch")
+            for c in P["cases"]: require(re.fullmatch(r"[a-z_][a-z0-9_:]*",c["name"]) is not None, "invalid case name")
+            for name in ("home","tmp","scratch","target","cargo-home","rustup-home","empty-hooks","empty-template","evidence"):
+                (R/name).mkdir(mode=0o700, exist_ok=False)
+            save(R/"profile.json",P)
+            prerequisites = {}
+            for command in ("git","rustup","cc","pkg-config","cmake","make","prlimit","time"):
+                f = shutil.which(command)
+                require(f is not None, "missing native prerequisite: "+command)
+                prerequisites[command] = {"path":f,"realpath":str(pathlib.Path(f).resolve()),"sha256":sha(pathlib.Path(f).read_bytes())}
+            save(E/"native-prerequisites.json",prerequisites)
+            require(all(pathlib.Path(f).is_file() for f in ("/usr/bin/time","/usr/bin/prlimit")), "missing fixed resource tool")
+            require((os.cpu_count() or 0)>=P["runner"]["minimum_cpus"], "CPU admission failed")
+            bound = source_check(checkout, initial=True)
+            shutil.copytree(checkout,R/"source",ignore=lambda directory,names: {".git"} if pathlib.Path(directory)==checkout else set())
+            original_git = checkout/".git"
+            require(original_git.is_dir() and not (original_git/"objects/info/alternates").exists(), "unsupported checkout Git storage")
+            private_git = R/"source/.git"
+            private_git.mkdir()
+            shutil.copytree(original_git/"objects",private_git/"objects")
+            (private_git/"refs").mkdir()
+            for name in ("index","shallow"):
+                if (original_git/name).is_file(): shutil.copyfile(original_git/name,private_git/name)
+            (private_git/"HEAD").write_text(os.environ["GITHUB_SHA"]+"\n")
+            (private_git/"config").write_text("[core]\nrepositoryformatversion = 0\nbare = false\nlogallrefupdates = false\n")
+            require(not (R/"source/Cargo.lock").exists(), "unexpected tracked/root lock")
+            shutil.copyfile(R/"source"/P["lock"]["fixture_path"],R/"source/Cargo.lock")
+            require(source_check(R/"source")==bound, "private source binding changed")
+            save(E/"source.json",bound)
+            save(E/"profile.json",P)
+            save(E/"admission.json",{"recorded_utc":now(),"run_id":os.environ["GITHUB_RUN_ID"],"attempt":os.environ["GITHUB_RUN_ATTEMPT"],"runner_name":os.environ.get("RUNNER_NAME"),"runner_os":os.environ.get("RUNNER_OS"),"image_os":os.environ.get("ImageOS"),"image_version":os.environ.get("ImageVersion"),"capacity":capacity(),"status":"ADMITTED_FOR_THIS_JOB_ONLY"})
+            (R/"rustup.path").write_text(shutil.which("rustup")+"\n")
+            for c in P["cases"]: save(case_path(c["index"]),{"index":c["index"],"name":c["name"],"status":"NOT_RUN"})
+        def toolchain():
+            for tool, expected in (("rustc",P["toolchain"]["rustc_commit"]),("cargo",P["toolchain"]["cargo_commit"])):
+                text=(E/(tool+"-version.txt")).read_text()
+                require(re.search(r"^release: 1\.98\.1$",text,re.M) and re.search(r"^commit-hash: "+expected+r"$",text,re.M), "toolchain identity mismatch: "+tool)
+                path=pathlib.Path((R/(tool+".path")).read_text().strip())
+                require(path.is_file() and path.resolve().is_relative_to((R/"rustup-home").resolve()), "nonprivate toolchain")
+                save(E/(tool+"-identity.json"),{"path":str(path),"sha256":sha(path.read_bytes()),"version":text})
+        def cache():
+            import tomllib
+            packages=tomllib.loads((R/"source/Cargo.lock").read_text())["package"]
+            registry=[p for p in packages if p.get("source","").startswith("registry+")]
+            require(len(packages)==P["lock"]["all_packages"] and len(registry)==P["lock"]["registry_packages"],"lock package inventory mismatch")
+            expected={p["name"]+"-"+p["version"]+".crate":p["checksum"] for p in registry}
+            files=list((R/"cargo-home/registry/cache").glob("*/*.crate"))
+            require(bool(files),"empty downloaded registry cache")
+            actual=[]
+            for f in sorted(files):
+                digest=sha(f.read_bytes())
+                require(expected.get(f.name)==digest,"downloaded crate checksum mismatch: "+f.name)
+                actual.append({"crate":f.name,"bytes":f.stat().st_size,"sha256":digest})
+            require(sha((R/"source/Cargo.lock").read_bytes())==P["lock"]["sha256"],"fetch changed lock")
+            save(E/"cache.json",{"lock_packages":len(packages),"registry_lock_packages":len(registry),"downloaded_archives":actual,"scope":"Linux target fetch; does not assert every cross-target locked archive was downloaded","capacity":capacity()})
+        def binary(target_id):
+            targets=[t for t in P["compile"]["targets"] if t["id"]==target_id]
+            require(len(targets)==1,"unknown compile target")
+            target=targets[0];matches=[]
+            for line in (E/("compile-"+target_id+".jsonl")).open():
+                item=json.loads(line)
+                artifact=item.get("target",{})
+                if item.get("reason")=="compiler-artifact" and artifact.get("name")==target["cargo_target"] and artifact.get("kind")==[target["kind"]] and item.get("profile",{}).get("test") is True and item.get("executable"):
+                    require(item.get("manifest_path")==str(R/"source"/target["manifest_path"]),"artifact manifest mismatch")
+                    require(artifact.get("src_path")==str(R/"source"/target["source_path"]),"artifact source mismatch")
+                    matches.append(item["executable"])
+            require(len(matches)==1,"expected exactly one "+target_id+" test artifact")
+            f=pathlib.Path(matches[0])
+            require(f.is_file() and not f.is_symlink() and f.resolve().is_relative_to((R/"target").resolve()),"invalid artifact path")
+            save(E/("binary-"+target_id+".json"),{"target_id":target_id,"cargo_target":target["cargo_target"],"kind":target["kind"],"manifest_path":target["manifest_path"],"source_path":target["source_path"],"path":str(f),"bytes":f.stat().st_size,"sha256":sha(f.read_bytes()),"source":json.loads((E/"source.json").read_text()),"lock_sha256":P["lock"]["sha256"],"compile_args":target["args"],"capacity":capacity()})
+            (R/("binary-"+target_id+".path")).write_text(str(f)+"\n")
+        def inventory():
+            b=json.loads((E/"binary-core.json").read_text())
+            require(sha(pathlib.Path(b["path"]).read_bytes())==b["sha256"],"inventory binary changed")
+            raw=(E/"inventory.stdout").read_bytes()
+            names=re.findall(r"^([a-z_][a-z0-9_:]*): test$",raw.decode("utf-8"),re.M)
+            selected=[c["name"] for c in P["cases"]]
+            require(all(names.count(name)==1 for name in selected),"missing or duplicate selected libtest identity")
+            require(len(names)==len(set(names)),"duplicate libtest inventory identity")
+            save(E/"inventory.json",{"status":"PASS_SELECTED_NAMES_ONCE","selected":selected,"selected_count":len(selected),"total_tests":len(names),"binary_sha256":b["sha256"],"stdout":{"bytes":len(raw),"sha256":sha(raw)},"bodies_run":False})
+        def start(i):
+            for n in range(1,i): require(json.loads(case_path(n).read_text())["status"].startswith("PASS"),"prior case incomplete or failed")
+            c=P["cases"][i-1]
+            require(c["index"]==i,"case order")
+            for target in P["compile"]["targets"]: require((E/("binary-"+target["id"]+".json")).is_file(),"missing compiled target")
+            inventory_record=json.loads((E/"inventory.json").read_text())
+            require(inventory_record["status"]=="PASS_SELECTED_NAMES_ONCE" and inventory_record["selected"]==[case["name"] for case in P["cases"]],"inventory admission missing")
+            b=json.loads((E/("binary-"+c["target"]+".json")).read_text())
+            require(inventory_record["binary_sha256"]==b["sha256"],"inventory binary binding mismatch")
+            require(b["target_id"]==c["target"] and b["source"]==json.loads((E/"source.json").read_text()) and b["lock_sha256"]==P["lock"]["sha256"],"case binary binding mismatch")
+            require(sha(pathlib.Path(b["path"]).read_bytes())==b["sha256"],"binary changed")
+            require(sha((R/"source/Cargo.lock").read_bytes())==P["lock"]["sha256"],"lock changed")
+            save(case_path(i),{"index":i,"name":c["name"],"status":"RUNNING","started_utc":now(),"binary_target":c["target"],"binary_sha256":b["sha256"],"capacity":capacity()})
+        def end(i,code):
+            c=P["cases"][i-1]; state=json.loads(case_path(i).read_text())
+            prefix=E/"cases"/("%02d"%i)
+            out=pathlib.Path(str(prefix)+".stdout").read_bytes()
+            err=pathlib.Path(str(prefix)+".stderr").read_bytes()
+            stdout=out.decode("utf-8","replace"); combined=stdout+"\n"+err.decode("utf-8","replace")
+            summary=re.search(r"test result: ok\.\s+1 passed;\s+0 failed;\s+0 ignored;\s+0 measured;",stdout)
+            named=re.search(r"^test "+re.escape(c["name"])+r" \.\.\.",stdout,re.M) and re.search(r"^running 1 test$",stdout,re.M)
+            panic_messages=re.findall(r"panicked at[^\n]*\n([^\n]*)",combined)
+            panics=combined.count("panicked at")
+            expected=c["expected_panic_message"]
+            ok=code==0 and bool(summary) and bool(named) and panics==(1 if expected else 0) and (not expected or panic_messages==[expected])
+            state.update({"finished_utc":now(),"exit_code":code,"status":("PASS_EXPECTED_INJECTED_PANIC" if expected else "PASS") if ok else "FAIL","stdout":{"bytes":len(out),"sha256":sha(out)},"stderr":{"bytes":len(err),"sha256":sha(err)},"panic_hooks":panics,"expected_panic_message":expected,"one_named_passed_no_ignored":bool(summary and named)})
+            save(case_path(i),state)
+            try: state["capacity"]=capacity()
+            except Exception as error:
+                state["status"]="FAIL_RESOURCE_ADMISSION";state["resource_error"]=str(error);save(case_path(i),state)
+                raise
+            save(case_path(i),state)
+            require(ok,"case failed: "+c["name"])
+        def finalise():
+            errors=[];cases=[]
+            for c in P["cases"]:
+                f=case_path(c["index"])
+                state=json.loads(f.read_text()) if f.exists() else {"index":c["index"],"name":c["name"],"status":"NOT_RUN"}
+                if state["status"]=="RUNNING": state["status"]="INCOMPLETE_NO_EXIT_RECEIPT";save(f,state)
+                cases.append(state)
+            try: save(E/"post-source.json",source_check(R/"source"));save(E/"post-capacity.json",capacity())
+            except Exception as error: errors.append(str(error))
+            passed=sum(c["status"].startswith("PASS") for c in cases)
+            ok=passed==8 and not errors and os.environ.get("RS69_PRIOR_JOB_STATUS")=="success"
+            save(E/"result.json",{"status":"CASE_EVIDENCE_PASS_REQUIRES_PROVIDER_TERMINAL_READBACK" if ok else "FAIL_OR_INCOMPLETE","passed":passed,"required":8,"cases":cases,"errors":errors,"observed_prior_job_status":os.environ.get("RS69_PRIOR_JOB_STATUS"),"provider_terminal":"PENDING_EXTERNAL_JOB_AND_RUN_API_READBACK","resource_peak_kind":P["limits"]["resource_observation"],"gates_open":P["open_gates"],"finished_utc":now()})
+            files=[f for f in E.rglob("*") if f.is_file()]
+            total=sum(f.stat().st_size for f in files)
+            inventory=[{"path":str(f.relative_to(E)),"bytes":f.stat().st_size,"sha256":sha(f.read_bytes())} for f in sorted(files)]
+            # Reserve a bounded manifest allowance; oversized raw evidence is never silently reported complete.
+            within=total+65536<=P["limits"]["artifact_bytes"]
+            save(E/"ARTIFACT-MANIFEST.json",{"files":inventory,"bytes_before_manifest":total,"within_budget":within,"upload":"BEST_EFFORT_NOT_TERMINAL_JOB_PROOF","public_repository_access":True})
+            upload=R/"upload"
+            upload.mkdir()
+            for f in [*files,E/"ARTIFACT-MANIFEST.json"]:
+                if within or f.suffix==".json":
+                    dst=upload/f.relative_to(E);dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(f,dst)
+            if not within: ok=False
+            with open(os.environ["GITHUB_OUTPUT"],"a") as stream: stream.write("upload_ready=true\n")
+            require(ok,"campaign failed or incomplete; retained evidence is not terminal provider proof")
+        command=sys.argv[1]
+        if command=="init": initialise()
+        elif command=="toolchain": toolchain()
+        elif command=="cache": cache()
+        elif command=="binary": binary(sys.argv[2])
+        elif command=="inventory": inventory()
+        elif command=="start": start(int(sys.argv[2]))
+        elif command=="end": end(int(sys.argv[2]),int(sys.argv[3]))
+        elif command=="final": finalise()
+        else: raise RuntimeError("unknown evidence operation")
+        PY_EVIDENCE
+        cat > "$RS69_ROOT/environment.sh" <<'SH_ENV'
+        SAFE_ENV=(
+          "HOME=$RS69_ROOT/home" "TMPDIR=$RS69_ROOT/tmp" "XDG_CONFIG_HOME=$RS69_ROOT/home/.config"
+          "PATH=/usr/bin:/bin" "CARGO_HOME=$RS69_ROOT/cargo-home" "RUSTUP_HOME=$RS69_ROOT/rustup-home"
+          "CARGO_TARGET_DIR=$RS69_ROOT/target" "CARGO_INCREMENTAL=0" "CARGO_BUILD_JOBS=2" "CARGO_TERM_COLOR=never"
+          "LANG=C.UTF-8" "LC_ALL=C.UTF-8" "RUST_BACKTRACE=0"
+          "GIT_CONFIG_NOSYSTEM=1" "GIT_CONFIG_GLOBAL=/dev/null" "GIT_CONFIG_COUNT=2"
+          "GIT_CONFIG_KEY_0=core.hooksPath" "GIT_CONFIG_VALUE_0=$RS69_ROOT/empty-hooks"
+          "GIT_CONFIG_KEY_1=core.fsmonitor" "GIT_CONFIG_VALUE_1=false"
+          "GIT_TEMPLATE_DIR=$RS69_ROOT/empty-template" "GIT_OPTIONAL_LOCKS=0"
+        )
+        SH_ENV
+        cat > "$RS69_ROOT/run-case.sh" <<'SH_CASE'
+        set -euo pipefail
+        umask 077
+        index="$1"
+        python3 "$RS69_ROOT/evidence.py" start "$index"
+        case_name="$(python3 - "$RS69_ROOT/profile.json" "$index" <<'PY'
+        import json,sys
+        print(json.load(open(sys.argv[1]))["cases"][int(sys.argv[2])-1]["name"])
+        PY
+        )"
+        binary="$(python3 - "$RS69_ROOT" "$index" <<'PY'
+        import json,pathlib,sys
+        root=pathlib.Path(sys.argv[1])
+        case=json.loads((root/"profile.json").read_text())["cases"][int(sys.argv[2])-1]
+        print(json.loads((root/"evidence"/("binary-"+case["target"]+".json")).read_text())["path"])
+        PY
+        )"
+        prefix="$(printf '%s/evidence/cases/%02d' "$RS69_ROOT" "$index")"
+        source "$RS69_ROOT/environment.sh"
+        SAFE_ENV+=("CARGO_NET_OFFLINE=true")
+        cd "$RS69_ROOT/source"
+        set +e
+        /usr/bin/time -v -o "$prefix.resources.txt" /usr/bin/prlimit \
+          --as=536870912 --cpu=30 --nofile=128 --fsize=16777216 --core=0 -- \
+          /usr/bin/env -i "${SAFE_ENV[@]}" "$binary" "$case_name" \
+          --exact --nocapture --test-threads=1 --color=never \
+          > "$prefix.stdout" 2> "$prefix.stderr"
+        status="$?"
+        set -e
+        python3 "$RS69_ROOT/evidence.py" end "$index" "$status"
+        SH_CASE
+        python3 "$RS69_ROOT/evidence.py" init
+    - name: Provision exact toolchain and fetch locked dependencies (online)
+      timeout-minutes: 10
+      run: |
+        set -euo pipefail
+        umask 077
+        source "$RS69_ROOT/environment.sh"
+        rustup="$(cat "$RS69_ROOT/rustup.path")"
+        /usr/bin/env -i "${SAFE_ENV[@]}" "$rustup" toolchain install 1.98.1 --profile minimal --no-self-update \
+          > "$RS69_ROOT/evidence/toolchain-install.stdout" 2> "$RS69_ROOT/evidence/toolchain-install.stderr"
+        /usr/bin/env -i "${SAFE_ENV[@]}" "$rustup" which --toolchain 1.98.1 rustc > "$RS69_ROOT/rustc.path"
+        /usr/bin/env -i "${SAFE_ENV[@]}" "$rustup" which --toolchain 1.98.1 cargo > "$RS69_ROOT/cargo.path"
+        rustc="$(cat "$RS69_ROOT/rustc.path")"
+        cargo="$(cat "$RS69_ROOT/cargo.path")"
+        /usr/bin/env -i "${SAFE_ENV[@]}" "$rustc" -vV > "$RS69_ROOT/evidence/rustc-version.txt"
+        /usr/bin/env -i "${SAFE_ENV[@]}" "$cargo" -vV > "$RS69_ROOT/evidence/cargo-version.txt"
+        /usr/bin/env -i "${SAFE_ENV[@]}" cc --version > "$RS69_ROOT/evidence/cc-version.txt"
+        /usr/bin/env -i "${SAFE_ENV[@]}" pkg-config --modversion openssl > "$RS69_ROOT/evidence/openssl-version.txt"
+        /usr/bin/env -i "${SAFE_ENV[@]}" git --version > "$RS69_ROOT/evidence/git-version.txt"
+        python3 "$RS69_ROOT/evidence.py" toolchain
+        cd "$RS69_ROOT/source"
+        /usr/bin/env -i "${SAFE_ENV[@]}" "RUSTC=$rustc" "$cargo" \
+          fetch --locked --target x86_64-unknown-linux-gnu \
+          > "$RS69_ROOT/evidence/fetch.stdout" 2> "$RS69_ROOT/evidence/fetch.stderr"
+        python3 "$RS69_ROOT/evidence.py" cache
+    - name: Compile core library test target (locked/offline)
+      timeout-minutes: 10
+      run: |
+        set -euo pipefail
+        umask 077
+        source "$RS69_ROOT/environment.sh"
+        rustc="$(cat "$RS69_ROOT/rustc.path")"
+        cargo="$(cat "$RS69_ROOT/cargo.path")"
+        SAFE_ENV+=("CARGO_NET_OFFLINE=true" "RUSTC=$rustc")
+        cd "$RS69_ROOT/source"
+        /usr/bin/time -v -o "$RS69_ROOT/evidence/compile-core.resources.txt" /usr/bin/prlimit \
+          --as=4294967296 --cpu=1500 --nofile=512 --fsize=1073741824 --core=0 -- \
+          /usr/bin/env -i "${SAFE_ENV[@]}" "$cargo" \
+          test --no-run -p reposync-core --lib \
+          --locked --offline --jobs=2 --message-format=json \
+          > "$RS69_ROOT/evidence/compile-core.jsonl" 2> "$RS69_ROOT/evidence/compile-core.stderr"
+        python3 "$RS69_ROOT/evidence.py" binary core
+    - name: Admit eight exact names in compiled libtest inventory
+      timeout-minutes: 1
+      run: |
+        set -euo pipefail
+        source "$RS69_ROOT/environment.sh"
+        binary="$(cat "$RS69_ROOT/binary-core.path")"
+        SAFE_ENV+=("CARGO_NET_OFFLINE=true")
+        cd "$RS69_ROOT/source"
+        /usr/bin/time -v -o "$RS69_ROOT/evidence/inventory.resources.txt" /usr/bin/prlimit \
+          --as=536870912 --cpu=30 --nofile=128 --fsize=16777216 --core=0 -- \
+          /usr/bin/env -i "${SAFE_ENV[@]}" "$binary" --list --format pretty --color never \
+          > "$RS69_ROOT/evidence/inventory.stdout" 2> "$RS69_ROOT/evidence/inventory.stderr"
+        python3 "$RS69_ROOT/evidence.py" inventory
+    - name: pair_refresh::execution::lifecycle_tests::ordinary_work_stays_independent_of_held_case
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 1
+    - name: pair_refresh::execution::lifecycle_tests::cancelled_invocation_and_observer_keep_handle_and_result
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 2
+    - name: pair_refresh::execution::lifecycle_tests::panic_is_terminal_and_does_not_block_ordinary_work
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 3
+    - name: pair_refresh::execution::lifecycle_tests::intended_work_error_is_not_a_failed_join
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 4
+    - name: pair_refresh::service::service_shutdown_and_receiver::empty_service_shutdown_returns_only_for_completed
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 5
+    - name: pair_refresh::service::service_shutdown_and_receiver::cancelled_shutdown_stays_pending
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 6
+    - name: pair_refresh::service::service_shutdown_and_receiver::panic_then_joining_the_other_worker_latches_failed
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 7
+    - name: pair_refresh::service::service_shutdown_and_receiver::receiver_close_forgets_a_holding_guard_and_drops_a_proved_absence
+      timeout-minutes: 1
+      run: |
+        bash "$RS69_ROOT/run-case.sh" 8
+    - name: Retain partial/complete evidence; reject unknown completion
+      id: evidence
+      if: always()
+      timeout-minutes: 2
+      env:
+        RS69_PRIOR_JOB_STATUS: ${{ job.status }}
+      run: |
+        test -f "$RS69_ROOT/evidence.py"
+        python3 "$RS69_ROOT/evidence.py" final
+    - name: Upload bounded sanitized evidence (best effort)
+      if: always() && steps.evidence.outputs.upload_ready == 'true'
+      timeout-minutes: 3
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rs69-lifecycle8-0a0458ac-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ env.RS69_ROOT }}/upload/
+        if-no-files-found: error
+        retention-days: 14
+        compression-level: 6
+        include-hidden-files: false
