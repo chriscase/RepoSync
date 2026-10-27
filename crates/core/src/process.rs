@@ -426,3 +426,135 @@ mod tests {
         .unwrap();
     }
 }
+
+// This context exists only for the blocking-registry unit regressions. It is
+// not native child supervision, packaged fixture admission, or a production
+// process-wide capability. Keep the epic supervision implementation above exact.
+#[cfg(test)]
+mod blocking_test_context {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct CaseContextId(u64);
+
+    struct CaseState {
+        id: CaseContextId,
+        retained: bool,
+        closed: bool,
+        failed: bool,
+        blocking: usize,
+        settled: usize,
+    }
+
+    static STATE: Mutex<Option<CaseState>> = Mutex::new(None);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    fn state() -> MutexGuard<'static, Option<CaseState>> {
+        STATE.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    pub(crate) fn admit_case_context() -> Result<CaseContextId, String> {
+        let mut state = state();
+        if state.is_some() {
+            return Err("case context or prior cleanup is unresolved".into());
+        }
+        let mut observed = NEXT.load(Ordering::Acquire);
+        let number = loop {
+            let next = observed
+                .checked_add(1)
+                .ok_or_else(|| "case identity exhausted".to_string())?;
+            match NEXT.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(previous) => break previous,
+                Err(current) => observed = current,
+            }
+        };
+        let id = CaseContextId(number);
+        *state = Some(CaseState {
+            id,
+            retained: false,
+            closed: false,
+            failed: false,
+            blocking: 0,
+            settled: 0,
+        });
+        Ok(id)
+    }
+
+    pub(crate) fn close_case_registration(id: CaseContextId) -> Result<(), String> {
+        let mut state = state();
+        let case = state
+            .as_mut()
+            .filter(|case| case.id == id)
+            .ok_or_else(|| "case context changed before registration closed".to_string())?;
+        case.closed = true;
+        Ok(())
+    }
+
+    pub(crate) fn case_blocking_ready(id: CaseContextId) -> bool {
+        state().as_ref().is_some_and(|case| {
+            case.id == id && case.closed && !case.failed && case.blocking == 0 && case.settled > 0
+        })
+    }
+
+    pub(crate) fn release_case_context(id: CaseContextId, explicit: bool) -> Result<(), String> {
+        let mut state = state();
+        if !state.as_ref().is_some_and(|case| {
+            case.id == id
+                && !case.failed
+                && case.blocking == 0
+                && (case.settled == 0 || case.closed)
+                && (explicit || !case.retained)
+        }) {
+            return Err("case handles or terminal failure remain retained".into());
+        }
+        *state = None;
+        Ok(())
+    }
+
+    pub(crate) struct CaseWorkToken {
+        id: CaseContextId,
+        settled: bool,
+    }
+
+    impl CaseWorkToken {
+        pub(crate) fn reserve(id: CaseContextId) -> Result<Self, String> {
+            let mut state = state();
+            let case = state
+                .as_mut()
+                .filter(|case| case.id == id)
+                .ok_or_else(|| "blocking invocation has no admitted case".to_string())?;
+            if case.closed || case.failed {
+                return Err("case registration is closed or failed".into());
+            }
+            case.blocking += 1;
+            Ok(Self { id, settled: false })
+        }
+
+        pub(crate) fn complete(mut self) {
+            if let Some(case) = state().as_mut().filter(|case| case.id == self.id) {
+                case.blocking -= 1;
+                case.settled += 1;
+            }
+            self.settled = true;
+        }
+    }
+
+    impl Drop for CaseWorkToken {
+        fn drop(&mut self) {
+            if !self.settled {
+                if let Some(case) = state().as_mut().filter(|case| case.id == self.id) {
+                    case.blocking -= 1;
+                    case.failed = true;
+                    case.retained = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) use blocking_test_context::{
+    admit_case_context, case_blocking_ready, close_case_registration, release_case_context,
+    CaseContextId, CaseWorkToken,
+};

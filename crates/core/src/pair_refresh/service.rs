@@ -110,6 +110,14 @@ struct Worker {
 
 /// One instance per actual server engine. The registry contains channels and
 /// routing metadata, never deserialized native/resource capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownRecord {
+    Idle,
+    Pending,
+    Completed,
+    Failed,
+}
+
 pub struct RefreshService {
     engine: Arc<SyncEngine>,
     workers: Mutex<HashMap<Uuid, Worker>>,
@@ -117,15 +125,26 @@ pub struct RefreshService {
     recovery_owner: Option<Arc<recovery_owner::RecoveryOwner>>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     stopping: AtomicBool,
+    shutdown: Arc<Mutex<ShutdownRecord>>,
+    shutdown_watch: tokio::sync::watch::Sender<ShutdownRecord>,
+    shutdown_join: Mutex<Option<std::thread::JoinHandle<()>>>,
+    shutdown_joined: AtomicBool,
+    worker_failures: Arc<AtomicBool>,
 }
 
 impl RefreshService {
     pub fn new(engine: Arc<SyncEngine>) -> Arc<Self> {
+        let (shutdown_watch, _) = tokio::sync::watch::channel(ShutdownRecord::Idle);
         Arc::new(Self {
             engine,
             workers: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
+            shutdown: Arc::new(Mutex::new(ShutdownRecord::Idle)),
+            shutdown_watch,
+            shutdown_join: Mutex::new(None),
+            shutdown_joined: AtomicBool::new(false),
+            worker_failures: Arc::new(AtomicBool::new(false)),
             fixture_client: None,
             recovery_owner: None,
         })
@@ -136,11 +155,17 @@ impl RefreshService {
         engine: Arc<SyncEngine>,
         client: reqwest::Client,
     ) -> Arc<Self> {
+        let (shutdown_watch, _) = tokio::sync::watch::channel(ShutdownRecord::Idle);
         Arc::new(Self {
             engine,
             workers: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
+            shutdown: Arc::new(Mutex::new(ShutdownRecord::Idle)),
+            shutdown_watch,
+            shutdown_join: Mutex::new(None),
+            shutdown_joined: AtomicBool::new(false),
+            worker_failures: Arc::new(AtomicBool::new(false)),
             fixture_client: Some(client),
             recovery_owner: None,
         })
@@ -153,11 +178,17 @@ impl RefreshService {
         lock: Arc<crate::data_dir::LockGuard>,
     ) -> Result<Arc<Self>> {
         let owner = recovery_owner::RecoveryOwner::new(engine.clone(), lock)?;
+        let (shutdown_watch, _) = tokio::sync::watch::channel(ShutdownRecord::Idle);
         Ok(Arc::new(Self {
             engine,
             workers: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
+            shutdown: Arc::new(Mutex::new(ShutdownRecord::Idle)),
+            shutdown_watch,
+            shutdown_join: Mutex::new(None),
+            shutdown_joined: AtomicBool::new(false),
+            worker_failures: Arc::new(AtomicBool::new(false)),
             fixture_client: None,
             recovery_owner: Some(owner),
         }))
@@ -170,11 +201,17 @@ impl RefreshService {
         client: reqwest::Client,
     ) -> Result<Arc<Self>> {
         let owner = recovery_owner::RecoveryOwner::new(engine.clone(), lock)?;
+        let (shutdown_watch, _) = tokio::sync::watch::channel(ShutdownRecord::Idle);
         Ok(Arc::new(Self {
             engine,
             workers: Mutex::new(HashMap::new()),
             threads: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
+            shutdown: Arc::new(Mutex::new(ShutdownRecord::Idle)),
+            shutdown_watch,
+            shutdown_join: Mutex::new(None),
+            shutdown_joined: AtomicBool::new(false),
+            worker_failures: Arc::new(AtomicBool::new(false)),
             fixture_client: Some(client),
             recovery_owner: Some(owner),
         }))
@@ -183,16 +220,153 @@ impl RefreshService {
     /// Stop accepting commands and wait for supervised work to finish before
     /// the server releases its engine, native lease or local directory lock.
     pub async fn shutdown(&self) {
-        self.stopping.store(true, Ordering::Release);
-        let threads = {
-            let mut threads = self.threads.lock().unwrap_or_else(|p| p.into_inner());
-            self.workers
+        {
+            let mut join_slot = self
+                .shutdown_join
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clear();
-            std::mem::take(&mut *threads)
-        };
-        let _ = tokio::task::spawn_blocking(move || join_workers(threads)).await;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = *self
+                .shutdown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let already = join_slot.is_some()
+                || matches!(
+                    state,
+                    ShutdownRecord::Pending | ShutdownRecord::Completed | ShutdownRecord::Failed
+                );
+            if !already {
+                self.stopping.store(true, Ordering::Release);
+                let threads = {
+                    let mut threads = self
+                        .threads
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    self.workers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                    std::mem::take(&mut *threads)
+                };
+                let parked = std::sync::Arc::new(std::sync::Mutex::new(Some(threads)));
+                let parked_for_thread = std::sync::Arc::clone(&parked);
+                let record = Arc::clone(&self.shutdown);
+                let worker_failures = Arc::clone(&self.worker_failures);
+                let watch = self.shutdown_watch.clone();
+                let publish = Arc::new(AtomicBool::new(false));
+                let publish_for_thread = Arc::clone(&publish);
+                let spawned = std::thread::Builder::new()
+                    .name("refresh-shutdown".into())
+                    .spawn(move || {
+                        let threads = parked_for_thread
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                            .unwrap_or_default();
+                        let failed =
+                            join_workers(threads) || worker_failures.load(Ordering::Acquire);
+                        while !publish_for_thread.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        let next = {
+                            let mut slot = record
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if *slot == ShutdownRecord::Pending {
+                                *slot = if failed {
+                                    ShutdownRecord::Failed
+                                } else {
+                                    ShutdownRecord::Completed
+                                };
+                            }
+                            *slot
+                        };
+                        let _ = watch.send(next);
+                    });
+                match spawned {
+                    Ok(handle) => {
+                        let mut slot = self
+                            .shutdown
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if *slot == ShutdownRecord::Idle {
+                            *slot = ShutdownRecord::Pending;
+                            let _ = self.shutdown_watch.send(ShutdownRecord::Pending);
+                        }
+                        drop(slot);
+                        *join_slot = Some(handle);
+                        publish.store(true, Ordering::Release);
+                    }
+                    Err(_) => {
+                        let restored = parked
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                            .unwrap_or_default();
+                        self.threads
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .extend(restored);
+                        *self
+                            .shutdown
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            ShutdownRecord::Failed;
+                        let _ = self.shutdown_watch.send(ShutdownRecord::Failed);
+                    }
+                }
+            }
+        }
+        self.wait_shutdown_record().await;
+        loop {
+            let observed = {
+                let mut slot = self.shutdown_join.lock().unwrap_or_else(|p| p.into_inner());
+                match slot.as_ref() {
+                    Some(handle) if handle.is_finished() => {
+                        let joined = slot.take().unwrap().join();
+                        if joined.is_ok() {
+                            self.shutdown_joined.store(true, Ordering::Release);
+                            Some(true)
+                        } else {
+                            // Publish failure while still owning the join slot;
+                            // another waiter cannot observe None as success.
+                            *self.shutdown.lock().unwrap_or_else(|p| p.into_inner()) =
+                                ShutdownRecord::Failed;
+                            let _ = self.shutdown_watch.send(ShutdownRecord::Failed);
+                            Some(false)
+                        }
+                    }
+                    Some(_) => None,
+                    None if self.shutdown_joined.load(Ordering::Acquire) => Some(true),
+                    None => Some(false),
+                }
+            };
+            match observed {
+                Some(true) => return,
+                Some(false) => std::future::pending::<()>().await,
+                None => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+    }
+
+    async fn wait_shutdown_record(&self) {
+        let mut rx = self.shutdown_watch.subscribe();
+        loop {
+            let state = *self
+                .shutdown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match state {
+                ShutdownRecord::Completed => return,
+                ShutdownRecord::Failed => {
+                    std::future::pending::<()>().await;
+                }
+                ShutdownRecord::Pending | ShutdownRecord::Idle => {
+                    if rx.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        }
     }
 
     pub fn require_engine(&self, engine: &Arc<SyncEngine>) -> Result<()> {
@@ -273,7 +447,9 @@ impl RefreshService {
                 !self.stopping.load(Ordering::Acquire),
                 "refresh service is stopping"
             );
-            threads.retain(|thread| !thread.is_finished());
+            if collect_finished_workers(&mut threads) {
+                self.worker_failures.store(true, Ordering::Release);
+            }
             let handle = Uuid::new_v4();
             let (sender, receiver) = mpsc::sync_channel(1);
             let (reply, result) = oneshot::channel();
@@ -314,6 +490,7 @@ impl RefreshService {
             let engine = self.engine.clone();
             let client = self.fixture_client.clone();
             let recovery_owner = self.recovery_owner.clone();
+            let cleanup_failures = Arc::clone(&self.worker_failures);
             let spawned = std::thread::Builder::new()
                 .name("pair-refresh".into())
                 .spawn(move || {
@@ -336,16 +513,21 @@ impl RefreshService {
                         handle,
                         fixture_client: client,
                     };
+                    let blocking = super::execution::BlockingCohort::for_worker(handle);
                     if recovery {
-                        runtime.block_on(recovery_worker::own_recovery(
+                        runtime.block_on(blocking.run(recovery_worker::own_recovery(
                             &engine,
                             owner,
                             recovery_owner,
                             receiver,
                             reply,
-                        ));
+                        )));
                     } else {
-                        runtime.block_on(own_request(&engine, owner, receiver, reply));
+                        runtime
+                            .block_on(blocking.run(own_request(&engine, owner, receiver, reply)));
+                    }
+                    if runtime.block_on(blocking.observe()).is_err() {
+                        cleanup_failures.store(true, Ordering::Release);
                     }
                 });
             match spawned {
@@ -422,15 +604,37 @@ impl RefreshService {
     }
 }
 
-fn join_workers(threads: Vec<std::thread::JoinHandle<()>>) {
+// A finished handle still owns a result. Observe it before removal so a
+// panic is carried into shutdown rather than silently discarded at admission.
+fn collect_finished_workers(threads: &mut Vec<std::thread::JoinHandle<()>>) -> bool {
+    let mut failed = false;
+    let mut index = 0;
+    while index < threads.len() {
+        if threads[index].is_finished() {
+            failed |= threads.swap_remove(index).join().is_err();
+        } else {
+            index += 1;
+        }
+    }
+    failed
+}
+
+fn join_workers(threads: Vec<std::thread::JoinHandle<()>>) -> bool {
     let current = std::thread::current().id();
+    let mut failed = false;
+    let mut skipped = false;
     for thread in threads {
         // A registration can temporarily hold the last service Arc from this
         // worker after all its SCM work has finished. Never join ourselves.
-        if thread.thread().id() != current {
-            let _ = thread.join();
+        if thread.thread().id() == current {
+            skipped = true;
+            continue;
+        }
+        if thread.join().is_err() {
+            failed = true;
         }
     }
+    failed || skipped
 }
 
 impl Drop for RefreshService {
@@ -438,11 +642,31 @@ impl Drop for RefreshService {
         self.stopping.store(true, Ordering::Release);
         self.workers
             .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        join_workers(std::mem::take(
-            self.threads.get_mut().unwrap_or_else(|p| p.into_inner()),
-        ));
+        if self
+            .shutdown_join
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        let threads = std::mem::take(
+            self.threads
+                .get_mut()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if threads.is_empty() {
+            return;
+        }
+        if join_workers(threads) {
+            *self
+                .shutdown
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = ShutdownRecord::Failed;
+            let _ = self.shutdown_watch.send(ShutdownRecord::Failed);
+        }
     }
 }
 
@@ -513,6 +737,42 @@ struct RequestOwner {
     request: String,
     handle: Uuid,
     fixture_client: Option<reqwest::Client>,
+}
+
+struct PanicRetain {
+    busy: *mut Option<crate::busy::PairBusyGuard>,
+    operation_id: Uuid,
+    engine: *const SyncEngine,
+}
+
+impl Drop for PanicRetain {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            unsafe {
+                let holds = (*self.engine)
+                    .db()
+                    .verified_refresh_job_holds(self.operation_id)
+                    .map_err(|_| ());
+                release_busy_on_receiver_close(&mut *self.busy, holds);
+            }
+        }
+    }
+}
+
+fn release_busy_on_receiver_close(
+    busy: &mut Option<crate::busy::PairBusyGuard>,
+    holds: Result<bool, ()>,
+) {
+    match holds {
+        Ok(false) => {
+            *busy = None;
+        }
+        Ok(true) | Err(()) => {
+            if let Some(guard) = busy.take() {
+                std::mem::forget(guard);
+            }
+        }
+    }
 }
 
 async fn own_request(
@@ -591,7 +851,12 @@ async fn own_request(
     if reply.send(Ok(RefreshResponse::Approval(approval))).is_err() {
         return;
     }
-    let mut busy = None;
+    let mut busy: Option<crate::busy::PairBusyGuard> = None;
+    let _panic_retain = PanicRetain {
+        busy: &mut busy as *mut Option<crate::busy::PairBusyGuard>,
+        operation_id,
+        engine: engine as *const SyncEngine,
+    };
     loop {
         let command = if busy.is_some() {
             receiver.recv().ok()
@@ -601,6 +866,13 @@ async fn own_request(
                 .ok()
         };
         let Some(command) = command else {
+            release_busy_on_receiver_close(
+                &mut busy,
+                engine
+                    .db()
+                    .verified_refresh_job_holds(operation_id)
+                    .map_err(|_| ()),
+            );
             return;
         };
         let outcome = async {
@@ -728,5 +1000,304 @@ fn cancelled_view(id: Uuid, request: &str, child: &str, parent: &str) -> Refresh
         phase: "preparation_cancelled".into(),
         svn_revision: None,
         git_sha: None,
+    }
+}
+
+#[cfg(test)]
+mod service_shutdown_and_receiver {
+    use super::{release_busy_on_receiver_close, RefreshService, ShutdownRecord};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct WorkerCleanup {
+        release: Arc<AtomicBool>,
+        service: Option<Arc<RefreshService>>,
+    }
+
+    impl WorkerCleanup {
+        fn arm(release: Arc<AtomicBool>, service: Arc<RefreshService>) -> Self {
+            Self {
+                release,
+                service: Some(service),
+            }
+        }
+
+        fn finish(&mut self) {
+            self.release.store(true, Ordering::Release);
+            let Some(service) = self.service.take() else {
+                return;
+            };
+            let handle = service
+                .shutdown_join
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            drop(service);
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for WorkerCleanup {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+
+    fn record(service: &RefreshService) -> ShutdownRecord {
+        *service
+            .shutdown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn idle_service() -> (tempfile::TempDir, Arc<RefreshService>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config: crate::config::AppConfig = toml::from_str(
+            r#"
+            [daemon]
+            data_dir = "/unused"
+            [svn]
+            url = "file:///unused/svn"
+            username = ""
+            password_env = ""
+            [github]
+            repo = "fixture/repo"
+            token_env = ""
+            "#,
+        )
+        .unwrap();
+        config.daemon.data_dir = temp.path().to_owned();
+        let git_dir = temp.path().join("engine-git");
+        git2::Repository::init(&git_dir).unwrap();
+        let engine = crate::sync_engine::SyncEngine::new(
+            config,
+            crate::Database::new(temp.path().join("reposync.db")).unwrap(),
+            crate::svn::SvnClient::new("file:///unused/svn", "", ""),
+            crate::git::client::GitClient::new(&git_dir).unwrap(),
+            Arc::new(
+                crate::identity::mapper::IdentityMapper::new(
+                    &crate::config::IdentityConfig::default(),
+                )
+                .unwrap(),
+            ),
+        );
+        (temp, RefreshService::new(Arc::new(engine)))
+    }
+
+    #[tokio::test]
+    async fn empty_service_shutdown_returns_only_for_completed() {
+        let (_temp, service) = idle_service();
+        assert!(matches!(record(&service), ShutdownRecord::Idle));
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("an empty worker set reaches Completed");
+        assert!(matches!(record(&service), ShutdownRecord::Completed));
+        assert!(service.shutdown_joined.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_stays_pending() {
+        let (_temp, service) = idle_service();
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let _cleanup = WorkerCleanup::arm(Arc::clone(&release), Arc::clone(&service));
+        {
+            let release = Arc::clone(&release);
+            let finished = Arc::clone(&finished);
+            service
+                .threads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(std::thread::spawn(move || {
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    finished.store(true, Ordering::Release);
+                }));
+        }
+        let observed = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(record(&service), ShutdownRecord::Pending) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown entered Pending");
+        observed.abort();
+        let _ = observed.await;
+        assert!(matches!(record(&service), ShutdownRecord::Pending));
+        assert!(!finished.load(Ordering::Acquire));
+        let mut second = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        let returned_early = tokio::select! {
+            biased;
+            joined = &mut second => Some(joined),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => None,
+        };
+        assert!(
+            returned_early.is_none(),
+            "shutdown join returned before the worker was released"
+        );
+        assert!(matches!(record(&service), ShutdownRecord::Pending));
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("the second await returns only for Completed")
+            .unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        assert!(matches!(record(&service), ShutdownRecord::Completed));
+        assert!(service.shutdown_joined.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn panic_then_joining_the_other_worker_latches_failed() {
+        let (_temp, service) = idle_service();
+        let release = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut cleanup = WorkerCleanup::arm(Arc::clone(&release), Arc::clone(&service));
+        {
+            let release = Arc::clone(&release);
+            let finished = Arc::clone(&finished);
+            let mut threads = service
+                .threads
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            threads.push(std::thread::spawn(|| panic!("worker")));
+            threads.push(std::thread::spawn(move || {
+                while !release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                finished.store(true, Ordering::Release);
+            }));
+        }
+        let first = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        let not_joined = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if finished.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(not_joined.is_err());
+        assert!(matches!(record(&service), ShutdownRecord::Pending));
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if finished.load(Ordering::Acquire)
+                    && matches!(record(&service), ShutdownRecord::Failed)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the other worker was joined and Failed latched");
+        first.abort();
+        let _ = first.await;
+        assert!(matches!(record(&service), ShutdownRecord::Failed));
+        let mut again = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        let returned_while_failed = tokio::select! {
+            biased;
+            joined = &mut again => Some(joined),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => None,
+        };
+        assert!(
+            returned_while_failed.is_none(),
+            "shutdown join returned while Failed"
+        );
+        assert!(matches!(record(&service), ShutdownRecord::Failed));
+        again.abort();
+        let _ = again.await;
+        cleanup.finish();
+        drop(cleanup);
+        let service = match Arc::try_unwrap(service) {
+            Ok(owned) => owned,
+            Err(_shared) => panic!("no observer still holds the service"),
+        };
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(service)));
+        assert!(dropped.is_ok());
+    }
+
+    #[test]
+    fn receiver_close_forgets_a_holding_guard_and_drops_a_proved_absence() {
+        let held_a = format!("recv-hold-a-{}", std::process::id());
+        let held_b = format!("recv-hold-b-{}", std::process::id());
+        let mut busy = Some(crate::busy::try_acquire_pair(&held_a, &held_b).unwrap());
+        release_busy_on_receiver_close(&mut busy, Ok(true));
+        assert!(busy.is_none());
+        assert!(crate::busy::is_busy(&held_a));
+        assert!(crate::busy::is_busy(&held_b));
+
+        let free_a = format!("recv-free-a-{}", std::process::id());
+        let free_b = format!("recv-free-b-{}", std::process::id());
+        let mut busy = Some(crate::busy::try_acquire_pair(&free_a, &free_b).unwrap());
+        release_busy_on_receiver_close(&mut busy, Ok(false));
+        assert!(busy.is_none());
+        assert!(!crate::busy::is_busy(&free_a));
+        assert!(!crate::busy::is_busy(&free_b));
+
+        let bad_a = format!("recv-bad-a-{}", std::process::id());
+        let bad_b = format!("recv-bad-b-{}", std::process::id());
+        let mut busy = Some(crate::busy::try_acquire_pair(&bad_a, &bad_b).unwrap());
+        release_busy_on_receiver_close(&mut busy, Err(()));
+        assert!(busy.is_none());
+        assert!(crate::busy::is_busy(&bad_a));
+    }
+    #[tokio::test]
+    async fn finished_worker_panic_is_not_lost_before_shutdown() {
+        let (_temp, service) = idle_service();
+        let worker = std::thread::spawn(|| panic!("finished worker"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker finished");
+        {
+            let mut threads = service.threads.lock().unwrap_or_else(|p| p.into_inner());
+            threads.push(worker);
+            if super::collect_finished_workers(&mut threads) {
+                service.worker_failures.store(true, Ordering::Release);
+            }
+            assert!(threads.is_empty());
+        }
+        assert!(service.worker_failures.load(Ordering::Acquire));
+        let _cleanup = WorkerCleanup::arm(Arc::new(AtomicBool::new(true)), Arc::clone(&service));
+        let stopped = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move { service.shutdown().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(record(&service), ShutdownRecord::Failed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("saved worker failure reached shutdown");
+        assert!(!stopped.is_finished(), "Failed must not become Completed");
+        stopped.abort();
+        let _ = stopped.await;
+        assert!(matches!(record(&service), ShutdownRecord::Failed));
     }
 }
