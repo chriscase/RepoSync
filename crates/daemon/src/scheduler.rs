@@ -256,11 +256,13 @@ impl Scheduler {
     }
 
     /// The registry lock is acquired before spawning. A stop racing with that
-    /// lock refuses the unpolled future. Once admitted, spawn and registration
-    /// contain no await and are serialized with closing the gate.
-    async fn spawn_registered_sync<F>(&self, work: F) -> bool
+    /// lock refuses the factory without invoking it. Once admitted, factory
+    /// invocation, spawn and registration contain no await and are serialized
+    /// with closing the gate.
+    async fn spawn_registered_sync<F, M>(&self, make_work: M) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
+        M: FnOnce() -> F + Send,
     {
         let mut handles = self.sync_handles.lock().await;
         let mut index = 0;
@@ -294,6 +296,7 @@ impl Scheduler {
             return false;
         }
         handles.reserve(1);
+        let work = make_work();
         handles.push(tokio::spawn(work));
         #[cfg(test)]
         self.sync_task_spawns.fetch_add(1, Ordering::SeqCst);
@@ -1197,104 +1200,111 @@ impl Scheduler {
             if self.shutdown_requested() {
                 break;
             }
-            let admitted = self.spawn_registered_sync(async move {
-                info!(repo_name = %repo_name, repo_id = %repo_id, "starting per-repo sync cycle");
-                // Move the busy guard into the task so it's released when
-                // the cycle finishes (including on panic).
-                let _busy_guard = busy_guard;
-                let result = engine
-                    .run_sync_cycle_with_writer_window(writer_window)
-                    .await;
+            let make_sync = || {
+                info!(
+                    repo_name = %repo_name,
+                    repo_id = %repo_id,
+                    "starting per-repo sync cycle"
+                );
+                async move {
+                    // Move the busy guard into the task so it's released when
+                    // the cycle finishes (including on panic).
+                    let _busy_guard = busy_guard;
+                    let result = engine
+                        .run_sync_cycle_with_writer_window(writer_window)
+                        .await;
 
-                // Access the engine's DB for circuit breaker updates
-                let engine_db = engine.db();
+                    // Access the engine's DB for circuit breaker updates
+                    let engine_db = engine.db();
 
-                match &result {
-                    Ok(sync_stats) => {
-                        // Reset consecutive errors on success
-                        let _ = engine_db.reset_consecutive_errors(&repo_id);
+                    match &result {
+                        Ok(sync_stats) => {
+                            // Reset consecutive errors on success
+                            let _ = engine_db.reset_consecutive_errors(&repo_id);
 
-                        info!(
-                            repo_name = %repo_name,
-                            svn_to_git = sync_stats.svn_to_git_count,
-                            git_to_svn = sync_stats.git_to_svn_count,
-                            conflicts = sync_stats.conflicts_detected,
-                            "per-repo sync cycle completed"
-                        );
-
-                        let msg = serde_json::json!({
-                            "type": "repo_sync_completed",
-                            "repo_id": repo_id,
-                            "repo_name": repo_name,
-                            "svn_to_git": sync_stats.svn_to_git_count,
-                            "git_to_svn": sync_stats.git_to_svn_count,
-                            "conflicts": sync_stats.conflicts_detected,
-                            "messages": sync_stats.recent_messages,
-                            "commits": sync_stats.synced_commits,
-                        });
-                        let _ = ws.send(msg.to_string());
-                    }
-                    Err(e) => {
-                        error!(
-                            repo_name = %repo_name,
-                            error = %e,
-                            "per-repo sync cycle failed"
-                        );
-
-                        // Circuit breaker: only count permanent errors
-                        if e.is_permanent() {
-                            if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id) {
-                                if count >= 3 {
-                                    warn!(
-                                        repo_name = %repo_name,
-                                        repo_id = %repo_id,
-                                        consecutive_errors = count,
-                                        "circuit breaker triggered: pausing repo after {} permanent errors",
-                                        count
-                                    );
-                                    let _ = engine_db.conn().execute(
-                                        "UPDATE repositories SET sync_status = 'error_paused' WHERE id = ?1",
-                                        rusqlite::params![&repo_id],
-                                    );
-                                }
-                            }
-                        }
-
-                        // Suppress Teams notifications for transient push failures
-                        // (non-fast-forward). These auto-resolve on the next cycle
-                        // after pulling the remote changes. Sending error cards for
-                        // every transient conflict creates noise.
-                        let error_str = e.to_string();
-                        let is_transient = error_str.contains("non-fast-forward")
-                            || error_str.contains("E155011")  // SVN "out of date"
-                            || error_str.contains("E155010")  // SVN "node not found"
-                            || error_str.contains("E150000")  // SVN "can't find parent"
-                            || error_str.contains("out of date")
-                            || error_str.contains("parent directory");
-
-                        if is_transient {
                             info!(
                                 repo_name = %repo_name,
-                                "transient sync error — will retry next cycle: {}",
-                                &error_str[..error_str.len().min(100)]
+                                svn_to_git = sync_stats.svn_to_git_count,
+                                git_to_svn = sync_stats.git_to_svn_count,
+                                conflicts = sync_stats.conflicts_detected,
+                                "per-repo sync cycle completed"
                             );
-                        } else {
-                            let sanitized_error =
-                                reposync_core::errors::sanitize_error_message(&error_str);
+
                             let msg = serde_json::json!({
-                                "type": "repo_sync_failed",
+                                "type": "repo_sync_completed",
                                 "repo_id": repo_id,
                                 "repo_name": repo_name,
-                                "error": sanitized_error,
-                                "is_permanent": e.is_permanent(),
+                                "svn_to_git": sync_stats.svn_to_git_count,
+                                "git_to_svn": sync_stats.git_to_svn_count,
+                                "conflicts": sync_stats.conflicts_detected,
+                                "messages": sync_stats.recent_messages,
+                                "commits": sync_stats.synced_commits,
                             });
                             let _ = ws.send(msg.to_string());
                         }
-                    }
-                }
+                        Err(e) => {
+                            error!(
+                                repo_name = %repo_name,
+                                error = %e,
+                                "per-repo sync cycle failed"
+                            );
 
-                // busy guard drops here, releasing the slot.
-            }).await;
+                            // Circuit breaker: only count permanent errors
+                            if e.is_permanent() {
+                                if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id) {
+                                    if count >= 3 {
+                                        warn!(
+                                            repo_name = %repo_name,
+                                            repo_id = %repo_id,
+                                            consecutive_errors = count,
+                                            "circuit breaker triggered: pausing repo after {} permanent errors",
+                                            count
+                                        );
+                                        let _ = engine_db.conn().execute(
+                                            "UPDATE repositories SET sync_status = 'error_paused' WHERE id = ?1",
+                                            rusqlite::params![&repo_id],
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Suppress Teams notifications for transient push failures
+                            // (non-fast-forward). These auto-resolve on the next cycle
+                            // after pulling the remote changes. Sending error cards for
+                            // every transient conflict creates noise.
+                            let error_str = e.to_string();
+                            let is_transient = error_str.contains("non-fast-forward")
+                                || error_str.contains("E155011")  // SVN "out of date"
+                                || error_str.contains("E155010")  // SVN "node not found"
+                                || error_str.contains("E150000")  // SVN "can't find parent"
+                                || error_str.contains("out of date")
+                                || error_str.contains("parent directory");
+
+                            if is_transient {
+                                info!(
+                                    repo_name = %repo_name,
+                                    "transient sync error — will retry next cycle: {}",
+                                    &error_str[..error_str.len().min(100)]
+                                );
+                            } else {
+                                let sanitized_error =
+                                    reposync_core::errors::sanitize_error_message(&error_str);
+                                let msg = serde_json::json!({
+                                    "type": "repo_sync_failed",
+                                    "repo_id": repo_id,
+                                    "repo_name": repo_name,
+                                    "error": sanitized_error,
+                                    "is_permanent": e.is_permanent(),
+                                });
+                                let _ = ws.send(msg.to_string());
+                            }
+                        }
+                    }
+
+                    // busy guard drops here, releasing the slot.
+                }
+            };
+            let admitted = self.spawn_registered_sync(make_sync).await;
             if !admitted {
                 break;
             }
@@ -2284,9 +2294,14 @@ mod shutdown_admission_tests {
         let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
         let polled = Arc::new(AtomicBool::new(false));
         let child_polled = Arc::clone(&polled);
+        let prepared = Arc::new(AtomicBool::new(false));
+        let factory_prepared = Arc::clone(&prepared);
         let locked = scheduler.sync_handles.lock().await;
-        let admission = scheduler.spawn_registered_sync(async move {
-            child_polled.store(true, Ordering::SeqCst);
+        let admission = scheduler.spawn_registered_sync(move || {
+            factory_prepared.store(true, Ordering::SeqCst);
+            async move {
+                child_polled.store(true, Ordering::SeqCst);
+            }
         });
         tokio::pin!(admission);
         tokio::select! {
@@ -2295,9 +2310,11 @@ mod shutdown_admission_tests {
             _ = tokio::task::yield_now() => {}
         }
         scheduler.shutdown_gate().request_stop();
+        assert!(!prepared.load(Ordering::SeqCst));
         assert!(!polled.load(Ordering::SeqCst));
         drop(locked);
         assert!(!admission.await);
+        assert!(!prepared.load(Ordering::SeqCst));
         assert!(!polled.load(Ordering::SeqCst));
         assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 0);
         assert!(scheduler.sync_handles.lock().await.is_empty());
@@ -2309,13 +2326,21 @@ mod shutdown_admission_tests {
         let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
         let release = Arc::new(Notify::new());
         let child_release = Arc::clone(&release);
+        let prepared = Arc::new(AtomicBool::new(false));
+        let factory_prepared = Arc::clone(&prepared);
+        let child_prepared = Arc::clone(&prepared);
         assert!(
             scheduler
-                .spawn_registered_sync(async move {
-                    child_release.notified().await;
+                .spawn_registered_sync(move || {
+                    factory_prepared.store(true, Ordering::SeqCst);
+                    async move {
+                        assert!(child_prepared.load(Ordering::SeqCst));
+                        child_release.notified().await;
+                    }
                 })
                 .await
         );
+        assert!(prepared.load(Ordering::SeqCst));
         scheduler.shutdown_gate().request_stop();
         assert_eq!(scheduler.sync_handles.lock().await.len(), 1);
         assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 1);
@@ -2340,7 +2365,7 @@ mod shutdown_admission_tests {
         let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
         assert!(
             scheduler
-                .spawn_registered_sync(async {
+                .spawn_registered_sync(|| async {
                     panic!("RS112 expected child panic");
                 })
                 .await
@@ -2355,7 +2380,7 @@ mod shutdown_admission_tests {
         })
         .await
         .unwrap();
-        assert!(scheduler.spawn_registered_sync(async {}).await);
+        assert!(scheduler.spawn_registered_sync(|| async {}).await);
         let failures = scheduler.shutdown_gate().sync_join_failures();
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("panic"));
