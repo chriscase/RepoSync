@@ -177,11 +177,21 @@ impl BlockingLease {
                         || matches!(record.phase, BlockingPhase::Failed(_)))),
             "blocking cleanup for this invocation association is unresolved"
         );
-        let id = BLOCKING_IDS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                old.checked_add(1)
-            })
-            .map_err(|_| anyhow::anyhow!("blocking identity exhausted"))?;
+        let mut observed = BLOCKING_IDS.load(Ordering::Acquire);
+        let id = loop {
+            let next = observed
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("blocking identity exhausted"))?;
+            match BLOCKING_IDS.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(previous) => break previous,
+                Err(current) => observed = current,
+            }
+        };
         table.records.insert(
             id,
             BlockingRecord {
@@ -357,11 +367,21 @@ impl Drop for BlockingObserver {
 /// handle, receiver and id in the registry and releases only the observer lease.
 pub(crate) async fn observe_retained(assoc: BlockingAssoc) -> Result<()> {
     let assoc = assoc.resolve()?;
-    let id = BLOCKING_OBSERVERS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-            old.checked_add(1)
-        })
-        .map_err(|_| anyhow::anyhow!("observer identity exhausted"))?;
+    let mut observed = BLOCKING_OBSERVERS.load(Ordering::Acquire);
+    let id = loop {
+        let next = observed
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("observer identity exhausted"))?;
+        match BLOCKING_OBSERVERS.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(previous) => break previous,
+            Err(current) => observed = current,
+        }
+    };
     let observer = {
         let mut table = blocking_table();
         anyhow::ensure!(
