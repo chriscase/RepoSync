@@ -6633,9 +6633,9 @@ mod exact_witness_bytes {
 
     #[test]
     fn ready_bodies_stay_exact() {
-        assert_eq!(ready_bytes(CaseId::GitFinalBarrier).as_slice(), b"");
-        assert_eq!(ready_bytes(CaseId::SvnDisconnect).as_slice(), b"ready");
-        assert_eq!(ready_bytes(CaseId::SvnShutdown).as_slice(), b"ready");
+        assert_eq!(ready_bytes(CaseId::GitFinalBarrier), b"");
+        assert_eq!(ready_bytes(CaseId::SvnDisconnect), b"ready");
+        assert_eq!(ready_bytes(CaseId::SvnShutdown), b"ready");
         assert!(require_exact(b"ready\n", b"ready").is_err());
         assert!(require_exact(b"", b"").is_ok());
     }
@@ -6666,7 +6666,7 @@ mod case_session_owner {
         let nonce = native.nonce().expect("native begin binds a core nonce without S");
         assert_eq!(nonce.len(), 32);
         assert!(nonce.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
-        let missing = select_attested_entry("git-reject-v1", None).unwrap_err();
+        let missing = select_attested_entry("git-reject-v1", None).map(|_| ()).unwrap_err();
         assert!(missing.contains("validated catalogue metadata is missing"));
         let implicit = select_attested_entry(
             "git-reject-v1",
@@ -6679,15 +6679,15 @@ mod case_session_owner {
                 installed_mode: 0o755,
             }),
         )
-        .unwrap_err();
+        .map(|_| ()).unwrap_err();
         assert!(implicit.contains("explicit mode"));
         assert!(implicit.contains("archive-relative"));
         assert!(implicit.contains("installed_relative_path is not the hook slot"));
-        let unbound = attested_entry_from_validated_metadata("git-reject-v1").unwrap_err();
+        let unbound = attested_entry_from_validated_metadata("git-reject-v1").map(|_| ()).unwrap_err();
         assert!(unbound.contains("01a1434e-b4d8-7583-969f-75ad62ef10ce"));
         assert!(unbound.contains("reposync-immutable-exec-v2.1"));
         assert!(unbound.contains("process-wide entry id is not provenance"));
-        let other = attested_entry_from_validated_metadata("git-final-barrier-v1").unwrap_err();
+        let other = attested_entry_from_validated_metadata("git-final-barrier-v1").map(|_| ()).unwrap_err();
         assert!(other.contains("git-final-barrier-v1"));
         let mut mode = EnvGuard::new();
         mode.push_utf8("REPOSYNC_FIXTURE_EXEC_MODE", "native-generated-v1");
@@ -6697,12 +6697,12 @@ mod case_session_owner {
             CatalogueAttestation::HistoricalNativeNotCatalogueProof
         ));
         drop(mode);
-        let absent = attest_catalogue().unwrap_err();
+        let absent = attest_catalogue().map(|_| ()).unwrap_err();
         assert!(absent.contains("absent mode is not native"));
         let packaged_mode = {
             let mut packaged = EnvGuard::new();
             packaged.push_utf8("REPOSYNC_FIXTURE_EXEC_MODE", "packaged-immutable-v1");
-            let missing_h = attest_catalogue().unwrap_err();
+            let missing_h = attest_catalogue().map(|_| ()).unwrap_err();
             assert!(missing_h.contains("absent H"));
             missing_h
         };
@@ -6775,7 +6775,7 @@ mod case_session_owner {
                 installed_mode: 0o755,
             }),
         )
-        .unwrap_err();
+        .map(|_| ()).unwrap_err();
         assert!(illegal.contains("archive-relative"));
         assert!(illegal.contains("source_mode is git 100755"));
         let selected = select_attested_entry(
