@@ -66,8 +66,7 @@ static SHUTDOWN_TASK_IDS: AtomicU64 = AtomicU64::new(1);
 static RETAINED_SHUTDOWN_TASKS: OnceLock<Mutex<Vec<RetainedShutdownTask>>> = OnceLock::new();
 static RETAINED_SHUTDOWN_REGISTRIES: OnceLock<Mutex<Vec<(&'static str, TaskHandles)>>> =
     OnceLock::new();
-static RETAINED_IMPORT_STATES: OnceLock<Mutex<Vec<Arc<reposync_web::AppState>>>> =
-    OnceLock::new();
+static RETAINED_IMPORT_STATES: OnceLock<Mutex<Vec<Arc<reposync_web::AppState>>>> = OnceLock::new();
 
 /// A completed task is still owned until its join result has been observed.
 /// Cancellation, timeout and unwind retain the same unconsumed handle.
@@ -92,7 +91,9 @@ impl OwnedShutdownTask {
 
     #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
-        self.handle.as_ref().is_none_or(|handle| handle.is_finished())
+        self.handle
+            .as_ref()
+            .is_none_or(|handle| handle.is_finished())
     }
 
     /// Reclaim exactly one retained owner for a separately bounded join. No
@@ -105,7 +106,11 @@ impl OwnedShutdownTask {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let index = retained.iter().position(|task| task.id == id)?;
         let task = retained.swap_remove(index);
-        Some(Self { id: task.id, role: task.role, handle: Some(task.handle) })
+        Some(Self {
+            id: task.id,
+            role: task.role,
+            handle: Some(task.handle),
+        })
     }
 
     fn abort(&self) {
@@ -129,7 +134,11 @@ impl OwnedShutdownTask {
 impl Drop for OwnedShutdownTask {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            error!(task_id = self.id, role = self.role, "retaining unjoined shutdown task");
+            error!(
+                task_id = self.id,
+                role = self.role,
+                "retaining unjoined shutdown task"
+            );
             RETAINED_SHUTDOWN_TASKS
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
@@ -304,7 +313,9 @@ pub(crate) async fn stop_scheduler_and_drain_sync_tasks(
     for reason in drain.join_failures.iter().chain(prior_join_failures.iter()) {
         error!(%reason, "observed sync task join failure");
     }
-    if drain.timed_out || drain.unresolved != 0 || !drain.join_failures.is_empty()
+    if drain.timed_out
+        || drain.unresolved != 0
+        || !drain.join_failures.is_empty()
         || !prior_join_failures.is_empty()
     {
         let reason = format!(
@@ -973,8 +984,8 @@ async fn main() -> Result<()> {
         stop_timeout = scheduler_stop.stop_timeout_recorded,
         "scheduler shutdown join report"
     );
-    let mut unresolved_shutdown = !scheduler_stop.terminated_before_drain
-        || scheduler_stop.unresolved_sync_tasks != 0;
+    let mut unresolved_shutdown =
+        !scheduler_stop.terminated_before_drain || scheduler_stop.unresolved_sync_tasks != 0;
     if scheduler_stop.terminated_before_drain {
         let imports = drain_owned_tasks(
             &app_state_for_shutdown.import_handles,
@@ -988,7 +999,8 @@ async fn main() -> Result<()> {
             error!(%reason, "observed import task join failure");
         }
         if imports.timed_out || imports.unresolved != 0 || !imports.join_failures.is_empty() {
-            let reason = format!(
+            let reason =
+                format!(
                 "import task shutdown incomplete: timed_out={}, unresolved={}, join_failures={}",
                 imports.timed_out, imports.unresolved, imports.join_failures.len()
             );
@@ -1035,7 +1047,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-
 /// AUTHORED UNRUN. These cases exercise ownership and join observations only;
 /// expected injected panic cases are explicitly named and must retain evidence.
 #[cfg(test)]
@@ -1052,19 +1063,33 @@ mod shutdown_ownership_tests {
         let notify = Arc::new(tokio::sync::Notify::new());
         let gate = Arc::new(scheduler::SchedulerShutdownGate::default());
         let handles = empty_handles();
-        let mut task = OwnedShutdownTask::new("finished scheduler panic regression",
-            tokio::spawn(async { panic!("RS112 expected scheduler panic"); }));
+        let mut task = OwnedShutdownTask::new(
+            "finished scheduler panic regression",
+            tokio::spawn(async {
+                panic!("RS112 expected scheduler panic");
+            }),
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
-            while !task.is_finished() { tokio::task::yield_now().await; }
-        }).await.unwrap();
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(!task.join_observed());
         let mut failures = Vec::new();
         let report = stop_scheduler_and_drain_sync_tasks(
-            &notify, &gate, &mut task, &handles, Duration::from_secs(2), None,
+            &notify,
+            &gate,
+            &mut task,
+            &handles,
+            Duration::from_secs(2),
+            None,
             &mut |level, reason| failures.push((level, reason.to_string())),
             &mut || panic!("finished scheduler must not time out"),
             Duration::from_secs(2),
-        ).await;
+        )
+        .await;
         assert!(task.join_observed());
         assert!(report.terminated_before_drain);
         assert!(!report.stop_timeout_recorded);
@@ -1081,18 +1106,29 @@ mod shutdown_ownership_tests {
         let gate = Arc::new(scheduler::SchedulerShutdownGate::default());
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mark_exit = Arc::clone(&exited);
-        let mut task = OwnedShutdownTask::new("existing failure regression", tokio::spawn(async move {
-            wait.notified().await;
-            mark_exit.store(true, Ordering::SeqCst);
-        }));
+        let mut task = OwnedShutdownTask::new(
+            "existing failure regression",
+            tokio::spawn(async move {
+                wait.notified().await;
+                mark_exit.store(true, Ordering::SeqCst);
+            }),
+        );
         let report = stop_scheduler_and_drain_sync_tasks(
-            &notify, &gate, &mut task, &empty_handles(), Duration::from_secs(2),
+            &notify,
+            &gate,
+            &mut task,
+            &empty_handles(),
+            Duration::from_secs(2),
             Some("retained earlier fatal reason".to_string()),
             &mut |_level, _reason| panic!("cooperative join must not add failure"),
             &mut || panic!("cooperative join must not time out"),
             Duration::from_secs(2),
-        ).await;
-        assert_eq!(report.failure.as_deref(), Some("retained earlier fatal reason"));
+        )
+        .await;
+        assert_eq!(
+            report.failure.as_deref(),
+            Some("retained earlier fatal reason")
+        );
         assert!(report.terminated_before_drain);
         assert!(task.join_observed());
         assert!(exited.load(Ordering::SeqCst));
@@ -1102,35 +1138,48 @@ mod shutdown_ownership_tests {
     async fn stop_deadline_aborts_and_observes_scheduler_before_child_drain() {
         struct MarkExit(Arc<std::sync::atomic::AtomicBool>);
         impl Drop for MarkExit {
-            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
         }
         let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mark = MarkExit(Arc::clone(&exited));
         let entered = Arc::new(tokio::sync::Notify::new());
         let announce = Arc::clone(&entered);
-        let mut task = OwnedShutdownTask::new("abort join regression", tokio::spawn(async move {
-            let _mark = mark;
-            announce.notify_one();
-            std::future::pending::<()>().await;
-        }));
-        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        let mut task = OwnedShutdownTask::new(
+            "abort join regression",
+            tokio::spawn(async move {
+                let _mark = mark;
+                announce.notify_one();
+                std::future::pending::<()>().await;
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
         let handles = empty_handles();
         let seen_exit = Arc::clone(&exited);
         handles.lock().await.push(tokio::spawn(async move {
-            while !seen_exit.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+            while !seen_exit.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
         }));
         let mut failures = Vec::new();
         let report = stop_scheduler_and_drain_sync_tasks(
             &Arc::new(tokio::sync::Notify::new()),
             &Arc::new(scheduler::SchedulerShutdownGate::default()),
-            &mut task, &handles, Duration::from_millis(20), None,
+            &mut task,
+            &handles,
+            Duration::from_millis(20),
+            None,
             &mut |_level, reason| failures.push(reason.to_string()),
             &mut || {
                 assert!(!exited.load(Ordering::SeqCst));
                 assert_eq!(handles.try_lock().unwrap().len(), 1);
             },
             Duration::from_secs(2),
-        ).await;
+        )
+        .await;
         let (_, reason) = reposync_web::scheduler_failure_from_stop_timeout();
         assert_eq!(failures, vec![reason.clone()]);
         assert_eq!(report.failure.as_deref(), Some(reason.as_str()));
@@ -1148,45 +1197,65 @@ mod shutdown_ownership_tests {
         struct Release(Option<std::sync::mpsc::Sender<()>>);
         impl Drop for Release {
             fn drop(&mut self) {
-                if let Some(tx) = self.0.take() { let _ = tx.send(()); }
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
             }
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let release = Release(Some(tx));
         let entered = Arc::new(tokio::sync::Notify::new());
         let announce = Arc::clone(&entered);
-        let mut task = OwnedShutdownTask::new("noncancellable scheduler regression",
+        let mut task = OwnedShutdownTask::new(
+            "noncancellable scheduler regression",
             tokio::spawn(async move {
                 tokio::task::block_in_place(|| {
                     announce.notify_one();
-                    rx.recv_timeout(Duration::from_secs(5)).expect("fixture release");
+                    rx.recv_timeout(Duration::from_secs(5))
+                        .expect("fixture release");
                 });
-            }));
+            }),
+        );
         let id = task.id;
-        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
         let handles = empty_handles();
         let child_release = Arc::new(tokio::sync::Notify::new());
         let wait = Arc::clone(&child_release);
-        handles.lock().await.push(tokio::spawn(async move { wait.notified().await; }));
+        handles.lock().await.push(tokio::spawn(async move {
+            wait.notified().await;
+        }));
         let report = stop_scheduler_and_drain_sync_tasks(
             &Arc::new(tokio::sync::Notify::new()),
             &Arc::new(scheduler::SchedulerShutdownGate::default()),
-            &mut task, &handles, Duration::from_millis(20), None,
-            &mut |_level, _reason| {}, &mut || {}, Duration::from_millis(20),
-        ).await;
+            &mut task,
+            &handles,
+            Duration::from_millis(20),
+            None,
+            &mut |_level, _reason| {},
+            &mut || {},
+            Duration::from_millis(20),
+        )
+        .await;
         let unobserved = !task.join_observed();
         let still_owned_children = handles.lock().await.len();
         drop(task);
         let mut retained = OwnedShutdownTask::take_retained(id).expect("same retained owner");
         assert_eq!(retained.id, id);
         drop(release);
-        tokio::time::timeout(Duration::from_secs(2), retained.join()).await
-            .expect("released blocking work must join").unwrap();
+        tokio::time::timeout(Duration::from_secs(2), retained.join())
+            .await
+            .expect("released blocking work must join")
+            .unwrap();
         child_release.notify_one();
         let children = drain_owned_tasks(
-            &handles, "noncancellable regression cleanup",
-            Duration::from_secs(2), Duration::from_secs(2),
-        ).await;
+            &handles,
+            "noncancellable regression cleanup",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
         assert!(report.stop_timeout_recorded);
         assert!(!report.terminated_before_drain);
         assert_eq!(report.drained_sync_tasks, 0);
@@ -1203,17 +1272,26 @@ mod shutdown_ownership_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn child_drain_observes_an_already_finished_panic() {
         let handles = empty_handles();
-        handles.lock().await.push(tokio::spawn(async { panic!("RS112 expected drain panic"); }));
+        handles.lock().await.push(tokio::spawn(async {
+            panic!("RS112 expected drain panic");
+        }));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if handles.lock().await[0].is_finished() { break; }
+                if handles.lock().await[0].is_finished() {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         let report = drain_owned_tasks(
-            &handles, "finished drain panic regression",
-            Duration::from_secs(2), Duration::from_secs(2),
-        ).await;
+            &handles,
+            "finished drain panic regression",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
         assert_eq!(report.owned, 1);
         assert_eq!(report.join_failures.len(), 1);
         assert!(report.join_failures[0].contains("panic"));
@@ -1229,24 +1307,45 @@ mod shutdown_ownership_tests {
         for _ in 0..2 {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             releases.push(tx);
-            handles.lock().await.push(tokio::spawn(async move { let _ = rx.await; }));
+            handles.lock().await.push(tokio::spawn(async move {
+                let _ = rx.await;
+            }));
         }
-        let timeout = tokio::time::timeout(Duration::from_millis(20), drain_owned_tasks(
-            &handles, "cancelled drain regression",
-            Duration::from_secs(5), Duration::from_secs(2),
-        )).await;
+        let timeout = tokio::time::timeout(
+            Duration::from_millis(20),
+            drain_owned_tasks(
+                &handles,
+                "cancelled drain regression",
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+            ),
+        )
+        .await;
         assert!(timeout.is_err());
-        let ids: Vec<_> = RETAINED_SHUTDOWN_TASKS.get().unwrap().lock().unwrap().iter()
+        let ids: Vec<_> = RETAINED_SHUTDOWN_TASKS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .iter()
             .filter(|task| task.role == "cancelled drain regression")
-            .map(|task| task.id).collect();
-        for release in releases { let _ = release.send(()); }
+            .map(|task| task.id)
+            .collect();
+        for release in releases {
+            let _ = release.send(());
+        }
         for id in &ids {
             let mut owner = OwnedShutdownTask::take_retained(*id).expect("retained child owner");
-            tokio::time::timeout(Duration::from_secs(2), owner.join()).await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), owner.join())
+                .await
+                .unwrap()
+                .unwrap();
             assert!(owner.join_observed());
         }
         assert_eq!(ids.len(), 2);
         assert!(handles.lock().await.is_empty());
-        for id in ids { assert!(OwnedShutdownTask::take_retained(id).is_none()); }
+        for id in ids {
+            assert!(OwnedShutdownTask::take_retained(id).is_none());
+        }
     }
 }

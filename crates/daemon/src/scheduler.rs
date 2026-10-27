@@ -149,7 +149,10 @@ pub(crate) struct SchedulerShutdownGate {
 
 impl SchedulerShutdownGate {
     pub(crate) fn request_stop(&self) {
-        let _admission = self.admission.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.closed.store(true, Ordering::SeqCst);
     }
 
@@ -555,7 +558,8 @@ impl Scheduler {
         }
         #[cfg(test)]
         {
-            let barrier = self.reconcile_barrier
+            let barrier = self
+                .reconcile_barrier
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
@@ -2111,7 +2115,6 @@ mod shutdown_admission_tests {
         (tmp, scheduler)
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_flag_before_run_admits_nothing() {
         let (_tx, rx) = mpsc::channel(1);
@@ -2132,16 +2135,25 @@ mod shutdown_admission_tests {
         let notify_run = Arc::clone(&notify);
         let handles = Arc::clone(&scheduler.sync_handles);
         let entries = Arc::clone(&scheduler.repo_cycle_entries);
-        let mut task = crate::OwnedShutdownTask::new("cooperative scheduler", tokio::spawn(async move {
-            scheduler.run(notify_run).await;
-        }));
+        let mut task = crate::OwnedShutdownTask::new(
+            "cooperative scheduler",
+            tokio::spawn(async move {
+                scheduler.run(notify_run).await;
+            }),
+        );
         let mut recorded = Vec::new();
         let outcome = crate::stop_scheduler_and_drain_sync_tasks(
-            &notify, &gate, &mut task, &handles, Duration::from_secs(2), None,
+            &notify,
+            &gate,
+            &mut task,
+            &handles,
+            Duration::from_secs(2),
+            None,
             &mut |_level, reason| recorded.push(reason.to_string()),
             &mut || panic!("cooperative shutdown must not time out"),
             Duration::from_millis(50),
-        ).await;
+        )
+        .await;
         assert!(outcome.failure.is_none());
         assert!(!outcome.stop_timeout_recorded);
         assert!(outcome.terminated_before_drain);
@@ -2153,7 +2165,10 @@ mod shutdown_admission_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_during_reconcile_does_not_admit_and_drains_after_exit() {
-        let barrier = Arc::new(ReconcileBarrier { entered: Notify::new(), release: Notify::new() });
+        let barrier = Arc::new(ReconcileBarrier {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
         let (tx, rx) = mpsc::channel(1);
         tx.try_send(()).expect("webhook slot");
         let (_tmp, mut scheduler) = test_scheduler(Duration::from_secs(3600), rx);
@@ -2166,17 +2181,31 @@ mod shutdown_admission_tests {
         let spawns = Arc::clone(&scheduler.sync_task_spawns);
         let release = Arc::new(Notify::new());
         let child_release = Arc::clone(&release);
-        handles.lock().await.push(tokio::spawn(async move { child_release.notified().await; }));
-        let mut task = crate::OwnedShutdownTask::new("reconcile scheduler", tokio::spawn(async move {
-            scheduler.run(notify_run).await;
+        handles.lock().await.push(tokio::spawn(async move {
+            child_release.notified().await;
         }));
-        tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await.unwrap();
+        let mut task = crate::OwnedShutdownTask::new(
+            "reconcile scheduler",
+            tokio::spawn(async move {
+                scheduler.run(notify_run).await;
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+            .await
+            .unwrap();
         let mut recorded = Vec::new();
         let outcome = crate::stop_scheduler_and_drain_sync_tasks(
-            &notify, &gate, &mut task, &handles, Duration::from_millis(50), None,
+            &notify,
+            &gate,
+            &mut task,
+            &handles,
+            Duration::from_millis(50),
+            None,
             &mut |_level, reason| recorded.push(reason.to_string()),
             &mut || {
-                let owned = handles.try_lock().expect("no child snapshot before scheduler join");
+                let owned = handles
+                    .try_lock()
+                    .expect("no child snapshot before scheduler join");
                 assert_eq!(owned.len(), 1);
                 assert!(!owned[0].is_finished());
                 drop(owned);
@@ -2184,7 +2213,8 @@ mod shutdown_admission_tests {
                 release.notify_one();
             },
             Duration::from_secs(2),
-        ).await;
+        )
+        .await;
         let (_, expected) = reposync_web::scheduler_failure_from_stop_timeout();
         assert_eq!(recorded, vec![expected.clone()]);
         assert_eq!(outcome.failure.as_deref(), Some(expected.as_str()));
@@ -2202,22 +2232,33 @@ mod shutdown_admission_tests {
     async fn stop_inline_reconcile(webhook: bool) {
         let (_tx, rx) = mpsc::channel(1);
         let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
-        let barrier = Arc::new(ReconcileBarrier { entered: Notify::new(), release: Notify::new() });
+        let barrier = Arc::new(ReconcileBarrier {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
         *scheduler.reconcile_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
         let scheduler = Arc::new(scheduler);
         let run = Arc::clone(&scheduler);
-        let mut task = crate::OwnedShutdownTask::new("inline scheduler arm", tokio::spawn(async move {
-            if webhook {
-                run.handle_webhook_tick().await;
-            } else {
-                let mut maintenance = time::Instant::now() - MAINTENANCE_CADENCE;
-                run.handle_interval_tick(&mut maintenance).await;
-            }
-        }));
-        tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await.unwrap();
+        let mut task = crate::OwnedShutdownTask::new(
+            "inline scheduler arm",
+            tokio::spawn(async move {
+                if webhook {
+                    run.handle_webhook_tick().await;
+                } else {
+                    let mut maintenance = time::Instant::now() - MAINTENANCE_CADENCE;
+                    run.handle_interval_tick(&mut maintenance).await;
+                }
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+            .await
+            .unwrap();
         scheduler.shutdown_gate().request_stop();
         barrier.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), task.join()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task.join())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(scheduler.repo_cycle_entries.load(Ordering::SeqCst), 0);
         assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 0);
         assert_eq!(scheduler.stats.maintenance_runs.load(Ordering::SeqCst), 0);
@@ -2264,15 +2305,24 @@ mod shutdown_admission_tests {
         let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
         let release = Arc::new(Notify::new());
         let child_release = Arc::clone(&release);
-        assert!(scheduler.spawn_registered_sync(async move { child_release.notified().await; }).await);
+        assert!(
+            scheduler
+                .spawn_registered_sync(async move {
+                    child_release.notified().await;
+                })
+                .await
+        );
         scheduler.shutdown_gate().request_stop();
         assert_eq!(scheduler.sync_handles.lock().await.len(), 1);
         assert_eq!(scheduler.sync_task_spawns.load(Ordering::SeqCst), 1);
         release.notify_one();
         let report = crate::drain_owned_tasks(
-            &scheduler.sync_handles, "registered child regression",
-            Duration::from_secs(2), Duration::from_secs(2),
-        ).await;
+            &scheduler.sync_handles,
+            "registered child regression",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
         assert_eq!(report.owned, 1);
         assert!(!report.timed_out);
         assert_eq!(report.unresolved, 0);
@@ -2284,22 +2334,35 @@ mod shutdown_admission_tests {
     async fn finished_sync_panic_is_observed_before_handle_removal() {
         let (_tx, rx) = mpsc::channel(1);
         let (_tmp, scheduler) = test_scheduler(Duration::from_secs(3600), rx);
-        assert!(scheduler.spawn_registered_sync(async { panic!("RS112 expected child panic"); }).await);
+        assert!(
+            scheduler
+                .spawn_registered_sync(async {
+                    panic!("RS112 expected child panic");
+                })
+                .await
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if scheduler.sync_handles.lock().await[0].is_finished() { break; }
+                if scheduler.sync_handles.lock().await[0].is_finished() {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         assert!(scheduler.spawn_registered_sync(async {}).await);
         let failures = scheduler.shutdown_gate().sync_join_failures();
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("panic"));
         scheduler.shutdown_gate().request_stop();
         let report = crate::drain_owned_tasks(
-            &scheduler.sync_handles, "post-panic child regression",
-            Duration::from_secs(2), Duration::from_secs(2),
-        ).await;
+            &scheduler.sync_handles,
+            "post-panic child regression",
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
         assert_eq!(report.owned, 1);
         assert_eq!(report.unresolved, 0);
         assert!(report.join_failures.is_empty());
