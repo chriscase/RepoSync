@@ -1251,7 +1251,8 @@ impl Scheduler {
 
                             // Circuit breaker: only count permanent errors
                             if e.is_permanent() {
-                                if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id) {
+                                if let Ok(count) = engine_db.increment_consecutive_errors(&repo_id)
+                                {
                                     if count >= 3 {
                                         warn!(
                                             repo_name = %repo_name,
