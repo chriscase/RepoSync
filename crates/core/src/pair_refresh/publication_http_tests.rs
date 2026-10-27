@@ -256,7 +256,15 @@ fn run_case_tool(
         Ok(CaseHttpChild { context, role: HttpChildRole::CertificateTool, child, group, _root: retained_root,
             stopping: None, killed: false, status: None, error: None })
     })?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    observe_case_tool_until(handle, std::time::Instant::now() + std::time::Duration::from_secs(45))
+}
+
+// The real certificate path and fixed native probes share result/cleanup
+// interpretation. Production still spawns only its fixed OpenSSL command.
+fn observe_case_tool_until(
+    handle: crate::process::CaseResourceHandle<CaseHttpChild>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
     loop {
         if std::time::Instant::now() >= deadline {
             let cleanup = match stop_http_child(handle) {
@@ -386,20 +394,36 @@ fn server_with_context(
             let stdout = crate::process::with_case_resource(handle,
                 |server| server.child.stdout.take())?
                 .ok_or_else(|| "HTTP server readiness pipe missing".to_string())?;
-            let reader = spawn_http_work(session, move || {
-                let mut line = String::new();
-                BufReader::new(stdout).read_line(&mut line)
-                    .map_err(|error| format!("HTTP server readiness: {error}"))?;
-                Ok::<_, String>(line)
-            })?;
-            let (line, _joined) = join_http_work(reader, std::time::Duration::from_secs(45))?;
-            (Server::Case(handle), line?)
+            let line = read_case_http_readiness(session, stdout, std::time::Duration::from_secs(45))?;
+            (Server::Case(handle), line)
         }
     };
-    let ready: serde_json::Value = serde_json::from_str(&line)
+    Ok((server, parse_http_readiness(&line)?))
+}
+
+// The native child fixture supplies a real owned pipe to this same reader;
+// production supplies the actual Python server's ChildStdout. No OS wait,
+// signal or group observation is replaced by this input boundary.
+fn read_case_http_readiness<R: std::io::Read + Send + 'static>(
+    session: crate::process::CaseContextId,
+    stdout: R,
+    budget: std::time::Duration,
+) -> Result<String, String> {
+    let reader = spawn_http_work(session, move || {
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line)
+            .map_err(|error| format!("HTTP server readiness: {error}"))?;
+        Ok::<_, String>(line)
+    })?;
+    let (line, _joined) = join_http_work(reader, budget)?;
+    line
+}
+
+fn parse_http_readiness(line: &str) -> Result<String, String> {
+    let ready: serde_json::Value = serde_json::from_str(line)
         .map_err(|error| format!("HTTP server readiness JSON: {error}"))?;
     let url = ready["url"].as_str().ok_or_else(|| "HTTP server readiness URL missing".to_string())?;
-    Ok((server, url.to_owned()))
+    Ok(url.to_owned())
 }
 
 impl HttpFixture {
@@ -416,11 +440,15 @@ impl HttpFixture {
             }
             None => return Err("fixture server was already released".into()),
         };
-        let proof = stop_http_child(handle)?;
+        let checked = Self::check_server_completion(stop_http_child(handle)?)?;
+        self._server.take();
+        Ok(checked)
+    }
+
+    fn check_server_completion(proof: CheckedHttpChild) -> Result<CheckedHttpServer, String> {
         if proof.role != HttpChildRole::Server {
             return Err("HTTP server completion came from a different child role".into());
         }
-        self._server.take();
         Ok(CheckedHttpServer { context: proof.context })
     }
 
@@ -2764,6 +2792,697 @@ mod packaged_call_site {
             assert!(weak.upgrade().is_some());
             assert!(!crate::process::case_context_ready(context));
             assert!(crate::process::release_case_context(context, true).is_err());
+        }
+    }
+
+    #[cfg(test)]
+    mod http_child_failure_tests {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+
+        type ChildHandle = crate::process::CaseResourceHandle<super::super::CaseHttpChild>;
+        const UNIT_CHILD: &str = "REPOSYNC_HTTP_CHILD_FAILURE_UNIT";
+        const PROBE: &str = "REPOSYNC_HTTP_FIXED_PROBE";
+        const SCENARIO: &str = "REPOSYNC_HTTP_FIXED_PROBE_SCENARIO";
+        const ROLE: &str = "REPOSYNC_HTTP_FIXED_PROBE_ROLE";
+        const READY_FD: &str = "REPOSYNC_HTTP_FIXED_PROBE_READY_FD";
+        const RELEASE_FD: &str = "REPOSYNC_HTTP_FIXED_PROBE_RELEASE_FD";
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Scenario { LeaderExits, Nonzero, MalformedReady, MissingReady, HelperHolds }
+
+        impl Scenario {
+            fn name(self) -> &'static str {
+                match self {
+                    Self::LeaderExits => "leader-exits-child-holds",
+                    Self::Nonzero => "nonzero-before-stop",
+                    Self::MalformedReady => "malformed-ready",
+                    Self::MissingReady => "missing-ready",
+                    Self::HelperHolds => "helper-holds",
+                }
+            }
+
+            fn from_name(name: &str) -> Self {
+                match name {
+                    "leader-exits-child-holds" => Self::LeaderExits,
+                    "nonzero-before-stop" => Self::Nonzero,
+                    "malformed-ready" => Self::MalformedReady,
+                    "missing-ready" => Self::MissingReady,
+                    "helper-holds" => Self::HelperHolds,
+                    _ => panic!("unknown fixed native probe scenario"),
+                }
+            }
+        }
+
+        fn module_name() -> &'static str {
+            module_path!().split_once("::").expect("crate module prefix").1
+        }
+
+        fn require_native() {
+            assert_eq!(std::env::var("REPOSYNC_FIXTURE_EXEC_MODE").ok().as_deref(),
+                Some("native-generated-v1"), "fixed native probe needs explicit native mode");
+            assert!(std::env::var_os("REPOSYNC_LAUNCH_BINDING_V1").is_none(),
+                "fixed native probe refuses a packaged channel");
+            // An unreaped Child is an identity anchor only under exclusive
+            // wait ownership. Refuse auto-reaping dispositions; do not change
+            // this process-wide signal policy to make the fixture admissible.
+            let mut disposition = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+            assert_eq!(unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), disposition.as_mut_ptr()) }, 0);
+            let disposition = unsafe { disposition.assume_init() };
+            assert_eq!(disposition.sa_sigaction, libc::SIG_DFL,
+                "native group lifetime needs default SIGCHLD and no other waiter");
+            assert_eq!(disposition.sa_flags & libc::SA_NOCLDWAIT, 0,
+                "native group lifetime refuses automatic child reaping");
+            // Enforce the existing inherited-case-pin refusal in every entry,
+            // including the isolated body/ignored fixture, before its effects.
+            let command = Command::new(std::env::current_exe().unwrap());
+            admit_child_environment(&command, ExplicitMode::NativeGenerated)
+                .expect("fixed native probe refuses inherited packaged case pins");
+        }
+
+        // Expected failures retain production latches and resources. Give each
+        // leaf its own native libtest process instead of clearing those latches.
+        fn isolated(leaf: &str) -> bool {
+            require_native();
+            let full = format!("{}::{leaf}", module_name());
+            if std::env::var(UNIT_CHILD).ok().as_deref() == Some(full.as_str()) { return false; }
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", full.as_str(), "--nocapture", "--test-threads=1",
+                "--format", "pretty", "--color", "never"])
+                .env(UNIT_CHILD, &full);
+            admit_child_environment(&command, ExplicitMode::NativeGenerated).unwrap();
+            let scratch = tempfile::Builder::new().prefix("rs-http-child-failure-").tempdir().unwrap();
+            command.env("TMPDIR", scratch.path()).env("TMP", scratch.path()).env("TEMP", scratch.path());
+            let output = match command.output() {
+                Ok(output) => output,
+                Err(error) => {
+                    let path = scratch.path().to_owned(); std::mem::forget(scratch);
+                    panic!("native child output observation failed (spawn/read/wait stage unknown): {error}; scratch={path:?}");
+                }
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let passed = format!("test {full} ... ok");
+            if !output.status.success()
+                || stdout.lines().filter(|line| *line == passed.as_str()).count() != 1
+                || !stdout.contains("1 passed; 0 failed; 0 ignored;") {
+                let path = scratch.path().to_owned(); std::mem::forget(scratch);
+                panic!("native failure child failed or selected zero/ignored tests; scratch={path:?}; stdout={stdout}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr));
+            }
+            if !output.stderr.is_empty() { eprint!("{}", String::from_utf8_lossy(&output.stderr)); }
+            true
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum ProbeRole { Primary, Descendant, Anchor }
+
+        // Only the current executable, one ignored leaf and fixed IPC roles
+        // are expressible. Anchor is a separate, exclusively owned group leader;
+        // it is never polled/reaped until all signal-capable calls have ended.
+        fn fixed_command(scenario: Scenario, role: ProbeRole, ready_fd: RawFd,
+            release_fd: Option<RawFd>) -> Command {
+            require_native();
+            assert!(ready_fd > 2);
+            assert_eq!(release_fd.is_some(), role == ProbeRole::Descendant);
+            if let Some(fd) = release_fd { assert!(fd > 2 && fd != ready_fd); }
+            let fixture = format!("{}::fixed_native_probe", module_name());
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", fixture.as_str(), "--ignored", "--nocapture",
+                "--test-threads=1", "--format", "pretty", "--color", "never"])
+                .env(PROBE, &fixture).env(SCENARIO, scenario.name())
+                .env(ROLE, match role { ProbeRole::Primary => "primary",
+                    ProbeRole::Descendant => "descendant", ProbeRole::Anchor => "anchor" })
+                .env(READY_FD, ready_fd.to_string()).env_remove(RELEASE_FD);
+            if let Some(fd) = release_fd { command.env(RELEASE_FD, fd.to_string()); }
+            admit_child_environment(&command, ExplicitMode::NativeGenerated).unwrap();
+            unsafe {
+                command.pre_exec(move || {
+                    for fd in [Some(ready_fd), release_fd].into_iter().flatten() {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0 { return Err(std::io::Error::last_os_error()); }
+                        if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            command
+        }
+
+        fn read_control(stream: &mut UnixStream) -> serde_json::Value {
+            let mut line = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let remaining = deadline.checked_duration_since(std::time::Instant::now())
+                    .expect("fixed probe control deadline");
+                assert!(!remaining.is_zero()); stream.set_read_timeout(Some(remaining)).unwrap();
+                let mut byte = [0]; stream.read_exact(&mut byte).unwrap();
+                assert!(std::time::Instant::now() < deadline, "control arrived late");
+                line.push(byte[0]); assert!(line.len() <= 512);
+                if byte[0] == b'\n' { break; }
+            }
+            stream.set_read_timeout(None).unwrap(); serde_json::from_slice(&line).unwrap()
+        }
+
+        fn send_control(stream: &mut UnixStream, descendant: Option<u32>) {
+            let line = serde_json::json!({"pid": std::process::id(),
+                "parent_pid": unsafe { libc::getppid() },
+                "group": unsafe { libc::getpgrp() }, "descendant_pid": descendant});
+            writeln!(stream, "{line}").unwrap(); stream.flush().unwrap();
+        }
+
+        unsafe fn inherited_socket(fd: RawFd) -> UnixStream {
+            assert!(fd > 2);
+            let stream = unsafe { UnixStream::from_raw_fd(fd) };
+            stream.peer_addr().unwrap();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) }; assert!(flags >= 0);
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) }, 0);
+            stream
+        }
+
+        fn expect_byte(stream: &mut UnixStream, byte: u8) {
+            stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+            let mut got = [0]; stream.read_exact(&mut got).expect("fixed owned IPC control");
+            assert_eq!(got, [byte]);
+        }
+
+        #[test]
+        #[ignore = "fixed native child fixture; not an independently passing obligation"]
+        fn fixed_native_probe() {
+            require_native();
+            assert_eq!(std::env::var(PROBE).unwrap(), format!("{}::fixed_native_probe", module_name()));
+            let scenario = Scenario::from_name(&std::env::var(SCENARIO).unwrap());
+            let role = std::env::var(ROLE).unwrap();
+            assert!(role == "primary" || role == "descendant" || role == "anchor");
+            let fd: RawFd = std::env::var(READY_FD).unwrap().parse().unwrap();
+            let mut ready = unsafe { inherited_socket(fd) };
+            if role == "anchor" {
+                assert!(scenario == Scenario::HelperHolds);
+                assert!(std::env::var_os(RELEASE_FD).is_none());
+                send_control(&mut ready, None); expect_byte(&mut ready, b'Q'); return;
+            }
+            if role == "descendant" {
+                assert!(scenario == Scenario::LeaderExits);
+                let release_fd: RawFd = std::env::var(RELEASE_FD).unwrap().parse().unwrap();
+                assert_ne!(release_fd, fd);
+                let mut release = unsafe { inherited_socket(release_fd) };
+                send_control(&mut ready, None); expect_byte(&mut release, b'Q'); return;
+            }
+            assert!(std::env::var_os(RELEASE_FD).is_none());
+            // Pause before scenario actions while the parent installs actual
+            // group-leader lifetime custody where legacy stop calls need it.
+            send_control(&mut ready, None); expect_byte(&mut ready, b'S');
+            if scenario == Scenario::LeaderExits {
+                let (mut control, writer) = UnixStream::pair().unwrap();
+                let mut command = fixed_command(scenario, ProbeRole::Descendant,
+                    writer.as_raw_fd(), Some(ready.as_raw_fd()));
+                command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::inherit());
+                let mut child = command.spawn().unwrap(); drop(writer);
+                let started = read_control(&mut control);
+                assert_eq!(started["pid"].as_u64(), Some(u64::from(child.id())));
+                assert_eq!(started["parent_pid"].as_i64(), Some(i64::from(std::process::id())));
+                assert_eq!(started["group"].as_i64(), Some(i64::from(unsafe { libc::getpgrp() })));
+                assert!(child.try_wait().unwrap().is_none());
+                send_control(&mut ready, Some(child.id()));
+                std::mem::forget(child); std::process::exit(0);
+            }
+            send_control(&mut ready, None);
+            match scenario {
+                Scenario::Nonzero => std::process::exit(23),
+                Scenario::MalformedReady => ready.write_all(b"not-json\n").unwrap(),
+                Scenario::MissingReady => ready.shutdown(std::net::Shutdown::Write).unwrap(),
+                Scenario::HelperHolds => {}
+                Scenario::LeaderExits => unreachable!(),
+            }
+            expect_byte(&mut ready, b'Q');
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum AnchorPhase { Unreaped, Reaping, Reaped }
+
+        struct GroupLifetimeAnchor {
+            context: crate::process::CaseContextId,
+            group: i32,
+            child: std::process::Child,
+            release: UnixStream,
+            phase: AnchorPhase,
+            reaped: Option<std::process::ExitStatus>,
+            authority_error: Option<String>,
+            case_error: Option<String>,
+        }
+
+        impl GroupLifetimeAnchor {
+            fn authorize(&self, context: crate::process::CaseContextId, group: i32) -> Result<(), String> {
+                // Actual exclusive unreaped group-LEADER Child is the pin. No
+                // procfs/getpgid/kill0 observation or numeric equality grants it.
+                if self.context != context || self.group != group || group <= 0
+                    || self.child.id() != u32::try_from(group).unwrap_or(0)
+                    || self.phase != AnchorPhase::Unreaped || self.reaped.is_some()
+                    || self.authority_error.is_some() {
+                    return Err("unreaped group-leader anchor authority is absent or revoked".into());
+                }
+                Ok(())
+            }
+
+            fn poll_reap(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+                if let Some(status) = self.reaped { return Ok(Some(status)); }
+                // Irrevocably revoke signalling BEFORE any potentially reaping
+                // operation, even if it errors, blocks or returns no status.
+                self.phase = AnchorPhase::Reaping;
+                match self.child.try_wait() {
+                    Ok(Some(status)) => { self.reaped = Some(status); self.phase = AnchorPhase::Reaped; Ok(Some(status)) }
+                    Ok(None) => Ok(None),
+                    Err(error) => {
+                        let error = format!("anchor wait unknown: {error}");
+                        self.authority_error = Some(error.clone()); Err(error)
+                    }
+                }
+            }
+        }
+
+        type AnchorHandle = crate::process::CaseResourceHandle<GroupLifetimeAnchor>;
+        #[derive(Clone, Copy)]
+        struct CheckedStopRecord { context: crate::process::CaseContextId, role: super::super::HttpChildRole }
+        #[derive(Clone, Copy)]
+        enum LegacyPhase { Open, CheckedStop(CheckedStopRecord), Ended }
+        enum PrimaryCollection { Reaped(std::process::ExitStatus), CheckedStop(CheckedStopRecord), NotSpawned }
+        struct ContainmentRecord { primary: PrimaryCollection, anchor: Option<std::process::ExitStatus> }
+
+        struct Probe {
+            handle: Option<ChildHandle>,
+            context: crate::process::CaseContextId,
+            group: i32, // diagnostics/observation only; never raw collector signal authority
+            release: Option<UnixStream>,
+            anchor: Option<AnchorHandle>,
+            legacy: LegacyPhase,
+            signal_capable_dispatches: usize,
+            authority_loss: Option<String>,
+            collection_attempted: bool,
+            containment: Option<ContainmentRecord>,
+        }
+
+        impl Probe {
+            fn primary(&self) -> ChildHandle { self.handle.expect("registered primary") }
+
+            fn record_error(&mut self, error: &str) {
+                crate::process::retain_case_context(self.context);
+                if let Some(anchor) = self.anchor {
+                    let _ = crate::process::with_case_resource(anchor, |slot| slot.case_error = Some(error.to_string()));
+                }
+            }
+
+            fn require_signal_authority(&self, claimed_group: i32) -> Result<(), String> {
+                if claimed_group != self.group || self.containment.is_some() || self.collection_attempted
+                    || !matches!(self.legacy, LegacyPhase::Open) || self.authority_loss.is_some() {
+                    return Err("physical completion or retained failure prohibits another group stop".into());
+                }
+                let anchor = self.anchor.ok_or_else(|| "no unreaped group-leader anchor".to_string())?;
+                crate::process::with_case_resource(anchor, |slot| slot.authorize(self.context, claimed_group))?
+            }
+
+            fn checked_stop_for_claim(&mut self, claimed_group: i32,
+                deadline: Option<std::time::Instant>) -> Result<super::super::CheckedHttpChild, String> {
+                self.require_signal_authority(claimed_group)?;
+                self.signal_capable_dispatches += 1;
+                // Only this caller can reap the anchor, and collection cannot
+                // start until this synchronous call returns. Anchor stays in
+                // its registered, exclusive Unreaped state through ALL legacy
+                // waits/TERM/KILL, including a primary reaped by request_stop.
+                let result = match deadline {
+                    Some(deadline) => super::super::stop_http_child_until(self.primary(), deadline),
+                    None => super::super::stop_http_child(self.primary()),
+                };
+                match &result {
+                    Ok(proof) => {
+                        assert_eq!(proof.context, self.context);
+                        self.legacy = LegacyPhase::CheckedStop(CheckedStopRecord { context: proof.context, role: proof.role });
+                    }
+                    Err(error) => { self.legacy = LegacyPhase::Ended; self.record_error(error); }
+                }
+                result
+            }
+
+            fn observe_certificate_until(&mut self, deadline: std::time::Instant) -> Result<(), String> {
+                self.require_signal_authority(self.group)?;
+                self.signal_capable_dispatches += 1;
+                let result = super::super::observe_case_tool_until(self.primary(), deadline);
+                self.legacy = LegacyPhase::Ended;
+                if let Err(error) = &result { self.record_error(error); }
+                result
+            }
+
+            fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    assert!(std::time::Instant::now() < deadline);
+                    let status = crate::process::with_case_resource(self.primary(), |child| child.child.try_wait())
+                        .unwrap().unwrap();
+                    assert!(std::time::Instant::now() < deadline, "primary wait arrived late");
+                    if let Some(status) = status { return status; }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            fn reap_anchor(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+                let Some(anchor) = self.anchor else { return Ok(None); };
+                // A socket release is bound to the original endpoint, not an
+                // integer process identity. No group signal occurs here.
+                let _ = crate::process::with_case_resource(anchor, |slot| slot.release.write_all(b"Q"))?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    if std::time::Instant::now() >= deadline { return Err("anchor collection unknown".into()); }
+                    let status = crate::process::with_case_resource(anchor, |slot| slot.poll_reap())??;
+                    if std::time::Instant::now() >= deadline { return Err("anchor collection arrived late".into()); }
+                    if let Some(status) = status { return Ok(Some(status)); }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            // This collector has NO group/direct kill or legacy stop path.
+            // Cooperative original IPC + actual Child waits + group observation
+            // may establish physical containment; no qualification/error/root
+            // token is released. If cooperation/observation fails, retain
+            // UNKNOWN and leave further containment to admitted outer owners.
+            fn contain_without_group_signals(&mut self) -> Result<(), String> {
+                if self.containment.is_some() { return Ok(()); }
+                if self.collection_attempted { return Err("prior physical containment remains unknown".into()); }
+                self.collection_attempted = true;
+                if let Some(release) = self.release.as_mut() { let _ = release.write_all(b"Q"); }
+                let primary = if let LegacyPhase::CheckedStop(record) = self.legacy {
+                    PrimaryCollection::CheckedStop(record)
+                } else if self.handle.is_some() {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    loop {
+                        if std::time::Instant::now() >= deadline { return Err("primary containment unknown".into()); }
+                        let status = crate::process::with_case_resource(self.primary(), |slot| slot.child.try_wait())?
+                            .map_err(|error| format!("primary wait unknown: {error}"))?;
+                        if std::time::Instant::now() >= deadline { return Err("primary containment arrived late".into()); }
+                        if let Some(status) = status { break PrimaryCollection::Reaped(status); }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                } else { PrimaryCollection::NotSpawned };
+                let anchor = self.reap_anchor()?;
+                if self.group <= 0 { return Err("group identity unavailable; no unsafe signal attempted".into()); }
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    if std::time::Instant::now() >= deadline { return Err("group containment unknown".into()); }
+                    let quiet = crate::process::owned_group_quiescent(self.group)
+                        .map_err(|error| format!("group observation unknown: {error}"))?;
+                    if std::time::Instant::now() >= deadline { return Err("group containment arrived late".into()); }
+                    if quiet { self.containment = Some(ContainmentRecord { primary, anchor }); return Ok(()); }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            fn cleanup(&mut self) -> Result<(), String> {
+                if let Some(error) = &self.authority_loss { return Err(error.clone()); }
+                let result = self.contain_without_group_signals();
+                if let Err(error) = &result { self.record_error(error); }
+                result
+            }
+
+            fn revoke_anchor_for_test(&mut self, error: &str) {
+                self.authority_loss = Some(error.to_string()); self.record_error(error);
+                let anchor = self.anchor.expect("real anchor");
+                crate::process::with_case_resource(anchor, |slot| slot.authority_error = Some(error.to_string())).unwrap();
+            }
+
+            fn retire_anchor_for_test(&mut self) {
+                assert!(self.reap_anchor().unwrap().is_some(), "actual anchor must be reaped");
+                // Reaped OS lifetime itself must refuse, independently of the
+                // error latch installed below. A copied numeric ID is no pin.
+                crate::process::with_case_resource(self.anchor.unwrap(), |slot| {
+                    assert!(slot.phase == AnchorPhase::Reaped && slot.reaped.is_some());
+                    assert!(slot.authority_error.is_none());
+                    assert!(slot.authorize(self.context, self.group).is_err());
+                }).unwrap();
+                self.revoke_anchor_for_test("actual group-leader anchor was retired; numeric claim is not authority");
+            }
+
+            fn assert_contained(&self) {
+                let record = self.containment.as_ref().expect("actual physical observations");
+                match &record.primary {
+                    PrimaryCollection::CheckedStop(stopped) => {
+                        assert_eq!(stopped.context, self.context);
+                        assert!(stopped.role == super::super::HttpChildRole::CertificateTool
+                            || stopped.role == super::super::HttpChildRole::Server);
+                    }
+                    PrimaryCollection::Reaped(status) => { let _ = status.code(); }
+                    PrimaryCollection::NotSpawned => panic!("no primary in completed test"),
+                }
+                if self.anchor.is_some() { assert!(record.anchor.is_some()); }
+            }
+        }
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if self.containment.is_none() && !self.collection_attempted {
+                    if let Err(error) = self.contain_without_group_signals() {
+                        self.record_error(&error);
+                        eprintln!("UNKNOWN native fixture containment: {error}; group={} (no signal authorized)", self.group);
+                        if !std::thread::panicking() { panic!("{error}"); }
+                    }
+                }
+            }
+        }
+
+        fn spawn_probe(context: crate::process::CaseContextId, role: super::super::HttpChildRole,
+            scenario: Scenario) -> (Probe, UnixStream, serde_json::Value, std::sync::Weak<tempfile::TempDir>) {
+            require_native();
+            let root = std::sync::Arc::new(tempfile::tempdir().unwrap()); let weak = std::sync::Arc::downgrade(&root);
+            let retained = std::sync::Arc::clone(&root);
+            crate::process::register_case_resource(context, || Ok(super::super::CaseHttpRoot { _root: retained })).unwrap();
+            let log = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW).open(root.path().join("fixed-probe.log")).unwrap();
+            let mut probe = Probe { handle: None, context, group: 0, release: None, anchor: None,
+                legacy: LegacyPhase::Open, signal_capable_dispatches: 0, authority_loss: None,
+                collection_attempted: false, containment: None };
+            if scenario != Scenario::LeaderExits {
+                let (mut control, writer) = UnixStream::pair().unwrap();
+                let release = control.try_clone().unwrap(); release.set_write_timeout(Some(Duration::from_millis(50))).unwrap();
+                let mut command = fixed_command(Scenario::HelperHolds, ProbeRole::Anchor, writer.as_raw_fd(), None);
+                command.process_group(0).stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log.try_clone().unwrap());
+                let mut group = 0;
+                let anchor = crate::process::register_case_resource(context, || {
+                    let child = command.spawn().map_err(|error| format!("anchor spawn: {error}"))?;
+                    group = i32::try_from(child.id()).unwrap_or(0);
+                    Ok(GroupLifetimeAnchor { context, group, child, release, phase: AnchorPhase::Unreaped,
+                        reaped: None, authority_error: None, case_error: None })
+                }).unwrap();
+                probe.anchor = Some(anchor); probe.group = group; drop(writer);
+                assert!(group > 0); let hello = read_control(&mut control);
+                assert_eq!(hello["pid"].as_u64(), Some(u64::try_from(group).unwrap()));
+                assert_eq!(hello["group"].as_i64(), Some(i64::from(group)));
+            }
+            let (mut control, writer) = UnixStream::pair().unwrap();
+            let release = control.try_clone().unwrap(); release.set_write_timeout(Some(Duration::from_millis(50))).unwrap();
+            let mut command = fixed_command(scenario, ProbeRole::Primary, writer.as_raw_fd(), None);
+            command.process_group(probe.group).stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log);
+            let retained = std::sync::Arc::clone(&root); let mut pid = 0; let mut group = probe.group;
+            let handle = crate::process::register_case_resource(context, || {
+                let child = command.spawn().map_err(|error| format!("primary spawn: {error}"))?; pid = child.id();
+                if group == 0 { group = i32::try_from(pid).unwrap_or(0); }
+                Ok(super::super::CaseHttpChild { context, role, child, group, _root: retained,
+                    stopping: None, killed: false, status: None, error: None })
+            }).unwrap();
+            probe.handle = Some(handle); probe.group = group; probe.release = Some(release);
+            drop(writer); drop(root); assert!(group > 0);
+            let hello = read_control(&mut control);
+            assert_eq!(hello["pid"].as_u64(), Some(u64::from(pid)));
+            assert_eq!(hello["group"].as_i64(), Some(i64::from(group)));
+            if let Some(anchor) = probe.anchor {
+                // Only release execution, NEVER reap. Even an exited zombie
+                // group-leader Child pins its PID until our last stop returns.
+                crate::process::with_case_resource(anchor, |slot| slot.release.write_all(b"Q")).unwrap().unwrap();
+            }
+            probe.release.as_mut().unwrap().write_all(b"S").unwrap();
+            let hello = read_control(&mut control);
+            assert_eq!(hello["pid"].as_u64(), Some(u64::from(pid)));
+            assert_eq!(hello["group"].as_i64(), Some(i64::from(group)));
+            (probe, control, hello, weak)
+        }
+
+        fn retained(context: crate::process::CaseContextId, weak: &std::sync::Weak<tempfile::TempDir>) {
+            assert!(weak.upgrade().is_some(), "case root lost while child/observation is unresolved");
+            assert!(!crate::process::case_context_ready(context));
+            assert!(crate::process::release_case_context(context, true).is_err());
+            assert!(crate::process::admit_case_context().is_err());
+        }
+
+        #[test]
+        fn http_l4_reaped_leader_with_live_descendant_refuses_completion() {
+            if isolated("http_l4_reaped_leader_with_live_descendant_refuses_completion") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, Scenario::LeaderExits);
+            let descendant = i32::try_from(hello["descendant_pid"].as_u64().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::getpgid(descendant) }, probe.group, "descendant escaped its owned group");
+            assert!(probe.wait_for_exit().success(), "leader must really be reaped");
+            assert!(!crate::process::owned_group_quiescent(probe.group).unwrap());
+            let observed = crate::process::with_case_resource(probe.primary(), |child| child.observe_exit())
+                .unwrap().unwrap();
+            assert!(observed.is_none(), "reaped leader falsely qualified a live descendant");
+            retained(context, &weak); probe.cleanup().unwrap(); retained(context, &weak);
+        }
+
+        #[test]
+        fn http_l4_expired_cleanup_deadline_retains_child_and_root() {
+            if isolated("http_l4_expired_cleanup_deadline_retains_child_and_root") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, Scenario::HelperHolds);
+            let error = probe.checked_stop_for_claim(probe.group, Some(std::time::Instant::now()))
+                .map(|_| ()).unwrap_err();
+            assert!(error.contains("budget expired"));
+            assert_eq!(crate::process::case_resource_handles::<super::super::CaseHttpChild>(context).len(), 1);
+            retained(context, &weak); probe.cleanup().unwrap(); retained(context, &weak);
+        }
+
+        #[test]
+        fn http_l5_nonzero_before_stop_preserves_actual_failure() {
+            if isolated("http_l5_nonzero_before_stop_preserves_actual_failure") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, Scenario::Nonzero);
+            assert_eq!(probe.wait_for_exit().code(), Some(23));
+            let error = probe.checked_stop_for_claim(probe.group, None).map(|_| ()).unwrap_err();
+            assert!(error.contains("exited before stop"));
+            crate::process::with_case_resource(probe.primary(), |child| {
+                assert_eq!(child.status.and_then(|status| status.code()), Some(23));
+                assert!(child.error.is_some());
+            }).unwrap();
+            retained(context, &weak); probe.cleanup().unwrap();
+        }
+
+        fn refused_readiness(scenario: Scenario) {
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, scenario);
+            let line = super::super::read_case_http_readiness(context, ready, Duration::from_secs(2)).unwrap();
+            if scenario == Scenario::MissingReady { assert!(line.is_empty()); }
+            else { assert_eq!(line, "not-json\n"); }
+            assert!(super::super::parse_http_readiness(&line).unwrap_err().contains("readiness JSON"));
+            assert_eq!(crate::process::case_resource_handles::<super::super::CaseHttpChild>(context).len(), 1);
+            retained(context, &weak); probe.cleanup().unwrap(); retained(context, &weak);
+        }
+
+        #[test]
+        fn http_l6_malformed_readiness_retains_server_and_root() {
+            if isolated("http_l6_malformed_readiness_retains_server_and_root") { return; }
+            refused_readiness(Scenario::MalformedReady);
+        }
+
+        #[test]
+        fn http_l6_missing_readiness_retains_server_and_root() {
+            if isolated("http_l6_missing_readiness_retains_server_and_root") { return; }
+            refused_readiness(Scenario::MissingReady);
+        }
+
+        #[test]
+        fn http_l6_readiness_timeout_keeps_actual_reader_and_child() {
+            if isolated("http_l6_readiness_timeout_keeps_actual_reader_and_child") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, Scenario::HelperHolds);
+            let error = super::super::read_case_http_readiness(context, ready, Duration::from_millis(50))
+                .unwrap_err();
+            assert!(error.contains("timed out"));
+            let readers = crate::process::case_resource_handles::<super::super::CaseHttpThread<Result<String, String>>>(context);
+            assert_eq!(readers.len(), 1, "timed-out actual reader must remain registered");
+            crate::process::with_case_resource(readers[0], |slot| {
+                assert!(slot.handle.is_some()); assert!(slot.ready.is_none());
+            }).unwrap();
+            retained(context, &weak); probe.cleanup().unwrap();
+            // Group cleanup unblocks the pipe but cannot reconstruct the
+            // abandoned readiness assertion or release its retained result.
+            super::super::observe_http_threads::<Result<String, String>>(context,
+                std::time::Instant::now() + Duration::from_secs(2)).unwrap();
+            assert_eq!(crate::process::case_resource_handles::<super::super::CaseHttpThread<Result<String, String>>>(context).len(), 1);
+            crate::process::with_case_resource(readers[0], |slot| {
+                assert!(slot.handle.is_none(), "physically joined reader handle was not consumed");
+                assert!(matches!(slot.ready.as_ref(), Some(Ok(line)) if line.is_empty()),
+                    "late EOF result was lost or converted into a readiness assertion");
+            }).unwrap();
+            retained(context, &weak);
+        }
+
+        #[test]
+        fn http_l6_certificate_role_nonzero_keeps_failure_and_root() {
+            if isolated("http_l6_certificate_role_nonzero_keeps_failure_and_root") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::CertificateTool, Scenario::Nonzero);
+            assert_eq!(probe.wait_for_exit().code(), Some(23));
+            let error = probe.observe_certificate_until(std::time::Instant::now() + Duration::from_secs(2)).unwrap_err();
+            assert!(error.contains("HTTP certificate tool failed"));
+            assert_eq!(crate::process::case_resource_handles::<super::super::CaseHttpChild>(context).len(), 1);
+            retained(context, &weak); probe.cleanup().unwrap();
+        }
+
+        #[test]
+        fn http_l7_certificate_child_cannot_supply_server_completion() {
+            if isolated("http_l7_certificate_child_cannot_supply_server_completion") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::CertificateTool, Scenario::HelperHolds);
+            let proof = probe.checked_stop_for_claim(probe.group, None).unwrap();
+            assert_eq!(proof.context, context);
+            let error = super::super::HttpFixture::check_server_completion(proof).map(|_| ()).unwrap_err();
+            assert!(error.contains("different child role")); probe.record_error(&error);
+            let dispatches = probe.signal_capable_dispatches;
+            assert!(probe.require_signal_authority(probe.group).is_err(), "checked stop already ended signal authority");
+            retained(context, &weak); probe.cleanup().unwrap(); probe.assert_contained();
+            assert_eq!(probe.signal_capable_dispatches, dispatches, "checked stop must not be dispatched again");
+            assert!(probe.checked_stop_for_claim(probe.group, None).is_err());
+            assert_eq!(probe.signal_capable_dispatches, dispatches, "physical completion cannot reauthorize a stop");
+            retained(context, &weak);
+        }
+
+        #[test]
+        fn http_l4_reaped_anchor_number_cannot_authorize_replacement_claim() {
+            if isolated("http_l4_reaped_anchor_number_cannot_authorize_replacement_claim") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, Scenario::Nonzero);
+            assert_eq!(probe.wait_for_exit().code(), Some(23));
+            let old_numeric_group = probe.group;
+            probe.retire_anchor_for_test(); // actual exit/reap, no ID-reuse process probe
+            let dispatches = probe.signal_capable_dispatches;
+            assert!(probe.checked_stop_for_claim(old_numeric_group, None).is_err());
+            let replacement_numeric_claim = old_numeric_group;
+            assert!(probe.checked_stop_for_claim(replacement_numeric_claim, None).is_err());
+            assert_eq!(probe.signal_capable_dispatches, dispatches);
+            assert!(probe.cleanup().is_err()); retained(context, &weak);
+            probe.contain_without_group_signals().unwrap(); probe.assert_contained();
+            assert!(probe.cleanup().is_err(), "retired authority must not turn into cleanup success");
+            assert_eq!(probe.signal_capable_dispatches, dispatches); retained(context, &weak);
+        }
+
+        #[test]
+        fn http_l4_revoked_anchor_retains_error_root_and_context() {
+            if isolated("http_l4_revoked_anchor_retains_error_root_and_context") { return; }
+            let boundary = enter_process_boundary().unwrap(); let context = boundary.context();
+            let (mut probe, _ready, _hello, weak) = spawn_probe(context,
+                super::super::HttpChildRole::Server, Scenario::HelperHolds);
+            probe.revoke_anchor_for_test("controlled loss of validated lifetime authority");
+            let anchor = probe.anchor.unwrap();
+            let dispatches = probe.signal_capable_dispatches;
+            assert!(probe.checked_stop_for_claim(probe.group, None).is_err());
+            assert!(probe.cleanup().unwrap_err().contains("controlled loss"));
+            retained(context, &weak);
+            // Original IPC/Child owners can collect the fixed actors without
+            // a numeric group signal. That does not clear the failed case.
+            probe.contain_without_group_signals().unwrap(); probe.assert_contained();
+            crate::process::with_case_resource(anchor, |slot| {
+                assert!(slot.reaped.is_some()); assert!(slot.authority_error.is_some()); assert!(slot.case_error.is_some());
+            }).unwrap();
+            assert!(probe.cleanup().is_err());
+            assert_eq!(probe.signal_capable_dispatches, dispatches); retained(context, &weak);
         }
     }
 
