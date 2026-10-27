@@ -2803,6 +2803,7 @@ mod packaged_call_site {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::net::UnixStream;
         use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
 
         type ChildHandle = crate::process::CaseResourceHandle<super::super::CaseHttpChild>;
         const UNIT_CHILD: &str = "REPOSYNC_HTTP_CHILD_FAILURE_UNIT";
