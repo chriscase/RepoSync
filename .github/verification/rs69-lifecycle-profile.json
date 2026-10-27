@@ -1,0 +1,449 @@
+{
+  "schema_version": 1,
+  "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb",
+  "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
+  "lock": {
+    "kind": "external_prepared_input_not_tracked_root_lock",
+    "fixture_path": "docs/reliability/fixtures/Cargo.lock",
+    "bytes": 82871,
+    "sha256": "295583faf31523be3fb43d729e1777d45751cda900439f6ae6b0e682fe6605c6",
+    "blob": "265e8f191e3427f00a134015bcf4ad9173072242",
+    "registry_packages": 332,
+    "all_packages": 337,
+    "initial_generation_tool": "UNKNOWN; later 1.98.1 consumption and unchanged six manifests are separately recorded"
+  },
+  "toolchain": {
+    "channel": "1.98.1",
+    "target": "x86_64-unknown-linux-gnu",
+    "rustc_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "cargo_commit": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+    "provisioning": "Existing runner rustup, private RUSTUP_HOME, minimal profile, no self-update; stop if exact release unavailable"
+  },
+  "actions": {
+    "checkout": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "upload_artifact": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "runner": {
+    "label": "ubuntu-24.04",
+    "kind": "GitHub-hosted fresh disposable VM; no self-hosted/container fallback",
+    "minimum_cpus": 4,
+    "minimum_available_ram_bytes": 8589934592,
+    "minimum_free_disk_bytes": 8589934592,
+    "target_budget_bytes": 8589934592,
+    "target_budget_enforcement": "Checked between steps, not a continuous kernel or aggregate process disk cap",
+    "shared_cache": false,
+    "output_budget_bytes": 16777216
+  },
+  "limits": {
+    "job_minutes": 50,
+    "setup_fetch_minutes": 10,
+    "compile_minutes": 10,
+    "case_minutes": 1,
+    "evidence_minutes": 2,
+    "upload_minutes": 3,
+    "compile": {
+      "address_space_bytes": 4294967296,
+      "cpu_seconds": 1500,
+      "nofile": 512,
+      "max_file_bytes": 1073741824
+    },
+    "case": {
+      "address_space_bytes": 536870912,
+      "cpu_seconds": 30,
+      "nofile": 128,
+      "max_file_bytes": 16777216
+    },
+    "core_bytes": 0,
+    "artifact_bytes": 16777216,
+    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap",
+    "compile_step_minutes": 10,
+    "compile_total_minutes": 10,
+    "inventory_minutes": 1
+  },
+  "fetch": {
+    "args": [
+      "fetch",
+      "--locked",
+      "--target",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "online": true,
+    "private_cache": true,
+    "lock_regeneration": false
+  },
+  "test": {
+    "count": 8,
+    "expected_injected_panic": 1,
+    "args": [
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--color=never"
+    ],
+    "one_case_per_native_step": true,
+    "stop_on_first_failure": true,
+    "zero_or_ignored_success": false,
+    "retries": 0,
+    "intentional_source_panic_cases": 2,
+    "no_visible_panic_hooks": 7
+  },
+  "effects": {
+    "compile": "One pinned core-lib compiler invocation, proc macros/dependency build scripts and C compiler/linker; online locked preparation precedes offline compile. No project command is executed during metadata preparation.",
+    "tests": "Eight existing cases only: four same-binary child lifecycle regressions, then four service shutdown/receiver cases. Two intentional source panics, one visible outer panic hook. Service fixtures use SQLite and libgit2 init; no live Git/SVN/HTTP/provider fixtures.",
+    "network": "Online exact toolchain/dependency preparation; Cargo offline for compile/tests is not OS network isolation",
+    "git": "Private HOME, empty template/hooks, per-command no-system/global config; no credentials forwarded to build/tests",
+    "credentials": "Read-only checkout token not persisted; no repository/environment secrets or OIDC requested; artifact runtime credentials remain confined to action steps",
+    "inventory": "Run selected libtest binary with --list only; require eight exact names once and bind inventory to binary digest; no test body selected.",
+    "jobs": "Two Cargo build jobs; per-process prlimit values are inherited by descendants, not aggregate VM quotas. Native GitHub step/job bounds and fresh-VM disposal own descendant containment."
+  },
+  "completion": {
+    "authority": "GitHub native step/job cancellation and fresh-VM decommission; no custom process supervisor",
+    "cancellation": "Documented SIGINT 7.5s, SIGTERM 2.5s, process-tree kill; server cancellation procedure up to five minutes. No earlier 5+2s guarantee.",
+    "stdout_eof": "Not a completion oracle; logs use regular files and native step conclusion is required",
+    "unknown": "RUNNING without an exit becomes INCOMPLETE; unstarted cases NOT_RUN; no campaign PASS without external terminal job/run readback",
+    "artifact_upload": "Best effort on cancellation; bounded sanitized evidence only; uploaded data inherits public repository access",
+    "rerun": "Frozen first-attempt tag only; meaningful corrections use focused review, updated exact identity and a fresh tag under the standing correction/test cycle. No blind rerun or manual dispatch."
+  },
+  "revision": "rs69-owned-lifecycle-hosted8-v1",
+  "state": "UNPUBLISHED_UNRUN_REQUIRES_FOCUSED_COMPOSITION_METADATA_REVIEW_AND_FRESH_LAUNCH_ADMISSION",
+  "trigger": {
+    "repository": "chriscase/RepoSync",
+    "event": "push",
+    "ref": "refs/tags/rs69-lifecycle-05252713-v1",
+    "first_attempt_only": true
+  },
+  "source": {
+    "parent_commit": "5d6481effd758cdd4c88b84bb9d78cacf1bd7b84",
+    "base_tree": "052527138d54c383f6c3580db696b42e555f7b81",
+    "project_tree": "052527138d54c383f6c3580db696b42e555f7b81",
+    "project_file_count": 510,
+    "execution_metadata_paths": [
+      ".github/workflows/rs69-lifecycle.yml",
+      ".github/verification/rs69-lifecycle-profile.json"
+    ],
+    "origin_epic_commit": "c1c5a9db9f4a8f3d626ce5a14869db8dbb7bad03",
+    "origin_epic_tree": "5d6fe30cef746978a9a300af5cd5baf5cace4fc8",
+    "packet": {
+      "bytes": 1320960,
+      "sha256": "a0ff7c9e5e3856bc02dca1e5d33026b9798284fa38e5cf85fd0cbcc74b38edc2"
+    },
+    "source_delta": {
+      "bytes": 240642,
+      "sha256": "fa80b9f289179eda4de99c22784f0e5b4673ddac3263b507630d05ce9ce077b5",
+      "base_commit": "c1c5a9db9f4a8f3d626ce5a14869db8dbb7bad03",
+      "candidate_commit": "5d6481effd758cdd4c88b84bb9d78cacf1bd7b84",
+      "paths": [
+        "crates/core/src/process.rs",
+        "crates/core/src/pair_refresh/execution.rs",
+        "crates/core/src/pair_refresh/service.rs",
+        "crates/core/src/pair_refresh/authenticated_enrollment_tests.rs"
+      ]
+    },
+    "changed_files": [
+      {
+        "path": "crates/core/src/process.rs",
+        "bytes": 54307,
+        "sha256": "c7467ce90694ad296036e87276f84449c4381c6950d0b21b45b553edd41fb348",
+        "blob": "b5d022dfb3455508fa74dc57121e553091d23fff",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/execution.rs",
+        "bytes": 42900,
+        "sha256": "059fb0da3cc73acbc207c3cb75c250dfc9fe6161f03b5819f66ab1064eb0afaa",
+        "blob": "7d65b5d71c3a8e06936c986eb046643a662e362b",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/service.rs",
+        "bytes": 47254,
+        "sha256": "eeb9baeb728a9774421849b85843d464d6b519ebe3603d3732e8fe3c350a26d3",
+        "blob": "81f7785be262492ba5d5725f3c9e36b0f9c6a343",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/authenticated_enrollment_tests.rs",
+        "bytes": 274150,
+        "sha256": "652fb9d0353b4c1273aebe7860930646b9845a7b0523735e83d7539f17df3dcd",
+        "blob": "ffcac84532491620eaeede78004d920e69a00a0f",
+        "git_mode": "100644"
+      }
+    ],
+    "manifests": [
+      {
+        "path": "Cargo.toml",
+        "bytes": 1716,
+        "sha256": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "git_blob": "a7288a3392fc0188252d7eff3148fd5c6230e966"
+      },
+      {
+        "path": "crates/cli/Cargo.toml",
+        "bytes": 743,
+        "sha256": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
+        "git_blob": "855ff09a9808f9e2ae8a352b8d448d50f2540e41"
+      },
+      {
+        "path": "crates/core/Cargo.toml",
+        "bytes": 1405,
+        "sha256": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
+        "git_blob": "a421ee53f4c83a65aec5960f28b8d61cdcfe3834"
+      },
+      {
+        "path": "crates/daemon/Cargo.toml",
+        "bytes": 974,
+        "sha256": "3d371eef846c33fb78713c28d238bfb26cf4e5945d2aa357d9cd2686257bbb57",
+        "git_blob": "4bbd89f25a977795362629a44f401b559eda7c16"
+      },
+      {
+        "path": "crates/personal/Cargo.toml",
+        "bytes": 936,
+        "sha256": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
+        "git_blob": "9b4964431304dd2251c12d915e141efdbcfe3cd1"
+      },
+      {
+        "path": "crates/web/Cargo.toml",
+        "bytes": 1079,
+        "sha256": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178",
+        "git_blob": "6166927f3218c53cc4e8dd51f0d7f21ceaeb2e9a"
+      }
+    ],
+    "acceptance_context_files": [],
+    "unchanged_workflows_sha256": {
+      "ci.yml": "023f2f17373839d1c67919359688191ef6e8e683fc79216cd71dc4c6f116ee24",
+      "e2e.yml": "5a0d18b8398fa97a57638e35f13c2675983fa58bd99eab6780adc010f29ecd14",
+      "git-operation-request.yml": "cf33dc98e1ea73c5b072738c9a74343e0fb6ad9da1e2c7cf2b2038897ba71219",
+      "release.yml": "df0db540139487dddde6e69a1960819b57c8bc1df042f8dab8ea84607a79c689",
+      "reliability-phase0.yml": "0dfe9d8d4d9e8375c7a2cb2d3ea232531c3ce5a3da97d1da614c5f97797b516e"
+    },
+    "retained_source_review_reports": [
+      {
+        "bytes": 12249,
+        "sha256": "b527c58dcfc17a08ec970652f52e2bf154bdcf6d9b94db3e78eadec100870321",
+        "scope": "v1 source only"
+      },
+      {
+        "bytes": 7933,
+        "sha256": "dbdca2445009638ebd821654e65cf990d56c653acbba1c9b572a50f820f919de",
+        "scope": "v1.1 source addendum only"
+      }
+    ]
+  },
+  "compile": {
+    "targets": [
+      {
+        "id": "core",
+        "package": "reposync-core",
+        "cargo_target": "reposync_core",
+        "kind": "lib",
+        "manifest_path": "crates/core/Cargo.toml",
+        "source_path": "crates/core/src/lib.rs",
+        "args": [
+          "test",
+          "--no-run",
+          "-p",
+          "reposync-core",
+          "--lib",
+          "--locked",
+          "--offline",
+          "--jobs=2",
+          "--message-format=json"
+        ],
+        "case_indexes": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ]
+      }
+    ],
+    "attempts_per_target": 1,
+    "sequence": [
+      "core"
+    ],
+    "scope": "One exact core library libtest artifact, default features plus manifest dev-dependency test-support; no reliability-fixture feature, workspace/all-targets compile, doctest or integration-test invocation",
+    "all_required_before_cases": true
+  },
+  "inventory": {
+    "args": [
+      "--list",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "required_selected_names_once": true,
+    "selected_count": 8,
+    "all_inventory_bodies_executed": false,
+    "binary_digest_checked_before_and_after": true
+  },
+  "cases": [
+    {
+      "index": 1,
+      "target": "core",
+      "name": "pair_refresh::execution::lifecycle_tests::ordinary_work_stays_independent_of_held_case",
+      "source_path": "crates/core/src/pair_refresh/execution.rs",
+      "source_function_line": 982,
+      "acceptance": "A",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh same-executable child libtest process owned by test helper; parent removes launch binding and does not inherit an external lifecycle-child marker; in-memory channels/registry/Tokio blocking work and cancellation; no HTTP/Git/SVN/provider launch"
+      ],
+      "special_effect": "Exact case assertion semantics preserved; no test-source edits"
+    },
+    {
+      "index": 2,
+      "target": "core",
+      "name": "pair_refresh::execution::lifecycle_tests::cancelled_invocation_and_observer_keep_handle_and_result",
+      "source_path": "crates/core/src/pair_refresh/execution.rs",
+      "source_function_line": 1013,
+      "acceptance": "B",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh same-executable child libtest process owned by test helper; parent removes launch binding and does not inherit an external lifecycle-child marker; in-memory channels/registry/Tokio blocking work and cancellation; no HTTP/Git/SVN/provider launch"
+      ],
+      "special_effect": "Exact case assertion semantics preserved; no test-source edits"
+    },
+    {
+      "index": 3,
+      "target": "core",
+      "name": "pair_refresh::execution::lifecycle_tests::panic_is_terminal_and_does_not_block_ordinary_work",
+      "source_path": "crates/core/src/pair_refresh/execution.rs",
+      "source_function_line": 1061,
+      "acceptance": "C",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh same-executable child libtest process owned by test helper; parent removes launch binding and does not inherit an external lifecycle-child marker; in-memory channels/registry/Tokio blocking work and cancellation; no HTTP/Git/SVN/provider launch"
+      ],
+      "special_effect": "Intentional blocking worker panic inside isolated child; source asserts join failure is terminal. Child stdout/stderr are captured and discarded on success by existing test helper, so outer artifact makes no direct child panic-hook count claim."
+    },
+    {
+      "index": 4,
+      "target": "core",
+      "name": "pair_refresh::execution::lifecycle_tests::intended_work_error_is_not_a_failed_join",
+      "source_path": "crates/core/src/pair_refresh/execution.rs",
+      "source_function_line": 1077,
+      "acceptance": "D",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh same-executable child libtest process owned by test helper; parent removes launch binding and does not inherit an external lifecycle-child marker; in-memory channels/registry/Tokio blocking work and cancellation; no HTTP/Git/SVN/provider launch"
+      ],
+      "special_effect": "Exact case assertion semantics preserved; no test-source edits"
+    },
+    {
+      "index": 5,
+      "target": "core",
+      "name": "pair_refresh::service::service_shutdown_and_receiver::empty_service_shutdown_returns_only_for_completed",
+      "source_path": "crates/core/src/pair_refresh/service.rs",
+      "source_function_line": 1112,
+      "acceptance": "E",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir, SQLite and libgit2 local repository initialization; service shutdown publisher and worker threads; no enabled repositories, HTTP/Git/SVN/provider process launch"
+      ],
+      "special_effect": "Exact case assertion semantics preserved; no test-source edits"
+    },
+    {
+      "index": 6,
+      "target": "core",
+      "name": "pair_refresh::service::service_shutdown_and_receiver::cancelled_shutdown_stays_pending",
+      "source_path": "crates/core/src/pair_refresh/service.rs",
+      "source_function_line": 1123,
+      "acceptance": "E",
+      "expected_panic_message": null,
+      "effects": [
+        "Task-owned TempDir, SQLite and libgit2 local repository initialization; service shutdown publisher and worker threads; no enabled repositories, HTTP/Git/SVN/provider process launch"
+      ],
+      "special_effect": "Cancellation and second observer keep shutdown Pending until worker releases; bounded millisecond sleeps"
+    },
+    {
+      "index": 7,
+      "target": "core",
+      "name": "pair_refresh::service::service_shutdown_and_receiver::panic_then_joining_the_other_worker_latches_failed",
+      "source_path": "crates/core/src/pair_refresh/service.rs",
+      "source_function_line": 1185,
+      "acceptance": "E",
+      "expected_panic_message": "worker",
+      "effects": [
+        "Task-owned TempDir, SQLite and libgit2 local repository initialization; service shutdown publisher and worker threads; no enabled repositories, HTTP/Git/SVN/provider process launch"
+      ],
+      "special_effect": "Intentional worker-thread panic with exact visible message worker; source verifies failed shutdown is retained while other worker is joined."
+    },
+    {
+      "index": 8,
+      "target": "core",
+      "name": "pair_refresh::service::service_shutdown_and_receiver::receiver_close_forgets_a_holding_guard_and_drops_a_proved_absence",
+      "source_path": "crates/core/src/pair_refresh/service.rs",
+      "source_function_line": 1263,
+      "acceptance": "E",
+      "expected_panic_message": null,
+      "effects": [
+        "Process-local busy guard acquisition, intentional retained holds and proved-absence/error branches; no subprocess/filesystem/server effects"
+      ],
+      "special_effect": "Exact case assertion semantics preserved; no test-source edits"
+    }
+  ],
+  "open_gates": [
+    "issue69 whole acceptance",
+    "issue64 whole acceptance",
+    "whole H9",
+    "F01/F02/F03/F04/F05/F07/F08/F09/F10/F11 packaged qualification",
+    "projection readers and H/JH final executable identity admission",
+    "24 prior/new regressions and118plans as a complete suite",
+    "main promotion E2E/Phase0 and baseline39726272900 disposition",
+    "full real-engine catalog/live/native acceptance",
+    "merge/deploy"
+  ],
+  "acceptance_scope": {
+    "issue": 69,
+    "plan_id": "RS69-OWNED-BLOCKING-LIFECYCLE-EPIC-C1C5",
+    "requirements": [
+      {
+        "id": "A",
+        "requirement": "Healthy ordinary invocations remain independent; closed case refuses work before it runs.",
+        "tests": [
+          "pair_refresh::execution::lifecycle_tests::ordinary_work_stays_independent_of_held_case"
+        ]
+      },
+      {
+        "id": "B",
+        "requirement": "Cancelled invocation and cancelled observer retain real handle/receiver, original result 37, and context until observed completion.",
+        "tests": [
+          "pair_refresh::execution::lifecycle_tests::cancelled_invocation_and_observer_keep_handle_and_result"
+        ]
+      },
+      {
+        "id": "C",
+        "requirement": "Panic is terminal, consumed handle is never repolled, case cannot qualify, ordinary work still completes.",
+        "tests": [
+          "pair_refresh::execution::lifecycle_tests::panic_is_terminal_and_does_not_block_ordinary_work"
+        ]
+      },
+      {
+        "id": "D",
+        "requirement": "Intentional inner error is joined work, not a fabricated JoinError or publication-success receipt.",
+        "tests": [
+          "pair_refresh::execution::lifecycle_tests::intended_work_error_is_not_a_failed_join"
+        ]
+      },
+      {
+        "id": "E",
+        "requirement": "Actual shutdown worker/publisher custody survives cancellation, Pending/Failed never count as completed, receiver-close releases only proved nonholding work.",
+        "tests": [
+          "pair_refresh::service::service_shutdown_and_receiver::empty_service_shutdown_returns_only_for_completed",
+          "pair_refresh::service::service_shutdown_and_receiver::cancelled_shutdown_stays_pending",
+          "pair_refresh::service::service_shutdown_and_receiver::panic_then_joining_the_other_worker_latches_failed",
+          "pair_refresh::service::service_shutdown_and_receiver::receiver_close_forgets_a_holding_guard_and_drops_a_proved_absence"
+        ]
+      }
+    ],
+    "closure": "Only core owned-lifecycle mechanism evidence; no issue69 or whole H9 closure",
+    "automatic_issue_close": false,
+    "F07_F08_owner": "01a1434e-b4d8-7583-969f-75ad62ef10ce; exact ten-span reservation separate, excluded from current source/compile/test changes",
+    "issue112": "Completed at epic integration; no repeat of its19-case campaign",
+    "resource_route_choice": "Reuse previously reviewed hosted50-minute VM profile, minimum free disk8GiB, target8GiB, one10-minute compile and8one-minute cases. This replaces local proposed20-minute/minimum32GiB cache/executor proposal with the demonstrated hosted route; checks are sampled, not kernel quotas."
+  }
+}
