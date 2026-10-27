@@ -1,0 +1,693 @@
+{
+  "schema_version": 1,
+  "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb",
+  "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
+  "lock": {
+    "kind": "external_prepared_input_not_tracked_root_lock",
+    "fixture_path": "docs/reliability/fixtures/Cargo.lock",
+    "bytes": 82871,
+    "sha256": "295583faf31523be3fb43d729e1777d45751cda900439f6ae6b0e682fe6605c6",
+    "blob": "265e8f191e3427f00a134015bcf4ad9173072242",
+    "registry_packages": 332,
+    "all_packages": 337,
+    "initial_generation_tool": "UNKNOWN; later 1.98.1 consumption and unchanged six manifests are separately recorded"
+  },
+  "toolchain": {
+    "channel": "1.98.1",
+    "target": "x86_64-unknown-linux-gnu",
+    "rustc_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "cargo_commit": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+    "provisioning": "Existing runner rustup, private RUSTUP_HOME, minimal profile, no self-update; stop if exact release unavailable"
+  },
+  "actions": {
+    "checkout": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "upload_artifact": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "runner": {
+    "label": "ubuntu-24.04",
+    "kind": "GitHub-hosted fresh disposable VM; no self-hosted/container fallback",
+    "minimum_cpus": 4,
+    "minimum_available_ram_bytes": 8589934592,
+    "minimum_free_disk_bytes": 8589934592,
+    "target_budget_bytes": 8589934592,
+    "target_budget_enforcement": "Checked between steps, not a continuous kernel or aggregate process disk cap",
+    "shared_cache": false,
+    "output_budget_bytes": 16777216
+  },
+  "limits": {
+    "job_minutes": 50,
+    "setup_fetch_minutes": 10,
+    "compile_minutes": 10,
+    "case_minutes": 1,
+    "evidence_minutes": 2,
+    "upload_minutes": 3,
+    "compile": {
+      "address_space_bytes": 4294967296,
+      "cpu_seconds": 1500,
+      "nofile": 512,
+      "max_file_bytes": 1073741824
+    },
+    "case": {
+      "address_space_bytes": 536870912,
+      "cpu_seconds": 30,
+      "nofile": 128,
+      "max_file_bytes": 16777216
+    },
+    "core_bytes": 0,
+    "artifact_bytes": 16777216,
+    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap",
+    "compile_step_minutes": 10,
+    "compile_total_minutes": 10,
+    "inventory_minutes": 1
+  },
+  "fetch": {
+    "args": [
+      "fetch",
+      "--locked",
+      "--target",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "online": true,
+    "private_cache": true,
+    "lock_regeneration": false
+  },
+  "test": {
+    "count": 6,
+    "expected_injected_panic": 1,
+    "args": [
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--color=never"
+    ],
+    "one_case_per_native_step": true,
+    "stop_on_first_failure": true,
+    "zero_or_ignored_success": false,
+    "retries": 0,
+    "intentional_source_panic_cases": 1,
+    "no_visible_panic_hooks": 5,
+    "native_mode": "native-generated-v1",
+    "private_child_marker": "REPOSYNC_HTTP_NEGATIVE_UNIT_CHILD (absent in outer env-i; allocated by existing-author same-executable helper)"
+  },
+  "effects": {
+    "compile": "One pinned core-lib compiler invocation, proc macros/dependency build scripts and C compiler/linker; online locked preparation precedes offline compile. No project command is executed during metadata preparation.",
+    "tests": "Six same-executable native unit children only: process-wide admission, real threads/mpsc/result retention, one intentional owned-worker panic, wrong-owner proof/seal refusal, fixed-entry factory early refusal and UnixStream/FD alias retention. No Git/SVN/Python/OpenSSL/server/provider fixture bodies, no TCP listeners or packaged catalogue launch.",
+    "network": "Online exact toolchain/dependency preparation; Cargo offline for compile/tests is not OS network isolation",
+    "git": "Private HOME, empty template/hooks, per-command no-system/global config; no credentials forwarded to build/tests",
+    "credentials": "Read-only checkout token not persisted; no repository/environment secrets or OIDC requested; artifact runtime credentials remain confined to action steps",
+    "inventory": "Run newly compiled libtest --list; require all six exact names once and digest-bind selection. Old inventory does not prove new leaves exist in a compiled binary.",
+    "jobs": "Two Cargo build jobs; per-process prlimit values are inherited by descendants, not aggregate VM quotas. Native GitHub step/job bounds and fresh-VM disposal own descendant containment.",
+    "native_mode": "Outer case env-i contains explicit native-generated-v1; no REPOSYNC_LAUNCH_BINDING_V1, per-case packaged pins or external recursion marker are passed. Nested child stays in inherited GitHub-owned process cohort and uses private scratch."
+  },
+  "completion": {
+    "authority": "GitHub native step/job cancellation and fresh-VM decommission; no custom process supervisor",
+    "cancellation": "Documented SIGINT 7.5s, SIGTERM 2.5s, process-tree kill; server cancellation procedure up to five minutes. No earlier 5+2s guarantee.",
+    "stdout_eof": "Not a completion oracle; logs use regular files and native step conclusion is required",
+    "unknown": "RUNNING without an exit becomes INCOMPLETE; unstarted cases NOT_RUN; no campaign PASS without external terminal job/run readback",
+    "artifact_upload": "Best effort on cancellation; bounded sanitized evidence only; uploaded data inherits public repository access",
+    "rerun": "Frozen first-attempt tag only; meaningful corrections use focused review, updated exact identity and a fresh tag under the standing correction/test cycle. No blind rerun or manual dispatch.",
+    "nested_child_evidence": "On successful nested child exit, source helper asserts exact named success and forwards stderr; child stdout is not separately retained. On observed child failure, stdout/stderr and scratch path are included in the parent panic. Timeout/unknown termination may prevent retrieval of output held in parent memory: mark INCOMPLETE, never PASS.",
+    "scratch_retention_limit": "Failed-child scratch is kept job-local by the source helper; baseline sanitized artifact route does not archive scratch contents. Provider VM decommission removes it. Durable scratch retention, if required by admission, needs a separately reviewed bounded sanitized capture delta; no durability is claimed here.",
+    "operator_control": "Reconfirm named normal-cancellation actor at launch; threshold30min from publication receipt plus5min recovery observation, not hard termination."
+  },
+  "revision": "rs69-http-negative-six-on-a09ebc0a-v1",
+  "state": "UNPUBLISHED_UNCOMPILED_UNRUN_SOURCE_AND_METADATA_REVIEW_PENDING_FRESH_EXECUTION_ADMISSION_REQUIRED",
+  "trigger": {
+    "repository": "chriscase/RepoSync",
+    "event": "push",
+    "ref": "refs/tags/rs69-http-negative-a09ebc0a-v1",
+    "first_attempt_only": true
+  },
+  "source": {
+    "parent_commit": "2da5fea233eb71a6c8498c7679b8c6da7096d34b",
+    "base_tree": "a09ebc0af4cc8bb79d1fd420d0af1a0ac59949ee",
+    "project_tree": "a09ebc0af4cc8bb79d1fd420d0af1a0ac59949ee",
+    "project_file_count": 510,
+    "execution_metadata_paths": [
+      ".github/workflows/rs69-lifecycle.yml",
+      ".github/verification/rs69-lifecycle-profile.json"
+    ],
+    "origin_epic_commit": "c1c5a9db9f4a8f3d626ce5a14869db8dbb7bad03",
+    "origin_epic_tree": "5d6fe30cef746978a9a300af5cd5baf5cace4fc8",
+    "packet": {
+      "bytes": 1320960,
+      "sha256": "a0ff7c9e5e3856bc02dca1e5d33026b9798284fa38e5cf85fd0cbcc74b38edc2"
+    },
+    "source_delta": {
+      "bytes": 377021,
+      "sha256": "9d4f41f419d5cba7fd6ee3782febb509a7848cae0a9efbf4c01d5bce83119bca",
+      "base_commit": "c1c5a9db9f4a8f3d626ce5a14869db8dbb7bad03",
+      "candidate_commit": "2da5fea233eb71a6c8498c7679b8c6da7096d34b",
+      "paths": [
+        "crates/core/src/pair_refresh/authenticated_enrollment_tests.rs",
+        "crates/core/src/pair_refresh/execution.rs",
+        "crates/core/src/pair_refresh/publication_http_tests.rs",
+        "crates/core/src/pair_refresh/service.rs",
+        "crates/core/src/process.rs"
+      ]
+    },
+    "changed_files": [
+      {
+        "path": "crates/core/src/pair_refresh/authenticated_enrollment_tests.rs",
+        "bytes": 274201,
+        "sha256": "48527e9dd01d44d7831caed007083bfef2bd0c62a3c28aea272fe753c8dbeb36",
+        "blob": "9062d770a2b45807df331d4acb16696c7a11bc96",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/execution.rs",
+        "bytes": 42900,
+        "sha256": "059fb0da3cc73acbc207c3cb75c250dfc9fe6161f03b5819f66ab1064eb0afaa",
+        "blob": "7d65b5d71c3a8e06936c986eb046643a662e362b",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+        "bytes": 151478,
+        "sha256": "bcb329f79def8383cc6d7f5cf633cdc45549f9a84e654002fe4b8a9274a99950",
+        "blob": "ead7955723d50f7a2ab092ca86bd5083777575d6",
+        "git_mode": "100644",
+        "mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/service.rs",
+        "bytes": 47254,
+        "sha256": "eeb9baeb728a9774421849b85843d464d6b519ebe3603d3732e8fe3c350a26d3",
+        "blob": "81f7785be262492ba5d5725f3c9e36b0f9c6a343",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/process.rs",
+        "bytes": 54307,
+        "sha256": "c7467ce90694ad296036e87276f84449c4381c6950d0b21b45b553edd41fb348",
+        "blob": "b5d022dfb3455508fa74dc57121e553091d23fff",
+        "git_mode": "100644"
+      }
+    ],
+    "manifests": [
+      {
+        "path": "Cargo.toml",
+        "bytes": 1716,
+        "sha256": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "git_blob": "a7288a3392fc0188252d7eff3148fd5c6230e966"
+      },
+      {
+        "path": "crates/cli/Cargo.toml",
+        "bytes": 743,
+        "sha256": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
+        "git_blob": "855ff09a9808f9e2ae8a352b8d448d50f2540e41"
+      },
+      {
+        "path": "crates/core/Cargo.toml",
+        "bytes": 1405,
+        "sha256": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
+        "git_blob": "a421ee53f4c83a65aec5960f28b8d61cdcfe3834"
+      },
+      {
+        "path": "crates/daemon/Cargo.toml",
+        "bytes": 974,
+        "sha256": "3d371eef846c33fb78713c28d238bfb26cf4e5945d2aa357d9cd2686257bbb57",
+        "git_blob": "4bbd89f25a977795362629a44f401b559eda7c16"
+      },
+      {
+        "path": "crates/personal/Cargo.toml",
+        "bytes": 936,
+        "sha256": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
+        "git_blob": "9b4964431304dd2251c12d915e141efdbcfe3cd1"
+      },
+      {
+        "path": "crates/web/Cargo.toml",
+        "bytes": 1079,
+        "sha256": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178",
+        "git_blob": "6166927f3218c53cc4e8dd51f0d7f21ceaeb2e9a"
+      }
+    ],
+    "acceptance_context_files": [],
+    "unchanged_workflows_sha256": {
+      "ci.yml": "023f2f17373839d1c67919359688191ef6e8e683fc79216cd71dc4c6f116ee24",
+      "e2e.yml": "5a0d18b8398fa97a57638e35f13c2675983fa58bd99eab6780adc010f29ecd14",
+      "git-operation-request.yml": "cf33dc98e1ea73c5b072738c9a74343e0fb6ad9da1e2c7cf2b2038897ba71219",
+      "release.yml": "df0db540139487dddde6e69a1960819b57c8bc1df042f8dab8ea84607a79c689",
+      "reliability-phase0.yml": "0dfe9d8d4d9e8375c7a2cb2d3ea232531c3ce5a3da97d1da614c5f97797b516e"
+    },
+    "retained_source_review_reports": [
+      {
+        "bytes": 12249,
+        "sha256": "b527c58dcfc17a08ec970652f52e2bf154bdcf6d9b94db3e78eadec100870321",
+        "scope": "v1 source only"
+      },
+      {
+        "bytes": 7933,
+        "sha256": "dbdca2445009638ebd821654e65cf990d56c653acbba1c9b572a50f820f919de",
+        "scope": "v1.1 source addendum only"
+      }
+    ],
+    "additional_source_packets": [
+      {
+        "scope": "Reviewed ten-span HTTP candidate over H9REFERENCE; full HTTP file composed after exactepicpreimage check",
+        "bytes": 450560,
+        "sha256": "a270d4fbbaabae69e49ddf948c25eb4787c3a6e5395ec398f4b1639358f56169",
+        "candidate_sha256": "7638c3b454581c36350c0075b23db48911ab13921510223eca5d63113ff8230c"
+      },
+      {
+        "scope": "Reviewed ten-line C01 enrollment compile correction on exact274150B preimage",
+        "bytes": 134045,
+        "sha256": "1a707ec1b50eda31f99e76a304f9ba6ec986fce16102601b766f965e31cccf6d",
+        "candidate_sha256": "48527e9dd01d44d7831caed007083bfef2bd0c62a3c28aea272fe753c8dbeb36"
+      },
+      {
+        "bytes": 849920,
+        "sha256": "2b435ecc8ceced9d9ee1715a107de889daa814d9b4e38d388c6002b42d4add21",
+        "candidate_sha256": "bcb329f79def8383cc6d7f5cf633cdc45549f9a84e654002fe4b8a9274a99950",
+        "scope": "Six authored native unit leaves and fixed-entry factory gate in HTTP reserved spans7/10; source review pending"
+      }
+    ],
+    "component_reviews": [
+      {
+        "run": "163f0f7e-1586-4bed-955f-9e4bb7bcbe73",
+        "report_bytes": 11843,
+        "report_sha256": "8d252ba7223c1a3282f6c06bffee366f80eb472fd55814090ebb894bf6a0985c",
+        "scope": "Original four-file composition and eight-case harness source/profile; newidentitybindingsverifiedmechanically, no runtimecredit"
+      },
+      {
+        "run": "836faa17-0220-4763-9069-a5fed802bb5d",
+        "report_bytes": 8965,
+        "report_sha256": "d802488ef70e3b09c3478514502bfda6d70e487a6b5336cb7c0317dacbbff0e2",
+        "scope": "HTTP ten-span source/preservation only; noHTTPbehaviorqualification"
+      },
+      {
+        "run": "72dbb6e5-499c-4e19-a4bd-5e9f7075a1d2",
+        "report_request_label": "905bb769-3f64-41d6-a4aa-1b472c6b8f11",
+        "report_bytes": 6401,
+        "report_sha256": "2b285f53388471f08bbfab9c54f4c7ba20ef67ed4267a7a2ad3282abe5e47ba5",
+        "scope": "Ten-line C01 diagnostic-targeted correction only; nopostfixcompileclaim"
+      }
+    ],
+    "previous_failed_campaign": {
+      "commit": "f45b80eebea2eb64d0b4a7245d3d21baf76857ab",
+      "full_tree": "26caabf4f3370d7534e8cc097028ae21971cbb06",
+      "project_tree": "052527138d54c383f6c3580db696b42e555f7b81",
+      "tag": "refs/tags/rs69-lifecycle-05252713-v1",
+      "run_id": 40494904944,
+      "attempt": 1,
+      "result": "COMPILE_EXIT101_TEN_ERRORS_ALL8_NOT_RUN",
+      "artifact_id": 12729198738,
+      "artifact_bytes": 57929,
+      "artifact_sha256": "51a52b7fa3811cb49ff693f791a2bd22144f414068451fa446156bf00dc8820b",
+      "diagnostic_jsonl_bytes": 300324,
+      "diagnostic_jsonl_sha256": "3162659927009fde7f3eb32d0cb13d2c2e2e8df220866c8314d6cd2cced6335f",
+      "correction": "C01 componentreview above; exactsourcecorrected. No blindrerun or tagmovement."
+    },
+    "current_source_review": {
+      "status": "PENDING_RETAINED_REVIEW",
+      "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
+      "archive_bytes": 849920,
+      "archive_sha256": "2b435ecc8ceced9d9ee1715a107de889daa814d9b4e38d388c6002b42d4add21",
+      "delta": {
+        "bytes": 15875,
+        "sha256": "69b77c8ca1337219749c6f587756349a1369aec761d61c7e0d91cfedfddf6338"
+      },
+      "spans": [
+        7,
+        10
+      ],
+      "no_verdict_transfer": true
+    },
+    "previous_successful_campaign": {
+      "commit": "32c88e8030370fd6caf1f73e94d3d79a2ec87c1e",
+      "product_commit": "1b99a81ba509892b7a688dfc859933c6a76ca34f",
+      "project_tree": "0a0458ace6ea127d1b2d10febb9c8f07dd54fcac",
+      "run": 40499131247,
+      "attempt": 1,
+      "artifact_id": 12732460138,
+      "artifact_bytes": 96323,
+      "artifact_sha256": "ed47b518b782110156de18c8cba76f3e0ee8ebcb35b541858ac8f75c08effcc5",
+      "consumer_manifest_payloads_verified": 59,
+      "provider": "completed/success",
+      "selected_cases_passed": 8,
+      "binary_sha256": "50aad5cb807b87f0a3f0e95dae25d94b8aacfc4a283cedc3af2d0bfd2f24df66",
+      "credit": "Exact historical eight-case mechanism campaign only; not rerun or transferred to this new HTTP source."
+    }
+  },
+  "compile": {
+    "targets": [
+      {
+        "id": "core",
+        "package": "reposync-core",
+        "cargo_target": "reposync_core",
+        "kind": "lib",
+        "manifest_path": "crates/core/Cargo.toml",
+        "source_path": "crates/core/src/lib.rs",
+        "args": [
+          "test",
+          "--no-run",
+          "-p",
+          "reposync-core",
+          "--lib",
+          "--locked",
+          "--offline",
+          "--jobs=2",
+          "--message-format=json"
+        ],
+        "case_indexes": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ]
+      }
+    ],
+    "attempts_per_target": 1,
+    "sequence": [
+      "core"
+    ],
+    "scope": "One exact core library libtest artifact, default features plus manifest dev-dependency test-support; no reliability-fixture feature, workspace/all-targets compile, doctest or integration-test invocation",
+    "all_required_before_cases": true
+  },
+  "inventory": {
+    "args": [
+      "--list",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "required_selected_names_once": true,
+    "selected_count": 6,
+    "all_inventory_bodies_executed": false,
+    "binary_digest_checked_before_and_after": true
+  },
+  "cases": [
+    {
+      "index": 1,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l1_shared_admission_excludes_a_second_case",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 2639,
+      "acceptance": "HTTP-L1",
+      "expected_panic_message": null,
+      "effects": [
+        "One native libtest child at a time under existing outer supervision",
+        "Owned std threads, mpsc barriers, task-owned TempDir roots",
+        "UnixStream descriptor pair and fcntl(F_GETFD) observation",
+        "Deliberate retained terminal state dies with the isolated child; no test-only clearing of production latches"
+      ],
+      "special_effect": "Exactly one nested same-executable libtest child; child validates one named pass and forwards stderr. Successful child stdout is validated by source helper then discarded; outer receipt does not retain a separate raw child stdout file."
+    },
+    {
+      "index": 2,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l2_lost_observer_keeps_thread_result_and_root",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 2655,
+      "acceptance": "HTTP-L2",
+      "expected_panic_message": null,
+      "effects": [
+        "One native libtest child at a time under existing outer supervision",
+        "Owned std threads, mpsc barriers, task-owned TempDir roots",
+        "UnixStream descriptor pair and fcntl(F_GETFD) observation",
+        "Deliberate retained terminal state dies with the isolated child; no test-only clearing of production latches"
+      ],
+      "special_effect": "Exactly one nested same-executable libtest child; child validates one named pass and forwards stderr. Successful child stdout is validated by source helper then discarded; outer receipt does not retain a separate raw child stdout file."
+    },
+    {
+      "index": 3,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l3_panic_handle_stays_consumed_and_case_held",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 2685,
+      "acceptance": "HTTP-L3",
+      "expected_panic_message": "HTTP-L3 expected owned worker panic",
+      "effects": [
+        "One native libtest child at a time under existing outer supervision",
+        "Owned std threads, mpsc barriers, task-owned TempDir roots",
+        "UnixStream descriptor pair and fcntl(F_GETFD) observation",
+        "Deliberate retained terminal state dies with the isolated child; no test-only clearing of production latches"
+      ],
+      "special_effect": "Exactly one nested same-executable libtest child; child validates one named pass and forwards stderr. Successful child stdout is validated by source helper then discarded; outer receipt does not retain a separate raw child stdout file."
+    },
+    {
+      "index": 4,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l7_other_case_join_cannot_qualify",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 2708,
+      "acceptance": "HTTP-L7",
+      "expected_panic_message": null,
+      "effects": [
+        "One native libtest child at a time under existing outer supervision",
+        "Owned std threads, mpsc barriers, task-owned TempDir roots",
+        "UnixStream descriptor pair and fcntl(F_GETFD) observation",
+        "Deliberate retained terminal state dies with the isolated child; no test-only clearing of production latches"
+      ],
+      "special_effect": "Exactly one nested same-executable libtest child; child validates one named pass and forwards stderr. Successful child stdout is validated by source helper then discarded; outer receipt does not retain a separate raw child stdout file."
+    },
+    {
+      "index": 5,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l8_unbound_projection_never_calls_fixture_factory",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 2734,
+      "acceptance": "HTTP-L8",
+      "expected_panic_message": null,
+      "effects": [
+        "One native libtest child at a time under existing outer supervision",
+        "Owned std threads, mpsc barriers, task-owned TempDir roots",
+        "UnixStream descriptor pair and fcntl(F_GETFD) observation",
+        "Deliberate retained terminal state dies with the isolated child; no test-only clearing of production latches"
+      ],
+      "special_effect": "Exactly one nested same-executable libtest child; child validates one named pass and forwards stderr. Successful child stdout is validated by source helper then discarded; outer receipt does not retain a separate raw child stdout file."
+    },
+    {
+      "index": 6,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l9_aliased_descriptors_stay_owned_until_proof",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 2746,
+      "acceptance": "HTTP-L9",
+      "expected_panic_message": null,
+      "effects": [
+        "One native libtest child at a time under existing outer supervision",
+        "Owned std threads, mpsc barriers, task-owned TempDir roots",
+        "UnixStream descriptor pair and fcntl(F_GETFD) observation",
+        "Deliberate retained terminal state dies with the isolated child; no test-only clearing of production latches"
+      ],
+      "special_effect": "Exactly one nested same-executable libtest child; child validates one named pass and forwards stderr. Successful child stdout is validated by source helper then discarded; outer receipt does not retain a separate raw child stdout file."
+    }
+  ],
+  "open_gates": [
+    "Exact six-leaf source review, changed-metadata review and fresh current execution admission",
+    "issue69 whole acceptance",
+    "issue64 whole acceptance",
+    "whole H9",
+    "F01/F02/F03/F04/F05/F07/F08/F09/F10/F11 packaged qualification",
+    "projection readers and H/JH final executable identity admission",
+    "24 prior/new regressions and118plans as a complete suite",
+    "main promotion E2E/Phase0 and baseline39726272900 disposition",
+    "full real-engine catalog/live/native acceptance",
+    "merge/deploy"
+  ],
+  "acceptance_scope": {
+    "issue": 69,
+    "plan_id": "RS69-HTTP-NATIVE-NEGATIVE-SIX",
+    "requirements": [
+      {
+        "id": "HTTP-L1",
+        "requirement": "F07 and F08 contend with the same process-wide C01 context; a local HTTP owner integer cannot bypass common admission.",
+        "tests": [
+          "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l1_shared_admission_excludes_a_second_case"
+        ],
+        "qualification_limit": "Packaged F07/F08 contention and ordinary production concurrency are not newly qualified."
+      },
+      {
+        "id": "HTTP-L2",
+        "requirement": "Drop/cancel the local publication/readiness observer while a real handle is running; actual handle, result, temporary root and case exclusion remain until checked observation.",
+        "tests": [
+          "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l2_lost_observer_keeps_thread_result_and_root"
+        ],
+        "qualification_limit": "No real server/readiness child cancellation is exercised."
+      },
+      {
+        "id": "HTTP-L3",
+        "requirement": "A real panic consumes its handle once, remains terminal on repeated observation, and cannot seal or retire the case.",
+        "tests": [
+          "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l3_panic_handle_stays_consumed_and_case_held"
+        ],
+        "qualification_limit": "No terminal failure retirement is authorized or simulated."
+      },
+      {
+        "id": "HTTP-L7",
+        "requirement": "Wrong case or certificate-child proof cannot qualify the HTTP server; skipped publication/blocking/server proof keeps seal refused.",
+        "tests": [
+          "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l7_other_case_join_cannot_qualify"
+        ],
+        "qualification_limit": "Certificate-tool versus server role confusion needs an actual checked child proof from the fixed child probe."
+      },
+      {
+        "id": "HTTP-L8",
+        "requirement": "Unbound selector refuses before any temp directory/certificate/server creation; native and packaged paths retain their separate explicit semantics.",
+        "tests": [
+          "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l8_unbound_projection_never_calls_fixture_factory"
+        ],
+        "qualification_limit": "Positive validated packaged projection, metadata adversaries, actual directory/certificate/server effects and native/package partition qualification remain pending."
+      },
+      {
+        "id": "HTTP-L9",
+        "requirement": "Aliased descriptors close once; incomplete-session observation cannot fabricate skipped assertions, clear ownerless/terminal failure, launch retries, or release a foreign cohort.",
+        "tests": [
+          "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l9_aliased_descriptors_stay_owned_until_proof"
+        ],
+        "qualification_limit": "Positive exactly-once close after full genuine publication/server/blocking proof, observer no-retry checks and terminal/ownerless retirement adversaries remain open."
+      }
+    ],
+    "closure": "Six native negative leaves only. L7/L9 partial; L4-L6 and packaged projection open. No whole issue69/H9 closure.",
+    "automatic_issue_close": false,
+    "issue112": "Complete; no repeat of its19-case campaign",
+    "previous_eight_case_cycle": "Complete PASS on old product0a0458ac; not selected or repeated",
+    "route": "Same qualified hosted50-minute VM; one offline core-lib compile, inventory and six sequential one-minute native steps under unchanged per-process limits. Fresh source/profile review and execution admission still required."
+  },
+  "HTTP_regression_obligations": {
+    "state": "SIX_NATIVE_LEAVES_AUTHORED_UNCOMPILED_UNRUN_NOT_TEN_CASE_INVENTORY",
+    "cases": [
+      {
+        "authored_or_preserved": "A real HTTP boundary excludes common C01 admission; dropping an empty completed boundary permits a new, distinct common identity.",
+        "new_test": {
+          "exact_test_name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l1_shared_admission_excludes_a_second_case",
+          "intentional_worker_panic": false,
+          "leaf": "http_l1_shared_admission_excludes_a_second_case",
+          "line": 2639,
+          "status": "AUTHORED SOURCE; UNCOMPILED/UNRUN",
+          "tier": "native unit negative, not packaged catalogue proof"
+        },
+        "obligation": "HTTP-L1",
+        "regression_sensitivity": "Bypass shared admission: the expected common-gate refusal assertion fails.",
+        "remaining": "Packaged F07/F08 contention and ordinary production concurrency are not newly qualified.",
+        "required_verbatim": "F07 and F08 contend with the same process-wide C01 context; a local HTTP owner integer cannot bypass common admission.",
+        "status": "NATIVE UNIT SOURCE AUTHORED; UNCOMPILED/UNRUN"
+      },
+      {
+        "authored_or_preserved": "Drop a local observer of a real blocked thread; typed registry/root survive, actual original result is joined, and root removal is explicit.",
+        "new_test": {
+          "exact_test_name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l2_lost_observer_keeps_thread_result_and_root",
+          "intentional_worker_panic": false,
+          "leaf": "http_l2_lost_observer_keeps_thread_result_and_root",
+          "line": 2655,
+          "status": "AUTHORED SOURCE; UNCOMPILED/UNRUN",
+          "tier": "native unit negative, not packaged catalogue proof"
+        },
+        "obligation": "HTTP-L2",
+        "regression_sensitivity": "Detach/drop actual thread resource/root or lose result: registry cardinality, Weak root or exact value assertions fail.",
+        "remaining": "No real server/readiness child cancellation is exercised.",
+        "required_verbatim": "Drop/cancel the local publication/readiness observer while a real handle is running; actual handle, result, temporary root and case exclusion remain until checked observation.",
+        "status": "NATIVE UNIT SOURCE AUTHORED; UNCOMPILED/UNRUN"
+      },
+      {
+        "authored_or_preserved": "A real worker panic consumes the join handle once; repeated observation returns the same terminal error and common admission remains held.",
+        "new_test": {
+          "exact_test_name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l3_panic_handle_stays_consumed_and_case_held",
+          "intentional_worker_panic": true,
+          "leaf": "http_l3_panic_handle_stays_consumed_and_case_held",
+          "line": 2685,
+          "status": "AUTHORED SOURCE; UNCOMPILED/UNRUN",
+          "tier": "native unit negative, not packaged catalogue proof"
+        },
+        "obligation": "HTTP-L3",
+        "regression_sensitivity": "Repoll/recreate the panic handle, clear the error or release context: retained-state and repeated-error assertions fail.",
+        "remaining": "No terminal failure retirement is authorized or simulated.",
+        "required_verbatim": "A real panic consumes its handle once, remains terminal on repeated observation, and cannot seal or retire the case.",
+        "status": "NATIVE UNIT SOURCE AUTHORED; UNCOMPILED/UNRUN"
+      },
+      {
+        "authored_or_preserved": "No new executable test covers child/group observation failures.",
+        "obligation": "HTTP-L4",
+        "regression_sensitivity": "Future tests must refuse proof and retain actual child/root/context, including after leader exit. Host global process absence is insufficient.",
+        "remaining": "Fixed child probe plus controlled test-only OS-observation error interface is needed: reaped leader/live same-group child; unknown group observation; signal/wait failure; cleanup timeout.",
+        "required_verbatim": "Reaped leader with live descendant, unknown /proc observation, signal/wait error and cleanup timeout all refuse server completion and retain resources.",
+        "status": "NOT AUTHORED"
+      },
+      {
+        "authored_or_preserved": "No new executable test covers premature server exit.",
+        "obligation": "HTTP-L5",
+        "regression_sensitivity": "Future assertion requires the original nonzero failure to survive stop/observation.",
+        "remaining": "Fixed child probe must exit nonzero before stop; completion must retain actual failure/status rather than Drop-to-Ok.",
+        "required_verbatim": "Server exits nonzero before requested stop; completion conveys failure rather than Drop-to-Ok.",
+        "status": "NOT AUTHORED"
+      },
+      {
+        "authored_or_preserved": "No new executable test covers malformed readiness or failed/timed-out certificate tool.",
+        "obligation": "HTTP-L6",
+        "regression_sensitivity": "Future tests require failed initialization, actual retained handles/root and no fabricated server-completion proof.",
+        "remaining": "Fixed server probe/readiness seam; existing real OpenSSL invalid-argument failure can be used only after tool admission; timeout needs a finite fixed held-tool probe.",
+        "required_verbatim": "Missing/malformed readiness and failed/timed-out OpenSSL helper keep owned resources/root and cannot claim successful fixture initialization.",
+        "status": "NOT AUTHORED"
+      },
+      {
+        "authored_or_preserved": "Actual joined publication proof from another case is refused; missing publication/blocking/server proof cannot seal.",
+        "new_test": {
+          "exact_test_name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l7_other_case_join_cannot_qualify",
+          "intentional_worker_panic": false,
+          "leaf": "http_l7_other_case_join_cannot_qualify",
+          "line": 2708,
+          "status": "AUTHORED SOURCE; UNCOMPILED/UNRUN",
+          "tier": "native unit negative, not packaged catalogue proof"
+        },
+        "obligation": "HTTP-L7",
+        "regression_sensitivity": "Accept foreign proof or synthesize missing blocking proof: expected owner/seal refusal assertions fail.",
+        "remaining": "Certificate-tool versus server role confusion needs an actual checked child proof from the fixed child probe.",
+        "required_verbatim": "Wrong case or certificate-child proof cannot qualify the HTTP server; skipped publication/blocking/server proof keeps seal refused.",
+        "status": "PARTIAL NATIVE UNIT SOURCE AUTHORED; UNCOMPILED/UNRUN"
+      },
+      {
+        "authored_or_preserved": "The real packaged call now uses a fixed-entry factory gate; unchanged unbound selector refuses and the supplied fixture factory remains uncalled. Parent and child native unit modes explicitly refuse a packaged channel.",
+        "new_test": {
+          "exact_test_name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l8_unbound_projection_never_calls_fixture_factory",
+          "intentional_worker_panic": false,
+          "leaf": "http_l8_unbound_projection_never_calls_fixture_factory",
+          "line": 2734,
+          "status": "AUTHORED SOURCE; UNCOMPILED/UNRUN",
+          "tier": "native unit negative, not packaged catalogue proof"
+        },
+        "obligation": "HTTP-L8",
+        "regression_sensitivity": "Invoke the fixture factory despite selector failure: the call flag or expected error assertion fails.",
+        "remaining": "Positive validated packaged projection, metadata adversaries, actual directory/certificate/server effects and native/package partition qualification remain pending.",
+        "required_verbatim": "Unbound selector refuses before any temp directory/certificate/server creation; native and packaged paths retain their separate explicit semantics.",
+        "status": "NATIVE EARLY-REFUSAL SOURCE AUTHORED; UNCOMPILED/UNRUN"
+      },
+      {
+        "authored_or_preserved": "A real aliased Unix FD is retained once; missing-proof or foreign-owner release is refused and FD/root/context remain owned.",
+        "new_test": {
+          "exact_test_name": "pair_refresh::publication::http_tests::packaged_call_site::http_lifecycle_negative_tests::http_l9_aliased_descriptors_stay_owned_until_proof",
+          "intentional_worker_panic": false,
+          "leaf": "http_l9_aliased_descriptors_stay_owned_until_proof",
+          "line": 2746,
+          "status": "AUTHORED SOURCE; UNCOMPILED/UNRUN",
+          "tier": "native unit negative, not packaged catalogue proof"
+        },
+        "obligation": "HTTP-L9",
+        "regression_sensitivity": "Duplicate alias or close on refused/foreign release: exact retained FD vector or fcntl/root/context assertions fail.",
+        "remaining": "Positive exactly-once close after full genuine publication/server/blocking proof, observer no-retry checks and terminal/ownerless retirement adversaries remain open.",
+        "required_verbatim": "Aliased descriptors close once; incomplete-session observation cannot fabricate skipped assertions, clear ownerless/terminal failure, launch retries, or release a foreign cohort.",
+        "status": "PARTIAL NATIVE UNIT SOURCE AUTHORED; UNCOMPILED/UNRUN"
+      },
+      {
+        "authored_or_preserved": "Existing native HTTP and HTTPS advertisement tests and three protected assertion excerpts are unchanged.",
+        "existing_native_tests": [
+          "pair_refresh::publication::http_tests::http_advertisement_race",
+          "pair_refresh::publication::http_tests::https_advertisement_race"
+        ],
+        "obligation": "HTTP-L10",
+        "regression_sensitivity": "Protected assertion byte excerpts are checked; behavioral equivalence still needs actual execution evidence.",
+        "remaining": "The two native cases need their own admitted exact profile; packaged F07/F08 additionally needs the validated projection. Neither is inferred from the previous 8/8.",
+        "required_verbatim": "Preserve actual HTTP/HTTPS advertisement race outcomes, exact receiver/audit/witness interpretation, and all native TLS/auth/redirect assertion coverage.",
+        "status": "PRESERVED SOURCE; NOT RUN BY THIS CHANGE"
+      }
+    ],
+    "fixture_projection_admission": "No Git/SVN/Python/OpenSSL/HTTP fixture admitted by this profile; positive packaged projection remains unbound/refused.",
+    "L4_L5_L6": "NOT_AUTHORED_OPEN_REQUIRES_EXACT_NEW_SOURCE_RESERVATION_AND_FIXTURE_ADMISSION",
+    "L7_L9": "PARTIAL_NEGATIVES_ONLY",
+    "L10": "PRESERVED_SOURCE_NOT_SELECTED",
+    "historical24_and118": "Not recounted or accepted as a whole by this six-case selection."
+  }
+}
