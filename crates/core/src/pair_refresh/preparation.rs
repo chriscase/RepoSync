@@ -432,7 +432,9 @@ fn review_registration(
         || registration.scoped_git_checkpoint.as_deref() != Some(input.commit.as_str())
         || registration.scoped_svn_checkpoint.as_deref() != Some(svn_revision.to_string().as_str())
     {
-        return Err(review_error("contradictory registration/checkpoint metadata"));
+        return Err(review_error(
+            "contradictory registration/checkpoint metadata",
+        ));
     }
     Ok(())
 }
@@ -516,7 +518,9 @@ fn review_inputs(inputs: &ChangedChildReviewInputs) -> Result<(), GitError> {
         .as_deref()
         .is_some_and(|digest| !review_sha256(digest))
     {
-        return Err(review_error("malformed actor or credential context metadata"));
+        return Err(review_error(
+            "malformed actor or credential context metadata",
+        ));
     }
     Ok(())
 }
@@ -532,7 +536,9 @@ fn review_tree_entries(
     while let Some((prefix, id)) = pending.pop() {
         let tree = repo.find_tree(id)?;
         if !prefix.is_empty() && tree.is_empty() {
-            return Err(review_error("empty subtree has unsupported SVN directory semantics"));
+            return Err(review_error(
+                "empty subtree has unsupported SVN directory semantics",
+            ));
         }
         for entry in &tree {
             let name = entry.name().ok_or_else(|| review_error("non-UTF8 path"))?;
@@ -571,7 +577,9 @@ fn review_side(repo: &Repository, tip: Oid, baseline: Oid) -> Result<(), GitErro
     while current != baseline {
         let commit = repo.find_commit(current)?;
         if commit.parent_count() != 1 || count >= MAX_PARENT_ADVANCE {
-            return Err(review_error("nonlinear, unrelated or oversized review history"));
+            return Err(review_error(
+                "nonlinear, unrelated or oversized review history",
+            ));
         }
         review_tree_entries(repo, commit.tree_id())?;
         current = commit.parent_id(0)?;
@@ -672,7 +680,10 @@ fn review_unverified(context: &ChangedChildReviewContext) -> Vec<String> {
             context.baseline_evidence.is_none(),
             "baseline_evidence_missing",
         ),
-        (context.actor_policy.is_none(), "actor_policy_metadata_missing"),
+        (
+            context.actor_policy.is_none(),
+            "actor_policy_metadata_missing",
+        ),
         (
             context.credential_context_digest.is_none(),
             "credential_context_metadata_missing",
@@ -727,9 +738,18 @@ pub fn inspect_changed_child_review(
     let mut parent_changes = Vec::new();
     let mut unresolved = false;
     for path in names {
-        let baseline = base.get(&path).cloned().unwrap_or(ChangedChildEntry::Absent {});
-        let child = child.get(&path).cloned().unwrap_or(ChangedChildEntry::Absent {});
-        let parent = parent.get(&path).cloned().unwrap_or(ChangedChildEntry::Absent {});
+        let baseline = base
+            .get(&path)
+            .cloned()
+            .unwrap_or(ChangedChildEntry::Absent {});
+        let child = child
+            .get(&path)
+            .cloned()
+            .unwrap_or(ChangedChildEntry::Absent {});
+        let parent = parent
+            .get(&path)
+            .cloned()
+            .unwrap_or(ChangedChildEntry::Absent {});
         if child != baseline {
             child_changes.push(path.clone());
         }
@@ -825,7 +845,9 @@ pub fn resolve_changed_child_review(
     for path in &mut paths {
         match &path.disposition {
             ChangedChildDisposition::Refused { .. } => {
-                return Err(review_error("unsupported topology cannot be resolved by side choice"));
+                return Err(review_error(
+                    "unsupported topology cannot be resolved by side choice",
+                ));
             }
             ChangedChildDisposition::Conflict => {
                 let choice = choices
@@ -835,7 +857,9 @@ pub fn resolve_changed_child_review(
                     || choice.child != path.child
                     || choice.parent != path.parent
                 {
-                    return Err(review_error("resolution triple differs from current conflict"));
+                    return Err(review_error(
+                        "resolution triple differs from current conflict",
+                    ));
                 }
                 let entry = match choice.choice {
                     ChangedChildChoice::Base => path.baseline.clone(),
@@ -848,7 +872,9 @@ pub fn resolve_changed_child_review(
         }
     }
     if !choices.is_empty() {
-        return Err(review_error("resolution names an unknown or non-conflict path"));
+        return Err(review_error(
+            "resolution names an unknown or non-conflict path",
+        ));
     }
     let mut choices = resolution.choices.clone();
     choices.sort_by(|left, right| left.path.cmp(&right.path));

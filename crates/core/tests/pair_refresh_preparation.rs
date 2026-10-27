@@ -439,14 +439,19 @@ mod changed_child_review {
         let mut directories: BTreeMap<&str, Vec<File<'_>>> = BTreeMap::new();
         for &(path, bytes, mode) in files {
             if let Some((directory, tail)) = path.split_once('/') {
-                directories.entry(directory).or_default().push((tail, bytes, mode));
+                directories
+                    .entry(directory)
+                    .or_default()
+                    .push((tail, bytes, mode));
             } else {
                 let blob = repo.blob(bytes).unwrap();
                 builder.insert(path, blob, mode).unwrap();
             }
         }
         for (name, children) in directories {
-            builder.insert(name, write_tree(repo, &children), 0o040000).unwrap();
+            builder
+                .insert(name, write_tree(repo, &children), 0o040000)
+                .unwrap();
         }
         builder.write().unwrap()
     }
@@ -490,10 +495,22 @@ mod changed_child_review {
                 Repository::init(directory.path()).unwrap()
             };
             let baseline = commit(&repo, write_tree(&repo, base), &[], "review baseline");
-            let child = commit(&repo, write_tree(&repo, child), &[baseline], "child advance");
-            let parent = commit(&repo, write_tree(&repo, parent), &[baseline], "parent advance");
-            repo.reference("refs/heads/child", child, false, "fixture").unwrap();
-            repo.reference("refs/heads/parent", parent, false, "fixture").unwrap();
+            let child = commit(
+                &repo,
+                write_tree(&repo, child),
+                &[baseline],
+                "child advance",
+            );
+            let parent = commit(
+                &repo,
+                write_tree(&repo, parent),
+                &[baseline],
+                "parent advance",
+            );
+            repo.reference("refs/heads/child", child, false, "fixture")
+                .unwrap();
+            repo.reference("refs/heads/parent", parent, false, "fixture")
+                .unwrap();
             let inputs = ChangedChildReviewInputs {
                 schema: 1,
                 policy: CHANGED_CHILD_REVIEW_POLICY.into(),
@@ -501,8 +518,18 @@ mod changed_child_review {
                 child: role(&repo, child),
                 parent: role(&repo, parent),
                 context: ChangedChildReviewContext {
-                    child: registration("child", "11111111-1111-4111-8111-111111111111", &child.to_string(), 2),
-                    parent: registration("parent", "22222222-2222-4222-8222-222222222222", &parent.to_string(), 3),
+                    child: registration(
+                        "child",
+                        "11111111-1111-4111-8111-111111111111",
+                        &child.to_string(),
+                        2,
+                    ),
+                    parent: registration(
+                        "parent",
+                        "22222222-2222-4222-8222-222222222222",
+                        &parent.to_string(),
+                        3,
+                    ),
                     git_remote_url: "https://git.example.invalid/repo.git".into(),
                     child_git_branch: "child".into(),
                     parent_git_branch: "parent".into(),
@@ -530,7 +557,11 @@ mod changed_child_review {
                     },
                 },
             };
-            Self { directory, repo, inputs }
+            Self {
+                directory,
+                repo,
+                inputs,
+            }
         }
 
         fn conflict() -> Self {
@@ -558,14 +589,16 @@ mod changed_child_review {
             policy: CHANGED_CHILD_REVIEW_POLICY.into(),
             inputs: manifest.inputs.clone(),
             manifest_digest: manifest.manifest_digest.clone(),
-            choices: manifest.paths.iter()
+            choices: manifest
+                .paths
+                .iter()
                 .filter(|path| matches!(path.disposition, ChangedChildDisposition::Conflict))
                 .map(|path| ChangedChildConflictChoice {
-                        path: path.path.clone(),
-                        baseline: path.baseline.clone(),
-                        child: path.child.clone(),
-                        parent: path.parent.clone(),
-                        choice: ChangedChildChoice::Child,
+                    path: path.path.clone(),
+                    baseline: path.baseline.clone(),
+                    child: path.child.clone(),
+                    parent: path.parent.clone(),
+                    choice: ChangedChildChoice::Child,
                 })
                 .collect(),
         }
@@ -580,7 +613,10 @@ mod changed_child_review {
                 if metadata.is_dir() {
                     visit(root, &path, files);
                 } else {
-                    files.insert(path.strip_prefix(root).unwrap().into(), std::fs::read(&path).unwrap());
+                    files.insert(
+                        path.strip_prefix(root).unwrap().into(),
+                        std::fs::read(&path).unwrap(),
+                    );
                 }
             }
         }
@@ -597,7 +633,10 @@ mod changed_child_review {
             &[("a", b"parent", 0o100644)],
         );
         let manifest = clean.inspect();
-        assert_eq!(manifest.candidate_tree.as_deref(), Some(clean.inputs.parent.tree.as_str()));
+        assert_eq!(
+            manifest.candidate_tree.as_deref(),
+            Some(clean.inputs.parent.tree.as_str())
+        );
         assert!(manifest.child_changes.is_empty());
         assert_eq!(manifest.parent_changes, ["a"]);
         let changed = Scenario::conflict();
@@ -607,7 +646,9 @@ mod changed_child_review {
             parent_baseline_tip: changed.inputs.baseline.commit.clone(),
         };
         let before = snapshot(changed.directory.path());
-        assert!(prepare_clean_child_git(&changed.repo, &pins, uuid::Uuid::from_u128(42), 1).is_err());
+        assert!(
+            prepare_clean_child_git(&changed.repo, &pins, uuid::Uuid::from_u128(42), 1).is_err()
+        );
         assert_eq!(before, snapshot(changed.directory.path()));
     }
 
@@ -616,13 +657,19 @@ mod changed_child_review {
         let s = Scenario::new(
             &[("old", b"base", 0o100644)],
             &[("old", b"base", 0o100644), ("foo/z", b"child", 0o100755)],
-            &[("old", b"parent", 0o100644), ("foo.bar", b"parent add", 0o100644)],
+            &[
+                ("old", b"parent", 0o100644),
+                ("foo.bar", b"parent add", 0o100644),
+            ],
         );
-        let expected = write_tree(&s.repo, &[
-            ("old", b"parent", 0o100644),
-            ("foo/z", b"child", 0o100755),
-            ("foo.bar", b"parent add", 0o100644),
-        ]);
+        let expected = write_tree(
+            &s.repo,
+            &[
+                ("old", b"parent", 0o100644),
+                ("foo/z", b"child", 0o100755),
+                ("foo.bar", b"parent add", 0o100644),
+            ],
+        );
         let before = snapshot(s.directory.path());
         let manifest = s.inspect();
         assert_eq!(manifest.candidate_tree, Some(expected.to_string()));
@@ -634,7 +681,11 @@ mod changed_child_review {
 
     #[test]
     fn identical_changes_still_record_each_side_delta() {
-        let s = Scenario::new(&[], &[("new", b"same", 0o100644)], &[("new", b"same", 0o100644)]);
+        let s = Scenario::new(
+            &[],
+            &[("new", b"same", 0o100644)],
+            &[("new", b"same", 0o100644)],
+        );
         let manifest = s.inspect();
         assert_eq!(manifest.child_changes, ["new"]);
         assert_eq!(manifest.parent_changes, ["new"]);
@@ -645,10 +696,26 @@ mod changed_child_review {
     #[test]
     fn opaque_overlap_conflicts_include_modes_absence_and_exact_triples() {
         let cases: Vec<TreeCase<'_>> = vec![
-            (vec![("a", b"base", 0o100644)], vec![("a", b"child", 0o100644)], vec![("a", b"parent", 0o100644)]),
-            (vec![], vec![("a", b"child", 0o100644)], vec![("a", b"parent", 0o100644)]),
-            (vec![("a", b"base", 0o100644)], vec![], vec![("a", b"parent", 0o100644)]),
-            (vec![("a", b"base", 0o100644)], vec![("a", b"child", 0o100644)], vec![("a", b"base", 0o100755)]),
+            (
+                vec![("a", b"base", 0o100644)],
+                vec![("a", b"child", 0o100644)],
+                vec![("a", b"parent", 0o100644)],
+            ),
+            (
+                vec![],
+                vec![("a", b"child", 0o100644)],
+                vec![("a", b"parent", 0o100644)],
+            ),
+            (
+                vec![("a", b"base", 0o100644)],
+                vec![],
+                vec![("a", b"parent", 0o100644)],
+            ),
+            (
+                vec![("a", b"base", 0o100644)],
+                vec![("a", b"child", 0o100644)],
+                vec![("a", b"base", 0o100755)],
+            ),
         ];
         for (base, child, parent) in cases {
             let s = Scenario::new(&base, &child, &parent);
@@ -656,7 +723,10 @@ mod changed_child_review {
             assert!(manifest.candidate_tree.is_none());
             assert_eq!(manifest.paths.len(), 1);
             let path = &manifest.paths[0];
-            assert!(matches!(path.disposition, ChangedChildDisposition::Conflict));
+            assert!(matches!(
+                path.disposition,
+                ChangedChildDisposition::Conflict
+            ));
             assert_ne!(path.child, path.parent);
             assert_ne!(path.child, path.baseline);
             assert_ne!(path.parent, path.baseline);
@@ -691,9 +761,12 @@ mod changed_child_review {
         let before = snapshot(s.directory.path());
         let result = resolve_changed_child_review(&s.repo, &s.inputs, &choice).unwrap();
         assert_eq!(result.candidate_tree, s.inputs.parent.tree);
-        assert_eq!(result.paths[0].disposition, ChangedChildDisposition::Selected {
-            entry: manifest.paths[0].parent.clone(),
-        });
+        assert_eq!(
+            result.paths[0].disposition,
+            ChangedChildDisposition::Selected {
+                entry: manifest.paths[0].parent.clone(),
+            }
+        );
         assert_eq!(before, snapshot(s.directory.path()));
     }
 
@@ -708,7 +781,10 @@ mod changed_child_review {
         let mut choice = resolution(&manifest);
         let first = resolve_changed_child_review(&s.repo, &s.inputs, &choice).unwrap();
         choice.choices.reverse();
-        assert_eq!(first, resolve_changed_child_review(&s.repo, &s.inputs, &choice).unwrap());
+        assert_eq!(
+            first,
+            resolve_changed_child_review(&s.repo, &s.inputs, &choice).unwrap()
+        );
         assert_eq!(first.original_manifest_digest, manifest.manifest_digest);
         assert_eq!(first.paths[0].baseline, manifest.paths[0].baseline);
         choice.choices[0].choice = ChangedChildChoice::Parent;
@@ -722,7 +798,12 @@ mod changed_child_review {
         let mut s = Scenario::conflict();
         let choice = resolution(&s.inspect());
         let old = Oid::from_str(&s.inputs.child.commit).unwrap();
-        let id = commit(&s.repo, Oid::from_str(&s.inputs.child.tree).unwrap(), &[old], "child history drift");
+        let id = commit(
+            &s.repo,
+            Oid::from_str(&s.inputs.child.tree).unwrap(),
+            &[old],
+            "child history drift",
+        );
         s.set_child(id);
         let error = resolve_changed_child_review(&s.repo, &s.inputs, &choice).unwrap_err();
         assert!(error.to_string().contains("stale resolution identity"));
@@ -740,18 +821,47 @@ mod changed_child_review {
             |i| i.context.svn.repository_root_url = "https://svn.example.invalid/other".into(),
             |i| i.context.svn.child_path = "/branches/other".into(),
             |i| i.context.svn.inspected_head_revision += 1,
-            |i| { i.context.svn.child_revision = 3; i.context.child.last_svn_rev = 3; i.context.child.scoped_svn_checkpoint = Some("3".into()); },
-            |i| i.context.baseline_evidence = Some(ChangedChildEvidence { reference: "receipt-1".into(), sha256: "c".repeat(64) }),
-            |i| i.context.svn.lineage_evidence = Some(ChangedChildEvidence { reference: "lineage-1".into(), sha256: "d".repeat(64) }),
-            |i| i.context.svn.property_evidence = Some(ChangedChildEvidence { reference: "props-1".into(), sha256: "e".repeat(64) }),
+            |i| {
+                i.context.svn.child_revision = 3;
+                i.context.child.last_svn_rev = 3;
+                i.context.child.scoped_svn_checkpoint = Some("3".into());
+            },
+            |i| {
+                i.context.baseline_evidence = Some(ChangedChildEvidence {
+                    reference: "receipt-1".into(),
+                    sha256: "c".repeat(64),
+                })
+            },
+            |i| {
+                i.context.svn.lineage_evidence = Some(ChangedChildEvidence {
+                    reference: "lineage-1".into(),
+                    sha256: "d".repeat(64),
+                })
+            },
+            |i| {
+                i.context.svn.property_evidence = Some(ChangedChildEvidence {
+                    reference: "props-1".into(),
+                    sha256: "e".repeat(64),
+                })
+            },
             |i| i.context.credential_context_digest = Some("f".repeat(64)),
-            |i| i.context.actor_policy = Some(RefreshActorPolicyPin { version: 2, actor_id: "actor".into(), session_context_digest: "b".repeat(64), policy_context_digest: "c".repeat(64) }),
+            |i| {
+                i.context.actor_policy = Some(RefreshActorPolicyPin {
+                    version: 2,
+                    actor_id: "actor".into(),
+                    session_context_digest: "b".repeat(64),
+                    policy_context_digest: "c".repeat(64),
+                })
+            },
         ];
         for mutate in mutations {
             let mut current = s.inputs.clone();
             mutate(&mut current);
             let error = resolve_changed_child_review(&s.repo, &current, &choice).unwrap_err();
-            assert!(error.to_string().contains("stale resolution identity"), "{error}");
+            assert!(
+                error.to_string().contains("stale resolution identity"),
+                "{error}"
+            );
         }
     }
 
@@ -761,13 +871,22 @@ mod changed_child_review {
         let original = resolution(&s.inspect());
         let mut invalid = original.clone();
         invalid.choices.push(invalid.choices[0].clone());
-        assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid).unwrap_err().to_string().contains("duplicate"));
+        assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
         invalid = original.clone();
         invalid.choices.clear();
-        assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid).unwrap_err().to_string().contains("missing conflict"));
+        assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("missing conflict"));
         invalid = original.clone();
         invalid.choices[0].child = ChangedChildEntry::Absent {};
-        assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid).unwrap_err().to_string().contains("triple differs"));
+        assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("triple differs"));
         invalid = original.clone();
         invalid.choices[0].path = "foreign".into();
         assert!(resolve_changed_child_review(&s.repo, &s.inputs, &invalid).is_err());
@@ -784,23 +903,53 @@ mod changed_child_review {
         let manifest = clean.inspect();
         let mut invalid = resolution(&manifest);
         let path = &manifest.paths[0];
-        invalid.choices.push(ChangedChildConflictChoice { path: path.path.clone(), baseline: path.baseline.clone(), child: path.child.clone(), parent: path.parent.clone(), choice: ChangedChildChoice::Parent });
-        assert!(resolve_changed_child_review(&clean.repo, &clean.inputs, &invalid).unwrap_err().to_string().contains("non-conflict"));
+        invalid.choices.push(ChangedChildConflictChoice {
+            path: path.path.clone(),
+            baseline: path.baseline.clone(),
+            child: path.child.clone(),
+            parent: path.parent.clone(),
+            choice: ChangedChildChoice::Parent,
+        });
+        assert!(
+            resolve_changed_child_review(&clean.repo, &clean.inputs, &invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("non-conflict")
+        );
     }
 
     #[test]
     fn strict_wire_schema_refuses_unknown_duplicate_and_malformed_fields() {
         let s = Scenario::conflict();
         let encoded = serde_json::to_value(resolution(&s.inspect())).unwrap();
-        for pointer in ["", "/inputs", "/inputs/context", "/inputs/context/projection", "/inputs/context/child", "/choices/0", "/choices/0/child"] {
+        for pointer in [
+            "",
+            "/inputs",
+            "/inputs/context",
+            "/inputs/context/projection",
+            "/inputs/context/child",
+            "/choices/0",
+            "/choices/0/child",
+        ] {
             let mut bad = encoded.clone();
-            bad.pointer_mut(pointer).unwrap().as_object_mut().unwrap().insert("unknown".into(), true.into());
-            assert!(serde_json::from_value::<ChangedChildResolution>(bad).is_err(), "{pointer}");
+            bad.pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unknown".into(), true.into());
+            assert!(
+                serde_json::from_value::<ChangedChildResolution>(bad).is_err(),
+                "{pointer}"
+            );
         }
         let raw = serde_json::to_string(&encoded).unwrap();
         let duplicate = format!("{{\"schema\":1,{}", &raw[1..]);
         assert!(serde_json::from_str::<ChangedChildResolution>(&duplicate).is_err());
-        for replacement in [serde_json::json!("Other"), serde_json::json!(true), serde_json::Value::Null] {
+        for replacement in [
+            serde_json::json!("Other"),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
             let mut bad = encoded.clone();
             bad["choices"][0]["choice"] = replacement;
             assert!(serde_json::from_value::<ChangedChildResolution>(bad).is_err());
@@ -818,15 +967,28 @@ mod changed_child_review {
     #[test]
     fn topology_conflicts_cannot_be_resolved_by_choosing_a_blob() {
         let cases: Vec<TreeCase<'_>> = vec![
-            (vec![], vec![("x", b"file", 0o100644)], vec![("x/y", b"nested", 0o100644)]),
-            (vec![("x/a", b"base", 0o100644)], vec![], vec![("x/a", b"base", 0o100644), ("x/b", b"new", 0o100644)]),
+            (
+                vec![],
+                vec![("x", b"file", 0o100644)],
+                vec![("x/y", b"nested", 0o100644)],
+            ),
+            (
+                vec![("x/a", b"base", 0o100644)],
+                vec![],
+                vec![("x/a", b"base", 0o100644), ("x/b", b"new", 0o100644)],
+            ),
         ];
         for (base, child, parent) in cases {
             let s = Scenario::new(&base, &child, &parent);
             let manifest = s.inspect();
             assert!(manifest.candidate_tree.is_none());
-            assert!(manifest.paths.iter().any(|p| matches!(p.disposition, ChangedChildDisposition::Refused { .. })));
-            assert!(resolve_changed_child_review(&s.repo, &s.inputs, &resolution(&manifest)).is_err());
+            assert!(manifest
+                .paths
+                .iter()
+                .any(|p| matches!(p.disposition, ChangedChildDisposition::Refused { .. })));
+            assert!(
+                resolve_changed_child_review(&s.repo, &s.inputs, &resolution(&manifest)).is_err()
+            );
         }
     }
 
@@ -835,7 +997,11 @@ mod changed_child_review {
         let bad: Vec<File<'_>> = vec![
             ("bad name", b"bytes", 0o100644),
             ("link", b"target", 0o120000),
-            ("pointer", b"version https://git-lfs.github.com/spec/v1\noid sha256:0000\nsize 1\n", 0o100644),
+            (
+                "pointer",
+                b"version https://git-lfs.github.com/spec/v1\noid sha256:0000\nsize 1\n",
+                0o100644,
+            ),
             (".gitattributes", b"*.dat filter=custom\n", 0o100644),
         ];
         for file in bad {
@@ -849,8 +1015,18 @@ mod changed_child_review {
     #[test]
     fn intermediate_unsupported_child_content_is_not_hidden_by_deletion() {
         let mut s = Scenario::conflict();
-        let bad = commit(&s.repo, write_tree(&s.repo, &[(".gitattributes", b"* filter=custom", 0o100644)]), &[Oid::from_str(&s.inputs.child.commit).unwrap()], "temporary attributes");
-        let clean = commit(&s.repo, Oid::from_str(&s.inputs.child.tree).unwrap(), &[bad], "delete attributes");
+        let bad = commit(
+            &s.repo,
+            write_tree(&s.repo, &[(".gitattributes", b"* filter=custom", 0o100644)]),
+            &[Oid::from_str(&s.inputs.child.commit).unwrap()],
+            "temporary attributes",
+        );
+        let clean = commit(
+            &s.repo,
+            Oid::from_str(&s.inputs.child.tree).unwrap(),
+            &[bad],
+            "delete attributes",
+        );
         s.set_child(clean);
         assert!(inspect_changed_child_review(&s.repo, &s.inputs).is_err());
     }
@@ -863,7 +1039,12 @@ mod changed_child_review {
         s.set_child(unrelated);
         assert!(inspect_changed_child_review(&s.repo, &s.inputs).is_err());
         let baseline = Oid::from_str(&s.inputs.baseline.commit).unwrap();
-        let nonlinear = commit(&s.repo, same_tree, &[baseline, unrelated], "nonlinear child");
+        let nonlinear = commit(
+            &s.repo,
+            same_tree,
+            &[baseline, unrelated],
+            "nonlinear child",
+        );
         s.set_child(nonlinear);
         assert!(inspect_changed_child_review(&s.repo, &s.inputs).is_err());
     }
@@ -874,7 +1055,10 @@ mod changed_child_review {
         let before = snapshot(s.directory.path());
         let mut bad = s.inputs.clone();
         bad.child.tree = bad.parent.tree.clone();
-        assert!(inspect_changed_child_review(&s.repo, &bad).unwrap_err().to_string().contains("commit/tree pin"));
+        assert!(inspect_changed_child_review(&s.repo, &bad)
+            .unwrap_err()
+            .to_string()
+            .contains("commit/tree pin"));
         bad = s.inputs.clone();
         bad.child.commit = "0".repeat(40);
         bad.context.child.last_git_sha = bad.child.commit.clone();
@@ -882,12 +1066,18 @@ mod changed_child_review {
         assert!(inspect_changed_child_review(&s.repo, &bad).is_err());
         bad = s.inputs.clone();
         bad.context.projection.allowed_paths.push("a".into());
-        assert!(inspect_changed_child_review(&s.repo, &bad).unwrap_err().to_string().contains("projection"));
+        assert!(inspect_changed_child_review(&s.repo, &bad)
+            .unwrap_err()
+            .to_string()
+            .contains("projection"));
         bad = s.inputs.clone();
         bad.context.child.scoped_git_checkpoint = None;
         assert!(inspect_changed_child_review(&s.repo, &bad).is_err());
         bad = s.inputs.clone();
-        bad.context.baseline_evidence = Some(ChangedChildEvidence { reference: "receipt".into(), sha256: "bad".into() });
+        bad.context.baseline_evidence = Some(ChangedChildEvidence {
+            reference: "receipt".into(),
+            sha256: "bad".into(),
+        });
         assert!(inspect_changed_child_review(&s.repo, &bad).is_err());
         assert_eq!(before, snapshot(s.directory.path()));
     }
@@ -897,14 +1087,24 @@ mod changed_child_review {
         for overlay in ["shallow", "info/grafts", "replace"] {
             let s = Scenario::conflict();
             if overlay == "replace" {
-                s.repo.reference(&format!("refs/replace/{}", s.inputs.child.commit), Oid::from_str(&s.inputs.parent.commit).unwrap(), false, "fixture replace").unwrap();
+                s.repo
+                    .reference(
+                        &format!("refs/replace/{}", s.inputs.child.commit),
+                        Oid::from_str(&s.inputs.parent.commit).unwrap(),
+                        false,
+                        "fixture replace",
+                    )
+                    .unwrap();
             } else {
                 let path = s.repo.path().join(overlay);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(path, format!("{}\n", s.inputs.child.commit)).unwrap();
             }
             let before = snapshot(s.directory.path());
-            assert!(inspect_changed_child_review(&s.repo, &s.inputs).is_err(), "{overlay}");
+            assert!(
+                inspect_changed_child_review(&s.repo, &s.inputs).is_err(),
+                "{overlay}"
+            );
             assert_eq!(before, snapshot(s.directory.path()));
         }
     }
@@ -921,7 +1121,10 @@ mod changed_child_review {
         assert!(inspect_changed_child_review(&s.repo, &s.inputs).is_ok());
         let excess = commit(&s.repo, tree, &[tip], "child step 1001");
         s.set_child(excess);
-        assert!(inspect_changed_child_review(&s.repo, &s.inputs).unwrap_err().to_string().contains("oversized"));
+        assert!(inspect_changed_child_review(&s.repo, &s.inputs)
+            .unwrap_err()
+            .to_string()
+            .contains("oversized"));
     }
 
     #[test]
@@ -950,19 +1153,36 @@ mod changed_child_review {
     fn metadata_never_becomes_authenticated_correspondence_or_execution() {
         let mut s = Scenario::conflict();
         let missing = s.inspect();
-        assert!(missing.unverified.contains(&"svn_property_evidence_missing".into()));
-        let evidence = ChangedChildEvidence { reference: "caller-reference".into(), sha256: "b".repeat(64) };
+        assert!(missing
+            .unverified
+            .contains(&"svn_property_evidence_missing".into()));
+        let evidence = ChangedChildEvidence {
+            reference: "caller-reference".into(),
+            sha256: "b".repeat(64),
+        };
         s.inputs.context.baseline_evidence = Some(evidence.clone());
         s.inputs.context.svn.lineage_evidence = Some(evidence.clone());
         s.inputs.context.svn.property_evidence = Some(evidence);
-        s.inputs.context.actor_policy = Some(RefreshActorPolicyPin { version: 2, actor_id: "actor".into(), session_context_digest: "c".repeat(64), policy_context_digest: "d".repeat(64) });
+        s.inputs.context.actor_policy = Some(RefreshActorPolicyPin {
+            version: 2,
+            actor_id: "actor".into(),
+            session_context_digest: "c".repeat(64),
+            policy_context_digest: "d".repeat(64),
+        });
         s.inputs.context.credential_context_digest = Some("e".repeat(64));
         let supplied = s.inspect();
         assert!(!supplied.execution_eligible);
-        assert!(supplied.unverified.contains(&"baseline_provenance_not_authenticated".into()));
-        assert!(supplied.unverified.contains(&"svn_correspondence_not_verified".into()));
-        assert!(supplied.unverified.contains(&"pending_work_not_independently_observed".into()));
-        let resolved = resolve_changed_child_review(&s.repo, &s.inputs, &resolution(&supplied)).unwrap();
+        assert!(supplied
+            .unverified
+            .contains(&"baseline_provenance_not_authenticated".into()));
+        assert!(supplied
+            .unverified
+            .contains(&"svn_correspondence_not_verified".into()));
+        assert!(supplied
+            .unverified
+            .contains(&"pending_work_not_independently_observed".into()));
+        let resolved =
+            resolve_changed_child_review(&s.repo, &s.inputs, &resolution(&supplied)).unwrap();
         assert!(!resolved.execution_eligible);
         assert_eq!(resolved.unverified, supplied.unverified);
         assert_ne!(missing.manifest_digest, supplied.manifest_digest);
@@ -995,7 +1215,10 @@ mod changed_child_review {
         };
         let id = commit(&s.repo, nested_empty, &[base], "empty directory");
         s.set_child(id);
-        assert!(inspect_changed_child_review(&s.repo, &s.inputs).unwrap_err().to_string().contains("empty subtree"));
+        assert!(inspect_changed_child_review(&s.repo, &s.inputs)
+            .unwrap_err()
+            .to_string()
+            .contains("empty subtree"));
     }
 
     #[test]
@@ -1007,15 +1230,19 @@ mod changed_child_review {
         );
         let expected_directory = tempfile::tempdir().unwrap();
         let expected_repo = Repository::init_bare(expected_directory.path()).unwrap();
-        let expected = write_tree(&expected_repo, &[
-            ("child", b"child", 0o100644),
-            ("parent", b"parent", 0o100755),
-        ]);
+        let expected = write_tree(
+            &expected_repo,
+            &[
+                ("child", b"child", 0o100644),
+                ("parent", b"parent", 0o100755),
+            ],
+        );
         assert!(s.repo.find_tree(expected).is_err());
         let before = snapshot(s.directory.path());
         let manifest = s.inspect();
         assert_eq!(manifest.candidate_tree, Some(expected.to_string()));
-        let result = resolve_changed_child_review(&s.repo, &s.inputs, &resolution(&manifest)).unwrap();
+        let result =
+            resolve_changed_child_review(&s.repo, &s.inputs, &resolution(&manifest)).unwrap();
         assert_eq!(result.candidate_tree, expected.to_string());
         assert!(s.repo.find_tree(expected).is_err());
         assert_eq!(before, snapshot(s.directory.path()));
