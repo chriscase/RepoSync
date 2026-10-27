@@ -459,11 +459,16 @@ mod blocking_test_context {
         if state.is_some() {
             return Err("case context or prior cleanup is unresolved".into());
         }
-        let number = NEXT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                old.checked_add(1)
-            })
-            .map_err(|_| "case identity exhausted".to_string())?;
+        let mut observed = NEXT.load(Ordering::Acquire);
+        let number = loop {
+            let next = observed
+                .checked_add(1)
+                .ok_or_else(|| "case identity exhausted".to_string())?;
+            match NEXT.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(previous) => break previous,
+                Err(current) => observed = current,
+            }
+        };
         let id = CaseContextId(number);
         *state = Some(CaseState {
             id,
