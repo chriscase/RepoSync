@@ -1,20 +1,20 @@
 # Unpublished candidate: focused review and separate publication/execution approval required.
-name: RS112 targeted 14 cases (partial)
+name: RS112 targeted 5 acceptance cases (partial)
 'on':
   push:
     tags:
-    - rs112-verify-4b66a9f0-v1
+    - rs112-acceptance-4b66a9f0-v1
 permissions:
   contents: read
 concurrency:
-  group: rs112-hosted14-${{ github.ref }}
+  group: rs112-hosted5-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  scheduler14:
-    name: RS112 exact 14; whole-story gates remain open
+  acceptance5:
+    name: RS112 exact 5; issue acceptance remains owner-reviewed
     runs-on: ubuntu-24.04
     timeout-minutes: 50
-    if: github.repository == 'chriscase/RepoSync' && github.event_name == 'push' && github.ref == 'refs/tags/rs112-verify-4b66a9f0-v1'
+    if: github.repository == 'chriscase/RepoSync' && github.event_name == 'push' && github.ref == 'refs/tags/rs112-acceptance-4b66a9f0-v1'
     defaults:
       run:
         shell: bash --noprofile --norc -euo pipefail {0}
@@ -91,7 +91,7 @@ jobs:
             require(git(src, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"], "checkout SHA mismatch")
             parents = [line.split()[1].decode() for line in git(src, "cat-file", "commit", "HEAD").split(b"\n\n",1)[0].splitlines() if line.startswith(b"parent ")]
             require(parents == [P["source"]["parent_commit"]], "execution commit parent mismatch")
-            for item in P["source"]["changed_files"] + P["source"]["manifests"]:
+            for item in P["source"]["changed_files"] + P["source"]["manifests"] + P["source"]["acceptance_context_files"]:
                 b = (src/item["path"]).read_bytes()
                 require(len(b)==item["bytes"] and sha(b)==item["sha256"], "pinned file mismatch: "+item["path"])
             for name, expected in P["source"]["unchanged_workflows_sha256"].items():
@@ -117,8 +117,11 @@ jobs:
             P = json.loads((checkout/".github/verification/rs112-profile.json").read_text())
             require(os.environ["GITHUB_REPOSITORY"]==P["trigger"]["repository"] and os.environ["GITHUB_EVENT_NAME"]==P["trigger"]["event"] and os.environ["GITHUB_REF"]==P["trigger"]["ref"], "wrong publication event")
             require(os.environ["GITHUB_RUN_ATTEMPT"]=="1", "reruns require separate approval")
-            require(len(P["cases"])==14 and len({c["name"] for c in P["cases"]})==14, "case catalogue mismatch")
-            require(sum(c["expected_panic_message"] is not None for c in P["cases"])==3, "panic catalogue mismatch")
+            require(len(P["cases"])==5 and len({c["name"] for c in P["cases"]})==5, "case catalogue mismatch")
+            require(all(c["expected_panic_message"] is None for c in P["cases"]), "acceptance cases allow no panic")
+            require([c["index"] for c in P["cases"]]==list(range(1,6)), "case index catalogue mismatch")
+            require([c["target"] for c in P["cases"]]==["daemon","daemon","web","web","web"], "case target catalogue mismatch")
+            require([t["id"] for t in P["compile"]["targets"]]==["daemon","web"], "compile target catalogue mismatch")
             for c in P["cases"]: require(re.fullmatch(r"[a-z_][a-z0-9_:]*",c["name"]) is not None, "invalid case name")
             for name in ("home","tmp","scratch","target","cargo-home","rustup-home","empty-hooks","empty-template","evidence"):
                 (R/name).mkdir(mode=0o700, exist_ok=False)
@@ -173,25 +176,32 @@ jobs:
                 actual.append({"crate":f.name,"bytes":f.stat().st_size,"sha256":digest})
             require(sha((R/"source/Cargo.lock").read_bytes())==P["lock"]["sha256"],"fetch changed lock")
             save(E/"cache.json",{"lock_packages":len(packages),"registry_lock_packages":len(registry),"downloaded_archives":actual,"scope":"Linux target fetch; does not assert every cross-target locked archive was downloaded","capacity":capacity()})
-        def binary():
-            matches=[]
-            for line in (E/"compile.jsonl").open():
+        def binary(target_id):
+            targets=[t for t in P["compile"]["targets"] if t["id"]==target_id]
+            require(len(targets)==1,"unknown compile target")
+            target=targets[0];matches=[]
+            for line in (E/("compile-"+target_id+".jsonl")).open():
                 item=json.loads(line)
-                if item.get("reason")=="compiler-artifact" and item.get("target",{}).get("name")==P["compile"]["binary_target"] and "bin" in item.get("target",{}).get("kind",[]) and item.get("profile",{}).get("test") and item.get("executable"):
+                artifact=item.get("target",{})
+                if item.get("reason")=="compiler-artifact" and artifact.get("name")==target["cargo_target"] and artifact.get("kind")==[target["kind"]] and item.get("profile",{}).get("test") is True and item.get("executable"):
+                    require(item.get("manifest_path")==str(R/"source"/target["manifest_path"]),"artifact manifest mismatch")
+                    require(artifact.get("src_path")==str(R/"source"/target["source_path"]),"artifact source mismatch")
                     matches.append(item["executable"])
-            require(len(matches)==1,"expected exactly one daemon test artifact")
+            require(len(matches)==1,"expected exactly one "+target_id+" test artifact")
             f=pathlib.Path(matches[0])
             require(f.is_file() and not f.is_symlink() and f.resolve().is_relative_to((R/"target").resolve()),"invalid artifact path")
-            save(E/"binary.json",{"path":str(f),"bytes":f.stat().st_size,"sha256":sha(f.read_bytes()),"source":json.loads((E/"source.json").read_text()),"lock_sha256":P["lock"]["sha256"],"compile_args":P["compile"]["args"],"capacity":capacity()})
-            (R/"binary.path").write_text(str(f)+"\n")
+            save(E/("binary-"+target_id+".json"),{"target_id":target_id,"cargo_target":target["cargo_target"],"kind":target["kind"],"manifest_path":target["manifest_path"],"source_path":target["source_path"],"path":str(f),"bytes":f.stat().st_size,"sha256":sha(f.read_bytes()),"source":json.loads((E/"source.json").read_text()),"lock_sha256":P["lock"]["sha256"],"compile_args":target["args"],"capacity":capacity()})
+            (R/("binary-"+target_id+".path")).write_text(str(f)+"\n")
         def start(i):
             for n in range(1,i): require(json.loads(case_path(n).read_text())["status"].startswith("PASS"),"prior case incomplete or failed")
             c=P["cases"][i-1]
             require(c["index"]==i,"case order")
-            b=json.loads((E/"binary.json").read_text())
+            for target in P["compile"]["targets"]: require((E/("binary-"+target["id"]+".json")).is_file(),"missing compiled target")
+            b=json.loads((E/("binary-"+c["target"]+".json")).read_text())
+            require(b["target_id"]==c["target"] and b["source"]==json.loads((E/"source.json").read_text()) and b["lock_sha256"]==P["lock"]["sha256"],"case binary binding mismatch")
             require(sha(pathlib.Path(b["path"]).read_bytes())==b["sha256"],"binary changed")
             require(sha((R/"source/Cargo.lock").read_bytes())==P["lock"]["sha256"],"lock changed")
-            save(case_path(i),{"index":i,"name":c["name"],"status":"RUNNING","started_utc":now(),"binary_sha256":b["sha256"],"capacity":capacity()})
+            save(case_path(i),{"index":i,"name":c["name"],"status":"RUNNING","started_utc":now(),"binary_target":c["target"],"binary_sha256":b["sha256"],"capacity":capacity()})
         def end(i,code):
             c=P["cases"][i-1]; state=json.loads(case_path(i).read_text())
             prefix=E/"cases"/("%02d"%i)
@@ -222,8 +232,8 @@ jobs:
             try: save(E/"post-source.json",source_check(R/"source"));save(E/"post-capacity.json",capacity())
             except Exception as error: errors.append(str(error))
             passed=sum(c["status"].startswith("PASS") for c in cases)
-            ok=passed==14 and not errors and os.environ.get("RS112_PRIOR_JOB_STATUS")=="success"
-            save(E/"result.json",{"status":"CASE_EVIDENCE_PASS_REQUIRES_PROVIDER_TERMINAL_READBACK" if ok else "FAIL_OR_INCOMPLETE","passed":passed,"required":14,"cases":cases,"errors":errors,"observed_prior_job_status":os.environ.get("RS112_PRIOR_JOB_STATUS"),"provider_terminal":"PENDING_EXTERNAL_JOB_AND_RUN_API_READBACK","resource_peak_kind":P["limits"]["resource_observation"],"gates_open":P["open_gates"],"finished_utc":now()})
+            ok=passed==5 and not errors and os.environ.get("RS112_PRIOR_JOB_STATUS")=="success"
+            save(E/"result.json",{"status":"CASE_EVIDENCE_PASS_REQUIRES_PROVIDER_TERMINAL_READBACK" if ok else "FAIL_OR_INCOMPLETE","passed":passed,"required":5,"cases":cases,"errors":errors,"observed_prior_job_status":os.environ.get("RS112_PRIOR_JOB_STATUS"),"provider_terminal":"PENDING_EXTERNAL_JOB_AND_RUN_API_READBACK","resource_peak_kind":P["limits"]["resource_observation"],"gates_open":P["open_gates"],"finished_utc":now()})
             files=[f for f in E.rglob("*") if f.is_file()]
             total=sum(f.stat().st_size for f in files)
             inventory=[{"path":str(f.relative_to(E)),"bytes":f.stat().st_size,"sha256":sha(f.read_bytes())} for f in sorted(files)]
@@ -242,7 +252,7 @@ jobs:
         if command=="init": initialise()
         elif command=="toolchain": toolchain()
         elif command=="cache": cache()
-        elif command=="binary": binary()
+        elif command=="binary": binary(sys.argv[2])
         elif command=="start": start(int(sys.argv[2]))
         elif command=="end": end(int(sys.argv[2]),int(sys.argv[3]))
         elif command=="final": finalise()
@@ -270,7 +280,13 @@ jobs:
         print(json.load(open(sys.argv[1]))["cases"][int(sys.argv[2])-1]["name"])
         PY
         )"
-        binary="$(cat "$RS112_ROOT/binary.path")"
+        binary="$(python3 - "$RS112_ROOT" "$index" <<'PY'
+        import json,pathlib,sys
+        root=pathlib.Path(sys.argv[1])
+        case=json.loads((root/"profile.json").read_text())["cases"][int(sys.argv[2])-1]
+        print(json.loads((root/"evidence"/("binary-"+case["target"]+".json")).read_text())["path"])
+        PY
+        )"
         prefix="$(printf '%s/evidence/cases/%02d' "$RS112_ROOT" "$index")"
         source "$RS112_ROOT/environment.sh"
         SAFE_ENV+=("CARGO_NET_OFFLINE=true")
@@ -310,8 +326,8 @@ jobs:
           fetch --locked --target x86_64-unknown-linux-gnu \
           > "$RS112_ROOT/evidence/fetch.stdout" 2> "$RS112_ROOT/evidence/fetch.stderr"
         python3 "$RS112_ROOT/evidence.py" cache
-    - name: Compile one daemon test binary (locked/offline)
-      timeout-minutes: 20
+    - name: Compile daemon test target (locked/offline)
+      timeout-minutes: 10
       run: |
         set -euo pipefail
         umask 077
@@ -320,71 +336,54 @@ jobs:
         cargo="$(cat "$RS112_ROOT/cargo.path")"
         SAFE_ENV+=("CARGO_NET_OFFLINE=true" "RUSTC=$rustc")
         cd "$RS112_ROOT/source"
-        /usr/bin/time -v -o "$RS112_ROOT/evidence/compile.resources.txt" /usr/bin/prlimit \
+        /usr/bin/time -v -o "$RS112_ROOT/evidence/compile-daemon.resources.txt" /usr/bin/prlimit \
           --as=4294967296 --cpu=1500 --nofile=512 --fsize=1073741824 --core=0 -- \
           /usr/bin/env -i "${SAFE_ENV[@]}" "$cargo" \
           test --no-run -p reposync-daemon --bin reposync-daemon \
           --locked --offline --jobs=1 \
           --features reposync-core/reliability-fixture,reposync-web/reliability-fixture \
           --message-format=json \
-          > "$RS112_ROOT/evidence/compile.jsonl" 2> "$RS112_ROOT/evidence/compile.stderr"
-        python3 "$RS112_ROOT/evidence.py" binary
-    - name: shutdown_ownership_tests::finished_scheduler_panic_is_joined_and_classified
+          > "$RS112_ROOT/evidence/compile-daemon.jsonl" 2> "$RS112_ROOT/evidence/compile-daemon.stderr"
+        python3 "$RS112_ROOT/evidence.py" binary daemon
+    - name: Compile web test target (locked/offline)
+      timeout-minutes: 10
+      run: |
+        set -euo pipefail
+        umask 077
+        source "$RS112_ROOT/environment.sh"
+        rustc="$(cat "$RS112_ROOT/rustc.path")"
+        cargo="$(cat "$RS112_ROOT/cargo.path")"
+        SAFE_ENV+=("CARGO_NET_OFFLINE=true" "RUSTC=$rustc")
+        cd "$RS112_ROOT/source"
+        /usr/bin/time -v -o "$RS112_ROOT/evidence/compile-web.resources.txt" /usr/bin/prlimit \
+          --as=4294967296 --cpu=1500 --nofile=512 --fsize=1073741824 --core=0 -- \
+          /usr/bin/env -i "${SAFE_ENV[@]}" "$cargo" \
+          test --no-run -p reposync-web --lib \
+          --locked --offline --jobs=1 \
+          --features reliability-fixture \
+          --message-format=json \
+          > "$RS112_ROOT/evidence/compile-web.jsonl" 2> "$RS112_ROOT/evidence/compile-web.stderr"
+        python3 "$RS112_ROOT/evidence.py" binary web
+    - name: scheduler::maintenance_cadence_tests::paused_ticks_keep_syncing_and_bound_maintenance
       timeout-minutes: 1
       run: |
         bash "$RS112_ROOT/run-case.sh" 1
-    - name: shutdown_ownership_tests::existing_failure_does_not_skip_an_unobserved_scheduler_join
+    - name: scheduler::maintenance_cadence_tests::run_loop_survives_valid_poll_intervals_without_panic
       timeout-minutes: 1
       run: |
         bash "$RS112_ROOT/run-case.sh" 2
-    - name: shutdown_ownership_tests::stop_deadline_aborts_and_observes_scheduler_before_child_drain
+    - name: api::status::health_tests::running_scheduler_stays_ok_without_a_reason
       timeout-minutes: 1
       run: |
         bash "$RS112_ROOT/run-case.sh" 3
-    - name: shutdown_ownership_tests::abort_timeout_retains_the_same_scheduler_handle_and_closes_child_drain
+    - name: api::status::health_tests::fatal_scheduler_is_not_ok_and_includes_the_reason
       timeout-minutes: 1
       run: |
         bash "$RS112_ROOT/run-case.sh" 4
-    - name: shutdown_ownership_tests::child_drain_observes_an_already_finished_panic
+    - name: api::status::health_tests::degraded_scheduler_is_not_ok_and_includes_the_reason
       timeout-minutes: 1
       run: |
         bash "$RS112_ROOT/run-case.sh" 5
-    - name: shutdown_ownership_tests::cancelled_child_drain_retains_current_and_remaining_owners
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 6
-    - name: scheduler::shutdown_admission_tests::shutdown_flag_before_run_admits_nothing
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 7
-    - name: scheduler::shutdown_admission_tests::cooperative_shutdown_finishes_before_the_deadline
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 8
-    - name: scheduler::shutdown_admission_tests::shutdown_during_reconcile_does_not_admit_and_drains_after_exit
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 9
-    - name: scheduler::shutdown_admission_tests::interval_stop_during_inline_reconcile_closes_later_admission
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 10
-    - name: scheduler::shutdown_admission_tests::webhook_stop_during_inline_reconcile_closes_later_admission
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 11
-    - name: scheduler::shutdown_admission_tests::stop_while_waiting_for_registry_lock_refuses_unpolled_child
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 12
-    - name: scheduler::shutdown_admission_tests::admitted_child_is_registered_before_stop_snapshot
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 13
-    - name: scheduler::shutdown_admission_tests::finished_sync_panic_is_observed_before_handle_removal
-      timeout-minutes: 1
-      run: |
-        bash "$RS112_ROOT/run-case.sh" 14
     - name: Retain partial/complete evidence; reject unknown completion
       id: evidence
       if: always()
@@ -399,7 +398,7 @@ jobs:
       timeout-minutes: 3
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: rs112-4b66a9f0-${{ github.run_id }}-${{ github.run_attempt }}
+        name: rs112-acceptance5-4b66a9f0-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ env.RS112_ROOT }}/upload/
         if-no-files-found: error
         retention-days: 14

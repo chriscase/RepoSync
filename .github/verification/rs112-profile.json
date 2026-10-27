@@ -1,18 +1,18 @@
 {
   "schema_version": 1,
-  "revision": "rs112-hosted14-metadata-v2-compiler-repair",
+  "revision": "rs112-hosted5-acceptance-metadata-v1",
   "state": "UNPUBLISHED_UNRUN_REQUIRES_REVIEW_AND_SEPARATE_PUBLICATION_EXECUTION_APPROVAL",
   "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb",
   "reviewer": "bc-a90bb484-f03a-50ed-807f-10ba6ccb86b4",
   "trigger": {
     "repository": "chriscase/RepoSync",
     "event": "push",
-    "ref": "refs/tags/rs112-verify-4b66a9f0-v1",
+    "ref": "refs/tags/rs112-acceptance-4b66a9f0-v1",
     "first_attempt_only": true
   },
   "source": {
-    "parent_commit": "9b1d17cf5f42ab92fecc7f18db644b95d6be2d96",
-    "base_tree": "aba35132ccf5e413b2279730726df2ca67dc3d2b",
+    "parent_commit": "b4a65dc1c5ff0880e7dac6cc4ed4b43caf3eec4d",
+    "base_tree": "f1590aa36d976e7aa3aa2b23b277e57379d1a6d8",
     "project_tree": "4b66a9f0bdcaef80459778449b3e3b2d2db7963f",
     "project_file_count": 510,
     "execution_metadata_paths": [
@@ -119,8 +119,53 @@
       "report_bytes": 4743,
       "report_sha256": "5e2defc0a347c7bc9865ba277525217b056c7cabea3891db6d8d4ee4c88a0501",
       "reviewer_bundle_limit": "Full bundle verification UNRUN because e64 parent missing at reviewer; author identity evidence separate",
-      "runtime": "Corrected source compile and all14 cases UNRUN; no previous campaign approval carried over"
-    }
+      "runtime": "Corrected daemon source compiled and14 shutdown/admission cases passed in run40430176598 at b4a65dc1; new acceptance5 cases remain NOT_RUN."
+    },
+    "previous_pass_campaign": {
+      "commit": "b4a65dc1c5ff0880e7dac6cc4ed4b43caf3eec4d",
+      "full_tree": "f1590aa36d976e7aa3aa2b23b277e57379d1a6d8",
+      "project_tree": "4b66a9f0bdcaef80459778449b3e3b2d2db7963f",
+      "tag": "refs/tags/rs112-verify-4b66a9f0-v1",
+      "run_id": 40430176598,
+      "attempt": 1,
+      "result": "OFFLINE_COMPILE_EXIT_0_ALL14_PASS",
+      "repeat": false,
+      "artifact_id": 12701248382,
+      "artifact_bytes": 87241,
+      "artifact_sha256": "b5d81e6d7d9b8deb18bc4ebe646296bd25ae13d4098bab4390fb021527bc2744",
+      "consumer_receipt_bytes": 8693,
+      "consumer_receipt_sha256": "b4f0731c6646a88c5a4565ed7b531f09b89d0383e2889f8db56b658eb2c207a3",
+      "authority": "Completed14-case cycle does not authorize this5-case campaign"
+    },
+    "composition_proposal": {
+      "commit": "a4e2f311ca341a0a34f4700a1a97c97889d67460",
+      "parent": "0a96eb027f3208a52f40dbcaca21c96864343b7e",
+      "tree": "4b66a9f0bdcaef80459778449b3e3b2d2db7963f",
+      "state": "Separate source-only composition/mapping review pending; no application inferred or required for this metadata preparation"
+    },
+    "acceptance_context_files": [
+      {
+        "path": "crates/daemon/src/scheduler/maintenance_cadence_tests.rs",
+        "mode": "100644",
+        "blob": "b016061fc6f987d1415c77a30bef578168f4ca03",
+        "bytes": 9715,
+        "sha256": "980a433584d396fceb5352a1d7d667d91983f2dfb2c8f7918c8b7fa738468ad3"
+      },
+      {
+        "path": "crates/web/src/lib.rs",
+        "mode": "100644",
+        "blob": "a4f30c40c3a797a665149aa1a1abe6c240fae8de",
+        "bytes": 22397,
+        "sha256": "db950ab099a67066aec8b5485cfabea64a618e4d8e9f8f1750f9aa80c2a92c4f"
+      },
+      {
+        "path": "crates/web/src/api/status.rs",
+        "mode": "100644",
+        "blob": "9cf9d2543dbbbbd3928cfb1173fe9df3de339dcc",
+        "bytes": 23484,
+        "sha256": "203db4e5ea5b2ba272da720c81ec0624fb4b5948d3f5c6109dd70038a7f05dea"
+      }
+    ]
   },
   "lock": {
     "kind": "external_prepared_input_not_tracked_root_lock",
@@ -174,7 +219,9 @@
     },
     "core_bytes": 0,
     "artifact_bytes": 1073741824,
-    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap"
+    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap",
+    "compile_step_minutes": 10,
+    "compile_total_minutes": 20
   },
   "fetch": {
     "args": [
@@ -188,28 +235,72 @@
     "lock_regeneration": false
   },
   "compile": {
-    "args": [
-      "test",
-      "--no-run",
-      "-p",
-      "reposync-daemon",
-      "--bin",
-      "reposync-daemon",
-      "--locked",
-      "--offline",
-      "--jobs=1",
-      "--features",
-      "reposync-core/reliability-fixture,reposync-web/reliability-fixture",
-      "--message-format=json"
+    "targets": [
+      {
+        "id": "daemon",
+        "package": "reposync-daemon",
+        "cargo_target": "reposync-daemon",
+        "kind": "bin",
+        "manifest_path": "crates/daemon/Cargo.toml",
+        "source_path": "crates/daemon/src/main.rs",
+        "args": [
+          "test",
+          "--no-run",
+          "-p",
+          "reposync-daemon",
+          "--bin",
+          "reposync-daemon",
+          "--locked",
+          "--offline",
+          "--jobs=1",
+          "--features",
+          "reposync-core/reliability-fixture,reposync-web/reliability-fixture",
+          "--message-format=json"
+        ],
+        "case_indexes": [
+          1,
+          2
+        ]
+      },
+      {
+        "id": "web",
+        "package": "reposync-web",
+        "cargo_target": "reposync_web",
+        "kind": "lib",
+        "manifest_path": "crates/web/Cargo.toml",
+        "source_path": "crates/web/src/lib.rs",
+        "args": [
+          "test",
+          "--no-run",
+          "-p",
+          "reposync-web",
+          "--lib",
+          "--locked",
+          "--offline",
+          "--jobs=1",
+          "--features",
+          "reliability-fixture",
+          "--message-format=json"
+        ],
+        "case_indexes": [
+          3,
+          4,
+          5
+        ]
+      }
     ],
-    "package": "reposync-daemon",
-    "binary_target": "reposync-daemon",
-    "attempts": 1
+    "attempts_per_target": 1,
+    "sequence": [
+      "daemon",
+      "web"
+    ],
+    "both_required_before_cases": true,
+    "scope": "Two exact no-run targets; no workspace/all-targets compile, doctest or integration-test invocation"
   },
   "test": {
-    "count": 14,
-    "ordinary": 11,
-    "expected_injected_panic": 3,
+    "count": 5,
+    "ordinary": 5,
+    "expected_injected_panic": 0,
     "args": [
       "--exact",
       "--nocapture",
@@ -224,134 +315,68 @@
   "cases": [
     {
       "index": 1,
-      "name": "shutdown_ownership_tests::finished_scheduler_panic_is_joined_and_classified",
-      "expected_panic_message": "RS112 expected scheduler panic",
+      "target": "daemon",
+      "name": "scheduler::maintenance_cadence_tests::paused_ticks_keep_syncing_and_bound_maintenance",
+      "source_path": "crates/daemon/src/scheduler/maintenance_cadence_tests.rs",
+      "acceptance": "AC1/AC2",
+      "expected_panic_message": null,
       "effects": [
-        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+        "Task-owned TempDir/config/SQLite initialization and local git init; no enabled repositories; paused Tokio time, in-memory scheduler/channels and maintenance; no wall-clock interval sleeps or live synchronization"
       ],
-      "special_effect": "Injected panic is expected in this exact case only"
+      "special_effect": "All five interval values1,30,600,601,3600 are looped inside this exact case; polling/maintenance progress only"
     },
     {
       "index": 2,
-      "name": "shutdown_ownership_tests::existing_failure_does_not_skip_an_unobserved_scheduler_join",
+      "target": "daemon",
+      "name": "scheduler::maintenance_cadence_tests::run_loop_survives_valid_poll_intervals_without_panic",
+      "source_path": "crates/daemon/src/scheduler/maintenance_cadence_tests.rs",
+      "acceptance": "AC1/AC2",
       "expected_panic_message": null,
       "effects": [
-        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+        "Task-owned TempDir/config/SQLite initialization and local git init; no enabled repositories; paused Tokio time, in-memory scheduler/channels and maintenance; no wall-clock interval sleeps or live synchronization"
       ],
-      "special_effect": "Bounded in-test waits; no test was executed"
+      "special_effect": "All five interval values1,30,600,601,3600 are looped inside this exact case; polling/maintenance progress only"
     },
     {
       "index": 3,
-      "name": "shutdown_ownership_tests::stop_deadline_aborts_and_observes_scheduler_before_child_drain",
+      "target": "web",
+      "name": "api::status::health_tests::running_scheduler_stays_ok_without_a_reason",
+      "source_path": "crates/web/src/api/status.rs",
+      "acceptance": "AC3",
       "expected_panic_message": null,
       "effects": [
-        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+        "Pure health_http response mapping and assertions; JSON serialization in running case; no filesystem/server/network/Git/SVN calls in these three test bodies"
       ],
-      "special_effect": "Bounded in-test waits; no test was executed"
+      "special_effect": "Assert Running200/ok or Fatal/Degraded503/not-ok with reason; no launched HTTP server"
     },
     {
       "index": 4,
-      "name": "shutdown_ownership_tests::abort_timeout_retains_the_same_scheduler_handle_and_closes_child_drain",
+      "target": "web",
+      "name": "api::status::health_tests::fatal_scheduler_is_not_ok_and_includes_the_reason",
+      "source_path": "crates/web/src/api/status.rs",
+      "acceptance": "AC3",
       "expected_panic_message": null,
       "effects": [
-        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+        "Pure health_http response mapping and assertions; JSON serialization in running case; no filesystem/server/network/Git/SVN calls in these three test bodies"
       ],
-      "special_effect": "Two-worker Tokio runtime and one block_in_place guarded by a command-independent std channel with five-second fixture receive bound; outer process timeout/teardown remains mandatory"
+      "special_effect": "Assert Running200/ok or Fatal/Degraded503/not-ok with reason; no launched HTTP server"
     },
     {
       "index": 5,
-      "name": "shutdown_ownership_tests::child_drain_observes_an_already_finished_panic",
-      "expected_panic_message": "RS112 expected drain panic",
-      "effects": [
-        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
-      ],
-      "special_effect": "Injected panic is expected in this exact case only"
-    },
-    {
-      "index": 6,
-      "name": "shutdown_ownership_tests::cancelled_child_drain_retains_current_and_remaining_owners",
+      "target": "web",
+      "name": "api::status::health_tests::degraded_scheduler_is_not_ok_and_includes_the_reason",
+      "source_path": "crates/web/src/api/status.rs",
+      "acceptance": "AC3",
       "expected_panic_message": null,
       "effects": [
-        "In-memory owned Tokio tasks/channels/atomics and join registry; no filesystem/Git/SVN/provider operations in test body"
+        "Pure health_http response mapping and assertions; JSON serialization in running case; no filesystem/server/network/Git/SVN calls in these three test bodies"
       ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 7,
-      "name": "scheduler::shutdown_admission_tests::shutdown_flag_before_run_admits_nothing",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 8,
-      "name": "scheduler::shutdown_admission_tests::cooperative_shutdown_finishes_before_the_deadline",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 9,
-      "name": "scheduler::shutdown_admission_tests::shutdown_during_reconcile_does_not_admit_and_drains_after_exit",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 10,
-      "name": "scheduler::shutdown_admission_tests::interval_stop_during_inline_reconcile_closes_later_admission",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 11,
-      "name": "scheduler::shutdown_admission_tests::webhook_stop_during_inline_reconcile_closes_later_admission",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 12,
-      "name": "scheduler::shutdown_admission_tests::stop_while_waiting_for_registry_lock_refuses_unpolled_child",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 13,
-      "name": "scheduler::shutdown_admission_tests::admitted_child_is_registered_before_stop_snapshot",
-      "expected_panic_message": null,
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Bounded in-test waits; no test was executed"
-    },
-    {
-      "index": 14,
-      "name": "scheduler::shutdown_admission_tests::finished_sync_panic_is_observed_before_handle_removal",
-      "expected_panic_message": "RS112 expected child panic",
-      "effects": [
-        "Task-owned TempDir/config/SQLite database initialization; local git init and GitClient/SyncEngine constructors; fixture DB has no enabled repositories; in-memory channels, atomics and Tokio tasks; no daemon/service launch"
-      ],
-      "special_effect": "Injected panic is expected in this exact case only"
+      "special_effect": "Assert Running200/ok or Fatal/Degraded503/not-ok with reason; no launched HTTP server"
     }
   ],
   "effects": {
     "compile": "Rust compiler, proc macros/dependency build scripts, C compiler/linker and source-bound git rev-parse/status execute only after separate campaign authorization",
-    "tests": "Six memory/task cases; eight task-local config/SQLite/git-init cases with an empty enabled-repository set; one block_in_place fixture; no daemon/provider/live service launch intended",
+    "tests": "Two paused-time production scheduler cadence cases with task-local config/SQLite/local git init and no enabled repositories, then three pure web health response mappings; no intentional panic, daemon/HTTP server/provider/live sync launch",
     "network": "Online exact toolchain/dependency preparation; Cargo offline for compile/tests is not OS network isolation",
     "git": "Private HOME, empty template/hooks, per-command no-system/global config; no credentials forwarded to build/tests",
     "credentials": "Read-only checkout token not persisted; no repository/environment secrets or OIDC requested; artifact runtime credentials remain confined to action steps"
@@ -378,5 +403,21 @@
     "native/isolation qualification",
     "main/integration/epic application",
     "merge/deploy"
-  ]
+  ],
+  "acceptance_scope": {
+    "issue": 112,
+    "criteria": {
+      "AC1": "Monotonic maintenance source plus retained historical pure-case evidence; production cases1/2 regression-check the current path",
+      "AC2": "Cases1/2 cover1/30/600/601/3600 without wall-clock interval sleeps; continued scheduler polling and bounded maintenance with no enabled repos, not successful real SVN/Git synchronization",
+      "AC3": "Cases3/4/5 check normal/fatal/degraded health mapping; retain historical supervision helpers and completed14-case shutdown evidence separately"
+    },
+    "historical_credit": {
+      "source_commit": "2db29d6c2402681a261ea9616a45af80ee60b5f0",
+      "receipt_sha256": "e454c599ed08c43a6e472bbf79d1c137601f55d0f31da39e7933cc1042e27e5c",
+      "unchanged_source": "Entire cadence tests, web/lib.rs and web/api/status.rs byte-identical to current source; pure3 and supervision5 retained without repeat",
+      "runtime_profile_reuse": false
+    },
+    "automatic_issue_close": false,
+    "unrelated_gates": "Existing whole-H9/Phase0/native/catalog holds remain; none is added as a hard prerequisite for these five scheduler acceptance cases"
+  }
 }
