@@ -1,0 +1,779 @@
+{
+  "schema_version": 1,
+  "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb",
+  "reviewer": "01a169fc-3e02-7298-b1cc-1ef01c90300a",
+  "lock": {
+    "kind": "external_prepared_input_not_tracked_root_lock",
+    "fixture_path": "docs/reliability/fixtures/Cargo.lock",
+    "bytes": 82871,
+    "sha256": "295583faf31523be3fb43d729e1777d45751cda900439f6ae6b0e682fe6605c6",
+    "blob": "265e8f191e3427f00a134015bcf4ad9173072242",
+    "registry_packages": 332,
+    "all_packages": 337,
+    "initial_generation_tool": "UNKNOWN; later 1.98.1 consumption and unchanged six manifests are separately recorded"
+  },
+  "toolchain": {
+    "channel": "1.98.1",
+    "target": "x86_64-unknown-linux-gnu",
+    "rustc_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "cargo_commit": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+    "provisioning": "Existing runner rustup, private RUSTUP_HOME, minimal profile, no self-update; stop if exact release unavailable"
+  },
+  "actions": {
+    "checkout": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "upload_artifact": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "runner": {
+    "label": "ubuntu-24.04",
+    "kind": "GitHub-hosted fresh disposable VM; no self-hosted/container fallback",
+    "minimum_cpus": 4,
+    "minimum_available_ram_bytes": 8589934592,
+    "minimum_free_disk_bytes": 8589934592,
+    "target_budget_bytes": 8589934592,
+    "target_budget_enforcement": "Checked between steps, not a continuous kernel or aggregate process disk cap",
+    "shared_cache": false,
+    "output_budget_bytes": 16777216
+  },
+  "limits": {
+    "job_minutes": 50,
+    "setup_fetch_minutes": 10,
+    "compile_minutes": 10,
+    "case_minutes": 1,
+    "evidence_minutes": 2,
+    "upload_minutes": 3,
+    "compile": {
+      "address_space_bytes": 4294967296,
+      "cpu_seconds": 1500,
+      "nofile": 512,
+      "max_file_bytes": 1073741824
+    },
+    "case": {
+      "address_space_bytes": 536870912,
+      "cpu_seconds": 30,
+      "nofile": 128,
+      "max_file_bytes": 16777216
+    },
+    "core_bytes": 0,
+    "artifact_bytes": 16777216,
+    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap",
+    "compile_step_minutes": 10,
+    "compile_total_minutes": 10,
+    "inventory_minutes": 1
+  },
+  "fetch": {
+    "args": [
+      "fetch",
+      "--locked",
+      "--target",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "online": true,
+    "private_cache": true,
+    "lock_regeneration": false
+  },
+  "test": {
+    "count": 10,
+    "expected_injected_panic": 0,
+    "args": [
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--color=never"
+    ],
+    "one_case_per_native_step": true,
+    "stop_on_first_failure": true,
+    "zero_or_ignored_success": false,
+    "retries": 0,
+    "intentional_source_panic_cases": 0,
+    "no_visible_panic_hooks": 10,
+    "native_mode": "native-generated-v1",
+    "private_child_marker": "REPOSYNC_HTTP_CHILD_FAILURE_UNIT; outer env-i does not pass this or fixture-control keys. Source allocates exact private child/actor controls."
+  },
+  "effects": {
+    "compile": "One pinned core-lib compiler invocation, proc macros/dependency build scripts and C compiler/linker; online locked preparation precedes offline compile. No project command is executed during metadata preparation.",
+    "tests": "Ten selected native unit bodies with10 isolated unit children,10 primaries,9 anchor actors and1 genuine descendant as source expectations; maximum4 simultaneous libtest processes, not a quota. Owned process groups, defaultSIGCHLD queries, UnixStream IPC, scoped FD inheritance, real waits/signals/proc observations and retained roots. No Git/SVN/Python/OpenSSL/hooks/server/network or packaged catalogue bodies.",
+    "network": "Online exact toolchain/dependency preparation; Cargo offline for compile/tests is not OS network isolation",
+    "git": "Private HOME, empty template/hooks, per-command no-system/global config; no credentials forwarded to build/tests",
+    "credentials": "Read-only checkout token not persisted; no repository/environment secrets or OIDC requested; artifact runtime credentials remain confined to action steps",
+    "inventory": "Two non-body --list observations on the new binary: normal and --ignored. Require each of ten selected names once, none in ignored list, and fixed_native_probe once in both lists; ignored helper is not a selected pass.",
+    "jobs": "Two Cargo build jobs; per-process prlimit values are inherited by descendants, not aggregate VM quotas. Native GitHub step/job bounds and fresh-VM disposal own descendant containment.",
+    "native_mode": "Explicit native-generated-v1 only for case bodies; env-i does not carry private UNIT_CHILD/PROBE/SCENARIO/ROLE/FD fields or packaged channels. Source constructs fixed actor controls itself."
+  },
+  "completion": {
+    "authority": "GitHub native step/job cancellation and fresh-VM decommission; no custom process supervisor",
+    "cancellation": "Documented SIGINT 7.5s, SIGTERM 2.5s, process-tree kill; server cancellation procedure up to five minutes. No earlier 5+2s guarantee.",
+    "stdout_eof": "Not a completion oracle; logs use regular files and native step conclusion is required",
+    "unknown": "RUNNING without an exit becomes INCOMPLETE; unstarted cases NOT_RUN; no campaign PASS without external terminal job/run readback",
+    "artifact_upload": "Best effort on cancellation; bounded sanitized evidence only; uploaded data inherits public repository access",
+    "rerun": "Frozen first-attempt tag only; meaningful corrections use focused review, updated exact identity and a fresh tag under the standing correction/test cycle. No blind rerun or manual dispatch.",
+    "nested_child_evidence": "N1: Command::output has no whole-child deadline or retained child/PID on output observation error. Failed spawn/read/wait stage is UNKNOWN, not fabricated spawn-only failure. Successful nested stdout is internally validated then discarded; stderr forwarded. Timeout can lose buffered child output. Provider terminal job/run and artifact readback remain required.",
+    "scratch_retention_limit": "Failed-child scratch is kept job-local by the source helper; baseline sanitized artifact route does not archive scratch contents. Provider VM decommission removes it. Durable scratch retention, if required by admission, needs a separately reviewed bounded sanitized capture delta; no durability is claimed here.",
+    "operator_control": "Reconfirm named normal-cancellation actor at launch; threshold30min from publication receipt plus5min recovery observation, not hard termination.",
+    "source_operation_timing": "N2: source timing fields are independent per-operation3s/15s/50ms checks; sequential phases compose. No cumulative3s, whole-process15s, end-to-end termination or successful cleanup guarantee. One-minute native step and50-minute job are external bounds with provider cancellation overhead."
+  },
+  "revision": "rs69-http-finite-child-v2-hosted10-on-14c7838a-v1",
+  "state": "UNPUBLISHED_UNCOMPILED_UNRUN_SOURCE_APPROVED_CHANGED_METADATA_REVIEW_AND_FRESH_ADMISSION_REQUIRED",
+  "trigger": {
+    "repository": "chriscase/RepoSync",
+    "event": "push",
+    "ref": "refs/tags/rs69-http-child10-14c7838a-v1",
+    "first_attempt_only": true
+  },
+  "source": {
+    "parent_commit": "1f99c1eefb1fd92b44cc16d9531d22590cc07a2f",
+    "base_tree": "14c7838a368f7743bb4332efb56cb775125ba654",
+    "project_tree": "14c7838a368f7743bb4332efb56cb775125ba654",
+    "project_file_count": 510,
+    "execution_metadata_paths": [
+      ".github/workflows/rs69-lifecycle.yml",
+      ".github/verification/rs69-lifecycle-profile.json"
+    ],
+    "origin_epic_commit": "c1c5a9db9f4a8f3d626ce5a14869db8dbb7bad03",
+    "origin_epic_tree": "5d6fe30cef746978a9a300af5cd5baf5cace4fc8",
+    "packet": {
+      "bytes": 1320960,
+      "sha256": "a0ff7c9e5e3856bc02dca1e5d33026b9798284fa38e5cf85fd0cbcc74b38edc2"
+    },
+    "source_delta": {
+      "bytes": 420671,
+      "sha256": "c34bf3b4278c729ba12af541e6563f120954f57b9403b5eb1b1884fac704dff4",
+      "base_commit": "c1c5a9db9f4a8f3d626ce5a14869db8dbb7bad03",
+      "candidate_commit": "1f99c1eefb1fd92b44cc16d9531d22590cc07a2f",
+      "paths": [
+        "crates/core/src/pair_refresh/authenticated_enrollment_tests.rs",
+        "crates/core/src/pair_refresh/execution.rs",
+        "crates/core/src/pair_refresh/publication_http_tests.rs",
+        "crates/core/src/pair_refresh/service.rs",
+        "crates/core/src/process.rs"
+      ]
+    },
+    "changed_files": [
+      {
+        "path": "crates/core/src/pair_refresh/authenticated_enrollment_tests.rs",
+        "bytes": 274201,
+        "sha256": "48527e9dd01d44d7831caed007083bfef2bd0c62a3c28aea272fe753c8dbeb36",
+        "blob": "9062d770a2b45807df331d4acb16696c7a11bc96",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/execution.rs",
+        "bytes": 42900,
+        "sha256": "059fb0da3cc73acbc207c3cb75c250dfc9fe6161f03b5819f66ab1064eb0afaa",
+        "blob": "7d65b5d71c3a8e06936c986eb046643a662e362b",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+        "bytes": 194409,
+        "sha256": "8820a0d9b790f777a443681b56ff853a788b08f4c11af0def61c2b31a26420d0",
+        "blob": "744e2abf0255ccd187b309016a8ade0a8f0d90e8",
+        "git_mode": "100644",
+        "mode": "100644"
+      },
+      {
+        "path": "crates/core/src/pair_refresh/service.rs",
+        "bytes": 47254,
+        "sha256": "eeb9baeb728a9774421849b85843d464d6b519ebe3603d3732e8fe3c350a26d3",
+        "blob": "81f7785be262492ba5d5725f3c9e36b0f9c6a343",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/process.rs",
+        "bytes": 54307,
+        "sha256": "c7467ce90694ad296036e87276f84449c4381c6950d0b21b45b553edd41fb348",
+        "blob": "b5d022dfb3455508fa74dc57121e553091d23fff",
+        "git_mode": "100644"
+      }
+    ],
+    "manifests": [
+      {
+        "path": "Cargo.toml",
+        "bytes": 1716,
+        "sha256": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "git_blob": "a7288a3392fc0188252d7eff3148fd5c6230e966"
+      },
+      {
+        "path": "crates/cli/Cargo.toml",
+        "bytes": 743,
+        "sha256": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
+        "git_blob": "855ff09a9808f9e2ae8a352b8d448d50f2540e41"
+      },
+      {
+        "path": "crates/core/Cargo.toml",
+        "bytes": 1405,
+        "sha256": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
+        "git_blob": "a421ee53f4c83a65aec5960f28b8d61cdcfe3834"
+      },
+      {
+        "path": "crates/daemon/Cargo.toml",
+        "bytes": 974,
+        "sha256": "3d371eef846c33fb78713c28d238bfb26cf4e5945d2aa357d9cd2686257bbb57",
+        "git_blob": "4bbd89f25a977795362629a44f401b559eda7c16"
+      },
+      {
+        "path": "crates/personal/Cargo.toml",
+        "bytes": 936,
+        "sha256": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
+        "git_blob": "9b4964431304dd2251c12d915e141efdbcfe3cd1"
+      },
+      {
+        "path": "crates/web/Cargo.toml",
+        "bytes": 1079,
+        "sha256": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178",
+        "git_blob": "6166927f3218c53cc4e8dd51f0d7f21ceaeb2e9a"
+      }
+    ],
+    "acceptance_context_files": [],
+    "unchanged_workflows_sha256": {
+      "ci.yml": "023f2f17373839d1c67919359688191ef6e8e683fc79216cd71dc4c6f116ee24",
+      "e2e.yml": "5a0d18b8398fa97a57638e35f13c2675983fa58bd99eab6780adc010f29ecd14",
+      "git-operation-request.yml": "cf33dc98e1ea73c5b072738c9a74343e0fb6ad9da1e2c7cf2b2038897ba71219",
+      "release.yml": "df0db540139487dddde6e69a1960819b57c8bc1df042f8dab8ea84607a79c689",
+      "reliability-phase0.yml": "0dfe9d8d4d9e8375c7a2cb2d3ea232531c3ce5a3da97d1da614c5f97797b516e"
+    },
+    "retained_source_review_reports": [
+      {
+        "bytes": 12249,
+        "sha256": "b527c58dcfc17a08ec970652f52e2bf154bdcf6d9b94db3e78eadec100870321",
+        "scope": "v1 source only"
+      },
+      {
+        "bytes": 7933,
+        "sha256": "dbdca2445009638ebd821654e65cf990d56c653acbba1c9b572a50f820f919de",
+        "scope": "v1.1 source addendum only"
+      }
+    ],
+    "additional_source_packets": [
+      {
+        "scope": "Reviewed ten-span HTTP candidate over H9REFERENCE; full HTTP file composed after exactepicpreimage check",
+        "bytes": 450560,
+        "sha256": "a270d4fbbaabae69e49ddf948c25eb4787c3a6e5395ec398f4b1639358f56169",
+        "candidate_sha256": "7638c3b454581c36350c0075b23db48911ab13921510223eca5d63113ff8230c"
+      },
+      {
+        "scope": "Reviewed ten-line C01 enrollment compile correction on exact274150B preimage",
+        "bytes": 134045,
+        "sha256": "1a707ec1b50eda31f99e76a304f9ba6ec986fce16102601b766f965e31cccf6d",
+        "candidate_sha256": "48527e9dd01d44d7831caed007083bfef2bd0c62a3c28aea272fe753c8dbeb36"
+      },
+      {
+        "bytes": 849920,
+        "sha256": "2b435ecc8ceced9d9ee1715a107de889daa814d9b4e38d388c6002b42d4add21",
+        "candidate_sha256": "bcb329f79def8383cc6d7f5cf633cdc45549f9a84e654002fe4b8a9274a99950",
+        "scope": "Six authored native unit leaves and fixed-entry factory gate in HTTP reserved spans7/10; source review pending"
+      },
+      {
+        "bytes": 1300480,
+        "sha256": "de44d15a0223c112eb29efd706f73ef4178531a1f791c42327404aa4ee9501f7",
+        "candidate_sha256": "8820a0d9b790f777a443681b56ff853a788b08f4c11af0def61c2b31a26420d0",
+        "scope": "Finite-child v2; predecessor-six module and actual CaseHttpChild OS methods unchanged; v1 P1 corrected."
+      }
+    ],
+    "component_reviews": [
+      {
+        "run": "163f0f7e-1586-4bed-955f-9e4bb7bcbe73",
+        "report_bytes": 11843,
+        "report_sha256": "8d252ba7223c1a3282f6c06bffee366f80eb472fd55814090ebb894bf6a0985c",
+        "scope": "Original four-file composition and eight-case harness source/profile; newidentitybindingsverifiedmechanically, no runtimecredit"
+      },
+      {
+        "run": "836faa17-0220-4763-9069-a5fed802bb5d",
+        "report_bytes": 8965,
+        "report_sha256": "d802488ef70e3b09c3478514502bfda6d70e487a6b5336cb7c0317dacbbff0e2",
+        "scope": "HTTP ten-span source/preservation only; noHTTPbehaviorqualification"
+      },
+      {
+        "run": "72dbb6e5-499c-4e19-a4bd-5e9f7075a1d2",
+        "report_request_label": "905bb769-3f64-41d6-a4aa-1b472c6b8f11",
+        "report_bytes": 6401,
+        "report_sha256": "2b285f53388471f08bbfab9c54f4c7ba20ef67ed4267a7a2ad3282abe5e47ba5",
+        "scope": "Ten-line C01 diagnostic-targeted correction only; nopostfixcompileclaim"
+      }
+    ],
+    "previous_failed_campaign": {
+      "commit": "f45b80eebea2eb64d0b4a7245d3d21baf76857ab",
+      "full_tree": "26caabf4f3370d7534e8cc097028ae21971cbb06",
+      "project_tree": "052527138d54c383f6c3580db696b42e555f7b81",
+      "tag": "refs/tags/rs69-lifecycle-05252713-v1",
+      "run_id": 40494904944,
+      "attempt": 1,
+      "result": "COMPILE_EXIT101_TEN_ERRORS_ALL8_NOT_RUN",
+      "artifact_id": 12729198738,
+      "artifact_bytes": 57929,
+      "artifact_sha256": "51a52b7fa3811cb49ff693f791a2bd22144f414068451fa446156bf00dc8820b",
+      "diagnostic_jsonl_bytes": 300324,
+      "diagnostic_jsonl_sha256": "3162659927009fde7f3eb32d0cb13d2c2e2e8df220866c8314d6cd2cced6335f",
+      "correction": "C01 componentreview above; exactsourcecorrected. No blindrerun or tagmovement."
+    },
+    "current_source_review": {
+      "status": "APPROVE-WITH-NOTES_SOURCE_ONLY",
+      "task": "01a17365-b565-7108-aff7-76c12eaef022",
+      "selected_override": "gpt-6-astra/high perliaison; serving-model attestation not exposed",
+      "report_bytes": 9290,
+      "report_sha256": "fe4714f17c9d07b0c5c9d032aaaafe6e63f60925f4d5ca8354b148264469ac4a",
+      "P1": "CLOSED_IN_ACTUAL_V2",
+      "scope": "No whole issue69/H9 or runtime credit transfer."
+    },
+    "rejected_v1": {
+      "packet_sha256": "fd02330e8d9c0a1bc7dc246c6d821fa02151efad9dc088d66ac6c1a6e67b4c3c",
+      "source_sha256": "a779e07bcb8d5f7f576f150a4e3c0f1f9ee371254628fca26dfb6da65bcfea66",
+      "review_sha256": "d2b8af7cb77685b776bf261d6b3fc7321c7eb0ad283ce5415e3bb5537ab3192a",
+      "state": "CHANGES_REQUESTED_SUPERSEDED_NEVER_COMPOSED_OR_EXECUTED",
+      "v2_direct_preimage": "Passed six source; v1 is not an ancestor applied by this publisher."
+    },
+    "previous_successful_campaigns": [
+      {
+        "commit": "32c88e8030370fd6caf1f73e94d3d79a2ec87c1e",
+        "product_commit": "1b99a81ba509892b7a688dfc859933c6a76ca34f",
+        "project_tree": "0a0458ace6ea127d1b2d10febb9c8f07dd54fcac",
+        "run": 40499131247,
+        "attempt": 1,
+        "artifact_id": 12732460138,
+        "artifact_bytes": 96323,
+        "artifact_sha256": "ed47b518b782110156de18c8cba76f3e0ee8ebcb35b541858ac8f75c08effcc5",
+        "consumer_manifest_payloads_verified": 59,
+        "provider": "completed/success",
+        "selected_cases_passed": 8,
+        "binary_sha256": "50aad5cb807b87f0a3f0e95dae25d94b8aacfc4a283cedc3af2d0bfd2f24df66",
+        "credit": "Exact historical eight-case mechanism campaign only; not rerun or transferred to this new HTTP source."
+      },
+      {
+        "commit": "03f4264759f893fe94c7cf24e2b8a25c9f192398",
+        "product_commit": "2da5fea233eb71a6c8498c7679b8c6da7096d34b",
+        "product_tree": "a09ebc0af4cc8bb79d1fd420d0af1a0ac59949ee",
+        "run": 40513025312,
+        "attempt": 1,
+        "artifact_id": 12736999165,
+        "artifact_bytes": 94419,
+        "artifact_sha256": "af7e3c9ad7c95a66090bebdde1c77836aec947a046e6ef640031bfa1a01643db",
+        "consumer_original_payloads_verified": 51,
+        "provider": "completed/success",
+        "selected_cases_passed": 6,
+        "binary_sha256": "4447cb35c81e20c24aa6bd31d157185adc0c59876647f32c6532384c8b95257d",
+        "credit_transfer_to_new_tree": false
+      }
+    ]
+  },
+  "compile": {
+    "targets": [
+      {
+        "id": "core",
+        "package": "reposync-core",
+        "cargo_target": "reposync_core",
+        "kind": "lib",
+        "manifest_path": "crates/core/Cargo.toml",
+        "source_path": "crates/core/src/lib.rs",
+        "args": [
+          "test",
+          "--no-run",
+          "-p",
+          "reposync-core",
+          "--lib",
+          "--locked",
+          "--offline",
+          "--jobs=2",
+          "--message-format=json"
+        ],
+        "case_indexes": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ]
+      }
+    ],
+    "attempts_per_target": 1,
+    "sequence": [
+      "core"
+    ],
+    "scope": "One exact core library libtest artifact, default features plus manifest dev-dependency test-support; no reliability-fixture feature, workspace/all-targets compile, doctest or integration-test invocation",
+    "all_required_before_cases": true
+  },
+  "inventory": {
+    "args": [
+      "--list",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "required_selected_names_once": true,
+    "selected_count": 10,
+    "all_inventory_bodies_executed": false,
+    "binary_digest_checked_before_and_after": true,
+    "ignored_args": [
+      "--list",
+      "--ignored",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "required_ignored_helper": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::fixed_native_probe",
+    "selected_nonignored_required": true,
+    "ignored_helper_in_pass_count": false
+  },
+  "cases": [
+    {
+      "index": 1,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_reaped_leader_with_live_descendant_refuses_completion",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3318,
+      "acceptance": "L4",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 2,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_expired_cleanup_deadline_retains_child_and_root",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3334,
+      "acceptance": "L4",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 3,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l5_nonzero_before_stop_preserves_actual_failure",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3347,
+      "acceptance": "L5",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 4,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_malformed_readiness_retains_server_and_root",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3375,
+      "acceptance": "L6",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 5,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_missing_readiness_retains_server_and_root",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3381,
+      "acceptance": "L6",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 6,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_readiness_timeout_keeps_actual_reader_and_child",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3387,
+      "acceptance": "L6",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 7,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_certificate_role_nonzero_keeps_failure_and_root",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3415,
+      "acceptance": "L6",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 8,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l7_certificate_child_cannot_supply_server_completion",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3428,
+      "acceptance": "L7",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 9,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_reaped_anchor_number_cannot_authorize_replacement_claim",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3447,
+      "acceptance": "L4",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    },
+    {
+      "index": 10,
+      "target": "core",
+      "name": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_revoked_anchor_retains_error_root_and_context",
+      "source_path": "crates/core/src/pair_refresh/publication_http_tests.rs",
+      "source_function_line": 3467,
+      "acceptance": "L4",
+      "expected_panic_message": null,
+      "effects": [
+        "Fresh exact-case isolated native libtest child; one fixture group per body",
+        "Primary joins an actual exclusively unreaped group-leader anchor for9of10bodies; original reaped-leader body has no anchor and no signal-capable call",
+        "Default SIGCHLD/absence of SA_NOCLDWAIT read-only queries and strict refusal; no disposition change or global reaper setting",
+        "Owned UnixStream endpoints, scoped FD_CLOEXEC export/reset, START/QUIT bytes, actual Child waits and group observations",
+        "Original TERM/KILL-capable routines used only under unreaped anchor lifetime; collector uses NO group/direct signal",
+        "Descendant explicitly inherits original-parent release endpoint; no escape/new group; same-group liveness remains a real observation",
+        "Retained roots, actual handles/status/error records; no clearing case/resource tokens or terminal failure",
+        "No Git/SVN/Python/OpenSSL/hook/network/provider/application invocation by these bodies"
+      ],
+      "qualification_limit": "Native physical/ownership negative only; retained resources/errors do not become completed case or packaged proofs."
+    }
+  ],
+  "open_gates": [
+    "Exact ten-case metadata/effects review and fresh source/tag/owner/host/cancellation admission",
+    "issue69 whole acceptance",
+    "issue64 whole acceptance",
+    "whole H9",
+    "F01/F02/F03/F04/F05/F07/F08/F09/F10/F11 packaged qualification",
+    "projection readers and H/JH final executable identity admission",
+    "24 prior/new regressions and118plans as a complete suite",
+    "main promotion E2E/Phase0 and baseline39726272900 disposition",
+    "full real-engine catalog/live/native acceptance",
+    "merge/deploy"
+  ],
+  "acceptance_scope": {
+    "issue": 69,
+    "plan_id": "RS69-HTTP-FINITE-CHILD-V2-TEN",
+    "automatic_issue_close": false,
+    "requirements": [
+      {
+        "id": "L4",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_reaped_leader_with_live_descendant_refuses_completion"
+      },
+      {
+        "id": "L4",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_expired_cleanup_deadline_retains_child_and_root"
+      },
+      {
+        "id": "L5",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l5_nonzero_before_stop_preserves_actual_failure"
+      },
+      {
+        "id": "L6",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_malformed_readiness_retains_server_and_root"
+      },
+      {
+        "id": "L6",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_missing_readiness_retains_server_and_root"
+      },
+      {
+        "id": "L6",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_readiness_timeout_keeps_actual_reader_and_child"
+      },
+      {
+        "id": "L6",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_certificate_role_nonzero_keeps_failure_and_root"
+      },
+      {
+        "id": "L7",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l7_certificate_child_cannot_supply_server_completion"
+      },
+      {
+        "id": "L4",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_reaped_anchor_number_cannot_authorize_replacement_claim"
+      },
+      {
+        "id": "L4",
+        "test": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_revoked_anchor_retains_error_root_and_context"
+      }
+    ],
+    "closure": "Only ten exact native negative bodies, with one ignored helper used internally. No previous6/old8 repetition or verdict transfer; L4 controlled-error/real-tool/TLS/L9/L10/packaged/full issue69 remain open.",
+    "issue112": "Completed; no19-case rerun",
+    "prior6": "Complete PASS and original custody on predecessor only; source module byte-exact but not reselected",
+    "rejected_v1": "Not composed or run; source correction bound to accepted v2 report."
+  },
+  "HTTP_regression_obligations": {
+    "state": "TEN_NATIVE_FINITE_CHILD_V2_BODIES_AUTHORED_UNCOMPILED_UNRUN",
+    "selected_names": [
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_reaped_leader_with_live_descendant_refuses_completion",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_expired_cleanup_deadline_retains_child_and_root",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l5_nonzero_before_stop_preserves_actual_failure",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_malformed_readiness_retains_server_and_root",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_missing_readiness_retains_server_and_root",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_readiness_timeout_keeps_actual_reader_and_child",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l6_certificate_role_nonzero_keeps_failure_and_root",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l7_certificate_child_cannot_supply_server_completion",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_reaped_anchor_number_cannot_authorize_replacement_claim",
+      "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::http_l4_revoked_anchor_retains_error_root_and_context"
+    ],
+    "ignored_helper": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::fixed_native_probe",
+    "not_a_complete_L1_L10_inventory": true,
+    "preserved_prior6": "No repeat or verdict transfer",
+    "remaining": "Packaged projection/unreserved consumers/producer harness, L4 controlledOSerror adapter, real-tool/TLS/L9/L10 obligations and full issue69/H9 gates.",
+    "controlled_OS_error_adapter": "UNRESERVED_UNIMPLEMENTED; authority controls are not synthetic OS-error injections."
+  },
+  "native_child_protocol": {
+    "commands": {
+      "authority": "These are private native fixture controls, never packaged/H/S/P/J or per-case authority. Existing native mode/channel/inherited packaged-pin refusal applies before effects.",
+      "fixed_actor_argv": [
+        "--exact",
+        "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::fixed_native_probe",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+        "--format",
+        "pretty",
+        "--color",
+        "never"
+      ],
+      "fixed_actor_executable": "Same current_exe(), no arbitrary path/script/argv/PATH input",
+      "private_IPC_keys": [
+        "REPOSYNC_HTTP_FIXED_PROBE",
+        "REPOSYNC_HTTP_FIXED_PROBE_SCENARIO",
+        "REPOSYNC_HTTP_FIXED_PROBE_ROLE",
+        "REPOSYNC_HTTP_FIXED_PROBE_READY_FD",
+        "REPOSYNC_HTTP_FIXED_PROBE_RELEASE_FD (descendant original-parent endpoint only)"
+      ],
+      "role_values": [
+        "primary",
+        "descendant (LeaderExits only)",
+        "anchor (HelperHolds only)"
+      ],
+      "scenario_values": [
+        "leader-exits-child-holds",
+        "nonzero-before-stop",
+        "malformed-ready",
+        "missing-ready",
+        "helper-holds"
+      ],
+      "unit_child": "Same current_exe() of externally hash-bound reposync_core libtest, --exact same full reviewed leaf --nocapture --test-threads=1 --format pretty --color never; exact one matching passing row and1passed0failed0ignored summary required."
+    },
+    "ignored_helper": "pair_refresh::publication::http_tests::packaged_call_site::http_child_failure_tests::fixed_native_probe",
+    "ignored_helper_is_not_a_pass": true,
+    "source_process_expectation": {
+      "anchor_fixture_processes": 9,
+      "descendant_fixture_processes": 1,
+      "isolated_unit_children": 10,
+      "maximum_simultaneous_libtest_processes_including_unreaped_anchor": 4,
+      "not_a_quota_or_observed_inventory": true,
+      "outer_selected_bodies": 10,
+      "primary_fixture_processes": 10
+    },
+    "source_timing": {
+      "anchor_reap_seconds_each_invocation": 3,
+      "blocking_limit": "Spawn, locks, stdout/stderr/IPC writes, filesystem/procfs and output() can stall. Checks/timeouts do not supply an end-to-end finite wall clock, aggregate resource quota, or confirmed cleanup after cancellation.",
+      "expect_byte_socket_read_timeout_seconds_each_invocation": 15,
+      "group_observation_seconds_each_invocation": 3,
+      "outer_output": "Command::output waits for exit and EOF; post-spawn observation errors have unknown stage and no explicit retained child/PID owner in the driver. Preserve scratch/UNKNOWN; native provider step/process-tree cancellation/freshVM containment admission is still required.",
+      "parent_release_socket_write_timeout_ms": 50,
+      "read_control_seconds_each_invocation": 3,
+      "readiness_negative_join_budget_ms": 50,
+      "sequential_composition": "Anchored startup has anchor-control, primary-initial-control and primary-scenario-control invocations. Reaped-leader startup adds its own descendant handshake. Primary collection, anchor collection and group observation each start separate budgets. The two primary IPC phases may each wait15s. No field is a cumulative3s or per-process15s overall bound.",
+      "wait_for_exit_seconds_each_invocation": 3
+    },
+    "exclusive_wait_ownership": {
+      "substantive_precondition": "No competing waiter may reap the registered group-leader anchor before all signal-capable calls return. DefaultSIGCHLD alone is not proof of this.",
+      "proposed_closed_topology": "Each provider step starts a fresh exact-one-case libtest process with one test thread under env-i. The sole selected helper spawns one exact isolated unit process. That unit alone owns its anchor/primary Children in the typed resource registry. Only this case executes; no service, scheduler, background test or generic child-reaper is started.",
+      "wait_roles": "Outer driver waits only for its direct isolated-unit Child. Anchor/primary waits occur only through their source-owned Child records; actor roles use original IPC. The source registry is context/type scoped; signal-capable calls hold the actual exclusively unreaped group-leader Child synchronously and revoke before any anchor reap. No collector signal, legacy redispatch or numeric revalidation may grant authority.",
+      "read_only_runtime_admission": "Source require_native() checks actual defaultSIGCHLD and absenceSA_NOCLDWAIT before all native entry effects; it refuses without changing policy. No inherited preloader, packaged channel, private test/fixture marker, launcher, signal-disposition change, competing-waiter utility or shell command is passed in the env-i allowlist.",
+      "limits": "Source/metadata review must assess the closed execution call graph, not infer exclusive wait ownership from runner label, no observed processes, procfs or the signal query. Kernel stalls/SIGKILL/loss of Drop remain external containment obligations.",
+      "inspection": "The only other repository waitpid occurrence is in a different unselected process.rs test; none is selected by this profile. This text inspection is not a host process probe or serving-image attestation.",
+      "status": "EXPLICIT_EXECUTION_CONTRACT_FOR_INDEPENDENT_METADATA_REVIEW_AND_FRESH_ADMISSION"
+    },
+    "IPC_FD_contract": "Source fixed current_exe actor argv plus enum scenario/role and original UnixStream endpoints; only its owned ready/release descriptors have FD_CLOEXEC adjusted in the spawned child. No arbitrary executable/PATH/script or external FD injection.",
+    "retention": "Physical ContainmentRecord never finishes case/resource/error ownership. Reaped/revoked authority stays unusable; wrong-role checked stop cannot redispatch. Unknown collection retains evidence.",
+    "external_containment": "Native GitHub step/job cancellation and fresh disposable VM containment cover the driver, isolated child, anchor, primary and same-group descendant. No custom supervisor or job-local PGID snapshot is substituted."
+  }
+}
