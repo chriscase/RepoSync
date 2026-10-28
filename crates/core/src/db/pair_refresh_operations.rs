@@ -1561,3 +1561,194 @@ impl Database {
         })
     }
 }
+
+/// Read-only, authenticated *stored history* plus a current registration
+/// snapshot. Private construction is deliberately not a baseline-applicability,
+/// current-mapping, actor-approval, resource or publication capability. In
+/// particular, historical parent and integrated-child anchors remain distinct.
+/// This type has no Deserialize/Serialize/Clone implementation or public fields.
+pub struct ChangedChildProvenanceReview {
+    historical: PairRefreshOperation,
+    historical_document: String,
+    historical_authority_digest: String,
+    historical_child_revision: i64,
+    current: crate::pair_refresh::execution_configuration::ExecutionConfigurationPin,
+    snapshot_digest: String,
+}
+
+impl ChangedChildProvenanceReview {
+    pub fn historical_operation(&self) -> &PairRefreshOperation {
+        &self.historical
+    }
+
+    /// Exact original document bytes, not a rewritten/deserialized substitute.
+    pub fn historical_document(&self) -> &str {
+        &self.historical_document
+    }
+
+    pub fn historical_authority_digest(&self) -> &str {
+        &self.historical_authority_digest
+    }
+
+    /// The prior parent's P1 anchor, not the child's integration commit R.
+    pub fn historical_parent_anchor(&self) -> (&str, i64) {
+        (
+            &self.historical.pins.parent.last_git_sha,
+            self.historical.pins.parent.last_svn_rev,
+        )
+    }
+
+    /// The prior integrated child's R anchor and its observed SVN receipt.
+    pub fn historical_child_anchor(&self) -> (&str, i64) {
+        (
+            &self.historical.pins.git.prepared_sha,
+            self.historical_child_revision,
+        )
+    }
+
+    pub fn current_configuration(
+        &self,
+    ) -> &crate::pair_refresh::execution_configuration::ExecutionConfigurationPin {
+        &self.current
+    }
+
+    /// Unkeyed identity of this captured review, not an execution approval.
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+
+    pub fn unverified_gates(&self) -> &'static [&'static str] {
+        &[
+            "historical_baseline_applicability",
+            "live_git_graphs_and_remote_freshness",
+            "current_mapping_provenance",
+            "live_svn_tree_property_mergeinfo_correspondence",
+            "current_actor_session_authorization",
+            "authenticated_resolution_freshness",
+            "exclusive_changed_child_execution_admission",
+        ]
+    }
+}
+
+impl Database {
+    /// Capture one explicitly named, authenticated completed operation and the
+    /// expected current registration in one read transaction. The selector is
+    /// never a claim that this operation is the applicable live baseline.
+    /// Current checkpoints may differ from historical receipt checkpoints; no
+    /// ancestry, synchronization or correspondence is inferred from that fact.
+    /// Existing execution readers/writers and their strict equality stay intact.
+    pub fn capture_changed_child_provenance_review(
+        &self,
+        expected: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        historical_id: Uuid,
+    ) -> Result<ChangedChildProvenanceReview, DatabaseError> {
+        if historical_id.is_nil() {
+            return Err(refused("historical review requires an explicit operation ID"));
+        }
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &expected.pin().child.repo_id,
+            )?;
+        if current.pin() != expected.pin() {
+            return Err(refused("current provenance-review context changed"));
+        }
+
+        // This validates *all* documents, authority MACs/storage identity,
+        // duplicate/orphan ownership, receipt consistency and key history.
+        // Do not replace with deserialization of the selected raw document.
+        let operations = journal(&tx)?;
+        let mut selected = operations.iter().filter(|op| op.id == historical_id);
+        let historical = selected
+            .next()
+            .ok_or_else(|| refused("historical review operation is missing"))?;
+        if selected.next().is_some()
+            || historical.version != 3
+            || historical.phase != PairRefreshPhase::Completed
+            || historical.reconciliation_detail.is_some()
+        {
+            return Err(refused(
+                "historical review requires one authenticated completed receipt",
+            ));
+        }
+        let receipt = historical
+            .svn_receipt
+            .as_ref()
+            .ok_or_else(|| refused("historical review SVN receipt is missing"))?;
+        if historical.git_receipt_sha.as_deref()
+            != Some(historical.pins.git.prepared_sha.as_str())
+        {
+            return Err(refused("historical review Git receipt is missing or differs"));
+        }
+        let pin = current.pin();
+        let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        let lineage = &historical.pins.svn.pins.lineage.pins;
+        if !same_incarnation(&historical.pins.child, &pin.child)
+            || !same_incarnation(&historical.pins.parent, &pin.parent)
+            || historical.pins.git_remote_url != pin.git_remote_url
+            || historical.pins.git_branch != pin.child_git_branch
+            || historical.pins.transport_policy != pin.transport_policy
+            || lineage.child_url != pin.child_svn_url
+            || lineage.parent_url != pin.parent_svn_url
+        {
+            return Err(refused(
+                "historical review belongs to another registration or policy",
+            ));
+        }
+        // Current credential chains were independently resolved above. A valid
+        // rotation must not revive historical credentials or invalidate a signed
+        // receipt: retain old/current context digests separately, never adopt one.
+        for registration in [&pin.child, &pin.parent] {
+            require_no_pair_refresh_hold(&tx, Some(&registration.repo_id))?;
+            require_other_journals_quiet(&tx, &registration.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &registration.repo_id,
+                &registration.scope_uuid,
+            )?;
+        }
+        require_execution_conflicts_quiet(&tx, &historical.pins)?;
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical_id.to_string()),
+        )?
+        .ok_or_else(|| refused("historical review document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical_id.to_string()),
+        )?
+        .ok_or_else(|| refused("historical review authority disappeared"))?;
+        let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
+        let snapshot_digest = digest(&(
+            "changed_child_provenance_review_v1",
+            historical_id,
+            pin,
+            &document,
+            &authority_digest,
+        ))?;
+        let snapshot = ChangedChildProvenanceReview {
+            historical: historical.clone(),
+            historical_document: document,
+            historical_authority_digest: authority_digest,
+            historical_child_revision: receipt.revision,
+            current: pin.clone(),
+            snapshot_digest,
+        };
+        tx.commit()?;
+        Ok(snapshot)
+    }
+}
