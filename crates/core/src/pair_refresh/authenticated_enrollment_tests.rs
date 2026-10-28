@@ -3942,24 +3942,37 @@ mod changed_child_provenance_review {
         op
     }
 
+    fn request_log(f: &Fixture) -> Option<Vec<u8>> {
+        match std::fs::read(&f.log) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("request-log observation failed: {error}"),
+        }
+    }
+
+    #[track_caller]
     fn refuse_without_repair(
         f: &Fixture,
         engine: &crate::sync_engine::SyncEngine,
         expected: &LiveExecutionConfiguration,
         id: Uuid,
+        subcase: &str,
     ) {
         let before = storage(&f.db);
         assert_eq!(storage(engine.db()), before);
-        let requests = std::fs::read(&f.log).unwrap();
-        assert!(f
-            .db
-            .capture_changed_child_provenance_review(expected, id)
-            .is_err());
+        let requests = request_log(f);
+        assert!(
+            f.db.capture_changed_child_provenance_review(expected, id)
+                .is_err(),
+            "review capture accepted negative subcase {subcase} at {}",
+            std::panic::Location::caller()
+        );
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
-        assert_eq!(std::fs::read(&f.log).unwrap(), requests);
+        assert_eq!(request_log(f), requests);
     }
 
+    #[track_caller]
     fn kv_fault(
         f: &Fixture,
         engine: &crate::sync_engine::SyncEngine,
@@ -3987,7 +4000,7 @@ mod changed_child_provenance_review {
                     .unwrap();
             }
         }
-        refuse_without_repair(f, engine, expected, id);
+        refuse_without_repair(f, engine, expected, id, key);
         match prior {
             Some((value, updated)) => {
                 f.db.conn().execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![key,value,updated]).unwrap();
@@ -4071,7 +4084,7 @@ mod changed_child_provenance_review {
             )
             .unwrap();
         }
-        refuse_without_repair(&f, &engine, &original_configuration, op.id);
+        refuse_without_repair(&f, &engine, &original_configuration, op.id, "stale-checkpoints");
         let current =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
@@ -4155,7 +4168,7 @@ mod changed_child_provenance_review {
         // credential rotation. No HTTP request is sent with either token here.
         f.db.set_state("secret_git_token_child", "disposable-m2a-rotated-token")
             .unwrap();
-        refuse_without_repair(&f, &engine, &current, op.id);
+        refuse_without_repair(&f, &engine, &current, op.id, "stale-credentials");
         let rotated =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
@@ -4198,8 +4211,8 @@ mod changed_child_provenance_review {
         let auth_key = format!("pair_refresh_execution_v3:authority:{}", op.id);
         let document = f.db.get_state(&doc_key).unwrap().unwrap();
         let authority = f.db.get_state(&auth_key).unwrap().unwrap();
-        refuse_without_repair(&f, &engine, &expected, Uuid::nil());
-        refuse_without_repair(&f, &engine, &expected, Uuid::new_v4());
+        refuse_without_repair(&f, &engine, &expected, Uuid::nil(), "nil-selector");
+        refuse_without_repair(&f, &engine, &expected, Uuid::new_v4(), "missing-selector");
         for (key, value) in [
             (&auth_key, None),
             (&auth_key, Some("{}")),
@@ -4276,7 +4289,7 @@ mod changed_child_provenance_review {
         f.db.conn()
             .execute("DELETE FROM pair_refresh_journal_key_v3 WHERE id=1", [])
             .unwrap();
-        refuse_without_repair(&f, &engine, &expected, op.id);
+        refuse_without_repair(&f, &engine, &expected, op.id, "missing-key");
         let count: i64 =
             f.db.conn()
                 .query_row(
@@ -4293,7 +4306,7 @@ mod changed_child_provenance_review {
             )
             .unwrap();
         f.db.conn().execute_batch("CREATE TRIGGER m2a_unknown_key_trigger AFTER UPDATE ON pair_refresh_journal_key_v3 BEGIN SELECT 1; END;").unwrap();
-        refuse_without_repair(&f, &engine, &expected, op.id);
+        refuse_without_repair(&f, &engine, &expected, op.id, "key-schema-trigger");
         f.db.conn()
             .execute_batch("DROP TRIGGER m2a_unknown_key_trigger;")
             .unwrap();
@@ -4314,7 +4327,7 @@ mod changed_child_provenance_review {
         let recreated =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
-        refuse_without_repair(&f, &engine, &recreated, op.id);
+        refuse_without_repair(&f, &engine, &recreated, op.id, "new-incarnation");
         f.db.conn()
             .execute(
                 "UPDATE repositories SET scope_uuid=?1 WHERE id='child'",
@@ -4333,7 +4346,7 @@ mod changed_child_provenance_review {
         let changed =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
-        refuse_without_repair(&f, &engine, &changed, op.id);
+        refuse_without_repair(&f, &engine, &changed, op.id, "changed-branch");
         f.db.conn()
             .execute(
                 "UPDATE repositories SET git_branch='feature' WHERE id='child'",
@@ -4350,7 +4363,7 @@ mod changed_child_provenance_review {
         let changed =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
-        refuse_without_repair(&f, &engine, &changed, op.id);
+        refuse_without_repair(&f, &engine, &changed, op.id, "changed-echo");
         match echo {
             Some(value) => f.db.set_state(&echo_key, &value).unwrap(),
             None => {
@@ -4361,10 +4374,9 @@ mod changed_child_provenance_review {
         }
 
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
-        let window =
-            f.db.begin_ordinary_writer_window(Some("m2a-unregistered-alias"))
-                .unwrap();
-        refuse_without_repair(&f, &engine, &expected, op.id);
+        let window = f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+        window.require_engine_scope(&f.db, Some("child")).unwrap();
+        refuse_without_repair(&f, &engine, &expected, op.id, "matching-writer-window");
         window.finish_preparation().unwrap();
         drop(fence);
 
@@ -4394,7 +4406,8 @@ mod changed_child_provenance_review {
         let expected =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
-        refuse_without_repair(&f, &engine, &expected, Uuid::new_v4());
+        assert_eq!(request_log(&f), None);
+        refuse_without_repair(&f, &engine, &expected, Uuid::new_v4(), "no-history");
         assert!(!key_table(&f));
         let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let (actor, _workspace, prepared) = prepared(&f, &engine).await;
