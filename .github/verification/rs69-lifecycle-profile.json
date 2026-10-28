@@ -1,0 +1,347 @@
+{
+  "schema_version": 1,
+  "lock": {
+    "kind": "external_prepared_input_not_tracked_root_lock",
+    "fixture_path": "docs/reliability/fixtures/Cargo.lock",
+    "bytes": 82871,
+    "sha256": "295583faf31523be3fb43d729e1777d45751cda900439f6ae6b0e682fe6605c6",
+    "blob": "265e8f191e3427f00a134015bcf4ad9173072242",
+    "registry_packages": 332,
+    "all_packages": 337,
+    "initial_generation_tool": "UNKNOWN; later 1.98.1 consumption and unchanged six manifests are separately recorded"
+  },
+  "toolchain": {
+    "channel": "1.98.1",
+    "target": "x86_64-unknown-linux-gnu",
+    "rustc_commit": "48a229ceaefd4985c50990b14116b6d856af0985",
+    "cargo_commit": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+    "provisioning": "Existing runner rustup, private RUSTUP_HOME, minimal profile, no self-update; stop if exact release unavailable"
+  },
+  "actions": {
+    "checkout": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "upload_artifact": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "runner": {
+    "label": "ubuntu-24.04",
+    "kind": "GitHub-hosted fresh disposable VM; no self-hosted/container fallback",
+    "minimum_cpus": 4,
+    "minimum_available_ram_bytes": 8589934592,
+    "minimum_free_disk_bytes": 8589934592,
+    "target_budget_bytes": 8589934592,
+    "target_budget_enforcement": "Checked between steps, not a continuous kernel or aggregate process disk cap",
+    "shared_cache": false,
+    "output_budget_bytes": 16777216
+  },
+  "limits": {
+    "job_minutes": 50,
+    "setup_fetch_minutes": 10,
+    "compile_minutes": 10,
+    "case_minutes": 1,
+    "evidence_minutes": 2,
+    "upload_minutes": 3,
+    "compile": {
+      "address_space_bytes": 4294967296,
+      "cpu_seconds": 1500,
+      "nofile": 512,
+      "max_file_bytes": 1073741824
+    },
+    "case": {
+      "address_space_bytes": 536870912,
+      "cpu_seconds": 30,
+      "nofile": 128,
+      "max_file_bytes": 16777216
+    },
+    "core_bytes": 0,
+    "artifact_bytes": 16777216,
+    "resource_observation": "GNU time per-command maxRSS/CPU and between-step disk checks; not simultaneous aggregate peak or a 4GiB VM memory cap",
+    "compile_step_minutes": 10,
+    "compile_total_minutes": 10,
+    "inventory_minutes": 1
+  },
+  "fetch": {
+    "args": [
+      "fetch",
+      "--locked",
+      "--target",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "online": true,
+    "private_cache": true,
+    "lock_regeneration": false
+  },
+  "completion": {
+    "authority": "GitHub native step/job cancellation and fresh-VM decommission; no custom process supervisor",
+    "cancellation": "Documented SIGINT 7.5s, SIGTERM 2.5s, process-tree kill; server cancellation procedure up to five minutes. No earlier 5+2s guarantee.",
+    "stdout_eof": "Not a completion oracle; logs use regular files and native step conclusion is required",
+    "unknown": "RUNNING without an exit becomes INCOMPLETE; unstarted cases NOT_RUN; no campaign PASS without external terminal job/run readback",
+    "artifact_upload": "Best effort on cancellation; bounded sanitized evidence only; uploaded data inherits public repository access",
+    "rerun": "Frozen first-attempt tag only; meaningful corrections use focused review, updated exact identity and a fresh tag under the standing correction/test cycle. No blind rerun or manual dispatch.",
+    "scratch_retention_limit": "Fixture/temp data remain job-local; upload contains bounded result/tool/resource/stdout/stderr evidence, not private working copies. No durable scratch retention claim.",
+    "operator_control": "Reconfirm named normal-cancellation actor at launch; threshold30min from publication receipt plus5min recovery observation, not hard termination.",
+    "source_operation_timing": "Helper30s cooperative async timeout per invocation and20ms polling; barrier readiness and cancellation have separate waits/native setup. No whole-scenario hard deadline is claimed; inherited one-minute case step/provider cancellation are external limits.",
+    "observation_limit": "Existing is_busy false may also mean poisoned mutex; API and registry observations are separate, not an atomic operation lease or proof against later reacquisition."
+  },
+  "revision": "rs64-setup-terminal-idle-two-case-v1",
+  "state": "UNPUBLISHED_UNRUN_REQUIRES_INDEPENDENT_METADATA_REVIEW_AND_FRESH_EXACT_LAUNCH_ADMISSION",
+  "owner": "01a145a6-69e9-7427-ba8c-26b2c39200fb sole composition/publisher; source author01a1434e unchanged",
+  "reviewer": "Retained independent metadata reviewer; pending original verdict, no new worker",
+  "trigger": {
+    "repository": "chriscase/RepoSync",
+    "event": "push",
+    "ref": "refs/tags/rs64-setup-idle-9e3ab768-v1",
+    "first_attempt_only": true
+  },
+  "source": {
+    "parent_commit": "6055e73a0fa08ad5c80bdfb2bc80dc1f2265649f",
+    "project_tree": "9e3ab7686d4cfbe617b3b1900e214e357596df18",
+    "project_file_count": 512,
+    "execution_metadata_paths": [
+      ".github/workflows/rs69-lifecycle.yml",
+      ".github/verification/rs69-lifecycle-profile.json"
+    ],
+    "origin_epic_commit": "83cc39afb0377743f94ffc85f6001313d91d0e98",
+    "origin_epic_tree": "2ab0a33e98122507d7846385db1a91b7a29f48e1",
+    "changed_files": [
+      {
+        "path": "crates/web/tests/setup_wizard_busy.rs",
+        "bytes": 35752,
+        "sha256": "da5e75b2c2a973bdeac2e4e42dc769259fb7bec53b8aab15191d7f2d5b0ddde3",
+        "blob": "2018b7f317e5e5ef07e6f4f5771731c475136b0a",
+        "git_mode": "100644"
+      }
+    ],
+    "manifests": [
+      {
+        "path": "Cargo.toml",
+        "bytes": 1716,
+        "sha256": "a3f26cd64dd9e0d8f12dd16d2e461b1c72201809b8a3aae626aeadbec0819285",
+        "blob": "a7288a3392fc0188252d7eff3148fd5c6230e966",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/cli/Cargo.toml",
+        "bytes": 743,
+        "sha256": "1172bdc9a72a96b0bb1d72e28ccf1e0e4a93bc24434e88c2cda1c2d20198bb9e",
+        "blob": "855ff09a9808f9e2ae8a352b8d448d50f2540e41",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/Cargo.toml",
+        "bytes": 1405,
+        "sha256": "efca5096361a144694dab5c2b0c60dc2c2108c227a1c3ba2b746730e5abfed41",
+        "blob": "a421ee53f4c83a65aec5960f28b8d61cdcfe3834",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/daemon/Cargo.toml",
+        "bytes": 974,
+        "sha256": "3d371eef846c33fb78713c28d238bfb26cf4e5945d2aa357d9cd2686257bbb57",
+        "blob": "4bbd89f25a977795362629a44f401b559eda7c16",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/personal/Cargo.toml",
+        "bytes": 936,
+        "sha256": "f89d7ff46a46170cfdb3742042e234e84f15cbf01b2f05490665ad31ed2f7523",
+        "blob": "9b4964431304dd2251c12d915e141efdbcfe3cd1",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/web/Cargo.toml",
+        "bytes": 1079,
+        "sha256": "c3aca8315d7bfbf9a6925df5163a3a88345abbf11a55cfd5022dbc2a1b833178",
+        "blob": "6166927f3218c53cc4e8dd51f0d7f21ceaeb2e9a",
+        "git_mode": "100644"
+      }
+    ],
+    "acceptance_context_files": [
+      {
+        "path": "crates/web/src/api/setup.rs",
+        "bytes": 67955,
+        "sha256": "63e7363acf4deb9f1f77ec395dfca8bae4be80b0026784f7dc74fd5f6fea2923",
+        "blob": "90e479411ebbc4d65e3ed87dae93b05a170dab9f",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/core/src/busy.rs",
+        "bytes": 2581,
+        "sha256": "e8d3ba2adb30f22ed5cfc30ed3e13260f1e10e34dacb40e9cb71a58d319a4154",
+        "blob": "54b5684043095f2eb179d803848d12fbc6fbf2a8",
+        "git_mode": "100644"
+      },
+      {
+        "path": "crates/web/src/api/import_failure_persistence.rs",
+        "bytes": 40001,
+        "sha256": "147378ea650420156b8411322f27ef984e42900c4a40fe8fb72ab5ad9405e56d",
+        "blob": "f1997e4f1e9838e674901934b523c91a06cf7b80",
+        "git_mode": "100644"
+      }
+    ],
+    "unchanged_workflows_sha256": {
+      "ci.yml": "023f2f17373839d1c67919359688191ef6e8e683fc79216cd71dc4c6f116ee24",
+      "e2e.yml": "5a0d18b8398fa97a57638e35f13c2675983fa58bd99eab6780adc010f29ecd14",
+      "reliability-phase0.yml": "0dfe9d8d4d9e8375c7a2cb2d3ea232531c3ce5a3da97d1da614c5f97797b516e",
+      "git-operation-request.yml": "cf33dc98e1ea73c5b072738c9a74343e0fb6ad9da1e2c7cf2b2038897ba71219",
+      "release.yml": "df0db540139487dddde6e69a1960819b57c8bc1df042f8dab8ea84607a79c689"
+    },
+    "source_review": {
+      "bytes": 10260,
+      "sha256": "b5c8827c66fe892b09100e193facc73a530d0c6f6c6306fb0ec2d1baeccb6a95",
+      "verdict": "APPROVE-WITH-NOTES",
+      "runtime": "UNRUN"
+    },
+    "source_packet": {
+      "bytes": 527218,
+      "sha256": "de953cba53854237d7aaf01147352110a7e4f7526150e82dcfaaecea159157b8"
+    }
+  },
+  "compile": {
+    "targets": [
+      {
+        "id": "setup",
+        "package": "reposync-web",
+        "cargo_target": "setup_wizard_busy",
+        "kind": "test",
+        "manifest_path": "crates/web/Cargo.toml",
+        "source_path": "crates/web/tests/setup_wizard_busy.rs",
+        "features": [
+          "reliability-fixture"
+        ],
+        "args": [
+          "test",
+          "--no-run",
+          "-p",
+          "reposync-web",
+          "--test",
+          "setup_wizard_busy",
+          "--features",
+          "reliability-fixture",
+          "--locked",
+          "--offline",
+          "--jobs=2",
+          "--message-format=json"
+        ],
+        "case_indexes": [
+          1,
+          2
+        ]
+      }
+    ],
+    "attempts_per_target": 1,
+    "sequence": [
+      "setup"
+    ],
+    "all_required_before_cases": true,
+    "scope": "One feature-enabled web integration libtest artifact; not workspace/all-targets/doc tests. Feature forwards to core/reliability-fixture. Release/product source6055 unchanged."
+  },
+  "inventory": {
+    "args": [
+      "--list",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "ignored_args": [
+      "--list",
+      "--ignored",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "required_selected_names_once": true,
+    "selected_count": 2,
+    "expected_all_names": [
+      "candidate_64c07_setup_wizard_busy_duplicate_cancel_idle_after_terminal",
+      "candidate_64c07_setup_wizard_held_operation_refuses_duplicate_start",
+      "candidate_64c07_setup_wizard_failed_clone_refuses_replacement_and_holds",
+      "candidate_64c07_setup_wizard_reset_reimport_failed_clone_holds",
+      "candidate_64_setup_wizard_preparation_hold_persist_failure_is_not_acknowledged",
+      "candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel",
+      "candidate_rs11_setup_import_config_remote_ignores_managed_chain",
+      "candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation"
+    ],
+    "required_ignored_helper": null,
+    "selected_nonignored_required": true,
+    "all_inventory_bodies_executed": false,
+    "binary_digest_checked_before_and_after": true
+  },
+  "test": {
+    "count": 2,
+    "expected_injected_panic": 0,
+    "args": [
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--format",
+      "pretty",
+      "--color",
+      "never"
+    ],
+    "one_case_per_native_step": true,
+    "stop_on_first_failure": true,
+    "zero_or_ignored_success": false,
+    "retries": 0,
+    "intentional_source_panic_cases": 0,
+    "no_visible_panic_hooks": 2,
+    "prerequisite_skip_is_failure": true,
+    "mode": "Existing setup integration fixture, one fresh libtest process per exact case"
+  },
+  "cases": [
+    {
+      "index": 1,
+      "target": "setup",
+      "name": "candidate_64c07_setup_wizard_busy_duplicate_cancel_idle_after_terminal",
+      "source_path": "crates/web/tests/setup_wizard_busy.rs",
+      "source_function_line": 291,
+      "expected_panic_message": null,
+      "effects": [
+        "Existing disposable SQLite/config files, file:// SVN repository and local Git bare/clone/worktree, native svnadmin/svn/git commands",
+        "Existing loopback-only axum HTTP app and minted fixture bearer/session; no remote service or real credential",
+        "Existing import worker/cancel/duplicate/durable-journal logic; read-only busy-registry observation",
+        "Existing cancel/history/restart assertions; no new fixture or side-effect path"
+      ],
+      "qualification_limit": "Existing registry false also covers poisoned mutex; no unconditional guard-release/atomic-lease/future-reacquisition proof. OBS1-OBS5 specs are not new executed cases."
+    },
+    {
+      "index": 2,
+      "target": "setup",
+      "name": "candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel",
+      "source_path": "crates/web/tests/setup_wizard_busy.rs",
+      "source_function_line": 845,
+      "expected_panic_message": null,
+      "effects": [
+        "Existing disposable SQLite/config files, file:// SVN repository and local Git bare/clone/worktree, native svnadmin/svn/git commands",
+        "Existing loopback-only axum HTTP app and minted fixture bearer/session; no remote service or real credential",
+        "Existing import worker/cancel/duplicate/durable-journal logic; read-only busy-registry observation",
+        "Case2 sets REPOSYNC_FIXTURE_ROOT/REPOSYNC_IMPORT_BARRIER_DIR only to its own temp root and removes them; no control keys inherited from outer environment"
+      ],
+      "qualification_limit": "Existing registry false also covers poisoned mutex; no unconditional guard-release/atomic-lease/future-reacquisition proof. OBS1-OBS5 specs are not new executed cases."
+    }
+  ],
+  "effects": {
+    "compile": "One pinned Rust1.98.1 web integration compiler invocation with reliability-fixture; dependency/proc-macro/C build scripts unchanged. Online locked fetch then offline compile; no lock regeneration.",
+    "tests": "Two exact existing setup bodies, sequential one-testthread fresh processes, existing local SVN/Git/SQLite/loopback app. No new source/fixture/Python/TLS-server/catalogue or external network target.",
+    "features": "reliability-fixture enables the authored connecting barrier. No reliability-browser/all-features flag or other selected body.",
+    "prerequisites": "Require git,svn,svnadmin on the exact /usr/bin:/bin case PATH; hash and version-check them under env-i before project compilation. Missing prerequisite FAILS before cases; no installation/fallback and no SKIP credited.",
+    "network": "Online exact toolchain/locked-cache preparation only; test loopback HTTP allowed. Cargo offline is not OS network isolation.",
+    "credentials": "contents:read checkout token not persisted; env-i forwards no repository secrets/OIDC/action runtime credentials. Only source-created disposable fixture credentials.",
+    "git": "Private HOME/config/template/hooks plus existing CI dummy Git author/committer identity; no user config or managed credential chain.",
+    "inventory": "All8 source-registered names required in feature-enabled compiled inventory; selected2 once, neither ignored. Six other names are listed only, not run.",
+    "jobs": "Two Cargo build jobs; inherited per-process prlimit, sampled disk/RAM checks, fresh hosted VM/provider termination; not aggregate resource quotas."
+  },
+  "open_gates": [
+    "Independent exact metadata/effects review pending; source review already hash verified",
+    "Fresh source/tag absence/owner/host-slot/cancellation admission before single tag launch",
+    "Both selected bodies UNRUN; provider terminal plus original artifact custody required",
+    "Ordinary source head/default CI and conditional epic merge/postmerge gates remain separate",
+    "M2a3/3 prior receipts preserved; globalqualification remainsOPEN; issue69/AC7/mainE2E/Phase0 not closed"
+  ],
+  "acceptance_scope": "Bounded setup-wizard terminal-and-idle observation correction, not production status semantics or wholeissue69 completion",
+  "authority": {
+    "current": "Parent current bounded two-case supplement direction under Chris standing routine-test/correction authority; not reuse of old consumed ten-case grant",
+    "preparation": "Ordinary metadata preparation authorized; no publication or execution before independent metadata review and current admission",
+    "retained_route_reference": "b5fafdc1 workflow/profile mechanical provenance only; old source/cases/tag/grant remain historical and untouched"
+  }
+}
