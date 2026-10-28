@@ -1647,7 +1647,9 @@ impl Database {
         historical_id: Uuid,
     ) -> Result<ChangedChildProvenanceReview, DatabaseError> {
         if historical_id.is_nil() {
-            return Err(refused("historical review requires an explicit operation ID"));
+            return Err(refused(
+                "historical review requires an explicit operation ID",
+            ));
         }
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
@@ -1681,10 +1683,11 @@ impl Database {
             .svn_receipt
             .as_ref()
             .ok_or_else(|| refused("historical review SVN receipt is missing"))?;
-        if historical.git_receipt_sha.as_deref()
-            != Some(historical.pins.git.prepared_sha.as_str())
+        if historical.git_receipt_sha.as_deref() != Some(historical.pins.git.prepared_sha.as_str())
         {
-            return Err(refused("historical review Git receipt is missing or differs"));
+            return Err(refused(
+                "historical review Git receipt is missing or differs",
+            ));
         }
         let pin = current.pin();
         let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {

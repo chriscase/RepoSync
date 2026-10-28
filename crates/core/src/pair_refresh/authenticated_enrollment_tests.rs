@@ -3883,7 +3883,11 @@ mod changed_child_provenance_review {
         let schema = conn
             .prepare("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name")
             .unwrap()
-            .query_map([], |row| (0..5).map(|i| row.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<_>>>())
+            .query_map([], |row| {
+                (0..5)
+                    .map(|i| row.get::<_, Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
@@ -3900,7 +3904,11 @@ mod changed_child_provenance_review {
             let mut query = conn.prepare(&sql).unwrap();
             let columns = query.column_count();
             let mut rows = query
-                .query_map([], |row| (0..columns).map(|i| row.get::<_, Value>(i)).collect::<rusqlite::Result<Vec<_>>>())
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
                 .unwrap()
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .unwrap();
@@ -3943,7 +3951,10 @@ mod changed_child_provenance_review {
         let before = storage(&f.db);
         assert_eq!(storage(engine.db()), before);
         let requests = std::fs::read(&f.log).unwrap();
-        assert!(f.db.capture_changed_child_provenance_review(expected, id).is_err());
+        assert!(f
+            .db
+            .capture_changed_child_provenance_review(expected, id)
+            .is_err());
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
         assert_eq!(std::fs::read(&f.log).unwrap(), requests);
@@ -3958,20 +3969,34 @@ mod changed_child_provenance_review {
         value: Option<&str>,
     ) {
         use rusqlite::OptionalExtension;
-        let prior: Option<(String, String)> = f.db.conn()
-            .query_row("SELECT value,updated_at FROM kv_state WHERE key=?1", [key], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional().unwrap();
+        let prior: Option<(String, String)> =
+            f.db.conn()
+                .query_row(
+                    "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .unwrap();
         let original = storage(&f.db);
         match value {
             Some(value) => f.db.set_state(key, value).unwrap(),
-            None => { f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [key]).unwrap(); }
+            None => {
+                f.db.conn()
+                    .execute("DELETE FROM kv_state WHERE key=?1", [key])
+                    .unwrap();
+            }
         }
         refuse_without_repair(f, engine, expected, id);
         match prior {
             Some((value, updated)) => {
                 f.db.conn().execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![key,value,updated]).unwrap();
             }
-            None => { f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [key]).unwrap(); }
+            None => {
+                f.db.conn()
+                    .execute("DELETE FROM kv_state WHERE key=?1", [key])
+                    .unwrap();
+            }
         }
         assert_eq!(storage(&f.db), original);
     }
@@ -3985,17 +4010,27 @@ mod changed_child_provenance_review {
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let op = completed(&f, &engine).await;
         drop(fence); // Stop independent lease heartbeat before full storage comparisons.
-        let original_configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let original_configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let doc_key = format!("pair_refresh_execution_v3:document:{}", op.id);
         let original_document = f.db.get_state(&doc_key).unwrap().unwrap();
         let before = storage(&f.db);
-        let original = f.db.capture_changed_child_provenance_review(&original_configuration, op.id).unwrap();
+        let original =
+            f.db.capture_changed_child_provenance_review(&original_configuration, op.id)
+                .unwrap();
         assert_eq!(original.historical_operation(), &op);
         assert_eq!(original.historical_document(), original_document);
         {
-            let integrated = f.target.find_commit(Oid::from_str(original.historical_child_anchor().0).unwrap()).unwrap();
+            let integrated = f
+                .target
+                .find_commit(Oid::from_str(original.historical_child_anchor().0).unwrap())
+                .unwrap();
             assert_eq!(integrated.parent_count(), 2);
-            assert_eq!(integrated.parent_id(1).unwrap().to_string(), original.historical_parent_anchor().0);
+            assert_eq!(
+                integrated.parent_id(1).unwrap().to_string(),
+                original.historical_parent_anchor().0
+            );
         }
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
@@ -4003,57 +4038,142 @@ mod changed_child_provenance_review {
         // These are deliberately *unproven* current registration values. Real
         // Git commits model R->C and P1->P2; no claim of SVN/current mapping proof
         // is made, and no remote ref, SVN revision or completed receipt is edited.
-        let child = commit(&f.target, b"child after integration\n", &[Oid::from_str(&op.pins.git.prepared_sha).unwrap()]);
+        let child = commit(
+            &f.target,
+            b"child after integration\n",
+            &[Oid::from_str(&op.pins.git.prepared_sha).unwrap()],
+        );
         let parent = commit(&f.target, b"parent after integration\n", &[f.parent]);
         let child_revision = op.svn_receipt.as_ref().unwrap().revision + 2;
         let parent_revision = child_revision + 1;
         for (registration, sha, revision) in [
             (&original_configuration.pin().child, child, child_revision),
-            (&original_configuration.pin().parent, parent, parent_revision),
+            (
+                &original_configuration.pin().parent,
+                parent,
+                parent_revision,
+            ),
         ] {
-            f.db.conn().execute("UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id=?3", rusqlite::params![sha.to_string(), revision, registration.repo_id]).unwrap();
-            f.db.set_state(&format!("last_git_sha_{}", registration.scope_uuid), &sha.to_string()).unwrap();
-            f.db.set_state(&format!("last_svn_rev_{}", registration.repo_id), &revision.to_string()).unwrap();
+            f.db.conn()
+                .execute(
+                    "UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id=?3",
+                    rusqlite::params![sha.to_string(), revision, registration.repo_id],
+                )
+                .unwrap();
+            f.db.set_state(
+                &format!("last_git_sha_{}", registration.scope_uuid),
+                &sha.to_string(),
+            )
+            .unwrap();
+            f.db.set_state(
+                &format!("last_svn_rev_{}", registration.repo_id),
+                &revision.to_string(),
+            )
+            .unwrap();
         }
         refuse_without_repair(&f, &engine, &original_configuration, op.id);
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let before = storage(&f.db);
         let requests = std::fs::read(&f.log).unwrap();
-        let review = f.db.capture_changed_child_provenance_review(&current, op.id).unwrap();
-        assert_eq!(review.historical_parent_anchor(), (op.pins.parent.last_git_sha.as_str(), op.pins.parent.last_svn_rev));
-        assert_eq!(review.historical_child_anchor(), (op.pins.git.prepared_sha.as_str(), op.svn_receipt.as_ref().unwrap().revision));
-        assert_ne!(review.historical_parent_anchor().0, review.historical_child_anchor().0);
+        let review =
+            f.db.capture_changed_child_provenance_review(&current, op.id)
+                .unwrap();
+        assert_eq!(
+            review.historical_parent_anchor(),
+            (
+                op.pins.parent.last_git_sha.as_str(),
+                op.pins.parent.last_svn_rev
+            )
+        );
+        assert_eq!(
+            review.historical_child_anchor(),
+            (
+                op.pins.git.prepared_sha.as_str(),
+                op.svn_receipt.as_ref().unwrap().revision
+            )
+        );
+        assert_ne!(
+            review.historical_parent_anchor().0,
+            review.historical_child_anchor().0
+        );
         assert_eq!(review.current_configuration(), current.pin());
-        assert_eq!(review.current_configuration().child.last_git_sha, child.to_string());
-        assert_eq!(review.current_configuration().parent.last_git_sha, parent.to_string());
-        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target().unwrap().to_string(), op.pins.git.prepared_sha);
-        assert_eq!(f.target.find_reference("refs/heads/main").unwrap().target(), Some(f.parent));
+        assert_eq!(
+            review.current_configuration().child.last_git_sha,
+            child.to_string()
+        );
+        assert_eq!(
+            review.current_configuration().parent.last_git_sha,
+            parent.to_string()
+        );
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string(),
+            op.pins.git.prepared_sha
+        );
+        assert_eq!(
+            f.target.find_reference("refs/heads/main").unwrap().target(),
+            Some(f.parent)
+        );
         assert_eq!(review.historical_operation(), &op);
         assert_eq!(review.historical_document(), original_document);
-        assert_eq!(review.historical_authority_digest(), original.historical_authority_digest());
+        assert_eq!(
+            review.historical_authority_digest(),
+            original.historical_authority_digest()
+        );
         assert_ne!(review.snapshot_digest(), original.snapshot_digest());
         assert!(!review.execution_eligible());
-        for gate in ["historical_baseline_applicability", "current_mapping_provenance", "live_git_graphs_and_remote_freshness"] {
+        for gate in [
+            "historical_baseline_applicability",
+            "current_mapping_provenance",
+            "live_git_graphs_and_remote_freshness",
+        ] {
             assert!(review.unverified_gates().contains(&gate));
         }
-        assert!(f.db.capture_completed_pair_refresh_baseline(&current).is_err());
-        let repeated = f.db.capture_changed_child_provenance_review(&current, op.id).unwrap();
+        assert!(f
+            .db
+            .capture_completed_pair_refresh_baseline(&current)
+            .is_err());
+        let repeated =
+            f.db.capture_changed_child_provenance_review(&current, op.id)
+                .unwrap();
         assert_eq!(review.snapshot_digest(), repeated.snapshot_digest());
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
         assert_eq!(std::fs::read(&f.log).unwrap(), requests);
-        assert_eq!(f.db.get_state(&doc_key).unwrap().unwrap(), original_document);
+        assert_eq!(
+            f.db.get_state(&doc_key).unwrap().unwrap(),
+            original_document
+        );
 
         // Historical signing authority is independent of a valid current
         // credential rotation. No HTTP request is sent with either token here.
-        f.db.set_state("secret_git_token_child", "disposable-m2a-rotated-token").unwrap();
+        f.db.set_state("secret_git_token_child", "disposable-m2a-rotated-token")
+            .unwrap();
         refuse_without_repair(&f, &engine, &current, op.id);
-        let rotated = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let rotated =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let before = storage(&f.db);
-        let rotated_review = f.db.capture_changed_child_provenance_review(&rotated, op.id).unwrap();
-        assert_ne!(rotated_review.current_configuration().credential_context_digest, op.pins.credential_context_digest);
+        let rotated_review =
+            f.db.capture_changed_child_provenance_review(&rotated, op.id)
+                .unwrap();
+        assert_ne!(
+            rotated_review
+                .current_configuration()
+                .credential_context_digest,
+            op.pins.credential_context_digest
+        );
         assert_eq!(rotated_review.historical_operation(), &op);
-        assert_eq!(rotated_review.historical_authority_digest(), original.historical_authority_digest());
+        assert_eq!(
+            rotated_review.historical_authority_digest(),
+            original.historical_authority_digest()
+        );
         assert_eq!(rotated_review.historical_document(), original_document);
         assert_ne!(rotated_review.snapshot_digest(), review.snapshot_digest());
         assert!(!rotated_review.execution_eligible());
@@ -4071,14 +4191,21 @@ mod changed_child_provenance_review {
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let op = completed(&f, &engine).await;
         drop(fence);
-        let expected = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let expected =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let doc_key = format!("pair_refresh_execution_v3:document:{}", op.id);
         let auth_key = format!("pair_refresh_execution_v3:authority:{}", op.id);
         let document = f.db.get_state(&doc_key).unwrap().unwrap();
         let authority = f.db.get_state(&auth_key).unwrap().unwrap();
         refuse_without_repair(&f, &engine, &expected, Uuid::nil());
         refuse_without_repair(&f, &engine, &expected, Uuid::new_v4());
-        for (key, value) in [(&auth_key, None), (&auth_key, Some("{}")), (&doc_key, None), (&doc_key, Some("{}"))] {
+        for (key, value) in [
+            (&auth_key, None),
+            (&auth_key, Some("{}")),
+            (&doc_key, None),
+            (&doc_key, Some("{}")),
+        ] {
             kv_fault(&f, &engine, &expected, op.id, key, value);
         }
         let auth: serde_json::Value = serde_json::from_str(&authority).unwrap();
@@ -4087,49 +4214,156 @@ mod changed_child_provenance_review {
         kv_fault(&f, &engine, &expected, op.id, &auth_key, Some(&tampered));
         let mut missing_receipt: serde_json::Value = serde_json::from_str(&document).unwrap();
         missing_receipt["svn_receipt"] = serde_json::Value::Null;
-        kv_fault(&f, &engine, &expected, op.id, &doc_key, Some(&missing_receipt.to_string()));
-        kv_fault(&f, &engine, &expected, op.id, &format!("last_git_sha_{}", expected.pin().child.scope_uuid), Some(&"f".repeat(40)));
-        kv_fault(&f, &engine, &expected, op.id, &format!("last_svn_rev_{}", expected.pin().parent.repo_id), None);
-        kv_fault(&f, &engine, &expected, op.id, "secret_git_token_child", Some(""));
-        kv_fault(&f, &engine, &expected, op.id, "import_operation_v1:active:child", Some("missing-operation"));
-        kv_fault(&f, &engine, &expected, op.id, &crate::history_inspect::history_block_key(Some("child")), Some("{}"));
+        kv_fault(
+            &f,
+            &engine,
+            &expected,
+            op.id,
+            &doc_key,
+            Some(&missing_receipt.to_string()),
+        );
+        kv_fault(
+            &f,
+            &engine,
+            &expected,
+            op.id,
+            &format!("last_git_sha_{}", expected.pin().child.scope_uuid),
+            Some(&"f".repeat(40)),
+        );
+        kv_fault(
+            &f,
+            &engine,
+            &expected,
+            op.id,
+            &format!("last_svn_rev_{}", expected.pin().parent.repo_id),
+            None,
+        );
+        kv_fault(
+            &f,
+            &engine,
+            &expected,
+            op.id,
+            "secret_git_token_child",
+            Some(""),
+        );
+        kv_fault(
+            &f,
+            &engine,
+            &expected,
+            op.id,
+            "import_operation_v1:active:child",
+            Some("missing-operation"),
+        );
+        kv_fault(
+            &f,
+            &engine,
+            &expected,
+            op.id,
+            &crate::history_inspect::history_block_key(Some("child")),
+            Some("{}"),
+        );
         let alias = format!("pair_refresh_execution_v3:document:{}", Uuid::new_v4());
         kv_fault(&f, &engine, &expected, op.id, &alias, Some(&document));
 
-        let secret: Vec<u8> = f.db.conn().query_row("SELECT secret FROM pair_refresh_journal_key_v3 WHERE id=1", [], |row| row.get(0)).unwrap();
-        f.db.conn().execute("DELETE FROM pair_refresh_journal_key_v3 WHERE id=1", []).unwrap();
+        let secret: Vec<u8> =
+            f.db.conn()
+                .query_row(
+                    "SELECT secret FROM pair_refresh_journal_key_v3 WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        f.db.conn()
+            .execute("DELETE FROM pair_refresh_journal_key_v3 WHERE id=1", [])
+            .unwrap();
         refuse_without_repair(&f, &engine, &expected, op.id);
-        let count: i64 = f.db.conn().query_row("SELECT count(*) FROM pair_refresh_journal_key_v3", [], |row| row.get(0)).unwrap();
+        let count: i64 =
+            f.db.conn()
+                .query_row(
+                    "SELECT count(*) FROM pair_refresh_journal_key_v3",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
         assert_eq!(count, 0);
-        f.db.conn().execute("INSERT INTO pair_refresh_journal_key_v3(id,secret) VALUES(1,?1)", [secret]).unwrap();
+        f.db.conn()
+            .execute(
+                "INSERT INTO pair_refresh_journal_key_v3(id,secret) VALUES(1,?1)",
+                [secret],
+            )
+            .unwrap();
         f.db.conn().execute_batch("CREATE TRIGGER m2a_unknown_key_trigger AFTER UPDATE ON pair_refresh_journal_key_v3 BEGIN SELECT 1; END;").unwrap();
         refuse_without_repair(&f, &engine, &expected, op.id);
-        f.db.conn().execute_batch("DROP TRIGGER m2a_unknown_key_trigger;").unwrap();
+        f.db.conn()
+            .execute_batch("DROP TRIGGER m2a_unknown_key_trigger;")
+            .unwrap();
 
         // Coherent but different current incarnation/configuration cannot reuse
         // the historical authenticated operation. No old document is re-signed.
         let old_scope = expected.pin().child.scope_uuid.clone();
         let new_scope = Uuid::new_v4().to_string();
         let new_key = format!("last_git_sha_{new_scope}");
-        f.db.set_state(&new_key, &expected.pin().child.last_git_sha).unwrap();
-        f.db.conn().execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'", [&new_scope]).unwrap();
-        let recreated = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        f.db.set_state(&new_key, &expected.pin().child.last_git_sha)
+            .unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET scope_uuid=?1 WHERE id='child'",
+                [&new_scope],
+            )
+            .unwrap();
+        let recreated =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         refuse_without_repair(&f, &engine, &recreated, op.id);
-        f.db.conn().execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'", [&old_scope]).unwrap();
-        f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [&new_key]).unwrap();
-        f.db.conn().execute("UPDATE repositories SET git_branch='feature-other' WHERE id='child'", []).unwrap();
-        let changed = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET scope_uuid=?1 WHERE id='child'",
+                [&old_scope],
+            )
+            .unwrap();
+        f.db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&new_key])
+            .unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET git_branch='feature-other' WHERE id='child'",
+                [],
+            )
+            .unwrap();
+        let changed =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         refuse_without_repair(&f, &engine, &changed, op.id);
-        f.db.conn().execute("UPDATE repositories SET git_branch='feature' WHERE id='child'", []).unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET git_branch='feature' WHERE id='child'",
+                [],
+            )
+            .unwrap();
         let echo_key = format!("repo_echo_generation_{}", expected.pin().child.scope_uuid);
         let echo = f.db.get_state(&echo_key).unwrap();
-        f.db.set_state(&echo_key, &(expected.pin().child.echo_generation + 1).to_string()).unwrap();
-        let changed = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        f.db.set_state(
+            &echo_key,
+            &(expected.pin().child.echo_generation + 1).to_string(),
+        )
+        .unwrap();
+        let changed =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         refuse_without_repair(&f, &engine, &changed, op.id);
-        match echo { Some(value) => f.db.set_state(&echo_key, &value).unwrap(), None => { f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [&echo_key]).unwrap(); } }
+        match echo {
+            Some(value) => f.db.set_state(&echo_key, &value).unwrap(),
+            None => {
+                f.db.conn()
+                    .execute("DELETE FROM kv_state WHERE key=?1", [&echo_key])
+                    .unwrap();
+            }
+        }
 
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
-        let window = f.db.begin_ordinary_writer_window(Some("m2a-unregistered-alias")).unwrap();
+        let window =
+            f.db.begin_ordinary_writer_window(Some("m2a-unregistered-alias"))
+                .unwrap();
         refuse_without_repair(&f, &engine, &expected, op.id);
         window.finish_preparation().unwrap();
         drop(fence);
@@ -4137,10 +4371,14 @@ mod changed_child_provenance_review {
         // Existing copied-storage regression mechanism, no new OS adapter.
         let copy_dir = tempfile::tempdir().unwrap();
         let copy_path = copy_dir.path().join("foreign.db");
-        f.db.conn().execute("VACUUM INTO ?1", [copy_path.to_str().unwrap()]).unwrap();
+        f.db.conn()
+            .execute("VACUUM INTO ?1", [copy_path.to_str().unwrap()])
+            .unwrap();
         let foreign = Database::new(copy_path).unwrap();
         let before = storage(&foreign);
-        assert!(foreign.capture_changed_child_provenance_review(&expected, op.id).is_err());
+        assert!(foreign
+            .capture_changed_child_provenance_review(&expected, op.id)
+            .is_err());
         assert_eq!(storage(&foreign), before);
         assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
         assert_eq!(f.db.get_state(&doc_key).unwrap().unwrap(), document);
@@ -4153,16 +4391,23 @@ mod changed_child_provenance_review {
         let f = Fixture::new();
         let engine = f.engine();
         let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
-        let expected = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let expected =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         refuse_without_repair(&f, &engine, &expected, Uuid::new_v4());
         assert!(!key_table(&f));
         let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let (actor, _workspace, prepared) = prepared(&f, &engine).await;
         let approved = actor.prepared_approval_digest(&engine, &prepared).unwrap();
         let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
-        let held = actor.enroll_prepared(&engine, &prepared, "m2a-held", &approved, &busy).unwrap();
+        let held = actor
+            .enroll_prepared(&engine, &prepared, "m2a-held", &approved, &busy)
+            .unwrap();
         let before = journal_state(&f); // Existing independent writer heartbeat excluded.
-        assert!(f.db.capture_changed_child_provenance_review(&expected, held.id).is_err());
+        assert!(f
+            .db
+            .capture_changed_child_provenance_review(&expected, held.id)
+            .is_err());
         assert_eq!(journal_state(&f), before);
         assert_eq!(f.db.pair_refresh_operation(held.id).unwrap(), held);
         assert!(key_table(&f));
