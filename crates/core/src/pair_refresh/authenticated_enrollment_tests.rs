@@ -4084,7 +4084,13 @@ mod changed_child_provenance_review {
             )
             .unwrap();
         }
-        refuse_without_repair(&f, &engine, &original_configuration, op.id, "stale-checkpoints");
+        refuse_without_repair(
+            &f,
+            &engine,
+            &original_configuration,
+            op.id,
+            "stale-checkpoints",
+        );
         let current =
             f.db.capture_pair_refresh_execution_configuration("child")
                 .unwrap();
