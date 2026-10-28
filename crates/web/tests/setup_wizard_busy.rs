@@ -260,21 +260,31 @@ async fn cancel_setup(client: &reqwest::Client, addr: SocketAddr) -> serde_json:
     .expect("timed out cancelling setup import")
 }
 
-async fn wait_terminal(client: &reqwest::Client, addr: SocketAddr) -> serde_json::Value {
+// A durable terminal outcome can precede worker cleanup and BusyGuard release.
+// These callers require both that outcome and actual idle for the same operation.
+async fn wait_terminal(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    operation_id: &str,
+    repo_id: &str,
+) -> serde_json::Value {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let status = setup_status(client, addr).await;
+            assert_eq!(status["operation_id"], operation_id, "{status}");
             if matches!(
                 status["lifecycle"].as_str(),
                 Some("completed" | "cancelled" | "failed" | "reconciliation_required")
-            ) {
+            ) && status["busy"] == false
+                && !reposync_core::busy::is_busy(repo_id)
+            {
                 break status;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("timed out waiting for setup import terminal status")
+    .expect("timed out waiting for setup import terminal and idle status")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -361,7 +371,7 @@ async fn candidate_64c07_setup_wizard_busy_duplicate_cancel_idle_after_terminal(
                 || cancel["lifecycle"] == "completed",
             "{cancel}"
         );
-        let terminal = wait_terminal(&client, addr).await;
+        let terminal = wait_terminal(&client, addr, &op_id, &repo_id).await;
         assert_eq!(terminal["operation_id"], op_id);
         assert_eq!(terminal["busy"], false, "{terminal}");
         assert!(!reposync_core::busy::is_busy(&repo_id));
@@ -377,6 +387,7 @@ async fn candidate_64c07_setup_wizard_busy_duplicate_cancel_idle_after_terminal(
             );
         }
     } else {
+        let status = wait_terminal(&client, addr, &op_id, &repo_id).await;
         assert_eq!(status["busy"], false, "{status}");
         assert!(!reposync_core::busy::is_busy(&repo_id));
     }
@@ -881,7 +892,7 @@ async fn candidate_64c07_setup_wizard_connecting_barrier_busy_and_cancel() {
         .await
         .unwrap();
     assert_eq!(cancel["lifecycle"], "cancel_requested", "{cancel}");
-    let terminal = wait_terminal(&client, addr).await;
+    let terminal = wait_terminal(&client, addr, op_id, &repo_id).await;
     assert_eq!(terminal["lifecycle"], "cancelled", "{terminal}");
     assert_eq!(terminal["busy"], false, "{terminal}");
     assert!(!reposync_core::busy::is_busy(&repo_id));
