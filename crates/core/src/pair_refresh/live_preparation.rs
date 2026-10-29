@@ -757,3 +757,102 @@ where
         context_digest,
     })
 }
+
+/// Selector-free, conservative candidate review. Its private construction adds
+/// exactly-one authenticated stored candidate to M2b's observed role facts;
+/// semantic applicability, correspondence and execution remain unverified.
+pub struct LiveChangedChildBaselineCandidateContext {
+    candidate: crate::db::pair_refresh_operations::ChangedChildBaselineCandidateReview,
+    preview: LiveChangedChildPreviewContext,
+    context_digest: String,
+}
+
+impl LiveChangedChildBaselineCandidateContext {
+    pub fn candidate_review(
+        &self,
+    ) -> &crate::db::pair_refresh_operations::ChangedChildBaselineCandidateReview {
+        &self.candidate
+    }
+
+    pub fn preview_context(&self) -> &LiveChangedChildPreviewContext {
+        &self.preview
+    }
+
+    pub fn context_digest(&self) -> &str {
+        &self.context_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+
+    pub fn verified_gates(&self) -> &'static [&'static str] {
+        &[
+            "single_authenticated_receipt_candidate",
+            "registered_source_preview_recapture",
+            "final_candidate_set_recapture",
+        ]
+    }
+
+    pub fn unverified_gates(&self) -> &'static [&'static str] {
+        self.preview.unverified_gates()
+    }
+}
+
+/// No historical UUID, candidate list, source snapshot or digest is accepted
+/// from the caller. All successful facts originate at registered DB/observers.
+/// Existing selected-history and production preparation paths stay unchanged.
+pub async fn capture_registered_changed_child_baseline_candidate_context(
+    db: &Database,
+    child_id: &str,
+) -> Result<LiveChangedChildBaselineCandidateContext> {
+    capture_changed_child_baseline_candidate_with_sources(db, child_id, None, |_| Ok(())).await
+}
+
+// Reuse the private M2b observer/fault seam. The callback supplies no authority
+// and is only used by this module's disposable tests at the recapture boundary.
+async fn capture_changed_child_baseline_candidate_with_sources<F>(
+    db: &Database,
+    child_id: &str,
+    client: Option<reqwest::Client>,
+    after_sources: F,
+) -> Result<LiveChangedChildBaselineCandidateContext>
+where
+    F: FnOnce(&Database) -> Result<()>,
+{
+    let configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let candidate = db.capture_changed_child_baseline_candidate_review(&configuration)?;
+    let selected = candidate.selected_review();
+    let preview = capture_changed_child_preview_with_sources(
+        db,
+        child_id,
+        selected.historical_operation().id,
+        client,
+        after_sources,
+    )
+    .await?;
+    if preview.current_configuration() != configuration.pin()
+        || preview.historical_review().snapshot_digest() != selected.snapshot_digest()
+    {
+        bail!("baseline candidate changed before registered preview capture");
+    }
+    let current = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let repeated = db.capture_changed_child_baseline_candidate_review(&current)?;
+    if current.pin() != configuration.pin()
+        || repeated.candidate_set_digest() != candidate.candidate_set_digest()
+    {
+        bail!("authenticated baseline candidate set changed during preview");
+    }
+    use sha2::Digest;
+    let context_digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(
+        "changed_child_baseline_candidate_context_v1",
+        candidate.candidate_set_digest(),
+        preview.context_digest(),
+        current.pin(),
+    ))?));
+    Ok(LiveChangedChildBaselineCandidateContext {
+        candidate,
+        preview,
+        context_digest,
+    })
+}

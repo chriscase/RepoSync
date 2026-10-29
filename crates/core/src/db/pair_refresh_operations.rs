@@ -1755,3 +1755,142 @@ impl Database {
         Ok(snapshot)
     }
 }
+
+/// Conservative stored-candidate closure for review, not semantic baseline
+/// applicability. Construction authenticates the entire journal and requires
+/// exactly one same-incarnation completed v3 receipt. No caller selects its ID.
+/// Private fields and no Deserialize/Clone prevent caller-minted proof values.
+pub struct ChangedChildBaselineCandidateReview {
+    selected: ChangedChildProvenanceReview,
+    candidate_set_digest: String,
+}
+
+impl ChangedChildBaselineCandidateReview {
+    pub fn selected_review(&self) -> &ChangedChildProvenanceReview {
+        &self.selected
+    }
+
+    /// Unkeyed capture identity, not a signature or an execution capability.
+    pub fn candidate_set_digest(&self) -> &str {
+        &self.candidate_set_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+}
+
+impl Database {
+    /// Read-only supported subset: one authenticated completed receipt matching
+    /// both current incarnations/endpoints/policy. Legitimate multi-receipt
+    /// chains are refused too; there is no newest/ancestry/equal-tree tie-break.
+    pub fn capture_changed_child_baseline_candidate_review(
+        &self,
+        expected: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+    ) -> Result<ChangedChildBaselineCandidateReview, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &expected.pin().child.repo_id,
+            )?;
+        if current.pin() != expected.pin() {
+            return Err(refused("baseline candidate current context changed"));
+        }
+        // Global integrity validation is mandatory even for unrelated or
+        // otherwise ineligible entries. Never read a filtered raw SQL journal.
+        let operations = journal(&tx)?;
+        let pin = current.pin();
+        let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        let candidates = operations
+            .iter()
+            .filter(|op| {
+                let lineage = &op.pins.svn.pins.lineage.pins;
+                op.version == 3
+                    && op.phase == PairRefreshPhase::Completed
+                    && op.reconciliation_detail.is_none()
+                    && same_incarnation(&op.pins.child, &pin.child)
+                    && same_incarnation(&op.pins.parent, &pin.parent)
+                    && op.pins.git_remote_url == pin.git_remote_url
+                    && op.pins.git_branch == pin.child_git_branch
+                    && op.pins.transport_policy == pin.transport_policy
+                    && lineage.child_url == pin.child_svn_url
+                    && lineage.parent_url == pin.parent_svn_url
+            })
+            .collect::<Vec<_>>();
+        let historical = match candidates.as_slice() {
+            [only] => *only,
+            [] => {
+                return Err(refused(
+                    "no authenticated same-incarnation receipt candidate",
+                ))
+            }
+            _ => return Err(refused("ambiguous authenticated receipt candidates")),
+        };
+        for registration in [&pin.child, &pin.parent] {
+            require_no_pair_refresh_hold(&tx, Some(&registration.repo_id))?;
+            require_other_journals_quiet(&tx, &registration.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &registration.repo_id,
+                &registration.scope_uuid,
+            )?;
+        }
+        require_execution_conflicts_quiet(&tx, &historical.pins)?;
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("baseline candidate document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("baseline candidate authority disappeared"))?;
+        let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
+        let receipt = historical
+            .svn_receipt
+            .as_ref()
+            .ok_or_else(|| refused("baseline candidate SVN receipt is missing"))?;
+        let snapshot_digest = digest(&(
+            "changed_child_provenance_review_v1",
+            historical.id,
+            pin,
+            &document,
+            &authority_digest,
+        ))?;
+        // Count is explicit; successful construction has inspected the entire
+        // authenticated journal, not just this document. Current credentials
+        // are independently resolved, never compared to historical secrets.
+        let candidate_set_digest = digest(&(
+            "changed_child_baseline_candidate_set_v1",
+            pin,
+            candidates.len(),
+            historical.id,
+            &document,
+            &authority_digest,
+        ))?;
+        let result = ChangedChildBaselineCandidateReview {
+            selected: ChangedChildProvenanceReview {
+                historical: historical.clone(),
+                historical_document: document,
+                historical_authority_digest: authority_digest,
+                historical_child_revision: receipt.revision,
+                current: pin.clone(),
+                snapshot_digest,
+            },
+            candidate_set_digest,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+}
