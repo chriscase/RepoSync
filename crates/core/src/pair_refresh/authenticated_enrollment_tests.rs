@@ -4953,3 +4953,646 @@ mod changed_child_preview_binding {
         assert!(!second.execution_eligible());
     }
 }
+
+// Candidate-closure tests use genuine completed production receipts and the
+// existing private TLS/Git/SVN fixture; no positive journal MAC is fabricated.
+mod changed_child_baseline_candidate_closure {
+    use super::*;
+    use crate::db::pair_refresh_operations::{
+        ChangedChildBaselineCandidateReview, PairRefreshOperation, PairRefreshPhase,
+    };
+    use std::collections::BTreeMap;
+
+    type Storage = BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>;
+
+    fn storage(db: &Database) -> Storage {
+        use rusqlite::types::Value;
+        let conn = db.conn();
+        let mut snapshot = BTreeMap::new();
+        let schema = conn
+            .prepare("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| {
+                (0..5)
+                    .map(|i| row.get::<_, Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        snapshot.insert("schema".into(), schema);
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in tables {
+            let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+            let mut query = conn.prepare(&sql).unwrap();
+            let columns = query.column_count();
+            let mut values = query
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            values.sort_by_cached_key(|row| format!("{row:?}"));
+            snapshot.insert(table, values);
+        }
+        snapshot
+    }
+
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                if kind.is_dir() {
+                    collect(root, &entry.path(), out);
+                } else {
+                    assert!(kind.is_file());
+                    out.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        collect(root, root, &mut out);
+        out
+    }
+
+    fn set_checkpoint(f: &Fixture, id: &str, sha: Oid, revision: i64) {
+        let scope: String =
+            f.db.conn()
+                .query_row(
+                    "SELECT scope_uuid FROM repositories WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id=?3",
+                rusqlite::params![sha.to_string(), revision, id],
+            )
+            .unwrap();
+        f.db.set_state(&format!("last_git_sha_{scope}"), &sha.to_string())
+            .unwrap();
+        f.db.set_state(&format!("last_svn_rev_{id}"), &revision.to_string())
+            .unwrap();
+    }
+
+    fn svn_revision(url: &str) -> i64 {
+        let mut command = Command::new("svn");
+        command
+            .args(["info", "--show-item", "revision", url])
+            .args(["--non-interactive", "--no-auth-cache"]);
+        let revision: i64 = run(&mut command)
+            .trim()
+            .parse()
+            .expect("SVN revision query returned malformed stdout");
+        assert!(revision > 0, "SVN revision must be positive");
+        revision
+    }
+
+    fn advance(f: &Fixture, op: &PairRefreshOperation) {
+        let child_wc = f.temp.path().join("m2b-child-wc");
+        svn(
+            &[
+                "checkout",
+                &format!("{}/branches/f", f.root),
+                child_wc.to_str().unwrap(),
+            ],
+            None,
+        );
+        std::fs::write(child_wc.join("file.txt"), b"child work\n").unwrap();
+        svn(&["commit", "-m", "m2b child work"], Some(&child_wc));
+        let child_revision = svn_revision(&format!("{}/branches/f", f.root));
+        std::fs::write(f._parent_wc.join("file.txt"), b"parent work\n").unwrap();
+        svn(&["commit", "-m", "m2b parent work"], Some(&f._parent_wc));
+        let parent_revision = svn_revision(&format!("{}/trunk", f.root));
+        let r = Oid::from_str(&op.pins.git.prepared_sha).unwrap();
+        let p1 = Oid::from_str(&op.pins.parent.last_git_sha).unwrap();
+        let c = commit(&f.target, b"child work\n", &[r]);
+        let p2 = commit(&f.target, b"parent work\n", &[p1]);
+        f.target
+            .reference("refs/heads/feature", c, true, "disposable m2b fixture")
+            .unwrap();
+        f.target
+            .reference("refs/heads/main", p2, true, "disposable m2b fixture")
+            .unwrap();
+        set_checkpoint(f, "child", c, child_revision);
+        set_checkpoint(f, "parent", p2, parent_revision);
+    }
+
+    fn saved_kv(f: &Fixture, key: &str) -> Option<(String, String)> {
+        use rusqlite::OptionalExtension;
+        f.db.conn()
+            .query_row(
+                "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn restore_kv(f: &Fixture, key: &str, value: Option<(String, String)>) {
+        match value {
+            Some((value, updated)) => {
+                f.db.conn().execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![key, value, updated]).unwrap();
+            }
+            None => {
+                f.db.conn()
+                    .execute("DELETE FROM kv_state WHERE key=?1", [key])
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn completed(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+        request: &str,
+    ) -> PairRefreshOperation {
+        let (actor, _workspace, value) = prepared(f, engine).await;
+        let approved = actor.prepared_approval_digest(engine, &value).unwrap();
+        let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+        let op = super::super::super::execution::complete_owned_refresh_with_client(
+            engine,
+            &actor,
+            &value,
+            request,
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.version, 3);
+        assert_eq!(op.phase, PairRefreshPhase::Completed);
+        assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
+        op
+    }
+
+    async fn ready(f: &Fixture, engine: &crate::sync_engine::SyncEngine) -> PairRefreshOperation {
+        let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let op = completed(f, engine, "m2c-first-genuine-receipt").await;
+        drop(fence);
+        advance(f, &op);
+        op
+    }
+
+    fn candidate(
+        f: &Fixture,
+    ) -> Result<ChangedChildBaselineCandidateReview, crate::errors::DatabaseError> {
+        let current = f.db.capture_pair_refresh_execution_configuration("child")?;
+        f.db.capture_changed_child_baseline_candidate_review(&current)
+    }
+
+    async fn capture(
+        f: &Fixture,
+    ) -> anyhow::Result<super::super::LiveChangedChildBaselineCandidateContext> {
+        super::super::capture_changed_child_baseline_candidate_with_sources(
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    fn request_log(f: &Fixture) -> Option<Vec<u8>> {
+        match std::fs::read(&f.log) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("request-log observation failed: {error}"),
+        }
+    }
+
+    #[track_caller]
+    fn refuse_stored_without_repair(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+        expected_detail: &str,
+    ) {
+        let before = storage(&f.db);
+        let refs_and_objects = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let requests = request_log(f);
+        let error = match candidate(f) {
+            Ok(_) => panic!("accepted negative candidate subcase {expected_detail}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected_detail), "unexpected refusal: {error}");
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(f.target.path()), refs_and_objects);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        assert_eq!(request_log(f), requests);
+    }
+
+    // Two actual production completions, including distinct parent commits
+    // that return to the same content. No receipt/document/authority is signed
+    // by a test helper. Real SVN revisions and Git commits retain their history.
+    async fn two_genuine_receipts(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+    ) -> (PairRefreshOperation, PairRefreshOperation) {
+        let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let first = completed(f, engine, "m2c-chain-first").await;
+        std::fs::write(f._parent_wc.join("file.txt"), b"temporary parent work\n").unwrap();
+        svn(&["commit", "-m", "m2c temporary parent work"], Some(&f._parent_wc));
+        let temporary = commit(&f.target, b"temporary parent work\n", &[f.parent]);
+        std::fs::write(f._parent_wc.join("file.txt"), b"advanced\n").unwrap();
+        svn(&["commit", "-m", "m2c parent content return"], Some(&f._parent_wc));
+        let parent_revision = svn_revision(&format!("{}/trunk", f.root));
+        let parent = commit(&f.target, b"advanced\n", &[temporary]);
+        f.target
+            .reference("refs/heads/main", parent, true, "disposable m2c parent advance")
+            .unwrap();
+        f.db.insert_commit_map_with_repo(
+            parent_revision,
+            &parent.to_string(),
+            "svn_to_git",
+            "fixture",
+            "fixture",
+            Some("parent"),
+        )
+        .unwrap();
+        f.db.update_repo_watermark("parent", parent_revision, &parent.to_string())
+            .unwrap();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &f.db.conn(),
+            "parent",
+            &parent.to_string(),
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+        let second = completed(f, engine, "m2c-chain-second").await;
+        drop(fence);
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.pins.git.prepared_sha, second.pins.git.prepared_sha);
+        assert_eq!(first.pins.git.tree_sha, second.pins.git.tree_sha);
+        assert_ne!(
+            first.svn_receipt.as_ref().unwrap().revision,
+            second.svn_receipt.as_ref().unwrap().revision
+        );
+        assert_eq!(f.db.pair_refresh_operation(first.id).unwrap(), first);
+        assert_eq!(f.db.pair_refresh_operation(second.id).unwrap(), second);
+        (first, second)
+    }
+
+    // Withhold and restore exact genuine rows only to control the read boundary.
+    // The shared signing key and both genuine completion documents are retained.
+    fn operation_rows(f: &Fixture, id: Uuid) -> Vec<(String, String, String)> {
+        let document = format!("pair_refresh_execution_v3:document:{id}");
+        let authority = format!("pair_refresh_execution_v3:authority:{id}");
+        let rows = f.db.conn()
+            .prepare("SELECT key,value,updated_at FROM kv_state WHERE key=?1 OR key=?2 OR (key LIKE 'pair_refresh_execution_v3:request:%' AND value=?3) ORDER BY key")
+            .unwrap()
+            .query_map(rusqlite::params![document, authority, id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        rows
+    }
+
+    fn remove_rows(f: &Fixture, rows: &[(String, String, String)]) {
+        for (key, _, _) in rows {
+            assert_eq!(f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [key]).unwrap(), 1);
+        }
+    }
+
+    fn restore_rows(f: &Fixture, rows: &[(String, String, String)]) {
+        for (key, value, updated) in rows {
+            assert_eq!(
+                f.db.conn()
+                    .execute(
+                        "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+                        rusqlite::params![key, value, updated],
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_authenticated_candidate_is_stable_read_only_and_never_execution() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let op = ready(&f, &engine).await;
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let requests = request_log(&f).unwrap();
+        let first = capture(&f).await.unwrap();
+        let second = capture(&f).await.unwrap();
+        assert_eq!(
+            first.candidate_review().selected_review().historical_operation(),
+            &op
+        );
+        assert_eq!(first.preview_context().historical_review().historical_operation(), &op);
+        assert_eq!(first.context_digest(), second.context_digest());
+        assert_eq!(
+            first.candidate_review().candidate_set_digest(),
+            second.candidate_review().candidate_set_digest()
+        );
+        assert_ne!(first.context_digest(), first.preview_context().context_digest());
+        assert_ne!(op.pins.parent.last_git_sha, op.pins.git.prepared_sha);
+        assert_ne!(first.preview_context().git_sources().child_tip, op.pins.git.prepared_sha);
+        assert_ne!(first.preview_context().git_sources().parent_tip, op.pins.parent.last_git_sha);
+        assert!(!first.preview_context().parent_contains_integrated_child());
+        assert!(first.verified_gates().contains(&"single_authenticated_receipt_candidate"));
+        for gate in [
+            "unique_applicable_historical_baseline",
+            "current_mapping_provenance",
+            "svn_visibility_content_properties_mergeinfo_correspondence",
+            "current_actor_session_authorization",
+            "exclusive_changed_child_execution_admission",
+        ] {
+            assert!(first.unverified_gates().contains(&gate));
+        }
+        assert!(!first.execution_eligible());
+        assert!(!first.candidate_review().execution_eligible());
+        assert!(!first.preview_context().execution_eligible());
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        let reads = request_log(&f).unwrap();
+        assert!(reads.starts_with(&requests));
+        let added = std::str::from_utf8(&reads[requests.len()..]).unwrap();
+        assert!(added.contains("git-upload-pack"));
+        assert!(!added.contains("git-receive-pack"));
+        let scratch = first.preview.git.repository().path().to_owned();
+        assert_eq!(first.preview.git.repository().references().unwrap().count(), 0);
+        assert!(!scratch.join("FETCH_HEAD").exists());
+        drop(first);
+        assert!(!scratch.exists());
+
+        // Independent current credential resolution permits a valid rotation
+        // for stored closure capture without reviving or altering signed history.
+        let old = candidate(&f).unwrap();
+        f.db.set_state("secret_git_token_child", "disposable-m2c-rotated-token").unwrap();
+        let rotated_state = storage(&f.db);
+        let rotated = candidate(&f).unwrap();
+        assert_eq!(
+            old.selected_review().historical_document(),
+            rotated.selected_review().historical_document()
+        );
+        assert_eq!(
+            old.selected_review().historical_authority_digest(),
+            rotated.selected_review().historical_authority_digest()
+        );
+        assert_ne!(old.candidate_set_digest(), rotated.candidate_set_digest());
+        assert_eq!(storage(&f.db), rotated_state);
+        assert_eq!(storage(engine.db()), rotated_state);
+        // No live request is made with the rotated token in this storage check.
+        assert_eq!(request_log(&f).unwrap(), reads);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_or_ineligible_history_cannot_supply_a_candidate() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        refuse_stored_without_repair(
+            &f,
+            &engine,
+            "no authenticated same-incarnation receipt candidate",
+        );
+        assert!(!key_table(&f));
+        assert_eq!(request_log(&f), None);
+        {
+            let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+            let (actor, _workspace, value) = prepared(&f, &engine).await;
+            let approved = actor.prepared_approval_digest(&engine, &value).unwrap();
+            let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+            let held = actor
+                .enroll_prepared(&engine, &value, "m2c-not-completed", &approved, &busy)
+                .unwrap();
+            assert_eq!(held.phase, PairRefreshPhase::Prepared);
+            let before = journal_state(&f);
+            assert!(candidate(&f).is_err());
+            assert_eq!(journal_state(&f), before);
+            let cancelled = actor.cancel_prepared_enrollment(&engine, &value, &busy).unwrap();
+            assert_eq!(cancelled.phase, PairRefreshPhase::CancelledBeforePublication);
+            drop(fence);
+        }
+        // A real cancelled authority remains valid stored history but cannot
+        // become a completed-receipt candidate. No signing key is synthesized.
+        refuse_stored_without_repair(
+            &f,
+            &engine,
+            "no authenticated same-incarnation receipt candidate",
+        );
+        let op = ready(&f, &engine).await;
+        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let echo = format!("repo_echo_generation_{}", current.pin().child.scope_uuid);
+        let saved = saved_kv(&f, &echo);
+        f.db.set_state(&echo, &(current.pin().child.echo_generation + 1).to_string()).unwrap();
+        refuse_stored_without_repair(
+            &f,
+            &engine,
+            "no authenticated same-incarnation receipt candidate",
+        );
+        restore_kv(&f, &echo, saved);
+        let old_scope = current.pin().child.scope_uuid.clone();
+        let new_scope = Uuid::new_v4().to_string();
+        let key = format!("last_git_sha_{new_scope}");
+        f.db.set_state(&key, &current.pin().child.last_git_sha).unwrap();
+        f.db.conn()
+            .execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'", [&new_scope])
+            .unwrap();
+        refuse_stored_without_repair(
+            &f,
+            &engine,
+            "no authenticated same-incarnation receipt candidate",
+        );
+        f.db.conn()
+            .execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'", [&old_scope])
+            .unwrap();
+        f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [&key]).unwrap();
+        f.db.conn()
+            .execute("UPDATE repositories SET git_branch='other-feature' WHERE id='child'", [])
+            .unwrap();
+        refuse_stored_without_repair(
+            &f,
+            &engine,
+            "no authenticated same-incarnation receipt candidate",
+        );
+        f.db.conn()
+            .execute("UPDATE repositories SET git_branch='feature' WHERE id='child'", [])
+            .unwrap();
+        assert_eq!(candidate(&f).unwrap().selected_review().historical_operation(), &op);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multiple_genuine_receipts_refuse_without_recency_or_equal_tree_selection() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let (first, second) = two_genuine_receipts(&f, &engine).await;
+        let first_rows = operation_rows(&f, first.id);
+        let second_rows = operation_rows(&f, second.id);
+        refuse_stored_without_repair(&f, &engine, "ambiguous authenticated receipt candidates");
+        let before = storage(&f.db);
+        let requests = request_log(&f);
+        let error = match capture(&f).await {
+            Ok(_) => panic!("selector-free live factory accepted two genuine receipts"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ambiguous authenticated receipt candidates"));
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(request_log(&f), requests);
+        assert_eq!(operation_rows(&f, first.id), first_rows);
+        assert_eq!(operation_rows(&f, second.id), second_rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_or_registration_drift_invalidates_final_recapture() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let (first, second) = two_genuine_receipts(&f, &engine).await;
+        let second_rows = operation_rows(&f, second.id);
+        remove_rows(&f, &second_rows);
+        assert_eq!(candidate(&f).unwrap().selected_review().historical_operation(), &first);
+        let target = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let injected = std::cell::RefCell::new(None);
+        let result = super::super::capture_changed_child_baseline_candidate_with_sources(
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |_| {
+                restore_rows(&f, &second_rows);
+                *injected.borrow_mut() = Some(storage(&f.db));
+                Ok(())
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("late second genuine receipt did not invalidate candidate closure"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("ambiguous authenticated receipt candidates"), "{error}");
+        assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
+        assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
+        assert_eq!(operation_rows(&f, second.id), second_rows);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+
+        // Remove the exact fixture's second rows again, then change current
+        // registration only after the initial authenticated/live observations.
+        remove_rows(&f, &second_rows);
+        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let echo = format!("repo_echo_generation_{}", current.pin().child.scope_uuid);
+        let prior = saved_kv(&f, &echo);
+        let injected = std::cell::RefCell::new(None);
+        let result = super::super::capture_changed_child_baseline_candidate_with_sources(
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |db| {
+                db.set_state(&echo, &(current.pin().child.echo_generation + 1).to_string())?;
+                *injected.borrow_mut() = Some(storage(db));
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(injected.borrow().is_some(), "fault boundary was not reached");
+        assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
+        assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        restore_kv(&f, &echo, prior);
+        restore_rows(&f, &second_rows);
+        assert_eq!(f.db.pair_refresh_operation(second.id).unwrap(), second);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corrupt_or_held_authority_refuses_without_repair() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let op = ready(&f, &engine).await;
+        let auth = format!("pair_refresh_execution_v3:authority:{}", op.id);
+        let doc = format!("pair_refresh_execution_v3:document:{}", op.id);
+        for (key, value) in [
+            (auth.clone(), Some("{}")),
+            (auth.clone(), None),
+            (doc.clone(), Some("{}")),
+            ("pair_refresh_execution_v99:unknown:retained".into(), Some("{}")),
+            ("import_operation_v1:active:child".into(), Some("retained-m2c-import")),
+        ] {
+            let prior = saved_kv(&f, &key);
+            match value {
+                Some(value) => f.db.set_state(&key, value).unwrap(),
+                None => {
+                    f.db.conn()
+                        .execute("DELETE FROM kv_state WHERE key=?1", [&key])
+                        .unwrap();
+                }
+            }
+            // Different malformed/unknown/held gates have distinct original
+            // diagnostics; preserve all evidence instead of repairing on read.
+            refuse_stored_without_repair(&f, &engine, "pair refresh journal:");
+            restore_kv(&f, &key, prior);
+        }
+        let original = storage(&f.db);
+        let secret: Vec<u8> = f
+            .db
+            .conn()
+            .query_row("SELECT secret FROM pair_refresh_journal_key_v3 WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        f.db.conn().execute("DELETE FROM pair_refresh_journal_key_v3 WHERE id=1", []).unwrap();
+        refuse_stored_without_repair(&f, &engine, "pair refresh journal:");
+        assert!(!f
+            .db
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pair_refresh_journal_key_v3 WHERE id=1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        f.db.conn()
+            .execute("INSERT INTO pair_refresh_journal_key_v3(id,secret) VALUES(1,?1)", [secret])
+            .unwrap();
+        assert_eq!(storage(&f.db), original);
+
+        // Exercise a real current writer admission; the independent existing
+        // lease heartbeat is excluded only in this bounded held-window check.
+        let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let window = f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+        window.require_engine_scope(&f.db, Some("child")).unwrap();
+        let before = journal_state(&f);
+        assert!(candidate(&f).is_err());
+        assert_eq!(journal_state(&f), before);
+        window.finish_preparation().unwrap();
+        drop(fence);
+        assert_eq!(candidate(&f).unwrap().selected_review().historical_operation(), &op);
+    }
+}
