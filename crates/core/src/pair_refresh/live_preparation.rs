@@ -480,3 +480,283 @@ mod tests;
 #[cfg(test)]
 #[path = "workspace_preparation_tests.rs"]
 mod workspace_tests;
+
+/// Factory-only, read-only source context. This is neither an applicable-baseline
+/// certificate nor an approved changed-child result. In particular, registered
+/// checkpoints do not themselves prove Git/SVN content or mapping correspondence.
+/// There is deliberately no public constructor, Clone, Serialize or Deserialize.
+pub struct LiveChangedChildPreviewContext {
+    history: crate::db::pair_refresh_operations::ChangedChildProvenanceReview,
+    configuration: LiveExecutionConfiguration,
+    git: GitSourceSnapshot,
+    svn: SvnSourceSnapshot,
+    lineage: super::lineage::SvnRefreshLineageProof,
+    roles: ChangedChildRoleFacts,
+    context_digest: String,
+}
+
+#[derive(serde::Serialize)]
+struct ChangedChildRoleFacts {
+    parent_anchor: String,
+    integrated_child: String,
+    current_child: String,
+    current_parent: String,
+    parent_anchor_tree: String,
+    integrated_child_tree: String,
+    current_child_tree: String,
+    current_parent_tree: String,
+    parent_contains_integrated_child: bool,
+}
+
+impl LiveChangedChildPreviewContext {
+    pub fn historical_review(
+        &self,
+    ) -> &crate::db::pair_refresh_operations::ChangedChildProvenanceReview {
+        &self.history
+    }
+
+    pub fn current_configuration(
+        &self,
+    ) -> &super::execution_configuration::ExecutionConfigurationPin {
+        self.configuration.pin()
+    }
+
+    pub fn git_sources(&self) -> &super::git_sources::ObservedGitSourcePins {
+        self.git.pins()
+    }
+
+    pub fn svn_sources(&self) -> &super::svn_sources::ObservedSvnSourcePins {
+        self.svn.pins()
+    }
+
+    pub fn svn_lineage(&self) -> &super::lineage::SvnRefreshLineageProof {
+        &self.lineage
+    }
+
+    /// Tree identities in the fixed order P1, R, C, P2. Equal trees never stand
+    /// in for a role's commit identity or for SVN correspondence.
+    pub fn role_tree_ids(&self) -> [&str; 4] {
+        [
+            &self.roles.parent_anchor_tree,
+            &self.roles.integrated_child_tree,
+            &self.roles.current_child_tree,
+            &self.roles.current_parent_tree,
+        ]
+    }
+
+    /// This may legitimately be false: P2 advances from P1, not necessarily R.
+    pub fn parent_contains_integrated_child(&self) -> bool {
+        self.roles.parent_contains_integrated_child
+    }
+
+    /// Unkeyed identity of captured facts, not an actor's approval or a job pin.
+    pub fn context_digest(&self) -> &str {
+        &self.context_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+
+    pub fn verified_gates(&self) -> &'static [&'static str] {
+        &[
+            "authenticated_stored_receipt",
+            "current_registration_and_credential_capture",
+            "registered_git_tip_observations",
+            "historical_git_object_identity",
+            "role_specific_git_ancestry",
+            "registered_svn_identity_and_checkpoint_history",
+            "svn_copy_and_parent_incarnation_continuity",
+            "repeated_git_svn_observation_pins",
+            "final_stored_context_recapture",
+        ]
+    }
+
+    pub fn unverified_gates(&self) -> &'static [&'static str] {
+        &[
+            "unique_applicable_historical_baseline",
+            "current_mapping_provenance",
+            "svn_visibility_content_properties_mergeinfo_correspondence",
+            "current_actor_session_authorization",
+            "authenticated_resolution_freshness",
+            "exclusive_changed_child_execution_admission",
+            "atomic_remote_freshness_after_return",
+        ]
+    }
+}
+
+/// Capture sources for review using registered observers, never caller-supplied
+/// tips, object repositories, mapping assertions or inspection digests. Reads
+/// create private observation scratch and make configured Git/SVN read requests.
+/// No prepared merge, checkout result, DB write, ref update or admission is made.
+pub async fn capture_registered_changed_child_preview_context(
+    db: &Database,
+    child_id: &str,
+    historical_operation_id: Uuid,
+) -> Result<LiveChangedChildPreviewContext> {
+    capture_changed_child_preview_with_sources(
+        db,
+        child_id,
+        historical_operation_id,
+        None,
+        |_| Ok(()),
+    )
+    .await
+}
+
+async fn changed_child_git_observation(
+    configuration: LiveExecutionConfiguration,
+    client: Option<reqwest::Client>,
+) -> Result<(LiveExecutionConfiguration, GitSourceSnapshot)> {
+    tokio::task::spawn_blocking(move || {
+        let git = match client {
+            Some(client) => super::git_sources::observe_with_client(&configuration, client)?,
+            None => observe_registered_git_sources(&configuration)?,
+        };
+        Ok::<_, anyhow::Error>((configuration, git))
+    })
+    .await
+    .context("changed-child Git source observation task failed")?
+}
+
+fn changed_child_role_facts(
+    git: &GitSourceSnapshot,
+    history: &crate::db::pair_refresh_operations::ChangedChildProvenanceReview,
+) -> Result<ChangedChildRoleFacts> {
+    let repository = git.repository();
+    let operation = history.historical_operation();
+    // Reuse the existing exact signed-object validator. Do not manufacture an
+    // absent R or weaken the old clean-child policy that created this receipt.
+    super::preparation::require_prepared_refresh_object(repository, &operation.pins.git)?;
+    let p1 = git2::Oid::from_str(history.historical_parent_anchor().0)?;
+    let r = git2::Oid::from_str(history.historical_child_anchor().0)?;
+    let c = git2::Oid::from_str(&git.pins().child_tip)?;
+    let p2 = git2::Oid::from_str(&git.pins().parent_tip)?;
+    if (c != r && !repository.graph_descendant_of(c, r)?)
+        || (p2 != p1 && !repository.graph_descendant_of(p2, p1)?)
+    {
+        bail!("changed-child sources do not descend from their distinct receipt roles");
+    }
+    let mut trees = Vec::new();
+    for id in [p1, r, c, p2] {
+        let tree = repository.find_commit(id)?.tree()?;
+        super::preparation::require_supported_refresh_tree(repository, &tree)?;
+        trees.push(tree.id().to_string());
+    }
+    if trees[0] != operation.pins.git.tree_sha || trees[1] != operation.pins.git.tree_sha {
+        bail!("historical Git tree differs from its authenticated receipt");
+    }
+    Ok(ChangedChildRoleFacts {
+        parent_anchor: p1.to_string(),
+        integrated_child: r.to_string(),
+        current_child: c.to_string(),
+        current_parent: p2.to_string(),
+        parent_anchor_tree: trees[0].clone(),
+        integrated_child_tree: trees[1].clone(),
+        current_child_tree: trees[2].clone(),
+        current_parent_tree: trees[3].clone(),
+        parent_contains_integrated_child: p2 == r || repository.graph_descendant_of(p2, r)?,
+    })
+}
+
+// Private composition seam: production passes no injected client or callback.
+// Tests use the existing private fixture CA and a fault at the recapture boundary;
+// neither supplies a source snapshot or bypasses the registered observers.
+async fn capture_changed_child_preview_with_sources<F>(
+    db: &Database,
+    child_id: &str,
+    historical_operation_id: Uuid,
+    client: Option<reqwest::Client>,
+    after_sources: F,
+) -> Result<LiveChangedChildPreviewContext>
+where
+    F: FnOnce(&Database) -> Result<()>,
+{
+    if historical_operation_id.is_nil() {
+        bail!("changed-child review requires an explicit historical operation");
+    }
+    let configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let history =
+        db.capture_changed_child_provenance_review(&configuration, historical_operation_id)?;
+    let source = configuration.pin().clone();
+    let (configuration, git) = changed_child_git_observation(configuration, client.clone()).await?;
+    let svn = observe_registered_svn_sources(&configuration).await?;
+    let roles = changed_child_role_facts(&git, &history)?;
+    let historical = history.historical_operation();
+    let old_lineage = &historical.pins.svn.pins.lineage;
+    let receipt = historical
+        .svn_receipt
+        .as_ref()
+        .context("authenticated historical SVN receipt is missing")?;
+    let observed = svn.pins();
+    if observed.repository_uuid != old_lineage.pins.child.repository_uuid
+        || observed.repository_root_url != old_lineage.pins.repository_root_url
+        || observed.child_path != receipt.child_copy.child_path
+        || observed.parent_path != receipt.child_copy.parent_path
+        || observed.child_url != receipt.child_url
+        || source.child.last_svn_rev < receipt.revision
+        || source.parent.last_svn_rev < historical.pins.parent.last_svn_rev
+    {
+        bail!("current SVN source identity or role range differs from signed history");
+    }
+    let lineage = inspect_svn_refresh_lineage(
+        svn.child_client(),
+        svn.parent_client(),
+        &SvnRefreshLineagePins {
+            child: SvnLineagePins {
+                repository_uuid: observed.repository_uuid.clone(),
+                child_path: observed.child_path.clone(),
+                parent_path: observed.parent_path.clone(),
+                child_revision: source.child.last_svn_rev,
+                child_mapping_revision: receipt.revision,
+                parent_baseline_revision: historical.pins.parent.last_svn_rev,
+            },
+            repository_root_url: observed.repository_root_url.clone(),
+            child_url: source.child_svn_url.clone(),
+            parent_url: source.parent_svn_url.clone(),
+            parent_revision: source.parent.last_svn_rev,
+        },
+    )
+    .await?;
+    let mut expected_copy = receipt.child_copy.clone();
+    expected_copy.inspected_revision = source.child.last_svn_rev;
+    if lineage.child_copy != expected_copy
+        || lineage.parent_originating_revision != old_lineage.parent_originating_revision
+    {
+        bail!("current SVN incarnation differs from the historical receipt");
+    }
+
+    after_sources(db)?;
+    // Re-observe actual endpoints after the asynchronous lineage reads. A DB
+    // recapture alone cannot detect a ref or SVN HEAD change with unchanged rows.
+    let (configuration, repeated_git) = changed_child_git_observation(configuration, client).await?;
+    let repeated_svn = observe_registered_svn_sources(&configuration).await?;
+    if repeated_git.pins() != git.pins() || repeated_svn.pins() != svn.pins() {
+        bail!("registered sources changed during changed-child review");
+    }
+    let current = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let repeated_history =
+        db.capture_changed_child_provenance_review(&current, historical_operation_id)?;
+    if current.pin() != &source || repeated_history.snapshot_digest() != history.snapshot_digest() {
+        bail!("registered context or authenticated history changed during changed-child review");
+    }
+    use sha2::Digest;
+    let context_digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(
+        "changed_child_preview_context_v1",
+        history.snapshot_digest(),
+        current.pin(),
+        git.pins(),
+        svn.pins(),
+        &lineage,
+        &roles,
+    ))?));
+    Ok(LiveChangedChildPreviewContext {
+        history,
+        configuration,
+        git,
+        svn,
+        lineage,
+        roles,
+        context_digest,
+    })
+}
