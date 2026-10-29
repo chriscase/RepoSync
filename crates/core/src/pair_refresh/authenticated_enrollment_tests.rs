@@ -4525,15 +4525,14 @@ mod changed_child_preview_binding {
     }
 
     fn set_checkpoint(f: &Fixture, id: &str, sha: Oid, revision: i64) {
-        let scope: String = f
-            .db
-            .conn()
-            .query_row(
-                "SELECT scope_uuid FROM repositories WHERE id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let scope: String =
+            f.db.conn()
+                .query_row(
+                    "SELECT scope_uuid FROM repositories WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
         f.db.conn()
             .execute(
                 "UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id=?3",
@@ -4666,7 +4665,9 @@ mod changed_child_preview_binding {
             first.svn_lineage().child_copy.created_revision,
             op.svn_receipt.as_ref().unwrap().child_copy.created_revision
         );
-        assert!(first.verified_gates().contains(&"role_specific_git_ancestry"));
+        assert!(first
+            .verified_gates()
+            .contains(&"role_specific_git_ancestry"));
         assert!(first
             .unverified_gates()
             .contains(&"current_mapping_provenance"));
@@ -4684,8 +4685,13 @@ mod changed_child_preview_binding {
             )
             .unwrap();
         assert_eq!(current_mappings, 0);
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
-        assert!(f.db.capture_completed_pair_refresh_baseline(&current).is_err());
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
+        assert!(f
+            .db
+            .capture_completed_pair_refresh_baseline(&current)
+            .is_err());
         // The unchanged clean-child preparer must not accept C merely because
         // its signed ancestry reaches P1 through the integration merge R.
         assert!(crate::pair_refresh::preparation::prepare_clean_child_git(
@@ -4725,16 +4731,20 @@ mod changed_child_preview_binding {
         let op = ready(&f, &engine).await;
         let before = storage(&f.db);
         let requests = std::fs::read(&f.log).unwrap();
-        assert!(super::super::capture_registered_changed_child_preview_context(
-            &f.db,
-            "child",
-            Uuid::nil(),
-        )
-        .await
-        .is_err());
+        assert!(
+            super::super::capture_registered_changed_child_preview_context(
+                &f.db,
+                "child",
+                Uuid::nil(),
+            )
+            .await
+            .is_err()
+        );
         assert!(capture(&f, Uuid::nil()).await.is_err());
         assert!(capture(&f, Uuid::new_v4()).await.is_err());
-        let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let scope = &configuration.pin().child.scope_uuid;
         let echo = format!("repo_echo_generation_{scope}");
         let next_echo = (configuration.pin().child.echo_generation + 1).to_string();
@@ -4778,14 +4788,18 @@ mod changed_child_preview_binding {
             op.id,
             Some(f.client.clone()),
             |_| {
-                f.target.reference("refs/heads/feature", other, true, "disposable drift")?;
+                f.target
+                    .reference("refs/heads/feature", other, true, "disposable drift")?;
                 Ok(())
             },
         )
         .await;
         assert!(result.is_err());
         assert_eq!(
-            f.target.find_reference("refs/heads/feature").unwrap().target(),
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target(),
             Some(other)
         );
         assert_eq!(storage(&f.db), before);
@@ -4827,8 +4841,13 @@ mod changed_child_preview_binding {
         let op = ready(&f, &engine).await;
         let before = storage(&f.db);
         let auth = format!("pair_refresh_execution_v3:authority:{}", op.id);
-        let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
-        let echo = format!("repo_echo_generation_{}", configuration.pin().child.scope_uuid);
+        let configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
+        let echo = format!(
+            "repo_echo_generation_{}",
+            configuration.pin().child.scope_uuid
+        );
         let next_echo = (configuration.pin().child.echo_generation + 1).to_string();
         for (key, value) in [
             (auth.as_str(), "{}"),
@@ -4889,7 +4908,9 @@ mod changed_child_preview_binding {
         let engine = f.engine();
         let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
         let op = ready(&f, &engine).await;
-        let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let c = Oid::from_str(&configuration.pin().child.last_git_sha).unwrap();
         // Equal bytes with P1 ancestry cannot substitute for R ancestry.
         let foreign = commit(&f.target, b"child work\n", &[f.parent]);
@@ -4915,7 +4936,10 @@ mod changed_child_preview_binding {
             &["propset", "m2b:unproved", "not-a-mapping-proof", "."],
             Some(&child_wc),
         );
-        svn(&["commit", "-m", "unproved fixture property"], Some(&child_wc));
+        svn(
+            &["commit", "-m", "unproved fixture property"],
+            Some(&child_wc),
+        );
         let revision = svn_revision(&format!("{}/branches/f", f.root));
         set_checkpoint(&f, "child", c, revision);
         let second = capture(&f, op.id).await.unwrap();

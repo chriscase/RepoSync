@@ -594,13 +594,9 @@ pub async fn capture_registered_changed_child_preview_context(
     child_id: &str,
     historical_operation_id: Uuid,
 ) -> Result<LiveChangedChildPreviewContext> {
-    capture_changed_child_preview_with_sources(
-        db,
-        child_id,
-        historical_operation_id,
-        None,
-        |_| Ok(()),
-    )
+    capture_changed_child_preview_with_sources(db, child_id, historical_operation_id, None, |_| {
+        Ok(())
+    })
     .await
 }
 
@@ -729,7 +725,8 @@ where
     after_sources(db)?;
     // Re-observe actual endpoints after the asynchronous lineage reads. A DB
     // recapture alone cannot detect a ref or SVN HEAD change with unchanged rows.
-    let (configuration, repeated_git) = changed_child_git_observation(configuration, client).await?;
+    let (configuration, repeated_git) =
+        changed_child_git_observation(configuration, client).await?;
     let repeated_svn = observe_registered_svn_sources(&configuration).await?;
     if repeated_git.pins() != git.pins() || repeated_svn.pins() != svn.pins() {
         bail!("registered sources changed during changed-child review");
