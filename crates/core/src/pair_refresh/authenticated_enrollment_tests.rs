@@ -5192,7 +5192,10 @@ mod changed_child_baseline_candidate_closure {
             Ok(_) => panic!("accepted negative candidate subcase {expected_detail}"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains(expected_detail), "unexpected refusal: {error}");
+        assert!(
+            error.contains(expected_detail),
+            "unexpected refusal: {error}"
+        );
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
         assert_eq!(files(f.target.path()), refs_and_objects);
@@ -5210,14 +5213,25 @@ mod changed_child_baseline_candidate_closure {
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let first = completed(f, engine, "m2c-chain-first").await;
         std::fs::write(f._parent_wc.join("file.txt"), b"temporary parent work\n").unwrap();
-        svn(&["commit", "-m", "m2c temporary parent work"], Some(&f._parent_wc));
+        svn(
+            &["commit", "-m", "m2c temporary parent work"],
+            Some(&f._parent_wc),
+        );
         let temporary = commit(&f.target, b"temporary parent work\n", &[f.parent]);
         std::fs::write(f._parent_wc.join("file.txt"), b"advanced\n").unwrap();
-        svn(&["commit", "-m", "m2c parent content return"], Some(&f._parent_wc));
+        svn(
+            &["commit", "-m", "m2c parent content return"],
+            Some(&f._parent_wc),
+        );
         let parent_revision = svn_revision(&format!("{}/trunk", f.root));
         let parent = commit(&f.target, b"advanced\n", &[temporary]);
         f.target
-            .reference("refs/heads/main", parent, true, "disposable m2c parent advance")
+            .reference(
+                "refs/heads/main",
+                parent,
+                true,
+                "disposable m2c parent advance",
+            )
             .unwrap();
         f.db.insert_commit_map_with_repo(
             parent_revision,
@@ -5271,7 +5285,12 @@ mod changed_child_baseline_candidate_closure {
 
     fn remove_rows(f: &Fixture, rows: &[(String, String, String)]) {
         for (key, _, _) in rows {
-            assert_eq!(f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [key]).unwrap(), 1);
+            assert_eq!(
+                f.db.conn()
+                    .execute("DELETE FROM kv_state WHERE key=?1", [key])
+                    .unwrap(),
+                1
+            );
         }
     }
 
@@ -5303,21 +5322,41 @@ mod changed_child_baseline_candidate_closure {
         let first = capture(&f).await.unwrap();
         let second = capture(&f).await.unwrap();
         assert_eq!(
-            first.candidate_review().selected_review().historical_operation(),
+            first
+                .candidate_review()
+                .selected_review()
+                .historical_operation(),
             &op
         );
-        assert_eq!(first.preview_context().historical_review().historical_operation(), &op);
+        assert_eq!(
+            first
+                .preview_context()
+                .historical_review()
+                .historical_operation(),
+            &op
+        );
         assert_eq!(first.context_digest(), second.context_digest());
         assert_eq!(
             first.candidate_review().candidate_set_digest(),
             second.candidate_review().candidate_set_digest()
         );
-        assert_ne!(first.context_digest(), first.preview_context().context_digest());
+        assert_ne!(
+            first.context_digest(),
+            first.preview_context().context_digest()
+        );
         assert_ne!(op.pins.parent.last_git_sha, op.pins.git.prepared_sha);
-        assert_ne!(first.preview_context().git_sources().child_tip, op.pins.git.prepared_sha);
-        assert_ne!(first.preview_context().git_sources().parent_tip, op.pins.parent.last_git_sha);
+        assert_ne!(
+            first.preview_context().git_sources().child_tip,
+            op.pins.git.prepared_sha
+        );
+        assert_ne!(
+            first.preview_context().git_sources().parent_tip,
+            op.pins.parent.last_git_sha
+        );
         assert!(!first.preview_context().parent_contains_integrated_child());
-        assert!(first.verified_gates().contains(&"single_authenticated_receipt_candidate"));
+        assert!(first
+            .verified_gates()
+            .contains(&"single_authenticated_receipt_candidate"));
         for gate in [
             "unique_applicable_historical_baseline",
             "current_mapping_provenance",
@@ -5340,7 +5379,10 @@ mod changed_child_baseline_candidate_closure {
         assert!(added.contains("git-upload-pack"));
         assert!(!added.contains("git-receive-pack"));
         let scratch = first.preview.git.repository().path().to_owned();
-        assert_eq!(first.preview.git.repository().references().unwrap().count(), 0);
+        assert_eq!(
+            first.preview.git.repository().references().unwrap().count(),
+            0
+        );
         assert!(!scratch.join("FETCH_HEAD").exists());
         drop(first);
         assert!(!scratch.exists());
@@ -5348,7 +5390,8 @@ mod changed_child_baseline_candidate_closure {
         // Independent current credential resolution permits a valid rotation
         // for stored closure capture without reviving or altering signed history.
         let old = candidate(&f).unwrap();
-        f.db.set_state("secret_git_token_child", "disposable-m2c-rotated-token").unwrap();
+        f.db.set_state("secret_git_token_child", "disposable-m2c-rotated-token")
+            .unwrap();
         let rotated_state = storage(&f.db);
         let rotated = candidate(&f).unwrap();
         assert_eq!(
@@ -5391,8 +5434,13 @@ mod changed_child_baseline_candidate_closure {
             let before = journal_state(&f);
             assert!(candidate(&f).is_err());
             assert_eq!(journal_state(&f), before);
-            let cancelled = actor.cancel_prepared_enrollment(&engine, &value, &busy).unwrap();
-            assert_eq!(cancelled.phase, PairRefreshPhase::CancelledBeforePublication);
+            let cancelled = actor
+                .cancel_prepared_enrollment(&engine, &value, &busy)
+                .unwrap();
+            assert_eq!(
+                cancelled.phase,
+                PairRefreshPhase::CancelledBeforePublication
+            );
             drop(fence);
         }
         // A real cancelled authority remains valid stored history but cannot
@@ -5403,10 +5451,16 @@ mod changed_child_baseline_candidate_closure {
             "no authenticated same-incarnation receipt candidate",
         );
         let op = ready(&f, &engine).await;
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let echo = format!("repo_echo_generation_{}", current.pin().child.scope_uuid);
         let saved = saved_kv(&f, &echo);
-        f.db.set_state(&echo, &(current.pin().child.echo_generation + 1).to_string()).unwrap();
+        f.db.set_state(
+            &echo,
+            &(current.pin().child.echo_generation + 1).to_string(),
+        )
+        .unwrap();
         refuse_stored_without_repair(
             &f,
             &engine,
@@ -5416,9 +5470,13 @@ mod changed_child_baseline_candidate_closure {
         let old_scope = current.pin().child.scope_uuid.clone();
         let new_scope = Uuid::new_v4().to_string();
         let key = format!("last_git_sha_{new_scope}");
-        f.db.set_state(&key, &current.pin().child.last_git_sha).unwrap();
+        f.db.set_state(&key, &current.pin().child.last_git_sha)
+            .unwrap();
         f.db.conn()
-            .execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'", [&new_scope])
+            .execute(
+                "UPDATE repositories SET scope_uuid=?1 WHERE id='child'",
+                [&new_scope],
+            )
             .unwrap();
         refuse_stored_without_repair(
             &f,
@@ -5426,11 +5484,19 @@ mod changed_child_baseline_candidate_closure {
             "no authenticated same-incarnation receipt candidate",
         );
         f.db.conn()
-            .execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'", [&old_scope])
+            .execute(
+                "UPDATE repositories SET scope_uuid=?1 WHERE id='child'",
+                [&old_scope],
+            )
             .unwrap();
-        f.db.conn().execute("DELETE FROM kv_state WHERE key=?1", [&key]).unwrap();
         f.db.conn()
-            .execute("UPDATE repositories SET git_branch='other-feature' WHERE id='child'", [])
+            .execute("DELETE FROM kv_state WHERE key=?1", [&key])
+            .unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET git_branch='other-feature' WHERE id='child'",
+                [],
+            )
             .unwrap();
         refuse_stored_without_repair(
             &f,
@@ -5438,9 +5504,18 @@ mod changed_child_baseline_candidate_closure {
             "no authenticated same-incarnation receipt candidate",
         );
         f.db.conn()
-            .execute("UPDATE repositories SET git_branch='feature' WHERE id='child'", [])
+            .execute(
+                "UPDATE repositories SET git_branch='feature' WHERE id='child'",
+                [],
+            )
             .unwrap();
-        assert_eq!(candidate(&f).unwrap().selected_review().historical_operation(), &op);
+        assert_eq!(
+            candidate(&f)
+                .unwrap()
+                .selected_review()
+                .historical_operation(),
+            &op
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5476,7 +5551,13 @@ mod changed_child_baseline_candidate_closure {
         let (first, second) = two_genuine_receipts(&f, &engine).await;
         let second_rows = operation_rows(&f, second.id);
         remove_rows(&f, &second_rows);
-        assert_eq!(candidate(&f).unwrap().selected_review().historical_operation(), &first);
+        assert_eq!(
+            candidate(&f)
+                .unwrap()
+                .selected_review()
+                .historical_operation(),
+            &first
+        );
         let target = files(f.target.path());
         let parent_wc = files(&f._parent_wc);
         let injected = std::cell::RefCell::new(None);
@@ -5495,7 +5576,10 @@ mod changed_child_baseline_candidate_closure {
             Ok(_) => panic!("late second genuine receipt did not invalidate candidate closure"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("ambiguous authenticated receipt candidates"), "{error}");
+        assert!(
+            error.contains("ambiguous authenticated receipt candidates"),
+            "{error}"
+        );
         assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
         assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
         assert_eq!(operation_rows(&f, second.id), second_rows);
@@ -5505,7 +5589,9 @@ mod changed_child_baseline_candidate_closure {
         // Remove the exact fixture's second rows again, then change current
         // registration only after the initial authenticated/live observations.
         remove_rows(&f, &second_rows);
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let echo = format!("repo_echo_generation_{}", current.pin().child.scope_uuid);
         let prior = saved_kv(&f, &echo);
         let injected = std::cell::RefCell::new(None);
@@ -5514,14 +5600,20 @@ mod changed_child_baseline_candidate_closure {
             "child",
             Some(f.client.clone()),
             |db| {
-                db.set_state(&echo, &(current.pin().child.echo_generation + 1).to_string())?;
+                db.set_state(
+                    &echo,
+                    &(current.pin().child.echo_generation + 1).to_string(),
+                )?;
                 *injected.borrow_mut() = Some(storage(db));
                 Ok(())
             },
         )
         .await;
         assert!(result.is_err());
-        assert!(injected.borrow().is_some(), "fault boundary was not reached");
+        assert!(
+            injected.borrow().is_some(),
+            "fault boundary was not reached"
+        );
         assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
         assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
         assert_eq!(files(f.target.path()), target);
@@ -5544,8 +5636,14 @@ mod changed_child_baseline_candidate_closure {
             (auth.clone(), Some("{}")),
             (auth.clone(), None),
             (doc.clone(), Some("{}")),
-            ("pair_refresh_execution_v99:unknown:retained".into(), Some("{}")),
-            ("import_operation_v1:active:child".into(), Some("retained-m2c-import")),
+            (
+                "pair_refresh_execution_v99:unknown:retained".into(),
+                Some("{}"),
+            ),
+            (
+                "import_operation_v1:active:child".into(),
+                Some("retained-m2c-import"),
+            ),
         ] {
             let prior = saved_kv(&f, &key);
             match value {
@@ -5562,12 +5660,17 @@ mod changed_child_baseline_candidate_closure {
             restore_kv(&f, &key, prior);
         }
         let original = storage(&f.db);
-        let secret: Vec<u8> = f
-            .db
-            .conn()
-            .query_row("SELECT secret FROM pair_refresh_journal_key_v3 WHERE id=1", [], |row| row.get(0))
+        let secret: Vec<u8> =
+            f.db.conn()
+                .query_row(
+                    "SELECT secret FROM pair_refresh_journal_key_v3 WHERE id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        f.db.conn()
+            .execute("DELETE FROM pair_refresh_journal_key_v3 WHERE id=1", [])
             .unwrap();
-        f.db.conn().execute("DELETE FROM pair_refresh_journal_key_v3 WHERE id=1", []).unwrap();
         refuse_stored_without_repair(&f, &engine, "pair refresh journal:");
         assert!(!f
             .db
@@ -5579,7 +5682,10 @@ mod changed_child_baseline_candidate_closure {
             )
             .unwrap());
         f.db.conn()
-            .execute("INSERT INTO pair_refresh_journal_key_v3(id,secret) VALUES(1,?1)", [secret])
+            .execute(
+                "INSERT INTO pair_refresh_journal_key_v3(id,secret) VALUES(1,?1)",
+                [secret],
+            )
             .unwrap();
         assert_eq!(storage(&f.db), original);
 
@@ -5593,6 +5699,12 @@ mod changed_child_baseline_candidate_closure {
         assert_eq!(journal_state(&f), before);
         window.finish_preparation().unwrap();
         drop(fence);
-        assert_eq!(candidate(&f).unwrap().selected_review().historical_operation(), &op);
+        assert_eq!(
+            candidate(&f)
+                .unwrap()
+                .selected_review()
+                .historical_operation(),
+            &op
+        );
     }
 }

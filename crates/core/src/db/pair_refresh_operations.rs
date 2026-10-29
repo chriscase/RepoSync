@@ -1826,7 +1826,11 @@ impl Database {
             .collect::<Vec<_>>();
         let historical = match candidates.as_slice() {
             [only] => *only,
-            [] => return Err(refused("no authenticated same-incarnation receipt candidate")),
+            [] => {
+                return Err(refused(
+                    "no authenticated same-incarnation receipt candidate",
+                ))
+            }
             _ => return Err(refused("ambiguous authenticated receipt candidates")),
         };
         for registration in [&pin.child, &pin.parent] {
