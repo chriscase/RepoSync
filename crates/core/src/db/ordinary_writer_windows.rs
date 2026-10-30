@@ -252,6 +252,11 @@ impl Database {
 /// Result of acquiring an optional, unboxed, single-use convergence capability.
 pub(crate) type EmittedGitConvergencePreparation<F> = Result<Option<F>, DatabaseError>;
 
+/// Complete ordered (Git SHA, tree) observations supplied to convergence.
+pub(crate) type EmittedGitCommitChain = [(String, String)];
+/// Database outcome of consuming the existing convergence capability.
+pub(crate) type EmittedGitConvergenceOutcome = Result<(), DatabaseError>;
+
 impl OrdinaryWriterWindow<'_> {
     /// The actual engine has selected this complete P..R graph after normal
     /// history admission. Settle only SVN-emitted commits, with current scoped
@@ -265,7 +270,7 @@ impl OrdinaryWriterWindow<'_> {
         remote_tip: &str,
         projection: &str,
     ) -> EmittedGitConvergencePreparation<
-        impl FnOnce(&str, &str, &[(String, String)]) -> Result<(), DatabaseError> + '_,
+        impl FnOnce(&str, &str, &EmittedGitCommitChain) -> EmittedGitConvergenceOutcome + '_,
     > {
         // Private capture lives in the returned single-use closure, not a
         // caller-constructible DTO. No credential values escape this method.
