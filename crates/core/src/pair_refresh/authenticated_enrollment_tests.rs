@@ -5708,3 +5708,786 @@ mod changed_child_baseline_candidate_closure {
         );
     }
 }
+
+// Genuine current mappings come from ordinary production SyncEngine cycles.
+// Existing fixture bootstrap checkpoints are not full initialization evidence.
+mod changed_child_source_correspondence {
+    use super::*;
+    use crate::db::pair_refresh_operations::{
+        ChangedChildMappingReview, PairRefreshOperation, PairRefreshPhase,
+    };
+    use super::super::LiveChangedChildSourceCorrespondence;
+    use std::collections::BTreeMap;
+
+    type Storage = BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>;
+
+    fn storage(db: &Database) -> Storage {
+        use rusqlite::types::Value;
+        let conn = db.conn();
+        let mut snapshot = BTreeMap::new();
+        let schema = conn
+            .prepare("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| {
+                (0..5)
+                    .map(|i| row.get::<_, Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        snapshot.insert("schema".into(), schema);
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in tables {
+            let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+            let mut query = conn.prepare(&sql).unwrap();
+            let columns = query.column_count();
+            let mut values = query
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            values.sort_by_cached_key(|row| format!("{row:?}"));
+            snapshot.insert(table, values);
+        }
+        snapshot
+    }
+
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                if kind.is_dir() {
+                    collect(root, &entry.path(), out);
+                } else {
+                    assert!(kind.is_file());
+                    out.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        collect(root, root, &mut out);
+        out
+    }
+
+    fn set_checkpoint(f: &Fixture, id: &str, sha: Oid, revision: i64) {
+        let scope: String =
+            f.db.conn()
+                .query_row(
+                    "SELECT scope_uuid FROM repositories WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id=?3",
+                rusqlite::params![sha.to_string(), revision, id],
+            )
+            .unwrap();
+        f.db.set_state(&format!("last_git_sha_{scope}"), &sha.to_string())
+            .unwrap();
+        f.db.set_state(&format!("last_svn_rev_{id}"), &revision.to_string())
+            .unwrap();
+    }
+
+    fn svn_revision(url: &str) -> i64 {
+        let mut command = Command::new("svn");
+        command
+            .args(["info", "--show-item", "revision", url])
+            .args(["--non-interactive", "--no-auth-cache"]);
+        let revision: i64 = run(&mut command)
+            .trim()
+            .parse()
+            .expect("SVN revision query returned malformed stdout");
+        assert!(revision > 0, "SVN revision must be positive");
+        revision
+    }
+
+    fn saved_kv(f: &Fixture, key: &str) -> Option<(String, String)> {
+        use rusqlite::OptionalExtension;
+        f.db.conn()
+            .query_row(
+                "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                [key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn restore_kv(f: &Fixture, key: &str, value: Option<(String, String)>) {
+        match value {
+            Some((value, updated)) => {
+                f.db.conn().execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", rusqlite::params![key, value, updated]).unwrap();
+            }
+            None => {
+                f.db.conn()
+                    .execute("DELETE FROM kv_state WHERE key=?1", [key])
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn completed(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+    ) -> PairRefreshOperation {
+        let (actor, _workspace, value) = prepared(f, engine).await;
+        let approved = actor.prepared_approval_digest(engine, &value).unwrap();
+        let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+        let op = super::super::super::execution::complete_owned_refresh_with_client(
+            engine,
+            &actor,
+            &value,
+            "m2d-genuine-history",
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.phase, PairRefreshPhase::Completed);
+        assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
+        op
+    }
+
+    // Use the same native DB and disposable bare repository, with a distinct
+    // ordinary bridge per role. Local Git transport here avoids a new CA policy;
+    // the correspondence factory still uses registered HTTPS observers/client.
+    fn producer_engine(f: &Fixture, id: &str) -> (crate::sync_engine::SyncEngine, PathBuf) {
+        let branch = if id == "child" { "feature" } else { "main" };
+        let path = f.temp.path().join(format!("m2d-{id}-bridge"));
+        let repo = git2::build::RepoBuilder::new()
+            .branch(branch)
+            .clone(f.target.path().to_str().unwrap(), &path)
+            .unwrap();
+        repo.config().unwrap().set_str("user.name", "Fixture").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "fixture@example.invalid")
+            .unwrap();
+        drop(repo);
+        let mut config: crate::config::AppConfig = toml::from_str(
+            r#"
+            [daemon]
+            data_dir = "/unused"
+            [svn]
+            url = "file:///unused/svn"
+            username = ""
+            password_env = ""
+            [github]
+            repo = "fixture/repo"
+            token_env = ""
+            "#,
+        )
+        .unwrap();
+        config.daemon.data_dir = f.temp.path().to_owned();
+        let svn_branch = if id == "child" { "branches/f" } else { "trunk" };
+        let svn_url = format!("{}/{svn_branch}", f.root);
+        config.svn.url = svn_url.clone();
+        config.svn.layout = crate::config::SvnLayout::Custom;
+        config.svn.password = Some(String::new());
+        config.github.default_branch = branch.to_owned();
+        config.github.token = Some(String::new());
+        config.sync.auto_merge = false;
+        let mut engine = crate::sync_engine::SyncEngine::new(
+            config,
+            Database::new(f.temp.path().join("reposync.db")).unwrap(),
+            crate::svn::SvnClient::new(svn_url, "", ""),
+            crate::git::GitClient::new(&path).unwrap(),
+            std::sync::Arc::new(
+                crate::identity::mapper::IdentityMapper::new(&crate::config::IdentityConfig {
+                    email_domain: Some("example.invalid".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        );
+        engine.set_repo_id(id.to_owned());
+        engine.set_git_credential_apply_clean(true);
+        (engine, path)
+    }
+
+    struct Ready {
+        history: PairRefreshOperation,
+        child_wc: PathBuf,
+        parent_bridge: PathBuf,
+        child_bridge: PathBuf,
+    }
+
+    async fn ready(f: &Fixture, engine: &crate::sync_engine::SyncEngine) -> Ready {
+        let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let history = completed(f, engine).await;
+        let (parent_engine, parent_bridge) = producer_engine(f, "parent");
+        let (child_engine, child_bridge) = producer_engine(f, "child");
+        std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
+        svn(&["commit", "-m", "m2d parent source work"], Some(&f._parent_wc));
+        let parent_stats = parent_engine.run_sync_cycle().await.unwrap();
+        assert_eq!(parent_stats.svn_to_git_count, 1);
+        assert_eq!(parent_stats.git_to_svn_count, 0);
+        let child_wc = f.temp.path().join("m2d-child-wc");
+        svn(
+            &[
+                "checkout",
+                &format!("{}/branches/f", f.root),
+                child_wc.to_str().unwrap(),
+            ],
+            None,
+        );
+        std::fs::write(child_wc.join("file.txt"), b"m2d child work\n").unwrap();
+        svn(&["commit", "-m", "m2d child source work"], Some(&child_wc));
+        let child_stats = child_engine.run_sync_cycle().await.unwrap();
+        assert_eq!(child_stats.svn_to_git_count, 1);
+        assert_eq!(child_stats.git_to_svn_count, 0);
+        drop(fence);
+        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        for registration in [&current.pin().child, &current.pin().parent] {
+            let rows: i64 = f.db.conn().query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",
+                rusqlite::params![registration.repo_id, registration.last_svn_rev, registration.last_git_sha],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(rows, 1, "actual ordinary producer mapping for {}", registration.repo_id);
+            assert_eq!(
+                f.target.find_reference(&format!("refs/heads/{}", if registration.repo_id == "child" { "feature" } else { "main" })).unwrap().target().unwrap().to_string(),
+                registration.last_git_sha,
+            );
+        }
+        assert_eq!(f.db.pair_refresh_operation(history.id).unwrap(), history);
+        Ready { history, child_wc, parent_bridge, child_bridge }
+    }
+
+    fn mapping(
+        f: &Fixture,
+    ) -> Result<ChangedChildMappingReview, crate::errors::DatabaseError> {
+        let current = f.db.capture_pair_refresh_execution_configuration("child")?;
+        let candidate = f.db.capture_changed_child_baseline_candidate_review(&current)?;
+        f.db.capture_changed_child_mapping_review(&current, &candidate)
+    }
+
+    async fn capture(f: &Fixture) -> anyhow::Result<LiveChangedChildSourceCorrespondence> {
+        super::super::capture_changed_child_correspondence_with_sources(
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    fn request_log(f: &Fixture) -> Option<Vec<u8>> {
+        match std::fs::read(&f.log) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("request-log read failed: {error}"),
+        }
+    }
+
+    fn child_row(f: &Fixture) -> (String, String, i64) {
+        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        f.db.conn().query_row(
+            "SELECT id,git_sha,svn_rev FROM sync_records WHERE repo_id='child' AND git_sha=?1 AND svn_rev=?2 AND status='applied' ORDER BY id",
+            rusqlite::params![current.pin().child.last_git_sha, current.pin().child.last_svn_rev],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap()
+    }
+
+    #[track_caller]
+    fn refuse_mapping_without_repair(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+        detail: &str,
+    ) {
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let requests = request_log(f);
+        let error = match mapping(f) {
+            Ok(_) => panic!("accepted negative mapping subcase {detail}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(detail), "unexpected mapping refusal: {error}");
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        assert_eq!(request_log(f), requests);
+    }
+
+    async fn refuse_live_without_repair(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+    ) -> String {
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let error = match capture(f).await {
+            Ok(_) => panic!("source correspondence accepted a negative fixture"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        error
+    }
+    fn sync_row(f: &Fixture, id: &str) -> Vec<rusqlite::types::Value> {
+        let conn = f.db.conn();
+        let mut query = conn.prepare("SELECT * FROM sync_records WHERE id=?1").unwrap();
+        let columns = query.column_count();
+        query.query_row([id], |row| {
+            (0..columns).map(|i| row.get(i)).collect::<rusqlite::Result<Vec<_>>>()
+        }).unwrap()
+    }
+
+    fn restore_sync_row(f: &Fixture, row: &[rusqlite::types::Value]) {
+        let placeholders = (1..=row.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        f.db.conn().execute(
+            &format!("INSERT INTO sync_records VALUES({placeholders})"),
+            rusqlite::params_from_iter(row),
+        ).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn genuine_current_mappings_and_four_visible_roles_bind_one_review() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let before = storage(&f.db);
+        let first = capture(&f).await.unwrap();
+        let second = capture(&f).await.unwrap();
+        assert_eq!(first.context_digest(), second.context_digest());
+        assert_eq!(
+            first.mapping_review().snapshot_digest(),
+            second.mapping_review().snapshot_digest()
+        );
+        assert_eq!(first.mapping_review().mapping_row_counts(), [1, 1]);
+        assert_eq!(first.retained_snapshot_count(), 4);
+        assert_eq!(
+            first.roles.iter().map(|p| p.role.as_str()).collect::<Vec<_>>(),
+            ["P1", "R", "C", "P2"]
+        );
+        assert_eq!(first.roles[0].git_commit, ready.history.pins.parent.last_git_sha);
+        assert_eq!(first.roles[1].git_commit, ready.history.pins.git.prepared_sha);
+        assert_ne!(first.roles[0].git_commit, first.roles[1].git_commit);
+        assert_ne!(first.roles[1].git_commit, first.roles[2].git_commit);
+        assert_ne!(first.roles[0].git_commit, first.roles[3].git_commit);
+        assert_eq!(first.roles[0].git_tree, first.roles[1].git_tree);
+        assert_ne!(first.roles[2].git_tree, first.roles[3].git_tree);
+        for proof in &first.roles {
+            assert!(proof.presence.node_count > 0);
+            assert!(!proof.presence.ancestors.is_empty());
+            assert!(proof.presence.max_changed_revision <= proof.handled_revision);
+        }
+        let expected_mergeinfo = ready.history.svn_receipt.as_ref().unwrap().mergeinfo.as_str();
+        assert_eq!(first.roles[1].expected_mergeinfo.as_deref(), Some(expected_mergeinfo));
+        assert_eq!(first.roles[2].expected_mergeinfo.as_deref(), Some(expected_mergeinfo));
+        assert_eq!(first.roles[0].expected_mergeinfo, None);
+        assert_eq!(first.roles[3].expected_mergeinfo, None);
+        assert!(first.verified_gates().contains(&"current_scoped_applied_mapping_capture"));
+        assert!(first.verified_gates().contains(&"four_role_complete_visible_svn_correspondence"));
+        assert!(!first.execution_eligible());
+        assert!(!first.mapping_review().execution_eligible());
+        assert!(!first.candidate_context().execution_eligible());
+        assert!(first.unverified_gates().contains(&"authenticated_changed_child_resolution"));
+        assert!(first.unverified_gates().contains(&"exclusive_changed_child_execution_admission"));
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_foreign_split_and_unscoped_correspondence_refuse() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let (id, _, _) = child_row(&f);
+        let original = sync_row(&f, &id);
+        let before = storage(&f.db);
+        f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id]).unwrap();
+        refuse_mapping_without_repair(
+            &f,
+            &engine,
+            "current scoped applied correspondence is missing",
+        );
+        restore_sync_row(&f, &original);
+        assert_eq!(storage(&f.db), before);
+        for update in [
+            "UPDATE sync_records SET repo_id='foreign-repo' WHERE id=?1",
+            "UPDATE sync_records SET svn_rev=svn_rev+1 WHERE id=?1",
+            "UPDATE sync_records SET status='pending' WHERE id=?1",
+            "UPDATE sync_records SET direction='unknown-direction' WHERE id=?1",
+        ] {
+            f.db.conn().execute(update, [&id]).unwrap();
+            refuse_mapping_without_repair(&f, &engine, "current");
+            f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id]).unwrap();
+            restore_sync_row(&f, &original);
+            assert_eq!(storage(&f.db), before);
+        }
+        let collision = Uuid::new_v4().to_string();
+        f.db.conn().execute(
+            "INSERT INTO sync_records(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) SELECT ?1,NULL,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status FROM sync_records WHERE id=?2",
+            rusqlite::params![collision, id],
+        ).unwrap();
+        refuse_mapping_without_repair(&f, &engine, "foreign or contradictory");
+        f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&collision]).unwrap();
+        assert_eq!(storage(&f.db), before);
+        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let echo = format!("repo_echo_generation_{}", current.pin().child.scope_uuid);
+        let prior = saved_kv(&f, &echo);
+        f.db.set_state(&echo, &(current.pin().child.echo_generation + 1).to_string()).unwrap();
+        refuse_mapping_without_repair(
+            &f,
+            &engine,
+            "no authenticated same-incarnation receipt candidate",
+        );
+        restore_kv(&f, &echo, prior);
+        assert_eq!(storage(&f.db), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rewritten_equal_content_or_mismatched_roles_refuse() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let (id, original, revision) = child_row(&f);
+        let c = Oid::from_str(&original).unwrap();
+        let foreign = commit(&f.target, b"m2d child work\n", &[f.parent]);
+        assert_eq!(
+            f.target.find_commit(c).unwrap().tree_id(),
+            f.target.find_commit(foreign).unwrap().tree_id()
+        );
+        f.target.reference("refs/heads/feature", foreign, true, "disposable rewritten fixture").unwrap();
+        set_checkpoint(&f, "child", foreign, revision);
+        // Tampering the original applied row is a negative fault, not a new
+        // genuine mapping. Full graph proof must refuse despite equal bytes.
+        f.db.conn().execute("UPDATE sync_records SET git_sha=?1 WHERE id=?2", rusqlite::params![foreign.to_string(), id]).unwrap();
+        let error = refuse_live_without_repair(&f, &engine).await;
+        assert!(error.contains("distinct receipt roles"), "{error}");
+        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(foreign));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unhandled_git_or_svn_work_remains_explicit_and_preserved() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let (_, sha, _) = child_row(&f);
+        let original = Oid::from_str(&sha).unwrap();
+        let pending = commit(&f.target, b"unhandled git work\n", &[original]);
+        f.target.reference("refs/heads/feature", pending, true, "disposable pending Git").unwrap();
+        refuse_live_without_repair(&f, &engine).await;
+        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
+        f.target.reference("refs/heads/feature", original, true, "disposable restore").unwrap();
+        std::fs::write(ready.child_wc.join("file.txt"), b"unhandled SVN work\n").unwrap();
+        svn(&["commit", "-m", "m2d unhandled SVN-only work"], Some(&ready.child_wc));
+        let revision = svn_revision(&format!("{}/branches/f", f.root));
+        let error = refuse_live_without_repair(&f, &engine).await;
+        assert!(error.contains("pending changes"), "{error}");
+        assert_eq!(svn_revision(&format!("{}/branches/f", f.root)), revision);
+        assert_eq!(
+            std::fs::read(ready.child_wc.join("file.txt")).unwrap(),
+            b"unhandled SVN work\n"
+        );
+    }
+
+    fn changed_child_tree(f: &Fixture, parent: Oid, bytes: &[u8], mode: i32) -> Oid {
+        let old = f.target.find_commit(parent).unwrap();
+        let old_tree = old.tree().unwrap();
+        let mut tree = f.target.treebuilder(Some(&old_tree)).unwrap();
+        tree.insert("file.txt", f.target.blob(bytes).unwrap(), mode).unwrap();
+        let tree = f.target.find_tree(tree.write().unwrap()).unwrap();
+        let signature = Signature::new(
+            "Fixture",
+            "fixture@example.invalid",
+            &Time::new(1_790_000_000, 0),
+        )
+        .unwrap();
+        f.target
+            .commit(None, &signature, &signature, "negative source tree", &tree, &[&old])
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bytes_modes_empty_directories_and_property_drift_refuse() {
+        let _serial = SERIAL.lock().await;
+        {
+            let f = Fixture::new();
+            let engine = f.engine();
+            let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+            let _ready = ready(&f, &engine).await;
+            let (id, original, revision) = child_row(&f);
+            let original = Oid::from_str(&original).unwrap();
+            let config = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+            let git_key = format!("last_git_sha_{}", config.pin().child.scope_uuid);
+            let svn_key = "last_svn_rev_child";
+            let git_kv = saved_kv(&f, &git_key);
+            let svn_kv = saved_kv(&f, svn_key);
+            let original_state = storage(&f.db);
+            for (bytes, mode, detail) in [
+                (&b"\0unmapped binary\xff"[..], 0o100644, "SVN content differs"),
+                (&b"m2d child work\n"[..], 0o100755, "SVN executable property differs"),
+            ] {
+                let wrong = changed_child_tree(&f, original, bytes, mode);
+                f.target.reference("refs/heads/feature", wrong, true, "disposable mismatch").unwrap();
+                set_checkpoint(&f, "child", wrong, revision);
+                f.db.conn().execute("UPDATE sync_records SET git_sha=?1 WHERE id=?2", rusqlite::params![wrong.to_string(), id]).unwrap();
+                let error = refuse_live_without_repair(&f, &engine).await;
+                assert!(error.contains(detail), "{error}");
+                f.target.reference("refs/heads/feature", original, true, "disposable restore").unwrap();
+                f.db.conn().execute("UPDATE repositories SET last_git_sha=?1 WHERE id='child'", [original.to_string()]).unwrap();
+                f.db.conn().execute("UPDATE sync_records SET git_sha=?1 WHERE id=?2", rusqlite::params![original.to_string(), id]).unwrap();
+                restore_kv(&f, &git_key, git_kv.clone());
+                restore_kv(&f, svn_key, svn_kv.clone());
+                assert_eq!(storage(&f.db), original_state);
+            }
+        }
+        for property_fault in ["empty-directory", "unknown-property", "mergeinfo"] {
+            let f = Fixture::new();
+            let engine = f.engine();
+            let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+            let ready = ready(&f, &engine).await;
+            let (id, sha, _) = child_row(&f);
+            match property_fault {
+                "empty-directory" => svn(&["mkdir", "empty"], Some(&ready.child_wc)),
+                "unknown-property" => svn(&["propset", "m2d:unknown", "retained", "."], Some(&ready.child_wc)),
+                "mergeinfo" => svn(&["propset", "svn:mergeinfo", "/trunk:1", "."], Some(&ready.child_wc)),
+                _ => unreachable!(),
+            }
+            svn(&["commit", "-m", "negative correspondence metadata"], Some(&ready.child_wc));
+            let revision = svn_revision(&format!("{}/branches/f", f.root));
+            set_checkpoint(&f, "child", Oid::from_str(&sha).unwrap(), revision);
+            // Retain but deliberately mislabel a current row for this negative
+            // case. Neither a row nor equal Git bytes can prove SVN properties.
+            f.db.conn().execute("UPDATE sync_records SET svn_rev=?1 WHERE id=?2", rusqlite::params![revision, id]).unwrap();
+            let error = refuse_live_without_repair(&f, &engine).await;
+            let detail = match property_fault {
+                "empty-directory" => "SVN and Git tree paths differ",
+                "unknown-property" => "unsupported SVN property semantics",
+                "mergeinfo" => "SVN mergeinfo differs",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(detail), "{property_fault}: {error}");
+            assert_eq!(svn_revision(&format!("{}/branches/f", f.root)), revision);
+        }
+    }
+    async fn serve_with_authz(f: &mut Fixture) -> fixture_process::OwnedProcessGroup {
+        let conf = f.temp.path().join("svn-repository/conf");
+        std::fs::write(conf.join("svnserve.conf"), "[general]\nanon-access = write\nauth-access = write\nauthz-db = authz\n").unwrap();
+        std::fs::write(conf.join("authz"), "[/]\n* = rw\n").unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let mut command = Command::new("svnserve");
+        command
+            .args(["--daemon", "--foreground", "--listen-host", "127.0.0.1", "--listen-port"])
+            .arg(port.to_string())
+            .arg("--root")
+            .arg(f.temp.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let server = fixture_process::OwnedProcessGroup::spawn(&mut command).unwrap();
+        f.root = format!("svn://127.0.0.1:{port}/svn-repository");
+        f.db.conn().execute("UPDATE repositories SET svn_url=?1", [&f.root]).unwrap();
+        let client = crate::svn::SvnClient::new(format!("{}/trunk", f.root), "", "");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if client.info().await.is_ok() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("disposable svnserve did not become ready");
+        server
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn excluded_sparse_unreadable_ancestor_or_history_refuses() {
+        let _serial = SERIAL.lock().await;
+        let mut f = Fixture::new();
+        let _svnserve = serve_with_authz(&mut f).await;
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let first = capture(&f).await.unwrap();
+        let client = first.candidate.preview.svn.child_client();
+        let head = first.candidate.preview.svn.pins().inspected_head_revision;
+        // Controlled corruption of task-owned fixture metadata exercises the
+        // same real WC31 validator; no OS function/production parser replacement.
+        for sql in [
+            "UPDATE NODES SET presence='server-excluded' WHERE local_relpath='file.txt'",
+            "UPDATE NODES SET depth='empty' WHERE local_relpath=''",
+        ] {
+            let snapshot = super::super::super::svn_visibility::observe_subtree(client, head)
+                .await
+                .unwrap();
+            let metadata = rusqlite::Connection::open(snapshot.path().join(".svn/wc.db")).unwrap();
+            assert!(metadata.execute(sql, []).unwrap() > 0);
+            drop(metadata);
+            assert!(super::super::super::svn_visibility::presence_pin(
+                "negative",
+                snapshot.path(),
+                snapshot.info(),
+            )
+            .is_err());
+        }
+        drop(first);
+        let authz = f.temp.path().join("svn-repository/conf/authz");
+        std::fs::write(&authz, "[/]\n* = rw\n[/branches/f/file.txt]\n* =\n").unwrap();
+        // Genuine read authorization changes, with all recorded coordinates
+        // unchanged. A history/visibility prerequisite may refuse first; never
+        // invent a more specific runtime cause or call an omitted path empty.
+        refuse_live_without_repair(&f, &engine).await;
+        let child = crate::svn::SvnClient::new_isolated_refresh(
+            &format!("{}/branches/f", f.root),
+            "",
+            None,
+        )
+        .unwrap();
+        assert!(super::super::super::svn_visibility::observe_subtree(&child, head).await.is_err());
+        std::fs::write(&authz, "[/]\n* = rw\n[/branches]\n* =\n").unwrap();
+        refuse_live_without_repair(&f, &engine).await;
+        let retained = std::fs::read(&authz).unwrap();
+        assert_eq!(retained, b"[/]\n* = rw\n[/branches]\n* =\n");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mapping_candidate_sources_and_credentials_drift_refuse() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let (id, sha, _) = child_row(&f);
+        let original_row = sync_row(&f, &id);
+        let credential = saved_kv(&f, "secret_git_token_child");
+        let current_configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current_candidate = f.db.capture_changed_child_baseline_candidate_review(&current_configuration).unwrap();
+        let auth_key = format!(
+            "pair_refresh_execution_v3:authority:{}",
+            current_candidate.selected_review().historical_operation().id
+        );
+        let authority = saved_kv(&f, &auth_key);
+        for fault in ["mapping-metadata", "missing-mapping", "authority", "credentials"] {
+            let injected = std::cell::RefCell::new(None);
+            let result = super::super::capture_changed_child_correspondence_with_sources(
+                &f.db,
+                "child",
+                Some(f.client.clone()),
+                |db| {
+                    match fault {
+                        "mapping-metadata" => {
+                            db.conn().execute(
+                                "UPDATE sync_records SET message=message||' late' WHERE id=?1",
+                                [&id],
+                            )?;
+                        }
+                        "missing-mapping" => {
+                            db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id])?;
+                        }
+                        "authority" => db.set_state(&auth_key, "{}")?,
+                        "credentials" => db.set_state("secret_git_token_child", "")?,
+                        _ => unreachable!(),
+                    }
+                    *injected.borrow_mut() = Some(storage(db));
+                    Ok(())
+                },
+            ).await;
+            let error = match result {
+                Ok(_) => panic!("late {fault} produced a correspondence proof"),
+                Err(error) => error.to_string(),
+            };
+            assert!(injected.borrow().is_some(), "late {fault} boundary was not reached: {error}");
+            if fault == "mapping-metadata" {
+                assert!(error.contains("stored evidence changed"), "{error}");
+            }
+            assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
+            assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
+            f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id]).unwrap();
+            restore_sync_row(&f, &original_row);
+            restore_kv(&f, &auth_key, authority.clone());
+            restore_kv(&f, "secret_git_token_child", credential.clone());
+        }
+        let current = Oid::from_str(&sha).unwrap();
+        let pending = commit(&f.target, b"late unhandled source\n", &[current]);
+        let reached = std::cell::Cell::new(false);
+        let result = super::super::capture_changed_child_correspondence_with_sources(
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |_| {
+                f.target.reference("refs/heads/feature", pending, true, "late source fault")?;
+                reached.set(true);
+                Ok(())
+            },
+        ).await;
+        assert!(result.is_err());
+        assert!(reached.get());
+        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_capture_preserves_shared_storage_refs_and_worktrees() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let child_wc = files(&ready.child_wc);
+        let parent_bridge = files(&ready.parent_bridge);
+        let child_bridge = files(&ready.child_bridge);
+        let requests = request_log(&f).unwrap();
+        let proof = capture(&f).await.unwrap();
+        let snapshots = proof
+            .snapshots
+            .iter()
+            .map(|s| s.path().parent().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let git_scratch = proof.candidate.preview.git.repository().path().to_owned();
+        assert_eq!(snapshots.len(), 4);
+        assert!(snapshots.iter().all(|p| p.is_dir()));
+        assert!(!proof.execution_eligible());
+        let reads = request_log(&f).unwrap();
+        assert!(reads.starts_with(&requests));
+        let added = std::str::from_utf8(&reads[requests.len()..]).unwrap();
+        assert!(added.contains("git-upload-pack"));
+        assert!(!added.contains("git-receive-pack"));
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        assert_eq!(files(&ready.child_wc), child_wc);
+        assert_eq!(files(&ready.parent_bridge), parent_bridge);
+        assert_eq!(files(&ready.child_bridge), child_bridge);
+        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+        drop(proof);
+        assert!(snapshots.iter().all(|p| !p.exists()));
+        assert!(!git_scratch.exists());
+        assert_eq!(storage(&f.db), before);
+    }
+}
