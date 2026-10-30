@@ -5873,10 +5873,20 @@ mod changed_child_source_correspondence {
     fn producer_engine(f: &Fixture, id: &str) -> (crate::sync_engine::SyncEngine, PathBuf) {
         let branch = if id == "child" { "feature" } else { "main" };
         let path = f.temp.path().join(format!("m2d-{id}-bridge"));
-        let repo = git2::build::RepoBuilder::new()
-            .branch(branch)
-            .clone(f.target.path().to_str().unwrap(), &path)
-            .unwrap();
+        let repo = if path.exists() {
+            let existing = Repository::open(&path).unwrap();
+            assert_eq!(existing.head().unwrap().shorthand(), Some(branch));
+            assert_eq!(
+                existing.find_remote("origin").unwrap().url(),
+                f.target.path().to_str()
+            );
+            existing
+        } else {
+            git2::build::RepoBuilder::new()
+                .branch(branch)
+                .clone(f.target.path().to_str().unwrap(), &path)
+                .unwrap()
+        };
         repo.config()
             .unwrap()
             .set_str("user.name", "Fixture")
@@ -5982,6 +5992,30 @@ mod changed_child_source_correspondence {
         child_bridge: PathBuf,
     }
 
+    fn local_source_url(f: &Fixture, branch: &str) -> String {
+        reqwest::Url::from_file_path(f.temp.path().join("svn-repository").join(branch))
+            .unwrap()
+            .to_string()
+    }
+
+    async fn require_named_source_revision(f: &Fixture, branch: &str) -> i64 {
+        let local_url = local_source_url(f, branch);
+        let revision = svn_revision(&local_url);
+        let local = crate::svn::SvnClient::new(&local_url, "", "");
+        let entries = local.strict_log_range(revision, revision).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].revision, revision);
+        assert_eq!(entries[0].author, "m2d-fixture-author");
+        let registered = crate::svn::SvnClient::new(format!("{}/{branch}", f.root), "", "");
+        let local_info = local.info().await.unwrap();
+        let registered_info = registered.info().await.unwrap();
+        assert_eq!(local_info.uuid, registered_info.uuid);
+        assert_eq!(local_info.latest_rev, registered_info.latest_rev);
+        assert_eq!(local_info.latest_rev, revision);
+        assert_eq!(registered_info.url.trim_end_matches('/'), format!("{}/{branch}", f.root));
+        revision
+    }
+
     async fn ready(f: &Fixture, engine: &crate::sync_engine::SyncEngine) -> Ready {
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let history = completed(f, engine).await;
@@ -5990,9 +6024,13 @@ mod changed_child_source_correspondence {
         let (child_engine, child_bridge) = producer_engine(f, "child");
         std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
         svn(
-            &["commit", "-m", "m2d parent source work"],
+            &[
+                "commit", "--username", "m2d-fixture-author", "--no-auth-cache",
+                "-m", "m2d parent source work",
+            ],
             Some(&f._parent_wc),
         );
+        let parent_source_revision = require_named_source_revision(f, "trunk").await;
         let parent_stats = parent_engine.run_sync_cycle().await.unwrap();
         assert_eq!(parent_stats.svn_to_git_count, 1);
         assert_eq!(parent_stats.git_to_svn_count, 0);
@@ -6010,20 +6048,29 @@ mod changed_child_source_correspondence {
         assert_eq!(baseline["repo_id"], "parent");
         assert_eq!(baseline["git_sha"].as_str(), Some(parent_sha.as_str()));
         assert_eq!(baseline["svn_rev"].as_i64(), Some(parent_revision));
+        assert_eq!(parent_revision, parent_source_revision);
         let child_wc = f.temp.path().join("m2d-child-wc");
         svn(
             &[
                 "checkout",
-                &format!("{}/branches/f", f.root),
+                &local_source_url(f, "branches/f"),
                 child_wc.to_str().unwrap(),
             ],
             None,
         );
         std::fs::write(child_wc.join("file.txt"), b"m2d child work\n").unwrap();
-        svn(&["commit", "-m", "m2d child source work"], Some(&child_wc));
+        svn(
+            &[
+                "commit", "--username", "m2d-fixture-author", "--no-auth-cache",
+                "-m", "m2d child source work",
+            ],
+            Some(&child_wc),
+        );
+        let child_source_revision = require_named_source_revision(f, "branches/f").await;
         let child_stats = child_engine.run_sync_cycle().await.unwrap();
         assert_eq!(child_stats.svn_to_git_count, 1);
         assert_eq!(child_stats.git_to_svn_count, 0);
+        assert_eq!(f.db.get_repo_watermark("child").unwrap().0, child_source_revision);
         drop(fence);
         let current =
             f.db.capture_pair_refresh_execution_configuration("child")
@@ -6778,5 +6825,539 @@ mod changed_child_source_correspondence {
         assert!(snapshots.iter().all(|p| !p.exists()));
         assert!(!git_scratch.exists());
         assert_eq!(storage(&f.db), before);
+    }
+
+    // The negative capability tests below reuse genuinely produced completed
+    // journals and mappings from ready(). Only the inbound pointer is rolled
+    // back to the genuine signed R to model an unsettled range; no positive
+    // mapping/receipt is synthesized. Each injected fault must remain refused.
+    fn unsettled_child_input(
+        f: &Fixture,
+        ready: &Ready,
+    ) -> (String, String, String, Vec<(String, String)>) {
+        let old = ready.history.pins.git.prepared_sha.clone();
+        let (_, current) = f.db.get_repo_watermark("child").unwrap();
+        let commit = f.target.find_commit(Oid::from_str(&current).unwrap()).unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).unwrap().to_string(), old);
+        let origin = Repository::open(&ready.child_bridge).unwrap()
+            .find_remote("origin").unwrap().url().unwrap().to_owned();
+        crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &f.db.conn(), "child", &old, &chrono::Utc::now().to_rfc3339(),
+        ).unwrap();
+        let chain = vec![(current.clone(), commit.tree_id().to_string())];
+        (old, current, origin, chain)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_real_roles_and_quiet_cycles_do_not_republish() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let pin = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        for role in [&pin.pin().child, &pin.pin().parent] {
+            assert_eq!(role.scoped_git_checkpoint.as_deref(), Some(role.last_git_sha.as_str()));
+        }
+        let source = files(f.target.path());
+        let revision = svn_revision(&f.root);
+        let mappings: i64 = f.db.conn().query_row("SELECT count(*) FROM sync_records", [], |row|row.get(0)).unwrap();
+        let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        for role in ["parent", "child"] {
+            let (ordinary, _) = producer_engine(&f, role);
+            let stats = ordinary.run_sync_cycle().await.unwrap();
+            assert_eq!(stats.svn_to_git_count, 0);
+            assert_eq!(stats.git_to_svn_count, 0);
+        }
+        assert_eq!(files(f.target.path()), source);
+        assert_eq!(svn_revision(&f.root), revision);
+        assert_eq!(f.db.conn().query_row("SELECT count(*) FROM sync_records", [], |row|row.get::<_,i64>(0)).unwrap(), mappings);
+        assert_eq!(f.db.capture_pair_refresh_execution_configuration("child").unwrap().pin(), pin.pin());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_captured_identity_and_owner_drift_refuse_without_repair() {
+        let _serial = SERIAL.lock().await;
+        for fault in ["configuration", "generation", "credential", "scope", "cursor", "window", "origin"] {
+            let f = Fixture::new();
+            let engine = f.engine();
+            let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+            let ready = ready(&f, &engine).await;
+            let (old, current, origin, chain) = unsettled_child_input(&f, &ready);
+            let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+            let window = f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+            let converge = window.prepare_emitted_git_convergence(
+                "child", "feature", &origin, &old, &current,
+                "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).unwrap().unwrap();
+            match fault {
+                "configuration" => { f.db.conn().execute("UPDATE repositories SET poll_interval_secs=poll_interval_secs+1 WHERE id='child'",[]).unwrap(); }
+                "generation" => {
+                    let scope = crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "child").unwrap();
+                    let generation = crate::echo_receipt_scope::repo_echo_generation(&f.db,"child").unwrap();
+                    f.db.set_state(&crate::db::repo_scope_identity::repo_echo_generation_kv_key(&scope), &(generation+1).to_string()).unwrap();
+                }
+                "credential" => { f.db.set_state("secret_git_token_child","changed-disposable-token").unwrap(); }
+                "scope" => { f.db.conn().execute("UPDATE repositories SET scope_uuid=?1 WHERE id='child'",[Uuid::new_v4().to_string()]).unwrap(); }
+                "cursor" => { crate::echo_receipt_scope::write_scoped_last_git_sha_kv(&f.db.conn(),"child",&current,&chrono::Utc::now().to_rfc3339()).unwrap(); }
+                "window" => { f.db.conn().execute("UPDATE kv_state SET value=json_set(value,'$.writer_epoch',json_extract(value,'$.writer_epoch')+1) WHERE key LIKE 'pair_refresh_writer_window_v1:document:%'",[]).unwrap(); }
+                "origin" => (),
+                _ => unreachable!(),
+            }
+            let before = storage(&f.db);
+            let source = files(f.target.path());
+            let observed_origin = if fault=="origin" { "different-origin" } else { &origin };
+            assert!(converge(&current, observed_origin, &chain).is_err(), "{fault}");
+            assert_eq!(storage(&f.db), before, "{fault}");
+            assert_eq!(storage(engine.db()), before, "{fault}");
+            assert_eq!(files(f.target.path()), source, "{fault}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_mapping_and_completed_receipt_faults_refuse() {
+        let _serial = SERIAL.lock().await;
+        for fault in ["missing", "foreign", "duplicate", "unscoped", "unfinished", "remote", "incomplete"] {
+            let f = Fixture::new();
+            let engine = f.engine();
+            let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+            let ready = ready(&f, &engine).await;
+            let id = child_row(&f).0;
+            let (old, current, origin, chain) = unsettled_child_input(&f, &ready);
+            let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+            let window = f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+            let converge = window.prepare_emitted_git_convergence(
+                "child", "feature", &origin, &old, &current,
+                "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).unwrap().unwrap();
+            match fault {
+                "missing" => { f.db.conn().execute("DELETE FROM sync_records WHERE id=?1",[&id]).unwrap(); }
+                "foreign" => { f.db.conn().execute("UPDATE sync_records SET repo_id='parent' WHERE id=?1",[&id]).unwrap(); }
+                "duplicate" => { f.db.conn().execute("INSERT INTO sync_records SELECT id||'-duplicate',repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status FROM sync_records WHERE id=?1",[&id]).unwrap(); }
+                "unscoped" => { f.db.conn().execute("UPDATE sync_records SET repo_id=NULL WHERE id=?1",[&id]).unwrap(); }
+                "unfinished" => { f.db.conn().execute("UPDATE kv_state SET value=json_set(value,'$.state','running') WHERE key LIKE 'svn_to_git_push_v1:document:%' AND json_extract(value,'$.repo_id')='child' AND json_extract(value,'$.intended_local_git_sha')=?1",[&current]).unwrap(); }
+                "remote" | "incomplete" => (),
+                _ => unreachable!(),
+            }
+            let before = storage(&f.db);
+            let observed = if fault=="remote" { &old } else { &current };
+            let selected = if fault=="incomplete" { &[][..] } else { &chain[..] };
+            assert!(converge(observed, &origin, selected).is_err(), "{fault}");
+            assert_eq!(storage(&f.db), before, "{fault}");
+            assert_eq!(storage(engine.db()), before, "{fault}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_transaction_failure_rolls_back_cursor_and_mirrors() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let (old, current, origin, chain) = unsettled_child_input(&f, &ready);
+        let proof_key = emitted_frontier_key(&f,"child",&current);
+        // Negative fault fixture for an uncommitted transition, not a new
+        // positive mapping. The real writer must insert the proof atomically.
+        f.db.delete_kv_state(&proof_key).unwrap();
+        let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let window = f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+        let converge = window.prepare_emitted_git_convergence(
+            "child", "feature", &origin, &old, &current,
+            "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+        ).unwrap().unwrap();
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(),"child").unwrap();
+        let key = crate::db::repo_scope_identity::last_git_sha_kv_key(&scope);
+        // The real canonical UPDATE reaches this trigger; SQLite must undo
+        // that write and all transaction work when the injected error occurs.
+        f.db.conn().execute_batch(&format!(
+            "CREATE TEMP TRIGGER convergence_atomic_failure AFTER UPDATE ON kv_state WHEN NEW.key='{key}' AND NEW.value='{current}' BEGIN SELECT RAISE(ABORT,'convergence atomic fault'); END;"
+        )).unwrap();
+        let before = storage(&f.db);
+        let error = converge(&current,&origin,&chain).unwrap_err().to_string();
+        assert!(error.contains("convergence atomic fault"), "{error}");
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(f.db.get_state(&proof_key).unwrap(),None);
+        assert!(!retained_frontier(&f,&current).unwrap());
+        assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap().as_deref(),Some(old.as_str()));
+        assert_eq!(f.db.conn().query_row("SELECT count(*) FROM sqlite_temp_master WHERE type='trigger' AND name='convergence_atomic_failure'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_dropped_observer_recovers_known_range_without_republication() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let (old,current,origin,_) = unsettled_child_input(&f,&ready);
+        let _fence = crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        {
+            let window=f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+            let before=storage(&f.db);
+            let captured=window.prepare_emitted_git_convergence(
+                "child","feature",&origin,&old,&current,
+                "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).unwrap().unwrap();
+            drop(captured);
+            assert_eq!(storage(&f.db),before);
+        }
+        assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap().as_deref(),Some(old.as_str()));
+        let source=files(f.target.path());let revision=svn_revision(&f.root);
+        let (ordinary,_)=producer_engine(&f,"child");
+        let stats=ordinary.run_sync_cycle().await.unwrap();
+        assert_eq!(stats.svn_to_git_count,0);assert_eq!(stats.git_to_svn_count,0);
+        assert_eq!(files(f.target.path()),source);assert_eq!(svn_revision(&f.root),revision);
+        assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap().as_deref(),Some(current.as_str()));
+        f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_missing_old_authority_and_unrelated_root_are_not_adopted() {
+        let _serial = SERIAL.lock().await;
+        // Existing ordinary in-memory support is not new convergence authority.
+        // Disregard only the established writer lease's permitted renewal when
+        // checking no additional storage/proof/cursor mutation on enrolled calls.
+        let retained_without_lease = |db: &Database| {
+            let mut snapshot = storage(db);
+            snapshot.get_mut("kv_state").unwrap().retain(|row| {
+                !matches!(&row[0], rusqlite::types::Value::Text(key) if key.starts_with("writer_fence_v1:"))
+            });
+            snapshot
+        };
+        {
+            let memory = Database::in_memory().unwrap();
+            memory.initialize().unwrap();
+            memory.conn().execute(
+                "INSERT INTO repositories (id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors) VALUES ('compat-root','compat','file:///unused','','','local','','unused','main','team',5,0,0,1,'t','t',2,?1,'idle',0,0)",
+                ["b".repeat(40)],
+            ).unwrap();
+            crate::db::repo_scope_identity::migrate_v13_scope_uuid(&memory.conn()).unwrap();
+            assert!(memory.opened_file().is_err());
+            assert_eq!(crate::writer_fence::ordinary_current_epoch(&memory.conn()).unwrap(),None);
+            {
+                let window = memory.begin_ordinary_writer_window(Some("compat-root")).unwrap();
+                let before = storage(&memory);
+                assert!(window.prepare_emitted_git_convergence(
+                    "compat-root","main","file:///unused",&"b".repeat(40),&"b".repeat(40),
+                    "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+                ).unwrap().is_none());
+                assert_eq!(storage(&memory),before);
+            }
+            let scratch = tempfile::tempdir().unwrap();
+            let _fence = crate::writer_fence::claim(&memory,scratch.path()).unwrap();
+            assert!(crate::writer_fence::ordinary_current_epoch(&memory.conn()).unwrap().is_some());
+            let window = memory.begin_ordinary_writer_window(Some("compat-root")).unwrap();
+            let before = retained_without_lease(&memory);
+            assert!(window.prepare_emitted_git_convergence(
+                "compat-root","main","file:///unused",&"b".repeat(40),&"b".repeat(40),
+                "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).unwrap().is_none());
+            assert_eq!(retained_without_lease(&memory),before);
+            assert!(memory.opened_file().is_err());
+        }
+        let f = Fixture::new();let engine=f.engine();
+        let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready=ready(&f,&engine).await;
+        let (old,current,origin,_)=unsettled_child_input(&f,&ready);
+        {
+            let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+            let window=f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+            let before=retained_without_lease(&f.db);
+            let capability=window.prepare_emitted_git_convergence(
+                "child","feature",&origin,&old,&current,
+                "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).unwrap();
+            assert!(capability.is_some(),"eligible valid native pair must remain applicable");
+            drop(capability);
+            assert_eq!(retained_without_lease(&f.db),before);
+            // A real second task-owned name breaks the unchanged single-link
+            // native guard. No fabricated attestation or OS-function adapter.
+            let alias=f.temp.path().join("pc1-native-alias.db");
+            std::fs::hard_link(f.temp.path().join("reposync.db"),&alias).unwrap();
+            let before=retained_without_lease(&f.db);
+            let result=window.prepare_emitted_git_convergence(
+                "child","feature",&origin,&old,&current,
+                "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            );
+            std::fs::remove_file(&alias).unwrap();
+            let error=match result {
+                Err(error)=>error.to_string(),
+                Ok(_)=>panic!("applicable native identity failure must not become a decline or capability"),
+            };
+            assert!(error.contains("owned singly linked native file"),"{error}");
+            assert_eq!(retained_without_lease(&f.db),before);
+            assert_eq!(retained_without_lease(engine.db()),before);
+        }
+        let scope=crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(),"child").unwrap();
+        f.db.delete_kv_state(&crate::db::repo_scope_identity::last_git_sha_kv_key(&scope)).unwrap();
+        f.db.delete_kv_state("last_git_sha_child").unwrap();
+        let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        let window=f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+        let before=storage(&f.db);
+        assert!(window.prepare_emitted_git_convergence(
+            "child","feature",&origin,&current,&current,
+            "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+        ).is_err());
+        assert_eq!(storage(&f.db),before);
+        // Controlled topology fault makes this an unrelated ordinary root.
+        // The optional convergence route must grant no capability or writes.
+        f.db.conn().execute("UPDATE repositories SET parent_id=NULL WHERE id='child'",[]).unwrap();
+        let before=storage(&f.db);
+        assert!(window.prepare_emitted_git_convergence(
+            "child","feature",&origin,&current,&current,
+            "{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+        ).unwrap().is_none());
+        assert_eq!(storage(&f.db),before);
+    }
+
+    fn emitted_frontier_key(f: &Fixture, id: &str, sha: &str) -> String {
+        let scope=crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(),id).unwrap();
+        let generation=crate::echo_receipt_scope::repo_echo_generation(&f.db,id).unwrap();
+        format!("handled_git_emitted_frontier_v1:{scope}:g{generation}:{sha}")
+    }
+
+    fn retained_frontier(f: &Fixture, sha: &str) -> Result<bool,crate::errors::DatabaseError> {
+        let conn=f.db.conn();
+        crate::db::ordinary_writer_windows::OrdinaryWriterWindow::verified_emitted_git_frontier(
+            &conn,&f.db,"child",sha,"{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_proof_survives_reopen_and_another_real_transition() {
+        let _serial=SERIAL.lock().await;
+        let f=Fixture::new();let engine=f.engine();
+        let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready=ready(&f,&engine).await;
+        let (_,first)=f.db.get_repo_watermark("child").unwrap();
+        assert!(retained_frontier(&f,&first).unwrap());
+        let key=emitted_frontier_key(&f,"child",&first);
+        let original_proof=f.db.get_state(&key).unwrap().unwrap();
+        let reopened=Database::new(f.temp.path().join("reposync.db")).unwrap();
+        {
+            let conn=reopened.conn();
+            assert!(crate::db::ordinary_writer_windows::OrdinaryWriterWindow::verified_emitted_git_frontier(
+                &conn,&reopened,"child",&first,"{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).unwrap());
+        }
+        let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        let (ordinary,_)=producer_engine(&f,"child");
+        let quiet=ordinary.run_sync_cycle().await.unwrap();
+        assert_eq!(quiet.svn_to_git_count,0);assert_eq!(quiet.git_to_svn_count,0);
+        std::fs::write(ready.child_wc.join("file.txt"),b"second genuine child work\n").unwrap();
+        svn(&["commit","--username","m2d-fixture-author","--no-auth-cache","-m","second genuine child source"],Some(&ready.child_wc));
+        let revision=require_named_source_revision(&f,"branches/f").await;
+        let advanced=ordinary.run_sync_cycle().await.unwrap();
+        assert_eq!(advanced.svn_to_git_count,1);assert_eq!(advanced.git_to_svn_count,0);
+        let (handled,second)=f.db.get_repo_watermark("child").unwrap();
+        assert_eq!(handled,revision);assert_ne!(first,second);
+        assert!(retained_frontier(&f,&second).unwrap());
+        assert_eq!(f.db.get_state(&key).unwrap().as_deref(),Some(original_proof.as_str()));
+        let second_proof:serde_json::Value=serde_json::from_str(&f.db.get_state(&emitted_frontier_key(&f,"child",&second)).unwrap().unwrap()).unwrap();
+        assert_eq!(second_proof["payload"]["old_authority"]["kind"],"convergence");
+        assert_eq!(second_proof["payload"]["old_frontier"],first);
+        let source=files(f.target.path());let svn_before=svn_revision(&f.root);
+        let quiet=ordinary.run_sync_cycle().await.unwrap();
+        assert_eq!(quiet.svn_to_git_count,0);assert_eq!(quiet.git_to_svn_count,0);
+        assert_eq!(files(f.target.path()),source);assert_eq!(svn_revision(&f.root),svn_before);
+        f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_retained_payload_and_required_proof_refuse_tampering() {
+        let _serial=SERIAL.lock().await;
+        let f=Fixture::new();let engine=f.engine();
+        let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready=ready(&f,&engine).await;
+        let (_,current)=f.db.get_repo_watermark("child").unwrap();
+        let key=emitted_frontier_key(&f,"child",&current);
+        let original=f.db.get_state(&key).unwrap().unwrap();
+        assert!(retained_frontier(&f,&current).unwrap());
+        // Invalid field changes are MAC-negative tests, not claims that every
+        // downstream semantic branch was independently reached.
+        for field in ["version","outcome","repo_id","scope_uuid","generation","configuration_digest","projection","origin_digest","native_database","writer_epoch","new_git_sha","new_git_tree","new_svn_revision","old_authority"] {
+            let mut record:serde_json::Value=serde_json::from_str(&original).unwrap();
+            record["payload"][field]=serde_json::json!("wrong");
+            f.db.set_state(&key,&record.to_string()).unwrap();
+            let before=storage(&f.db);
+            assert!(retained_frontier(&f,&current).is_err(),"{field}");
+            assert_eq!(storage(&f.db),before,"{field}");
+            assert_eq!(storage(engine.db()),before,"{field}");
+            f.db.set_state(&key,&original).unwrap();
+            assert!(retained_frontier(&f,&current).unwrap());
+        }
+        // Valid MAC, altered current configuration reaches invalidation.
+        f.db.conn().execute("UPDATE repositories SET poll_interval_secs=poll_interval_secs+1 WHERE id='child'",[]).unwrap();
+        assert!(retained_frontier(&f,&current).unwrap_err().to_string().contains("stale or foreign"));
+        f.db.conn().execute("UPDATE repositories SET poll_interval_secs=poll_interval_secs-1 WHERE id='child'",[]).unwrap();
+        assert!(retained_frontier(&f,&current).unwrap());
+        // A different actual database handle cannot supply the native context
+        // for this connection, even when the proof and key bytes are untouched.
+        let other=Database::new(f.temp.path().join("other-native.db")).unwrap();other.initialize().unwrap();
+        {
+            let conn=f.db.conn();
+            assert!(crate::db::ordinary_writer_windows::OrdinaryWriterWindow::verified_emitted_git_frontier(
+                &conn,&other,"child",&current,"{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+            ).is_err());
+        }
+        let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        f.db.delete_kv_state(&key).unwrap();
+        let before=storage(&f.db);assert!(!retained_frontier(&f,&current).unwrap());assert_eq!(storage(&f.db),before);
+        let source=files(f.target.path());let row=child_row(&f);
+        let (ordinary,_)=producer_engine(&f,"child");
+        assert!(matches!(ordinary.run_sync_cycle().await,Err(crate::errors::SyncError::HistoryBlocked {reason,..}) if reason=="ambiguous_checkpoint"));
+        assert_eq!(child_row(&f),row);assert_eq!(files(f.target.path()),source);
+        assert_eq!(f.db.get_state(&key).unwrap(),None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_retained_dependencies_and_generation_reset_fail_closed() {
+        let _serial=SERIAL.lock().await;
+        let f=Fixture::new();let engine=f.engine();
+        let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready=ready(&f,&engine).await;
+        let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        let (_,current)=f.db.get_repo_watermark("child").unwrap();
+        let key=emitted_frontier_key(&f,"child",&current);
+        let original=f.db.get_state(&key).unwrap().unwrap();
+        let record:serde_json::Value=serde_json::from_str(&original).unwrap();
+        let producer_key=record["payload"]["chain"][0]["producer_key"].as_str().unwrap();
+        let producer=f.db.get_state(producer_key).unwrap().unwrap();
+        f.db.delete_kv_state(producer_key).unwrap();
+        let before=storage(&f.db);
+        assert!(retained_frontier(&f,&current).unwrap_err().to_string().contains("producer dependency changed or missing"));
+        assert_eq!(storage(&f.db),before);f.db.set_state(producer_key,&producer).unwrap();
+        assert!(retained_frontier(&f,&current).unwrap());
+        let row_id=child_row(&f).0;let row=sync_row(&f,&row_id);
+        f.db.conn().execute("DELETE FROM sync_records WHERE id=?1",[&row_id]).unwrap();
+        let before=storage(&f.db);
+        assert!(retained_frontier(&f,&current).unwrap_err().to_string().contains("correspondence changed or missing"));
+        assert_eq!(storage(&f.db),before);restore_sync_row(&f,&row);
+        let old_id=ready.history.id.to_string();let old_row=sync_row(&f,&old_id);
+        f.db.conn().execute("DELETE FROM sync_records WHERE id=?1",[&old_id]).unwrap();
+        let before=storage(&f.db);
+        assert!(retained_frontier(&f,&current).unwrap_err().to_string().contains("old applied authority dependency missing or changed"));
+        assert_eq!(storage(&f.db),before);
+        let source_before=files(f.target.path());
+        let checkpoint_before=f.db.get_repo_watermark("child").unwrap();
+        let (ordinary,_)=producer_engine(&f,"child");
+        let rejected=ordinary.run_sync_cycle().await.unwrap_err().to_string();
+        assert!(rejected.contains("old applied authority dependency missing or changed"),"{rejected}");
+        assert_eq!(files(f.target.path()),source_before);
+        assert_eq!(f.db.get_repo_watermark("child").unwrap(),checkpoint_before);
+        // Losing both this proof and old disposable outbound diagnostics
+        // must not reclassify C as a legacy import: signed refresh history R
+        // is still present for the same incarnation/generation.
+        f.db.delete_kv_state(&key).unwrap();
+        assert!(!retained_frontier(&f,&current).unwrap());
+        let (ordinary,_)=producer_engine(&f,"child");
+        assert!(matches!(ordinary.run_sync_cycle().await,Err(crate::errors::SyncError::HistoryBlocked {reason,..}) if reason=="ambiguous_checkpoint"));
+        assert_eq!(f.db.get_repo_watermark("child").unwrap(),checkpoint_before);
+        assert_eq!(files(f.target.path()),source_before);
+        assert_eq!(f.db.get_state(&key).unwrap(),None);
+        f.db.set_state(&key,&original).unwrap();
+        restore_sync_row(&f,&old_row);
+        assert!(retained_frontier(&f,&current).unwrap());
+        let prior_generation=crate::echo_receipt_scope::repo_echo_generation(&f.db,"child").unwrap();
+        assert_eq!(crate::echo_receipt_scope::bump_repo_echo_generation(&f.db,"child").unwrap(),prior_generation+1);
+        assert!(!retained_frontier(&f,&current).unwrap());
+        assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap().as_deref(),Some(ready.history.pins.git.prepared_sha.as_str()));
+        let source=files(f.target.path());let revision=svn_revision(&f.root);
+        let (ordinary,_)=producer_engine(&f,"child");
+        let error=ordinary.run_sync_cycle().await.unwrap_err().to_string();
+        assert!(error.contains("stale emitted proof"),"{error}");
+        assert_eq!(files(f.target.path()),source);assert_eq!(svn_revision(&f.root),revision);
+        assert_eq!(f.db.get_state(&key).unwrap().as_deref(),Some(original.as_str()));
+        assert_eq!(f.db.get_state(&emitted_frontier_key(&f,"child",&current)).unwrap(),None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_proof_insertion_failure_rolls_back_entire_transition() {
+        let _serial=SERIAL.lock().await;
+        let f=Fixture::new();let engine=f.engine();
+        let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready=ready(&f,&engine).await;
+        let (old,current,origin,chain)=unsettled_child_input(&f,&ready);
+        let key=emitted_frontier_key(&f,"child",&current);
+        // Controlled uncommitted-transition model only: retain the genuine
+        // producer/mapping dependencies, remove this already committed proof
+        // so the real writer's INSERT (not a fake positive record) is exercised.
+        f.db.delete_kv_state(&key).unwrap();
+        let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        let window=f.db.begin_ordinary_writer_window(Some("child")).unwrap();
+        let converge=window.prepare_emitted_git_convergence(
+            "child","feature",&origin,&old,&current,"{\"allowed_paths\":[],\"blocked_patterns\":[]}",
+        ).unwrap().unwrap();
+        f.db.conn().execute_batch(&format!("CREATE TEMP TRIGGER emitted_proof_insert_failure AFTER INSERT ON kv_state WHEN NEW.key='{key}' BEGIN SELECT RAISE(ABORT,'proof insertion fault'); END;")).unwrap();
+        let before=storage(&f.db);let error=converge(&current,&origin,&chain).unwrap_err().to_string();
+        assert!(error.contains("proof insertion fault"),"{error}");
+        assert_eq!(storage(&f.db),before);assert_eq!(storage(engine.db()),before);
+        assert_eq!(f.db.get_state(&key).unwrap(),None);assert!(!retained_frontier(&f,&current).unwrap());
+        assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap().as_deref(),Some(old.as_str()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_pending_opposite_work_never_advances_as_an_echo() {
+        let _serial=SERIAL.lock().await;
+        let f=Fixture::new();let engine=f.engine();
+        let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready=ready(&f,&engine).await;
+        let (revision,handled)=f.db.get_repo_watermark("child").unwrap();
+        let proof_key=emitted_frontier_key(&f,"child",&handled);
+        let proof=f.db.get_state(&proof_key).unwrap().unwrap();
+        let pending=commit(&f.target,b"independent pending Git work\n",&[Oid::from_str(&handled).unwrap()]);
+        f.target.reference("refs/heads/feature",pending,true,"disposable pending opposite work").unwrap();
+        std::fs::write(ready.child_wc.join("file.txt"),b"independent pending SVN work\n").unwrap();
+        svn(&["commit","--username","m2d-fixture-author","--no-auth-cache","-m","pending opposite SVN work"],Some(&ready.child_wc));
+        let pending_revision=require_named_source_revision(&f,"branches/f").await;
+        assert!(pending_revision>revision);
+        let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+        let (ordinary,_)=producer_engine(&f,"child");
+        assert!(matches!(ordinary.run_sync_cycle().await,Err(crate::errors::SyncError::UnresolvableConflict { .. })));
+        assert_eq!(f.db.get_repo_watermark("child").unwrap(),(revision,handled.clone()));
+        assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap().as_deref(),Some(handled.as_str()));
+        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(),Some(pending));
+        assert_eq!(svn_revision(&f.root),pending_revision);
+        assert_eq!(f.db.get_state(&proof_key).unwrap().as_deref(),Some(proof.as_str()));
+        assert_eq!(f.db.get_state(&emitted_frontier_key(&f,"child",&pending.to_string())).unwrap(),None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn producer_convergence_past_proof_does_not_repair_missing_cursor_copies() {
+        let _serial=SERIAL.lock().await;
+        for shape in ["kv-only","column-only"] {
+            let f=Fixture::new();let engine=f.engine();
+            let _lock=crate::data_dir::acquire(f.temp.path()).unwrap();
+            let _ready=ready(&f,&engine).await;
+            let (_,current)=f.db.get_repo_watermark("child").unwrap();
+            let proof_key=emitted_frontier_key(&f,"child",&current);
+            let proof=f.db.get_state(&proof_key).unwrap().unwrap();
+            if shape=="kv-only" {
+                f.db.conn().execute("UPDATE repositories SET last_git_sha='' WHERE id='child'",[]).unwrap();
+            } else {
+                let scope=crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(),"child").unwrap();
+                f.db.delete_kv_state(&crate::db::repo_scope_identity::last_git_sha_kv_key(&scope)).unwrap();
+                f.db.delete_kv_state("last_git_sha_child").unwrap();
+            }
+            // This local proof is still a fact about past handled work. Its
+            // validation cannot manufacture a current cursor or a ready pair.
+            let before=storage(&f.db);
+            assert!(retained_frontier(&f,&current).unwrap(),"{shape}");
+            assert_eq!(storage(&f.db),before,"{shape}");
+            assert!(f.db.capture_pair_refresh_execution_configuration("child").is_err());
+            let _fence=crate::writer_fence::claim(engine.db(),f.temp.path()).unwrap();
+            let source=files(f.target.path());let revision=svn_revision(&f.root);
+            let watermark=f.db.get_repo_watermark("child").unwrap();
+            let inbound=crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap();
+            let (ordinary,_)=producer_engine(&f,"child");
+            assert!(ordinary.run_sync_cycle().await.is_err(),"{shape}");
+            assert_eq!(f.db.get_repo_watermark("child").unwrap(),watermark,"{shape}");
+            assert_eq!(crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db,"child").unwrap(),inbound,"{shape}");
+            assert_eq!(f.db.get_state(&proof_key).unwrap().as_deref(),Some(proof.as_str()));
+            assert_eq!(files(f.target.path()),source);assert_eq!(svn_revision(&f.root),revision);
+        }
     }
 }
