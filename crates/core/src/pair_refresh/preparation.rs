@@ -1082,3 +1082,121 @@ pub(crate) fn inspect_changed_child_applicable_graph(
     review.inspection_digest = review_digest("changed_child_applicable_graph_v1", &review)?;
     Ok(review)
 }
+
+/// Candidate-review policy only. A choice is untrusted intent until a fresh
+/// live capture binds it; even then this policy grants no actor/job authority.
+pub const CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY: &str =
+    "issue69_live_bound_resolution_candidate_review_v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangedChildResolutionCandidateRequest {
+    pub schema: u8,
+    pub policy: String,
+    pub manifest_digest: String,
+    pub choices: Vec<ChangedChildConflictChoice>,
+}
+
+/// Identity of a fully selected in-memory graph, not a written Git tree or an
+/// authenticated resolution. The complete input graph and choices stay bound.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangedChildResolvedGraphCandidate {
+    pub schema: u8,
+    pub policy: String,
+    pub source_graph: ChangedChildApplicableGraphReview,
+    pub choices: Vec<ChangedChildConflictChoice>,
+    pub paths: Vec<ChangedChildPathReview>,
+    pub candidate_tree: String,
+    pub execution_eligible: bool,
+    pub candidate_digest: String,
+}
+
+pub(crate) fn require_changed_child_resolution_request_header(
+    request: &ChangedChildResolutionCandidateRequest,
+) -> Result<(), GitError> {
+    if request.schema != 1
+        || request.policy != CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY
+        || !review_sha256(&request.manifest_digest)
+    {
+        return Err(review_error(
+            "unknown or malformed resolution-candidate request",
+        ));
+    }
+    Ok(())
+}
+
+/// Object-only implementation seam. Recompute instead of trusting a serialized
+/// graph/result. The live factory separately verifies the complete manifest pin.
+pub(crate) fn resolve_changed_child_applicable_graph(
+    repo: &Repository,
+    historical: &PreparedCleanChildGit,
+    roles: &ChangedChildApplicabilityRoles,
+    context: &ChangedChildReviewContext,
+    expected_inspection_digest: &str,
+    choices: &[ChangedChildConflictChoice],
+) -> Result<ChangedChildResolvedGraphCandidate, GitError> {
+    let graph = inspect_changed_child_applicable_graph(repo, historical, roles, context)?;
+    if graph.inspection_digest != expected_inspection_digest {
+        return Err(review_error("stale resolution-candidate graph pin"));
+    }
+    let mut by_path = std::collections::BTreeMap::new();
+    for choice in choices {
+        if !review_path(&choice.path) {
+            return Err(review_error("malformed resolution-candidate path"));
+        }
+        if by_path.insert(choice.path.as_str(), choice).is_some() {
+            return Err(review_error("duplicate resolution-candidate path"));
+        }
+    }
+    let mut paths = graph.paths.clone();
+    for path in &mut paths {
+        match &path.disposition {
+            ChangedChildDisposition::Refused { .. } => {
+                return Err(review_error(
+                    "unsupported topology cannot be resolved by side choice",
+                ));
+            }
+            ChangedChildDisposition::Conflict => {
+                let choice = by_path
+                    .remove(path.path.as_str())
+                    .ok_or_else(|| review_error("missing resolution-candidate conflict choice"))?;
+                if choice.baseline != path.baseline
+                    || choice.child != path.child
+                    || choice.parent != path.parent
+                {
+                    return Err(review_error("stale resolution-candidate conflict triple"));
+                }
+                let entry = match choice.choice {
+                    ChangedChildChoice::Base => path.baseline.clone(),
+                    ChangedChildChoice::Child => path.child.clone(),
+                    ChangedChildChoice::Parent => path.parent.clone(),
+                };
+                path.disposition = ChangedChildDisposition::Selected { entry };
+            }
+            // Uncontested selections and directory markers are preserved,
+            // never offered as choices that could erase either side's delta.
+            _ => {}
+        }
+    }
+    if !by_path.is_empty() {
+        return Err(review_error(
+            "resolution-candidate choice names an unknown or non-conflict path",
+        ));
+    }
+    let mut choices = choices.to_vec();
+    choices.sort_by(|left, right| left.path.cmp(&right.path));
+    let candidate_tree = review_result_tree(&paths)?;
+    let mut candidate = ChangedChildResolvedGraphCandidate {
+        schema: 1,
+        policy: CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
+        source_graph: graph,
+        choices,
+        paths,
+        candidate_tree,
+        execution_eligible: false,
+        candidate_digest: String::new(),
+    };
+    candidate.candidate_digest =
+        review_digest("changed_child_resolved_graph_candidate_v1", &candidate)?;
+    Ok(candidate)
+}
