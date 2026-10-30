@@ -1959,7 +1959,11 @@ fn changed_child_applied_rows(
     )?;
     let rows = query
         .query_map(
-            params![registration.repo_id, registration.last_git_sha, registration.last_svn_rev],
+            params![
+                registration.repo_id,
+                registration.last_git_sha,
+                registration.last_svn_rev
+            ],
             |row| {
                 Ok(ChangedChildAppliedRow {
                     id: row.get(0)?,
@@ -1989,7 +1993,9 @@ fn changed_child_applied_rows(
             || chrono::DateTime::parse_from_rfc3339(&row.timestamp).is_err()
             || chrono::DateTime::parse_from_rfc3339(&row.synced_at).is_err()
         {
-            return Err(refused("current applied correspondence is foreign or contradictory"));
+            return Err(refused(
+                "current applied correspondence is foreign or contradictory",
+            ));
         }
     }
     Ok(rows)
@@ -2042,10 +2048,16 @@ impl Database {
             [only] if only.id == candidate.selected.historical.id => *only,
             _ => return Err(refused("mapping-review candidate closure changed")),
         };
-        let document = read(&tx, &operation_key(3, "document", &historical.id.to_string()))?
-            .ok_or_else(|| refused("mapping-review candidate document disappeared"))?;
-        let authority = read(&tx, &operation_key(3, "authority", &historical.id.to_string()))?
-            .ok_or_else(|| refused("mapping-review candidate authority disappeared"))?;
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("mapping-review candidate document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("mapping-review candidate authority disappeared"))?;
         let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
         let candidate_digest = digest(&(
             "changed_child_baseline_candidate_set_v1",

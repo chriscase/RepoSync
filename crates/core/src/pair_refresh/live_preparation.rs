@@ -941,7 +941,10 @@ async fn observe_changed_child_correspondence_role(
     git_path: &std::path::Path,
     expected: &super::svn_sources::ObservedSvnSourcePins,
     role: ChangedChildCorrespondenceRole<'_>,
-) -> Result<(super::svn_visibility::VisibleSvnCheckout, ChangedChildSourceRoleProof)> {
+) -> Result<(
+    super::svn_visibility::VisibleSvnCheckout,
+    ChangedChildSourceRoleProof,
+)> {
     let snapshot = super::svn_visibility::observe_subtree(role.client, role.revision).await?;
     snapshot.require_unchanged_since(role.handled_revision)?;
     let info = snapshot.info();
@@ -959,12 +962,9 @@ async fn observe_changed_child_correspondence_role(
         snapshot.path(),
         info,
     )?;
-    let local = super::svn_preparation::visible_checkout_properties(
-        role.client,
-        snapshot.path(),
-        info,
-    )
-    .await?;
+    let local =
+        super::svn_preparation::visible_checkout_properties(role.client, snapshot.path(), info)
+            .await?;
     let meaningful = |mut values: super::svn_preparation::SvnPropertySnapshot| {
         values.retain(|path, properties| path.is_empty() || !properties.is_empty());
         values
@@ -1015,13 +1015,11 @@ async fn capture_changed_child_correspondence_with_sources<F>(
 where
     F: FnOnce(&Database) -> Result<()>,
 {
-    let candidate = capture_changed_child_baseline_candidate_with_sources(
-        db,
-        child_id,
-        client.clone(),
-        |_| Ok(()),
-    )
-    .await?;
+    let candidate =
+        capture_changed_child_baseline_candidate_with_sources(db, child_id, client.clone(), |_| {
+            Ok(())
+        })
+        .await?;
     let mappings = db.capture_changed_child_mapping_review(
         &candidate.preview.configuration,
         &candidate.candidate,
@@ -1095,11 +1093,10 @@ where
         bail!("changed-child correspondence registered sources changed");
     }
     let final_configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
-    let final_candidate = db.capture_changed_child_baseline_candidate_review(&final_configuration)?;
-    let final_mappings = db.capture_changed_child_mapping_review(
-        &final_configuration,
-        &final_candidate,
-    )?;
+    let final_candidate =
+        db.capture_changed_child_baseline_candidate_review(&final_configuration)?;
+    let final_mappings =
+        db.capture_changed_child_mapping_review(&final_configuration, &final_candidate)?;
     if final_configuration.pin() != &current_pin
         || final_candidate.candidate_set_digest() != candidate.candidate.candidate_set_digest()
         || final_mappings.snapshot_digest() != mappings.snapshot_digest()

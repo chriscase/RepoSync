@@ -5712,11 +5712,11 @@ mod changed_child_baseline_candidate_closure {
 // Genuine current mappings come from ordinary production SyncEngine cycles.
 // Existing fixture bootstrap checkpoints are not full initialization evidence.
 mod changed_child_source_correspondence {
+    use super::super::LiveChangedChildSourceCorrespondence;
     use super::*;
     use crate::db::pair_refresh_operations::{
         ChangedChildMappingReview, PairRefreshOperation, PairRefreshPhase,
     };
-    use super::super::LiveChangedChildSourceCorrespondence;
     use std::collections::BTreeMap;
 
     type Storage = BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>;
@@ -5877,7 +5877,10 @@ mod changed_child_source_correspondence {
             .branch(branch)
             .clone(f.target.path().to_str().unwrap(), &path)
             .unwrap();
-        repo.config().unwrap().set_str("user.name", "Fixture").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.name", "Fixture")
+            .unwrap();
         repo.config()
             .unwrap()
             .set_str("user.email", "fixture@example.invalid")
@@ -5937,7 +5940,10 @@ mod changed_child_source_correspondence {
         let (parent_engine, parent_bridge) = producer_engine(f, "parent");
         let (child_engine, child_bridge) = producer_engine(f, "child");
         std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
-        svn(&["commit", "-m", "m2d parent source work"], Some(&f._parent_wc));
+        svn(
+            &["commit", "-m", "m2d parent source work"],
+            Some(&f._parent_wc),
+        );
         let parent_stats = parent_engine.run_sync_cycle().await.unwrap();
         assert_eq!(parent_stats.svn_to_git_count, 1);
         assert_eq!(parent_stats.git_to_svn_count, 0);
@@ -5956,28 +5962,50 @@ mod changed_child_source_correspondence {
         assert_eq!(child_stats.svn_to_git_count, 1);
         assert_eq!(child_stats.git_to_svn_count, 0);
         drop(fence);
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         for registration in [&current.pin().child, &current.pin().parent] {
             let rows: i64 = f.db.conn().query_row(
                 "SELECT count(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",
                 rusqlite::params![registration.repo_id, registration.last_svn_rev, registration.last_git_sha],
                 |row| row.get(0),
             ).unwrap();
-            assert_eq!(rows, 1, "actual ordinary producer mapping for {}", registration.repo_id);
             assert_eq!(
-                f.target.find_reference(&format!("refs/heads/{}", if registration.repo_id == "child" { "feature" } else { "main" })).unwrap().target().unwrap().to_string(),
+                rows, 1,
+                "actual ordinary producer mapping for {}",
+                registration.repo_id
+            );
+            assert_eq!(
+                f.target
+                    .find_reference(&format!(
+                        "refs/heads/{}",
+                        if registration.repo_id == "child" {
+                            "feature"
+                        } else {
+                            "main"
+                        }
+                    ))
+                    .unwrap()
+                    .target()
+                    .unwrap()
+                    .to_string(),
                 registration.last_git_sha,
             );
         }
         assert_eq!(f.db.pair_refresh_operation(history.id).unwrap(), history);
-        Ready { history, child_wc, parent_bridge, child_bridge }
+        Ready {
+            history,
+            child_wc,
+            parent_bridge,
+            child_bridge,
+        }
     }
 
-    fn mapping(
-        f: &Fixture,
-    ) -> Result<ChangedChildMappingReview, crate::errors::DatabaseError> {
+    fn mapping(f: &Fixture) -> Result<ChangedChildMappingReview, crate::errors::DatabaseError> {
         let current = f.db.capture_pair_refresh_execution_configuration("child")?;
-        let candidate = f.db.capture_changed_child_baseline_candidate_review(&current)?;
+        let candidate =
+            f.db.capture_changed_child_baseline_candidate_review(&current)?;
         f.db.capture_changed_child_mapping_review(&current, &candidate)
     }
 
@@ -6000,7 +6028,9 @@ mod changed_child_source_correspondence {
     }
 
     fn child_row(f: &Fixture) -> (String, String, i64) {
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         f.db.conn().query_row(
             "SELECT id,git_sha,svn_rev FROM sync_records WHERE repo_id='child' AND git_sha=?1 AND svn_rev=?2 AND status='applied' ORDER BY id",
             rusqlite::params![current.pin().child.last_git_sha, current.pin().child.last_svn_rev],
@@ -6022,7 +6052,10 @@ mod changed_child_source_correspondence {
             Ok(_) => panic!("accepted negative mapping subcase {detail}"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains(detail), "unexpected mapping refusal: {error}");
+        assert!(
+            error.contains(detail),
+            "unexpected mapping refusal: {error}"
+        );
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
         assert_eq!(files(f.target.path()), target);
@@ -6049,19 +6082,30 @@ mod changed_child_source_correspondence {
     }
     fn sync_row(f: &Fixture, id: &str) -> Vec<rusqlite::types::Value> {
         let conn = f.db.conn();
-        let mut query = conn.prepare("SELECT * FROM sync_records WHERE id=?1").unwrap();
+        let mut query = conn
+            .prepare("SELECT * FROM sync_records WHERE id=?1")
+            .unwrap();
         let columns = query.column_count();
-        query.query_row([id], |row| {
-            (0..columns).map(|i| row.get(i)).collect::<rusqlite::Result<Vec<_>>>()
-        }).unwrap()
+        query
+            .query_row([id], |row| {
+                (0..columns)
+                    .map(|i| row.get(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
     }
 
     fn restore_sync_row(f: &Fixture, row: &[rusqlite::types::Value]) {
-        let placeholders = (1..=row.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-        f.db.conn().execute(
-            &format!("INSERT INTO sync_records VALUES({placeholders})"),
-            rusqlite::params_from_iter(row),
-        ).unwrap();
+        let placeholders = (1..=row.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        f.db.conn()
+            .execute(
+                &format!("INSERT INTO sync_records VALUES({placeholders})"),
+                rusqlite::params_from_iter(row),
+            )
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6082,11 +6126,21 @@ mod changed_child_source_correspondence {
         assert_eq!(first.mapping_review().mapping_row_counts(), [1, 1]);
         assert_eq!(first.retained_snapshot_count(), 4);
         assert_eq!(
-            first.roles.iter().map(|p| p.role.as_str()).collect::<Vec<_>>(),
+            first
+                .roles
+                .iter()
+                .map(|p| p.role.as_str())
+                .collect::<Vec<_>>(),
             ["P1", "R", "C", "P2"]
         );
-        assert_eq!(first.roles[0].git_commit, ready.history.pins.parent.last_git_sha);
-        assert_eq!(first.roles[1].git_commit, ready.history.pins.git.prepared_sha);
+        assert_eq!(
+            first.roles[0].git_commit,
+            ready.history.pins.parent.last_git_sha
+        );
+        assert_eq!(
+            first.roles[1].git_commit,
+            ready.history.pins.git.prepared_sha
+        );
         assert_ne!(first.roles[0].git_commit, first.roles[1].git_commit);
         assert_ne!(first.roles[1].git_commit, first.roles[2].git_commit);
         assert_ne!(first.roles[0].git_commit, first.roles[3].git_commit);
@@ -6097,21 +6151,44 @@ mod changed_child_source_correspondence {
             assert!(!proof.presence.ancestors.is_empty());
             assert!(proof.presence.max_changed_revision <= proof.handled_revision);
         }
-        let expected_mergeinfo = ready.history.svn_receipt.as_ref().unwrap().mergeinfo.as_str();
-        assert_eq!(first.roles[1].expected_mergeinfo.as_deref(), Some(expected_mergeinfo));
-        assert_eq!(first.roles[2].expected_mergeinfo.as_deref(), Some(expected_mergeinfo));
+        let expected_mergeinfo = ready
+            .history
+            .svn_receipt
+            .as_ref()
+            .unwrap()
+            .mergeinfo
+            .as_str();
+        assert_eq!(
+            first.roles[1].expected_mergeinfo.as_deref(),
+            Some(expected_mergeinfo)
+        );
+        assert_eq!(
+            first.roles[2].expected_mergeinfo.as_deref(),
+            Some(expected_mergeinfo)
+        );
         assert_eq!(first.roles[0].expected_mergeinfo, None);
         assert_eq!(first.roles[3].expected_mergeinfo, None);
-        assert!(first.verified_gates().contains(&"current_scoped_applied_mapping_capture"));
-        assert!(first.verified_gates().contains(&"four_role_complete_visible_svn_correspondence"));
+        assert!(first
+            .verified_gates()
+            .contains(&"current_scoped_applied_mapping_capture"));
+        assert!(first
+            .verified_gates()
+            .contains(&"four_role_complete_visible_svn_correspondence"));
         assert!(!first.execution_eligible());
         assert!(!first.mapping_review().execution_eligible());
         assert!(!first.candidate_context().execution_eligible());
-        assert!(first.unverified_gates().contains(&"authenticated_changed_child_resolution"));
-        assert!(first.unverified_gates().contains(&"exclusive_changed_child_execution_admission"));
+        assert!(first
+            .unverified_gates()
+            .contains(&"authenticated_changed_child_resolution"));
+        assert!(first
+            .unverified_gates()
+            .contains(&"exclusive_changed_child_execution_admission"));
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
-        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+        assert_eq!(
+            f.db.pair_refresh_operation(ready.history.id).unwrap(),
+            ready.history
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6124,7 +6201,9 @@ mod changed_child_source_correspondence {
         let (id, _, _) = child_row(&f);
         let original = sync_row(&f, &id);
         let before = storage(&f.db);
-        f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id]).unwrap();
+        f.db.conn()
+            .execute("DELETE FROM sync_records WHERE id=?1", [&id])
+            .unwrap();
         refuse_mapping_without_repair(
             &f,
             &engine,
@@ -6140,7 +6219,9 @@ mod changed_child_source_correspondence {
         ] {
             f.db.conn().execute(update, [&id]).unwrap();
             refuse_mapping_without_repair(&f, &engine, "current");
-            f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id]).unwrap();
+            f.db.conn()
+                .execute("DELETE FROM sync_records WHERE id=?1", [&id])
+                .unwrap();
             restore_sync_row(&f, &original);
             assert_eq!(storage(&f.db), before);
         }
@@ -6150,12 +6231,20 @@ mod changed_child_source_correspondence {
             rusqlite::params![collision, id],
         ).unwrap();
         refuse_mapping_without_repair(&f, &engine, "foreign or contradictory");
-        f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&collision]).unwrap();
+        f.db.conn()
+            .execute("DELETE FROM sync_records WHERE id=?1", [&collision])
+            .unwrap();
         assert_eq!(storage(&f.db), before);
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let echo = format!("repo_echo_generation_{}", current.pin().child.scope_uuid);
         let prior = saved_kv(&f, &echo);
-        f.db.set_state(&echo, &(current.pin().child.echo_generation + 1).to_string()).unwrap();
+        f.db.set_state(
+            &echo,
+            &(current.pin().child.echo_generation + 1).to_string(),
+        )
+        .unwrap();
         refuse_mapping_without_repair(
             &f,
             &engine,
@@ -6179,14 +6268,32 @@ mod changed_child_source_correspondence {
             f.target.find_commit(c).unwrap().tree_id(),
             f.target.find_commit(foreign).unwrap().tree_id()
         );
-        f.target.reference("refs/heads/feature", foreign, true, "disposable rewritten fixture").unwrap();
+        f.target
+            .reference(
+                "refs/heads/feature",
+                foreign,
+                true,
+                "disposable rewritten fixture",
+            )
+            .unwrap();
         set_checkpoint(&f, "child", foreign, revision);
         // Tampering the original applied row is a negative fault, not a new
         // genuine mapping. Full graph proof must refuse despite equal bytes.
-        f.db.conn().execute("UPDATE sync_records SET git_sha=?1 WHERE id=?2", rusqlite::params![foreign.to_string(), id]).unwrap();
+        f.db.conn()
+            .execute(
+                "UPDATE sync_records SET git_sha=?1 WHERE id=?2",
+                rusqlite::params![foreign.to_string(), id],
+            )
+            .unwrap();
         let error = refuse_live_without_repair(&f, &engine).await;
         assert!(error.contains("distinct receipt roles"), "{error}");
-        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(foreign));
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target(),
+            Some(foreign)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6199,12 +6306,30 @@ mod changed_child_source_correspondence {
         let (_, sha, _) = child_row(&f);
         let original = Oid::from_str(&sha).unwrap();
         let pending = commit(&f.target, b"unhandled git work\n", &[original]);
-        f.target.reference("refs/heads/feature", pending, true, "disposable pending Git").unwrap();
+        f.target
+            .reference(
+                "refs/heads/feature",
+                pending,
+                true,
+                "disposable pending Git",
+            )
+            .unwrap();
         refuse_live_without_repair(&f, &engine).await;
-        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
-        f.target.reference("refs/heads/feature", original, true, "disposable restore").unwrap();
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target(),
+            Some(pending)
+        );
+        f.target
+            .reference("refs/heads/feature", original, true, "disposable restore")
+            .unwrap();
         std::fs::write(ready.child_wc.join("file.txt"), b"unhandled SVN work\n").unwrap();
-        svn(&["commit", "-m", "m2d unhandled SVN-only work"], Some(&ready.child_wc));
+        svn(
+            &["commit", "-m", "m2d unhandled SVN-only work"],
+            Some(&ready.child_wc),
+        );
         let revision = svn_revision(&format!("{}/branches/f", f.root));
         let error = refuse_live_without_repair(&f, &engine).await;
         assert!(error.contains("pending changes"), "{error}");
@@ -6219,7 +6344,8 @@ mod changed_child_source_correspondence {
         let old = f.target.find_commit(parent).unwrap();
         let old_tree = old.tree().unwrap();
         let mut tree = f.target.treebuilder(Some(&old_tree)).unwrap();
-        tree.insert("file.txt", f.target.blob(bytes).unwrap(), mode).unwrap();
+        tree.insert("file.txt", f.target.blob(bytes).unwrap(), mode)
+            .unwrap();
         let tree = f.target.find_tree(tree.write().unwrap()).unwrap();
         let signature = Signature::new(
             "Fixture",
@@ -6228,7 +6354,14 @@ mod changed_child_source_correspondence {
         )
         .unwrap();
         f.target
-            .commit(None, &signature, &signature, "negative source tree", &tree, &[&old])
+            .commit(
+                None,
+                &signature,
+                &signature,
+                "negative source tree",
+                &tree,
+                &[&old],
+            )
             .unwrap()
     }
 
@@ -6242,25 +6375,54 @@ mod changed_child_source_correspondence {
             let _ready = ready(&f, &engine).await;
             let (id, original, revision) = child_row(&f);
             let original = Oid::from_str(&original).unwrap();
-            let config = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+            let config =
+                f.db.capture_pair_refresh_execution_configuration("child")
+                    .unwrap();
             let git_key = format!("last_git_sha_{}", config.pin().child.scope_uuid);
             let svn_key = "last_svn_rev_child";
             let git_kv = saved_kv(&f, &git_key);
             let svn_kv = saved_kv(&f, svn_key);
             let original_state = storage(&f.db);
             for (bytes, mode, detail) in [
-                (&b"\0unmapped binary\xff"[..], 0o100644, "SVN content differs"),
-                (&b"m2d child work\n"[..], 0o100755, "SVN executable property differs"),
+                (
+                    &b"\0unmapped binary\xff"[..],
+                    0o100644,
+                    "SVN content differs",
+                ),
+                (
+                    &b"m2d child work\n"[..],
+                    0o100755,
+                    "SVN executable property differs",
+                ),
             ] {
                 let wrong = changed_child_tree(&f, original, bytes, mode);
-                f.target.reference("refs/heads/feature", wrong, true, "disposable mismatch").unwrap();
+                f.target
+                    .reference("refs/heads/feature", wrong, true, "disposable mismatch")
+                    .unwrap();
                 set_checkpoint(&f, "child", wrong, revision);
-                f.db.conn().execute("UPDATE sync_records SET git_sha=?1 WHERE id=?2", rusqlite::params![wrong.to_string(), id]).unwrap();
+                f.db.conn()
+                    .execute(
+                        "UPDATE sync_records SET git_sha=?1 WHERE id=?2",
+                        rusqlite::params![wrong.to_string(), id],
+                    )
+                    .unwrap();
                 let error = refuse_live_without_repair(&f, &engine).await;
                 assert!(error.contains(detail), "{error}");
-                f.target.reference("refs/heads/feature", original, true, "disposable restore").unwrap();
-                f.db.conn().execute("UPDATE repositories SET last_git_sha=?1 WHERE id='child'", [original.to_string()]).unwrap();
-                f.db.conn().execute("UPDATE sync_records SET git_sha=?1 WHERE id=?2", rusqlite::params![original.to_string(), id]).unwrap();
+                f.target
+                    .reference("refs/heads/feature", original, true, "disposable restore")
+                    .unwrap();
+                f.db.conn()
+                    .execute(
+                        "UPDATE repositories SET last_git_sha=?1 WHERE id='child'",
+                        [original.to_string()],
+                    )
+                    .unwrap();
+                f.db.conn()
+                    .execute(
+                        "UPDATE sync_records SET git_sha=?1 WHERE id=?2",
+                        rusqlite::params![original.to_string(), id],
+                    )
+                    .unwrap();
                 restore_kv(&f, &git_key, git_kv.clone());
                 restore_kv(&f, svn_key, svn_kv.clone());
                 assert_eq!(storage(&f.db), original_state);
@@ -6274,16 +6436,30 @@ mod changed_child_source_correspondence {
             let (id, sha, _) = child_row(&f);
             match property_fault {
                 "empty-directory" => svn(&["mkdir", "empty"], Some(&ready.child_wc)),
-                "unknown-property" => svn(&["propset", "m2d:unknown", "retained", "."], Some(&ready.child_wc)),
-                "mergeinfo" => svn(&["propset", "svn:mergeinfo", "/trunk:1", "."], Some(&ready.child_wc)),
+                "unknown-property" => svn(
+                    &["propset", "m2d:unknown", "retained", "."],
+                    Some(&ready.child_wc),
+                ),
+                "mergeinfo" => svn(
+                    &["propset", "svn:mergeinfo", "/trunk:1", "."],
+                    Some(&ready.child_wc),
+                ),
                 _ => unreachable!(),
             }
-            svn(&["commit", "-m", "negative correspondence metadata"], Some(&ready.child_wc));
+            svn(
+                &["commit", "-m", "negative correspondence metadata"],
+                Some(&ready.child_wc),
+            );
             let revision = svn_revision(&format!("{}/branches/f", f.root));
             set_checkpoint(&f, "child", Oid::from_str(&sha).unwrap(), revision);
             // Retain but deliberately mislabel a current row for this negative
             // case. Neither a row nor equal Git bytes can prove SVN properties.
-            f.db.conn().execute("UPDATE sync_records SET svn_rev=?1 WHERE id=?2", rusqlite::params![revision, id]).unwrap();
+            f.db.conn()
+                .execute(
+                    "UPDATE sync_records SET svn_rev=?1 WHERE id=?2",
+                    rusqlite::params![revision, id],
+                )
+                .unwrap();
             let error = refuse_live_without_repair(&f, &engine).await;
             let detail = match property_fault {
                 "empty-directory" => "SVN and Git tree paths differ",
@@ -6297,14 +6473,24 @@ mod changed_child_source_correspondence {
     }
     async fn serve_with_authz(f: &mut Fixture) -> fixture_process::OwnedProcessGroup {
         let conf = f.temp.path().join("svn-repository/conf");
-        std::fs::write(conf.join("svnserve.conf"), "[general]\nanon-access = write\nauth-access = write\nauthz-db = authz\n").unwrap();
+        std::fs::write(
+            conf.join("svnserve.conf"),
+            "[general]\nanon-access = write\nauth-access = write\nauthz-db = authz\n",
+        )
+        .unwrap();
         std::fs::write(conf.join("authz"), "[/]\n* = rw\n").unwrap();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let mut command = Command::new("svnserve");
         command
-            .args(["--daemon", "--foreground", "--listen-host", "127.0.0.1", "--listen-port"])
+            .args([
+                "--daemon",
+                "--foreground",
+                "--listen-host",
+                "127.0.0.1",
+                "--listen-port",
+            ])
             .arg(port.to_string())
             .arg("--root")
             .arg(f.temp.path())
@@ -6312,14 +6498,20 @@ mod changed_child_source_correspondence {
             .stderr(Stdio::inherit());
         let server = fixture_process::OwnedProcessGroup::spawn(&mut command).unwrap();
         f.root = format!("svn://127.0.0.1:{port}/svn-repository");
-        f.db.conn().execute("UPDATE repositories SET svn_url=?1", [&f.root]).unwrap();
+        f.db.conn()
+            .execute("UPDATE repositories SET svn_url=?1", [&f.root])
+            .unwrap();
         let client = crate::svn::SvnClient::new(format!("{}/trunk", f.root), "", "");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if client.info().await.is_ok() { break; }
+                if client.info().await.is_ok() {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        }).await.expect("disposable svnserve did not become ready");
+        })
+        .await
+        .expect("disposable svnserve did not become ready");
         server
     }
 
@@ -6366,7 +6558,11 @@ mod changed_child_source_correspondence {
             None,
         )
         .unwrap();
-        assert!(super::super::super::svn_visibility::observe_subtree(&child, head).await.is_err());
+        assert!(
+            super::super::super::svn_visibility::observe_subtree(&child, head)
+                .await
+                .is_err()
+        );
         std::fs::write(&authz, "[/]\n* = rw\n[/branches]\n* =\n").unwrap();
         refuse_live_without_repair(&f, &engine).await;
         let retained = std::fs::read(&authz).unwrap();
@@ -6383,14 +6579,26 @@ mod changed_child_source_correspondence {
         let (id, sha, _) = child_row(&f);
         let original_row = sync_row(&f, &id);
         let credential = saved_kv(&f, "secret_git_token_child");
-        let current_configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
-        let current_candidate = f.db.capture_changed_child_baseline_candidate_review(&current_configuration).unwrap();
+        let current_configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
+        let current_candidate =
+            f.db.capture_changed_child_baseline_candidate_review(&current_configuration)
+                .unwrap();
         let auth_key = format!(
             "pair_refresh_execution_v3:authority:{}",
-            current_candidate.selected_review().historical_operation().id
+            current_candidate
+                .selected_review()
+                .historical_operation()
+                .id
         );
         let authority = saved_kv(&f, &auth_key);
-        for fault in ["mapping-metadata", "missing-mapping", "authority", "credentials"] {
+        for fault in [
+            "mapping-metadata",
+            "missing-mapping",
+            "authority",
+            "credentials",
+        ] {
             let injected = std::cell::RefCell::new(None);
             let result = super::super::capture_changed_child_correspondence_with_sources(
                 &f.db,
@@ -6405,7 +6613,8 @@ mod changed_child_source_correspondence {
                             )?;
                         }
                         "missing-mapping" => {
-                            db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id])?;
+                            db.conn()
+                                .execute("DELETE FROM sync_records WHERE id=?1", [&id])?;
                         }
                         "authority" => db.set_state(&auth_key, "{}")?,
                         "credentials" => db.set_state("secret_git_token_child", "")?,
@@ -6414,18 +6623,24 @@ mod changed_child_source_correspondence {
                     *injected.borrow_mut() = Some(storage(db));
                     Ok(())
                 },
-            ).await;
+            )
+            .await;
             let error = match result {
                 Ok(_) => panic!("late {fault} produced a correspondence proof"),
                 Err(error) => error.to_string(),
             };
-            assert!(injected.borrow().is_some(), "late {fault} boundary was not reached: {error}");
+            assert!(
+                injected.borrow().is_some(),
+                "late {fault} boundary was not reached: {error}"
+            );
             if fault == "mapping-metadata" {
                 assert!(error.contains("stored evidence changed"), "{error}");
             }
             assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
             assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
-            f.db.conn().execute("DELETE FROM sync_records WHERE id=?1", [&id]).unwrap();
+            f.db.conn()
+                .execute("DELETE FROM sync_records WHERE id=?1", [&id])
+                .unwrap();
             restore_sync_row(&f, &original_row);
             restore_kv(&f, &auth_key, authority.clone());
             restore_kv(&f, "secret_git_token_child", credential.clone());
@@ -6438,14 +6653,22 @@ mod changed_child_source_correspondence {
             "child",
             Some(f.client.clone()),
             |_| {
-                f.target.reference("refs/heads/feature", pending, true, "late source fault")?;
+                f.target
+                    .reference("refs/heads/feature", pending, true, "late source fault")?;
                 reached.set(true);
                 Ok(())
             },
-        ).await;
+        )
+        .await;
         assert!(result.is_err());
         assert!(reached.get());
-        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target(),
+            Some(pending)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6484,7 +6707,10 @@ mod changed_child_source_correspondence {
         assert_eq!(files(&ready.child_wc), child_wc);
         assert_eq!(files(&ready.parent_bridge), parent_bridge);
         assert_eq!(files(&ready.child_bridge), child_bridge);
-        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+        assert_eq!(
+            f.db.pair_refresh_operation(ready.history.id).unwrap(),
+            ready.history
+        );
         drop(proof);
         assert!(snapshots.iter().all(|p| !p.exists()));
         assert!(!git_scratch.exists());
