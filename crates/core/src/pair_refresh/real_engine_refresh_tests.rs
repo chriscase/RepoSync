@@ -451,6 +451,17 @@ async fn qualified_real_engine_worker() -> Result<()> {
     for iteration in 1..=2 {
         let parent_revision = 2 + iteration * 2;
         let child_revision = parent_revision + 1;
+        let previous_coordinate = f.db.get_repo_watermark("parent")?;
+        assert_eq!(previous_coordinate.1, prior_parent);
+        // Private actor-policy capture proves this actual engine is unfiltered;
+        // derive the expected projection here, never from the proof being tested.
+        let policy = f.parent_engine.capture_pair_refresh_actor_policy("real-engine-session")?;
+        policy.require_current(&f.parent_engine)?;
+        drop(policy);
+        let projection = serde_json::json!({
+            "allowed_paths": Vec::<String>::new(),
+            "blocked_patterns": Vec::<String>::new(),
+        }).to_string();
         let name = format!("parent-{iteration}.txt");
         std::fs::write(f.parent_wc.join(&name), format!("advance {iteration}\n"))?;
         svn(&["add", &name], Some(&f.parent_wc));
@@ -464,14 +475,184 @@ async fn qualified_real_engine_worker() -> Result<()> {
         assert_eq!(stats.conflicts_detected, 0);
         let parent_tip = f.db.get_repo_watermark("parent")?.1;
         assert_ne!(parent_tip, prior_parent);
-        // Publication alone cannot silently adopt the handled cursor. An
-        // ordinary subsequent cycle proves the complete emitted-only range.
+        // Same-cycle convergence is legitimate only with the real durable proof,
+        // its completed producer/mapping dependencies and coherent checkpoints.
+        {
+            let conn = f.db.conn();
+            assert!(crate::db::ordinary_writer_windows::OrdinaryWriterWindow::verified_emitted_git_frontier(
+                &conn, &f.db, "parent", &parent_tip, &projection,
+            )?);
+        }
+        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "parent")?;
+        let generation = crate::echo_receipt_scope::repo_echo_generation(&f.db, "parent")?;
+        let proof_key = format!("handled_git_emitted_frontier_v1:{scope}:g{generation}:{parent_tip}");
+        let proof_raw = f.db.get_state(&proof_key)?.context("actual parent convergence proof missing")?;
+        let proof: serde_json::Value = serde_json::from_str(&proof_raw)?;
+        assert_eq!(proof["payload"]["repo_id"], "parent");
+        assert_eq!(proof["payload"]["scope_uuid"], scope);
+        assert_eq!(proof["payload"]["generation"], generation);
+        assert_eq!(proof["payload"]["projection"], projection);
+        assert_eq!(proof["payload"]["old_frontier"], prior_parent);
+        assert_eq!(proof["payload"]["old_inbound"], prior_parent);
+        assert_eq!(proof["payload"]["old_svn_revision"], previous_coordinate.0);
+        assert_eq!(proof["payload"]["new_git_sha"], parent_tip);
+        assert_eq!(proof["payload"]["new_svn_revision"], parent_revision);
         assert_eq!(
-            f.db.get_state(&f.db.scoped_last_git_sha_kv_key_for_repo("parent")?)?,
-            Some(prior_parent.clone())
+            proof["payload"]["new_git_tree"],
+            f.target.find_commit(git2::Oid::from_str(&parent_tip)?)?.tree_id().to_string()
         );
+        checkpoint(&f, "parent", parent_revision, &parent_tip)?;
+        let legacy_key = crate::db::repo_scope_identity::legacy_last_git_sha_kv_key("parent");
+        let legacy_before = f.db.get_state(&legacy_key)?;
+        // Authority observation must never revoke a latch or sweep receipts.
+        // This fixture has exactly these two registrations and must already
+        // have an explicit revoked flag as produced by its real setup/cycle.
+        let authority_key = crate::db::repo_scope_identity::LEGACY_REPO_ID_KV_READS_KEY;
+        let kv_state = |conn: &rusqlite::Connection| -> Result<String> {
+            Ok(conn.query_row(
+                "SELECT json_group_array(json_array(key,value,updated_at)) FROM (SELECT key,value,updated_at FROM kv_state ORDER BY key)",
+                [], |row| row.get(0),
+            )?)
+        };
+        let observe_authority = |conn: &rusqlite::Connection| -> Result<serde_json::Value> {
+            use rusqlite::OptionalExtension;
+            let mut query = conn.prepare("SELECT id FROM repositories ORDER BY id")?;
+            let repositories = query
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                repositories == vec!["child".to_owned(), "parent".to_owned()],
+                "expected exactly the registered parent/child pair"
+            );
+            let flag: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT value,updated_at FROM kv_state WHERE key=?1",
+                    [authority_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            anyhow::ensure!(
+                flag.as_ref().is_some_and(|(value, _)| value == "0"),
+                "two repositories require explicitly revoked legacy authority"
+            );
+            let legacy_receipts: String = conn.query_row(
+                "SELECT json_group_array(json_array(key,value,updated_at)) FROM (SELECT key,value,updated_at FROM kv_state WHERE key GLOB 'handled_git_no_target_*' OR key GLOB 'handled_svn_no_target_*' OR key GLOB 'reposync_v13_quarantined:*' ORDER BY key)",
+                [], |row| row.get(0),
+            )?;
+            Ok(serde_json::json!({"repositories": repositories, "flag": flag, "legacy_receipts": legacy_receipts}))
+        };
+        if iteration == 1 {
+            // Isolated read-only-observer controls, not new production authority.
+            let isolated = rusqlite::Connection::open_in_memory()?;
+            isolated.execute_batch(
+                "CREATE TABLE repositories(id TEXT PRIMARY KEY,scope_uuid TEXT);
+                 CREATE TABLE kv_state(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT);
+                 INSERT INTO repositories VALUES('child','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
+                 INSERT INTO repositories VALUES('parent','bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');",
+            )?;
+            let orphan_key = format!("handled_git_no_target_retired_1_{}", "a".repeat(40));
+            isolated.execute(
+                "INSERT INTO kv_state VALUES(?1,?2,?3)",
+                rusqlite::params![orphan_key, "{\"repo_id\":\"retired\",\"version\":1}", "2026-10-30T00:00:00Z"],
+            )?;
+            for value in [Some("0"), Some("1"), None, Some("unknown")] {
+                isolated.execute("DELETE FROM kv_state WHERE key=?1", [authority_key])?;
+                if let Some(value) = value {
+                    isolated.execute(
+                        "INSERT INTO kv_state VALUES(?1,?2,?3)",
+                        rusqlite::params![authority_key, value, "2026-10-30T00:00:00Z"],
+                    )?;
+                }
+                let before = kv_state(&isolated)?;
+                let observed = observe_authority(&isolated);
+                if value == Some("0") {
+                    assert!(observed.is_ok(), "valid revoked state must be observable");
+                } else {
+                    let error = observed.err().context("inconsistent authority was accepted")?;
+                    assert!(error.to_string().contains("explicitly revoked legacy authority"));
+                }
+                // Exact flag value/timestamp/absence, orphan and every other KV
+                // row must survive either success or refusal without quarantine.
+                assert_eq!(kv_state(&isolated)?, before);
+                assert_eq!(isolated.query_row(
+                    "SELECT count(*) FROM kv_state WHERE key=?1", [&orphan_key], |row| row.get::<_, i64>(0),
+                )?, 1);
+                assert_eq!(isolated.query_row(
+                    "SELECT count(*) FROM kv_state WHERE key GLOB 'reposync_v13_quarantined:*'", [], |row| row.get::<_, i64>(0),
+                )?, 0);
+            }
+        }
+        let authority_before = {
+            let conn = f.db.conn();
+            let before = kv_state(&conn)?;
+            let observed = observe_authority(&conn)?;
+            assert_eq!(kv_state(&conn)?, before, "observation must not repair producer state");
+            observed
+        };
+        // Observe the physical bare target and journal/mapping identities.
+        // HTTP receive-pack counts alone cannot see ordinary local Git pushes.
+        let target_state = || -> Result<serde_json::Value> {
+            let mut references = Vec::new();
+            let mut walk = f.target.revwalk()?;
+            for reference in f.target.references()? {
+                let reference = reference?;
+                let name = reference.name().context("non-UTF8 target reference")?.to_owned();
+                walk.push(reference.peel_to_commit()?.id())?;
+                references.push((
+                    name,
+                    reference.target().map(|id| id.to_string()),
+                    reference.symbolic_target().map(str::to_owned),
+                ));
+            }
+            assert!(!references.is_empty());
+            references.sort();
+            let mut commits = walk
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>();
+            commits.sort();
+            let head = f.target.find_reference("HEAD")?;
+            Ok(serde_json::json!({
+                "head": (head.target().map(|id| id.to_string()), head.symbolic_target()),
+                "references": references,
+                "reachable_commits": commits,
+            }))
+        };
+        let publication_state = || -> Result<(String, String)> {
+            let conn = f.db.conn();
+            let operations = conn.query_row(
+                "SELECT json_group_array(json_array(key,value,updated_at)) FROM (SELECT key,value,updated_at FROM kv_state WHERE key GLOB 'svn_to_git_push_v1:document:*' OR key GLOB 'git_to_svn_commit_v1:document:*' ORDER BY key)",
+                [], |row| row.get(0),
+            )?;
+            let mappings = conn.query_row(
+                "SELECT json_group_array(json_array(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status)) FROM (SELECT * FROM sync_records ORDER BY id)",
+                [], |row| row.get(0),
+            )?;
+            Ok((operations, mappings))
+        };
+        let target_before = target_state()?;
+        let publication_before = publication_state()?;
+        let svn_before = SvnClient::new(&f.svn_root, "", "").info().await?.latest_rev;
+        let http_before = publications(&f)?;
         quiet(&f.parent_engine.run_sync_cycle().await?);
         checkpoint(&f, "parent", parent_revision, &parent_tip)?;
+        assert_eq!(target_state()?, target_before);
+        assert_eq!(publication_state()?, publication_before);
+        assert_eq!(SvnClient::new(&f.svn_root, "", "").info().await?.latest_rev, svn_before);
+        assert_eq!(publications(&f)?, http_before);
+        assert_eq!(f.db.get_state(&proof_key)?.as_deref(), Some(proof_raw.as_str()));
+        assert_eq!(f.db.get_state(&legacy_key)?, legacy_before);
+        let authority_after = {
+            let conn = f.db.conn();
+            let before = kv_state(&conn)?;
+            let observed = observe_authority(&conn)?;
+            assert_eq!(kv_state(&conn)?, before, "observation must remain read-only");
+            observed
+        };
+        assert_eq!(authority_after, authority_before);
+        // These checks reject new history/durable publication; they do not count
+        // an idempotent same-tip local transport attempt with no durable change.
         let parent_before = serde_json::to_value(f.db.get_repository("parent")?.unwrap())?;
         let actor = f
             .parent_engine
