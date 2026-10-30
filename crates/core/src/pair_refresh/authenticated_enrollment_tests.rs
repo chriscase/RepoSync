@@ -8552,7 +8552,6 @@ mod changed_child_applicability_review {
         (first, second)
     }
 
-
     async fn capture(f: &Fixture) -> anyhow::Result<LiveChangedChildApplicabilityReview> {
         super::super::capture_changed_child_applicability_with_sources(
             &f.db,
@@ -8570,7 +8569,9 @@ mod changed_child_applicability_review {
     ) -> Oid {
         let mut builder = repo.treebuilder(None).unwrap();
         for (name, bytes, mode) in entries {
-            builder.insert(*name, repo.blob(bytes).unwrap(), *mode).unwrap();
+            builder
+                .insert(*name, repo.blob(bytes).unwrap(), *mode)
+                .unwrap();
         }
         let tree = repo.find_tree(builder.write().unwrap()).unwrap();
         let signature = Signature::new(
@@ -8579,7 +8580,10 @@ mod changed_child_applicability_review {
             &Time::new(1_790_000_001, 0),
         )
         .unwrap();
-        let parents = parents.iter().map(|id| repo.find_commit(*id).unwrap()).collect::<Vec<_>>();
+        let parents = parents
+            .iter()
+            .map(|id| repo.find_commit(*id).unwrap())
+            .collect::<Vec<_>>();
         let parents = parents.iter().collect::<Vec<_>>();
         repo.commit(
             None,
@@ -8631,17 +8635,41 @@ mod changed_child_applicability_review {
         let graph = &manifest.graph;
         assert_eq!(manifest.policy, CHANGED_CHILD_APPLICABILITY_POLICY);
         assert_eq!(graph.historical_merge, ready.history.pins.git);
-        assert_eq!(graph.roles.parent_anchor.commit, ready.history.pins.parent.last_git_sha);
-        assert_eq!(graph.roles.integrated_child.commit, ready.history.pins.git.prepared_sha);
-        assert_ne!(graph.roles.parent_anchor.commit, graph.roles.integrated_child.commit);
-        assert_eq!(graph.roles.parent_anchor.tree, graph.roles.integrated_child.tree);
-        assert_ne!(graph.roles.current_child.commit, graph.roles.integrated_child.commit);
-        assert_ne!(graph.roles.current_parent.commit, graph.roles.parent_anchor.commit);
-        assert_eq!(graph.baseline_rule, "exact_authenticated_R_tree_equals_signed_P1_tree");
+        assert_eq!(
+            graph.roles.parent_anchor.commit,
+            ready.history.pins.parent.last_git_sha
+        );
+        assert_eq!(
+            graph.roles.integrated_child.commit,
+            ready.history.pins.git.prepared_sha
+        );
+        assert_ne!(
+            graph.roles.parent_anchor.commit,
+            graph.roles.integrated_child.commit
+        );
+        assert_eq!(
+            graph.roles.parent_anchor.tree,
+            graph.roles.integrated_child.tree
+        );
+        assert_ne!(
+            graph.roles.current_child.commit,
+            graph.roles.integrated_child.commit
+        );
+        assert_ne!(
+            graph.roles.current_parent.commit,
+            graph.roles.parent_anchor.commit
+        );
+        assert_eq!(
+            graph.baseline_rule,
+            "exact_authenticated_R_tree_equals_signed_P1_tree"
+        );
         assert_eq!(graph.child_changes, ["file.txt"]);
         assert_eq!(graph.parent_changes, ["file.txt"]);
         assert_eq!(graph.paths.len(), 1);
-        assert!(matches!(graph.paths[0].disposition, ChangedChildDisposition::Conflict));
+        assert!(matches!(
+            graph.paths[0].disposition,
+            ChangedChildDisposition::Conflict
+        ));
         assert_ne!(graph.paths[0].baseline, graph.paths[0].child);
         assert_ne!(graph.paths[0].baseline, graph.paths[0].parent);
         assert_ne!(graph.paths[0].child, graph.paths[0].parent);
@@ -8656,11 +8684,17 @@ mod changed_child_applicability_review {
         );
         assert_eq!(
             manifest.mapping_snapshot_digest,
-            review.source_correspondence().mapping_review().snapshot_digest()
+            review
+                .source_correspondence()
+                .mapping_review()
+                .snapshot_digest()
         );
         assert_eq!(manifest.manifest_digest.len(), 64);
         assert_eq!(graph.inspection_digest.len(), 64);
-        assert!(manifest.unverified.iter().any(|g| g == "authenticated_changed_child_resolution"));
+        assert!(manifest
+            .unverified
+            .iter()
+            .any(|g| g == "authenticated_changed_child_resolution"));
         // The unchanged M1 path still refuses the retained merge in C's ancestry.
         let old_inputs = ChangedChildReviewInputs {
             schema: 1,
@@ -8671,12 +8705,19 @@ mod changed_child_applicability_review {
             context: graph.context.clone(),
         };
         let old = inspect_changed_child_review(
-            review.source.candidate.preview.git.repository(), &old_inputs,
+            review.source.candidate.preview.git.repository(),
+            &old_inputs,
         );
-        assert!(old.is_err(), "new policy must not silently admit R through M1");
+        assert!(
+            old.is_err(),
+            "new policy must not silently admit R through M1"
+        );
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
-        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+        assert_eq!(
+            f.db.pair_refresh_operation(ready.history.id).unwrap(),
+            ready.history
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8692,12 +8733,20 @@ mod changed_child_applicability_review {
         let p1 = Oid::from_str(&graph.roles.parent_anchor.commit).unwrap();
         let tree = f.target.find_commit(r).unwrap().tree().unwrap();
         assert_eq!(tree.len(), 1);
-        let original = f.target.find_blob(tree.get_name("file.txt").unwrap().id()).unwrap();
-        let child = object_with_entries(&f.target, &[r], &[("child.bin", b"\0child\xff", 0o100755)]);
-        let parent = object_with_entries(&f.target, &[p1], &[
-            ("file.txt", original.content(), 0o100644),
-            ("parent.bin", b"\0parent\xfe", 0o100644),
-        ]);
+        let original = f
+            .target
+            .find_blob(tree.get_name("file.txt").unwrap().id())
+            .unwrap();
+        let child =
+            object_with_entries(&f.target, &[r], &[("child.bin", b"\0child\xff", 0o100755)]);
+        let parent = object_with_entries(
+            &f.target,
+            &[p1],
+            &[
+                ("file.txt", original.content(), 0o100644),
+                ("parent.bin", b"\0parent\xfe", 0o100644),
+            ],
+        );
         let (roles, context) = object_roles(&f.target, &graph.roles, &graph.context, child, parent);
         let before = files(f.target.path());
         let inspected = inspect_changed_child_applicable_graph(
@@ -8711,7 +8760,12 @@ mod changed_child_applicability_review {
         assert!(inspected.child_changes.contains(&"child.bin".into()));
         assert_eq!(inspected.parent_changes, ["parent.bin"]);
         let entry = |path: &str| {
-            &inspected.paths.iter().find(|p| p.path == path).unwrap().disposition
+            &inspected
+                .paths
+                .iter()
+                .find(|p| p.path == path)
+                .unwrap()
+                .disposition
         };
         assert!(matches!(
             entry("file.txt"),
@@ -8731,14 +8785,29 @@ mod changed_child_applicability_review {
                 entry: ChangedChildEntry::File { mode: 0o100644, .. }
             }
         ));
-        assert_eq!(files(f.target.path()), before, "inspector must not write Git objects or refs");
-        let expected = object_with_entries(&f.target, &[child], &[
-            ("child.bin", b"\0child\xff", 0o100755),
-            ("parent.bin", b"\0parent\xfe", 0o100644),
-        ]);
+        assert_eq!(
+            files(f.target.path()),
+            before,
+            "inspector must not write Git objects or refs"
+        );
+        let expected = object_with_entries(
+            &f.target,
+            &[child],
+            &[
+                ("child.bin", b"\0child\xff", 0o100755),
+                ("parent.bin", b"\0parent\xfe", 0o100644),
+            ],
+        );
         assert_eq!(
             inspected.candidate_tree.as_deref(),
-            Some(f.target.find_commit(expected).unwrap().tree_id().to_string().as_str())
+            Some(
+                f.target
+                    .find_commit(expected)
+                    .unwrap()
+                    .tree_id()
+                    .to_string()
+                    .as_str()
+            )
         );
         // Compare only the analyzer interval: expected-object construction above
         // is explicit fixture setup, not an allowed effect of the inspector.
@@ -8752,41 +8821,70 @@ mod changed_child_applicability_review {
         .unwrap();
         assert_eq!(inspected, repeated);
         assert_eq!(files(f.target.path()), after_expected);
-        assert!(before.iter().all(|(p, bytes)| after_expected.get(p) == Some(bytes)));
+        assert!(before
+            .iter()
+            .all(|(p, bytes)| after_expected.get(p) == Some(bytes)));
         assert!(!inspected.execution_eligible);
         // Unsupported path topology and LFS stay refusals in the new policy.
         let mut nested = f.target.treebuilder(None).unwrap();
-        nested.insert("leaf", f.target.blob(b"nested").unwrap(), 0o100644).unwrap();
+        nested
+            .insert("leaf", f.target.blob(b"nested").unwrap(), 0o100644)
+            .unwrap();
         let mut root = f.target.treebuilder(None).unwrap();
-        root.insert("file.txt", nested.write().unwrap(), 0o040000).unwrap();
+        root.insert("file.txt", nested.write().unwrap(), 0o040000)
+            .unwrap();
         let tree = f.target.find_tree(root.write().unwrap()).unwrap();
         let child_commit = f.target.find_commit(child).unwrap();
-        let directory_child = f.target.commit(
-            None, &child_commit.author(), &child_commit.committer(),
-            "object-only directory control", &tree, &[&child_commit],
-        ).unwrap();
+        let directory_child = f
+            .target
+            .commit(
+                None,
+                &child_commit.author(),
+                &child_commit.committer(),
+                "object-only directory control",
+                &tree,
+                &[&child_commit],
+            )
+            .unwrap();
         let (directory_roles, directory_context) = object_roles(
-            &f.target, &graph.roles, &graph.context, directory_child, parent,
+            &f.target,
+            &graph.roles,
+            &graph.context,
+            directory_child,
+            parent,
         );
         let before_directory = files(f.target.path());
         let refused = inspect_changed_child_applicable_graph(
-            &f.target, &graph.historical_merge, &directory_roles, &directory_context,
-        ).unwrap();
+            &f.target,
+            &graph.historical_merge,
+            &directory_roles,
+            &directory_context,
+        )
+        .unwrap();
         assert!(refused.candidate_tree.is_none());
         assert!(refused.paths.iter().any(|path| path.path == "file.txt"
             && matches!(&path.disposition, ChangedChildDisposition::Refused { reason }
                 if reason == "unsupported_file_directory_topology")));
         assert_eq!(files(f.target.path()), before_directory);
-        let lfs = object_with_entries(&f.target, &[r], &[
-            ("file.txt", b"version https://git-lfs.github.com/spec/v1\n", 0o100644),
-        ]);
-        let (lfs_roles, lfs_context) = object_roles(
-            &f.target, &graph.roles, &graph.context, lfs, parent,
+        let lfs = object_with_entries(
+            &f.target,
+            &[r],
+            &[(
+                "file.txt",
+                b"version https://git-lfs.github.com/spec/v1\n",
+                0o100644,
+            )],
         );
+        let (lfs_roles, lfs_context) =
+            object_roles(&f.target, &graph.roles, &graph.context, lfs, parent);
         let before_lfs = files(f.target.path());
         assert!(inspect_changed_child_applicable_graph(
-            &f.target, &graph.historical_merge, &lfs_roles, &lfs_context,
-        ).is_err());
+            &f.target,
+            &graph.historical_merge,
+            &lfs_roles,
+            &lfs_context,
+        )
+        .is_err());
         assert_eq!(files(f.target.path()), before_lfs);
     }
 
@@ -8803,14 +8901,29 @@ mod changed_child_applicability_review {
         let p1 = Oid::from_str(&graph.roles.parent_anchor.commit).unwrap();
         let c = Oid::from_str(&graph.roles.current_child.commit).unwrap();
         let p2 = Oid::from_str(&graph.roles.current_parent.commit).unwrap();
-        let original = f.target
+        let original = f
+            .target
             .find_blob(
-                f.target.find_commit(c).unwrap().tree().unwrap()
-                    .get_name("file.txt").unwrap().id(),
+                f.target
+                    .find_commit(c)
+                    .unwrap()
+                    .tree()
+                    .unwrap()
+                    .get_name("file.txt")
+                    .unwrap()
+                    .id(),
             )
             .unwrap();
-        let foreign = object_with_entries(&f.target, &[p1], &[("file.txt", original.content(), 0o100644)]);
-        let extra_merge = object_with_entries(&f.target, &[c, r], &[("file.txt", original.content(), 0o100644)]);
+        let foreign = object_with_entries(
+            &f.target,
+            &[p1],
+            &[("file.txt", original.content(), 0o100644)],
+        );
+        let extra_merge = object_with_entries(
+            &f.target,
+            &[c, r],
+            &[("file.txt", original.content(), 0o100644)],
+        );
         let mut wrong_p1 = graph.roles.clone();
         wrong_p1.parent_anchor = graph.roles.integrated_child.clone();
         let mut wrong_r = graph.roles.clone();
@@ -8854,7 +8967,10 @@ mod changed_child_applicability_review {
             Ok(_) => panic!("ambiguous genuine history must not select a baseline"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("ambiguous authenticated receipt candidates"), "{error}");
+        assert!(
+            error.contains("ambiguous authenticated receipt candidates"),
+            "{error}"
+        );
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
         assert_eq!(files(f.target.path()), target);
@@ -8870,7 +8986,9 @@ mod changed_child_applicability_review {
             let engine = f.engine();
             let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
             let ready = ready(&f, &engine).await;
-            let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+            let configuration =
+                f.db.capture_pair_refresh_execution_configuration("child")
+                    .unwrap();
             let pin = configuration.pin();
             let reached = std::cell::Cell::new(false);
             let injected = std::cell::RefCell::new(None);
@@ -8912,7 +9030,10 @@ mod changed_child_applicability_review {
                     Ok(())
                 },
             ).await;
-            assert!(reached.get(), "post-inspection {fault} boundary not reached");
+            assert!(
+                reached.get(),
+                "post-inspection {fault} boundary not reached"
+            );
             assert!(result.is_err(), "late {fault} must refuse");
             assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
             assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
@@ -8930,17 +9051,33 @@ mod changed_child_applicability_review {
         let current = Oid::from_str(&first.manifest().graph.roles.current_child.commit).unwrap();
         let pending = commit(&f.target, b"unhandled applicability Git work\n", &[current]);
         f.target
-            .reference("refs/heads/feature", pending, true, "disposable pending-work fault")
+            .reference(
+                "refs/heads/feature",
+                pending,
+                true,
+                "disposable pending-work fault",
+            )
             .unwrap();
         let before = storage(&f.db);
         let target = files(f.target.path());
         assert!(capture(&f).await.is_err());
         assert_eq!(storage(&f.db), before);
         assert_eq!(files(f.target.path()), target);
-        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target(),
+            Some(pending)
+        );
         // Restore only the deliberately injected ref before the separate SVN fault.
         f.target
-            .reference("refs/heads/feature", current, true, "restore disposable Git fault")
+            .reference(
+                "refs/heads/feature",
+                current,
+                true,
+                "restore disposable Git fault",
+            )
             .unwrap();
         svn(&["update"], Some(&ready.child_wc));
         std::fs::write(
@@ -8965,7 +9102,10 @@ mod changed_child_applicability_review {
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
         assert_eq!(files(&ready.child_wc), child);
-        assert_eq!(svn_revision(&local_source_url(&f, "branches/f")), pending_revision);
+        assert_eq!(
+            svn_revision(&local_source_url(&f, "branches/f")),
+            pending_revision
+        );
         assert_eq!(
             std::fs::read(ready.child_wc.join("file.txt")).unwrap(),
             b"unhandled applicability SVN work\n"
@@ -8985,9 +9125,15 @@ mod changed_child_applicability_review {
         let revision = std::cell::Cell::new(0);
         let before = storage(&f.db);
         let result = super::super::capture_changed_child_applicability_with_sources(
-            &f.db, "child", Some(f.client.clone()), |_| {
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |_| {
                 svn(&["update"], Some(&ready.child_wc));
-                svn(&["propset", "unreviewed:property", "retained", "."], Some(&ready.child_wc));
+                svn(
+                    &["propset", "unreviewed:property", "retained", "."],
+                    Some(&ready.child_wc),
+                );
                 svn(
                     &[
                         "commit",
@@ -9002,13 +9148,20 @@ mod changed_child_applicability_review {
                 reached.set(true);
                 Ok(())
             },
-        ).await;
-        assert!(reached.get(), "real post-inspection boundary must be reached");
+        )
+        .await;
+        assert!(
+            reached.get(),
+            "real post-inspection boundary must be reached"
+        );
         assert!(revision.get() > old_head);
         assert!(result.is_err());
         assert_eq!(storage(&f.db), before);
         assert_eq!(storage(engine.db()), before);
-        assert_eq!(svn_revision(&local_source_url(&f, "branches/f")), revision.get());
+        assert_eq!(
+            svn_revision(&local_source_url(&f, "branches/f")),
+            revision.get()
+        );
         let value = run(Command::new("svn").args([
             "propget",
             "unreviewed:property",
@@ -9050,10 +9203,20 @@ mod changed_child_applicability_review {
         assert!(!second.manifest().execution_eligible);
         assert!(!second.execution_eligible());
         assert!(!second.source_correspondence().execution_eligible());
-        let snapshots = first.source.snapshots.iter()
+        let snapshots = first
+            .source
+            .snapshots
+            .iter()
             .map(|s| s.path().parent().unwrap().to_owned())
             .collect::<Vec<_>>();
-        let git = first.source.candidate.preview.git.repository().path().to_owned();
+        let git = first
+            .source
+            .candidate
+            .preview
+            .git
+            .repository()
+            .path()
+            .to_owned();
         assert_eq!(snapshots.len(), 4);
         assert!(snapshots.iter().all(|p| p.is_dir()));
         assert!(git.is_dir());

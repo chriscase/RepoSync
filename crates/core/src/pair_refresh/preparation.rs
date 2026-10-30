@@ -963,9 +963,7 @@ pub(crate) fn inspect_changed_child_applicable_graph(
         &roles.current_parent,
     ] {
         if repo.find_commit(review_oid(&role.commit)?)?.tree_id() != review_oid(&role.tree)? {
-            return Err(review_error(
-                "applicability role commit/tree pin mismatch",
-            ));
+            return Err(review_error("applicability role commit/tree pin mismatch"));
         }
     }
     if roles.current_child.commit == roles.integrated_child.commit

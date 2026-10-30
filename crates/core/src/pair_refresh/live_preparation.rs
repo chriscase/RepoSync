@@ -1199,9 +1199,17 @@ fn inspect_changed_child_applicability_source(
     }
     for (proof, (name, commit, tree)) in source.roles.iter().zip([
         ("P1", &expected.parent_anchor, &expected.parent_anchor_tree),
-        ("R", &expected.integrated_child, &expected.integrated_child_tree),
+        (
+            "R",
+            &expected.integrated_child,
+            &expected.integrated_child_tree,
+        ),
         ("C", &expected.current_child, &expected.current_child_tree),
-        ("P2", &expected.current_parent, &expected.current_parent_tree),
+        (
+            "P2",
+            &expected.current_parent,
+            &expected.current_parent_tree,
+        ),
     ]) {
         if proof.role != name || &proof.git_commit != commit || &proof.git_tree != tree {
             bail!("changed-child applicability source-role partition differs");
@@ -1328,13 +1336,9 @@ async fn capture_changed_child_applicability_with_sources<F>(
 where
     F: FnOnce(&Database) -> Result<()>,
 {
-    let source = capture_changed_child_correspondence_with_sources(
-        db,
-        child_id,
-        client.clone(),
-        |_| Ok(()),
-    )
-    .await?;
+    let source =
+        capture_changed_child_correspondence_with_sources(db, child_id, client.clone(), |_| Ok(()))
+            .await?;
     let manifest = inspect_changed_child_applicability_source(&source)?;
     after_inspection(db)?;
     // Analysis of immutable objects is not an ongoing source lease. Repeat the
