@@ -5927,6 +5927,56 @@ mod changed_child_source_correspondence {
         (engine, path)
     }
 
+    // Fixture::new seeds an inbound KV without any ordinary handled-work proof.
+    // The completed refresh proves the child only. For the untouched parent,
+    // use the existing column-only, no-prior-work install bootstrap instead.
+    // Remove only that exact fixture seed: never erase real mappings, receipts,
+    // baselines, holds or an unknown cursor to make an ordinary cycle admissible.
+    fn parent_install_bootstrap(f: &Fixture, history: &PairRefreshOperation) {
+        use crate::db::repo_scope_identity as identity;
+
+        let parent = &history.pins.parent;
+        assert_eq!(parent.repo_id, "parent");
+        assert_eq!(parent.last_git_sha, f.parent.to_string());
+        assert_eq!(
+            f.db.get_repo_watermark("parent").unwrap(),
+            (parent.last_svn_rev, parent.last_git_sha.clone())
+        );
+        assert_eq!(
+            f.target.find_reference("refs/heads/main").unwrap().target(),
+            Some(f.parent)
+        );
+        let scope = identity::repository_scope_uuid(&f.db.conn(), "parent").unwrap();
+        assert_eq!(scope, parent.scope_uuid);
+        let key = identity::last_git_sha_kv_key(&scope);
+        assert_eq!(
+            f.db.get_state(&key).unwrap().as_deref(),
+            Some(parent.last_git_sha.as_str())
+        );
+        assert_eq!(f.db.get_state("last_git_sha_parent").unwrap(), None);
+        let rows: i64 = f
+            .db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id='parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "bootstrap must precede all ordinary parent work");
+        let no_target =
+            identity::repository_has_stored_no_target_receipt_kv(&f.db.conn(), "parent")
+                .unwrap();
+        assert!(!no_target);
+        assert_eq!(f.db.get_state("handled_git_baseline_parent").unwrap(), None);
+        f.db.delete_kv_state(&key).unwrap();
+        assert_eq!(
+            crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db, "parent")
+                .unwrap(),
+            None
+        );
+    }
+
     struct Ready {
         history: PairRefreshOperation,
         child_wc: PathBuf,
@@ -5937,6 +5987,7 @@ mod changed_child_source_correspondence {
     async fn ready(f: &Fixture, engine: &crate::sync_engine::SyncEngine) -> Ready {
         let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let history = completed(f, engine).await;
+        parent_install_bootstrap(f, &history);
         let (parent_engine, parent_bridge) = producer_engine(f, "parent");
         let (child_engine, child_bridge) = producer_engine(f, "child");
         std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
@@ -5947,6 +5998,17 @@ mod changed_child_source_correspondence {
         let parent_stats = parent_engine.run_sync_cycle().await.unwrap();
         assert_eq!(parent_stats.svn_to_git_count, 1);
         assert_eq!(parent_stats.git_to_svn_count, 0);
+        // The actual ordinary cycle, not fixture SQL, must now create the
+        // mapped handled baseline. Keep the emitted tip distinct from inbound KV.
+        let (parent_revision, parent_sha) = f.db.get_repo_watermark("parent").unwrap();
+        let baseline: serde_json::Value = serde_json::from_str(
+            &f.db.get_state("handled_git_baseline_parent").unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline["version"], 1);
+        assert_eq!(baseline["repo_id"], "parent");
+        assert_eq!(baseline["git_sha"].as_str(), Some(parent_sha.as_str()));
+        assert_eq!(baseline["svn_rev"].as_i64(), Some(parent_revision));
         let child_wc = f.temp.path().join("m2d-child-wc");
         svn(
             &[
