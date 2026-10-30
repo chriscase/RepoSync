@@ -1119,3 +1119,252 @@ where
         context_digest,
     })
 }
+
+/// A pinned read-only manifest, never an authenticated resolution or job. The
+/// source capability is retained separately and cannot be reconstructed from it.
+#[derive(serde::Serialize)]
+pub struct ChangedChildApplicabilityManifest {
+    pub schema: u8,
+    pub policy: String,
+    pub source_correspondence_digest: String,
+    pub source_role_proofs_digest: String,
+    pub candidate_set_digest: String,
+    pub historical_snapshot_digest: String,
+    pub mapping_snapshot_digest: String,
+    pub configuration: super::execution_configuration::ExecutionConfigurationPin,
+    pub observed_git: super::git_sources::ObservedGitSourcePins,
+    pub observed_svn: super::svn_sources::ObservedSvnSourcePins,
+    pub graph: super::preparation::ChangedChildApplicableGraphReview,
+    pub unverified: Vec<String>,
+    pub execution_eligible: bool,
+    pub manifest_digest: String,
+}
+
+/// Private construction, no Clone/Deserialize. The actual source observations,
+/// authenticated history, native mapping capture and four checkouts stay owned.
+pub struct LiveChangedChildApplicabilityReview {
+    source: LiveChangedChildSourceCorrespondence,
+    manifest: ChangedChildApplicabilityManifest,
+}
+
+impl LiveChangedChildApplicabilityReview {
+    pub fn manifest(&self) -> &ChangedChildApplicabilityManifest {
+        &self.manifest
+    }
+
+    pub fn source_correspondence(&self) -> &LiveChangedChildSourceCorrespondence {
+        &self.source
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+
+    /// Compare a review pin only after fresh capture. This accepts no choices,
+    /// actor assertion or serialized manifest, and does not grant execution.
+    pub fn require_manifest_digest(&self, expected: &str) -> Result<()> {
+        if expected != self.manifest.manifest_digest {
+            bail!("changed-child applicability review pin is stale or different");
+        }
+        Ok(())
+    }
+}
+
+fn changed_child_applicability_digest<T: serde::Serialize>(
+    domain: &str,
+    value: &T,
+) -> Result<String> {
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(
+        domain, value,
+    ))?)))
+}
+
+fn inspect_changed_child_applicability_source(
+    source: &LiveChangedChildSourceCorrespondence,
+) -> Result<ChangedChildApplicabilityManifest> {
+    use super::preparation::{
+        ChangedChildApplicabilityRoles, ChangedChildEvidence, ChangedChildGitInput,
+        ChangedChildProjection, ChangedChildReviewContext, ChangedChildSvnContext,
+    };
+
+    let preview = &source.candidate.preview;
+    let configuration = preview.current_configuration();
+    let history = preview.historical_review();
+    let historical = history.historical_operation();
+    let svn = preview.svn_sources();
+    let expected = &preview.roles;
+    if source.roles.len() != 4 || source.snapshots.len() != 4 {
+        bail!("changed-child applicability requires all four retained source roles");
+    }
+    for (proof, (name, commit, tree)) in source.roles.iter().zip([
+        ("P1", &expected.parent_anchor, &expected.parent_anchor_tree),
+        (
+            "R",
+            &expected.integrated_child,
+            &expected.integrated_child_tree,
+        ),
+        ("C", &expected.current_child, &expected.current_child_tree),
+        (
+            "P2",
+            &expected.current_parent,
+            &expected.current_parent_tree,
+        ),
+    ]) {
+        if proof.role != name || &proof.git_commit != commit || &proof.git_tree != tree {
+            bail!("changed-child applicability source-role partition differs");
+        }
+    }
+    let lineage_digest =
+        changed_child_applicability_digest("changed_child_lineage_v1", &preview.lineage)?;
+    let roles_digest =
+        changed_child_applicability_digest("changed_child_correspondence_roles_v1", &source.roles)?;
+    let context = ChangedChildReviewContext {
+        child: configuration.child.clone(),
+        parent: configuration.parent.clone(),
+        git_remote_url: configuration.git_remote_url.clone(),
+        child_git_branch: configuration.child_git_branch.clone(),
+        parent_git_branch: configuration.parent_git_branch.clone(),
+        transport_policy: configuration.transport_policy,
+        svn: ChangedChildSvnContext {
+            repository_uuid: svn.repository_uuid.clone(),
+            repository_root_url: svn.repository_root_url.clone(),
+            child_path: svn.child_path.clone(),
+            parent_path: svn.parent_path.clone(),
+            child_revision: configuration.child.last_svn_rev,
+            parent_revision: configuration.parent.last_svn_rev,
+            baseline_revision: history.historical_parent_anchor().1,
+            inspected_head_revision: svn.inspected_head_revision,
+            lineage_evidence: Some(ChangedChildEvidence {
+                reference: format!("registered-svn-lineage:{}", historical.id),
+                sha256: lineage_digest,
+            }),
+            property_evidence: Some(ChangedChildEvidence {
+                reference: "complete-four-role-correspondence".into(),
+                sha256: roles_digest.clone(),
+            }),
+        },
+        baseline_evidence: Some(ChangedChildEvidence {
+            reference: format!("authenticated-refresh-receipt:{}", historical.id),
+            sha256: history.snapshot_digest().to_owned(),
+        }),
+        // Stored execution policy is not the current actor's authorization.
+        actor_policy: None,
+        credential_context_digest: Some(configuration.credential_context_digest.clone()),
+        // capture_execution_configuration has already independently refused
+        // projection and LFS; these values do not come from a preview caller.
+        projection: ChangedChildProjection {
+            policy: "full_tree_no_lfs_v1".into(),
+            allowed_paths: Vec::new(),
+            blocked_patterns: Vec::new(),
+            lfs_threshold_mb: 0,
+        },
+    };
+    let roles = ChangedChildApplicabilityRoles {
+        parent_anchor: ChangedChildGitInput {
+            commit: expected.parent_anchor.clone(),
+            tree: expected.parent_anchor_tree.clone(),
+        },
+        integrated_child: ChangedChildGitInput {
+            commit: expected.integrated_child.clone(),
+            tree: expected.integrated_child_tree.clone(),
+        },
+        current_child: ChangedChildGitInput {
+            commit: expected.current_child.clone(),
+            tree: expected.current_child_tree.clone(),
+        },
+        current_parent: ChangedChildGitInput {
+            commit: expected.current_parent.clone(),
+            tree: expected.current_parent_tree.clone(),
+        },
+    };
+    let graph = super::preparation::inspect_changed_child_applicable_graph(
+        preview.git.repository(),
+        &historical.pins.git,
+        &roles,
+        &context,
+    )?;
+    let mut manifest = ChangedChildApplicabilityManifest {
+        schema: 1,
+        policy: super::preparation::CHANGED_CHILD_APPLICABILITY_POLICY.into(),
+        source_correspondence_digest: source.context_digest().to_owned(),
+        source_role_proofs_digest: roles_digest,
+        candidate_set_digest: source.candidate.candidate.candidate_set_digest().to_owned(),
+        historical_snapshot_digest: history.snapshot_digest().to_owned(),
+        mapping_snapshot_digest: source.mappings.snapshot_digest().to_owned(),
+        configuration: configuration.clone(),
+        observed_git: preview.git_sources().clone(),
+        observed_svn: svn.clone(),
+        graph,
+        unverified: [
+            "complete_arbitrary_pending_work_and_local_bridge_enumeration",
+            "authenticated_changed_child_resolution",
+            "current_actor_session_authorization",
+            "exclusive_changed_child_execution_admission",
+            "atomic_remote_freshness_after_return",
+            "other_graphs_properties_projection_and_reanchor",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        execution_eligible: false,
+        manifest_digest: String::new(),
+    };
+    manifest.manifest_digest =
+        changed_child_applicability_digest("changed_child_applicability_manifest_v1", &manifest)?;
+    Ok(manifest)
+}
+
+/// Factory-only inspection for exactly the documented retained-merge/linear-side
+/// subset. No supplied receipt UUID, baseline, mapping, manifest or choices.
+/// All default preparation/execution callers remain unchanged.
+pub async fn capture_registered_changed_child_applicability_review(
+    db: &Database,
+    child_id: &str,
+) -> Result<LiveChangedChildApplicabilityReview> {
+    capture_changed_child_applicability_with_sources(db, child_id, None, |_| Ok(())).await
+}
+
+// Existing private CA plus a post-inspection fault boundary; not a source-fact
+// injection seam. Production supplies neither the client nor callback.
+async fn capture_changed_child_applicability_with_sources<F>(
+    db: &Database,
+    child_id: &str,
+    client: Option<reqwest::Client>,
+    after_inspection: F,
+) -> Result<LiveChangedChildApplicabilityReview>
+where
+    F: FnOnce(&Database) -> Result<()>,
+{
+    let source =
+        capture_changed_child_correspondence_with_sources(db, child_id, client.clone(), |_| Ok(()))
+            .await?;
+    let manifest = inspect_changed_child_applicability_source(&source)?;
+    after_inspection(db)?;
+    // Analysis of immutable objects is not an ongoing source lease. Repeat the
+    // actual endpoints and final DB closure before returning the pinned review.
+    let current = db.capture_pair_refresh_execution_configuration(child_id)?;
+    if current.pin() != source.candidate.preview.current_configuration() {
+        bail!("changed-child applicability configuration changed");
+    }
+    let (current, repeated_git) = changed_child_git_observation(current, client).await?;
+    let repeated_svn = observe_registered_svn_sources(&current).await?;
+    if repeated_git.pins() != source.candidate.preview.git_sources()
+        || repeated_svn.pins() != source.candidate.preview.svn_sources()
+    {
+        bail!("changed-child applicability source visibility or tips changed");
+    }
+    let final_configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let final_candidate =
+        db.capture_changed_child_baseline_candidate_review(&final_configuration)?;
+    let final_mapping =
+        db.capture_changed_child_mapping_review(&final_configuration, &final_candidate)?;
+    if final_configuration.pin() != source.candidate.preview.current_configuration()
+        || final_candidate.candidate_set_digest()
+            != source.candidate.candidate.candidate_set_digest()
+        || final_mapping.snapshot_digest() != source.mappings.snapshot_digest()
+    {
+        bail!("changed-child applicability stored provenance changed");
+    }
+    Ok(LiveChangedChildApplicabilityReview { source, manifest })
+}

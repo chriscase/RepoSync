@@ -893,3 +893,192 @@ pub fn resolve_changed_child_review(
     result.resolution_digest = review_digest("changed_child_resolution_v1", &result)?;
     Ok(result)
 }
+
+/// The baseline is justified by an exact authenticated retained merge, not by
+/// a merge-base query or a current equal-content commit. This policy is separate
+/// from M1's unchanged object-only linear-history inspector.
+pub const CHANGED_CHILD_APPLICABILITY_POLICY: &str =
+    "issue69_retained_merge_linear_sides_review_v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangedChildApplicabilityRoles {
+    pub parent_anchor: ChangedChildGitInput,
+    pub integrated_child: ChangedChildGitInput,
+    pub current_child: ChangedChildGitInput,
+    pub current_parent: ChangedChildGitInput,
+}
+
+/// Serializable inspection metadata only. Constructing or changing these bytes
+/// cannot construct the live source capability or authorize a resolution/job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangedChildApplicableGraphReview {
+    pub schema: u8,
+    pub policy: String,
+    pub historical_merge: PreparedCleanChildGit,
+    pub roles: ChangedChildApplicabilityRoles,
+    pub context: ChangedChildReviewContext,
+    pub baseline_rule: String,
+    pub paths: Vec<ChangedChildPathReview>,
+    pub child_changes: Vec<String>,
+    pub parent_changes: Vec<String>,
+    pub candidate_tree: Option<String>,
+    pub execution_eligible: bool,
+    pub inspection_digest: String,
+}
+
+/// Object-level implementation seam, not a provenance factory. Only the live
+/// adapter binds its output to opaque M2d correspondence. No ODB/ref/DB write.
+pub(crate) fn inspect_changed_child_applicable_graph(
+    repo: &Repository,
+    historical: &PreparedCleanChildGit,
+    roles: &ChangedChildApplicabilityRoles,
+    context: &ChangedChildReviewContext,
+) -> Result<ChangedChildApplicableGraphReview, GitError> {
+    use std::collections::BTreeSet;
+
+    // Reuse metadata validation, not M1's linear-history admission. Its complete
+    // public inspector and resolution path remain unchanged and still refuse R.
+    review_inputs(&ChangedChildReviewInputs {
+        schema: 1,
+        policy: CHANGED_CHILD_REVIEW_POLICY.into(),
+        baseline: roles.parent_anchor.clone(),
+        child: roles.current_child.clone(),
+        parent: roles.current_parent.clone(),
+        context: context.clone(),
+    })?;
+    require_prepared_refresh_object(repo, historical)?;
+    if roles.parent_anchor.commit != historical.pins.parent_tip
+        || roles.integrated_child.commit != historical.prepared_sha
+        || roles.parent_anchor.tree != historical.tree_sha
+        || roles.integrated_child.tree != historical.tree_sha
+    {
+        return Err(review_error(
+            "retained P1/R roles differ from the exact signed merge",
+        ));
+    }
+    for role in [
+        &roles.parent_anchor,
+        &roles.integrated_child,
+        &roles.current_child,
+        &roles.current_parent,
+    ] {
+        if repo.find_commit(review_oid(&role.commit)?)?.tree_id() != review_oid(&role.tree)? {
+            return Err(review_error("applicability role commit/tree pin mismatch"));
+        }
+    }
+    if roles.current_child.commit == roles.integrated_child.commit
+        || roles.current_parent.commit == roles.parent_anchor.commit
+        || roles.current_child.tree == roles.integrated_child.tree
+        || roles.current_parent.tree == roles.parent_anchor.tree
+    {
+        return Err(review_error(
+            "this inspection subset requires both sides to advance content",
+        ));
+    }
+    // Each side has its own explicit anchor. Only the exact retained R merge is
+    // admitted; additional merges, foreign roots and oversize paths refuse.
+    review_side(
+        repo,
+        review_oid(&roles.current_child.commit)?,
+        review_oid(&roles.integrated_child.commit)?,
+    )?;
+    review_side(
+        repo,
+        review_oid(&roles.current_parent.commit)?,
+        review_oid(&roles.parent_anchor.commit)?,
+    )?;
+    let base = review_tree_entries(repo, review_oid(&roles.integrated_child.tree)?)?;
+    let child = review_tree_entries(repo, review_oid(&roles.current_child.tree)?)?;
+    let parent = review_tree_entries(repo, review_oid(&roles.current_parent.tree)?)?;
+    let names: BTreeSet<_> = base
+        .keys()
+        .chain(child.keys())
+        .chain(parent.keys())
+        .cloned()
+        .collect();
+    let mut paths = Vec::new();
+    let mut child_changes = Vec::new();
+    let mut parent_changes = Vec::new();
+    let mut unresolved = false;
+    for path in names {
+        let baseline = base
+            .get(&path)
+            .cloned()
+            .unwrap_or(ChangedChildEntry::Absent {});
+        let child = child
+            .get(&path)
+            .cloned()
+            .unwrap_or(ChangedChildEntry::Absent {});
+        let parent = parent
+            .get(&path)
+            .cloned()
+            .unwrap_or(ChangedChildEntry::Absent {});
+        if child != baseline {
+            child_changes.push(path.clone());
+        }
+        if parent != baseline {
+            parent_changes.push(path.clone());
+        }
+        let entries = [&baseline, &child, &parent];
+        let has_directory = entries
+            .iter()
+            .any(|entry| matches!(entry, ChangedChildEntry::Directory { .. }));
+        let has_file = entries
+            .iter()
+            .any(|entry| matches!(entry, ChangedChildEntry::File { .. }));
+        let deleted_modified_directory = matches!(baseline, ChangedChildEntry::Directory { .. })
+            && ((matches!(child, ChangedChildEntry::Absent {})
+                && matches!(parent, ChangedChildEntry::Directory { .. })
+                && parent != baseline)
+                || (matches!(parent, ChangedChildEntry::Absent {})
+                    && matches!(child, ChangedChildEntry::Directory { .. })
+                    && child != baseline));
+        let disposition = if (has_directory && has_file) || deleted_modified_directory {
+            unresolved = true;
+            ChangedChildDisposition::Refused {
+                reason: "unsupported_file_directory_topology".into(),
+            }
+        } else if has_directory {
+            ChangedChildDisposition::Directory
+        } else if child == parent || parent == baseline {
+            ChangedChildDisposition::Selected {
+                entry: child.clone(),
+            }
+        } else if child == baseline {
+            ChangedChildDisposition::Selected {
+                entry: parent.clone(),
+            }
+        } else {
+            unresolved = true;
+            ChangedChildDisposition::Conflict
+        };
+        paths.push(ChangedChildPathReview {
+            path,
+            baseline,
+            child,
+            parent,
+            disposition,
+        });
+    }
+    let candidate_tree = if unresolved {
+        None
+    } else {
+        Some(review_result_tree(&paths)?)
+    };
+    let mut review = ChangedChildApplicableGraphReview {
+        schema: 1,
+        policy: CHANGED_CHILD_APPLICABILITY_POLICY.into(),
+        historical_merge: historical.clone(),
+        roles: roles.clone(),
+        context: context.clone(),
+        baseline_rule: "exact_authenticated_R_tree_equals_signed_P1_tree".into(),
+        paths,
+        child_changes,
+        parent_changes,
+        candidate_tree,
+        execution_eligible: false,
+        inspection_digest: String::new(),
+    };
+    review.inspection_digest = review_digest("changed_child_applicable_graph_v1", &review)?;
+    Ok(review)
+}
