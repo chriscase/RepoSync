@@ -1118,7 +1118,9 @@ pub(crate) fn require_changed_child_resolution_request_header(
         || request.policy != CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY
         || !review_sha256(&request.manifest_digest)
     {
-        return Err(review_error("unknown or malformed resolution-candidate request"));
+        return Err(review_error(
+            "unknown or malformed resolution-candidate request",
+        ));
     }
     Ok(())
 }
@@ -1155,9 +1157,9 @@ pub(crate) fn resolve_changed_child_applicable_graph(
                 ));
             }
             ChangedChildDisposition::Conflict => {
-                let choice = by_path.remove(path.path.as_str()).ok_or_else(|| {
-                    review_error("missing resolution-candidate conflict choice")
-                })?;
+                let choice = by_path
+                    .remove(path.path.as_str())
+                    .ok_or_else(|| review_error("missing resolution-candidate conflict choice"))?;
                 if choice.baseline != path.baseline
                     || choice.child != path.child
                     || choice.parent != path.parent

@@ -1412,14 +1412,8 @@ pub async fn capture_registered_changed_child_resolution_candidate_review(
     child_id: &str,
     request: &super::preparation::ChangedChildResolutionCandidateRequest,
 ) -> Result<LiveChangedChildResolutionCandidateReview> {
-    capture_changed_child_resolution_candidate_with_sources(
-        db,
-        child_id,
-        request,
-        None,
-        |_| Ok(()),
-    )
-    .await
+    capture_changed_child_resolution_candidate_with_sources(db, child_id, request, None, |_| Ok(()))
+        .await
 }
 
 // Private fixture CA and post-resolution fault seam. Neither supplies a source
@@ -1437,13 +1431,9 @@ where
     // Malformed headers refuse before any new registered-source read. The DTO
     // and its nested choices/entries deny unknown fields and unknown choices.
     super::preparation::require_changed_child_resolution_request_header(request)?;
-    let applicability = capture_changed_child_applicability_with_sources(
-        db,
-        child_id,
-        client.clone(),
-        |_| Ok(()),
-    )
-    .await?;
+    let applicability =
+        capture_changed_child_applicability_with_sources(db, child_id, client.clone(), |_| Ok(()))
+            .await?;
     applicability.require_manifest_digest(&request.manifest_digest)?;
     let graph = {
         let captured = applicability.manifest();
@@ -1463,7 +1453,10 @@ where
         schema: 1,
         policy: super::preparation::CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
         applicability_manifest_digest: applicability.manifest().manifest_digest.clone(),
-        source_correspondence_digest: applicability.manifest().source_correspondence_digest.clone(),
+        source_correspondence_digest: applicability
+            .manifest()
+            .source_correspondence_digest
+            .clone(),
         graph,
         unverified,
         execution_eligible: false,
@@ -1478,7 +1471,13 @@ where
     // Selection/hash computation does not extend the observation interval or
     // lock a remote. Repeat actual endpoints and final DB closure once more.
     let current = db.capture_pair_refresh_execution_configuration(child_id)?;
-    if current.pin() != applicability.source.candidate.preview.current_configuration() {
+    if current.pin()
+        != applicability
+            .source
+            .candidate
+            .preview
+            .current_configuration()
+    {
         bail!("changed-child resolution candidate configuration changed");
     }
     let (current, repeated_git) = changed_child_git_observation(current, client).await?;
@@ -1494,9 +1493,17 @@ where
     let final_mapping =
         db.capture_changed_child_mapping_review(&final_configuration, &final_candidate)?;
     if final_configuration.pin()
-        != applicability.source.candidate.preview.current_configuration()
+        != applicability
+            .source
+            .candidate
+            .preview
+            .current_configuration()
         || final_candidate.candidate_set_digest()
-            != applicability.source.candidate.candidate.candidate_set_digest()
+            != applicability
+                .source
+                .candidate
+                .candidate
+                .candidate_set_digest()
         || final_mapping.snapshot_digest() != applicability.source.mappings.snapshot_digest()
     {
         bail!("changed-child resolution candidate stored provenance changed");

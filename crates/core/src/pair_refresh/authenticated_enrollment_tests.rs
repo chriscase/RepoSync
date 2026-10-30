@@ -9249,8 +9249,8 @@ mod changed_child_resolution_candidate_review {
         inspect_changed_child_applicable_graph, require_changed_child_resolution_request_header,
         resolve_changed_child_applicable_graph, resolve_changed_child_review,
         ChangedChildApplicabilityRoles, ChangedChildChoice, ChangedChildConflictChoice,
-        ChangedChildDisposition, ChangedChildEntry, ChangedChildGitInput,
-        ChangedChildResolution, ChangedChildResolutionCandidateRequest, ChangedChildReviewContext,
+        ChangedChildDisposition, ChangedChildEntry, ChangedChildGitInput, ChangedChildResolution,
+        ChangedChildResolutionCandidateRequest, ChangedChildReviewContext,
         ChangedChildReviewInputs, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY,
         CHANGED_CHILD_REVIEW_POLICY,
     };
@@ -9678,7 +9678,6 @@ mod changed_child_resolution_candidate_review {
         (roles, context)
     }
 
-
     async fn preview(f: &Fixture) -> anyhow::Result<LiveChangedChildApplicabilityReview> {
         super::super::capture_changed_child_applicability_with_sources(
             &f.db,
@@ -9742,19 +9741,34 @@ mod changed_child_resolution_candidate_review {
         let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
         let ready = ready(&f, &engine).await;
         let current = preview(&f).await.unwrap();
-        assert_eq!(choices(&current.manifest().graph, ChangedChildChoice::Base).len(), 1);
+        assert_eq!(
+            choices(&current.manifest().graph, ChangedChildChoice::Base).len(),
+            1
+        );
         let before = storage(&f.db);
         let target = files(f.target.path());
         let mut digests = std::collections::BTreeSet::new();
         for (side, expected_tree) in [
-            (ChangedChildChoice::Base, current.manifest().graph.roles.integrated_child.tree.clone()),
-            (ChangedChildChoice::Child, current.manifest().graph.roles.current_child.tree.clone()),
-            (ChangedChildChoice::Parent, current.manifest().graph.roles.current_parent.tree.clone()),
+            (
+                ChangedChildChoice::Base,
+                current.manifest().graph.roles.integrated_child.tree.clone(),
+            ),
+            (
+                ChangedChildChoice::Child,
+                current.manifest().graph.roles.current_child.tree.clone(),
+            ),
+            (
+                ChangedChildChoice::Parent,
+                current.manifest().graph.roles.current_parent.tree.clone(),
+            ),
         ] {
             let intent = request(&current, side);
             let result = resolve(&f, &intent).await.unwrap();
             let manifest = result.manifest();
-            assert_eq!(manifest.applicability_manifest_digest, intent.manifest_digest);
+            assert_eq!(
+                manifest.applicability_manifest_digest,
+                intent.manifest_digest
+            );
             assert_eq!(manifest.graph.candidate_tree, expected_tree);
             assert_eq!(manifest.graph.choices, intent.choices);
             assert_eq!(manifest.graph.source_graph, current.manifest().graph);
@@ -9765,7 +9779,10 @@ mod changed_child_resolution_candidate_review {
                 ChangedChildChoice::Child => original.child.clone(),
                 ChangedChildChoice::Parent => original.parent.clone(),
             };
-            assert_eq!(manifest.graph.paths[0].disposition, ChangedChildDisposition::Selected { entry: expected });
+            assert_eq!(
+                manifest.graph.paths[0].disposition,
+                ChangedChildDisposition::Selected { entry: expected }
+            );
             assert_eq!(manifest.candidate_digest.len(), 64);
             assert_eq!(manifest.graph.candidate_digest.len(), 64);
             assert!(!manifest.execution_eligible);
@@ -9773,15 +9790,24 @@ mod changed_child_resolution_candidate_review {
             assert!(!result.execution_eligible());
             assert!(!result.applicability_review().execution_eligible());
             assert!(manifest.graph.source_graph.context.actor_policy.is_none());
-            assert!(manifest.unverified.iter().any(|g| g == "authenticated_changed_child_resolution"));
-            assert!(manifest.unverified.iter().any(|g| g == "resolution_choices_not_actor_authorized"));
+            assert!(manifest
+                .unverified
+                .iter()
+                .any(|g| g == "authenticated_changed_child_resolution"));
+            assert!(manifest
+                .unverified
+                .iter()
+                .any(|g| g == "resolution_choices_not_actor_authorized"));
             digests.insert(manifest.candidate_digest.clone());
             assert_eq!(storage(&f.db), before);
             assert_eq!(storage(engine.db()), before);
             assert_eq!(files(f.target.path()), target);
         }
         assert_eq!(digests.len(), 3);
-        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+        assert_eq!(
+            f.db.pair_refresh_operation(ready.history.id).unwrap(),
+            ready.history
+        );
         let graph = &current.manifest().graph;
         let inputs = ChangedChildReviewInputs {
             schema: 1,
@@ -9799,7 +9825,9 @@ mod changed_child_resolution_candidate_review {
             choices: choices(graph, ChangedChildChoice::Child),
         };
         let error = match resolve_changed_child_review(
-            current.source.candidate.preview.git.repository(), &inputs, &old_request,
+            current.source.candidate.preview.git.repository(),
+            &inputs,
+            &old_request,
         ) {
             Ok(_) => panic!("M1 must still refuse the retained R merge"),
             Err(error) => error.to_string(),
@@ -9819,73 +9847,161 @@ mod changed_child_resolution_candidate_review {
         let original = &current.manifest().graph;
         let r = Oid::from_str(&original.roles.integrated_child.commit).unwrap();
         let p1 = Oid::from_str(&original.roles.parent_anchor.commit).unwrap();
-        let child = object_with_entries(&f.target, &[r], &[
-            ("file.txt", b"child conflict", 0o100644),
-            ("overlap.bin", b"\0child overlap", 0o100644),
-            ("child.bin", b"\0child only\xff", 0o100755),
-        ]);
-        let parent = object_with_entries(&f.target, &[p1], &[
-            ("file.txt", b"parent conflict", 0o100644),
-            ("overlap.bin", b"\0parent overlap", 0o100644),
-            ("parent.bin", b"\0parent only\xfe", 0o100644),
-        ]);
-        let (roles, context) = object_roles(&f.target, &original.roles, &original.context, child, parent);
-        let graph = inspect_changed_child_applicable_graph(&f.target, &original.historical_merge, &roles, &context).unwrap();
+        let child = object_with_entries(
+            &f.target,
+            &[r],
+            &[
+                ("file.txt", b"child conflict", 0o100644),
+                ("overlap.bin", b"\0child overlap", 0o100644),
+                ("child.bin", b"\0child only\xff", 0o100755),
+            ],
+        );
+        let parent = object_with_entries(
+            &f.target,
+            &[p1],
+            &[
+                ("file.txt", b"parent conflict", 0o100644),
+                ("overlap.bin", b"\0parent overlap", 0o100644),
+                ("parent.bin", b"\0parent only\xfe", 0o100644),
+            ],
+        );
+        let (roles, context) =
+            object_roles(&f.target, &original.roles, &original.context, child, parent);
+        let graph = inspect_changed_child_applicable_graph(
+            &f.target,
+            &original.historical_merge,
+            &roles,
+            &context,
+        )
+        .unwrap();
         let mut selected = choices(&graph, ChangedChildChoice::Parent);
         assert_eq!(selected.len(), 2);
-        selected.iter_mut().find(|c| c.path == "overlap.bin").unwrap().choice = ChangedChildChoice::Base;
-        let expected = object_with_entries(&f.target, &[child], &[
-            ("file.txt", b"parent conflict", 0o100644),
-            ("child.bin", b"\0child only\xff", 0o100755),
-            ("parent.bin", b"\0parent only\xfe", 0o100644),
-        ]);
-        let expected_tree = f.target.find_commit(expected).unwrap().tree_id().to_string();
+        selected
+            .iter_mut()
+            .find(|c| c.path == "overlap.bin")
+            .unwrap()
+            .choice = ChangedChildChoice::Base;
+        let expected = object_with_entries(
+            &f.target,
+            &[child],
+            &[
+                ("file.txt", b"parent conflict", 0o100644),
+                ("child.bin", b"\0child only\xff", 0o100755),
+                ("parent.bin", b"\0parent only\xfe", 0o100644),
+            ],
+        );
+        let expected_tree = f
+            .target
+            .find_commit(expected)
+            .unwrap()
+            .tree_id()
+            .to_string();
         let before = files(f.target.path());
         let first = resolve_changed_child_applicable_graph(
-            &f.target, &graph.historical_merge, &roles, &context,
-            &graph.inspection_digest, &selected,
-        ).unwrap();
+            &f.target,
+            &graph.historical_merge,
+            &roles,
+            &context,
+            &graph.inspection_digest,
+            &selected,
+        )
+        .unwrap();
         selected.reverse();
         let second = resolve_changed_child_applicable_graph(
-            &f.target, &graph.historical_merge, &roles, &context,
-            &graph.inspection_digest, &selected,
-        ).unwrap();
+            &f.target,
+            &graph.historical_merge,
+            &roles,
+            &context,
+            &graph.inspection_digest,
+            &selected,
+        )
+        .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.candidate_tree, expected_tree);
         assert_eq!(files(f.target.path()), before);
         assert!(!first.execution_eligible);
         for path in &graph.paths {
             if !matches!(path.disposition, ChangedChildDisposition::Conflict) {
-                assert_eq!(&first.paths.iter().find(|p| p.path == path.path).unwrap().disposition, &path.disposition);
+                assert_eq!(
+                    &first
+                        .paths
+                        .iter()
+                        .find(|p| p.path == path.path)
+                        .unwrap()
+                        .disposition,
+                    &path.disposition
+                );
             }
         }
-        assert!(matches!(first.paths.iter().find(|p| p.path == "overlap.bin").unwrap().disposition,
-            ChangedChildDisposition::Selected { entry: ChangedChildEntry::Absent {} }));
-        assert!(matches!(first.paths.iter().find(|p| p.path == "child.bin").unwrap().disposition,
-            ChangedChildDisposition::Selected { entry: ChangedChildEntry::File { mode: 0o100755, .. } }));
+        assert!(matches!(
+            first
+                .paths
+                .iter()
+                .find(|p| p.path == "overlap.bin")
+                .unwrap()
+                .disposition,
+            ChangedChildDisposition::Selected {
+                entry: ChangedChildEntry::Absent {}
+            }
+        ));
+        assert!(matches!(
+            first
+                .paths
+                .iter()
+                .find(|p| p.path == "child.bin")
+                .unwrap()
+                .disposition,
+            ChangedChildDisposition::Selected {
+                entry: ChangedChildEntry::File { mode: 0o100755, .. }
+            }
+        ));
         // Empty choices are complete when both independent deltas are uncontested.
         let base_tree = f.target.find_commit(r).unwrap().tree().unwrap();
-        let base_blob = f.target.find_blob(base_tree.get_name("file.txt").unwrap().id()).unwrap();
-        let clean_child = object_with_entries(&f.target, &[r], &[
-            ("file.txt", base_blob.content(), 0o100644),
-            ("child.bin", b"child uncontested", 0o100755),
-        ]);
-        let clean_parent = object_with_entries(&f.target, &[p1], &[
-            ("file.txt", base_blob.content(), 0o100644),
-            ("parent.bin", b"parent uncontested", 0o100644),
-        ]);
+        let base_blob = f
+            .target
+            .find_blob(base_tree.get_name("file.txt").unwrap().id())
+            .unwrap();
+        let clean_child = object_with_entries(
+            &f.target,
+            &[r],
+            &[
+                ("file.txt", base_blob.content(), 0o100644),
+                ("child.bin", b"child uncontested", 0o100755),
+            ],
+        );
+        let clean_parent = object_with_entries(
+            &f.target,
+            &[p1],
+            &[
+                ("file.txt", base_blob.content(), 0o100644),
+                ("parent.bin", b"parent uncontested", 0o100644),
+            ],
+        );
         let (clean_roles, clean_context) = object_roles(
-            &f.target, &original.roles, &original.context, clean_child, clean_parent,
+            &f.target,
+            &original.roles,
+            &original.context,
+            clean_child,
+            clean_parent,
         );
         let clean_graph = inspect_changed_child_applicable_graph(
-            &f.target, &original.historical_merge, &clean_roles, &clean_context,
-        ).unwrap();
+            &f.target,
+            &original.historical_merge,
+            &clean_roles,
+            &clean_context,
+        )
+        .unwrap();
         assert!(choices(&clean_graph, ChangedChildChoice::Base).is_empty());
         let before_clean = files(f.target.path());
         let clean_result = resolve_changed_child_applicable_graph(
-            &f.target, &clean_graph.historical_merge, &clean_roles, &clean_context,
-            &clean_graph.inspection_digest, &[],
-        ).unwrap();
+            &f.target,
+            &clean_graph.historical_merge,
+            &clean_roles,
+            &clean_context,
+            &clean_graph.inspection_digest,
+            &[],
+        )
+        .unwrap();
         assert!(clean_result.choices.is_empty());
         assert_eq!(
             Some(clean_result.candidate_tree.as_str()),
@@ -9895,19 +10011,51 @@ mod changed_child_resolution_candidate_review {
         assert_eq!(files(f.target.path()), before_clean);
         // A refused file/directory graph cannot become a choice candidate.
         let mut nested = f.target.treebuilder(None).unwrap();
-        nested.insert("leaf", f.target.blob(b"nested").unwrap(), 0o100644).unwrap();
+        nested
+            .insert("leaf", f.target.blob(b"nested").unwrap(), 0o100644)
+            .unwrap();
         let mut root = f.target.treebuilder(None).unwrap();
-        root.insert("file.txt", nested.write().unwrap(), 0o040000).unwrap();
+        root.insert("file.txt", nested.write().unwrap(), 0o040000)
+            .unwrap();
         let tree = f.target.find_tree(root.write().unwrap()).unwrap();
         let c = f.target.find_commit(child).unwrap();
-        let directory_child = f.target.commit(None, &c.author(), &c.committer(), "directory control", &tree, &[&c]).unwrap();
-        let (bad_roles, bad_context) = object_roles(&f.target, &original.roles, &original.context, directory_child, parent);
-        let refused = inspect_changed_child_applicable_graph(&f.target, &original.historical_merge, &bad_roles, &bad_context).unwrap();
-        assert!(refused.paths.iter().any(|p| matches!(p.disposition, ChangedChildDisposition::Refused { .. })));
+        let directory_child = f
+            .target
+            .commit(
+                None,
+                &c.author(),
+                &c.committer(),
+                "directory control",
+                &tree,
+                &[&c],
+            )
+            .unwrap();
+        let (bad_roles, bad_context) = object_roles(
+            &f.target,
+            &original.roles,
+            &original.context,
+            directory_child,
+            parent,
+        );
+        let refused = inspect_changed_child_applicable_graph(
+            &f.target,
+            &original.historical_merge,
+            &bad_roles,
+            &bad_context,
+        )
+        .unwrap();
+        assert!(refused
+            .paths
+            .iter()
+            .any(|p| matches!(p.disposition, ChangedChildDisposition::Refused { .. })));
         let before = files(f.target.path());
         let error = match resolve_changed_child_applicable_graph(
-            &f.target, &refused.historical_merge, &bad_roles, &bad_context,
-            &refused.inspection_digest, &choices(&refused, ChangedChildChoice::Base),
+            &f.target,
+            &refused.historical_merge,
+            &bad_roles,
+            &bad_context,
+            &refused.inspection_digest,
+            &choices(&refused, ChangedChildChoice::Base),
         ) {
             Ok(_) => panic!("side choice must not resolve refused topology"),
             Err(error) => error.to_string(),
@@ -9936,45 +10084,87 @@ mod changed_child_resolution_candidate_review {
         let mut stale_base = correct.clone();
         stale_base[0].baseline = ChangedChildEntry::Absent {};
         let mut stale_child = correct.clone();
-        stale_child[0].child = ChangedChildEntry::File { blob: "0".repeat(40), mode: 0o100755 };
+        stale_child[0].child = ChangedChildEntry::File {
+            blob: "0".repeat(40),
+            mode: 0o100755,
+        };
         let mut stale_parent = correct.clone();
         stale_parent[0].parent = ChangedChildEntry::Absent {};
         let repository = current.source.candidate.preview.git.repository();
         let before = files(repository.path());
         for (label, selected) in [
-            ("missing", Vec::new()), ("duplicate", duplicate), ("unknown", unknown),
-            ("malformed", malformed), ("stale baseline", stale_base),
-            ("stale child", stale_child), ("stale parent", stale_parent),
+            ("missing", Vec::new()),
+            ("duplicate", duplicate),
+            ("unknown", unknown),
+            ("malformed", malformed),
+            ("stale baseline", stale_base),
+            ("stale child", stale_child),
+            ("stale parent", stale_parent),
         ] {
-            assert!(resolve_changed_child_applicable_graph(
-                repository, &graph.historical_merge, &graph.roles, &graph.context,
-                &graph.inspection_digest, &selected,
-            ).is_err(), "{label}");
+            assert!(
+                resolve_changed_child_applicable_graph(
+                    repository,
+                    &graph.historical_merge,
+                    &graph.roles,
+                    &graph.context,
+                    &graph.inspection_digest,
+                    &selected,
+                )
+                .is_err(),
+                "{label}"
+            );
         }
         assert!(resolve_changed_child_applicable_graph(
-            repository, &graph.historical_merge, &graph.roles, &graph.context,
-            &"0".repeat(64), &correct,
-        ).is_err());
+            repository,
+            &graph.historical_merge,
+            &graph.roles,
+            &graph.context,
+            &"0".repeat(64),
+            &correct,
+        )
+        .is_err());
         assert_eq!(files(repository.path()), before);
         // An existing uncontested entry is also not a conflict-choice slot.
         let r = Oid::from_str(&graph.roles.integrated_child.commit).unwrap();
         let p1 = Oid::from_str(&graph.roles.parent_anchor.commit).unwrap();
-        let child = object_with_entries(&f.target, &[r], &[
-            ("file.txt", b"child conflict", 0o100644), ("only.txt", b"child only", 0o100644),
-        ]);
-        let parent = object_with_entries(&f.target, &[p1], &[("file.txt", b"parent conflict", 0o100644)]);
+        let child = object_with_entries(
+            &f.target,
+            &[r],
+            &[
+                ("file.txt", b"child conflict", 0o100644),
+                ("only.txt", b"child only", 0o100644),
+            ],
+        );
+        let parent = object_with_entries(
+            &f.target,
+            &[p1],
+            &[("file.txt", b"parent conflict", 0o100644)],
+        );
         let (roles, context) = object_roles(&f.target, &graph.roles, &graph.context, child, parent);
-        let mixed = inspect_changed_child_applicable_graph(&f.target, &graph.historical_merge, &roles, &context).unwrap();
+        let mixed = inspect_changed_child_applicable_graph(
+            &f.target,
+            &graph.historical_merge,
+            &roles,
+            &context,
+        )
+        .unwrap();
         let mut selected = choices(&mixed, ChangedChildChoice::Child);
         let only = mixed.paths.iter().find(|p| p.path == "only.txt").unwrap();
         selected.push(ChangedChildConflictChoice {
-            path: only.path.clone(), baseline: only.baseline.clone(), child: only.child.clone(),
-            parent: only.parent.clone(), choice: ChangedChildChoice::Base,
+            path: only.path.clone(),
+            baseline: only.baseline.clone(),
+            child: only.child.clone(),
+            parent: only.parent.clone(),
+            choice: ChangedChildChoice::Base,
         });
         let before = files(f.target.path());
         let error = match resolve_changed_child_applicable_graph(
-            &f.target, &mixed.historical_merge, &roles, &context,
-            &mixed.inspection_digest, &selected,
+            &f.target,
+            &mixed.historical_merge,
+            &roles,
+            &context,
+            &mixed.inspection_digest,
+            &selected,
         ) {
             Ok(_) => panic!("uncontested child delta must not be a choice slot"),
             Err(error) => error.to_string(),
@@ -9986,16 +10176,29 @@ mod changed_child_resolution_candidate_review {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_schema_policy_unknown_fields_and_approval_assertions_refuse() {
         let valid = ChangedChildResolutionCandidateRequest {
-            schema: 1, policy: CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
-            manifest_digest: "a".repeat(64), choices: Vec::new(),
+            schema: 1,
+            policy: CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
+            manifest_digest: "a".repeat(64),
+            choices: Vec::new(),
         };
         require_changed_child_resolution_request_header(&valid).unwrap();
         let json = serde_json::to_value(&valid).unwrap();
-        assert_eq!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(json.clone()).unwrap(), valid);
-        for field in ["actor_approval", "actor_policy", "execution_eligible", "source_manifest"] {
+        assert_eq!(
+            serde_json::from_value::<ChangedChildResolutionCandidateRequest>(json.clone()).unwrap(),
+            valid
+        );
+        for field in [
+            "actor_approval",
+            "actor_policy",
+            "execution_eligible",
+            "source_manifest",
+        ] {
             let mut value = json.clone();
             value[field] = serde_json::json!(true);
-            assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(value).is_err(), "{field}");
+            assert!(
+                serde_json::from_value::<ChangedChildResolutionCandidateRequest>(value).is_err(),
+                "{field}"
+            );
         }
         for (schema, policy, digest) in [
             (0, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY, "a".repeat(64)),
@@ -10005,7 +10208,10 @@ mod changed_child_resolution_candidate_review {
             (1, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY, "A".repeat(64)),
         ] {
             let request = ChangedChildResolutionCandidateRequest {
-                schema, policy: policy.into(), manifest_digest: digest, choices: Vec::new(),
+                schema,
+                policy: policy.into(),
+                manifest_digest: digest,
+                choices: Vec::new(),
             };
             assert!(require_changed_child_resolution_request_header(&request).is_err());
         }
@@ -10013,7 +10219,9 @@ mod changed_child_resolution_candidate_review {
             "{{\"schema\":1,\"schema\":1,\"policy\":\"{}\",\"manifest_digest\":\"{}\",\"choices\":[]}}",
             valid.policy, valid.manifest_digest,
         );
-        assert!(serde_json::from_str::<ChangedChildResolutionCandidateRequest>(&duplicate).is_err());
+        assert!(
+            serde_json::from_str::<ChangedChildResolutionCandidateRequest>(&duplicate).is_err()
+        );
         let entry = serde_json::json!({"kind":"absent"});
         let choice = serde_json::json!({
             "path":"file.txt", "baseline":entry.clone(), "child":entry.clone(),
@@ -10021,16 +10229,27 @@ mod changed_child_resolution_candidate_review {
         });
         let mut with_choice = json.clone();
         with_choice["choices"] = serde_json::json!([choice]);
-        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(with_choice.clone()).is_ok());
+        assert!(
+            serde_json::from_value::<ChangedChildResolutionCandidateRequest>(with_choice.clone())
+                .is_ok()
+        );
         let mut unknown_side = with_choice.clone();
         unknown_side["choices"][0]["choice"] = serde_json::json!("manual");
-        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_side).is_err());
+        assert!(
+            serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_side).is_err()
+        );
         let mut unknown_entry = with_choice.clone();
         unknown_entry["choices"][0]["baseline"]["approval"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_entry).is_err());
+        assert!(
+            serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_entry)
+                .is_err()
+        );
         let mut unknown_choice_field = with_choice;
         unknown_choice_field["choices"][0]["approved"] = serde_json::json!(true);
-        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_choice_field).is_err());
+        assert!(
+            serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_choice_field)
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10058,7 +10277,10 @@ mod changed_child_resolution_candidate_review {
         ).unwrap(), 1);
         let injected = storage(&f.db);
         let fresh = preview(&f).await.unwrap();
-        assert_ne!(fresh.manifest().manifest_digest, original.manifest().manifest_digest);
+        assert_ne!(
+            fresh.manifest().manifest_digest,
+            original.manifest().manifest_digest
+        );
         let error = match resolve(&f, &old_request).await {
             Ok(_) => panic!("old manifest pin must not adopt a new mapping snapshot"),
             Err(error) => error.to_string(),
@@ -10066,10 +10288,21 @@ mod changed_child_resolution_candidate_review {
         assert!(error.contains("stale or different"), "{error}");
         let new_request = request(&fresh, ChangedChildChoice::Child);
         let new_result = resolve(&f, &new_request).await.unwrap();
-        assert_eq!(new_result.manifest().applicability_manifest_digest, fresh.manifest().manifest_digest);
+        assert_eq!(
+            new_result.manifest().applicability_manifest_digest,
+            fresh.manifest().manifest_digest
+        );
         assert_eq!(storage(&f.db), injected);
         assert_eq!(storage(engine.db()), injected);
-        assert_eq!(f.db.conn().execute("UPDATE repositories SET allowed_paths='[\"file.txt\"]' WHERE id='child'", []).unwrap(), 1);
+        assert_eq!(
+            f.db.conn()
+                .execute(
+                    "UPDATE repositories SET allowed_paths='[\"file.txt\"]' WHERE id='child'",
+                    []
+                )
+                .unwrap(),
+            1
+        );
         let policy_fault = storage(&f.db);
         assert!(resolve(&f, &new_request).await.is_err());
         assert_eq!(storage(&f.db), policy_fault);
@@ -10087,7 +10320,11 @@ mod changed_child_resolution_candidate_review {
             let current = preview(&f).await.unwrap();
             let intent = request(&current, ChangedChildChoice::Parent);
             let pin = &current.manifest().configuration.child;
-            let pending = commit(&f.target, b"late resolution Git work\n", &[Oid::from_str(&pin.last_git_sha).unwrap()]);
+            let pending = commit(
+                &f.target,
+                b"late resolution Git work\n",
+                &[Oid::from_str(&pin.last_git_sha).unwrap()],
+            );
             let reached = std::cell::Cell::new(false);
             let injected = std::cell::RefCell::new(None);
             let retained_git = std::cell::RefCell::new(None);
@@ -10125,20 +10362,40 @@ mod changed_child_resolution_candidate_review {
                     Ok(())
                 },
             ).await;
-            assert!(reached.get(), "actual post-resolution {fault} boundary not reached");
+            assert!(
+                reached.get(),
+                "actual post-resolution {fault} boundary not reached"
+            );
             assert!(result.is_err(), "late {fault} must not return a candidate");
             assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
             assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
             if fault == "git" {
-                assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
-                assert_eq!(files(f.target.path()), *retained_git.borrow().as_ref().unwrap());
+                assert_eq!(
+                    f.target
+                        .find_reference("refs/heads/feature")
+                        .unwrap()
+                        .target(),
+                    Some(pending)
+                );
+                assert_eq!(
+                    files(f.target.path()),
+                    *retained_git.borrow().as_ref().unwrap()
+                );
             }
             if fault == "svn" {
-                assert!(retained_svn.get() > current.manifest().observed_svn.inspected_head_revision);
-                assert_eq!(svn_revision(&local_source_url(&f, "branches/f")), retained_svn.get());
+                assert!(
+                    retained_svn.get() > current.manifest().observed_svn.inspected_head_revision
+                );
+                assert_eq!(
+                    svn_revision(&local_source_url(&f, "branches/f")),
+                    retained_svn.get()
+                );
                 let value = run(Command::new("svn").args([
-                    "propget", "unreviewed:resolution", ready.child_wc.to_str().unwrap(),
-                    "--non-interactive", "--no-auth-cache",
+                    "propget",
+                    "unreviewed:resolution",
+                    ready.child_wc.to_str().unwrap(),
+                    "--non-interactive",
+                    "--no-auth-cache",
                 ]));
                 assert_eq!(value.trim(), "retained");
             }
@@ -10156,17 +10413,50 @@ mod changed_child_resolution_candidate_review {
         let intent = request(&current, ChangedChildChoice::Child);
         let tip = Oid::from_str(&current.manifest().graph.roles.current_child.commit).unwrap();
         let pending = commit(&f.target, b"pending candidate Git work\n", &[tip]);
-        f.target.reference("refs/heads/feature", pending, true, "pending candidate fault").unwrap();
+        f.target
+            .reference(
+                "refs/heads/feature",
+                pending,
+                true,
+                "pending candidate fault",
+            )
+            .unwrap();
         let before = storage(&f.db);
         let target = files(f.target.path());
         assert!(resolve(&f, &intent).await.is_err());
         assert_eq!(storage(&f.db), before);
         assert_eq!(files(f.target.path()), target);
-        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
-        f.target.reference("refs/heads/feature", tip, true, "restore disposable candidate ref").unwrap();
+        assert_eq!(
+            f.target
+                .find_reference("refs/heads/feature")
+                .unwrap()
+                .target(),
+            Some(pending)
+        );
+        f.target
+            .reference(
+                "refs/heads/feature",
+                tip,
+                true,
+                "restore disposable candidate ref",
+            )
+            .unwrap();
         svn(&["update"], Some(&ready.child_wc));
-        std::fs::write(ready.child_wc.join("file.txt"), b"pending candidate SVN work\n").unwrap();
-        svn(&["commit", "--username", "m2d-fixture-author", "-m", "pending candidate work"], Some(&ready.child_wc));
+        std::fs::write(
+            ready.child_wc.join("file.txt"),
+            b"pending candidate SVN work\n",
+        )
+        .unwrap();
+        svn(
+            &[
+                "commit",
+                "--username",
+                "m2d-fixture-author",
+                "-m",
+                "pending candidate work",
+            ],
+            Some(&ready.child_wc),
+        );
         let revision = svn_revision(&local_source_url(&f, "branches/f"));
         let before = storage(&f.db);
         let wc = files(&ready.child_wc);
@@ -10195,16 +10485,29 @@ mod changed_child_resolution_candidate_review {
         let requests = std::fs::read(&f.log).unwrap();
         let result = resolve(&f, &intent).await.unwrap();
         let repeated = resolve(&f, &intent).await.unwrap();
-        assert_eq!(result.manifest().candidate_digest, repeated.manifest().candidate_digest);
+        assert_eq!(
+            result.manifest().candidate_digest,
+            repeated.manifest().candidate_digest
+        );
         assert_eq!(result.manifest().graph, repeated.manifest().graph);
         assert!(!result.execution_eligible());
         let json = serde_json::to_value(result.manifest()).unwrap();
         assert_eq!(json["execution_eligible"], serde_json::json!(false));
         assert!(json.get("actor_approval").is_none());
         assert!(json.get("actor_policy").is_none());
-        assert!(result.manifest().graph.source_graph.context.actor_policy.is_none());
+        assert!(result
+            .manifest()
+            .graph
+            .source_graph
+            .context
+            .actor_policy
+            .is_none());
         let source = &result.applicability.source;
-        let snapshots = source.snapshots.iter().map(|s| s.path().parent().unwrap().to_owned()).collect::<Vec<_>>();
+        let snapshots = source
+            .snapshots
+            .iter()
+            .map(|s| s.path().parent().unwrap().to_owned())
+            .collect::<Vec<_>>();
         let git = source.candidate.preview.git.repository().path().to_owned();
         assert_eq!(snapshots.len(), 4);
         assert!(snapshots.iter().all(|p| p.is_dir()));
@@ -10224,7 +10527,10 @@ mod changed_child_resolution_candidate_review {
         drop(result);
         assert!(snapshots.iter().all(|p| !p.exists()));
         assert!(!git.exists());
-        assert_eq!(repeated.manifest().applicability_manifest_digest, intent.manifest_digest);
+        assert_eq!(
+            repeated.manifest().applicability_manifest_digest,
+            intent.manifest_digest
+        );
         assert_eq!(current.manifest().manifest_digest, intent.manifest_digest);
     }
 }
