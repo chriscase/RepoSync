@@ -9238,3 +9238,993 @@ mod changed_child_applicability_review {
         assert_eq!(second.manifest().manifest_digest, pin);
     }
 }
+
+/// Source-only candidate-review regressions. Positive preparation uses the exact
+/// qualified applicability fixture recipe; object controls confer no authority.
+#[cfg(test)]
+mod changed_child_resolution_candidate_review {
+    use super::*;
+    use crate::db::pair_refresh_operations::{PairRefreshOperation, PairRefreshPhase};
+    use crate::pair_refresh::preparation::{
+        inspect_changed_child_applicable_graph, require_changed_child_resolution_request_header,
+        resolve_changed_child_applicable_graph, resolve_changed_child_review,
+        ChangedChildApplicabilityRoles, ChangedChildChoice, ChangedChildConflictChoice,
+        ChangedChildDisposition, ChangedChildEntry, ChangedChildGitInput,
+        ChangedChildResolution, ChangedChildResolutionCandidateRequest, ChangedChildReviewContext,
+        ChangedChildReviewInputs, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY,
+        CHANGED_CHILD_REVIEW_POLICY,
+    };
+    use std::collections::BTreeMap;
+
+    type Storage = BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>;
+
+    fn storage(db: &Database) -> Storage {
+        use rusqlite::types::Value;
+        let conn = db.conn();
+        let mut snapshot = BTreeMap::new();
+        let schema = conn
+            .prepare("SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master ORDER BY type,name")
+            .unwrap()
+            .query_map([], |row| {
+                (0..5)
+                    .map(|i| row.get::<_, Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        snapshot.insert("schema".into(), schema);
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for table in tables {
+            let sql = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+            let mut query = conn.prepare(&sql).unwrap();
+            let columns = query.column_count();
+            let mut values = query
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|i| row.get::<_, Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            values.sort_by_cached_key(|row| format!("{row:?}"));
+            snapshot.insert(table, values);
+        }
+        snapshot
+    }
+
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                assert!(!kind.is_symlink());
+                if kind.is_dir() {
+                    collect(root, &entry.path(), out);
+                } else {
+                    assert!(kind.is_file());
+                    out.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        collect(root, root, &mut out);
+        out
+    }
+
+    fn svn_revision(url: &str) -> i64 {
+        let mut command = Command::new("svn");
+        command
+            .args(["info", "--show-item", "revision", url])
+            .args(["--non-interactive", "--no-auth-cache"]);
+        let revision: i64 = run(&mut command)
+            .trim()
+            .parse()
+            .expect("SVN revision query returned malformed stdout");
+        assert!(revision > 0, "SVN revision must be positive");
+        revision
+    }
+
+    async fn completed(
+        f: &Fixture,
+        engine: &crate::sync_engine::SyncEngine,
+        request: &str,
+    ) -> PairRefreshOperation {
+        let (actor, _workspace, value) = prepared(f, engine).await;
+        let approved = actor.prepared_approval_digest(engine, &value).unwrap();
+        let busy = crate::busy::try_acquire_pair("child", "parent").unwrap();
+        let op = super::super::super::execution::complete_owned_refresh_with_client(
+            engine,
+            &actor,
+            &value,
+            request,
+            &approved,
+            &busy,
+            f.client.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(op.phase, PairRefreshPhase::Completed);
+        assert_eq!(f.db.pair_refresh_operation(op.id).unwrap(), op);
+        op
+    }
+
+    // Use the same native DB and disposable bare repository, with a distinct
+    // ordinary bridge per role. Local Git transport here avoids a new CA policy;
+    // the correspondence factory still uses registered HTTPS observers/client.
+    fn producer_engine(f: &Fixture, id: &str) -> (crate::sync_engine::SyncEngine, PathBuf) {
+        let branch = if id == "child" { "feature" } else { "main" };
+        let path = f.temp.path().join(format!("m2d-{id}-bridge"));
+        let repo = if path.exists() {
+            let existing = Repository::open(&path).unwrap();
+            assert_eq!(existing.head().unwrap().shorthand(), Some(branch));
+            assert_eq!(
+                existing.find_remote("origin").unwrap().url(),
+                f.target.path().to_str()
+            );
+            existing
+        } else {
+            git2::build::RepoBuilder::new()
+                .branch(branch)
+                .clone(f.target.path().to_str().unwrap(), &path)
+                .unwrap()
+        };
+        repo.config()
+            .unwrap()
+            .set_str("user.name", "Fixture")
+            .unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "fixture@example.invalid")
+            .unwrap();
+        drop(repo);
+        let mut config: crate::config::AppConfig = toml::from_str(
+            r#"
+            [daemon]
+            data_dir = "/unused"
+            [svn]
+            url = "file:///unused/svn"
+            username = ""
+            password_env = ""
+            [github]
+            repo = "fixture/repo"
+            token_env = ""
+            "#,
+        )
+        .unwrap();
+        config.daemon.data_dir = f.temp.path().to_owned();
+        let svn_branch = if id == "child" { "branches/f" } else { "trunk" };
+        let svn_url = format!("{}/{svn_branch}", f.root);
+        config.svn.url = svn_url.clone();
+        config.svn.layout = crate::config::SvnLayout::Custom;
+        config.svn.password = Some(String::new());
+        config.github.default_branch = branch.to_owned();
+        config.github.token = Some(String::new());
+        config.sync.auto_merge = false;
+        let mut engine = crate::sync_engine::SyncEngine::new(
+            config,
+            Database::new(f.temp.path().join("reposync.db")).unwrap(),
+            crate::svn::SvnClient::new(svn_url, "", ""),
+            crate::git::GitClient::new(&path).unwrap(),
+            std::sync::Arc::new(
+                crate::identity::mapper::IdentityMapper::new(&crate::config::IdentityConfig {
+                    email_domain: Some("example.invalid".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        );
+        engine.set_repo_id(id.to_owned());
+        engine.set_git_credential_apply_clean(true);
+        (engine, path)
+    }
+
+    // Fixture::new seeds an inbound KV without any ordinary handled-work proof.
+    // The completed refresh proves the child only. For the untouched parent,
+    // use the existing column-only, no-prior-work install bootstrap instead.
+    // Remove only that exact fixture seed: never erase real mappings, receipts,
+    // baselines, holds or an unknown cursor to make an ordinary cycle admissible.
+    fn parent_install_bootstrap(f: &Fixture, history: &PairRefreshOperation) {
+        use crate::db::repo_scope_identity as identity;
+
+        let parent = &history.pins.parent;
+        assert_eq!(parent.repo_id, "parent");
+        assert_eq!(parent.last_git_sha, f.parent.to_string());
+        assert_eq!(
+            f.db.get_repo_watermark("parent").unwrap(),
+            (parent.last_svn_rev, parent.last_git_sha.clone())
+        );
+        assert_eq!(
+            f.target.find_reference("refs/heads/main").unwrap().target(),
+            Some(f.parent)
+        );
+        let scope = identity::repository_scope_uuid(&f.db.conn(), "parent").unwrap();
+        assert_eq!(scope, parent.scope_uuid);
+        let key = identity::last_git_sha_kv_key(&scope);
+        assert_eq!(
+            f.db.get_state(&key).unwrap().as_deref(),
+            Some(parent.last_git_sha.as_str())
+        );
+        assert_eq!(f.db.get_state("last_git_sha_parent").unwrap(), None);
+        let rows: i64 =
+            f.db.conn()
+                .query_row(
+                    "SELECT count(*) FROM sync_records WHERE repo_id='parent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+        assert_eq!(rows, 0, "bootstrap must precede all ordinary parent work");
+        let no_target =
+            identity::repository_has_stored_no_target_receipt_kv(&f.db.conn(), "parent").unwrap();
+        assert!(!no_target);
+        assert_eq!(f.db.get_state("handled_git_baseline_parent").unwrap(), None);
+        f.db.delete_kv_state(&key).unwrap();
+        assert_eq!(
+            crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv(&f.db, "parent")
+                .unwrap(),
+            None
+        );
+    }
+
+    struct Ready {
+        history: PairRefreshOperation,
+        child_wc: PathBuf,
+        parent_bridge: PathBuf,
+        child_bridge: PathBuf,
+    }
+
+    fn local_source_url(f: &Fixture, branch: &str) -> String {
+        reqwest::Url::from_file_path(f.temp.path().join("svn-repository").join(branch))
+            .unwrap()
+            .to_string()
+    }
+
+    async fn require_named_source_revision(f: &Fixture, branch: &str) -> i64 {
+        let local_url = local_source_url(f, branch);
+        let revision = svn_revision(&local_url);
+        let local = crate::svn::SvnClient::new(&local_url, "", "");
+        let entries = local.strict_log_range(revision, revision).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].revision, revision);
+        assert_eq!(entries[0].author, "m2d-fixture-author");
+        let registered = crate::svn::SvnClient::new(format!("{}/{branch}", f.root), "", "");
+        let local_info = local.info().await.unwrap();
+        let registered_info = registered.info().await.unwrap();
+        assert_eq!(local_info.uuid, registered_info.uuid);
+        assert_eq!(local_info.latest_rev, registered_info.latest_rev);
+        assert_eq!(local_info.latest_rev, revision);
+        assert_eq!(
+            registered_info.url.trim_end_matches('/'),
+            format!("{}/{branch}", f.root)
+        );
+        revision
+    }
+
+    async fn ready(f: &Fixture, engine: &crate::sync_engine::SyncEngine) -> Ready {
+        let fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
+        let history = completed(f, engine, "applicability-genuine-history").await;
+        parent_install_bootstrap(f, &history);
+        let (parent_engine, parent_bridge) = producer_engine(f, "parent");
+        let (child_engine, child_bridge) = producer_engine(f, "child");
+        std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
+        svn(
+            &[
+                "commit",
+                "--username",
+                "m2d-fixture-author",
+                "--no-auth-cache",
+                "-m",
+                "m2d parent source work",
+            ],
+            Some(&f._parent_wc),
+        );
+        let parent_source_revision = require_named_source_revision(f, "trunk").await;
+        let parent_stats = parent_engine.run_sync_cycle().await.unwrap();
+        assert_eq!(parent_stats.svn_to_git_count, 1);
+        assert_eq!(parent_stats.git_to_svn_count, 0);
+        // The actual ordinary cycle, not fixture SQL, must now create the
+        // mapped handled baseline. Keep the emitted tip distinct from inbound KV.
+        let (parent_revision, parent_sha) = f.db.get_repo_watermark("parent").unwrap();
+        let baseline: serde_json::Value = serde_json::from_str(
+            &f.db
+                .get_state("handled_git_baseline_parent")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(baseline["version"], 1);
+        assert_eq!(baseline["repo_id"], "parent");
+        assert_eq!(baseline["git_sha"].as_str(), Some(parent_sha.as_str()));
+        assert_eq!(baseline["svn_rev"].as_i64(), Some(parent_revision));
+        assert_eq!(parent_revision, parent_source_revision);
+        let child_wc = f.temp.path().join("m2d-child-wc");
+        svn(
+            &[
+                "checkout",
+                &local_source_url(f, "branches/f"),
+                child_wc.to_str().unwrap(),
+            ],
+            None,
+        );
+        std::fs::write(child_wc.join("file.txt"), b"m2d child work\n").unwrap();
+        svn(
+            &[
+                "commit",
+                "--username",
+                "m2d-fixture-author",
+                "--no-auth-cache",
+                "-m",
+                "m2d child source work",
+            ],
+            Some(&child_wc),
+        );
+        let child_source_revision = require_named_source_revision(f, "branches/f").await;
+        let child_stats = child_engine.run_sync_cycle().await.unwrap();
+        assert_eq!(child_stats.svn_to_git_count, 1);
+        assert_eq!(child_stats.git_to_svn_count, 0);
+        assert_eq!(
+            f.db.get_repo_watermark("child").unwrap().0,
+            child_source_revision
+        );
+        drop(fence);
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
+        for registration in [&current.pin().child, &current.pin().parent] {
+            let rows: i64 = f.db.conn().query_row(
+                "SELECT count(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",
+                rusqlite::params![registration.repo_id, registration.last_svn_rev, registration.last_git_sha],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                rows, 1,
+                "actual ordinary producer mapping for {}",
+                registration.repo_id
+            );
+            assert_eq!(
+                f.target
+                    .find_reference(&format!(
+                        "refs/heads/{}",
+                        if registration.repo_id == "child" {
+                            "feature"
+                        } else {
+                            "main"
+                        }
+                    ))
+                    .unwrap()
+                    .target()
+                    .unwrap()
+                    .to_string(),
+                registration.last_git_sha,
+            );
+        }
+        assert_eq!(f.db.pair_refresh_operation(history.id).unwrap(), history);
+        Ready {
+            history,
+            child_wc,
+            parent_bridge,
+            child_bridge,
+        }
+    }
+
+    fn object_with_entries(
+        repo: &Repository,
+        parents: &[Oid],
+        entries: &[(&str, &[u8], i32)],
+    ) -> Oid {
+        let mut builder = repo.treebuilder(None).unwrap();
+        for (name, bytes, mode) in entries {
+            builder
+                .insert(*name, repo.blob(bytes).unwrap(), *mode)
+                .unwrap();
+        }
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let signature = Signature::new(
+            "Disposable applicability object control",
+            "fixture@example.invalid",
+            &Time::new(1_790_000_001, 0),
+        )
+        .unwrap();
+        let parents = parents
+            .iter()
+            .map(|id| repo.find_commit(*id).unwrap())
+            .collect::<Vec<_>>();
+        let parents = parents.iter().collect::<Vec<_>>();
+        repo.commit(
+            None,
+            &signature,
+            &signature,
+            "object-only applicability control",
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    // Object-only negative/selection controls deliberately bind no live source
+    // authority. The trusted positive test below uses the real factory instead.
+    fn object_roles(
+        repo: &Repository,
+        original: &ChangedChildApplicabilityRoles,
+        context: &ChangedChildReviewContext,
+        child: Oid,
+        parent: Oid,
+    ) -> (ChangedChildApplicabilityRoles, ChangedChildReviewContext) {
+        let mut roles = original.clone();
+        let mut context = context.clone();
+        roles.current_child = ChangedChildGitInput {
+            commit: child.to_string(),
+            tree: repo.find_commit(child).unwrap().tree_id().to_string(),
+        };
+        roles.current_parent = ChangedChildGitInput {
+            commit: parent.to_string(),
+            tree: repo.find_commit(parent).unwrap().tree_id().to_string(),
+        };
+        context.child.last_git_sha = child.to_string();
+        context.child.scoped_git_checkpoint = Some(child.to_string());
+        context.parent.last_git_sha = parent.to_string();
+        context.parent.scoped_git_checkpoint = Some(parent.to_string());
+        (roles, context)
+    }
+
+
+    async fn preview(f: &Fixture) -> anyhow::Result<LiveChangedChildApplicabilityReview> {
+        super::super::capture_changed_child_applicability_with_sources(
+            &f.db,
+            "child",
+            Some(f.client.clone()),
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    fn choices(
+        graph: &crate::pair_refresh::preparation::ChangedChildApplicableGraphReview,
+        side: ChangedChildChoice,
+    ) -> Vec<ChangedChildConflictChoice> {
+        let mut result = Vec::new();
+        for path in &graph.paths {
+            if matches!(path.disposition, ChangedChildDisposition::Conflict) {
+                result.push(ChangedChildConflictChoice {
+                    path: path.path.clone(),
+                    baseline: path.baseline.clone(),
+                    child: path.child.clone(),
+                    parent: path.parent.clone(),
+                    choice: side,
+                });
+            }
+        }
+        result
+    }
+
+    fn request(
+        current: &LiveChangedChildApplicabilityReview,
+        side: ChangedChildChoice,
+    ) -> ChangedChildResolutionCandidateRequest {
+        ChangedChildResolutionCandidateRequest {
+            schema: 1,
+            policy: CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
+            manifest_digest: current.manifest().manifest_digest.clone(),
+            choices: choices(&current.manifest().graph, side),
+        }
+    }
+
+    async fn resolve(
+        f: &Fixture,
+        request: &ChangedChildResolutionCandidateRequest,
+    ) -> anyhow::Result<LiveChangedChildResolutionCandidateReview> {
+        super::super::capture_changed_child_resolution_candidate_with_sources(
+            &f.db,
+            "child",
+            request,
+            Some(f.client.clone()),
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_live_base_child_parent_choices_bind_exact_candidate() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let current = preview(&f).await.unwrap();
+        assert_eq!(choices(&current.manifest().graph, ChangedChildChoice::Base).len(), 1);
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        let mut digests = std::collections::BTreeSet::new();
+        for (side, expected_tree) in [
+            (ChangedChildChoice::Base, current.manifest().graph.roles.integrated_child.tree.clone()),
+            (ChangedChildChoice::Child, current.manifest().graph.roles.current_child.tree.clone()),
+            (ChangedChildChoice::Parent, current.manifest().graph.roles.current_parent.tree.clone()),
+        ] {
+            let intent = request(&current, side);
+            let result = resolve(&f, &intent).await.unwrap();
+            let manifest = result.manifest();
+            assert_eq!(manifest.applicability_manifest_digest, intent.manifest_digest);
+            assert_eq!(manifest.graph.candidate_tree, expected_tree);
+            assert_eq!(manifest.graph.choices, intent.choices);
+            assert_eq!(manifest.graph.source_graph, current.manifest().graph);
+            assert_eq!(manifest.graph.paths.len(), 1);
+            let original = &current.manifest().graph.paths[0];
+            let expected = match side {
+                ChangedChildChoice::Base => original.baseline.clone(),
+                ChangedChildChoice::Child => original.child.clone(),
+                ChangedChildChoice::Parent => original.parent.clone(),
+            };
+            assert_eq!(manifest.graph.paths[0].disposition, ChangedChildDisposition::Selected { entry: expected });
+            assert_eq!(manifest.candidate_digest.len(), 64);
+            assert_eq!(manifest.graph.candidate_digest.len(), 64);
+            assert!(!manifest.execution_eligible);
+            assert!(!manifest.graph.execution_eligible);
+            assert!(!result.execution_eligible());
+            assert!(!result.applicability_review().execution_eligible());
+            assert!(manifest.graph.source_graph.context.actor_policy.is_none());
+            assert!(manifest.unverified.iter().any(|g| g == "authenticated_changed_child_resolution"));
+            assert!(manifest.unverified.iter().any(|g| g == "resolution_choices_not_actor_authorized"));
+            digests.insert(manifest.candidate_digest.clone());
+            assert_eq!(storage(&f.db), before);
+            assert_eq!(storage(engine.db()), before);
+            assert_eq!(files(f.target.path()), target);
+        }
+        assert_eq!(digests.len(), 3);
+        assert_eq!(f.db.pair_refresh_operation(ready.history.id).unwrap(), ready.history);
+        let graph = &current.manifest().graph;
+        let inputs = ChangedChildReviewInputs {
+            schema: 1,
+            policy: CHANGED_CHILD_REVIEW_POLICY.into(),
+            baseline: graph.roles.parent_anchor.clone(),
+            child: graph.roles.current_child.clone(),
+            parent: graph.roles.current_parent.clone(),
+            context: graph.context.clone(),
+        };
+        let old_request = ChangedChildResolution {
+            schema: 1,
+            policy: CHANGED_CHILD_REVIEW_POLICY.into(),
+            inputs: inputs.clone(),
+            manifest_digest: "0".repeat(64),
+            choices: choices(graph, ChangedChildChoice::Child),
+        };
+        let error = match resolve_changed_child_review(
+            current.source.candidate.preview.git.repository(), &inputs, &old_request,
+        ) {
+            Ok(_) => panic!("M1 must still refuse the retained R merge"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("nonlinear"), "{error}");
+        assert_eq!(storage(&f.db), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_resolution_keeps_uncontested_deltas_and_canonical_choice_order() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let current = preview(&f).await.unwrap();
+        let original = &current.manifest().graph;
+        let r = Oid::from_str(&original.roles.integrated_child.commit).unwrap();
+        let p1 = Oid::from_str(&original.roles.parent_anchor.commit).unwrap();
+        let child = object_with_entries(&f.target, &[r], &[
+            ("file.txt", b"child conflict", 0o100644),
+            ("overlap.bin", b"\0child overlap", 0o100644),
+            ("child.bin", b"\0child only\xff", 0o100755),
+        ]);
+        let parent = object_with_entries(&f.target, &[p1], &[
+            ("file.txt", b"parent conflict", 0o100644),
+            ("overlap.bin", b"\0parent overlap", 0o100644),
+            ("parent.bin", b"\0parent only\xfe", 0o100644),
+        ]);
+        let (roles, context) = object_roles(&f.target, &original.roles, &original.context, child, parent);
+        let graph = inspect_changed_child_applicable_graph(&f.target, &original.historical_merge, &roles, &context).unwrap();
+        let mut selected = choices(&graph, ChangedChildChoice::Parent);
+        assert_eq!(selected.len(), 2);
+        selected.iter_mut().find(|c| c.path == "overlap.bin").unwrap().choice = ChangedChildChoice::Base;
+        let expected = object_with_entries(&f.target, &[child], &[
+            ("file.txt", b"parent conflict", 0o100644),
+            ("child.bin", b"\0child only\xff", 0o100755),
+            ("parent.bin", b"\0parent only\xfe", 0o100644),
+        ]);
+        let expected_tree = f.target.find_commit(expected).unwrap().tree_id().to_string();
+        let before = files(f.target.path());
+        let first = resolve_changed_child_applicable_graph(
+            &f.target, &graph.historical_merge, &roles, &context,
+            &graph.inspection_digest, &selected,
+        ).unwrap();
+        selected.reverse();
+        let second = resolve_changed_child_applicable_graph(
+            &f.target, &graph.historical_merge, &roles, &context,
+            &graph.inspection_digest, &selected,
+        ).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.candidate_tree, expected_tree);
+        assert_eq!(files(f.target.path()), before);
+        assert!(!first.execution_eligible);
+        for path in &graph.paths {
+            if !matches!(path.disposition, ChangedChildDisposition::Conflict) {
+                assert_eq!(&first.paths.iter().find(|p| p.path == path.path).unwrap().disposition, &path.disposition);
+            }
+        }
+        assert!(matches!(first.paths.iter().find(|p| p.path == "overlap.bin").unwrap().disposition,
+            ChangedChildDisposition::Selected { entry: ChangedChildEntry::Absent {} }));
+        assert!(matches!(first.paths.iter().find(|p| p.path == "child.bin").unwrap().disposition,
+            ChangedChildDisposition::Selected { entry: ChangedChildEntry::File { mode: 0o100755, .. } }));
+        // Empty choices are complete when both independent deltas are uncontested.
+        let base_tree = f.target.find_commit(r).unwrap().tree().unwrap();
+        let base_blob = f.target.find_blob(base_tree.get_name("file.txt").unwrap().id()).unwrap();
+        let clean_child = object_with_entries(&f.target, &[r], &[
+            ("file.txt", base_blob.content(), 0o100644),
+            ("child.bin", b"child uncontested", 0o100755),
+        ]);
+        let clean_parent = object_with_entries(&f.target, &[p1], &[
+            ("file.txt", base_blob.content(), 0o100644),
+            ("parent.bin", b"parent uncontested", 0o100644),
+        ]);
+        let (clean_roles, clean_context) = object_roles(
+            &f.target, &original.roles, &original.context, clean_child, clean_parent,
+        );
+        let clean_graph = inspect_changed_child_applicable_graph(
+            &f.target, &original.historical_merge, &clean_roles, &clean_context,
+        ).unwrap();
+        assert!(choices(&clean_graph, ChangedChildChoice::Base).is_empty());
+        let before_clean = files(f.target.path());
+        let clean_result = resolve_changed_child_applicable_graph(
+            &f.target, &clean_graph.historical_merge, &clean_roles, &clean_context,
+            &clean_graph.inspection_digest, &[],
+        ).unwrap();
+        assert!(clean_result.choices.is_empty());
+        assert_eq!(
+            Some(clean_result.candidate_tree.as_str()),
+            clean_graph.candidate_tree.as_deref()
+        );
+        assert_eq!(clean_result.paths, clean_graph.paths);
+        assert_eq!(files(f.target.path()), before_clean);
+        // A refused file/directory graph cannot become a choice candidate.
+        let mut nested = f.target.treebuilder(None).unwrap();
+        nested.insert("leaf", f.target.blob(b"nested").unwrap(), 0o100644).unwrap();
+        let mut root = f.target.treebuilder(None).unwrap();
+        root.insert("file.txt", nested.write().unwrap(), 0o040000).unwrap();
+        let tree = f.target.find_tree(root.write().unwrap()).unwrap();
+        let c = f.target.find_commit(child).unwrap();
+        let directory_child = f.target.commit(None, &c.author(), &c.committer(), "directory control", &tree, &[&c]).unwrap();
+        let (bad_roles, bad_context) = object_roles(&f.target, &original.roles, &original.context, directory_child, parent);
+        let refused = inspect_changed_child_applicable_graph(&f.target, &original.historical_merge, &bad_roles, &bad_context).unwrap();
+        assert!(refused.paths.iter().any(|p| matches!(p.disposition, ChangedChildDisposition::Refused { .. })));
+        let before = files(f.target.path());
+        let error = match resolve_changed_child_applicable_graph(
+            &f.target, &refused.historical_merge, &bad_roles, &bad_context,
+            &refused.inspection_digest, &choices(&refused, ChangedChildChoice::Base),
+        ) {
+            Ok(_) => panic!("side choice must not resolve refused topology"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unsupported topology"), "{error}");
+        assert_eq!(files(f.target.path()), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn choice_set_requires_complete_unique_exact_conflict_triples() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let current = preview(&f).await.unwrap();
+        let graph = &current.manifest().graph;
+        let correct = choices(graph, ChangedChildChoice::Child);
+        assert_eq!(correct.len(), 1);
+        let mut duplicate = correct.clone();
+        duplicate.push(correct[0].clone());
+        let mut unknown = correct.clone();
+        unknown[0].path = "unknown.txt".into();
+        let mut malformed = correct.clone();
+        malformed[0].path = "../file.txt".into();
+        let mut stale_base = correct.clone();
+        stale_base[0].baseline = ChangedChildEntry::Absent {};
+        let mut stale_child = correct.clone();
+        stale_child[0].child = ChangedChildEntry::File { blob: "0".repeat(40), mode: 0o100755 };
+        let mut stale_parent = correct.clone();
+        stale_parent[0].parent = ChangedChildEntry::Absent {};
+        let repository = current.source.candidate.preview.git.repository();
+        let before = files(repository.path());
+        for (label, selected) in [
+            ("missing", Vec::new()), ("duplicate", duplicate), ("unknown", unknown),
+            ("malformed", malformed), ("stale baseline", stale_base),
+            ("stale child", stale_child), ("stale parent", stale_parent),
+        ] {
+            assert!(resolve_changed_child_applicable_graph(
+                repository, &graph.historical_merge, &graph.roles, &graph.context,
+                &graph.inspection_digest, &selected,
+            ).is_err(), "{label}");
+        }
+        assert!(resolve_changed_child_applicable_graph(
+            repository, &graph.historical_merge, &graph.roles, &graph.context,
+            &"0".repeat(64), &correct,
+        ).is_err());
+        assert_eq!(files(repository.path()), before);
+        // An existing uncontested entry is also not a conflict-choice slot.
+        let r = Oid::from_str(&graph.roles.integrated_child.commit).unwrap();
+        let p1 = Oid::from_str(&graph.roles.parent_anchor.commit).unwrap();
+        let child = object_with_entries(&f.target, &[r], &[
+            ("file.txt", b"child conflict", 0o100644), ("only.txt", b"child only", 0o100644),
+        ]);
+        let parent = object_with_entries(&f.target, &[p1], &[("file.txt", b"parent conflict", 0o100644)]);
+        let (roles, context) = object_roles(&f.target, &graph.roles, &graph.context, child, parent);
+        let mixed = inspect_changed_child_applicable_graph(&f.target, &graph.historical_merge, &roles, &context).unwrap();
+        let mut selected = choices(&mixed, ChangedChildChoice::Child);
+        let only = mixed.paths.iter().find(|p| p.path == "only.txt").unwrap();
+        selected.push(ChangedChildConflictChoice {
+            path: only.path.clone(), baseline: only.baseline.clone(), child: only.child.clone(),
+            parent: only.parent.clone(), choice: ChangedChildChoice::Base,
+        });
+        let before = files(f.target.path());
+        let error = match resolve_changed_child_applicable_graph(
+            &f.target, &mixed.historical_merge, &roles, &context,
+            &mixed.inspection_digest, &selected,
+        ) {
+            Ok(_) => panic!("uncontested child delta must not be a choice slot"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unknown or non-conflict"), "{error}");
+        assert_eq!(files(f.target.path()), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_schema_policy_unknown_fields_and_approval_assertions_refuse() {
+        let valid = ChangedChildResolutionCandidateRequest {
+            schema: 1, policy: CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
+            manifest_digest: "a".repeat(64), choices: Vec::new(),
+        };
+        require_changed_child_resolution_request_header(&valid).unwrap();
+        let json = serde_json::to_value(&valid).unwrap();
+        assert_eq!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(json.clone()).unwrap(), valid);
+        for field in ["actor_approval", "actor_policy", "execution_eligible", "source_manifest"] {
+            let mut value = json.clone();
+            value[field] = serde_json::json!(true);
+            assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(value).is_err(), "{field}");
+        }
+        for (schema, policy, digest) in [
+            (0, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY, "a".repeat(64)),
+            (2, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY, "a".repeat(64)),
+            (1, CHANGED_CHILD_REVIEW_POLICY, "a".repeat(64)),
+            (1, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY, String::new()),
+            (1, CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY, "A".repeat(64)),
+        ] {
+            let request = ChangedChildResolutionCandidateRequest {
+                schema, policy: policy.into(), manifest_digest: digest, choices: Vec::new(),
+            };
+            assert!(require_changed_child_resolution_request_header(&request).is_err());
+        }
+        let duplicate = format!(
+            "{{\"schema\":1,\"schema\":1,\"policy\":\"{}\",\"manifest_digest\":\"{}\",\"choices\":[]}}",
+            valid.policy, valid.manifest_digest,
+        );
+        assert!(serde_json::from_str::<ChangedChildResolutionCandidateRequest>(&duplicate).is_err());
+        let entry = serde_json::json!({"kind":"absent"});
+        let choice = serde_json::json!({
+            "path":"file.txt", "baseline":entry.clone(), "child":entry.clone(),
+            "parent":entry, "choice":"child",
+        });
+        let mut with_choice = json.clone();
+        with_choice["choices"] = serde_json::json!([choice]);
+        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(with_choice.clone()).is_ok());
+        let mut unknown_side = with_choice.clone();
+        unknown_side["choices"][0]["choice"] = serde_json::json!("manual");
+        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_side).is_err());
+        let mut unknown_entry = with_choice.clone();
+        unknown_entry["choices"][0]["baseline"]["approval"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_entry).is_err());
+        let mut unknown_choice_field = with_choice;
+        unknown_choice_field["choices"][0]["approved"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ChangedChildResolutionCandidateRequest>(unknown_choice_field).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_manifest_and_changed_mapping_or_policy_require_fresh_review() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let _ready = ready(&f, &engine).await;
+        let original = preview(&f).await.unwrap();
+        let old_request = request(&original, ChangedChildChoice::Child);
+        let mut wrong_pin = old_request.clone();
+        wrong_pin.manifest_digest = "0".repeat(64);
+        let before = storage(&f.db);
+        let error = match resolve(&f, &wrong_pin).await {
+            Ok(_) => panic!("wrong manifest pin must not select a result"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("stale or different"), "{error}");
+        assert_eq!(storage(&f.db), before);
+        let pin = &original.manifest().configuration.child;
+        assert_eq!(f.db.conn().execute(
+            "UPDATE sync_records SET message=coalesce(message,'')||' review metadata' WHERE repo_id='child' AND git_sha=?1 AND svn_rev=?2",
+            rusqlite::params![pin.last_git_sha, pin.last_svn_rev],
+        ).unwrap(), 1);
+        let injected = storage(&f.db);
+        let fresh = preview(&f).await.unwrap();
+        assert_ne!(fresh.manifest().manifest_digest, original.manifest().manifest_digest);
+        let error = match resolve(&f, &old_request).await {
+            Ok(_) => panic!("old manifest pin must not adopt a new mapping snapshot"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("stale or different"), "{error}");
+        let new_request = request(&fresh, ChangedChildChoice::Child);
+        let new_result = resolve(&f, &new_request).await.unwrap();
+        assert_eq!(new_result.manifest().applicability_manifest_digest, fresh.manifest().manifest_digest);
+        assert_eq!(storage(&f.db), injected);
+        assert_eq!(storage(engine.db()), injected);
+        assert_eq!(f.db.conn().execute("UPDATE repositories SET allowed_paths='[\"file.txt\"]' WHERE id='child'", []).unwrap(), 1);
+        let policy_fault = storage(&f.db);
+        assert!(resolve(&f, &new_request).await.is_err());
+        assert_eq!(storage(&f.db), policy_fault);
+        assert_eq!(storage(engine.db()), policy_fault);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_resolution_source_database_and_history_drift_refuse() {
+        let _serial = SERIAL.lock().await;
+        for fault in ["mapping", "generation", "history", "git", "svn"] {
+            let f = Fixture::new();
+            let engine = f.engine();
+            let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+            let ready = ready(&f, &engine).await;
+            let current = preview(&f).await.unwrap();
+            let intent = request(&current, ChangedChildChoice::Parent);
+            let pin = &current.manifest().configuration.child;
+            let pending = commit(&f.target, b"late resolution Git work\n", &[Oid::from_str(&pin.last_git_sha).unwrap()]);
+            let reached = std::cell::Cell::new(false);
+            let injected = std::cell::RefCell::new(None);
+            let retained_git = std::cell::RefCell::new(None);
+            let retained_svn = std::cell::Cell::new(0);
+            let result = super::super::capture_changed_child_resolution_candidate_with_sources(
+                &f.db, "child", &intent, Some(f.client.clone()), |db| {
+                    match fault {
+                        "mapping" => {
+                            assert_eq!(db.conn().execute(
+                                "UPDATE sync_records SET message=coalesce(message,'')||' after choice' WHERE repo_id='child' AND git_sha=?1 AND svn_rev=?2",
+                                rusqlite::params![pin.last_git_sha, pin.last_svn_rev],
+                            )?, 1);
+                        }
+                        "generation" => db.set_state(
+                            &format!("repo_echo_generation_{}", pin.scope_uuid),
+                            &(pin.echo_generation + 1).to_string(),
+                        )?,
+                        "history" => db.set_state(
+                            &format!("pair_refresh_execution_v3:authority:{}", ready.history.id), "{}",
+                        )?,
+                        "git" => {
+                            f.target.reference("refs/heads/feature", pending, true, "late resolution fault")?;
+                            *retained_git.borrow_mut() = Some(files(f.target.path()));
+                        }
+                        "svn" => {
+                            svn(&["update"], Some(&ready.child_wc));
+                            svn(&["propset", "unreviewed:resolution", "retained", "."], Some(&ready.child_wc));
+                            svn(&["commit", "--username", "m2d-fixture-author", "-m", "late resolution property"], Some(&ready.child_wc));
+                            retained_svn.set(svn_revision(&local_source_url(&f, "branches/f")));
+                        }
+                        _ => unreachable!(),
+                    }
+                    reached.set(true);
+                    *injected.borrow_mut() = Some(storage(db));
+                    Ok(())
+                },
+            ).await;
+            assert!(reached.get(), "actual post-resolution {fault} boundary not reached");
+            assert!(result.is_err(), "late {fault} must not return a candidate");
+            assert_eq!(storage(&f.db), *injected.borrow().as_ref().unwrap());
+            assert_eq!(storage(engine.db()), *injected.borrow().as_ref().unwrap());
+            if fault == "git" {
+                assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
+                assert_eq!(files(f.target.path()), *retained_git.borrow().as_ref().unwrap());
+            }
+            if fault == "svn" {
+                assert!(retained_svn.get() > current.manifest().observed_svn.inspected_head_revision);
+                assert_eq!(svn_revision(&local_source_url(&f, "branches/f")), retained_svn.get());
+                let value = run(Command::new("svn").args([
+                    "propget", "unreviewed:resolution", ready.child_wc.to_str().unwrap(),
+                    "--non-interactive", "--no-auth-cache",
+                ]));
+                assert_eq!(value.trim(), "retained");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_candidate_capture_never_adopts_pending_git_or_svn_work() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let current = preview(&f).await.unwrap();
+        let intent = request(&current, ChangedChildChoice::Child);
+        let tip = Oid::from_str(&current.manifest().graph.roles.current_child.commit).unwrap();
+        let pending = commit(&f.target, b"pending candidate Git work\n", &[tip]);
+        f.target.reference("refs/heads/feature", pending, true, "pending candidate fault").unwrap();
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        assert!(resolve(&f, &intent).await.is_err());
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(f.target.find_reference("refs/heads/feature").unwrap().target(), Some(pending));
+        f.target.reference("refs/heads/feature", tip, true, "restore disposable candidate ref").unwrap();
+        svn(&["update"], Some(&ready.child_wc));
+        std::fs::write(ready.child_wc.join("file.txt"), b"pending candidate SVN work\n").unwrap();
+        svn(&["commit", "--username", "m2d-fixture-author", "-m", "pending candidate work"], Some(&ready.child_wc));
+        let revision = svn_revision(&local_source_url(&f, "branches/f"));
+        let before = storage(&f.db);
+        let wc = files(&ready.child_wc);
+        assert!(resolve(&f, &intent).await.is_err());
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(&ready.child_wc), wc);
+        assert_eq!(svn_revision(&local_source_url(&f, "branches/f")), revision);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidate_capture_preserves_shared_storage_and_owned_source_lifetimes() {
+        let _serial = SERIAL.lock().await;
+        let f = Fixture::new();
+        let engine = f.engine();
+        let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
+        let ready = ready(&f, &engine).await;
+        let current = preview(&f).await.unwrap();
+        let intent = request(&current, ChangedChildChoice::Child);
+        let before = storage(&f.db);
+        let target = files(f.target.path());
+        let parent_wc = files(&f._parent_wc);
+        let child_wc = files(&ready.child_wc);
+        let parent_bridge = files(&ready.parent_bridge);
+        let child_bridge = files(&ready.child_bridge);
+        let requests = std::fs::read(&f.log).unwrap();
+        let result = resolve(&f, &intent).await.unwrap();
+        let repeated = resolve(&f, &intent).await.unwrap();
+        assert_eq!(result.manifest().candidate_digest, repeated.manifest().candidate_digest);
+        assert_eq!(result.manifest().graph, repeated.manifest().graph);
+        assert!(!result.execution_eligible());
+        let json = serde_json::to_value(result.manifest()).unwrap();
+        assert_eq!(json["execution_eligible"], serde_json::json!(false));
+        assert!(json.get("actor_approval").is_none());
+        assert!(json.get("actor_policy").is_none());
+        assert!(result.manifest().graph.source_graph.context.actor_policy.is_none());
+        let source = &result.applicability.source;
+        let snapshots = source.snapshots.iter().map(|s| s.path().parent().unwrap().to_owned()).collect::<Vec<_>>();
+        let git = source.candidate.preview.git.repository().path().to_owned();
+        assert_eq!(snapshots.len(), 4);
+        assert!(snapshots.iter().all(|p| p.is_dir()));
+        assert!(git.is_dir());
+        let reads = std::fs::read(&f.log).unwrap();
+        assert!(reads.starts_with(&requests));
+        let added = std::str::from_utf8(&reads[requests.len()..]).unwrap();
+        assert!(added.contains("git-upload-pack"));
+        assert!(!added.contains("git-receive-pack"));
+        assert_eq!(storage(&f.db), before);
+        assert_eq!(storage(engine.db()), before);
+        assert_eq!(files(f.target.path()), target);
+        assert_eq!(files(&f._parent_wc), parent_wc);
+        assert_eq!(files(&ready.child_wc), child_wc);
+        assert_eq!(files(&ready.parent_bridge), parent_bridge);
+        assert_eq!(files(&ready.child_bridge), child_bridge);
+        drop(result);
+        assert!(snapshots.iter().all(|p| !p.exists()));
+        assert!(!git.exists());
+        assert_eq!(repeated.manifest().applicability_manifest_digest, intent.manifest_digest);
+        assert_eq!(current.manifest().manifest_digest, intent.manifest_digest);
+    }
+}

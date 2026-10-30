@@ -1368,3 +1368,141 @@ where
     }
     Ok(LiveChangedChildApplicabilityReview { source, manifest })
 }
+
+/// An unauthenticated choice candidate bound to a fresh applicability manifest.
+/// These serializable bytes are neither the live source nor an approved job.
+#[derive(serde::Serialize)]
+pub struct ChangedChildResolutionCandidateManifest {
+    pub schema: u8,
+    pub policy: String,
+    pub applicability_manifest_digest: String,
+    pub source_correspondence_digest: String,
+    pub graph: super::preparation::ChangedChildResolvedGraphCandidate,
+    pub unverified: Vec<String>,
+    pub execution_eligible: bool,
+    pub candidate_digest: String,
+}
+
+/// Keeps the actual source observations alive. No public construction, Clone
+/// or Deserialize; mutable caller JSON cannot replace this owned capture.
+pub struct LiveChangedChildResolutionCandidateReview {
+    applicability: LiveChangedChildApplicabilityReview,
+    manifest: ChangedChildResolutionCandidateManifest,
+}
+
+impl LiveChangedChildResolutionCandidateReview {
+    pub fn applicability_review(&self) -> &LiveChangedChildApplicabilityReview {
+        &self.applicability
+    }
+
+    pub fn manifest(&self) -> &ChangedChildResolutionCandidateManifest {
+        &self.manifest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+}
+
+/// Accept choices as untrusted intent. Only a fresh opaque capture and exact
+/// manifest/triple comparisons bind a result; no actor approval is accepted.
+/// This does not publish a Git/SVN result, write a job or change default callers.
+pub async fn capture_registered_changed_child_resolution_candidate_review(
+    db: &Database,
+    child_id: &str,
+    request: &super::preparation::ChangedChildResolutionCandidateRequest,
+) -> Result<LiveChangedChildResolutionCandidateReview> {
+    capture_changed_child_resolution_candidate_with_sources(
+        db,
+        child_id,
+        request,
+        None,
+        |_| Ok(()),
+    )
+    .await
+}
+
+// Private fixture CA and post-resolution fault seam. Neither supplies a source
+// observation, manifest, selected baseline or execution/actor capability.
+async fn capture_changed_child_resolution_candidate_with_sources<F>(
+    db: &Database,
+    child_id: &str,
+    request: &super::preparation::ChangedChildResolutionCandidateRequest,
+    client: Option<reqwest::Client>,
+    after_resolution: F,
+) -> Result<LiveChangedChildResolutionCandidateReview>
+where
+    F: FnOnce(&Database) -> Result<()>,
+{
+    // Malformed headers refuse before any new registered-source read. The DTO
+    // and its nested choices/entries deny unknown fields and unknown choices.
+    super::preparation::require_changed_child_resolution_request_header(request)?;
+    let applicability = capture_changed_child_applicability_with_sources(
+        db,
+        child_id,
+        client.clone(),
+        |_| Ok(()),
+    )
+    .await?;
+    applicability.require_manifest_digest(&request.manifest_digest)?;
+    let graph = {
+        let captured = applicability.manifest();
+        super::preparation::resolve_changed_child_applicable_graph(
+            applicability.source.candidate.preview.git.repository(),
+            &captured.graph.historical_merge,
+            &captured.graph.roles,
+            &captured.graph.context,
+            &captured.graph.inspection_digest,
+            &request.choices,
+        )?
+    };
+    let mut unverified = applicability.manifest().unverified.clone();
+    unverified.push("resolution_choices_not_actor_authorized".into());
+    unverified.push("candidate_has_no_durable_execution_or_svn_result".into());
+    let mut manifest = ChangedChildResolutionCandidateManifest {
+        schema: 1,
+        policy: super::preparation::CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY.into(),
+        applicability_manifest_digest: applicability.manifest().manifest_digest.clone(),
+        source_correspondence_digest: applicability.manifest().source_correspondence_digest.clone(),
+        graph,
+        unverified,
+        execution_eligible: false,
+        candidate_digest: String::new(),
+    };
+    manifest.candidate_digest = changed_child_applicability_digest(
+        "changed_child_live_resolution_candidate_v1",
+        &manifest,
+    )?;
+    after_resolution(db)?;
+
+    // Selection/hash computation does not extend the observation interval or
+    // lock a remote. Repeat actual endpoints and final DB closure once more.
+    let current = db.capture_pair_refresh_execution_configuration(child_id)?;
+    if current.pin() != applicability.source.candidate.preview.current_configuration() {
+        bail!("changed-child resolution candidate configuration changed");
+    }
+    let (current, repeated_git) = changed_child_git_observation(current, client).await?;
+    let repeated_svn = observe_registered_svn_sources(&current).await?;
+    if repeated_git.pins() != applicability.source.candidate.preview.git_sources()
+        || repeated_svn.pins() != applicability.source.candidate.preview.svn_sources()
+    {
+        bail!("changed-child resolution candidate source visibility or tips changed");
+    }
+    let final_configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let final_candidate =
+        db.capture_changed_child_baseline_candidate_review(&final_configuration)?;
+    let final_mapping =
+        db.capture_changed_child_mapping_review(&final_configuration, &final_candidate)?;
+    if final_configuration.pin()
+        != applicability.source.candidate.preview.current_configuration()
+        || final_candidate.candidate_set_digest()
+            != applicability.source.candidate.candidate.candidate_set_digest()
+        || final_mapping.snapshot_digest() != applicability.source.mappings.snapshot_digest()
+    {
+        bail!("changed-child resolution candidate stored provenance changed");
+    }
+    Ok(LiveChangedChildResolutionCandidateReview {
+        applicability,
+        manifest,
+    })
+}
