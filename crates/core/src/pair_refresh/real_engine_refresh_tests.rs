@@ -455,13 +455,16 @@ async fn qualified_real_engine_worker() -> Result<()> {
         assert_eq!(previous_coordinate.1, prior_parent);
         // Private actor-policy capture proves this actual engine is unfiltered;
         // derive the expected projection here, never from the proof being tested.
-        let policy = f.parent_engine.capture_pair_refresh_actor_policy("real-engine-session")?;
+        let policy = f
+            .parent_engine
+            .capture_pair_refresh_actor_policy("real-engine-session")?;
         policy.require_current(&f.parent_engine)?;
         drop(policy);
         let projection = serde_json::json!({
             "allowed_paths": Vec::<String>::new(),
             "blocked_patterns": Vec::<String>::new(),
-        }).to_string();
+        })
+        .to_string();
         let name = format!("parent-{iteration}.txt");
         std::fs::write(f.parent_wc.join(&name), format!("advance {iteration}\n"))?;
         svn(&["add", &name], Some(&f.parent_wc));
@@ -485,8 +488,11 @@ async fn qualified_real_engine_worker() -> Result<()> {
         }
         let scope = crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "parent")?;
         let generation = crate::echo_receipt_scope::repo_echo_generation(&f.db, "parent")?;
-        let proof_key = format!("handled_git_emitted_frontier_v1:{scope}:g{generation}:{parent_tip}");
-        let proof_raw = f.db.get_state(&proof_key)?.context("actual parent convergence proof missing")?;
+        let proof_key =
+            format!("handled_git_emitted_frontier_v1:{scope}:g{generation}:{parent_tip}");
+        let proof_raw =
+            f.db.get_state(&proof_key)?
+                .context("actual parent convergence proof missing")?;
         let proof: serde_json::Value = serde_json::from_str(&proof_raw)?;
         assert_eq!(proof["payload"]["repo_id"], "parent");
         assert_eq!(proof["payload"]["scope_uuid"], scope);
@@ -499,7 +505,10 @@ async fn qualified_real_engine_worker() -> Result<()> {
         assert_eq!(proof["payload"]["new_svn_revision"], parent_revision);
         assert_eq!(
             proof["payload"]["new_git_tree"],
-            f.target.find_commit(git2::Oid::from_str(&parent_tip)?)?.tree_id().to_string()
+            f.target
+                .find_commit(git2::Oid::from_str(&parent_tip)?)?
+                .tree_id()
+                .to_string()
         );
         checkpoint(&f, "parent", parent_revision, &parent_tip)?;
         let legacy_key = crate::db::repo_scope_identity::legacy_last_git_sha_kv_key("parent");
@@ -539,7 +548,9 @@ async fn qualified_real_engine_worker() -> Result<()> {
                 "SELECT json_group_array(json_array(key,value,updated_at)) FROM (SELECT key,value,updated_at FROM kv_state WHERE key GLOB 'handled_git_no_target_*' OR key GLOB 'handled_svn_no_target_*' OR key GLOB 'reposync_v13_quarantined:*' ORDER BY key)",
                 [], |row| row.get(0),
             )?;
-            Ok(serde_json::json!({"repositories": repositories, "flag": flag, "legacy_receipts": legacy_receipts}))
+            Ok(
+                serde_json::json!({"repositories": repositories, "flag": flag, "legacy_receipts": legacy_receipts}),
+            )
         };
         if iteration == 1 {
             // Isolated read-only-observer controls, not new production authority.
@@ -553,7 +564,11 @@ async fn qualified_real_engine_worker() -> Result<()> {
             let orphan_key = format!("handled_git_no_target_retired_1_{}", "a".repeat(40));
             isolated.execute(
                 "INSERT INTO kv_state VALUES(?1,?2,?3)",
-                rusqlite::params![orphan_key, "{\"repo_id\":\"retired\",\"version\":1}", "2026-10-30T00:00:00Z"],
+                rusqlite::params![
+                    orphan_key,
+                    "{\"repo_id\":\"retired\",\"version\":1}",
+                    "2026-10-30T00:00:00Z"
+                ],
             )?;
             for value in [Some("0"), Some("1"), None, Some("unknown")] {
                 isolated.execute("DELETE FROM kv_state WHERE key=?1", [authority_key])?;
@@ -568,25 +583,43 @@ async fn qualified_real_engine_worker() -> Result<()> {
                 if value == Some("0") {
                     assert!(observed.is_ok(), "valid revoked state must be observable");
                 } else {
-                    let error = observed.err().context("inconsistent authority was accepted")?;
-                    assert!(error.to_string().contains("explicitly revoked legacy authority"));
+                    let error = observed
+                        .err()
+                        .context("inconsistent authority was accepted")?;
+                    assert!(error
+                        .to_string()
+                        .contains("explicitly revoked legacy authority"));
                 }
                 // Exact flag value/timestamp/absence, orphan and every other KV
                 // row must survive either success or refusal without quarantine.
                 assert_eq!(kv_state(&isolated)?, before);
-                assert_eq!(isolated.query_row(
-                    "SELECT count(*) FROM kv_state WHERE key=?1", [&orphan_key], |row| row.get::<_, i64>(0),
-                )?, 1);
-                assert_eq!(isolated.query_row(
-                    "SELECT count(*) FROM kv_state WHERE key GLOB 'reposync_v13_quarantined:*'", [], |row| row.get::<_, i64>(0),
-                )?, 0);
+                assert_eq!(
+                    isolated.query_row(
+                        "SELECT count(*) FROM kv_state WHERE key=?1",
+                        [&orphan_key],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    1
+                );
+                assert_eq!(
+                    isolated.query_row(
+                        "SELECT count(*) FROM kv_state WHERE key GLOB 'reposync_v13_quarantined:*'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0
+                );
             }
         }
         let authority_before = {
             let conn = f.db.conn();
             let before = kv_state(&conn)?;
             let observed = observe_authority(&conn)?;
-            assert_eq!(kv_state(&conn)?, before, "observation must not repair producer state");
+            assert_eq!(
+                kv_state(&conn)?,
+                before,
+                "observation must not repair producer state"
+            );
             observed
         };
         // Observe the physical bare target and journal/mapping identities.
@@ -596,7 +629,10 @@ async fn qualified_real_engine_worker() -> Result<()> {
             let mut walk = f.target.revwalk()?;
             for reference in f.target.references()? {
                 let reference = reference?;
-                let name = reference.name().context("non-UTF8 target reference")?.to_owned();
+                let name = reference
+                    .name()
+                    .context("non-UTF8 target reference")?
+                    .to_owned();
                 walk.push(reference.peel_to_commit()?.id())?;
                 references.push((
                     name,
@@ -639,15 +675,25 @@ async fn qualified_real_engine_worker() -> Result<()> {
         checkpoint(&f, "parent", parent_revision, &parent_tip)?;
         assert_eq!(target_state()?, target_before);
         assert_eq!(publication_state()?, publication_before);
-        assert_eq!(SvnClient::new(&f.svn_root, "", "").info().await?.latest_rev, svn_before);
+        assert_eq!(
+            SvnClient::new(&f.svn_root, "", "").info().await?.latest_rev,
+            svn_before
+        );
         assert_eq!(publications(&f)?, http_before);
-        assert_eq!(f.db.get_state(&proof_key)?.as_deref(), Some(proof_raw.as_str()));
+        assert_eq!(
+            f.db.get_state(&proof_key)?.as_deref(),
+            Some(proof_raw.as_str())
+        );
         assert_eq!(f.db.get_state(&legacy_key)?, legacy_before);
         let authority_after = {
             let conn = f.db.conn();
             let before = kv_state(&conn)?;
             let observed = observe_authority(&conn)?;
-            assert_eq!(kv_state(&conn)?, before, "observation must remain read-only");
+            assert_eq!(
+                kv_state(&conn)?,
+                before,
+                "observation must remain read-only"
+            );
             observed
         };
         assert_eq!(authority_after, authority_before);

@@ -6184,7 +6184,14 @@ mod changed_child_source_correspondence {
             .collect::<Vec<_>>();
         assert_eq!(
             fields,
-            ["acquired_at", "epoch", "holder_host", "holder_pid", "renewed_at", "version"]
+            [
+                "acquired_at",
+                "epoch",
+                "holder_host",
+                "holder_pid",
+                "renewed_at",
+                "version"
+            ]
         );
         let acquired =
             chrono::DateTime::parse_from_rfc3339(old["acquired_at"].as_str().unwrap()).unwrap();
@@ -6199,7 +6206,10 @@ mod changed_child_source_correspondence {
         );
         let mut expected_lease = old;
         expected_lease["renewed_at"] = new["renewed_at"].clone();
-        assert_eq!(new, expected_lease, "all acquisition fields must remain exact");
+        assert_eq!(
+            new, expected_lease,
+            "all acquisition fields must remain exact"
+        );
         let mut expected = before.clone();
         let row = expected
             .get_mut("kv_state")
@@ -6489,7 +6499,9 @@ mod changed_child_source_correspondence {
             )
             .unwrap();
         set_checkpoint(&f, "parent", visible_parent, parent_revision);
-        let current = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let current =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let (_, observed) =
             super::super::changed_child_git_observation(current, Some(f.client.clone()))
                 .await
@@ -6663,10 +6675,18 @@ mod changed_child_source_correspondence {
             );
             let root_revision = svn_revision(&local_source_url(&f, "branches/f"));
             svn(
-                &["update", "--revision", &root_revision.to_string(), "--ignore-externals"],
+                &[
+                    "update",
+                    "--revision",
+                    &root_revision.to_string(),
+                    "--ignore-externals",
+                ],
                 Some(&ready.child_wc),
             );
-            assert_eq!(svn_revision(ready.child_wc.to_str().unwrap()), root_revision);
+            assert_eq!(
+                svn_revision(ready.child_wc.to_str().unwrap()),
+                root_revision
+            );
             eprintln!("M2d property fault={property_fault} root_revision={root_revision}");
             match property_fault {
                 "empty-directory" => svn(&["mkdir", "empty"], Some(&ready.child_wc)),
@@ -7176,7 +7196,22 @@ mod changed_child_source_correspondence {
                         [format!("{id}-duplicate")],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     ).unwrap();
-                    assert_eq!(duplicate, ("child".into(), current.clone(), f.db.conn().query_row("SELECT svn_rev FROM sync_records WHERE id=?1", [&id], |row| row.get::<_, i64>(0)).unwrap(), "svn_to_git".into(), "applied".into()));
+                    assert_eq!(
+                        duplicate,
+                        (
+                            "child".into(),
+                            current.clone(),
+                            f.db.conn()
+                                .query_row(
+                                    "SELECT svn_rev FROM sync_records WHERE id=?1",
+                                    [&id],
+                                    |row| row.get::<_, i64>(0)
+                                )
+                                .unwrap(),
+                            "svn_to_git".into(),
+                            "applied".into()
+                        )
+                    );
                     assert_eq!(f.db.conn().query_row(
                         "SELECT count(*) FROM sync_records WHERE repo_id='child' AND git_sha=?1 AND svn_rev=?2 AND direction='svn_to_git' AND status='applied'",
                         rusqlite::params![current, duplicate.2], |row| row.get::<_, i64>(0),
@@ -7474,11 +7509,16 @@ mod changed_child_source_correspondence {
     // Read current coordinates directly: a retained history block must not
     // prevent observing that refusal left checkpoint columns/copies unchanged.
     fn convergence_checkpoint_state(f: &Fixture) -> ConvergenceCheckpointState {
-        let columns = f.db.conn().query_row(
-            "SELECT last_git_sha,last_svn_rev FROM repositories WHERE id='child'",
-            [], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "child").unwrap();
+        let columns =
+            f.db.conn()
+                .query_row(
+                    "SELECT last_git_sha,last_svn_rev FROM repositories WHERE id='child'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "child").unwrap();
         let keys = [
             crate::db::repo_scope_identity::last_git_sha_kv_key(&scope),
             crate::db::repo_scope_identity::legacy_last_git_sha_kv_key("child"),
@@ -7486,10 +7526,13 @@ mod changed_child_source_correspondence {
         ];
         ConvergenceCheckpointState {
             columns,
-            copies: keys.into_iter().map(|key| {
-                let value = saved_kv(f, &key);
-                (key, value)
-            }).collect(),
+            copies: keys
+                .into_iter()
+                .map(|key| {
+                    let value = saved_kv(f, &key);
+                    (key, value)
+                })
+                .collect(),
         }
     }
 
@@ -7676,31 +7719,58 @@ mod changed_child_source_correspondence {
             Ok(_) => panic!("retained history block must still refuse refresh capture"),
             Err(error) => error.to_string(),
         };
-        assert!(refusal.contains("history inspection must be quiet"), "{refusal}");
+        assert!(
+            refusal.contains("history inspection must be quiet"),
+            "{refusal}"
+        );
         assert_eq!(files(f.target.path()), source);
         assert_eq!(f.db.get_state(&key).unwrap(), None);
         // Controlled counterexamples: keeping the old row, absent proof and
         // retained history error must not hide a changed current coordinate.
         let refused_state = storage(&f.db);
         let pinned_row = sync_row(&f, &row.0);
-        let history_key = crate::history_inspect::history_block_key_for_repo(&f.db, "child").unwrap();
+        let history_key =
+            crate::history_inspect::history_block_key_for_repo(&f.db, "child").unwrap();
         let history = saved_kv(&f, &history_key);
         assert!(history.is_some());
-        let scope = crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "child").unwrap();
+        let scope =
+            crate::db::repo_scope_identity::repository_scope_uuid(&f.db.conn(), "child").unwrap();
         let canonical = crate::db::repo_scope_identity::last_git_sha_kv_key(&scope);
         let legacy = crate::db::repo_scope_identity::legacy_last_git_sha_kv_key("child");
         let other = f.baseline.to_string();
         assert_ne!(other, checkpoint_before.columns.0);
-        for fault in ["repository-git", "repository-svn", "canonical-git", "legacy-git", "svn-copy", "coherent-git"] {
+        for fault in [
+            "repository-git",
+            "repository-svn",
+            "canonical-git",
+            "legacy-git",
+            "svn-copy",
+            "coherent-git",
+        ] {
             match fault {
                 "repository-git" => {
-                    f.db.conn().execute("UPDATE repositories SET last_git_sha=?1 WHERE id='child'", [&other]).unwrap();
+                    f.db.conn()
+                        .execute(
+                            "UPDATE repositories SET last_git_sha=?1 WHERE id='child'",
+                            [&other],
+                        )
+                        .unwrap();
                 }
                 "repository-svn" => {
-                    f.db.conn().execute("UPDATE repositories SET last_svn_rev=last_svn_rev+1 WHERE id='child'", []).unwrap();
+                    f.db.conn()
+                        .execute(
+                            "UPDATE repositories SET last_svn_rev=last_svn_rev+1 WHERE id='child'",
+                            [],
+                        )
+                        .unwrap();
                 }
                 "coherent-git" => {
-                    f.db.conn().execute("UPDATE repositories SET last_git_sha=?1 WHERE id='child'", [&other]).unwrap();
+                    f.db.conn()
+                        .execute(
+                            "UPDATE repositories SET last_git_sha=?1 WHERE id='child'",
+                            [&other],
+                        )
+                        .unwrap();
                     f.db.set_state(&canonical, &other).unwrap();
                     if checkpoint_before.copies[&legacy].is_some() {
                         f.db.set_state(&legacy, &other).unwrap();
@@ -7708,28 +7778,50 @@ mod changed_child_source_correspondence {
                 }
                 "canonical-git" => f.db.set_state(&canonical, &other).unwrap(),
                 "legacy-git" => f.db.set_state(&legacy, &other).unwrap(),
-                "svn-copy" => f.db.set_state("last_svn_rev_child", &(checkpoint_before.columns.1 + 1).to_string()).unwrap(),
+                "svn-copy" => {
+                    f.db.set_state(
+                        "last_svn_rev_child",
+                        &(checkpoint_before.columns.1 + 1).to_string(),
+                    )
+                    .unwrap()
+                }
                 _ => unreachable!(),
             }
-            assert_ne!(convergence_checkpoint_state(&f), checkpoint_before, "{fault} must be detected");
+            assert_ne!(
+                convergence_checkpoint_state(&f),
+                checkpoint_before,
+                "{fault} must be detected"
+            );
             assert_eq!(sync_row(&f, &row.0), pinned_row, "{fault}");
             assert_eq!(saved_kv(&f, &history_key), history, "{fault}");
             assert_eq!(f.db.get_state(&key).unwrap(), None, "{fault}");
             if fault == "coherent-git" {
-                let still_refused = match f.db.capture_pair_refresh_execution_configuration("child") {
-                    Ok(_) => panic!("coherent changed coordinates cannot erase the history refusal"),
+                let still_refused = match f.db.capture_pair_refresh_execution_configuration("child")
+                {
+                    Ok(_) => {
+                        panic!("coherent changed coordinates cannot erase the history refusal")
+                    }
                     Err(error) => error.to_string(),
                 };
-                assert!(still_refused.contains("history inspection must be quiet"), "{still_refused}");
+                assert!(
+                    still_refused.contains("history inspection must be quiet"),
+                    "{still_refused}"
+                );
             }
-            f.db.conn().execute(
-                "UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id='child'",
-                rusqlite::params![checkpoint_before.columns.0, checkpoint_before.columns.1],
-            ).unwrap();
+            f.db.conn()
+                .execute(
+                    "UPDATE repositories SET last_git_sha=?1,last_svn_rev=?2 WHERE id='child'",
+                    rusqlite::params![checkpoint_before.columns.0, checkpoint_before.columns.1],
+                )
+                .unwrap();
             for (name, value) in &checkpoint_before.copies {
                 restore_kv(&f, name, value.clone());
             }
-            assert_eq!(convergence_checkpoint_state(&f), checkpoint_before, "{fault}");
+            assert_eq!(
+                convergence_checkpoint_state(&f),
+                checkpoint_before,
+                "{fault}"
+            );
             assert_eq!(storage(&f.db), refused_state, "{fault}");
         }
     }
