@@ -5954,19 +5954,17 @@ mod changed_child_source_correspondence {
             Some(parent.last_git_sha.as_str())
         );
         assert_eq!(f.db.get_state("last_git_sha_parent").unwrap(), None);
-        let rows: i64 = f
-            .db
-            .conn()
-            .query_row(
-                "SELECT count(*) FROM sync_records WHERE repo_id='parent'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let rows: i64 =
+            f.db.conn()
+                .query_row(
+                    "SELECT count(*) FROM sync_records WHERE repo_id='parent'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
         assert_eq!(rows, 0, "bootstrap must precede all ordinary parent work");
         let no_target =
-            identity::repository_has_stored_no_target_receipt_kv(&f.db.conn(), "parent")
-                .unwrap();
+            identity::repository_has_stored_no_target_receipt_kv(&f.db.conn(), "parent").unwrap();
         assert!(!no_target);
         assert_eq!(f.db.get_state("handled_git_baseline_parent").unwrap(), None);
         f.db.delete_kv_state(&key).unwrap();
@@ -6002,7 +6000,10 @@ mod changed_child_source_correspondence {
         // mapped handled baseline. Keep the emitted tip distinct from inbound KV.
         let (parent_revision, parent_sha) = f.db.get_repo_watermark("parent").unwrap();
         let baseline: serde_json::Value = serde_json::from_str(
-            &f.db.get_state("handled_git_baseline_parent").unwrap().unwrap(),
+            &f.db
+                .get_state("handled_git_baseline_parent")
+                .unwrap()
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(baseline["version"], 1);
