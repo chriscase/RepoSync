@@ -856,3 +856,266 @@ where
         context_digest,
     })
 }
+
+/// Safe metadata from a fully inspected role, not a publication capability.
+#[derive(serde::Serialize)]
+pub struct ChangedChildSourceRoleProof {
+    role: String,
+    git_commit: String,
+    git_tree: String,
+    handled_revision: i64,
+    presence: super::svn_visibility::SvnPresencePin,
+    properties: super::svn_preparation::SvnPropertySnapshot,
+    expected_mergeinfo: Option<String>,
+}
+
+/// Read-only source correspondence. Real private checkouts and their clients
+/// stay owned with the result. No public constructor, Clone or Deserialize.
+pub struct LiveChangedChildSourceCorrespondence {
+    candidate: LiveChangedChildBaselineCandidateContext,
+    mappings: crate::db::pair_refresh_operations::ChangedChildMappingReview,
+    snapshots: Vec<super::svn_visibility::VisibleSvnCheckout>,
+    roles: Vec<ChangedChildSourceRoleProof>,
+    context_digest: String,
+}
+
+impl LiveChangedChildSourceCorrespondence {
+    pub fn candidate_context(&self) -> &LiveChangedChildBaselineCandidateContext {
+        &self.candidate
+    }
+
+    pub fn mapping_review(&self) -> &crate::db::pair_refresh_operations::ChangedChildMappingReview {
+        &self.mappings
+    }
+
+    pub fn role_proofs(&self) -> &[ChangedChildSourceRoleProof] {
+        &self.roles
+    }
+
+    pub fn context_digest(&self) -> &str {
+        &self.context_digest
+    }
+
+    pub fn retained_snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+
+    pub fn verified_gates(&self) -> &'static [&'static str] {
+        &[
+            "single_authenticated_receipt_candidate",
+            "current_scoped_applied_mapping_capture",
+            "four_role_complete_visible_svn_correspondence",
+            "supported_direct_and_empty_ancestor_properties",
+            "handled_current_source_checkpoints",
+            "final_mapping_candidate_configuration_and_source_recapture",
+        ]
+    }
+
+    pub fn unverified_gates(&self) -> &'static [&'static str] {
+        &[
+            "semantic_baseline_applicability_beyond_singleton_subset",
+            "complete_arbitrary_pending_work_enumeration",
+            "authenticated_changed_child_resolution",
+            "current_actor_session_authorization",
+            "exclusive_changed_child_execution_admission",
+            "atomic_remote_freshness_after_return",
+        ]
+    }
+}
+
+struct ChangedChildCorrespondenceRole<'a> {
+    name: &'static str,
+    git_commit: &'a str,
+    git_tree: &'a str,
+    revision: i64,
+    handled_revision: i64,
+    expected_mergeinfo: Option<&'a str>,
+    client: &'a crate::svn::SvnClient,
+}
+
+async fn observe_changed_child_correspondence_role(
+    git_path: &std::path::Path,
+    expected: &super::svn_sources::ObservedSvnSourcePins,
+    role: ChangedChildCorrespondenceRole<'_>,
+) -> Result<(
+    super::svn_visibility::VisibleSvnCheckout,
+    ChangedChildSourceRoleProof,
+)> {
+    let snapshot = super::svn_visibility::observe_subtree(role.client, role.revision).await?;
+    snapshot.require_unchanged_since(role.handled_revision)?;
+    let info = snapshot.info();
+    if info.uuid != expected.repository_uuid
+        || info.root_url != expected.repository_root_url
+        || info.url != role.client.url()
+        || info.latest_rev != role.revision
+    {
+        bail!("changed-child complete SVN role identity differs");
+    }
+    let remote_xml = role.client.tree_properties_at_rev(role.revision).await?;
+    let properties = super::svn_preparation::bound_checkout_property_xml(
+        &remote_xml,
+        role.client.url(),
+        snapshot.path(),
+        info,
+    )?;
+    let local =
+        super::svn_preparation::visible_checkout_properties(role.client, snapshot.path(), info)
+            .await?;
+    let meaningful = |mut values: super::svn_preparation::SvnPropertySnapshot| {
+        values.retain(|path, properties| path.is_empty() || !properties.is_empty());
+        values
+    };
+    if meaningful(local) != meaningful(properties.clone()) {
+        bail!("changed-child local and remote property proofs differ");
+    }
+    super::svn_preparation::verify_refresh_svn_tree(
+        git_path,
+        role.git_tree,
+        snapshot.path(),
+        &properties,
+        role.expected_mergeinfo,
+        &expected.parent_path,
+    )?;
+    let mut presence = super::svn_visibility::presence_pin(role.name, snapshot.path(), info)?;
+    presence.ancestors =
+        super::svn_visibility::require_empty_visible_ancestors(role.client, info).await?;
+    let proof = ChangedChildSourceRoleProof {
+        role: role.name.to_owned(),
+        git_commit: role.git_commit.to_owned(),
+        git_tree: role.git_tree.to_owned(),
+        handled_revision: role.handled_revision,
+        presence,
+        properties,
+        expected_mergeinfo: role.expected_mergeinfo.map(str::to_owned),
+    };
+    Ok((snapshot, proof))
+}
+
+/// No caller-supplied history, mapping, tree, property or expected digest.
+/// This adds correspondence to a review context; no default caller is wired.
+pub async fn capture_registered_changed_child_source_correspondence(
+    db: &Database,
+    child_id: &str,
+) -> Result<LiveChangedChildSourceCorrespondence> {
+    capture_changed_child_correspondence_with_sources(db, child_id, None, |_| Ok(())).await
+}
+
+// Private fixture CA and post-proof fault seam, never an injected observation
+// or a bypass of DB, WC31, property, ancestry or registered-source validation.
+async fn capture_changed_child_correspondence_with_sources<F>(
+    db: &Database,
+    child_id: &str,
+    client: Option<reqwest::Client>,
+    after_proofs: F,
+) -> Result<LiveChangedChildSourceCorrespondence>
+where
+    F: FnOnce(&Database) -> Result<()>,
+{
+    let candidate =
+        capture_changed_child_baseline_candidate_with_sources(db, child_id, client.clone(), |_| {
+            Ok(())
+        })
+        .await?;
+    let mappings = db.capture_changed_child_mapping_review(
+        &candidate.preview.configuration,
+        &candidate.candidate,
+    )?;
+    let current_pin = candidate.preview.current_configuration().clone();
+    let historical = candidate.preview.history.historical_operation().clone();
+    let receipt = historical
+        .svn_receipt
+        .as_ref()
+        .context("authenticated correspondence receipt is missing")?;
+    let svn = candidate.preview.svn.pins().clone();
+    let git_path = candidate.preview.git.repository().path().to_owned();
+    let head = svn.inspected_head_revision;
+    let parent = candidate.preview.svn.parent_client();
+    let child = candidate.preview.svn.child_client();
+    let mut snapshots = Vec::new();
+    let mut roles = Vec::new();
+    for role in [
+        ChangedChildCorrespondenceRole {
+            name: "P1",
+            git_commit: &candidate.preview.roles.parent_anchor,
+            git_tree: &candidate.preview.roles.parent_anchor_tree,
+            revision: historical.pins.parent.last_svn_rev,
+            handled_revision: historical.pins.parent.last_svn_rev,
+            expected_mergeinfo: None,
+            client: parent,
+        },
+        ChangedChildCorrespondenceRole {
+            name: "R",
+            git_commit: &candidate.preview.roles.integrated_child,
+            git_tree: &candidate.preview.roles.integrated_child_tree,
+            revision: receipt.revision,
+            handled_revision: receipt.revision,
+            expected_mergeinfo: Some(&receipt.mergeinfo),
+            client: child,
+        },
+        ChangedChildCorrespondenceRole {
+            name: "C",
+            git_commit: &candidate.preview.roles.current_child,
+            git_tree: &candidate.preview.roles.current_child_tree,
+            revision: head,
+            handled_revision: current_pin.child.last_svn_rev,
+            expected_mergeinfo: Some(&receipt.mergeinfo),
+            client: child,
+        },
+        ChangedChildCorrespondenceRole {
+            name: "P2",
+            git_commit: &candidate.preview.roles.current_parent,
+            git_tree: &candidate.preview.roles.current_parent_tree,
+            revision: head,
+            handled_revision: current_pin.parent.last_svn_rev,
+            expected_mergeinfo: None,
+            client: parent,
+        },
+    ] {
+        let (snapshot, proof) =
+            observe_changed_child_correspondence_role(&git_path, &svn, role).await?;
+        snapshots.push(snapshot);
+        roles.push(proof);
+    }
+    after_proofs(db)?;
+    let current = db.capture_pair_refresh_execution_configuration(child_id)?;
+    if current.pin() != &current_pin {
+        bail!("changed-child correspondence configuration changed");
+    }
+    let (current, repeated_git) = changed_child_git_observation(current, client).await?;
+    let repeated_svn = observe_registered_svn_sources(&current).await?;
+    if repeated_git.pins() != candidate.preview.git.pins()
+        || repeated_svn.pins() != candidate.preview.svn.pins()
+    {
+        bail!("changed-child correspondence registered sources changed");
+    }
+    let final_configuration = db.capture_pair_refresh_execution_configuration(child_id)?;
+    let final_candidate =
+        db.capture_changed_child_baseline_candidate_review(&final_configuration)?;
+    let final_mappings =
+        db.capture_changed_child_mapping_review(&final_configuration, &final_candidate)?;
+    if final_configuration.pin() != &current_pin
+        || final_candidate.candidate_set_digest() != candidate.candidate.candidate_set_digest()
+        || final_mappings.snapshot_digest() != mappings.snapshot_digest()
+    {
+        bail!("changed-child correspondence stored evidence changed");
+    }
+    use sha2::Digest;
+    let context_digest = hex::encode(sha2::Sha256::digest(serde_json::to_vec(&(
+        "changed_child_source_correspondence_v1",
+        candidate.context_digest(),
+        mappings.snapshot_digest(),
+        &roles,
+        &current_pin,
+    ))?));
+    Ok(LiveChangedChildSourceCorrespondence {
+        candidate,
+        mappings,
+        snapshots,
+        roles,
+        context_digest,
+    })
+}

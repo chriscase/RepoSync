@@ -1894,3 +1894,212 @@ impl Database {
         Ok(result)
     }
 }
+
+// Scoped applied rows are existing storage provenance, not signed receipts.
+// Keep every original column in the snapshot identity; no recency tie-break.
+#[derive(Serialize)]
+struct ChangedChildAppliedRow {
+    id: String,
+    repo_id: Option<String>,
+    svn_revision: Option<i64>,
+    git_sha: Option<String>,
+    direction: String,
+    author: String,
+    message: String,
+    timestamp: String,
+    synced_at: String,
+    status: String,
+}
+
+/// Transaction-local applied correspondence plus current registration and an
+/// authenticated singleton-candidate identity. Private construction does not
+/// make legacy sync_records MAC-authenticated or prove live SVN content.
+pub struct ChangedChildMappingReview {
+    current: crate::pair_refresh::execution_configuration::ExecutionConfigurationPin,
+    candidate_set_digest: String,
+    child_rows: Vec<ChangedChildAppliedRow>,
+    parent_rows: Vec<ChangedChildAppliedRow>,
+    snapshot_digest: String,
+}
+
+impl ChangedChildMappingReview {
+    pub fn current_configuration(
+        &self,
+    ) -> &crate::pair_refresh::execution_configuration::ExecutionConfigurationPin {
+        &self.current
+    }
+
+    pub fn candidate_set_digest(&self) -> &str {
+        &self.candidate_set_digest
+    }
+
+    pub fn mapping_row_counts(&self) -> [usize; 2] {
+        [self.child_rows.len(), self.parent_rows.len()]
+    }
+
+    pub fn snapshot_digest(&self) -> &str {
+        &self.snapshot_digest
+    }
+
+    pub fn execution_eligible(&self) -> bool {
+        false
+    }
+}
+
+fn changed_child_applied_rows(
+    tx: &Connection,
+    registration: &RefreshRegistrationPin,
+) -> Result<Vec<ChangedChildAppliedRow>, DatabaseError> {
+    // An unscoped row with either coordinate is ambiguous, never adoptable.
+    // Other repositories' rows cannot supply this registration's evidence.
+    let mut query = tx.prepare(
+        "SELECT id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status
+         FROM sync_records WHERE (repo_id=?1 OR repo_id IS NULL OR repo_id='')
+         AND (git_sha=?2 OR svn_rev=?3) ORDER BY id",
+    )?;
+    let rows = query
+        .query_map(
+            params![
+                registration.repo_id,
+                registration.last_git_sha,
+                registration.last_svn_rev
+            ],
+            |row| {
+                Ok(ChangedChildAppliedRow {
+                    id: row.get(0)?,
+                    repo_id: row.get(1)?,
+                    svn_revision: row.get(2)?,
+                    git_sha: row.get(3)?,
+                    direction: row.get(4)?,
+                    author: row.get(5)?,
+                    message: row.get(6)?,
+                    timestamp: row.get(7)?,
+                    synced_at: row.get(8)?,
+                    status: row.get(9)?,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Err(refused("current scoped applied correspondence is missing"));
+    }
+    for row in &rows {
+        if row.id.is_empty()
+            || row.repo_id.as_deref() != Some(registration.repo_id.as_str())
+            || row.git_sha.as_deref() != Some(registration.last_git_sha.as_str())
+            || row.svn_revision != Some(registration.last_svn_rev)
+            || !matches!(row.direction.as_str(), "svn_to_git" | "git_to_svn")
+            || row.status != "applied"
+            || chrono::DateTime::parse_from_rfc3339(&row.timestamp).is_err()
+            || chrono::DateTime::parse_from_rfc3339(&row.synced_at).is_err()
+        {
+            return Err(refused(
+                "current applied correspondence is foreign or contradictory",
+            ));
+        }
+    }
+    Ok(rows)
+}
+
+impl Database {
+    /// Read current scoped correspondence in one transaction, tied to the
+    /// actual registration and opaque M2c candidate. Never establish a key,
+    /// adopt a checkpoint, infer an import completion or repair a mapping.
+    pub fn capture_changed_child_mapping_review(
+        &self,
+        expected: &crate::pair_refresh::execution_configuration::LiveExecutionConfiguration,
+        candidate: &ChangedChildBaselineCandidateReview,
+    ) -> Result<ChangedChildMappingReview, DatabaseError> {
+        let conn = self.conn();
+        let tx = conn.unchecked_transaction()?;
+        let current =
+            crate::pair_refresh::execution_configuration::capture_execution_configuration(
+                &tx,
+                &expected.pin().child.repo_id,
+            )?;
+        let pin = current.pin();
+        if pin != expected.pin() || pin != candidate.selected.current_configuration() {
+            return Err(refused("current mapping-review registration changed"));
+        }
+        let operations = journal(&tx)?;
+        let same_incarnation = |a: &RefreshRegistrationPin, b: &RefreshRegistrationPin| {
+            a.repo_id == b.repo_id
+                && a.scope_uuid == b.scope_uuid
+                && a.configuration_digest == b.configuration_digest
+                && a.echo_generation == b.echo_generation
+        };
+        let candidates = operations
+            .iter()
+            .filter(|op| {
+                let lineage = &op.pins.svn.pins.lineage.pins;
+                op.version == 3
+                    && op.phase == PairRefreshPhase::Completed
+                    && op.reconciliation_detail.is_none()
+                    && same_incarnation(&op.pins.child, &pin.child)
+                    && same_incarnation(&op.pins.parent, &pin.parent)
+                    && op.pins.git_remote_url == pin.git_remote_url
+                    && op.pins.git_branch == pin.child_git_branch
+                    && op.pins.transport_policy == pin.transport_policy
+                    && lineage.child_url == pin.child_svn_url
+                    && lineage.parent_url == pin.parent_svn_url
+            })
+            .collect::<Vec<_>>();
+        let historical = match candidates.as_slice() {
+            [only] if only.id == candidate.selected.historical.id => *only,
+            _ => return Err(refused("mapping-review candidate closure changed")),
+        };
+        let document = read(
+            &tx,
+            &operation_key(3, "document", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("mapping-review candidate document disappeared"))?;
+        let authority = read(
+            &tx,
+            &operation_key(3, "authority", &historical.id.to_string()),
+        )?
+        .ok_or_else(|| refused("mapping-review candidate authority disappeared"))?;
+        let authority_digest = hex::encode(Sha256::digest(authority.as_bytes()));
+        let candidate_digest = digest(&(
+            "changed_child_baseline_candidate_set_v1",
+            pin,
+            candidates.len(),
+            historical.id,
+            &document,
+            &authority_digest,
+        ))?;
+        if candidate_digest != candidate.candidate_set_digest {
+            return Err(refused("mapping-review candidate identity changed"));
+        }
+        for registration in [&pin.child, &pin.parent] {
+            require_no_pair_refresh_hold(&tx, Some(&registration.repo_id))?;
+            require_other_journals_quiet(&tx, &registration.repo_id)?;
+            super::ordinary_writer_windows::require_quiet_for_refresh(
+                &tx,
+                &registration.repo_id,
+                &registration.scope_uuid,
+            )?;
+        }
+        require_execution_conflicts_quiet(&tx, &historical.pins)?;
+        for id in super::personal_scope::personal_repo_ids_for_journal_read() {
+            require_other_journals_quiet(&tx, id)?;
+        }
+        let child_rows = changed_child_applied_rows(&tx, &pin.child)?;
+        let parent_rows = changed_child_applied_rows(&tx, &pin.parent)?;
+        let snapshot_digest = digest(&(
+            "changed_child_mapping_review_v1",
+            pin,
+            &candidate_digest,
+            &child_rows,
+            &parent_rows,
+        ))?;
+        let result = ChangedChildMappingReview {
+            current: pin.clone(),
+            candidate_set_digest: candidate_digest,
+            child_rows,
+            parent_rows,
+            snapshot_digest,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+}

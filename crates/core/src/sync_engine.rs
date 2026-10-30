@@ -1495,6 +1495,33 @@ impl SyncEngine {
         if !is_full_git_oid(sha) {
             return Ok(false);
         }
+        {
+            let conn = self.db.conn();
+            if crate::db::ordinary_writer_windows::OrdinaryWriterWindow::emitted_frontier_recorded(
+                &conn, rid, sha,
+            )
+            .map_err(SyncError::DatabaseError)?
+            {
+                // Historical proof cannot repair missing or split current
+                // copies through the predicate's KV-only/column-only callers.
+                let emitted: String = conn
+                    .query_row(
+                        "SELECT last_git_sha FROM repositories WHERE id=?1",
+                        [rid],
+                        |row| row.get(0),
+                    )
+                    .map_err(crate::errors::DatabaseError::from)?;
+                let inbound =
+                    crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(&conn, rid)
+                        .map_err(SyncError::DatabaseError)?;
+                if emitted != sha || inbound.as_deref() != Some(sha) {
+                    return Ok(false);
+                }
+                return crate::db::ordinary_writer_windows::OrdinaryWriterWindow::verified_emitted_git_frontier(
+                    &conn,&self.db,rid,sha,&self.no_target_projection(),
+                ).map_err(SyncError::DatabaseError);
+            }
+        }
         let (applied_outbound, applied_inbound, any_applied_outbound) = {
             let conn = self.db.conn();
             let applied_outbound: i64 = conn
@@ -1524,7 +1551,11 @@ impl SyncEngine {
             return Ok(true);
         }
         if applied_inbound > 0 && any_applied_outbound == 0 {
-            return Ok(true);
+            let conn = self.db.conn();
+            if !crate::db::ordinary_writer_windows::OrdinaryWriterWindow::emitted_frontier_needs_retained_history(&conn,rid,sha)
+                .map_err(SyncError::DatabaseError)? {
+                return Ok(true);
+            }
         }
         let projection = self.no_target_projection();
         if stored_git_no_target_receipt_exists(&self.db, rid, sha, &projection)
@@ -2182,12 +2213,55 @@ impl SyncEngine {
         self.refuse_apply_while_persisted_conflicts_block()?;
 
         // 3. Apply SVN -> Git.
+        let convergence = if git_fetch.replay_batch.is_empty()
+            && !git_fetch.has_more
+            && self.allowed_paths.is_empty()
+            && self.blocked_patterns.is_empty()
+            && (svn_changes.is_empty()
+                || (git_fetch.pending_total == 0 && admission.checkpoint == admission.remote_tip))
+        {
+            if let Some(rid) = self.effective_repo_id() {
+                let origin = {
+                    let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
+                    let repo = git2::Repository::open(git.repo_path())
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    let remote = repo
+                        .find_remote("origin")
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    remote
+                        .url()
+                        .ok_or_else(|| {
+                            SyncError::GitError(crate::errors::GitError::RefNotFound(
+                                "origin URL is missing".into(),
+                            ))
+                        })?
+                        .to_owned()
+                };
+                writer_window
+                    .prepare_emitted_git_convergence(
+                        rid,
+                        &self.config.github.default_branch,
+                        &origin,
+                        &admission.checkpoint,
+                        &admission.remote_tip,
+                        &self.no_target_projection(),
+                    )
+                    .map_err(SyncError::DatabaseError)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let _ = self.persist_sync_state("applying");
         self.sync_svn_to_git(&svn_changes, &mut stats.svn_to_git_count, writer_window)
             .await?;
 
-        // The exact remote Git tip had no pending commits before this SVN
-        // publication, so its newly mapped tip is a handled frontier.
+        // Keep the durable mapped baseline distinct from the inbound cursor.
+        // Convergence below additionally requires the captured old state and
+        // a freshly observed complete chain of actual completed publications.
         if git_fetch.replay_batch.is_empty()
             && !git_fetch.has_more
             && admission.checkpoint == admission.remote_tip
@@ -2211,41 +2285,92 @@ impl SyncEngine {
             )
             .await?;
 
-        // Receipt filtering must eventually advance the inbound cursor too.
-        // Only a complete range consisting entirely of our emitted commits is
-        // eligible, in a cycle with no source work or opposite publication.
-        if svn_changes.is_empty()
-            && !git_fetch.has_more
-            && git_fetch.replay_batch.is_empty()
-            && git_fetch.pending_total > 0
-            && self.allowed_paths.is_empty()
-            && self.blocked_patterns.is_empty()
-        {
-            if let Some(rid) = self.effective_repo_id() {
-                let selection = {
+        if let Some(converge) = convergence {
+            // An unused bootstrap capture must not manufacture an empty-range
+            // cursor after metadata-only SVN work. A quiet observation may
+            // settle only a complete, genuinely emitted nonempty Git range.
+            if stats.svn_to_git_count > 0 || svn_changes.is_empty() {
+                let (observed, origin, chain) = tokio::task::block_in_place(|| {
                     let git = self.git_client.lock().unwrap_or_else(|p| p.into_inner());
-                    git.pending_commits_between(
-                        &admission.checkpoint,
-                        &admission.remote_tip,
-                        self.replay_batch_cap(),
+                    let branch = &self.config.github.default_branch;
+                    let token = git.stored_http_auth_token();
+                    let fresh = crate::history_inspect::inspect_fetched_history(
+                        git.repo_path(),
+                        branch,
+                        Some(admission.checkpoint.clone()),
+                        token.as_deref(),
                     )
-                    .map_err(SyncError::GitError)?
-                };
-                if !selection.has_more && selection.total == selection.commits.len() {
-                    let shas = selection
-                        .commits
-                        .iter()
-                        .map(|commit| commit.sha.as_str())
-                        .collect::<Vec<_>>();
-                    writer_window
-                        .settle_emitted_git_echoes(
-                            rid,
-                            &admission.checkpoint,
-                            &admission.remote_tip,
-                            &shas,
+                    .map_err(|error| {
+                        self.record_history_block(
+                            &error.reason,
+                            &error.detail,
+                            Some(&admission.checkpoint),
+                            error.o.as_deref(),
+                            error.r.as_deref(),
+                            error.l.as_deref(),
                         )
-                        .map_err(SyncError::DatabaseError)?;
-                }
+                    })?;
+                    let selection = git
+                        .pending_commits_between(
+                            &admission.checkpoint,
+                            &fresh.remote_tip,
+                            self.replay_batch_cap(),
+                        )
+                        .map_err(SyncError::GitError)?;
+                    if selection.has_more || selection.total != selection.commits.len() {
+                        return Err(SyncError::DatabaseError(
+                            crate::errors::DatabaseError::Other(
+                                "emitted convergence requires complete selection".into(),
+                            ),
+                        ));
+                    }
+                    let repo = git2::Repository::open(git.repo_path())
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    let remote = repo
+                        .find_remote("origin")
+                        .map_err(crate::errors::GitError::from)
+                        .map_err(SyncError::GitError)?;
+                    let origin = remote
+                        .url()
+                        .ok_or_else(|| {
+                            SyncError::GitError(crate::errors::GitError::RefNotFound(
+                                "origin URL is missing".into(),
+                            ))
+                        })?
+                        .to_owned();
+                    let mut previous = admission.checkpoint.clone();
+                    let mut chain = Vec::with_capacity(selection.commits.len());
+                    for selected in selection.commits {
+                        let commit = repo
+                            .find_commit(
+                                git2::Oid::from_str(&selected.sha)
+                                    .map_err(crate::errors::GitError::from)
+                                    .map_err(SyncError::GitError)?,
+                            )
+                            .map_err(crate::errors::GitError::from)
+                            .map_err(SyncError::GitError)?;
+                        if commit.parent_count() != 1
+                            || commit
+                                .parent_id(0)
+                                .map_err(crate::errors::GitError::from)
+                                .map_err(SyncError::GitError)?
+                                .to_string()
+                                != previous
+                        {
+                            return Err(SyncError::DatabaseError(
+                                crate::errors::DatabaseError::Other(
+                                    "emitted convergence requires exact linear producer topology"
+                                        .into(),
+                                ),
+                            ));
+                        }
+                        chain.push((selected.sha.clone(), commit.tree_id().to_string()));
+                        previous = selected.sha;
+                    }
+                    Ok::<_, SyncError>((fresh.remote_tip, origin, chain))
+                })?;
+                converge(&observed, &origin, &chain).map_err(SyncError::DatabaseError)?;
             }
         }
 

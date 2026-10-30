@@ -249,59 +249,811 @@ impl Database {
     }
 }
 
+/// Result of acquiring an optional, unboxed, single-use convergence capability.
+pub(crate) type EmittedGitConvergencePreparation<F> = Result<Option<F>, DatabaseError>;
+
+/// Complete ordered (Git SHA, tree) observations supplied to convergence.
+pub(crate) type EmittedGitCommitChain = [(String, String)];
+/// Database outcome of consuming the existing convergence capability.
+pub(crate) type EmittedGitConvergenceOutcome = Result<(), DatabaseError>;
+
 impl OrdinaryWriterWindow<'_> {
     /// The actual engine has selected this complete P..R graph after normal
     /// history admission. Settle only SVN-emitted commits, with current scoped
     /// receipt/checkpoint and writer ownership checks in the same transaction.
-    pub(crate) fn settle_emitted_git_echoes(
+    pub(crate) fn prepare_emitted_git_convergence(
         &self,
         repo_id: &str,
+        branch: &str,
+        origin: &str,
         checkpoint: &str,
         remote_tip: &str,
-        commits: &[&str],
-    ) -> Result<(), DatabaseError> {
-        if commits.is_empty() || !commits.contains(&remote_tip) {
-            return Ok(());
+        projection: &str,
+    ) -> EmittedGitConvergencePreparation<
+        impl FnOnce(&str, &str, &EmittedGitCommitChain) -> EmittedGitConvergenceOutcome + '_,
+    > {
+        // Private capture lives in the returned single-use closure, not a
+        // caller-constructible DTO. No credential values escape this method.
+        #[derive(PartialEq, Eq)]
+        struct Pin {
+            configuration: Vec<String>,
+            credentials: String,
+            scope: String,
+            generation: i64,
+            copies: Vec<(String, String, String)>,
+            inbound: Option<String>,
+            emitted: String,
+            svn_revision: i64,
         }
-        self.db.immediate_transaction(|tx| {
-            let doc = self.owned(tx)?;
-            if doc.phase != Phase::Preparing || doc.repo_id.as_deref() != Some(repo_id) {
-                return Err(refused("echo settlement requires the current engine window"));
-            }
-            require_no_pair_refresh_hold(tx, Some(repo_id))?;
-            // Preserve the legacy dual-cursor protocol for ordinary roots.
-            // This convergence is needed only for a registered branch pair's
-            // parent to become an eligible refresh source.
-            let refresh_parent: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM repositories WHERE parent_id=?1 AND id<>?1 AND sync_mode='team' AND enabled=1)",
-                [repo_id], |row| row.get(0),
+        fn pin(
+            tx: &Connection,
+            id: &str,
+            branch: &str,
+            checkpoint: &str,
+        ) -> Result<Option<Pin>, DatabaseError> {
+            let related: Option<(Option<String>, String, i64)> = tx.query_row(
+                "SELECT parent_id,last_git_sha,last_svn_rev FROM repositories WHERE id=?1 AND enabled=1 AND sync_mode='team' AND git_branch=?2 AND (allowed_paths IS NULL OR allowed_paths='[]') AND (blocked_patterns IS NULL OR blocked_patterns='[]')",
+                params![id, branch],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?;
+            let Some((parent, emitted, svn_revision)) = related else {
+                return Ok(None);
+            };
+            let pair = match parent {
+                Some(parent) if parent != id => {
+                    let enabled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM repositories WHERE id=?1 AND enabled=1 AND sync_mode='team')",[&parent],|row|row.get(0))?;
+                    if !enabled {return Ok(None);}
+                    Some((id.to_owned(),parent))
+                },
+                Some(_) => return Err(refused("self-parent registration")),
+                None => tx.query_row(
+                    "SELECT id FROM repositories WHERE parent_id=?1 AND id<>?1 AND enabled=1 AND sync_mode='team' ORDER BY id LIMIT 1",
+                    [id], |row| row.get::<_,String>(0),
+                ).optional()?.map(|child| (child, id.to_owned())),
+            };
+            let Some((child, parent)) = pair else {
+                return Ok(None); // Unrelated ordinary roots keep their protocol.
+            };
+            // Unsupported ordinary credential setups do not acquire this new
+            // capability. Their existing engine protocol and strict reader stay.
+            let credentials = match super::pair_refresh_credentials::resolve_refresh_credentials(
+                tx, &child, &parent,
+            ) {
+                Ok(value) => value.context_digest().to_owned(),
+                Err(_) => return Ok(None),
+            };
+            let mut query = tx.prepare(
+                "SELECT json_object('id',id,'scope_uuid',scope_uuid,'parent_id',parent_id,'svn_url',svn_url,'svn_branch',svn_branch,'svn_username',svn_username,'git_provider',git_provider,'git_api_url',git_api_url,'git_repo',git_repo,'git_branch',git_branch,'sync_mode',sync_mode,'poll_interval_secs',poll_interval_secs,'lfs_threshold_mb',lfs_threshold_mb,'auto_merge',auto_merge,'enabled',enabled,'allowed_paths',allowed_paths,'blocked_patterns',blocked_patterns) FROM repositories WHERE id=?1 OR id=?2 OR parent_id=?1 ORDER BY id",
             )?;
-            if !refresh_parent {
-                return Ok(());
-            }
-            let (scope, emitted, revision): (Option<String>, String, i64) = tx.query_row(
-                "SELECT scope_uuid,last_git_sha,last_svn_rev FROM repositories WHERE id=?1",
-                [repo_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-            )?;
-            let handled = crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(tx, repo_id)?;
-            if scope.is_none() || scope != doc.scope_uuid || emitted != remote_tip
-                || handled.as_deref() != Some(checkpoint)
+            let configuration = query
+                .query_map(params![id, parent], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            let scope = super::repo_scope_identity::repository_scope_uuid(tx, id)?;
+            if !Uuid::parse_str(&scope)
+                .is_ok_and(|value| !value.is_nil() && value.to_string() == scope)
             {
-                return Ok(());
+                return Err(refused("convergence requires durable scope"));
             }
-            for sha in commits {
-                let matching: i64 = tx.query_row(
-                    "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='svn_to_git' AND status='applied' AND svn_rev>0 AND svn_rev<=?3",
-                    rusqlite::params![repo_id,sha,revision], |row| row.get(0),
-                )?;
-                if matching != 1 {
-                    return Ok(());
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key IN (?1,?2,?3))",
+                params![
+                    format!("svn_to_git_push_v1:active:{id}"),
+                    format!("git_to_svn_commit_v1:active:{id}"),
+                    format!("import_operation_v1:active:{id}")
+                ],
+                |row| row.get(0),
+            )?;
+            if active {
+                return Err(refused(
+                    "convergence cannot cross an active publication or import",
+                ));
+            }
+            let scope_owners: i64 = tx.query_row(
+                "SELECT count(*) FROM repositories WHERE scope_uuid=?1",
+                [&scope],
+                |row| row.get(0),
+            )?;
+            if scope_owners != 1 {
+                return Err(refused("convergence scope has multiple owners"));
+            }
+            let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, id)?;
+            if generation <= 0 {
+                return Err(refused("convergence requires positive generation"));
+            }
+            let mut keys = tx.prepare(
+                "SELECT key,value,updated_at FROM kv_state WHERE key IN (?1,?2,?3,?4,?5,?6) ORDER BY key",
+            )?;
+            let copies = keys
+                .query_map(
+                    params![
+                        super::repo_scope_identity::last_git_sha_kv_key(&scope),
+                        super::repo_scope_identity::legacy_last_git_sha_kv_key(id),
+                        super::repo_scope_identity::repo_echo_generation_kv_key(&scope),
+                        super::repo_scope_identity::legacy_repo_echo_generation_kv_key(id),
+                        super::repo_scope_identity::LEGACY_REPO_ID_KV_READS_KEY,
+                        crate::echo_receipt_scope::handled_git_no_target_state_key(
+                            &scope, generation, checkpoint
+                        ),
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?
+                .collect::<Result<Vec<(String, String, String)>, _>>()?;
+            let inbound =
+                crate::echo_receipt_scope::read_team_inbound_git_checkpoint_kv_tx(tx, id)?;
+            let svn_copy: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM kv_state WHERE key=?1",
+                    [format!("last_svn_rev_{id}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if svn_revision <= 0 || svn_copy.as_deref() != Some(svn_revision.to_string().as_str()) {
+                return Err(refused("convergence SVN checkpoint is not coherent"));
+            }
+            Ok(Some(Pin {
+                configuration,
+                credentials,
+                scope,
+                generation,
+                copies,
+                inbound,
+                emitted,
+                svn_revision,
+            }))
+        }
+        let id = repo_id.to_owned();
+        let branch = branch.to_owned();
+        let origin = origin.to_owned();
+        let checkpoint = checkpoint.to_owned();
+        let projection = projection.to_owned();
+        if !crate::history_inspect::is_full_git_oid(&checkpoint)
+            || !crate::history_inspect::is_full_git_oid(remote_tip)
+            || origin.is_empty()
+        {
+            return Err(refused("convergence source observation is malformed"));
+        }
+        let before = self.db.immediate_transaction(|tx| {
+            let doc = self.owned(tx)?;
+            if doc.writer_epoch.is_none() { return Ok(None); }
+            if doc.phase!=Phase::Preparing || doc.repo_id.as_deref()!=Some(id.as_str()) {
+                return Err(refused("convergence requires current engine window"));
+            }
+            require_no_pair_refresh_hold(tx,Some(&id))?;
+            let Some(before) = pin(tx,&id,&branch,&checkpoint)? else { return Ok(None) };
+            // This attestation belongs to the optional convergence capability,
+            // not to no-epoch or unrelated ordinary callers declined above.
+            self.db.opened_file()?.require_unaliased_owner(tx)?;
+            if doc.scope_uuid.as_deref()!=Some(before.scope.as_str()) || before.emitted!=remote_tip {
+                return Err(refused("convergence registration or observed tip changed"));
+            }
+            let old_authority = match before.inbound.as_deref() {
+                Some(handled) if handled==checkpoint => {
+                    let direct: i64 = tx.query_row(
+                        "SELECT count(*) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND status='applied' AND (direction='git_to_svn' OR (direction='svn_to_git' AND svn_rev>0 AND NOT EXISTS(SELECT 1 FROM sync_records WHERE repo_id=?1 AND direction='git_to_svn' AND status='applied')))",
+                        params![id,checkpoint],|row|row.get(0),
+                    )?;
+                    let accepted = before.copies.iter().any(|(key,raw,_)| {
+                        key==&crate::echo_receipt_scope::handled_git_no_target_state_key(&before.scope,before.generation,&checkpoint)
+                            && serde_json::from_str(raw).is_ok_and(|receipt| {
+                                crate::echo_suppression::verify_no_target_receipt(
+                                    &receipt,&id,&checkpoint,&projection,before.generation,Some(&before.scope),
+                                )==crate::echo_suppression::NoTargetReceiptVerdict::Accepted
+                            })
+                    });
+                    if Self::emitted_frontier_recorded(tx,&id,&checkpoint)? {
+                        if !Self::verified_emitted_git_frontier(tx,&self.db,&id,&checkpoint,&projection)? {
+                            return Err(refused("recorded old emitted proof is stale or missing"));
+                        }
+                        use sha2::Digest;
+                        let proof_key=format!("handled_git_emitted_frontier_v1:{}:g{}:{}",before.scope,before.generation,checkpoint);
+                        let raw:String=tx.query_row("SELECT value FROM kv_state WHERE key=?1",[&proof_key],|row|row.get(0))?;
+                        serde_json::json!({"kind":"convergence","key":proof_key,"sha256":hex::encode(sha2::Sha256::digest(raw.as_bytes()))})
+                    } else if direct>0 && !Self::emitted_frontier_needs_retained_history(tx,&id,&checkpoint)? {
+                        let mut rows=tx.prepare("SELECT json_array(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND status='applied' AND (direction='git_to_svn' OR (direction='svn_to_git' AND svn_rev>0 AND NOT EXISTS(SELECT 1 FROM sync_records WHERE repo_id=?1 AND direction='git_to_svn' AND status='applied'))) ORDER BY id")?;
+                        let rows=rows.query_map(params![id,checkpoint],|row|row.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
+                        serde_json::json!({"kind":"direct","rows":rows})
+                    } else if accepted {
+                        let key=crate::echo_receipt_scope::handled_git_no_target_state_key(&before.scope,before.generation,&checkpoint);
+                        let raw=before.copies.iter().find(|(name,_,_)|name==&key).map(|(_,raw,_)|raw.clone())
+                            .ok_or_else(||refused("accepted old receipt disappeared"))?;
+                        serde_json::json!({"kind":"no_target","key":key,"raw":raw})
+                    } else {
+                        // The ordinary inspector may admit an older supported
+                        // no-target representation outside this narrow durable
+                        // proof format. Decline the optional convergence route;
+                        // never reinterpret it, mutate it, or break that route.
+                        return Ok(None);
+                    }
                 }
+                None if before.emitted==checkpoint => {
+                    let applied: i64 = tx.query_row(
+                        "SELECT count(*) FROM sync_records WHERE repo_id=?1 AND status='applied' AND direction IN ('svn_to_git','git_to_svn')",[&id],|row|row.get(0),
+                    )?;
+                    let retained:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM kv_state WHERE key=?1 OR key LIKE ?2)",params![format!("handled_git_baseline_{id}"),format!("handled_git_emitted_frontier_v1:{}:%",before.scope)],|row|row.get(0))?;
+                    if applied!=0 || retained || super::repo_scope_identity::repository_has_stored_no_target_receipt_kv(tx,&id)? {
+                        // No durable record proves an old absence after an
+                        // interrupted publication. Retain evidence and refuse.
+                        return Err(refused("absent inbound needs original pre-publication bootstrap capture"));
+                    }
+                    serde_json::json!({"kind":"bootstrap_absent"})
+                }
+                _ => return Err(refused("convergence old inbound changed")),
+            };
+            Ok(Some((before,old_authority)))
+        })?;
+        let Some((before, old_authority)) = before else {
+            return Ok(None);
+        };
+        Ok(Some(
+            move |observed: &str, observed_origin: &str, commits: &[(String, String)]| {
+                self.db.immediate_transaction(|tx| {
+                self.db.opened_file()?.require_unaliased_owner(tx)?;
+                let doc = self.owned(tx)?;
+                if doc.phase!=Phase::Preparing || doc.repo_id.as_deref()!=Some(id.as_str()) {
+                    return Err(refused("convergence lost current engine window"));
+                }
+                require_no_pair_refresh_hold(tx,Some(&id))?;
+                let current = pin(tx,&id,&branch,&checkpoint)?
+                    .ok_or_else(||refused("convergence registration disappeared"))?;
+                if doc.scope_uuid.as_deref()!=Some(current.scope.as_str())
+                    || current.configuration!=before.configuration
+                    || current.credentials!=before.credentials || current.scope!=before.scope
+                    || current.generation!=before.generation || current.copies!=before.copies
+                    || current.inbound!=before.inbound || observed_origin!=origin
+                    || current.svn_revision<before.svn_revision
+                    || current.emitted!=observed
+                {
+                    return Err(refused("convergence source or captured authority drifted"));
+                }
+                match old_authority["kind"].as_str() {
+                    Some("convergence") => {
+                        use sha2::Digest;
+                        let key=old_authority["key"].as_str().ok_or_else(||refused("captured old proof key missing"))?;
+                        let raw:Option<String>=tx.query_row("SELECT value FROM kv_state WHERE key=?1",[key],|row|row.get(0)).optional()?;
+                        if raw.as_ref().is_none_or(|raw|old_authority["sha256"]!=hex::encode(sha2::Sha256::digest(raw.as_bytes()))) {
+                            return Err(refused("captured old emitted proof changed"));
+                        }
+                        if !Self::verified_emitted_git_frontier(tx,&self.db,&id,&checkpoint,&projection)? {
+                            return Err(refused("captured old emitted proof disappeared"));
+                        }
+                    }
+                    Some("direct") => {
+                        for raw in old_authority["rows"].as_array().ok_or_else(||refused("captured old rows missing"))? {
+                            let raw=raw.as_str().ok_or_else(||refused("captured old row bytes missing"))?;
+                            let row:serde_json::Value=serde_json::from_str(raw).map_err(|_|refused("captured old row corrupt"))?;
+                            let stored:Option<String>=tx.query_row("SELECT json_array(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) FROM sync_records WHERE id=?1",[row[0].as_str().ok_or_else(||refused("captured old row ID missing"))?],|row|row.get(0)).optional()?;
+                            if stored.as_deref()!=Some(raw) {return Err(refused("captured old row disappeared or changed"));}
+                        }
+                    }
+                    Some("bootstrap_absent"|"no_target") => (),
+                    _ => return Err(refused("unknown captured old authority")),
+                }
+                if commits.is_empty() {
+                    if current.emitted!=checkpoint || current.svn_revision!=before.svn_revision {
+                        return Err(refused("empty convergence range cannot claim progress"));
+                    }
+                    return Ok(()); // No evidence is synthesized for an empty range.
+                }
+                if commits.last().map(|value|value.0.as_str())!=Some(observed) {
+                    return Err(refused("convergence range is incomplete"));
+                }
+                let mut documents_query=tx.prepare(
+                    "SELECT key,value FROM kv_state WHERE substr(key,1,?1)=?2 ORDER BY key",
+                )?;
+                let prefix="svn_to_git_push_v1:document:";
+                let documents=documents_query.query_map(params![prefix.len(),prefix],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+                    .collect::<Result<Vec<_>,_>>()?;
+                let mut retained_chain=Vec::with_capacity(commits.len());
+                let mut previous=checkpoint.clone();
+                let mut previous_revision=0;
+                let mut seen=std::collections::BTreeSet::new();
+                for (sha,tree) in commits {
+                    if !seen.insert(sha) || !crate::history_inspect::is_full_git_oid(sha)
+                        || !crate::history_inspect::is_full_git_oid(tree) {
+                        return Err(refused("convergence duplicate or malformed commit"));
+                    }
+                    let mut matching=Vec::new();
+                    for (key,raw) in &documents {
+                        let op: super::git_push_operations::GitPushOperation=serde_json::from_str(raw)
+                            .map_err(|_|refused("corrupt producer evidence"))?;
+                        if op.repo_id==id && op.intended_local_git_sha==*sha {
+                            if serde_json::to_string(&op).map_err(|_|refused("producer encoding"))?!=*raw {
+                                return Err(refused("noncanonical producer evidence"));
+                            }
+                            if *key!=format!("{prefix}{}",op.id) || op.version!=1
+                                || op.operation_type!="svn_to_git_push" {
+                                return Err(refused("unknown producer evidence"));
+                            }
+                            matching.push(op);
+                        }
+                    }
+                    let [op]=matching.as_slice() else {
+                        return Err(refused("convergence needs one exact producer receipt"));
+                    };
+                    if op.state!=super::git_push_operations::GitPushOperationState::Completed
+                        || op.pre_push_git_remote!="origin" || op.pre_push_git_branch!=branch
+                        || op.target_fingerprint!=super::git_push_operations::git_push_target_fingerprint(&id,"origin",&branch)
+                        || op.pre_push_git_sha!=previous || op.intended_local_git_parent.as_deref()!=Some(previous.as_str())
+                        || op.intended_local_git_tree!=*tree || op.last_confirmed_git_sha.as_deref()!=Some(sha.as_str())
+                        || op.last_confirmed_git_tree.as_deref()!=Some(tree.as_str()) || op.resume_authorized
+                        || op.source_svn_rev<=previous_revision || op.source_svn_rev>current.svn_revision
+                    {
+                        return Err(refused("convergence producer chain differs"));
+                    }
+                    let mut mappings=tx.prepare(
+                        "SELECT repo_id,git_sha,svn_rev,direction,status FROM sync_records WHERE (repo_id=?1 OR repo_id IS NULL OR repo_id='') AND (git_sha=?2 OR svn_rev=?3)",
+                    )?;
+                    let rows=mappings.query_map(params![id,sha,op.source_svn_rev],|row|Ok((row.get::<_,Option<String>>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<i64>>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?)))?
+                        .collect::<Result<Vec<_>,_>>()?;
+                    if rows.len()!=1 || rows[0]!=(Some(id.clone()),Some(sha.clone()),Some(op.source_svn_rev),"svn_to_git".to_owned(),"applied".to_owned()) {
+                        return Err(refused("convergence correspondence is missing or contradictory"));
+                    }
+                    let proof_key=format!("handled_git_emitted_frontier_v1:{}:g{}:{}",current.scope,current.generation,sha);
+                    let stale:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM kv_state WHERE key LIKE ?1 AND key<>?2)",params![format!("handled_git_emitted_frontier_v1:{}:%:{}",current.scope,sha),proof_key],|row|row.get(0))?;
+                    if stale {return Err(refused("stale emitted proof requires separate reconciliation"));}
+                    let producer_key=format!("svn_to_git_push_v1:document:{}",op.id);
+                    let producer_raw=documents.iter().find(|(key,_)|key==&producer_key).map(|(_,raw)|raw.clone())
+                        .ok_or_else(||refused("completed producer bytes disappeared"))?;
+                    let mapping_raw:String=tx.query_row("SELECT json_array(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND svn_rev=?3 AND direction='svn_to_git' AND status='applied'",params![id,sha,op.source_svn_rev],|row|row.get(0))?;
+                    retained_chain.push(serde_json::json!({"sha":sha,"tree":tree,"producer_key":producer_key,"producer_raw":producer_raw,"mapping_raw":mapping_raw}));
+                    previous=sha.clone();previous_revision=op.source_svn_rev;
+                }
+                if previous_revision!=current.svn_revision {
+                    return Err(refused("convergence final SVN coordinate differs"));
+                }
+                use hmac::Mac;
+                use sha2::Digest;
+                let proof_key=format!("handled_git_emitted_frontier_v1:{}:g{}:{}",current.scope,current.generation,observed);
+                let existing:Option<String>=tx.query_row("SELECT value FROM kv_state WHERE key=?1",[&proof_key],|row|row.get(0)).optional()?;
+                if existing.is_some() {
+                    if !Self::verified_emitted_git_frontier(tx,&self.db,&id,observed,&projection)? {
+                        return Err(refused("existing emitted proof is not valid"));
+                    }
+                    // Keep the immutable historical proof. Fresh observation,
+                    // captured old authority and current owner were rechecked.
+                } else {
+                    let native=self.db.opened_file()?;
+                    let payload=serde_json::json!({
+                        "version":1,"outcome":"complete_svn_emitted_frontier",
+                        "repo_id":id,"scope_uuid":current.scope,"generation":current.generation,
+                        "configuration_digest":hex::encode(sha2::Sha256::digest(serde_json::to_vec(&current.configuration).map_err(|_|refused("configuration encoding"))?)),
+                        "projection":projection,"origin_digest":hex::encode(sha2::Sha256::digest(origin.as_bytes())),
+                        "branch":branch,"native_database":{"path":native.path.to_str().ok_or_else(||refused("non-UTF8 native database path"))?,"device":native.device,"inode":native.inode,"owner":rustix::process::geteuid().as_raw()},
+                        "writer_window":doc.id.to_string(),"writer_epoch":doc.writer_epoch,
+                        "old_frontier":checkpoint,"old_inbound":before.inbound,"old_svn_revision":before.svn_revision,
+                        "old_authority":old_authority,"new_git_sha":observed,
+                        "new_git_tree":commits.last().map(|value|value.1.as_str()).ok_or_else(||refused("missing final emitted tree"))?,
+                        "new_svn_revision":current.svn_revision,"chain":retained_chain,
+                        "credentials_at_transition":before.credentials,
+                    });
+                    let key=super::pair_refresh_credentials::fingerprint_key(tx)?;
+                    let mut mac=hmac::Hmac::<sha2::Sha256>::new_from_slice(&key).map_err(|_|refused("proof authority key"))?;
+                    mac.update(&serde_json::to_vec(&("reposync_emitted_frontier_v1",&payload)).map_err(|_|refused("proof encoding"))?);
+                    let record=serde_json::json!({"payload":payload,"mac":hex::encode(mac.finalize().into_bytes())});
+                    tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",params![proof_key,serde_json::to_string(&record).map_err(|_|refused("proof encoding"))?,Utc::now().to_rfc3339()])?;
+                }
+                crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx,&id,observed,&Utc::now().to_rfc3339())?;
+                if !Self::verified_emitted_git_frontier(tx,&self.db,&id,observed,&projection)? {
+                    return Err(refused("persisted emitted proof is not consumable"));
+                }
+                Ok(())
+            })
+            },
+        ))
+    }
+
+    /// Authenticated same-incarnation refresh history remains authoritative
+    /// even when disposable directional audit rows have been pruned. Such a
+    /// later SVN-origin SHA cannot become an old-import baseline by that pruning.
+    pub(crate) fn emitted_frontier_needs_retained_history(
+        tx: &Connection,
+        repo_id: &str,
+        sha: &str,
+    ) -> Result<bool, DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(tx, Some(repo_id))?;
+        let scope = super::repo_scope_identity::repository_scope_uuid(tx, repo_id)?;
+        let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
+        let prefix = "pair_refresh_execution_v3:document:";
+        Ok(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE substr(key,1,?1)=?2 AND json_extract(value,'$.phase')='completed' AND json_extract(value,'$.pins.child.repo_id')=?3 AND json_extract(value,'$.pins.child.scope_uuid')=?4 AND json_extract(value,'$.pins.child.echo_generation')=?5 AND json_extract(value,'$.pins.git.prepared_sha')<>?6) AND EXISTS(SELECT 1 FROM sync_records WHERE repo_id=?3 AND git_sha=?6 AND direction='svn_to_git' AND status='applied' AND svn_rev>0) AND NOT EXISTS(SELECT 1 FROM sync_records WHERE repo_id=?3 AND git_sha=?6 AND direction='git_to_svn' AND status='applied')",
+            params![prefix.len(),prefix,repo_id,scope,generation,sha],|row|row.get(0),
+        )?)
+    }
+
+    /// Once a frontier used this authority, dependency loss cannot silently
+    /// reclassify it as an old import after diagnostic rows are pruned.
+    pub(crate) fn emitted_frontier_recorded(
+        tx: &Connection,
+        repo_id: &str,
+        sha: &str,
+    ) -> Result<bool, DatabaseError> {
+        let scope = match super::repo_scope_identity::repository_scope_uuid(tx, repo_id) {
+            Ok(scope) => scope,
+            Err(DatabaseError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key LIKE ?1)",
+            [format!("handled_git_emitted_frontier_v1:{scope}:%:{sha}")],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// A retained completed transition, not permission for a new publication.
+    /// Validation is local/read-only; missing dependencies are never repaired.
+    pub(crate) fn verified_emitted_git_frontier(
+        tx: &Connection,
+        db: &Database,
+        repo_id: &str,
+        sha: &str,
+        projection: &str,
+    ) -> Result<bool, DatabaseError> {
+        use hmac::Mac;
+        use sha2::Digest;
+        let scope = match super::repo_scope_identity::repository_scope_uuid(tx, repo_id) {
+            Ok(scope) => scope,
+            Err(DatabaseError::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let generation = crate::echo_receipt_scope::repo_echo_generation_tx(tx, repo_id)?;
+        let key_for =
+            |tip: &str| format!("handled_git_emitted_frontier_v1:{scope}:g{generation}:{tip}");
+        let mut target = sha.to_owned();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut expected_digest: Option<String> = None;
+        loop {
+            if !crate::history_inspect::is_full_git_oid(&target) || !visited.insert(target.clone())
+            {
+                return Err(refused("malformed or cyclic emitted-frontier proof"));
             }
-            crate::echo_receipt_scope::write_scoped_last_git_sha_kv(
-                tx, repo_id, remote_tip, &Utc::now().to_rfc3339(),
-            )
-        })
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT value FROM kv_state WHERE key=?1",
+                    [key_for(&target)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                return if visited.len() == 1 {
+                    Ok(false)
+                } else {
+                    Err(refused("required prior emitted-frontier proof is missing"))
+                };
+            };
+            if expected_digest.as_ref().is_some_and(|expected| {
+                *expected != hex::encode(sha2::Sha256::digest(raw.as_bytes()))
+            }) {
+                return Err(refused("prior emitted-frontier proof dependency changed"));
+            }
+            let native = db.opened_file()?;
+            native.require_unaliased_owner(tx)?;
+            let scope_owners: i64 = tx.query_row(
+                "SELECT count(*) FROM repositories WHERE scope_uuid=?1",
+                [&scope],
+                |row| row.get(0),
+            )?;
+            if scope_owners != 1 {
+                return Err(refused("emitted proof scope has multiple owners"));
+            }
+            let record: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|_| refused("malformed emitted-frontier proof"))?;
+            if record.as_object().is_none_or(|fields| {
+                fields.len() != 2 || !fields.contains_key("payload") || !fields.contains_key("mac")
+            }) || serde_json::to_string(&record).map_err(|_| refused("proof encoding"))? != raw
+            {
+                return Err(refused("noncanonical emitted-frontier proof"));
+            }
+            let payload = &record["payload"];
+            let fields = [
+                "version",
+                "outcome",
+                "repo_id",
+                "scope_uuid",
+                "generation",
+                "configuration_digest",
+                "projection",
+                "origin_digest",
+                "branch",
+                "native_database",
+                "writer_window",
+                "writer_epoch",
+                "old_frontier",
+                "old_inbound",
+                "old_svn_revision",
+                "old_authority",
+                "new_git_sha",
+                "new_git_tree",
+                "new_svn_revision",
+                "chain",
+                "credentials_at_transition",
+            ];
+            if payload.as_object().is_none_or(|value| {
+                value.len() != fields.len() || fields.iter().any(|key| !value.contains_key(*key))
+            }) {
+                return Err(refused("unknown emitted-frontier proof schema"));
+            }
+            let encoded = serde_json::to_vec(&("reposync_emitted_frontier_v1", payload))
+                .map_err(|_| refused("proof encoding"))?;
+            let key = super::pair_refresh_credentials::fingerprint_key(tx)?;
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&key)
+                .map_err(|_| refused("proof authority key"))?;
+            mac.update(&encoded);
+            let signature = record["mac"]
+                .as_str()
+                .and_then(|value| hex::decode(value).ok())
+                .ok_or_else(|| refused("malformed emitted-frontier MAC"))?;
+            mac.verify_slice(&signature)
+                .map_err(|_| refused("emitted-frontier authority mismatch"))?;
+            let native_pin = serde_json::json!({
+                "path":native.path.to_str().ok_or_else(||refused("non-UTF8 native database path"))?,
+                "device":native.device,"inode":native.inode,"owner":rustix::process::geteuid().as_raw(),
+            });
+            let (parent,branch,current_revision):(Option<String>,String,i64)=tx.query_row(
+                "SELECT parent_id,git_branch,last_svn_rev FROM repositories WHERE id=?1 AND enabled=1 AND sync_mode='team'",
+                [repo_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )?;
+            let parent = match parent {
+                Some(value) if value != repo_id => {
+                    let enabled:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM repositories WHERE id=?1 AND enabled=1 AND sync_mode='team')",[&value],|row|row.get(0))?;
+                    if !enabled {
+                        return Err(refused("emitted proof parent is no longer enabled"));
+                    }
+                    value
+                }
+                Some(_) => return Err(refused("self-parent proof registration")),
+                None => {
+                    let related:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM repositories WHERE parent_id=?1 AND id<>?1 AND enabled=1 AND sync_mode='team')",[repo_id],|row|row.get(0))?;
+                    if !related {
+                        return Err(refused(
+                            "emitted-frontier proof no longer belongs to a pair",
+                        ));
+                    }
+                    repo_id.to_owned()
+                }
+            };
+            let mut query=tx.prepare(
+                "SELECT json_object('id',id,'scope_uuid',scope_uuid,'parent_id',parent_id,'svn_url',svn_url,'svn_branch',svn_branch,'svn_username',svn_username,'git_provider',git_provider,'git_api_url',git_api_url,'git_repo',git_repo,'git_branch',git_branch,'sync_mode',sync_mode,'poll_interval_secs',poll_interval_secs,'lfs_threshold_mb',lfs_threshold_mb,'auto_merge',auto_merge,'enabled',enabled,'allowed_paths',allowed_paths,'blocked_patterns',blocked_patterns) FROM repositories WHERE id=?1 OR id=?2 OR parent_id=?1 ORDER BY id",
+            )?;
+            let configuration = query
+                .query_map(params![repo_id, parent], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let configuration_digest = hex::encode(sha2::Sha256::digest(
+                serde_json::to_vec(&configuration)
+                    .map_err(|_| refused("configuration encoding"))?,
+            ));
+            let positive = |key: &str| payload[key].as_i64().is_some_and(|value| value > 0);
+            let full_digest = |value: &serde_json::Value| {
+                value.as_str().is_some_and(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            };
+            if payload["version"] != 1
+                || payload["outcome"] != "complete_svn_emitted_frontier"
+                || payload["repo_id"] != repo_id
+                || payload["scope_uuid"] != scope
+                || payload["generation"] != generation
+                || generation <= 0
+                || payload["configuration_digest"] != configuration_digest
+                || payload["projection"] != projection
+                || payload["branch"] != branch
+                || payload["native_database"] != native_pin
+                || payload["new_git_sha"] != target
+                || !positive("new_svn_revision")
+                || payload["new_svn_revision"]
+                    .as_i64()
+                    .is_none_or(|revision| revision > current_revision)
+                || !positive("old_svn_revision")
+                || payload["old_svn_revision"].as_i64() > payload["new_svn_revision"].as_i64()
+                || payload["writer_epoch"]
+                    .as_u64()
+                    .is_none_or(|epoch| epoch == 0)
+                || !full_digest(&payload["origin_digest"])
+                || !full_digest(&payload["credentials_at_transition"])
+                || !payload["writer_window"].as_str().is_some_and(|raw| {
+                    Uuid::parse_str(raw).is_ok_and(|id| !id.is_nil() && id.to_string() == raw)
+                })
+            {
+                return Err(refused("stale or foreign emitted-frontier proof"));
+            }
+            let old = payload["old_frontier"]
+                .as_str()
+                .filter(|value| crate::history_inspect::is_full_git_oid(value))
+                .ok_or_else(|| refused("malformed old emitted frontier"))?;
+            let chain = payload["chain"]
+                .as_array()
+                .filter(|chain| !chain.is_empty())
+                .ok_or_else(|| refused("empty retained producer chain"))?;
+            let mut previous = old.to_owned();
+            let mut revision = 0;
+            let mut final_tree = String::new();
+            for entry in chain {
+                if entry.as_object().is_none_or(|fields| {
+                    fields.len() != 5
+                        || ["sha", "tree", "producer_key", "producer_raw", "mapping_raw"]
+                            .iter()
+                            .any(|key| !fields.contains_key(*key))
+                }) {
+                    return Err(refused("unknown retained chain entry"));
+                }
+                let tip = entry["sha"]
+                    .as_str()
+                    .filter(|value| crate::history_inspect::is_full_git_oid(value))
+                    .ok_or_else(|| refused("malformed retained SHA"))?;
+                let tree = entry["tree"]
+                    .as_str()
+                    .filter(|value| crate::history_inspect::is_full_git_oid(value))
+                    .ok_or_else(|| refused("malformed retained tree"))?;
+                let producer_key = entry["producer_key"]
+                    .as_str()
+                    .ok_or_else(|| refused("missing producer dependency"))?;
+                let stored: Option<String> = tx
+                    .query_row(
+                        "SELECT value FROM kv_state WHERE key=?1",
+                        [producer_key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let raw = entry["producer_raw"]
+                    .as_str()
+                    .ok_or_else(|| refused("missing retained producer bytes"))?;
+                if stored.as_deref() != Some(raw) {
+                    return Err(refused("retained producer dependency changed or missing"));
+                }
+                let op: super::git_push_operations::GitPushOperation =
+                    serde_json::from_str(raw).map_err(|_| refused("corrupt retained producer"))?;
+                if serde_json::to_string(&op).map_err(|_| refused("producer encoding"))? != raw
+                    || producer_key != format!("svn_to_git_push_v1:document:{}", op.id)
+                    || op.version != 1
+                    || op.operation_type != "svn_to_git_push"
+                    || op.repo_id != repo_id
+                    || op.state != super::git_push_operations::GitPushOperationState::Completed
+                    || op.pre_push_git_remote != "origin"
+                    || op.pre_push_git_branch != branch
+                    || op.target_fingerprint
+                        != super::git_push_operations::git_push_target_fingerprint(
+                            repo_id, "origin", &branch,
+                        )
+                    || op.pre_push_git_sha != previous
+                    || op.intended_local_git_parent.as_deref() != Some(previous.as_str())
+                    || op.intended_local_git_sha != tip
+                    || op.intended_local_git_tree != tree
+                    || op.last_confirmed_git_sha.as_deref() != Some(tip)
+                    || op.last_confirmed_git_tree.as_deref() != Some(tree)
+                    || op.resume_authorized
+                    || op.source_svn_rev <= revision
+                {
+                    return Err(refused("retained producer chain contradicts proof"));
+                }
+                let mut mappings=tx.prepare("SELECT json_array(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) FROM sync_records WHERE (repo_id=?1 OR repo_id IS NULL OR repo_id='') AND (git_sha=?2 OR svn_rev=?3) ORDER BY id")?;
+                let rows = mappings
+                    .query_map(params![repo_id, tip, op.source_svn_rev], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let raw_mapping = entry["mapping_raw"]
+                    .as_str()
+                    .ok_or_else(|| refused("missing mapping dependency"))?;
+                let mapping: serde_json::Value = serde_json::from_str(raw_mapping)
+                    .map_err(|_| refused("invalid mapping dependency"))?;
+                if rows.len() != 1
+                    || rows[0] != raw_mapping
+                    || mapping.as_array().is_none_or(|row| row.len() != 10)
+                    || mapping[1] != repo_id
+                    || mapping[2] != op.source_svn_rev
+                    || mapping[3] != tip
+                    || mapping[4] != "svn_to_git"
+                    || mapping[9] != "applied"
+                {
+                    return Err(refused("retained correspondence changed or missing"));
+                }
+                previous = tip.to_owned();
+                revision = op.source_svn_rev;
+                final_tree = tree.to_owned();
+            }
+            if previous != target
+                || payload["new_git_tree"] != final_tree
+                || payload["new_svn_revision"] != revision
+            {
+                return Err(refused("retained final coordinates differ"));
+            }
+            let authority = &payload["old_authority"];
+            match authority["kind"].as_str() {
+                Some("bootstrap_absent") => {
+                    if authority.as_object().is_none_or(|fields|fields.len()!=1)
+                        || !payload["old_inbound"].is_null()
+                        || chain[0]["producer_raw"].as_str().and_then(|raw|serde_json::from_str::<super::git_push_operations::GitPushOperation>(raw).ok()).is_none_or(|op|op.source_svn_rev<=payload["old_svn_revision"].as_i64().unwrap_or(i64::MAX)) {
+                        return Err(refused("invalid retained bootstrap transition"));
+                    }
+                    return Ok(true); // MAC binds actual captured historical absence.
+                }
+                Some("direct") => {
+                    if authority.as_object().is_none_or(|fields| fields.len() != 2)
+                        || payload["old_inbound"] != old
+                    {
+                        return Err(refused("invalid retained direct authority"));
+                    }
+                    let rows = authority["rows"]
+                        .as_array()
+                        .filter(|rows| !rows.is_empty())
+                        .ok_or_else(|| refused("missing old applied authority"))?;
+                    for raw in rows {
+                        let raw = raw
+                            .as_str()
+                            .ok_or_else(|| refused("invalid old applied bytes"))?;
+                        let row: serde_json::Value = serde_json::from_str(raw)
+                            .map_err(|_| refused("invalid old applied row"))?;
+                        if row.as_array().is_none_or(|row| row.len() != 10)
+                            || row[1] != repo_id
+                            || row[3] != old
+                            || row[9] != "applied"
+                            || !matches!(row[4].as_str(), Some("git_to_svn" | "svn_to_git"))
+                        {
+                            return Err(refused("foreign old applied authority"));
+                        }
+                        let stored:Option<String>=tx.query_row("SELECT json_array(id,repo_id,svn_rev,git_sha,direction,author,message,timestamp,synced_at,status) FROM sync_records WHERE id=?1",[row[0].as_str().ok_or_else(||refused("old row ID missing"))?],|row|row.get(0)).optional()?;
+                        if stored.as_deref() != Some(raw) {
+                            return Err(refused(
+                                "old applied authority dependency missing or changed",
+                            ));
+                        }
+                    }
+                    return Ok(true);
+                }
+                Some("no_target") => {
+                    if authority.as_object().is_none_or(|fields| fields.len() != 3)
+                        || payload["old_inbound"] != old
+                    {
+                        return Err(refused("invalid retained no-target authority"));
+                    }
+                    let expected = crate::echo_receipt_scope::handled_git_no_target_state_key(
+                        &scope, generation, old,
+                    );
+                    if authority["key"] != expected {
+                        return Err(refused("foreign old no-target key"));
+                    }
+                    let stored: Option<String> = tx
+                        .query_row(
+                            "SELECT value FROM kv_state WHERE key=?1",
+                            [expected],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let raw = authority["raw"]
+                        .as_str()
+                        .ok_or_else(|| refused("old no-target bytes missing"))?;
+                    let receipt = serde_json::from_str(raw)
+                        .map_err(|_| refused("old no-target bytes corrupt"))?;
+                    if stored.as_deref() != Some(raw)
+                        || crate::echo_suppression::verify_no_target_receipt(
+                            &receipt,
+                            repo_id,
+                            old,
+                            projection,
+                            generation,
+                            Some(&scope),
+                        ) != crate::echo_suppression::NoTargetReceiptVerdict::Accepted
+                    {
+                        return Err(refused("old no-target dependency changed"));
+                    }
+                    return Ok(true);
+                }
+                Some("convergence") => {
+                    if authority.as_object().is_none_or(|fields| fields.len() != 3)
+                        || payload["old_inbound"] != old
+                        || authority["key"] != key_for(old)
+                        || !full_digest(&authority["sha256"])
+                    {
+                        return Err(refused("foreign prior convergence authority"));
+                    }
+                    expected_digest = authority["sha256"].as_str().map(str::to_owned);
+                    target = old.to_owned(); // Iterative, finite dependency walk; cycles refuse.
+                }
+                _ => return Err(refused("unknown retained old authority")),
+            }
+        }
     }
 
     /// The real engine observed the complete branch log beyond this checkpoint
