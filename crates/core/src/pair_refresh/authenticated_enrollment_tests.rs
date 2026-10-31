@@ -11001,7 +11001,7 @@ mod authenticated_review_service_journey {
                 "child",
                 "view-is-not-approval",
                 Uuid::new_v4(),
-                response.review_pin.as_ref().unwrap(),
+                response.review_pin.as_ref().unwrap().clone(),
                 crate::pair_refresh::service::RefreshAction::Execute,
             )
             .await;
