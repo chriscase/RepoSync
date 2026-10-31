@@ -20,7 +20,10 @@ use crate::AppState;
 pub fn routes(engine: Arc<SyncEngine>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v2/repos/:id/refresh/review", post(review))
-        .route("/api/v2/repos/:id/refresh/review/candidate", post(review_candidate))
+        .route(
+            "/api/v2/repos/:id/refresh/review/candidate",
+            post(review_candidate),
+        )
         .route("/api/v2/repos/:id/refresh/prepare", post(prepare))
         .route(
             "/api/v2/repos/:id/refresh/recovery/prepare",
@@ -176,7 +179,11 @@ async fn review(
     Json(_body): Json<ReviewRequest>,
 ) -> Result<Json<reposync_core::pair_refresh::service::RefreshReviewResponse>, AppError> {
     let bearer = authenticated_bearer(&state, &service, &headers)?;
-    service.review(bearer, child).await.map(Json).map_err(review_refused)
+    service
+        .review(bearer, child)
+        .await
+        .map(Json)
+        .map_err(review_refused)
 }
 
 async fn review_candidate(
@@ -187,12 +194,19 @@ async fn review_candidate(
     Json(body): Json<reposync_core::pair_refresh::service::RefreshReviewCandidateRequest>,
 ) -> Result<Json<reposync_core::pair_refresh::service::RefreshReviewResponse>, AppError> {
     let bearer = authenticated_bearer(&state, &service, &headers)?;
-    service.review_candidate(bearer, child, body).await.map(Json).map_err(review_refused)
+    service
+        .review_candidate(bearer, child, body)
+        .await
+        .map(Json)
+        .map_err(review_refused)
 }
 
 fn review_refused(error: anyhow::Error) -> AppError {
     use reposync_core::pair_refresh::service::RefreshReviewRefusal;
-    let reason = error.downcast_ref::<RefreshReviewRefusal>().copied().unwrap_or(RefreshReviewRefusal::Unavailable);
+    let reason = error
+        .downcast_ref::<RefreshReviewRefusal>()
+        .copied()
+        .unwrap_or(RefreshReviewRefusal::Unavailable);
     if matches!(reason, RefreshReviewRefusal::AuthorizationChanged) {
         AppError::Unauthorized(reason.code().into())
     } else {
@@ -207,9 +221,15 @@ fn review_refused(error: anyhow::Error) -> AppError {
 pub fn review_fixture_routes(service: Arc<RefreshService>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/v2/repos/:id/refresh/review", post(review))
-        .route("/api/v2/repos/:id/refresh/review/candidate", post(review_candidate))
+        .route(
+            "/api/v2/repos/:id/refresh/review/candidate",
+            post(review_candidate),
+        )
         .route("/api/v2/repos/:id/refresh/prepare", post(prepare))
-        .route("/api/v2/repos/:id/refresh/recovery/prepare", post(prepare_recovery))
+        .route(
+            "/api/v2/repos/:id/refresh/recovery/prepare",
+            post(prepare_recovery),
+        )
         .route("/api/v2/repos/:id/refresh/action", post(act))
         .route("/api/v2/repos/:id/refresh/requests/:request", get(receipt))
         .layer(Extension(service))

@@ -1617,16 +1617,39 @@ impl RegisteredReviewIntake {
         &mut self,
         review: &LiveChangedChildApplicabilityReview,
     ) -> Result<()> {
-        anyhow::ensure!(self.may_attempt_correspondence(), "review intake is not ready for source proof");
+        anyhow::ensure!(
+            self.may_attempt_correspondence(),
+            "review intake is not ready for source proof"
+        );
         let manifest = review.manifest();
-        anyhow::ensure!(manifest.configuration == self.configuration, "review source configuration changed");
+        anyhow::ensure!(
+            manifest.configuration == self.configuration,
+            "review source configuration changed"
+        );
         let expected = self.configuration.clone();
         for (role, side, url, tip) in [
-            ("C", &mut self.child, &expected.child_svn_url, &expected.child.last_git_sha),
-            ("P2", &mut self.parent, &expected.parent_svn_url, &expected.parent.last_git_sha),
+            (
+                "C",
+                &mut self.child,
+                &expected.child_svn_url,
+                &expected.child.last_git_sha,
+            ),
+            (
+                "P2",
+                &mut self.parent,
+                &expected.parent_svn_url,
+                &expected.parent.last_git_sha,
+            ),
         ] {
-            let proofs = review.source_correspondence().roles.iter().filter(|proof| proof.role == role).collect::<Vec<_>>();
-            let [proof] = proofs.as_slice() else { bail!("review role presence is ambiguous"); };
+            let proofs = review
+                .source_correspondence()
+                .roles
+                .iter()
+                .filter(|proof| proof.role == role)
+                .collect::<Vec<_>>();
+            let [proof] = proofs.as_slice() else {
+                bail!("review role presence is ambiguous");
+            };
             let pin = &proof.presence;
             anyhow::ensure!(
                 proof.git_commit == *tip
@@ -1648,7 +1671,8 @@ impl RegisteredReviewIntake {
             side.svn.blocked = None;
         }
         self.observation_digest.clear();
-        self.observation_digest = changed_child_applicability_digest("registered_review_intake_v1", self)?;
+        self.observation_digest =
+            changed_child_applicability_digest("registered_review_intake_v1", self)?;
         Ok(())
     }
 }
@@ -1703,12 +1727,10 @@ fn review_advertised_git(
         &pin.git_remote_url,
         super::publication::PinnedPushPolicy::SmartHttpV1,
     )?;
-    let transport = super::http_transport::HttpTransport::new(
-        &pin.git_remote_url,
-        token,
-        client.clone(),
-    )?;
-    let mut remote = super::publication::checked_anonymous_remote(&repository, &transport.endpoint)?;
+    let transport =
+        super::http_transport::HttpTransport::new(&pin.git_remote_url, token, client.clone())?;
+    let mut remote =
+        super::publication::checked_anonymous_remote(&repository, &transport.endpoint)?;
     let connection = remote.connect_auth(
         git2::Direction::Fetch,
         Some(super::publication::no_credentials()),
@@ -1745,7 +1767,9 @@ fn review_local_bridge(
     anyhow::ensure!(
         !id.is_empty()
             && !matches!(id, "." | "..")
-            && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
         "unsupported review bridge identity"
     );
     let root = root.canonicalize()?;
@@ -1753,7 +1777,10 @@ fn review_local_bridge(
     for part in ["repos", id, "git-repo", ".git"] {
         path.push(part);
         let metadata = std::fs::symlink_metadata(&path)?;
-        anyhow::ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(), "review bridge link or directory changed");
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "review bridge link or directory changed"
+        );
     }
     let bridge = path.parent().context("review bridge parent missing")?;
     let repository = git2::Repository::open(bridge)?;
@@ -1761,26 +1788,55 @@ fn review_local_bridge(
         !repository.is_bare()
             && !repository.is_worktree()
             && repository.path().canonicalize()? == path
-            && repository.workdir().context("review bridge worktree missing")?.canonicalize()? == bridge,
+            && repository
+                .workdir()
+                .context("review bridge worktree missing")?
+                .canonicalize()?
+                == bridge,
         "review bridge is not the registered worktree"
     );
     super::publication::require_complete_git_graph(&repository)?;
-    anyhow::ensure!(repository.state() == git2::RepositoryState::Clean, "review bridge has an unfinished operation");
-    anyhow::ensure!(repository.find_remote("origin")?.url() == Some(remote_url), "review bridge origin differs");
+    anyhow::ensure!(
+        repository.state() == git2::RepositoryState::Clean,
+        "review bridge has an unfinished operation"
+    );
+    anyhow::ensure!(
+        repository.find_remote("origin")?.url() == Some(remote_url),
+        "review bridge origin differs"
+    );
     let head = repository.head()?;
     let expected_ref = format!("refs/heads/{branch}");
-    anyhow::ensure!(!repository.head_detached()? && head.name() == Some(expected_ref.as_str()), "review bridge branch differs");
-    let branches = repository.branches(Some(git2::BranchType::Local))?.collect::<std::result::Result<Vec<_>, _>>()?;
-    anyhow::ensure!(branches.len() == 1, "additional local branch work is unknown");
-    let tip = head.target().context("review bridge tip unavailable")?.to_string();
+    anyhow::ensure!(
+        !repository.head_detached()? && head.name() == Some(expected_ref.as_str()),
+        "review bridge branch differs"
+    );
+    let branches = repository
+        .branches(Some(git2::BranchType::Local))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    anyhow::ensure!(
+        branches.len() == 1,
+        "additional local branch work is unknown"
+    );
+    let tip = head
+        .target()
+        .context("review bridge tip unavailable")?
+        .to_string();
     let index_path = path.join("index");
     let (index_before, _) = read_review_regular_file(&index_path, 16 * 1024 * 1024)?;
     let index = repository.index()?;
     anyhow::ensure!(
-        index.path().context("review index location unknown")?.canonicalize()? == index_path,
+        index
+            .path()
+            .context("review index location unknown")?
+            .canonicalize()?
+            == index_path,
         "review index is not the registered index"
     );
-    for key in ["core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse"] {
+    for key in [
+        "core.sparseCheckout",
+        "core.sparseCheckoutCone",
+        "index.sparse",
+    ] {
         match repository.config()?.get_bool(key) {
             Ok(false) => {}
             Err(error) if error.code() == git2::ErrorCode::NotFound => {}
@@ -1790,7 +1846,9 @@ fn review_local_bridge(
     anyhow::ensure!(
         !index.has_conflicts()
             && index.len() <= REVIEW_OBSERVATION_LIMIT
-            && index.iter().all(|entry| review_supported_index_entry(&entry)),
+            && index
+                .iter()
+                .all(|entry| review_supported_index_entry(&entry)),
         "local index has suppressed, sparse, unmerged or unsupported entries"
     );
     require_review_tracked_bytes(bridge, &index)?;
@@ -1804,7 +1862,10 @@ fn review_local_bridge(
         .no_refresh(true)
         .update_index(false);
     let statuses = repository.statuses(Some(&mut options))?;
-    anyhow::ensure!(statuses.len() <= REVIEW_OBSERVATION_LIMIT, "review local work exceeds bounded inventory");
+    anyhow::ensure!(
+        statuses.len() <= REVIEW_OBSERVATION_LIMIT,
+        "review local work exceeds bounded inventory"
+    );
     let mut paths = statuses
         .iter()
         .map(|entry| ReviewLocalPath {
@@ -1844,7 +1905,10 @@ fn read_review_regular_file(
     limit: usize,
 ) -> Result<(Vec<u8>, std::fs::Metadata)> {
     let metadata = std::fs::symlink_metadata(path)?;
-    anyhow::ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "review input is not a regular file");
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "review input is not a regular file"
+    );
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
@@ -1861,12 +1925,28 @@ fn read_review_regular_file(
         (&file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
     }
     let after = file.metadata()?;
-    anyhow::ensure!(bytes.len() <= limit && after.len() == bytes.len() as u64, "review input exceeds bound or changed length");
+    anyhow::ensure!(
+        bytes.len() <= limit && after.len() == bytes.len() as u64,
+        "review input exceeds bound or changed length"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let identity = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
-        anyhow::ensure!(identity(&metadata) == identity(&before) && identity(&before) == identity(&after), "review input identity changed");
+        let identity = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        anyhow::ensure!(
+            identity(&metadata) == identity(&before) && identity(&before) == identity(&after),
+            "review input identity changed"
+        );
     }
     Ok((bytes, after))
 }
@@ -1888,7 +1968,10 @@ fn require_review_tracked_bytes(bridge: &std::path::Path, index: &git2::Index) -
             path.push(part);
             if parts.peek().is_some() {
                 let metadata = std::fs::symlink_metadata(&path)?;
-                anyhow::ensure!(metadata.is_dir() && !metadata.file_type().is_symlink(), "review tracked directory changed");
+                anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "review tracked directory changed"
+                );
             }
         }
         let (bytes, metadata) = read_review_regular_file(&path, remaining)?;
@@ -1900,7 +1983,10 @@ fn require_review_tracked_bytes(bridge: &std::path::Path, index: &git2::Index) -
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            anyhow::ensure!((metadata.permissions().mode() & 0o100 != 0) == (entry.mode == 0o100755), "tracked executable mode differs");
+            anyhow::ensure!(
+                (metadata.permissions().mode() & 0o100 != 0) == (entry.mode == 0o100755),
+                "tracked executable mode differs"
+            );
         }
         #[cfg(not(unix))]
         let _ = metadata;
@@ -1925,10 +2011,19 @@ async fn review_svn_pending(
             && pegged.latest_rev == checkpoint,
         "review SVN checkpoint identity differs"
     );
-    let path = info.url.strip_prefix(&info.root_url).context("review SVN path missing")?;
-    anyhow::ensure!(path.starts_with('/') && path.len() > 1, "review SVN path invalid");
+    let path = info
+        .url
+        .strip_prefix(&info.root_url)
+        .context("review SVN path missing")?;
+    anyhow::ensure!(
+        path.starts_with('/') && path.len() > 1,
+        "review SVN path invalid"
+    );
     let history = client.copy_history_at_rev(info.latest_rev).await?;
-    anyhow::ensure!(!history.is_empty() && history.len() <= REVIEW_OBSERVATION_LIMIT, "review SVN history unavailable or exceeds bound");
+    anyhow::ensure!(
+        !history.is_empty() && history.len() <= REVIEW_OBSERVATION_LIMIT,
+        "review SVN history unavailable or exceeds bound"
+    );
     let mut previous = None;
     let mut pending = Vec::new();
     for entry in history {
@@ -1939,8 +2034,13 @@ async fn review_svn_pending(
                 && entry.changed_paths.iter().any(|change| {
                     change.path == "/"
                         || change.path == path
-                        || change.path.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/'))
-                        || path.strip_prefix(change.path.as_str()).is_some_and(|suffix| suffix.starts_with('/'))
+                        || change
+                            .path
+                            .strip_prefix(path)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                        || path
+                            .strip_prefix(change.path.as_str())
+                            .is_some_and(|suffix| suffix.starts_with('/'))
                 }),
             "review SVN history contradictory"
         );
@@ -1950,7 +2050,13 @@ async fn review_svn_pending(
         }
     }
     let repeated = client.info().await?;
-    anyhow::ensure!(repeated.url == info.url && repeated.uuid == info.uuid && repeated.root_url == info.root_url && repeated.latest_rev == info.latest_rev, "review SVN observation changed");
+    anyhow::ensure!(
+        repeated.url == info.url
+            && repeated.uuid == info.uuid
+            && repeated.root_url == info.root_url
+            && repeated.latest_rev == info.latest_rev,
+        "review SVN observation changed"
+    );
     Ok(ReviewSvnPending {
         checkpoint,
         observed_head: Some(info.latest_rev),
@@ -1987,11 +2093,29 @@ pub(super) async fn capture_registered_review_intake(
                 .unwrap_or_else(|_| review_git_unknown(&pin.child.last_git_sha));
             let parent_git = review_advertised_git(&configuration, &client, false)
                 .unwrap_or_else(|_| review_git_unknown(&pin.parent.last_git_sha));
-            let child_local = review_local_bridge(&root, &pin.child.repo_id, &pin.child_git_branch, &pin.git_remote_url, child_git.observed_tip.as_deref())
-                .unwrap_or_else(|_| review_local_unknown());
-            let parent_local = review_local_bridge(&root, &pin.parent.repo_id, &pin.parent_git_branch, &pin.git_remote_url, parent_git.observed_tip.as_deref())
-                .unwrap_or_else(|_| review_local_unknown());
-            (configuration, child_git, parent_git, child_local, parent_local)
+            let child_local = review_local_bridge(
+                &root,
+                &pin.child.repo_id,
+                &pin.child_git_branch,
+                &pin.git_remote_url,
+                child_git.observed_tip.as_deref(),
+            )
+            .unwrap_or_else(|_| review_local_unknown());
+            let parent_local = review_local_bridge(
+                &root,
+                &pin.parent.repo_id,
+                &pin.parent_git_branch,
+                &pin.git_remote_url,
+                parent_git.observed_tip.as_deref(),
+            )
+            .unwrap_or_else(|_| review_local_unknown());
+            (
+                configuration,
+                child_git,
+                parent_git,
+                child_local,
+                parent_local,
+            )
         })
         .await
         .context("review input observation worker failed")?;
@@ -2004,13 +2128,26 @@ pub(super) async fn capture_registered_review_intake(
         blocked: Some("visibility_or_history_unknown".into()),
         visibility: None,
     };
-    let child_svn = review_svn_pending(&child_client, &initial_pin.child_svn_url, initial_pin.child.last_svn_rev)
-        .await
-        .unwrap_or_else(|_| unknown(initial_pin.child.last_svn_rev));
-    let parent_svn = review_svn_pending(&parent_client, &initial_pin.parent_svn_url, initial_pin.parent.last_svn_rev)
-        .await
-        .unwrap_or_else(|_| unknown(initial_pin.parent.last_svn_rev));
-    anyhow::ensure!(db.capture_pair_refresh_execution_configuration(child_id)?.pin() == &initial_pin, "registered review configuration changed");
+    let child_svn = review_svn_pending(
+        &child_client,
+        &initial_pin.child_svn_url,
+        initial_pin.child.last_svn_rev,
+    )
+    .await
+    .unwrap_or_else(|_| unknown(initial_pin.child.last_svn_rev));
+    let parent_svn = review_svn_pending(
+        &parent_client,
+        &initial_pin.parent_svn_url,
+        initial_pin.parent.last_svn_rev,
+    )
+    .await
+    .unwrap_or_else(|_| unknown(initial_pin.parent.last_svn_rev));
+    anyhow::ensure!(
+        db.capture_pair_refresh_execution_configuration(child_id)?
+            .pin()
+            == &initial_pin,
+        "registered review configuration changed"
+    );
     let mut intake = RegisteredReviewIntake {
         schema: 1,
         child: ReviewPendingSide {
@@ -2028,7 +2165,8 @@ pub(super) async fn capture_registered_review_intake(
         configuration: initial_pin,
         observation_digest: String::new(),
     };
-    intake.observation_digest = changed_child_applicability_digest("registered_review_intake_v1", &intake)?;
+    intake.observation_digest =
+        changed_child_applicability_digest("registered_review_intake_v1", &intake)?;
     Ok(intake)
 }
 
@@ -2036,10 +2174,17 @@ pub(super) fn capture_review_applicability<'a>(
     db: &'a Database,
     child: &'a str,
     client: Option<reqwest::Client>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LiveChangedChildApplicabilityReview>> + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<LiveChangedChildApplicabilityReview>> + 'a>,
+> {
     // Store the large native observation future on the owned worker's heap;
     // do not duplicate it inline in each orchestration state machine.
-    Box::pin(capture_changed_child_applicability_with_sources(db, child, client, |_| Ok(())))
+    Box::pin(capture_changed_child_applicability_with_sources(
+        db,
+        child,
+        client,
+        |_| Ok(()),
+    ))
 }
 
 pub(super) fn capture_review_resolution<'a>(
@@ -2047,6 +2192,14 @@ pub(super) fn capture_review_resolution<'a>(
     child: &'a str,
     request: &'a super::preparation::ChangedChildResolutionCandidateRequest,
     client: Option<reqwest::Client>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LiveChangedChildResolutionCandidateReview>> + 'a>> {
-    Box::pin(capture_changed_child_resolution_candidate_with_sources(db, child, request, client, |_| Ok(())))
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<LiveChangedChildResolutionCandidateReview>> + 'a>,
+> {
+    Box::pin(capture_changed_child_resolution_candidate_with_sources(
+        db,
+        child,
+        request,
+        client,
+        |_| Ok(()),
+    ))
 }

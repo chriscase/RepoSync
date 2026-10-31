@@ -479,7 +479,13 @@ impl RefreshService {
                     "refresh request already has a live preparation"
                 );
                 anyhow::ensure!(
-                    workers.len() + self.review_workers.lock().unwrap_or_else(|p| p.into_inner()).len() < MAX_WORKERS,
+                    workers.len()
+                        + self
+                            .review_workers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .len()
+                        < MAX_WORKERS,
                     "refresh preparation capacity reached"
                 );
                 workers.insert(
@@ -1376,14 +1382,21 @@ struct ReviewRegistration {
 impl Drop for ReviewRegistration {
     fn drop(&mut self) {
         if let Some(service) = self.service.upgrade() {
-            service.review_workers.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.handle);
+            service
+                .review_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.handle);
         }
     }
 }
 
 fn require_review_pin(pin: &str) -> Result<()> {
     anyhow::ensure!(
-        pin.len() == 64 && pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        pin.len() == 64
+            && pin
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         RefreshReviewRefusal::MalformedRequest
     );
     Ok(())
@@ -1405,7 +1418,11 @@ fn authenticated_review_pin(
 
 impl RefreshService {
     /// A real configured-source read, not a preparation or approval request.
-    pub async fn review(self: &Arc<Self>, bearer: String, child: String) -> Result<RefreshReviewResponse> {
+    pub async fn review(
+        self: &Arc<Self>,
+        bearer: String,
+        child: String,
+    ) -> Result<RefreshReviewResponse> {
         self.spawn_review(bearer, child, ReviewCommand::Read).await
     }
 
@@ -1418,7 +1435,8 @@ impl RefreshService {
         child: String,
         boundary: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<RefreshReviewResponse> {
-        self.spawn_review(bearer, child, ReviewCommand::ReadAtBoundary(boundary)).await
+        self.spawn_review(bearer, child, ReviewCommand::ReadAtBoundary(boundary))
+            .await
     }
 
     #[cfg(test)]
@@ -1433,18 +1451,28 @@ impl RefreshService {
         request: RefreshReviewCandidateRequest,
     ) -> Result<RefreshReviewResponse> {
         require_review_pin(&request.review_pin)?;
-        super::preparation::require_changed_child_resolution_request_header(&request.resolution).map_err(|_| RefreshReviewRefusal::MalformedRequest)?;
-        anyhow::ensure!(request.resolution.choices.len() <= 1000, RefreshReviewRefusal::MalformedRequest);
-        self.spawn_review(bearer, child, ReviewCommand::Candidate(request)).await
+        super::preparation::require_changed_child_resolution_request_header(&request.resolution)
+            .map_err(|_| RefreshReviewRefusal::MalformedRequest)?;
+        anyhow::ensure!(
+            request.resolution.choices.len() <= 1000,
+            RefreshReviewRefusal::MalformedRequest
+        );
+        self.spawn_review(bearer, child, ReviewCommand::Candidate(request))
+            .await
     }
 
     /// Confined to the existing explicit reliability-fixture build. Production
     /// construction still uses the normal pinned HTTPS client and trust store.
     /// This supplies only a transport client, never a source/actor/mapping proof.
     #[cfg(feature = "reliability-fixture")]
-    pub fn with_review_fixture_client(engine: Arc<SyncEngine>, client: reqwest::Client) -> Arc<Self> {
+    pub fn with_review_fixture_client(
+        engine: Arc<SyncEngine>,
+        client: reqwest::Client,
+    ) -> Arc<Self> {
         let mut service = Self::new(engine);
-        Arc::get_mut(&mut service).expect("new service has one owner").fixture_client = Some(client);
+        Arc::get_mut(&mut service)
+            .expect("new service has one owner")
+            .fixture_client = Some(client);
         service
     }
 
@@ -1454,56 +1482,88 @@ impl RefreshService {
         child: String,
         command: ReviewCommand,
     ) -> Result<RefreshReviewResponse> {
-        anyhow::ensure!(!child.is_empty() && child.len() <= 256, "bounded repository ID required");
-        anyhow::ensure!(self.recovery_owner.is_none(), "inspection unavailable on recovery-only service");
+        anyhow::ensure!(
+            !child.is_empty() && child.len() <= 256,
+            "bounded repository ID required"
+        );
+        anyhow::ensure!(
+            self.recovery_owner.is_none(),
+            "inspection unavailable on recovery-only service"
+        );
         // Admission precedes configured endpoint/scratch reads, also for a
         // direct service caller that did not traverse the HTTP bearer helper.
         self.engine.capture_pair_refresh_actor_policy(&bearer)?;
         let result = {
             let mut threads = self.threads.lock().unwrap_or_else(|p| p.into_inner());
-            anyhow::ensure!(!self.stopping.load(Ordering::Acquire), "refresh service is stopping");
+            anyhow::ensure!(
+                !self.stopping.load(Ordering::Acquire),
+                "refresh service is stopping"
+            );
             if collect_finished_workers(&mut threads) {
                 self.worker_failures.store(true, Ordering::Release);
             }
             // Same lock order/admission budget as spawn_request. No detached
             // work or extra independent read-worker budget.
             let workers = self.workers.lock().unwrap_or_else(|p| p.into_inner());
-            let mut readers = self.review_workers.lock().unwrap_or_else(|p| p.into_inner());
-            anyhow::ensure!(workers.len() + readers.len() < MAX_WORKERS, "refresh preparation capacity reached");
+            let mut readers = self
+                .review_workers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            anyhow::ensure!(
+                workers.len() + readers.len() < MAX_WORKERS,
+                "refresh preparation capacity reached"
+            );
             let handle = Uuid::new_v4();
             readers.insert(handle);
             drop(readers);
             drop(workers);
             let (reply, result) = oneshot::channel();
-            let registration = ReviewRegistration { service: Arc::downgrade(self), handle };
+            let registration = ReviewRegistration {
+                service: Arc::downgrade(self),
+                handle,
+            };
             let engine = self.engine.clone();
             let client = self.fixture_client.clone();
-            let spawned = std::thread::Builder::new().name("pair-refresh-review".into()).spawn(move || {
-                let _registration = registration;
-                let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
-                    Ok(runtime) => runtime,
-                    Err(_) => {
-                        let _ = reply.send(Err(anyhow::anyhow!("inspection runtime unavailable")));
-                        return;
-                    }
-                };
-                // HTTP cancellation drops only the receiver. This thread owns
-                // its complete future/resources until it finishes; its actual
-                // JoinHandle is retained by the existing shutdown collector.
-                let value = runtime.block_on(Box::pin(authenticated_review(&engine, &bearer, &child, client, command)));
-                drop(runtime);
-                let _ = reply.send(value);
-            });
+            let spawned = std::thread::Builder::new()
+                .name("pair-refresh-review".into())
+                .spawn(move || {
+                    let _registration = registration;
+                    let runtime = match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(_) => {
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("inspection runtime unavailable")));
+                            return;
+                        }
+                    };
+                    // HTTP cancellation drops only the receiver. This thread owns
+                    // its complete future/resources until it finishes; its actual
+                    // JoinHandle is retained by the existing shutdown collector.
+                    let value = runtime.block_on(Box::pin(authenticated_review(
+                        &engine, &bearer, &child, client, command,
+                    )));
+                    drop(runtime);
+                    let _ = reply.send(value);
+                });
             match spawned {
                 Ok(thread) => threads.push(thread),
                 Err(_) => {
-                    self.review_workers.lock().unwrap_or_else(|p| p.into_inner()).remove(&handle);
+                    self.review_workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&handle);
                     bail!("inspection worker unavailable");
                 }
             }
             result
         };
-        result.await.context("inspection worker ended without a result")?
+        result
+            .await
+            .context("inspection worker ended without a result")?
     }
 }
 
@@ -1517,9 +1577,20 @@ async fn authenticated_review(
     use super::live_preparation::{
         capture_registered_review_intake, capture_review_applicability, capture_review_resolution,
     };
-    let actor = engine.capture_pair_refresh_actor_policy(bearer).map_err(|_| RefreshReviewRefusal::AuthorizationChanged)?;
-    let intake = capture_registered_review_intake(engine.db(), child, &engine.config().daemon.data_dir, client.clone()).await.map_err(|_| RefreshReviewRefusal::Unavailable)?;
-    actor.require_current(engine).map_err(|_| RefreshReviewRefusal::AuthorizationChanged)?;
+    let actor = engine
+        .capture_pair_refresh_actor_policy(bearer)
+        .map_err(|_| RefreshReviewRefusal::AuthorizationChanged)?;
+    let intake = capture_registered_review_intake(
+        engine.db(),
+        child,
+        &engine.config().daemon.data_dir,
+        client.clone(),
+    )
+    .await
+    .map_err(|_| RefreshReviewRefusal::Unavailable)?;
+    actor
+        .require_current(engine)
+        .map_err(|_| RefreshReviewRefusal::AuthorizationChanged)?;
     let raw_intake = intake.clone();
     let mut blocked = intake.blocked_reasons();
     let mut expected_context = None;
@@ -1543,7 +1614,10 @@ async fn authenticated_review(
     if response.pending.may_attempt_correspondence() {
         match capture_review_applicability(engine.db(), child, client.clone()).await {
             Ok(review) => {
-                response.pending.bind_correspondence_presence(&review).map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
+                response
+                    .pending
+                    .bind_correspondence_presence(&review)
+                    .map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
                 blocked = response.pending.blocked_reasons();
                 anyhow::ensure!(blocked.is_empty(), RefreshReviewRefusal::Unavailable);
                 let pin = authenticated_review_pin(&actor, &response.pending, review.manifest())?;
@@ -1562,11 +1636,27 @@ async fn authenticated_review(
                         response.state = "ready";
                     }
                     ReviewCommand::Candidate(request) => {
-                        anyhow::ensure!(request.review_pin == pin, RefreshReviewRefusal::StaleReview);
-                        review.require_manifest_digest(&request.resolution.manifest_digest).map_err(|_| RefreshReviewRefusal::StaleReview)?;
-                        let candidate = capture_review_resolution(engine.db(), child, &request.resolution, client.clone()).await.map_err(|_| RefreshReviewRefusal::ChoicesOrSourcesRefused)?;
                         anyhow::ensure!(
-                            authenticated_review_pin(&actor, &response.pending, candidate.applicability_review().manifest())? == pin,
+                            request.review_pin == pin,
+                            RefreshReviewRefusal::StaleReview
+                        );
+                        review
+                            .require_manifest_digest(&request.resolution.manifest_digest)
+                            .map_err(|_| RefreshReviewRefusal::StaleReview)?;
+                        let candidate = capture_review_resolution(
+                            engine.db(),
+                            child,
+                            &request.resolution,
+                            client.clone(),
+                        )
+                        .await
+                        .map_err(|_| RefreshReviewRefusal::ChoicesOrSourcesRefused)?;
+                        anyhow::ensure!(
+                            authenticated_review_pin(
+                                &actor,
+                                &response.pending,
+                                candidate.applicability_review().manifest()
+                            )? == pin,
                             RefreshReviewRefusal::SourcesChanged
                         );
                         response.candidate = Some(serde_json::to_value(candidate.manifest())?);
@@ -1575,14 +1665,22 @@ async fn authenticated_review(
                 }
                 response.review_pin = Some(pin);
             }
-            Err(_) => blocked.push("registered_history_correspondence_visibility_or_topology_refused".into()),
+            Err(_) => blocked
+                .push("registered_history_correspondence_visibility_or_topology_refused".into()),
         }
     }
     #[cfg(test)]
     if let Some(boundary) = boundary {
         boundary();
     }
-    let repeated = capture_registered_review_intake(engine.db(), child, &engine.config().daemon.data_dir, client).await.map_err(|_| RefreshReviewRefusal::Unavailable)?;
+    let repeated = capture_registered_review_intake(
+        engine.db(),
+        child,
+        &engine.config().daemon.data_dir,
+        client,
+    )
+    .await
+    .map_err(|_| RefreshReviewRefusal::Unavailable)?;
     // Compare like-for-like raw observations. The separately promoted complete
     // flags/pins came from the actual opaque correspondence factory above and
     // are bound to exactly this configuration, role and observed peg interval.
@@ -1590,10 +1688,22 @@ async fn authenticated_review(
     // The extra intake extends the observation interval. Recheck the native
     // candidate/mapping closure again rather than merely comparing tips/rows.
     if let Some((pin, candidates, mappings)) = expected_context {
-        let current = engine.db().capture_pair_refresh_execution_configuration(child).map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
-        let candidate = engine.db().capture_changed_child_baseline_candidate_review(&current).map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
-        let mapping = engine.db().capture_changed_child_mapping_review(&current, &candidate).map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
-        let final_configuration = engine.db().capture_pair_refresh_execution_configuration(child).map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
+        let current = engine
+            .db()
+            .capture_pair_refresh_execution_configuration(child)
+            .map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
+        let candidate = engine
+            .db()
+            .capture_changed_child_baseline_candidate_review(&current)
+            .map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
+        let mapping = engine
+            .db()
+            .capture_changed_child_mapping_review(&current, &candidate)
+            .map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
+        let final_configuration = engine
+            .db()
+            .capture_pair_refresh_execution_configuration(child)
+            .map_err(|_| RefreshReviewRefusal::SourcesChanged)?;
         anyhow::ensure!(
             current.pin() == &pin
                 && candidate.candidate_set_digest() == candidates.as_str()
@@ -1602,7 +1712,9 @@ async fn authenticated_review(
             RefreshReviewRefusal::SourcesChanged
         );
     }
-    actor.require_current(engine).map_err(|_| RefreshReviewRefusal::AuthorizationChanged)?;
+    actor
+        .require_current(engine)
+        .map_err(|_| RefreshReviewRefusal::AuthorizationChanged)?;
     response.blocked = blocked;
     Ok(response)
 }

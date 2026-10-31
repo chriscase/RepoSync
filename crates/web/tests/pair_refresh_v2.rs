@@ -318,15 +318,35 @@ async fn review_routes_require_native_admin_and_actual_engine_without_writes() {
     let f = fixture(false).await;
     let before = state(&f);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    for token in [None, Some("token-user"), Some("token-disabled"), Some("token-expired"), Some("legacy-memory-token"), Some("unknown")] {
-        let mut request = client.post(format!("{}/api/v2/repos/child/refresh/review", f.url)).json(&serde_json::json!({}));
-        if let Some(token) = token { request = request.bearer_auth(token); }
-        assert_eq!(request.send().await.unwrap().status(), reqwest::StatusCode::UNAUTHORIZED);
+    for token in [
+        None,
+        Some("token-user"),
+        Some("token-disabled"),
+        Some("token-expired"),
+        Some("legacy-memory-token"),
+        Some("unknown"),
+    ] {
+        let mut request = client
+            .post(format!("{}/api/v2/repos/child/refresh/review", f.url))
+            .json(&serde_json::json!({}));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
     }
     assert_eq!(state(&f), before);
     let other = fixture(true).await;
     let before = state(&other);
-    let response = client.post(format!("{}/api/v2/repos/child/refresh/review", other.url)).bearer_auth("token-admin").json(&serde_json::json!({})).send().await.unwrap();
+    let response = client
+        .post(format!("{}/api/v2/repos/child/refresh/review", other.url))
+        .bearer_auth("token-admin")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(state(&other), before);
 }
@@ -336,21 +356,47 @@ async fn review_routes_reject_authority_fields_and_remain_absent_from_recovery()
     let f = fixture(false).await;
     let before = state(&f);
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    for body in [serde_json::json!({"execute":true}), serde_json::json!({"actor_id":"admin"}), serde_json::json!({"historical_operation_id":uuid::Uuid::new_v4()})] {
-        let response = client.post(format!("{}/api/v2/repos/child/refresh/review", f.url)).bearer_auth("token-admin").json(&body).send().await.unwrap();
+    for body in [
+        serde_json::json!({"execute":true}),
+        serde_json::json!({"actor_id":"admin"}),
+        serde_json::json!({"historical_operation_id":uuid::Uuid::new_v4()}),
+    ] {
+        let response = client
+            .post(format!("{}/api/v2/repos/child/refresh/review", f.url))
+            .bearer_auth("token-admin")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     }
     let body = serde_json::json!({"review_pin":"0".repeat(64),"resolution":{"schema":1,"policy":"unsupported","manifest_digest":"0".repeat(64),"choices":[]}});
-    let response = client.post(format!("{}/api/v2/repos/child/refresh/review/candidate", f.url)).bearer_auth("token-admin").json(&body).send().await.unwrap();
+    let response = client
+        .post(format!(
+            "{}/api/v2/repos/child/refresh/review/candidate",
+            f.url
+        ))
+        .bearer_auth("token-admin")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(state(&f), before);
-    let service = reposync_core::pair_refresh::service::RefreshService::new(f.state.sync_engine.clone());
+    let service =
+        reposync_core::pair_refresh::service::RefreshService::new(f.state.sync_engine.clone());
     let router = api::pair_refresh::recovery_routes(service.clone()).with_state(f.state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let root = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     for suffix in ["review", "review/candidate"] {
-        let response = client.post(format!("{root}/api/v2/repos/child/refresh/{suffix}")).bearer_auth("token-admin").json(&serde_json::json!({})).send().await.unwrap();
+        let response = client
+            .post(format!("{root}/api/v2/repos/child/refresh/{suffix}"))
+            .bearer_auth("token-admin")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     }
     assert_eq!(state(&f), before);
@@ -368,223 +414,223 @@ mod review_fixture_process;
 #[cfg(all(feature = "reliability-fixture", unix))]
 mod authenticated_review_http_journey {
     use super::review_fixture_process as fixture_process;
+    use git2::{Oid, Repository, Signature, Time};
+    use reposync_core::db::pair_refresh_operations::{PairRefreshOperation, PairRefreshPhase};
+    use reposync_core::db::Database;
+    use reposync_core::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
+    use reposync_web::{api, WebServer};
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::Arc;
-    use git2::{Oid, Repository, Signature, Time};
     use uuid::Uuid;
-    use reposync_core::db::Database;
-    use reposync_core::db::pair_refresh_operations::{PairRefreshOperation, PairRefreshPhase};
-    use reposync_core::pair_refresh::service::{RefreshAction, RefreshResponse, RefreshService};
-    use reposync_web::{api, WebServer};
 
     // Same real SCM fixture/bootstrap as the qualified core source tests. Only
     // the transport client gains its disposable CA; actual proofs stay native.
-fn run(command: &mut Command) -> String {
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
-
-fn svn(args: &[&str], directory: Option<&Path>) {
-    let mut command = Command::new("svn");
-    command
-        .args(args)
-        .args(["--non-interactive", "--no-auth-cache"]);
-    if let Some(directory) = directory {
-        command.current_dir(directory);
+    fn run(command: &mut Command) -> String {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
-    run(&mut command);
-}
 
-fn commit(repository: &Repository, bytes: &[u8], parents: &[Oid]) -> Oid {
-    let mut tree = repository.treebuilder(None).unwrap();
-    tree.insert("file.txt", repository.blob(bytes).unwrap(), 0o100644)
-        .unwrap();
-    let tree_id = tree.write().unwrap();
-    let tree = repository.find_tree(tree_id).unwrap();
-    let signature = Signature::new(
-        "Disposable preparation fixture",
-        "fixture@example.invalid",
-        &Time::new(1_790_000_000, 0),
-    )
-    .unwrap();
-    let parents = parents
-        .iter()
-        .map(|id| repository.find_commit(*id).unwrap())
-        .collect::<Vec<_>>();
-    let parents = parents.iter().collect::<Vec<_>>();
-    repository
-        .commit(None, &signature, &signature, "fixture", &tree, &parents)
-        .unwrap()
-}
-
-struct Fixture {
-    db: Database,
-    _server: fixture_process::OwnedProcessGroup,
-    target: Repository,
-    _parent_wc: PathBuf,
-    root: String,
-    baseline: Oid,
-    parent: Oid,
-    client: reqwest::Client,
-    log: PathBuf,
-    temp: tempfile::TempDir,
-}
-
-impl Fixture {
-    fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        let db = Database::new(temp.path().join("reposync.db")).unwrap();
-        db.initialize().unwrap();
-        let svn_repository = temp.path().join("svn-repository");
-        run(Command::new("svnadmin").arg("create").arg(&svn_repository));
-        let root = reqwest::Url::from_file_path(svn_repository.canonicalize().unwrap())
-            .unwrap()
-            .to_string();
-        svn(
-            &[
-                "mkdir",
-                &format!("{root}/trunk"),
-                &format!("{root}/branches"),
-                "-m",
-                "layout",
-            ],
-            None,
-        );
-        let parent_wc = temp.path().join("parent-wc");
-        svn(
-            &[
-                "checkout",
-                &format!("{root}/trunk"),
-                parent_wc.to_str().unwrap(),
-            ],
-            None,
-        );
-        std::fs::write(parent_wc.join("file.txt"), b"baseline\n").unwrap();
-        svn(&["add", "file.txt"], Some(&parent_wc));
-        svn(&["commit", "-m", "baseline"], Some(&parent_wc));
-        svn(
-            &[
-                "copy",
-                &format!("{root}/trunk@2"),
-                &format!("{root}/branches/f"),
-                "-m",
-                "direct copy",
-            ],
-            None,
-        );
-        std::fs::write(parent_wc.join("file.txt"), b"advanced\n").unwrap();
-        svn(&["commit", "-m", "parent advance"], Some(&parent_wc));
-
-        let target = Repository::init_bare(temp.path().join("target.git")).unwrap();
-        let baseline = commit(&target, b"baseline\n", &[]);
-        let parent = commit(&target, b"advanced\n", &[baseline]);
-        target
-            .reference("refs/heads/feature", baseline, false, "fixture")
-            .unwrap();
-        target
-            .reference("refs/heads/main", parent, false, "fixture")
-            .unwrap();
-        let cert = temp.path().join("cert.pem");
-        let key = temp.path().join("key.pem");
-        let config = temp.path().join("cert.cnf");
-        std::fs::write(&config, "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:false\n").unwrap();
-        run(Command::new("openssl")
-            .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout",
-            ])
-            .arg(&key)
-            .arg("-out")
-            .arg(&cert)
-            .arg("-config")
-            .arg(&config));
-        let der = temp.path().join("cert.der");
-        run(Command::new("openssl")
-            .arg("x509")
-            .arg("-in")
-            .arg(&cert)
-            .args(["-outform", "DER", "-out"])
-            .arg(&der));
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
-            .add_root_certificate(
-                reqwest::Certificate::from_der(&std::fs::read(der).unwrap()).unwrap(),
-            )
-            .build()
-            .unwrap();
-        let log = temp.path().join("requests.jsonl");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../core/tests/fixtures/pair_refresh_http_server.py");
-        let mut command = Command::new("python3");
+    fn svn(args: &[&str], directory: Option<&Path>) {
+        let mut command = Command::new("svn");
         command
-            .arg(script)
-            .arg(temp.path())
-            .arg("--cert")
-            .arg(&cert)
-            .arg("--key")
-            .arg(&key)
-            .arg("--token")
-            .arg("disposable-preparation-token")
-            .arg("--request-log")
-            .arg(&log)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut server = fixture_process::OwnedProcessGroup::spawn(&mut command).unwrap();
-        let mut line = String::new();
-        BufReader::new(server.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let ready: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let url = ready["url"].as_str().unwrap();
-        db.set_state("encryption_key", &"41".repeat(32)).unwrap();
-        for (id, parent_id, sha, revision, git_branch, svn_branch) in [
-            ("parent", None, parent, 4, "main", "trunk"),
-            (
-                "child",
-                Some("parent"),
-                baseline,
-                3,
-                "feature",
-                "branches/f",
-            ),
-        ] {
-            let scope = Uuid::new_v4().to_string();
-            db.conn().execute("INSERT INTO repositories(id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors,parent_id,scope_uuid) VALUES(?1,?1,?2,?3,'','gitea',?4,'target',?5,'team',5,0,0,1,'t','t',?6,?7,'idle',0,0,?8,?9)", rusqlite::params![id, root, svn_branch, format!("{}/api/v1", url.trim_end_matches("/target.git")), git_branch, revision, sha.to_string(), parent_id, scope]).unwrap();
-            db.set_state(&format!("last_svn_rev_{id}"), &revision.to_string())
-                .unwrap();
-            db.set_state(&format!("last_git_sha_{scope}"), &sha.to_string())
-                .unwrap();
-            db.set_state(
-                &format!("secret_git_token_{id}"),
-                "disposable-preparation-token",
-            )
-            .unwrap();
+            .args(args)
+            .args(["--non-interactive", "--no-auth-cache"]);
+        if let Some(directory) = directory {
+            command.current_dir(directory);
         }
-        Self {
-            db,
-            _server: server,
-            target,
-            _parent_wc: parent_wc,
-            root,
-            baseline,
-            parent,
-            client,
-            log,
-            temp,
-        }
+        run(&mut command);
     }
 
-    fn engine(&self) -> reposync_core::sync_engine::SyncEngine {
-        let mut config: reposync_core::config::AppConfig = toml::from_str(
-            r#"
+    fn commit(repository: &Repository, bytes: &[u8], parents: &[Oid]) -> Oid {
+        let mut tree = repository.treebuilder(None).unwrap();
+        tree.insert("file.txt", repository.blob(bytes).unwrap(), 0o100644)
+            .unwrap();
+        let tree_id = tree.write().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = Signature::new(
+            "Disposable preparation fixture",
+            "fixture@example.invalid",
+            &Time::new(1_790_000_000, 0),
+        )
+        .unwrap();
+        let parents = parents
+            .iter()
+            .map(|id| repository.find_commit(*id).unwrap())
+            .collect::<Vec<_>>();
+        let parents = parents.iter().collect::<Vec<_>>();
+        repository
+            .commit(None, &signature, &signature, "fixture", &tree, &parents)
+            .unwrap()
+    }
+
+    struct Fixture {
+        db: Database,
+        _server: fixture_process::OwnedProcessGroup,
+        target: Repository,
+        _parent_wc: PathBuf,
+        root: String,
+        baseline: Oid,
+        parent: Oid,
+        client: reqwest::Client,
+        log: PathBuf,
+        temp: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let db = Database::new(temp.path().join("reposync.db")).unwrap();
+            db.initialize().unwrap();
+            let svn_repository = temp.path().join("svn-repository");
+            run(Command::new("svnadmin").arg("create").arg(&svn_repository));
+            let root = reqwest::Url::from_file_path(svn_repository.canonicalize().unwrap())
+                .unwrap()
+                .to_string();
+            svn(
+                &[
+                    "mkdir",
+                    &format!("{root}/trunk"),
+                    &format!("{root}/branches"),
+                    "-m",
+                    "layout",
+                ],
+                None,
+            );
+            let parent_wc = temp.path().join("parent-wc");
+            svn(
+                &[
+                    "checkout",
+                    &format!("{root}/trunk"),
+                    parent_wc.to_str().unwrap(),
+                ],
+                None,
+            );
+            std::fs::write(parent_wc.join("file.txt"), b"baseline\n").unwrap();
+            svn(&["add", "file.txt"], Some(&parent_wc));
+            svn(&["commit", "-m", "baseline"], Some(&parent_wc));
+            svn(
+                &[
+                    "copy",
+                    &format!("{root}/trunk@2"),
+                    &format!("{root}/branches/f"),
+                    "-m",
+                    "direct copy",
+                ],
+                None,
+            );
+            std::fs::write(parent_wc.join("file.txt"), b"advanced\n").unwrap();
+            svn(&["commit", "-m", "parent advance"], Some(&parent_wc));
+
+            let target = Repository::init_bare(temp.path().join("target.git")).unwrap();
+            let baseline = commit(&target, b"baseline\n", &[]);
+            let parent = commit(&target, b"advanced\n", &[baseline]);
+            target
+                .reference("refs/heads/feature", baseline, false, "fixture")
+                .unwrap();
+            target
+                .reference("refs/heads/main", parent, false, "fixture")
+                .unwrap();
+            let cert = temp.path().join("cert.pem");
+            let key = temp.path().join("key.pem");
+            let config = temp.path().join("cert.cnf");
+            std::fs::write(&config, "[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:false\n").unwrap();
+            run(Command::new("openssl")
+                .args([
+                    "req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout",
+                ])
+                .arg(&key)
+                .arg("-out")
+                .arg(&cert)
+                .arg("-config")
+                .arg(&config));
+            let der = temp.path().join("cert.der");
+            run(Command::new("openssl")
+                .arg("x509")
+                .arg("-in")
+                .arg(&cert)
+                .args(["-outform", "DER", "-out"])
+                .arg(&der));
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .add_root_certificate(
+                    reqwest::Certificate::from_der(&std::fs::read(der).unwrap()).unwrap(),
+                )
+                .build()
+                .unwrap();
+            let log = temp.path().join("requests.jsonl");
+            let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../core/tests/fixtures/pair_refresh_http_server.py");
+            let mut command = Command::new("python3");
+            command
+                .arg(script)
+                .arg(temp.path())
+                .arg("--cert")
+                .arg(&cert)
+                .arg("--key")
+                .arg(&key)
+                .arg("--token")
+                .arg("disposable-preparation-token")
+                .arg("--request-log")
+                .arg(&log)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            let mut server = fixture_process::OwnedProcessGroup::spawn(&mut command).unwrap();
+            let mut line = String::new();
+            BufReader::new(server.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let ready: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let url = ready["url"].as_str().unwrap();
+            db.set_state("encryption_key", &"41".repeat(32)).unwrap();
+            for (id, parent_id, sha, revision, git_branch, svn_branch) in [
+                ("parent", None, parent, 4, "main", "trunk"),
+                (
+                    "child",
+                    Some("parent"),
+                    baseline,
+                    3,
+                    "feature",
+                    "branches/f",
+                ),
+            ] {
+                let scope = Uuid::new_v4().to_string();
+                db.conn().execute("INSERT INTO repositories(id,name,svn_url,svn_branch,svn_username,git_provider,git_api_url,git_repo,git_branch,sync_mode,poll_interval_secs,lfs_threshold_mb,auto_merge,enabled,created_at,updated_at,last_svn_rev,last_git_sha,sync_status,total_syncs,total_errors,parent_id,scope_uuid) VALUES(?1,?1,?2,?3,'','gitea',?4,'target',?5,'team',5,0,0,1,'t','t',?6,?7,'idle',0,0,?8,?9)", rusqlite::params![id, root, svn_branch, format!("{}/api/v1", url.trim_end_matches("/target.git")), git_branch, revision, sha.to_string(), parent_id, scope]).unwrap();
+                db.set_state(&format!("last_svn_rev_{id}"), &revision.to_string())
+                    .unwrap();
+                db.set_state(&format!("last_git_sha_{scope}"), &sha.to_string())
+                    .unwrap();
+                db.set_state(
+                    &format!("secret_git_token_{id}"),
+                    "disposable-preparation-token",
+                )
+                .unwrap();
+            }
+            Self {
+                db,
+                _server: server,
+                target,
+                _parent_wc: parent_wc,
+                root,
+                baseline,
+                parent,
+                client,
+                log,
+                temp,
+            }
+        }
+
+        fn engine(&self) -> reposync_core::sync_engine::SyncEngine {
+            let mut config: reposync_core::config::AppConfig = toml::from_str(
+                r#"
             [daemon]
             data_dir = "/unused"
             [svn]
@@ -595,59 +641,58 @@ impl Fixture {
             repo = "fixture/repo"
             token_env = ""
         "#,
-        )
-        .unwrap();
-        config.daemon.data_dir = self.temp.path().to_owned();
-        let created = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
-        self.db
-            .insert_user(&reposync_core::models::User {
-                id: "admin".into(),
-                username: "admin".into(),
-                display_name: "Admin".into(),
-                email: "admin@example.invalid".into(),
-                password_hash: "fixture".into(),
-                role: "admin".into(),
-                enabled: true,
-                created_at: created.clone(),
-                updated_at: created,
-            })
+            )
             .unwrap();
-        self.db
-            .insert_session(&reposync_core::models::Session {
-                token: "disposable-workspace-session".into(),
-                user_id: "admin".into(),
-                created_at: (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
-                expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            })
-            .unwrap();
-        let git_dir = self.temp.path().join("engine-git");
-        Repository::init(&git_dir).unwrap();
-        reposync_core::sync_engine::SyncEngine::new(
-            config,
-            Database::new(self.temp.path().join("reposync.db")).unwrap(),
-            reposync_core::svn::SvnClient::new("file:///unused/svn", "", ""),
-            reposync_core::git::client::GitClient::new(git_dir).unwrap(),
-            std::sync::Arc::new(
-                reposync_core::identity::mapper::IdentityMapper::new(
-                    &reposync_core::config::IdentityConfig::default(),
-                )
-                .unwrap(),
-            ),
-        )
-    }
+            config.daemon.data_dir = self.temp.path().to_owned();
+            let created = (chrono::Utc::now() - chrono::Duration::minutes(2)).to_rfc3339();
+            self.db
+                .insert_user(&reposync_core::models::User {
+                    id: "admin".into(),
+                    username: "admin".into(),
+                    display_name: "Admin".into(),
+                    email: "admin@example.invalid".into(),
+                    password_hash: "fixture".into(),
+                    role: "admin".into(),
+                    enabled: true,
+                    created_at: created.clone(),
+                    updated_at: created,
+                })
+                .unwrap();
+            self.db
+                .insert_session(&reposync_core::models::Session {
+                    token: "disposable-workspace-session".into(),
+                    user_id: "admin".into(),
+                    created_at: (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                    expires_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                })
+                .unwrap();
+            let git_dir = self.temp.path().join("engine-git");
+            Repository::init(&git_dir).unwrap();
+            reposync_core::sync_engine::SyncEngine::new(
+                config,
+                Database::new(self.temp.path().join("reposync.db")).unwrap(),
+                reposync_core::svn::SvnClient::new("file:///unused/svn", "", ""),
+                reposync_core::git::client::GitClient::new(git_dir).unwrap(),
+                std::sync::Arc::new(
+                    reposync_core::identity::mapper::IdentityMapper::new(
+                        &reposync_core::config::IdentityConfig::default(),
+                    )
+                    .unwrap(),
+                ),
+            )
+        }
 
-    fn state(&self) -> Vec<(String, String, String)> {
-        self.db
-            .conn()
-            .prepare("SELECT key,value,updated_at FROM kv_state ORDER BY key")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
+        fn state(&self) -> Vec<(String, String, String)> {
+            self.db
+                .conn()
+                .prepare("SELECT key,value,updated_at FROM kv_state ORDER BY key")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
     }
-}
-
 
     fn svn_revision(url: &str) -> i64 {
         let mut command = Command::new("svn");
@@ -717,10 +762,12 @@ impl Fixture {
             reposync_core::svn::SvnClient::new(svn_url, "", ""),
             reposync_core::git::GitClient::new(&path).unwrap(),
             std::sync::Arc::new(
-                reposync_core::identity::mapper::IdentityMapper::new(&reposync_core::config::IdentityConfig {
-                    email_domain: Some("example.invalid".into()),
-                    ..Default::default()
-                })
+                reposync_core::identity::mapper::IdentityMapper::new(
+                    &reposync_core::config::IdentityConfig {
+                        email_domain: Some("example.invalid".into()),
+                        ..Default::default()
+                    },
+                )
                 .unwrap(),
             ),
         );
@@ -813,7 +860,11 @@ impl Fixture {
         let (parent_engine, parent_bridge) = producer_engine(f, "parent");
         let (child_engine, child_bridge) = producer_engine(f, "child");
         std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
-        std::fs::write(f._parent_wc.join("parent-only.txt"), b"preserve parent delta\n").unwrap();
+        std::fs::write(
+            f._parent_wc.join("parent-only.txt"),
+            b"preserve parent delta\n",
+        )
+        .unwrap();
         svn(&["add", "parent-only.txt"], Some(&f._parent_wc));
         svn(
             &[
@@ -923,12 +974,32 @@ impl Fixture {
         request: &str,
     ) -> PairRefreshOperation {
         let service = RefreshService::with_review_fixture_client(engine.clone(), f.client.clone());
-        let approval = match service.prepare("disposable-workspace-session".into(), "child".into(), request.into()).await.unwrap() {
+        let approval = match service
+            .prepare(
+                "disposable-workspace-session".into(),
+                "child".into(),
+                request.into(),
+            )
+            .await
+            .unwrap()
+        {
             RefreshResponse::Approval(approval) => approval,
-            RefreshResponse::Receipt(_) => panic!("new fixture request unexpectedly already completed"),
+            RefreshResponse::Receipt(_) => {
+                panic!("new fixture request unexpectedly already completed")
+            }
         };
         assert_eq!(approval.kind, "integration");
-        let receipt = service.act("disposable-workspace-session".into(), "child", request, approval.preparation_id, &approval.approval_digest, RefreshAction::Execute).await.unwrap();
+        let receipt = service
+            .act(
+                "disposable-workspace-session".into(),
+                "child",
+                request,
+                approval.preparation_id,
+                &approval.approval_digest,
+                RefreshAction::Execute,
+            )
+            .await
+            .unwrap();
         assert_eq!(receipt.phase, "completed");
         service.shutdown().await;
         let history = f.db.pair_refresh_operation(approval.operation_id).unwrap();
@@ -937,12 +1008,19 @@ impl Fixture {
     }
 
     fn install_bridges(f: &Fixture) {
-        let pin = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let pin =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         for (id, branch) in [("child", "feature"), ("parent", "main")] {
             let path = f.temp.path().join("repos").join(id).join("git-repo");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let repository = git2::build::RepoBuilder::new().branch(branch).clone(f.target.path().to_str().unwrap(), &path).unwrap();
-            repository.remote_set_url("origin", &pin.pin().git_remote_url).unwrap();
+            let repository = git2::build::RepoBuilder::new()
+                .branch(branch)
+                .clone(f.target.path().to_str().unwrap(), &path)
+                .unwrap();
+            repository
+                .remote_set_url("origin", &pin.pin().git_remote_url)
+                .unwrap();
         }
     }
 
@@ -964,22 +1042,48 @@ impl Fixture {
         let _lock = reposync_core::data_dir::acquire(f.temp.path()).unwrap();
         let ready = ready(&f, &engine).await;
         assert_eq!(ready.history.phase, PairRefreshPhase::Completed);
-        assert!(ready.parent_bridge.is_dir() && ready.child_bridge.is_dir() && ready.child_wc.is_dir());
+        assert!(
+            ready.parent_bridge.is_dir() && ready.child_bridge.is_dir() && ready.child_wc.is_dir()
+        );
         install_bridges(&f);
         let service = RefreshService::with_review_fixture_client(engine.clone(), f.client.clone());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let state = WebServer::new(engine.config().clone(), Database::new(f.temp.path().join("reposync.db")).unwrap(), engine.clone(), tx, f.temp.path().join("config.toml"), Arc::new(tokio::sync::RwLock::new(reposync_core::import::ImportProgress::default()))).app_state();
+        let state = WebServer::new(
+            engine.config().clone(),
+            Database::new(f.temp.path().join("reposync.db")).unwrap(),
+            engine.clone(),
+            tx,
+            f.temp.path().join("config.toml"),
+            Arc::new(tokio::sync::RwLock::new(
+                reposync_core::import::ImportProgress::default(),
+            )),
+        )
+        .app_state();
         let router = api::pair_refresh::review_fixture_routes(service.clone()).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let root = format!("http://{}/api/v2/repos/child/refresh", listener.local_addr().unwrap());
+        let root = format!(
+            "http://{}/api/v2/repos/child/refresh",
+            listener.local_addr().unwrap()
+        );
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let client = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(120)).build().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap();
         let before = f.state();
         let source_before = fixture_files(f.target.path());
         let svn_before = svn_revision(&f.root);
         let log_before = std::fs::read_to_string(&f.log).unwrap();
-        let refs = ["refs/heads/feature", "refs/heads/main"].map(|name| f.target.find_reference(name).unwrap().target().unwrap());
-        let response = client.post(format!("{root}/review")).bearer_auth("disposable-workspace-session").json(&serde_json::json!({})).send().await.unwrap();
+        let refs = ["refs/heads/feature", "refs/heads/main"]
+            .map(|name| f.target.find_reference(name).unwrap().target().unwrap());
+        let response = client
+            .post(format!("{root}/review"))
+            .bearer_auth("disposable-workspace-session")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let review: serde_json::Value = response.json().await.unwrap();
         assert_eq!(review["state"], "ready");
@@ -988,12 +1092,25 @@ impl Fixture {
         assert_eq!(review["execution_eligible"], false);
         assert_eq!(review["pending"]["child"]["git"]["pending_count"], 0);
         assert_eq!(review["pending"]["parent"]["git"]["pending_count"], 0);
-        for (choice, role) in [("base", "integrated_child"), ("child", "current_child"), ("parent", "current_parent")] {
-            let response = client.post(format!("{root}/review/candidate")).bearer_auth("disposable-workspace-session").json(&candidate_body(&review, choice)).send().await.unwrap();
+        for (choice, role) in [
+            ("base", "integrated_child"),
+            ("child", "current_child"),
+            ("parent", "current_parent"),
+        ] {
+            let response = client
+                .post(format!("{root}/review/candidate"))
+                .bearer_auth("disposable-workspace-session")
+                .json(&candidate_body(&review, choice))
+                .send()
+                .await
+                .unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             let candidate: serde_json::Value = response.json().await.unwrap();
             assert_eq!(candidate["state"], "candidate");
-            assert_eq!(candidate["candidate"]["graph"]["candidate_tree"], expected_candidate_tree(&f, &review["applicability"], role));
+            assert_eq!(
+                candidate["candidate"]["graph"]["candidate_tree"],
+                expected_candidate_tree(&f, &review["applicability"], role)
+            );
             assert_eq!(candidate["actor_approval"], false);
             assert_eq!(candidate["execution_eligible"], false);
         }
@@ -1001,27 +1118,63 @@ impl Fixture {
         // refused through the actual HTTP parser + live registered factory.
         let original = candidate_body(&review, "child");
         let mut invalid = Vec::new();
-        let mut body = original.clone(); body["review_pin"] = "0".repeat(64).into(); invalid.push(body);
-        let mut body = original.clone(); body["resolution"]["manifest_digest"] = "0".repeat(64).into(); invalid.push(body);
-        let mut body = original.clone(); body["resolution"]["choices"] = serde_json::json!([]); invalid.push(body);
-        let mut body = original.clone(); let duplicate = body["resolution"]["choices"][0].clone(); body["resolution"]["choices"].as_array_mut().unwrap().push(duplicate); invalid.push(body);
-        let mut body = original.clone(); body["resolution"]["choices"][0]["path"] = "unknown.txt".into(); invalid.push(body);
-        let mut body = original; body["resolution"]["choices"][0]["baseline"] = serde_json::json!({"kind":"absent"}); invalid.push(body);
+        let mut body = original.clone();
+        body["review_pin"] = "0".repeat(64).into();
+        invalid.push(body);
+        let mut body = original.clone();
+        body["resolution"]["manifest_digest"] = "0".repeat(64).into();
+        invalid.push(body);
+        let mut body = original.clone();
+        body["resolution"]["choices"] = serde_json::json!([]);
+        invalid.push(body);
+        let mut body = original.clone();
+        let duplicate = body["resolution"]["choices"][0].clone();
+        body["resolution"]["choices"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        invalid.push(body);
+        let mut body = original.clone();
+        body["resolution"]["choices"][0]["path"] = "unknown.txt".into();
+        invalid.push(body);
+        let mut body = original;
+        body["resolution"]["choices"][0]["baseline"] = serde_json::json!({"kind":"absent"});
+        invalid.push(body);
         for body in invalid {
-            let response = client.post(format!("{root}/review/candidate")).bearer_auth("disposable-workspace-session").json(&body).send().await.unwrap();
+            let response = client
+                .post(format!("{root}/review/candidate"))
+                .bearer_auth("disposable-workspace-session")
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
         }
         let response = client.post(format!("{root}/action")).bearer_auth("disposable-workspace-session").json(&serde_json::json!({"request_id":"view-not-approval","preparation_id":Uuid::new_v4(),"approval_digest":review["review_pin"],"action":"execute"})).send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
         assert_eq!(f.state(), before);
-        assert_eq!(["refs/heads/feature", "refs/heads/main"].map(|name| f.target.find_reference(name).unwrap().target().unwrap()), refs);
+        assert_eq!(
+            ["refs/heads/feature", "refs/heads/main"].map(|name| f
+                .target
+                .find_reference(name)
+                .unwrap()
+                .target()
+                .unwrap()),
+            refs
+        );
         let log = std::fs::read_to_string(&f.log).unwrap();
         // Setup deliberately published once; subsequent checks above compare
         // actual source refs and DB, not an HTTP-only publication counter.
         assert!(log.contains("git-upload-pack"));
         let path = f.temp.path().join("repos/child/git-repo/late.txt");
         std::fs::write(&path, b"preserved pending work").unwrap();
-        let response = client.post(format!("{root}/review/candidate")).bearer_auth("disposable-workspace-session").json(&candidate_body(&review, "child")).send().await.unwrap();
+        let response = client
+            .post(format!("{root}/review/candidate"))
+            .bearer_auth("disposable-workspace-session")
+            .json(&candidate_body(&review, "child"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let blocked: serde_json::Value = response.json().await.unwrap();
         assert_eq!(blocked["state"], "blocked");
@@ -1032,7 +1185,10 @@ impl Fixture {
         assert_eq!(svn_revision(&f.root), svn_before);
         let log_after = std::fs::read_to_string(&f.log).unwrap();
         assert!(log_after.starts_with(&log_before));
-        assert!(!log_after[log_before.len()..].contains("git-receive-pack"), "read phase must not attempt ordinary Git publication");
+        assert!(
+            !log_after[log_before.len()..].contains("git-receive-pack"),
+            "read phase must not attempt ordinary Git publication"
+        );
         service.shutdown().await;
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
@@ -1040,8 +1196,15 @@ impl Fixture {
     fn expected_candidate_tree(f: &Fixture, manifest: &serde_json::Value, role: &str) -> String {
         let roles = &manifest["graph"]["roles"];
         let mut bytes = Vec::new();
-        for (name, source_role) in [("child-only.txt", "current_child"), ("file.txt", role), ("parent-only.txt", "current_parent")] {
-            let tree = f.target.find_tree(Oid::from_str(roles[source_role]["tree"].as_str().unwrap()).unwrap()).unwrap();
+        for (name, source_role) in [
+            ("child-only.txt", "current_child"),
+            ("file.txt", role),
+            ("parent-only.txt", "current_parent"),
+        ] {
+            let tree = f
+                .target
+                .find_tree(Oid::from_str(roles[source_role]["tree"].as_str().unwrap()).unwrap())
+                .unwrap();
             let entry = tree.get_name(name).unwrap();
             assert_eq!(entry.filemode(), 0o100644);
             bytes.extend_from_slice(format!("100644 {name}\0").as_bytes());
@@ -1049,11 +1212,17 @@ impl Fixture {
         }
         // Hash canonical tree bytes only. Do not write an expected object into
         // the source ODB while testing a read-only operation.
-        Oid::hash_object(git2::ObjectType::Tree, &bytes).unwrap().to_string()
+        Oid::hash_object(git2::ObjectType::Tree, &bytes)
+            .unwrap()
+            .to_string()
     }
 
     fn fixture_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-        fn visit(root: &Path, directory: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        fn visit(
+            root: &Path,
+            directory: &Path,
+            out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
             for entry in std::fs::read_dir(directory).unwrap() {
                 let entry = entry.unwrap();
                 let kind = entry.file_type().unwrap();
@@ -1062,7 +1231,10 @@ impl Fixture {
                     visit(root, &entry.path(), out);
                 } else {
                     assert!(kind.is_file());
-                    out.insert(entry.path().strip_prefix(root).unwrap().to_owned(), std::fs::read(entry.path()).unwrap());
+                    out.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
                 }
             }
         }
@@ -1070,5 +1242,4 @@ impl Fixture {
         visit(root, root, &mut files);
         files
     }
-
 }

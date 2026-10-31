@@ -10538,10 +10538,12 @@ mod changed_child_resolution_candidate_review {
 mod authenticated_review_service_journey {
     use super::*;
     use crate::db::pair_refresh_operations::{PairRefreshOperation, PairRefreshPhase};
-    use crate::pair_refresh::service::{RefreshReviewCandidateRequest, RefreshReviewResponse, RefreshService};
+    use crate::pair_refresh::service::{
+        RefreshReviewCandidateRequest, RefreshReviewResponse, RefreshService,
+    };
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Condvar, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
 
     // Derived qualified setup helpers, adding two distinct uncontested files.
     // Real receipt/publication and ordinary cycles create all mapping evidence.
@@ -10777,7 +10779,11 @@ mod authenticated_review_service_journey {
         let (parent_engine, parent_bridge) = producer_engine(f, "parent");
         let (child_engine, child_bridge) = producer_engine(f, "child");
         std::fs::write(f._parent_wc.join("file.txt"), b"m2d parent work\n").unwrap();
-        std::fs::write(f._parent_wc.join("parent-only.txt"), b"preserve parent delta\n").unwrap();
+        std::fs::write(
+            f._parent_wc.join("parent-only.txt"),
+            b"preserve parent delta\n",
+        )
+        .unwrap();
         svn(&["add", "parent-only.txt"], Some(&f._parent_wc));
         svn(
             &[
@@ -10882,13 +10888,20 @@ mod authenticated_review_service_journey {
     }
 
     fn install_bridges(f: &Fixture) -> [PathBuf; 2] {
-        let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let mut paths = Vec::new();
         for (id, branch) in [("child", "feature"), ("parent", "main")] {
             let path = f.temp.path().join("repos").join(id).join("git-repo");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let repository = git2::build::RepoBuilder::new().branch(branch).clone(f.target.path().to_str().unwrap(), &path).unwrap();
-            repository.remote_set_url("origin", &configuration.pin().git_remote_url).unwrap();
+            let repository = git2::build::RepoBuilder::new()
+                .branch(branch)
+                .clone(f.target.path().to_str().unwrap(), &path)
+                .unwrap();
+            repository
+                .remote_set_url("origin", &configuration.pin().git_remote_url)
+                .unwrap();
             paths.push(path);
         }
         paths.try_into().unwrap()
@@ -10901,7 +10914,11 @@ mod authenticated_review_service_journey {
             .map(|row| serde_json::json!({
                 "path":row["path"], "baseline":row["baseline"], "child":row["child"], "parent":row["parent"], "choice":side
             })).collect::<Vec<_>>();
-        assert_eq!(choices.len(), 1, "real two-side changes must expose a conflict");
+        assert_eq!(
+            choices.len(),
+            1,
+            "real two-side changes must expose a conflict"
+        );
         serde_json::from_value(serde_json::json!({
             "review_pin": response.review_pin,
             "resolution": {"schema":1,"policy":crate::pair_refresh::preparation::CHANGED_CHILD_RESOLUTION_CANDIDATE_POLICY,"manifest_digest":manifest["manifest_digest"],"choices":choices}
@@ -10916,43 +10933,93 @@ mod authenticated_review_service_journey {
         let _lock = crate::data_dir::acquire(f.temp.path()).unwrap();
         let ready = ready(&f, &engine).await;
         assert_eq!(ready.history.phase, PairRefreshPhase::Completed);
-        assert!(ready.child_wc.is_dir() && ready.parent_bridge.is_dir() && ready.child_bridge.is_dir());
+        assert!(
+            ready.child_wc.is_dir() && ready.parent_bridge.is_dir() && ready.child_bridge.is_dir()
+        );
         let bridges = install_bridges(&f);
-        let indexes = bridges.iter().map(|path| std::fs::read(path.join(".git/index")).unwrap()).collect::<Vec<_>>();
+        let indexes = bridges
+            .iter()
+            .map(|path| std::fs::read(path.join(".git/index")).unwrap())
+            .collect::<Vec<_>>();
         let before = storage(&f.db);
         let source_before = fixture_files(f.target.path());
         let svn_before = svn_revision(&f.root);
         let log_before = std::fs::read_to_string(&f.log).unwrap();
         let service = RefreshService::with_fixture_client(engine.clone(), f.client.clone());
-        let response = service.review("disposable-workspace-session".into(), "child".into()).await.unwrap();
+        let response = service
+            .review("disposable-workspace-session".into(), "child".into())
+            .await
+            .unwrap();
         assert_eq!(response.state, "ready");
         assert!(response.blocked.is_empty());
         assert!(!response.actor_approval && !response.execution_eligible);
         assert_eq!(response.pending.child.git.pending_count, Some(0));
         assert_eq!(response.pending.parent.git.pending_count, Some(0));
-        assert!(response.pending.child.svn.observed_pending_revisions.is_empty());
-        assert!(response.pending.parent.svn.observed_pending_revisions.is_empty());
+        assert!(response
+            .pending
+            .child
+            .svn
+            .observed_pending_revisions
+            .is_empty());
+        assert!(response
+            .pending
+            .parent
+            .svn
+            .observed_pending_revisions
+            .is_empty());
         let manifest = response.applicability.as_ref().unwrap();
-        for (side, role) in [("base", "integrated_child"), ("child", "current_child"), ("parent", "current_parent")] {
-            let result = service.review_candidate("disposable-workspace-session".into(), "child".into(), intent(&response, side)).await.unwrap();
+        for (side, role) in [
+            ("base", "integrated_child"),
+            ("child", "current_child"),
+            ("parent", "current_parent"),
+        ] {
+            let result = service
+                .review_candidate(
+                    "disposable-workspace-session".into(),
+                    "child".into(),
+                    intent(&response, side),
+                )
+                .await
+                .unwrap();
             assert_eq!(result.state, "candidate");
             assert!(!result.execution_eligible && !result.actor_approval);
             assert_eq!(result.review_pin, response.review_pin);
             let candidate = result.candidate.unwrap();
-            assert_eq!(candidate["graph"]["candidate_tree"], expected_candidate_tree(&f, manifest, role));
-            assert_eq!(candidate["applicability_manifest_digest"], manifest["manifest_digest"]);
+            assert_eq!(
+                candidate["graph"]["candidate_tree"],
+                expected_candidate_tree(&f, manifest, role)
+            );
+            assert_eq!(
+                candidate["applicability_manifest_digest"],
+                manifest["manifest_digest"]
+            );
         }
         // A viewing pin has no matching execution/preparation identity.
-        let refused = service.act("disposable-workspace-session".into(), "child", "view-is-not-approval", Uuid::new_v4(), response.review_pin.as_ref().unwrap(), crate::pair_refresh::service::RefreshAction::Execute).await;
+        let refused = service
+            .act(
+                "disposable-workspace-session".into(),
+                "child",
+                "view-is-not-approval",
+                Uuid::new_v4(),
+                response.review_pin.as_ref().unwrap(),
+                crate::pair_refresh::service::RefreshAction::Execute,
+            )
+            .await;
         assert!(refused.is_err());
         service.shutdown().await;
-        assert_eq!(service.review_shutdown_record(), crate::pair_refresh::service::ShutdownRecord::Completed);
+        assert_eq!(
+            service.review_shutdown_record(),
+            crate::pair_refresh::service::ShutdownRecord::Completed
+        );
         assert_eq!(storage(&f.db), before);
         assert_eq!(fixture_files(f.target.path()), source_before);
         assert_eq!(svn_revision(&f.root), svn_before);
         let log_after = std::fs::read_to_string(&f.log).unwrap();
         assert!(log_after.starts_with(&log_before));
-        assert!(!log_after[log_before.len()..].contains("git-receive-pack"), "read phase must not attempt ordinary Git publication");
+        assert!(
+            !log_after[log_before.len()..].contains("git-receive-pack"),
+            "read phase must not attempt ordinary Git publication"
+        );
         for (path, bytes) in bridges.iter().zip(indexes) {
             assert_eq!(std::fs::read(path.join(".git/index")).unwrap(), bytes);
         }
@@ -10968,35 +11035,71 @@ mod authenticated_review_service_journey {
         let bridges = install_bridges(&f);
         for branch in ["main", "feature"] {
             let reference = format!("refs/heads/{branch}");
-            let old = f.target.find_reference(&reference).unwrap().target().unwrap();
+            let old = f
+                .target
+                .find_reference(&reference)
+                .unwrap()
+                .target()
+                .unwrap();
             let new = commit(&f.target, b"unhandled remote work\n", &[old]);
-            f.target.reference(&reference, new, true, "unhandled fixture work").unwrap();
+            f.target
+                .reference(&reference, new, true, "unhandled fixture work")
+                .unwrap();
         }
         for path in [&f._parent_wc, &ready.child_wc] {
             svn(&["update"], Some(path));
             std::fs::write(path.join("file.txt"), b"unhandled SVN work\n").unwrap();
-            svn(&["commit", "--username", "review-fixture-author", "-m", "unhandled review work"], Some(path));
+            svn(
+                &[
+                    "commit",
+                    "--username",
+                    "review-fixture-author",
+                    "-m",
+                    "unhandled review work",
+                ],
+                Some(path),
+            );
         }
         for path in &bridges {
             std::fs::write(path.join("untracked.txt"), b"preserve local work\n").unwrap();
         }
         let before = storage(&f.db);
         let service = RefreshService::with_fixture_client(engine, f.client.clone());
-        let response = service.review("disposable-workspace-session".into(), "child".into()).await.unwrap();
+        let response = service
+            .review("disposable-workspace-session".into(), "child".into())
+            .await
+            .unwrap();
         assert_eq!(response.state, "blocked");
-        assert!(response.review_pin.is_none() && response.applicability.is_none() && response.candidate.is_none());
+        assert!(
+            response.review_pin.is_none()
+                && response.applicability.is_none()
+                && response.candidate.is_none()
+        );
         for side in [&response.pending.child, &response.pending.parent] {
-            assert_ne!(side.git.observed_tip.as_deref(), Some(side.git.checkpoint.as_str()));
-            assert_eq!(side.git.pending_count, None, "changed tip is not an invented commit count");
+            assert_ne!(
+                side.git.observed_tip.as_deref(),
+                Some(side.git.checkpoint.as_str())
+            );
+            assert_eq!(
+                side.git.pending_count, None,
+                "changed tip is not an invented commit count"
+            );
             assert!(!side.git.complete && !side.svn.complete);
             assert!(!side.svn.observed_pending_revisions.is_empty());
-            assert!(side.local_bridge.paths.iter().any(|row| row.path == b"untracked.txt"));
+            assert!(side
+                .local_bridge
+                .paths
+                .iter()
+                .any(|row| row.path == b"untracked.txt"));
             assert!(side.local_bridge.blocked.is_some());
         }
         service.shutdown().await;
         assert_eq!(storage(&f.db), before);
         for path in bridges {
-            assert_eq!(std::fs::read(path.join("untracked.txt")).unwrap(), b"preserve local work\n");
+            assert_eq!(
+                std::fs::read(path.join("untracked.txt")).unwrap(),
+                b"preserve local work\n"
+            );
         }
     }
 
@@ -11011,17 +11114,40 @@ mod authenticated_review_service_journey {
         let service = RefreshService::with_fixture_client(engine.clone(), f.client.clone());
         let path = bridges[0].join("late.txt");
         let written = path.clone();
-        let drift = service.review_at_boundary("disposable-workspace-session".into(), "child".into(), Arc::new(move || {
-            std::fs::write(&written, b"late local change").unwrap();
-        })).await;
-        assert!(drift.is_err(), "late local work must not escape as a ready response");
+        let drift = service
+            .review_at_boundary(
+                "disposable-workspace-session".into(),
+                "child".into(),
+                Arc::new(move || {
+                    std::fs::write(&written, b"late local change").unwrap();
+                }),
+            )
+            .await;
+        assert!(
+            drift.is_err(),
+            "late local work must not escape as a ready response"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"late local change");
         std::fs::remove_file(path).unwrap(); // Fixture-owned mutation, not product cleanup.
         let db = Database::new(f.temp.path().join("reposync.db")).unwrap();
-        let revoked = service.review_at_boundary("disposable-workspace-session".into(), "child".into(), Arc::new(move || {
-            assert_eq!(db.conn().execute("UPDATE users SET enabled=0 WHERE id='admin'", []).unwrap(), 1);
-        })).await;
-        assert!(revoked.is_err(), "a revoked viewer cannot receive a post-observation result");
+        let revoked = service
+            .review_at_boundary(
+                "disposable-workspace-session".into(),
+                "child".into(),
+                Arc::new(move || {
+                    assert_eq!(
+                        db.conn()
+                            .execute("UPDATE users SET enabled=0 WHERE id='admin'", [])
+                            .unwrap(),
+                        1
+                    );
+                }),
+            )
+            .await;
+        assert!(
+            revoked.is_err(),
+            "a revoked viewer cannot receive a post-observation result"
+        );
         service.shutdown().await;
     }
 
@@ -11032,12 +11158,18 @@ mod authenticated_review_service_journey {
     }
     impl Gate {
         fn new() -> Arc<Self> {
-            Arc::new(Self { entered: AtomicBool::new(false), released: Mutex::new(false), changed: Condvar::new() })
+            Arc::new(Self {
+                entered: AtomicBool::new(false),
+                released: Mutex::new(false),
+                changed: Condvar::new(),
+            })
         }
         fn wait(&self) {
             self.entered.store(true, Ordering::Release);
             let mut released = self.released.lock().unwrap();
-            while !*released { released = self.changed.wait(released).unwrap(); }
+            while !*released {
+                released = self.changed.wait(released).unwrap();
+            }
         }
         fn release(&self) {
             *self.released.lock().unwrap_or_else(|p| p.into_inner()) = true;
@@ -11046,7 +11178,11 @@ mod authenticated_review_service_journey {
     }
     struct ReleaseGates(Vec<Arc<Gate>>);
     impl Drop for ReleaseGates {
-        fn drop(&mut self) { for gate in &self.0 { gate.release(); } }
+        fn drop(&mut self) {
+            for gate in &self.0 {
+                gate.release();
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11065,17 +11201,35 @@ mod authenticated_review_service_journey {
             let gate = gate.clone();
             let service = service.clone();
             observers.push(tokio::spawn(async move {
-                service.review_at_boundary("disposable-workspace-session".into(), "child".into(), Arc::new(move || gate.wait())).await
+                service
+                    .review_at_boundary(
+                        "disposable-workspace-session".into(),
+                        "child".into(),
+                        Arc::new(move || gate.wait()),
+                    )
+                    .await
             }));
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !release.0.iter().all(|gate| gate.entered.load(Ordering::Acquire)) {
-            assert!(std::time::Instant::now() < deadline, "real source workers did not reach controlled boundary");
+        while !release
+            .0
+            .iter()
+            .all(|gate| gate.entered.load(Ordering::Acquire))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real source workers did not reach controlled boundary"
+            );
             assert!(observers.iter().all(|task| !task.is_finished()));
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(service.review("disposable-workspace-session".into(), "child".into()).await.is_err());
-        for task in &observers { task.abort(); }
+        assert!(service
+            .review("disposable-workspace-session".into(), "child".into())
+            .await
+            .is_err());
+        for task in &observers {
+            task.abort();
+        }
         for task in observers {
             match task.await {
                 Err(error) => assert!(error.is_cancelled()),
@@ -11087,23 +11241,46 @@ mod authenticated_review_service_journey {
             tokio::spawn(async move { service.shutdown().await })
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while service.review_shutdown_record() == crate::pair_refresh::service::ShutdownRecord::Idle {
+        while service.review_shutdown_record() == crate::pair_refresh::service::ShutdownRecord::Idle
+        {
             assert!(std::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
         }
-        assert!(!shutdown.is_finished(), "receiver loss is not real worker completion");
-        assert_eq!(service.review_shutdown_record(), crate::pair_refresh::service::ShutdownRecord::Pending);
-        assert!(service.review("disposable-workspace-session".into(), "child".into()).await.is_err());
+        assert!(
+            !shutdown.is_finished(),
+            "receiver loss is not real worker completion"
+        );
+        assert_eq!(
+            service.review_shutdown_record(),
+            crate::pair_refresh::service::ShutdownRecord::Pending
+        );
+        assert!(service
+            .review("disposable-workspace-session".into(), "child".into())
+            .await
+            .is_err());
         drop(release);
-        tokio::time::timeout(std::time::Duration::from_secs(60), shutdown).await.unwrap().unwrap();
-        assert_eq!(service.review_shutdown_record(), crate::pair_refresh::service::ShutdownRecord::Completed);
+        tokio::time::timeout(std::time::Duration::from_secs(60), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.review_shutdown_record(),
+            crate::pair_refresh::service::ShutdownRecord::Completed
+        );
         assert_eq!(storage(&f.db), before);
     }
     fn expected_candidate_tree(f: &Fixture, manifest: &serde_json::Value, role: &str) -> String {
         let roles = &manifest["graph"]["roles"];
         let mut bytes = Vec::new();
-        for (name, source_role) in [("child-only.txt", "current_child"), ("file.txt", role), ("parent-only.txt", "current_parent")] {
-            let tree = f.target.find_tree(Oid::from_str(roles[source_role]["tree"].as_str().unwrap()).unwrap()).unwrap();
+        for (name, source_role) in [
+            ("child-only.txt", "current_child"),
+            ("file.txt", role),
+            ("parent-only.txt", "current_parent"),
+        ] {
+            let tree = f
+                .target
+                .find_tree(Oid::from_str(roles[source_role]["tree"].as_str().unwrap()).unwrap())
+                .unwrap();
             let entry = tree.get_name(name).unwrap();
             assert_eq!(entry.filemode(), 0o100644);
             bytes.extend_from_slice(format!("100644 {name}\0").as_bytes());
@@ -11111,11 +11288,17 @@ mod authenticated_review_service_journey {
         }
         // Hash canonical tree bytes only. Do not write an expected object into
         // the source ODB while testing a read-only operation.
-        Oid::hash_object(git2::ObjectType::Tree, &bytes).unwrap().to_string()
+        Oid::hash_object(git2::ObjectType::Tree, &bytes)
+            .unwrap()
+            .to_string()
     }
 
     fn fixture_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-        fn visit(root: &Path, directory: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        fn visit(
+            root: &Path,
+            directory: &Path,
+            out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
             for entry in std::fs::read_dir(directory).unwrap() {
                 let entry = entry.unwrap();
                 let kind = entry.file_type().unwrap();
@@ -11124,7 +11307,10 @@ mod authenticated_review_service_journey {
                     visit(root, &entry.path(), out);
                 } else {
                     assert!(kind.is_file());
-                    out.insert(entry.path().strip_prefix(root).unwrap().to_owned(), std::fs::read(entry.path()).unwrap());
+                    out.insert(
+                        entry.path().strip_prefix(root).unwrap().to_owned(),
+                        std::fs::read(entry.path()).unwrap(),
+                    );
                 }
             }
         }
@@ -11142,7 +11328,14 @@ mod authenticated_review_service_journey {
         let _ready = ready(&f, &engine).await;
         let bridges = install_bridges(&f);
         let service = RefreshService::with_fixture_client(engine, f.client.clone());
-        assert_eq!(service.review("disposable-workspace-session".into(), "child".into()).await.unwrap().state, "ready");
+        assert_eq!(
+            service
+                .review("disposable-workspace-session".into(), "child".into())
+                .await
+                .unwrap()
+                .state,
+            "ready"
+        );
         let db_before = storage(&f.db);
         for (role, bridge) in [("child", &bridges[0]), ("parent", &bridges[1])] {
             let index_path = bridge.join(".git/index");
@@ -11151,14 +11344,21 @@ mod authenticated_review_service_journey {
             let original_index = std::fs::read(&index_path).unwrap();
             let original_config = std::fs::read(&config_path).unwrap();
             let original_file = std::fs::read(&tracked_path).unwrap();
-            let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+            let configuration =
+                f.db.capture_pair_refresh_execution_configuration("child")
+                    .unwrap();
             let pin = configuration.pin();
             let (branch, expected) = if role == "child" {
                 ("feature", pin.child.last_git_sha.as_str())
             } else {
                 ("main", pin.parent.last_git_sha.as_str())
             };
-            for variant in ["assume_unchanged", "skip_worktree", "sparse_policy", "ordinary_bytes"] {
+            for variant in [
+                "assume_unchanged",
+                "skip_worktree",
+                "sparse_policy",
+                "ordinary_bytes",
+            ] {
                 // Restore fixture-owned bytes only between independent faults.
                 // The reader must never clear these flags or repair user work.
                 std::fs::write(&index_path, &original_index).unwrap();
@@ -11173,7 +11373,11 @@ mod authenticated_review_service_journey {
                         entry.flags |= git2::IndexEntryFlag::EXTENDED.bits();
                         entry.flags_extended |= git2::IndexEntryExtendedFlag::SKIP_WORKTREE.bits();
                     }
-                    "sparse_policy" => repository.config().unwrap().set_bool("core.sparseCheckout", true).unwrap(),
+                    "sparse_policy" => repository
+                        .config()
+                        .unwrap()
+                        .set_bool("core.sparseCheckout", true)
+                        .unwrap(),
                     _ => {}
                 }
                 index.add(&entry).unwrap();
@@ -11184,7 +11388,11 @@ mod authenticated_review_service_journey {
                     assert_ne!(persisted.flags & git2::IndexEntryFlag::VALID.bits(), 0);
                 }
                 if variant == "skip_worktree" {
-                    assert_ne!(persisted.flags_extended & git2::IndexEntryExtendedFlag::SKIP_WORKTREE.bits(), 0);
+                    assert_ne!(
+                        persisted.flags_extended
+                            & git2::IndexEntryExtendedFlag::SKIP_WORKTREE.bits(),
+                        0
+                    );
                 }
                 // Pure policy control: a sparse-directory entry is unsupported.
                 // This is not a claim to have generated a real sparse-index file.
@@ -11200,12 +11408,29 @@ mod authenticated_review_service_journey {
                 let before_config = std::fs::read(&config_path).unwrap();
                 let before_head = repository.head().unwrap().target();
                 for _ in 0..2 {
-                    assert!(super::super::review_local_bridge(f.temp.path(), role, branch, &pin.git_remote_url, Some(expected)).is_err(), "{role}/{variant} cannot be a complete clean observation");
+                    assert!(
+                        super::super::review_local_bridge(
+                            f.temp.path(),
+                            role,
+                            branch,
+                            &pin.git_remote_url,
+                            Some(expected)
+                        )
+                        .is_err(),
+                        "{role}/{variant} cannot be a complete clean observation"
+                    );
                     assert_eq!(std::fs::read(&index_path).unwrap(), before_index);
                 }
-                let response = service.review("disposable-workspace-session".into(), "child".into()).await.unwrap();
+                let response = service
+                    .review("disposable-workspace-session".into(), "child".into())
+                    .await
+                    .unwrap();
                 assert_eq!(response.state, "blocked", "{role}/{variant}");
-                let observed = if role == "child" { &response.pending.child } else { &response.pending.parent };
+                let observed = if role == "child" {
+                    &response.pending.child
+                } else {
+                    &response.pending.parent
+                };
                 assert!(!observed.local_bridge.complete);
                 assert!(observed.local_bridge.blocked.is_some());
                 assert!(response.review_pin.is_none() && response.candidate.is_none());
@@ -11225,9 +11450,20 @@ mod authenticated_review_service_journey {
             std::fs::write(config_path, original_config).unwrap();
             std::fs::write(tracked_path, original_file).unwrap();
         }
-        svn(&["mkdir", &format!("{}/unrelated-review", f.root), "-m", "unrelated repository head"], None);
+        svn(
+            &[
+                "mkdir",
+                &format!("{}/unrelated-review", f.root),
+                "-m",
+                "unrelated repository head",
+            ],
+            None,
+        );
         let head = svn_revision(&f.root);
-        let fresh = service.review("disposable-workspace-session".into(), "child".into()).await.unwrap();
+        let fresh = service
+            .review("disposable-workspace-session".into(), "child".into())
+            .await
+            .unwrap();
         assert_eq!(fresh.state, "ready");
         for (role, side) in [("C", &fresh.pending.child), ("P2", &fresh.pending.parent)] {
             assert!(side.svn.complete && side.svn.observed_pending_revisions.is_empty());
@@ -11238,7 +11474,10 @@ mod authenticated_review_service_journey {
         }
         assert_eq!(storage(&f.db), db_before);
         service.shutdown().await;
-        assert_eq!(service.review_shutdown_record(), crate::pair_refresh::service::ShutdownRecord::Completed);
+        assert_eq!(
+            service.review_shutdown_record(),
+            crate::pair_refresh::service::ShutdownRecord::Completed
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11256,40 +11495,119 @@ mod authenticated_review_service_journey {
         let mut tips = BTreeMap::new();
         for (id, branch) in [("child", "feature"), ("parent", "main")] {
             let reference = format!("refs/heads/{branch}");
-            let parent = f.target.find_commit(f.target.find_reference(&reference).unwrap().target().unwrap()).unwrap();
+            let parent = f
+                .target
+                .find_commit(
+                    f.target
+                        .find_reference(&reference)
+                        .unwrap()
+                        .target()
+                        .unwrap(),
+                )
+                .unwrap();
             let old_tree = parent.tree().unwrap();
             let mut builder = f.target.treebuilder(Some(&old_tree)).unwrap();
-            builder.insert("file.txt", old_tree.get_name("file.txt").unwrap().id(), 0o100755).unwrap();
+            builder
+                .insert(
+                    "file.txt",
+                    old_tree.get_name("file.txt").unwrap().id(),
+                    0o100755,
+                )
+                .unwrap();
             let tree = f.target.find_tree(builder.write().unwrap()).unwrap();
-            let signature = Signature::new("Disposable executable fixture", "fixture@example.invalid", &Time::new(1_790_000_002, 0)).unwrap();
-            let tip = f.target.commit(None, &signature, &signature, "unhandled executable-mode fixture", &tree, &[&parent]).unwrap();
-            f.target.reference(&reference, tip, true, "owned fixture descendant").unwrap();
+            let signature = Signature::new(
+                "Disposable executable fixture",
+                "fixture@example.invalid",
+                &Time::new(1_790_000_002, 0),
+            )
+            .unwrap();
+            let tip = f
+                .target
+                .commit(
+                    None,
+                    &signature,
+                    &signature,
+                    "unhandled executable-mode fixture",
+                    &tree,
+                    &[&parent],
+                )
+                .unwrap();
+            f.target
+                .reference(&reference, tip, true, "owned fixture descendant")
+                .unwrap();
             tips.insert(id, tip.to_string());
         }
         let bridges = install_bridges(&f);
-        let configuration = f.db.capture_pair_refresh_execution_configuration("child").unwrap();
+        let configuration =
+            f.db.capture_pair_refresh_execution_configuration("child")
+                .unwrap();
         let service = RefreshService::with_fixture_client(engine, f.client.clone());
         let db_before = storage(&f.db);
         let source_before = fixture_files(f.target.path());
         let svn_before = svn_revision(&f.root);
-        for (role, branch, bridge) in [("child", "feature", &bridges[0]), ("parent", "main", &bridges[1])] {
+        for (role, branch, bridge) in [
+            ("child", "feature", &bridges[0]),
+            ("parent", "main", &bridges[1]),
+        ] {
             let repository = Repository::open(bridge).unwrap();
-            repository.config().unwrap().set_bool("core.filemode", false).unwrap();
-            assert!(!repository.config().unwrap().get_bool("core.filemode").unwrap());
+            repository
+                .config()
+                .unwrap()
+                .set_bool("core.filemode", false)
+                .unwrap();
+            assert!(!repository
+                .config()
+                .unwrap()
+                .get_bool("core.filemode")
+                .unwrap());
             let path = bridge.join("file.txt");
             let original = std::fs::read(&path).unwrap();
             let head = repository.head().unwrap().target();
             assert_eq!(head.unwrap().to_string(), tips[role]);
-            assert_eq!(repository.head().unwrap().peel_to_tree().unwrap().get_name("file.txt").unwrap().filemode(), 0o100755);
-            assert_eq!(repository.index().unwrap().get_path(Path::new("file.txt"), 0).unwrap().mode, 0o100755);
+            assert_eq!(
+                repository
+                    .head()
+                    .unwrap()
+                    .peel_to_tree()
+                    .unwrap()
+                    .get_name("file.txt")
+                    .unwrap()
+                    .filemode(),
+                0o100755
+            );
+            assert_eq!(
+                repository
+                    .index()
+                    .unwrap()
+                    .get_path(Path::new("file.txt"), 0)
+                    .unwrap()
+                    .mode,
+                0o100755
+            );
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             let index_before = std::fs::read(bridge.join(".git/index")).unwrap();
             let config_before = std::fs::read(bridge.join(".git/config")).unwrap();
-            let positive = super::super::review_local_bridge(f.temp.path(), role, branch, &configuration.pin().git_remote_url, Some(tips[role].as_str())).unwrap();
-            assert!(positive.complete && positive.blocked.is_none(), "supported executable local observation");
-            assert_eq!(std::fs::read(bridge.join(".git/index")).unwrap(), index_before);
+            let positive = super::super::review_local_bridge(
+                f.temp.path(),
+                role,
+                branch,
+                &configuration.pin().git_remote_url,
+                Some(tips[role].as_str()),
+            )
+            .unwrap();
+            assert!(
+                positive.complete && positive.blocked.is_none(),
+                "supported executable local observation"
+            );
+            assert_eq!(
+                std::fs::read(bridge.join(".git/index")).unwrap(),
+                index_before
+            );
             assert_eq!(std::fs::read(&path).unwrap(), original);
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
             for mode in [0o654, 0o645] {
                 // Only the fixture chmods. Group/other execute is retained while
                 // owner execute is absent; bytes and genuine HEAD/index match.
@@ -11298,39 +11616,84 @@ mod authenticated_review_service_journey {
                 assert_ne!(mode & 0o011, 0);
                 let mut options = git2::StatusOptions::new();
                 options.no_refresh(true).update_index(false);
-                assert!(repository.statuses(Some(&mut options)).unwrap().is_empty(), "core.filemode=false must exercise status-suppressed mode difference");
+                assert!(
+                    repository.statuses(Some(&mut options)).unwrap().is_empty(),
+                    "core.filemode=false must exercise status-suppressed mode difference"
+                );
                 assert_eq!(std::fs::read(&path).unwrap(), original);
-                assert!(super::super::review_local_bridge(f.temp.path(), role, branch, &configuration.pin().git_remote_url, Some(tips[role].as_str())).is_err());
-                let response = service.review("disposable-workspace-session".into(), "child".into()).await.unwrap();
+                assert!(super::super::review_local_bridge(
+                    f.temp.path(),
+                    role,
+                    branch,
+                    &configuration.pin().git_remote_url,
+                    Some(tips[role].as_str())
+                )
+                .is_err());
+                let response = service
+                    .review("disposable-workspace-session".into(), "child".into())
+                    .await
+                    .unwrap();
                 assert_eq!(response.state, "blocked");
-                let observed = if role == "child" { &response.pending.child } else { &response.pending.parent };
+                let observed = if role == "child" {
+                    &response.pending.child
+                } else {
+                    &response.pending.parent
+                };
                 assert!(!observed.local_bridge.complete && observed.local_bridge.blocked.is_some());
-                assert!(response.review_pin.is_none() && response.applicability.is_none() && response.candidate.is_none());
+                assert!(
+                    response.review_pin.is_none()
+                        && response.applicability.is_none()
+                        && response.candidate.is_none()
+                );
                 assert!(!response.actor_approval && !response.execution_eligible);
                 assert_eq!(std::fs::read(&path).unwrap(), original);
-                assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, mode);
-                assert_eq!(std::fs::read(bridge.join(".git/index")).unwrap(), index_before);
-                assert_eq!(std::fs::read(bridge.join(".git/config")).unwrap(), config_before);
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+                assert_eq!(
+                    std::fs::read(bridge.join(".git/index")).unwrap(),
+                    index_before
+                );
+                assert_eq!(
+                    std::fs::read(bridge.join(".git/config")).unwrap(),
+                    config_before
+                );
                 assert_eq!(repository.head().unwrap().target(), head);
                 assert_eq!(storage(&f.db), db_before);
                 assert_eq!(fixture_files(f.target.path()), source_before);
                 assert_eq!(svn_revision(&f.root), svn_before);
             }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let restored = super::super::review_local_bridge(f.temp.path(), role, branch, &configuration.pin().git_remote_url, Some(tips[role].as_str())).unwrap();
+            let restored = super::super::review_local_bridge(
+                f.temp.path(),
+                role,
+                branch,
+                &configuration.pin().git_remote_url,
+                Some(tips[role].as_str()),
+            )
+            .unwrap();
             assert!(restored.complete && restored.blocked.is_none());
-            assert_eq!(std::fs::read(bridge.join(".git/index")).unwrap(), index_before);
-            assert_eq!(std::fs::read(bridge.join(".git/config")).unwrap(), config_before);
+            assert_eq!(
+                std::fs::read(bridge.join(".git/index")).unwrap(),
+                index_before
+            );
+            assert_eq!(
+                std::fs::read(bridge.join(".git/config")).unwrap(),
+                config_before
+            );
         }
         service.shutdown().await;
-        assert_eq!(service.review_shutdown_record(), crate::pair_refresh::service::ShutdownRecord::Completed);
+        assert_eq!(
+            service.review_shutdown_record(),
+            crate::pair_refresh::service::ShutdownRecord::Completed
+        );
     }
-
 }
 
 mod review_svn_intake_completeness {
-    use super::fixture_process as process_fixture;
     use super::super::review_svn_pending;
+    use super::fixture_process as process_fixture;
     use crate::svn::SvnClient;
     use std::net::TcpListener;
     use std::path::PathBuf;
@@ -11339,110 +11702,119 @@ mod review_svn_intake_completeness {
 
     // Exact existing disposable svnserve setup; no server-policy or OS-function
     // replacement is injected into production. Authz files are fixture-owned.
-struct Fixture {
-    // Stop and reap the server before removing its repository.
-    _server: process_fixture::OwnedProcessGroup,
-    root: tempfile::TempDir,
-    client: SvnClient,
-    repository: PathBuf,
-}
+    struct Fixture {
+        // Stop and reap the server before removing its repository.
+        _server: process_fixture::OwnedProcessGroup,
+        root: tempfile::TempDir,
+        client: SvnClient,
+        repository: PathBuf,
+    }
 
-fn command(args: &[&str]) -> String {
-    let output = Command::new(args[0]).args(&args[1..]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
+    fn command(args: &[&str]) -> String {
+        let output = Command::new(args[0]).args(&args[1..]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
 
-impl Fixture {
-    async fn new(hidden: bool) -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let repository = root.path().join("repo");
-        command(&["svnadmin", "create", repository.to_str().unwrap()]);
-        let seed = root.path().join("seed");
-        std::fs::create_dir_all(seed.join("trunk/hidden-dir")).unwrap();
-        std::fs::write(seed.join("trunk/visible"), "visible").unwrap();
-        std::fs::write(seed.join("trunk/hidden-file"), "hidden-file").unwrap();
-        std::fs::write(seed.join("trunk/hidden-dir/nested"), "hidden-dir").unwrap();
+    impl Fixture {
+        async fn new(hidden: bool) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let repository = root.path().join("repo");
+            command(&["svnadmin", "create", repository.to_str().unwrap()]);
+            let seed = root.path().join("seed");
+            std::fs::create_dir_all(seed.join("trunk/hidden-dir")).unwrap();
+            std::fs::write(seed.join("trunk/visible"), "visible").unwrap();
+            std::fs::write(seed.join("trunk/hidden-file"), "hidden-file").unwrap();
+            std::fs::write(seed.join("trunk/hidden-dir/nested"), "hidden-dir").unwrap();
+            command(&[
+                "svn",
+                "import",
+                seed.to_str().unwrap(),
+                reqwest::Url::from_directory_path(&repository)
+                    .unwrap()
+                    .as_str(),
+                "-m",
+                "disposable visibility fixture",
+                "--non-interactive",
+            ]);
+            std::fs::write(repository.join("conf/svnserve.conf"),
+            "[general]\nanon-access = none\nauth-access = write\npassword-db = passwd\nauthz-db = authz\nrealm = disposable visibility\n").unwrap();
+            std::fs::write(
+                repository.join("conf/passwd"),
+                "[users]\nreader = disposable-reader\n",
+            )
+            .unwrap();
+            let authz = if hidden {
+                "[repo:/]\nreader = r\n[repo:/trunk/hidden-dir]\nreader =\n[repo:/trunk/hidden-file]\nreader =\n"
+            } else {
+                "[repo:/]\nreader = r\n"
+            };
+            std::fs::write(repository.join("conf/authz"), authz).unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let server = process_fixture::OwnedProcessGroup::spawn(
+                Command::new("svnserve")
+                    .args([
+                        "-d",
+                        "--foreground",
+                        "--listen-host",
+                        "127.0.0.1",
+                        "--listen-port",
+                        &port.to_string(),
+                        "-r",
+                        root.path().to_str().unwrap(),
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap();
+            let client = SvnClient::new_isolated_refresh(
+                &format!("svn://127.0.0.1:{port}/repo/trunk"),
+                "reader",
+                Some("disposable-reader"),
+            )
+            .unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if client.info().await.is_ok() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "owned fixture server unavailable"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Self {
+                _server: server,
+                root,
+                client,
+                repository,
+            }
+        }
+
+        fn youngest(&self) -> String {
+            command(&["svnlook", "youngest", self.repository.to_str().unwrap()])
+        }
+    }
+    fn add_unrelated_revision(f: &Fixture) {
+        let url = reqwest::Url::from_directory_path(&f.repository)
+            .unwrap()
+            .join("unrelated")
+            .unwrap();
         command(&[
             "svn",
-            "import",
-            seed.to_str().unwrap(),
-            reqwest::Url::from_directory_path(&repository)
-                .unwrap()
-                .as_str(),
+            "mkdir",
+            url.as_str(),
             "-m",
-            "disposable visibility fixture",
+            "unrelated repository work",
             "--non-interactive",
         ]);
-        std::fs::write(repository.join("conf/svnserve.conf"),
-            "[general]\nanon-access = none\nauth-access = write\npassword-db = passwd\nauthz-db = authz\nrealm = disposable visibility\n").unwrap();
-        std::fs::write(
-            repository.join("conf/passwd"),
-            "[users]\nreader = disposable-reader\n",
-        )
-        .unwrap();
-        let authz = if hidden {
-            "[repo:/]\nreader = r\n[repo:/trunk/hidden-dir]\nreader =\n[repo:/trunk/hidden-file]\nreader =\n"
-        } else {
-            "[repo:/]\nreader = r\n"
-        };
-        std::fs::write(repository.join("conf/authz"), authz).unwrap();
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let server = process_fixture::OwnedProcessGroup::spawn(
-            Command::new("svnserve")
-                .args([
-                    "-d",
-                    "--foreground",
-                    "--listen-host",
-                    "127.0.0.1",
-                    "--listen-port",
-                    &port.to_string(),
-                    "-r",
-                    root.path().to_str().unwrap(),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null()),
-        )
-        .unwrap();
-        let client = SvnClient::new_isolated_refresh(
-            &format!("svn://127.0.0.1:{port}/repo/trunk"),
-            "reader",
-            Some("disposable-reader"),
-        )
-        .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if client.info().await.is_ok() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "owned fixture server unavailable"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        Self {
-            _server: server,
-            root,
-            client,
-            repository,
-        }
-    }
-
-    fn youngest(&self) -> String {
-        command(&["svnlook", "youngest", self.repository.to_str().unwrap()])
-    }
-
-}
-    fn add_unrelated_revision(f: &Fixture) {
-        let url = reqwest::Url::from_directory_path(&f.repository).unwrap().join("unrelated").unwrap();
-        command(&["svn", "mkdir", url.as_str(), "-m", "unrelated repository work", "--non-interactive"]);
         assert_eq!(f.youngest().trim(), "2");
     }
 
@@ -11452,15 +11824,26 @@ impl Fixture {
         let f = Fixture::new(true).await;
         add_unrelated_revision(&f);
         let visible = f.client.copy_history_at_rev(2).await.unwrap();
-        assert!(!visible.is_empty(), "exercise an internally valid nonempty visible list");
+        assert!(
+            !visible.is_empty(),
+            "exercise an internally valid nonempty visible list"
+        );
         assert!(visible.iter().all(|entry| entry.revision <= 1));
         let before = f.youngest();
-        let observation = review_svn_pending(&f.client, f.client.url(), 1).await.unwrap();
+        let observation = review_svn_pending(&f.client, f.client.url(), 1)
+            .await
+            .unwrap();
         assert_eq!(observation.observed_head, Some(2));
         assert!(observation.observed_pending_revisions.is_empty());
-        assert!(!observation.complete, "empty visible pending list is not visibility proof");
+        assert!(
+            !observation.complete,
+            "empty visible pending list is not visibility proof"
+        );
         assert!(observation.visibility.is_none());
-        assert_eq!(observation.blocked.as_deref(), Some("subtree_visibility_unproved"));
+        assert_eq!(
+            observation.blocked.as_deref(),
+            Some("subtree_visibility_unproved")
+        );
         assert_eq!(f.youngest(), before);
     }
 
@@ -11470,26 +11853,51 @@ impl Fixture {
         let f = Fixture::new(false).await;
         add_unrelated_revision(&f);
         let before = f.youngest();
-        let observation = review_svn_pending(&f.client, f.client.url(), 1).await.unwrap();
-        assert!(!observation.complete, "raw history alone remains incomplete even on a visible server");
+        let observation = review_svn_pending(&f.client, f.client.url(), 1)
+            .await
+            .unwrap();
+        assert!(
+            !observation.complete,
+            "raw history alone remains incomplete even on a visible server"
+        );
         assert_eq!(observation.observed_head, Some(2));
         assert!(observation.observed_pending_revisions.is_empty());
         assert!(observation.visibility.is_none());
         // Independent native evidence proves this is genuinely unrelated work,
         // not an invented HEAD-minus-checkpoint pending count. Only the full
         // registered correspondence factory may promote the service response.
-        let checkout = crate::pair_refresh::svn_visibility::observe_subtree(&f.client, 2).await.unwrap();
+        let checkout = crate::pair_refresh::svn_visibility::observe_subtree(&f.client, 2)
+            .await
+            .unwrap();
         checkout.require_unchanged_since(1).unwrap();
         assert_eq!(checkout.info().latest_rev, 2);
         assert_eq!(f.youngest(), before);
         let admin = f.root.path().join("admin");
-        let url = reqwest::Url::from_directory_path(&f.repository).unwrap().join("trunk").unwrap();
-        command(&["svn", "checkout", url.as_str(), admin.to_str().unwrap(), "--non-interactive"]);
+        let url = reqwest::Url::from_directory_path(&f.repository)
+            .unwrap()
+            .join("trunk")
+            .unwrap();
+        command(&[
+            "svn",
+            "checkout",
+            url.as_str(),
+            admin.to_str().unwrap(),
+            "--non-interactive",
+        ]);
         std::fs::write(admin.join("visible"), "actual pending work").unwrap();
-        command(&["svn", "commit", admin.to_str().unwrap(), "-m", "visible branch change", "--non-interactive"]);
+        command(&[
+            "svn",
+            "commit",
+            admin.to_str().unwrap(),
+            "-m",
+            "visible branch change",
+            "--non-interactive",
+        ]);
         assert_eq!(f.youngest().trim(), "3");
         let before = f.youngest();
-        let pending = review_svn_pending(&f.client, f.client.url(), 1).await.unwrap();
+        let pending = review_svn_pending(&f.client, f.client.url(), 1)
+            .await
+            .unwrap();
         assert_eq!(pending.observed_pending_revisions, vec![3]);
         assert!(!pending.complete);
         assert!(pending.visibility.is_none() && pending.blocked.is_some());
@@ -11504,19 +11912,43 @@ impl Fixture {
         let _fence = crate::writer_fence::claim(engine.db(), f.temp.path()).unwrap();
         let repository = f.temp.path().join("svn-repository");
         std::fs::write(repository.join("conf/svnserve.conf"), "[general]\nanon-access = none\nauth-access = read\npassword-db = passwd\nauthz-db = authz\nrealm = disposable read intake\n").unwrap();
-        std::fs::write(repository.join("conf/passwd"), "[users]\nreader = disposable-reader\n").unwrap();
+        std::fs::write(
+            repository.join("conf/passwd"),
+            "[users]\nreader = disposable-reader\n",
+        )
+        .unwrap();
         std::fs::write(repository.join("conf/authz"), "[svn-repository:/]\nreader = r\n[svn-repository:/trunk/file.txt]\nreader =\n[svn-repository:/branches/f/file.txt]\nreader =\n").unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let _server = process_fixture::OwnedProcessGroup::spawn(Command::new("svnserve")
-            .args(["-d", "--foreground", "--listen-host", "127.0.0.1", "--listen-port", &port.to_string(), "-r", f.temp.path().to_str().unwrap()])
-            .stdout(Stdio::null()).stderr(Stdio::null())).unwrap();
+        let _server = process_fixture::OwnedProcessGroup::spawn(
+            Command::new("svnserve")
+                .args([
+                    "-d",
+                    "--foreground",
+                    "--listen-host",
+                    "127.0.0.1",
+                    "--listen-port",
+                    &port.to_string(),
+                    "-r",
+                    f.temp.path().to_str().unwrap(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
         let root = format!("svn://127.0.0.1:{port}/svn-repository");
-        let reader = SvnClient::new_isolated_refresh(&format!("{root}/trunk"), "reader", Some("disposable-reader")).unwrap();
+        let reader = SvnClient::new_isolated_refresh(
+            &format!("{root}/trunk"),
+            "reader",
+            Some("disposable-reader"),
+        )
+        .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if reader.info().await.is_ok() { break; }
+            if reader.info().await.is_ok() {
+                break;
+            }
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -11524,23 +11956,39 @@ impl Fixture {
         // No applicable historical capability is needed for a blocked report.
         assert_eq!(f.db.conn().execute("UPDATE repositories SET svn_url=?1,svn_username='reader' WHERE id IN ('child','parent')", [&root]).unwrap(), 2);
         for id in ["child", "parent"] {
-            f.db.set_state(&format!("secret_svn_password_{id}"), "disposable-reader").unwrap();
+            f.db.set_state(&format!("secret_svn_password_{id}"), "disposable-reader")
+                .unwrap();
         }
         assert!(!f.temp.path().join("repos/child/git-repo").exists());
         let before = f.state();
         let revision = command(&["svnlook", "youngest", repository.to_str().unwrap()]);
-        let service = crate::pair_refresh::service::RefreshService::with_fixture_client(engine, f.client.clone());
-        let response = service.review("disposable-workspace-session".into(), "child".into()).await.unwrap();
+        let service = crate::pair_refresh::service::RefreshService::with_fixture_client(
+            engine,
+            f.client.clone(),
+        );
+        let response = service
+            .review("disposable-workspace-session".into(), "child".into())
+            .await
+            .unwrap();
         assert_eq!(response.state, "blocked");
         assert!(!response.pending.child.local_bridge.complete);
         for side in [&response.pending.child, &response.pending.parent] {
-            assert!(!side.svn.complete, "a different blocked source is not permission to claim SVN completeness");
+            assert!(
+                !side.svn.complete,
+                "a different blocked source is not permission to claim SVN completeness"
+            );
             assert!(side.svn.visibility.is_none() && side.svn.blocked.is_some());
         }
-        assert!(response.applicability.is_none() && response.candidate.is_none() && response.review_pin.is_none());
+        assert!(
+            response.applicability.is_none()
+                && response.candidate.is_none()
+                && response.review_pin.is_none()
+        );
         service.shutdown().await;
         assert_eq!(f.state(), before);
-        assert_eq!(command(&["svnlook", "youngest", repository.to_str().unwrap()]), revision);
+        assert_eq!(
+            command(&["svnlook", "youngest", repository.to_str().unwrap()]),
+            revision
+        );
     }
-
 }
