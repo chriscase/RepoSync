@@ -28,7 +28,7 @@ jobs:
         run: git lfs install
 
       - name: Verify tools
-        run: svn --version && svnadmin --version && git --version && git lfs version
+        run: svn --version && svnadmin --version && svnserve --version && svnlook --version && git --version && git lfs version
 
       - name: Reliability #62 acceptance matrix
         run: |
@@ -86,6 +86,82 @@ jobs:
           printf 'Workspace exit: %s; isolated FD case exit: %s\n' "$workspace_status" "$fd_status"
           if [[ "$workspace_status" -ne 0 ]]; then exit "$workspace_status"; fi
           exit "$fd_status"
+        env:
+          RUST_BACKTRACE: 1
+          GIT_AUTHOR_NAME: "Test User"
+          GIT_AUTHOR_EMAIL: "test@example.com"
+          GIT_COMMITTER_NAME: "Test User"
+          GIT_COMMITTER_EMAIL: "test@example.com"
+
+      - name: Authenticated read-only review HTTP qualification
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          case_id=authenticated_review_http_journey::authenticated_http_review_real_sources_choices_staleness_and_no_approval
+          receipt_dir="$(mktemp -d "$RUNNER_TEMP/reposync-review-http.XXXXXX")"
+          trap 'rm -rf -- "$receipt_dir"' EXIT
+          printf 'Qualified source: %s\n' "$GITHUB_SHA"
+          printf 'Runner image: %s / %s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          rustc --version --verbose
+          cargo --version
+          sha256sum Cargo.lock
+          cargo clippy --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 -- -D warnings
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 --no-run --message-format=json \
+            > "$receipt_dir/compiler-artifacts.jsonl"
+          python3 - "$receipt_dir/compiler-artifacts.jsonl" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          selected = []
+          for line in pathlib.Path(sys.argv[1]).read_text().splitlines(keepends=True):
+              record = json.loads(line)
+              target = record.get("target", {})
+              if (record.get("reason") == "compiler-artifact"
+                      and target.get("name") == "pair_refresh_v2"
+                      and target.get("kind") == ["test"]
+                      and target.get("src_path", "").endswith("/crates/web/tests/pair_refresh_v2.rs")
+                      and "reliability-fixture" in record.get("features", [])
+                      and record.get("executable")):
+                  selected.append((record, line))
+          if len(selected) != 1:
+              raise SystemExit("Expected one feature-qualified pair_refresh_v2 test artifact")
+          record, original_line = selected[0]
+          sys.stdout.write(original_line)
+          executable = pathlib.Path(record["executable"])
+          digest = hashlib.sha256()
+          with executable.open("rb") as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          print("Qualified test binary SHA256:", digest.hexdigest())
+          PY
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 \
+            -- --list --format pretty --color never > "$receipt_dir/normal.list"
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 \
+            -- --ignored --list --format pretty --color never > "$receipt_dir/ignored.list"
+          cat "$receipt_dir/normal.list" "$receipt_dir/ignored.list"
+          matches="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/normal.list")"
+          ignored="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/ignored.list")"
+          if [[ "$matches" -ne 1 || "$ignored" -ne 0 ]]; then
+            echo "::error::Expected one nonignored positive HTTP case; found $matches normal and $ignored ignored"
+            exit 1
+          fi
+          case_status=0
+          cargo test --locked -p reposync-web --features reliability-fixture --test pair_refresh_v2 "$case_id" \
+            -- --exact --test-threads=1 --format pretty --color never \
+            > "$receipt_dir/test.stdout.log" 2> "$receipt_dir/test.stderr.log" || case_status=$?
+          cat "$receipt_dir/test.stdout.log" "$receipt_dir/test.stderr.log"
+          if ! awk -v wanted="test $case_id ... ok" '$0 == wanted { n++ } END { exit(n != 1) }' "$receipt_dir/test.stdout.log"; then
+            echo "::error::Positive HTTP case did not report exactly one passing result"
+            if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+          fi
+          if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$receipt_dir/test.stdout.log"; then
+            echo "::error::Positive HTTP case lacks a one-pass, zero-failed, zero-ignored summary"
+            if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+          fi
+          printf 'Positive HTTP case exit: %s\n' "$case_status"
+          exit "$case_status"
         env:
           RUST_BACKTRACE: 1
           GIT_AUTHOR_NAME: "Test User"
