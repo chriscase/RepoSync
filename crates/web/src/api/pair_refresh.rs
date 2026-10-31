@@ -19,6 +19,8 @@ use crate::AppState;
 
 pub fn routes(engine: Arc<SyncEngine>) -> Router<Arc<AppState>> {
     Router::new()
+        .route("/api/v2/repos/:id/refresh/review", post(review))
+        .route("/api/v2/repos/:id/refresh/review/candidate", post(review_candidate))
         .route("/api/v2/repos/:id/refresh/prepare", post(prepare))
         .route(
             "/api/v2/repos/:id/refresh/recovery/prepare",
@@ -160,4 +162,55 @@ async fn receipt(
         .map_err(refused)?
         .map(Json)
         .ok_or_else(|| AppError::NotFound("refresh request not found".into()))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewRequest {}
+
+async fn review(
+    State(state): State<Arc<AppState>>,
+    Extension(service): Extension<Arc<RefreshService>>,
+    headers: HeaderMap,
+    Path(child): Path<String>,
+    Json(_body): Json<ReviewRequest>,
+) -> Result<Json<reposync_core::pair_refresh::service::RefreshReviewResponse>, AppError> {
+    let bearer = authenticated_bearer(&state, &service, &headers)?;
+    service.review(bearer, child).await.map(Json).map_err(review_refused)
+}
+
+async fn review_candidate(
+    State(state): State<Arc<AppState>>,
+    Extension(service): Extension<Arc<RefreshService>>,
+    headers: HeaderMap,
+    Path(child): Path<String>,
+    Json(body): Json<reposync_core::pair_refresh::service::RefreshReviewCandidateRequest>,
+) -> Result<Json<reposync_core::pair_refresh::service::RefreshReviewResponse>, AppError> {
+    let bearer = authenticated_bearer(&state, &service, &headers)?;
+    service.review_candidate(bearer, child, body).await.map(Json).map_err(review_refused)
+}
+
+fn review_refused(error: anyhow::Error) -> AppError {
+    use reposync_core::pair_refresh::service::RefreshReviewRefusal;
+    let reason = error.downcast_ref::<RefreshReviewRefusal>().copied().unwrap_or(RefreshReviewRefusal::Unavailable);
+    if matches!(reason, RefreshReviewRefusal::AuthorizationChanged) {
+        AppError::Unauthorized(reason.code().into())
+    } else {
+        AppError::Conflict(reason.code().into())
+    }
+}
+
+/// Test-only transport seam under the existing explicit fixture feature. The
+/// supplied service still authenticates against the actual AppState engine and
+/// captures registered sources; no observer/capability/result is injectable.
+#[cfg(feature = "reliability-fixture")]
+pub fn review_fixture_routes(service: Arc<RefreshService>) -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/v2/repos/:id/refresh/review", post(review))
+        .route("/api/v2/repos/:id/refresh/review/candidate", post(review_candidate))
+        .route("/api/v2/repos/:id/refresh/prepare", post(prepare))
+        .route("/api/v2/repos/:id/refresh/recovery/prepare", post(prepare_recovery))
+        .route("/api/v2/repos/:id/refresh/action", post(act))
+        .route("/api/v2/repos/:id/refresh/requests/:request", get(receipt))
+        .layer(Extension(service))
 }
