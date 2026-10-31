@@ -995,7 +995,7 @@ mod authenticated_review_http_journey {
                 "child",
                 request,
                 approval.preparation_id,
-                &approval.approval_digest,
+                approval.approval_digest.clone(),
                 RefreshAction::Execute,
             )
             .await
