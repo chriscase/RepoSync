@@ -18,7 +18,9 @@ use reposync_core::db::import_operations::{
     RepoImportBaseline, SnapshotPin,
 };
 use reposync_core::db::late_pair_publish_operations::late_pair_publish_fingerprint;
-use reposync_core::db::queries::AuditLogInput;
+use reposync_core::db::queries::{
+    AuditLogInput, RepositorySaveError, RepositorySaveKind, RepositorySaveReceipt,
+};
 use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
 use reposync_core::db::Database;
 use reposync_core::errors::{redact_vcs_error_detail, DatabaseError};
@@ -53,8 +55,10 @@ mod import_failure_persistence;
 // Request / response types
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CreateRepoRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    save_request_id: Option<String>,
     name: String,
     svn_url: String,
     #[serde(default)]
@@ -101,8 +105,18 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+fn present_nullable_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize, Serialize)]
 struct UpdateRepoRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    save_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_updated_at: Option<String>,
     name: Option<String>,
     svn_url: Option<String>,
     svn_branch: Option<String>,
@@ -116,8 +130,18 @@ struct UpdateRepoRequest {
     lfs_threshold_mb: Option<i64>,
     auto_merge: Option<bool>,
     enabled: Option<bool>,
-    allowed_paths: Option<String>,
-    blocked_patterns: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable_string"
+    )]
+    allowed_paths: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_nullable_string"
+    )]
+    blocked_patterns: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -140,6 +164,8 @@ struct RepoSummary {
 
 #[derive(Serialize)]
 struct RepoDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    save_receipt: Option<RepositorySaveReceipt>,
     id: String,
     name: String,
     parent_id: Option<String>,
@@ -175,6 +201,7 @@ struct RepoDetail {
 impl From<reposync_core::models::Repository> for RepoDetail {
     fn from(r: reposync_core::models::Repository) -> Self {
         Self {
+            save_receipt: None,
             id: r.id,
             name: r.name,
             parent_id: r.parent_id,
@@ -260,7 +287,12 @@ fn enrich_repo_detail(db: &Database, mut detail: RepoDetail) -> Result<RepoDetai
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SaveCredentialsRequest {
+    #[serde(default)]
+    save_request_id: Option<String>,
+    #[serde(default)]
+    expected_updated_at: Option<String>,
     svn_password: Option<String>,
     git_token: Option<String>,
 }
@@ -275,6 +307,10 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/repos", get(list_repos))
         .route("/api/repos", post(create_repo))
+        .route(
+            "/api/repository-save-requests/:request_id",
+            get(get_global_save_request),
+        )
         .route("/api/repos/:id", get(get_repo))
         .route("/api/repos/:id", put(update_repo))
         .route("/api/repos/:id", delete(delete_repo))
@@ -320,6 +356,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/repos/:id/credentials", get(get_credentials))
         .route("/api/repos/:id/credentials", post(save_credentials))
+        .route(
+            "/api/repos/:id/save-requests/:request_id",
+            get(get_save_request),
+        )
         .route("/api/repos/:id/branches", post(create_branch_pair))
         .route("/api/repos/:id/branches", get(list_branch_pairs))
         .route("/api/repos/:id/refresh", post(preview_pair_refresh))
@@ -389,7 +429,7 @@ async fn create_repo(
     .await?;
 
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
     if body.name.is_empty() {
@@ -399,6 +439,8 @@ async fn create_repo(
         return Err(AppError::BadRequest("svn_url is required".into()));
     }
 
+    let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
+    let request_id = body.save_request_id.clone();
     let now = Utc::now().to_rfc3339();
     let repo_id = reposync_core::db::repo_scope_identity::new_human_repository_id();
     reposync_core::db::repo_scope_identity::validate_human_repository_id(&repo_id)
@@ -418,7 +460,7 @@ async fn create_repo(
         lfs_threshold_mb: body.lfs_threshold_mb,
         auto_merge: body.auto_merge,
         enabled: body.enabled,
-        created_by: Some(user_id),
+        created_by: Some(user_id.clone()),
         parent_id: None,
         created_at: now.clone(),
         updated_at: now,
@@ -436,9 +478,22 @@ async fn create_repo(
 
     let db = &state.db;
 
+    if let Some(request_id) = request_id {
+        let receipt = db
+            .create_repository_once(&repo, &user_id, &request_id, &payload)
+            .map_err(save_error)?;
+        let known = db
+            .get_repository(&receipt.repo_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| {
+                AppError::Conflict("created registration is no longer available".into())
+            })?;
+        let mut result = RepoDetail::from(known);
+        result.save_receipt = Some(receipt);
+        return Ok(Json(result));
+    }
     db.insert_repository(&repo)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(RepoDetail::from(repo)))
 }
 
@@ -469,17 +524,40 @@ async fn update_repo(
     Path(id): Path<String>,
     Json(body): Json<UpdateRepoRequest>,
 ) -> Result<Json<RepoDetail>, AppError> {
-    let (_user_id, role) = validate_session_with_role(
+    let (user_id, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
 
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
 
+    let payload = serde_json::to_vec(&body).map_err(|e| AppError::Internal(e.to_string()))?;
+    let request_id = body.save_request_id.clone();
+    let expected_updated_at = body.expected_updated_at.clone();
     let db = &state.db;
+    if let Some(ref request_id) = request_id {
+        if let Some(receipt) = db
+            .verified_repository_save_receipt(
+                &user_id,
+                request_id,
+                RepositorySaveKind::Configuration,
+                Some(&id),
+                &payload,
+            )
+            .map_err(save_error)?
+        {
+            let current = db
+                .get_repository(&id)
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+            let mut result = RepoDetail::from(current);
+            result.save_receipt = Some(receipt);
+            return Ok(Json(result));
+        }
+    }
     reject_held_import(db, &id)?;
     if db
         .managed_remove_blocks_new_work(&id)
@@ -524,15 +602,32 @@ async fn update_repo(
         sync_status: existing.sync_status,
         total_syncs: existing.total_syncs,
         total_errors: existing.total_errors,
-        allowed_paths: body.allowed_paths.or(existing.allowed_paths),
-        blocked_patterns: body.blocked_patterns.or(existing.blocked_patterns),
+        allowed_paths: body.allowed_paths.unwrap_or(existing.allowed_paths),
+        blocked_patterns: body.blocked_patterns.unwrap_or(existing.blocked_patterns),
         consecutive_errors: existing.consecutive_errors,
         teams_webhook_url: existing.teams_webhook_url,
     };
 
+    if let Some(request_id) = request_id {
+        let receipt = db
+            .update_repository_once(
+                &updated,
+                &user_id,
+                &request_id,
+                expected_updated_at.as_deref(),
+                &payload,
+            )
+            .map_err(save_error)?;
+        let current = db
+            .get_repository(&id)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
+        let mut result = RepoDetail::from(current);
+        result.save_receipt = Some(receipt);
+        return Ok(Json(result));
+    }
     db.update_repository(&updated)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(RepoDetail::from(updated)))
 }
 
@@ -2990,118 +3085,85 @@ async fn get_credentials(
     }))
 }
 
+fn save_error(error: RepositorySaveError) -> AppError {
+    match error {
+        RepositorySaveError::InvalidRequest => AppError::BadRequest(error.to_string()),
+        RepositorySaveError::Conflict => AppError::Conflict(error.to_string()),
+        RepositorySaveError::NotFound => AppError::NotFound(error.to_string()),
+        RepositorySaveError::Database(_) => AppError::Internal(error.to_string()),
+    }
+}
+
+async fn get_global_save_request(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<RepositorySaveReceipt>, AppError> {
+    let (actor, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    let receipt = state
+        .db
+        .repository_save_receipt(&actor, &request_id)
+        .map_err(save_error)?
+        .ok_or_else(|| AppError::NotFound("save request not found".into()))?;
+    Ok(Json(receipt))
+}
+
+async fn get_save_request(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Path((id, request_id)): Path<(String, String)>,
+) -> Result<Json<RepositorySaveReceipt>, AppError> {
+    let (actor, role) = validate_session_with_role(
+        &state,
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+    )
+    .await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden("admin access required".into()));
+    }
+    let receipt = state
+        .db
+        .repository_save_receipt(&actor, &request_id)
+        .map_err(save_error)?
+        .filter(|receipt| receipt.repo_id == id)
+        .ok_or_else(|| AppError::NotFound("save request not found".into()))?;
+    Ok(Json(receipt))
+}
+
 async fn save_credentials(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<SaveCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (_user_id, role) = validate_session_with_role(
+    let (actor, role) = validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
-
     if role != "admin" {
-        return Err(AppError::Unauthorized("admin access required".into()));
+        return Err(AppError::Forbidden("admin access required".into()));
     }
-
-    let db = &state.db;
-
-    // Verify repo exists
-    let _repo = db
-        .get_repository(&id)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-        .ok_or_else(|| AppError::NotFound("repository not found".into()))?;
-
-    let now = Utc::now().to_rfc3339();
-
-    if let Some(ref password) = body.svn_password {
-        let key = format!("secret_svn_password_{}", id);
-        db.conn()
-            .execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![key, password, now],
-            )
-            .map_err(|e| AppError::Internal(format!("failed to store SVN password: {}", e)))?;
-        if password.is_empty() {
-            tracing::info!(repo_id = %id, "SVN password revoked for repository");
-        } else {
-            tracing::info!(repo_id = %id, "SVN password stored for repository");
-            let mut queue: Vec<String> = vec![id.clone()];
-            let mut propagated = 0;
-            while let Some(current) = queue.pop() {
-                if let Ok(children) = db.list_child_repositories(&current) {
-                    for child in children {
-                        let child_key = format!("secret_svn_password_{}", child.id);
-                        db.conn()
-                            .execute(
-                                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                                rusqlite::params![child_key, password, now],
-                            )
-                            .map_err(|e| {
-                                AppError::Internal(format!(
-                                    "failed to propagate SVN password: {}",
-                                    e
-                                ))
-                            })?;
-                        queue.push(child.id);
-                        propagated += 1;
-                    }
-                }
-            }
-            if propagated > 0 {
-                tracing::info!(
-                    repo_id = %id,
-                    propagated_to_children = propagated,
-                    "SVN password propagated to descendants"
-                );
-            }
-        }
-    }
-
-    if let Some(ref token) = body.git_token {
-        let key = format!("secret_git_token_{}", id);
-        db.conn()
-            .execute(
-                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                rusqlite::params![key, token, now],
-            )
-            .map_err(|e| AppError::Internal(format!("failed to store Git token: {}", e)))?;
-        if token.is_empty() {
-            tracing::info!(repo_id = %id, "Git token revoked for repository");
-        } else {
-            let mut queue: Vec<String> = vec![id.clone()];
-            let mut propagated = 0;
-            while let Some(current) = queue.pop() {
-                if let Ok(children) = db.list_child_repositories(&current) {
-                    for child in children {
-                        let child_key = format!("secret_git_token_{}", child.id);
-                        db.conn()
-                            .execute(
-                                "INSERT OR REPLACE INTO kv_state (key, value, updated_at) VALUES (?1, ?2, ?3)",
-                                rusqlite::params![child_key, token, now],
-                            )
-                            .map_err(|e| {
-                                AppError::Internal(format!(
-                                    "failed to propagate Git token: {}",
-                                    e
-                                ))
-                            })?;
-                        queue.push(child.id);
-                        propagated += 1;
-                    }
-                }
-            }
-            tracing::info!(
-                repo_id = %id,
-                propagated_to_children = propagated,
-                "Git token stored and propagated to descendants"
-            );
-        }
-    }
-
-    Ok(Json(serde_json::json!({ "ok": true })))
+    let receipt = state
+        .db
+        .save_repository_credentials(
+            &id,
+            body.svn_password.as_deref(),
+            body.git_token.as_deref(),
+            &actor,
+            body.save_request_id.as_deref(),
+            body.expected_updated_at.as_deref(),
+        )
+        .map_err(save_error)?;
+    // Only field names/counts are returned. Credential bytes and receipt MACs never leave the handler.
+    Ok(Json(serde_json::json!({"ok":true,"save_receipt":receipt})))
 }
 
 // ---------------------------------------------------------------------------

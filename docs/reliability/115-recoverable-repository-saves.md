@@ -1,0 +1,31 @@
+# Recovering repository settings and credential saves (#115)
+
+Repository registration/configuration and credential storage are separate stages. Configuration may already be active when the credential stage fails. The UI reports each stage and the existing repository ID; it does not promise a cross-stage rollback or close the form until every requested stage is confirmed. Settings saves do not start imports or VCS publications by themselves.
+
+## Recover the same save
+
+1. Keep the displayed repository ID. Select **Resume** in the original form, or open that repository's settings. Do not create a replacement repository because a response was lost.
+2. Review the configuration-stage outcome. An unknown response means the server may have committed. Resume retains the original configuration request ID and confirms its durable receipt before sending credentials.
+3. Re-enter the originally requested credential fields after reload/navigation. Credential bytes are kept only in memory; the browser recovery journal contains allowlisted nonsecret fields, request IDs, stage status and the known repository ID. With no credential inputs, Resume can confirm an earlier committed credential receipt. Partially entered new values are never reported as saved.
+4. If a request ID conflicts with changed input, retain the existing ID and review it. A new deliberate save on that repository uses new request IDs. Replaying a confirmed request never overwrites a later configuration or credential value.
+5. If the server returns no matching durable confirmation, the UI retains the ID and blocks blind write retry. Use a matching UI/API version and review the existing registration before beginning a new save. Do not delete recovery data to turn an unknown create into another registration.
+
+Closing or navigating away is not cancellation of a server commit. A 30-second response-observation timeout reports an unknown outcome and retains the original identity. It is not a rollback or an authorization expiry. Login changes prevent the old view from advancing further stages. Public drafts and created IDs survive view reloads; credential bytes must be re-entered. Browser storage failures block the first request rather than losing its recovery identity. If storage is unavailable/corrupt, review the existing ID before starting another save.
+
+Edits typed while an earlier snapshot is being saved remain unsaved and visible. Only confirmed matching credential bytes are cleared. Saving a previous snapshot does not silently close the newer draft. Do not embed credentials in repository URL fields; use the dedicated credential inputs.
+
+## API and durable behavior
+
+Create/update accept an optional canonical UUID `save_request_id`. Credential saves accept the same optional field and optional `expected_updated_at`; updates also accept `expected_updated_at`. The new UI supplies separate stable IDs for configuration and credentials. The server atomically commits each stage's effect and receipt in its existing SQLite database. Concurrent/repeated identical requests return the original receipt/registration. Reusing a request ID for different payload, kind, target or registration incarnation is a conflict; no prior write is replayed. A configuration timestamp precondition is an equality check against the current registration, not a global monotonic lease or execution permit.
+
+The admin-only read endpoints are `GET /api/repository-save-requests/:request_id` and `GET /api/repos/:id/save-requests/:request_id`. They are bound to the original authenticated actor and current registration incarnation. Missing requests return 404; conflicts return 409; absent/invalid authentication remains 401 and authenticated non-admin access is 403. Receipts disclose IDs, stage kind, configuration timestamp, credential field names and propagation count, never credential bytes or internal MACs. A historical receipt confirms its original commit, not that later settings or credentials are still the same.
+
+Receipts use a dedicated internal request-payload MAC key and namespace in existing `kv_state`, without schema migration or changing the existing encryption key, credential keys or fingerprint readers. Losing/corrupting this receipt key with retained receipts refuses recovery; it does not rotate the key and recreate writes. Back up the database as a whole. No new secret plaintext or unkeyed credential digest is stored in receipts or browser journals. Existing credential storage format is unchanged.
+
+Both supplied credential fields and all inherited descendant updates commit atomically. A descendant/query/write error rolls the whole credential stage back and leaves its receipt absent. Existing semantics remain: nonempty parent values propagate to descendants, an explicit empty string revokes only the selected repository, and an omitted field stays unchanged. Legacy API clients omitting request IDs retain their existing API shape and get atomic credential batches, but do not gain lost-response idempotency; the receipt-aware UI must use a matching API.
+
+## Regression coverage and qualification
+
+The source includes six DB regressions for committed-response replay, stale configuration/cursor preservation, full descendant rollback, no overwrite on old credential replay, revocation/absence, and registration/key loss. Four real local HTTP/SQLite tests cover partial failure and retry, concurrent/lost-response create, credential replay, explicit policy clearing, runtime cursor preservation, actor binding and refusal/error responses. Twenty-five new UI tests exercise the shared save/journal code used by both settings pages, including both stage-order failure cases, navigation/reload, private input loss/re-entry, newer drafts, mismatched confirmations, and immutable request/payload handling. The hook separately checks the current actor/session before each network stage; that integration guard is source-reviewed rather than a browser/session execution result.
+
+The UI tests are deterministic transport/journal tests, not a browser automation result. Final revision identity, commands, exit statuses and original logs are recorded in the review packet; hosted whole-workspace CI and independent source review remain separate gates. No live credentials, company repositories or production settings are needed for these synthetic tests.

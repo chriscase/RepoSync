@@ -6,6 +6,20 @@ import type { RepoImportMode, SnapshotPin, StartRepoImportRequest } from './impo
 
 const API_BASE = '/api';
 
+export interface RepositorySaveReceipt {
+  version: number;
+  request_id: string;
+  kind: 'create' | 'configuration' | 'credentials';
+  repo_id: string;
+  configuration_updated_at: string;
+  credential_fields: Array<'svn_password' | 'git_token'>;
+  propagated_repositories: number;
+}
+
+export class ApiError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
+
 export interface SyncStatus {
   state: string;
   last_sync_at: string | null;
@@ -304,11 +318,11 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
     if (window.location.pathname !== '/login') {
       window.location.href = '/login';
     }
-    throw new Error('Session expired — please log in again');
+    throw new ApiError(401, 'Session expired — please log in again');
   }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API error ${res.status}: ${text}`);
+    throw new ApiError(res.status, `API error ${res.status}: ${text}`);
   }
   return res.json();
 }
@@ -431,8 +445,8 @@ export const api = {
 
   // Repositories (multi-repo)
   getRepos: () => fetchJson<Repository[]>('/repos'),
-  createRepo: (data: Partial<Repository>) =>
-    fetchJson<Repository>('/repos', { method: 'POST', body: JSON.stringify(data) }),
+  createRepo: (data: Partial<Repository>, requestId?: string, signal?: AbortSignal) =>
+    fetchJson<Repository>('/repos', { method: 'POST', signal, body: JSON.stringify({ ...data, save_request_id: requestId }) }),
   startRepoImport: (id: string, body: StartRepoImportRequest = {}) =>
     fetchJson<{
       ok: boolean;
@@ -446,8 +460,8 @@ export const api = {
       body: JSON.stringify(body),
     }),
   getRepo: (id: string) => fetchJson<Repository>(`/repos/${id}`),
-  updateRepo: (id: string, data: Partial<Repository>) =>
-    fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  updateRepo: (id: string, data: Partial<Repository>, options?: { requestId?: string; expectedUpdatedAt?: string; signal?: AbortSignal }) =>
+    fetchJson<Repository>(`/repos/${id}`, { method: 'PUT', signal: options?.signal, body: JSON.stringify({ ...data, save_request_id: options?.requestId, expected_updated_at: options?.expectedUpdatedAt }) }),
   /** Legacy root DELETE — disable only (non-destructive). Prefer `disableRepo`. */
   deleteRepo: (id: string) =>
     fetchJson<{
@@ -686,10 +700,15 @@ export const api = {
     ),
   getRepoCredentials: (id: string) =>
     fetchJson<{ svn_password_set: boolean; git_token_set: boolean }>(`/repos/${id}/credentials`),
-  saveRepoCredentials: (id: string, data: { svn_password?: string; git_token?: string }) =>
-    fetchJson<{ ok: boolean }>(`/repos/${id}/credentials`, {
-      method: 'POST',
-      body: JSON.stringify(data),
+  getRepoSaveRequest: (requestId: string, repoId?: string, signal?: AbortSignal) =>
+    fetchJson<RepositorySaveReceipt>(repoId
+      ? `/repos/${encodeURIComponent(repoId)}/save-requests/${encodeURIComponent(requestId)}`
+      : `/repository-save-requests/${encodeURIComponent(requestId)}`, { signal }),
+
+  saveRepoCredentials: (id: string, data: { svn_password?: string; git_token?: string }, requestId?: string, expectedUpdatedAt?: string, signal?: AbortSignal) =>
+    fetchJson<{ ok: boolean; save_receipt: RepositorySaveReceipt }>(`/repos/${id}/credentials`, {
+      method: 'POST', signal,
+      body: JSON.stringify({ ...data, save_request_id: requestId, expected_updated_at: expectedUpdatedAt }),
     }),
 
   // Auth - public info (no auth required) for login page LDAP hints
@@ -841,6 +860,7 @@ export interface WizardSetupConfig {
 }
 
 export interface Repository {
+  save_receipt?: RepositorySaveReceipt;
   id: string;
   name: string;
   parent_id: string | null;
