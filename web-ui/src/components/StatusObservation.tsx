@@ -16,6 +16,16 @@ export function StatusObservationPanel({view}:{view:ReturnType<typeof statusObse
     {o?.operations.map((operation,index)=><div key={`${operation.kind}:${operation.operation_id ?? index}`} className="border-l border-gray-600 pl-2 break-words">
       <p>{operation.repository_id}: {operation.kind} — {operation.state}{operation.held ? ' (hold retained)':''}.</p>
       <p>Operation: {operation.operation_id ?? 'Unavailable / restricted'}. Ref: {operation.target_ref ?? 'Unknown'}. Intended Git: {operation.intended_git_sha ?? 'Unknown'}. Confirmed SVN: {operation.confirmed_svn_revision ?? 'Unknown'}.</p>
+      {operation.target_evidence?.kind==='late_pair' && <div>
+        <p>Stored target Git branch: {operation.target_evidence.target_git_branch}; SVN branch: {operation.target_evidence.target_svn_branch}.</p>
+        <p>Pinned Git tip: {operation.target_evidence.pinned_git_tip}. Baseline Git: {operation.target_evidence.baseline_git_sha}; baseline SVN: {operation.target_evidence.baseline_svn_revision}.</p>
+        <p>Copy source SVN revision: {operation.target_evidence.copy_source_svn_revision}; source path: {operation.target_evidence.copy_source_svn_path ?? 'Unknown'}; observed branch head: {operation.target_evidence.observed_svn_branch_head_revision ?? 'Unknown'}. These are pinned/source observations, not final publication confirmation.</p>
+      </div>}
+      {operation.target_evidence?.kind==='svn_commit' && <div>
+        <p>Stored target SVN UUID: {operation.target_evidence.target_svn_uuid}; branch path: {operation.target_evidence.target_svn_branch_path ?? 'Unknown'}.</p>
+        <p>Source Git commit: {operation.target_evidence.source_git_sha}; source tree: {operation.target_evidence.source_git_tree}.</p>
+        <p>Pre-write SVN revision: {operation.target_evidence.pre_write_svn_revision}; pre-write tree: {operation.target_evidence.pre_write_svn_tree}; intended SVN tree: {operation.target_evidence.intended_svn_tree}. Source/intent is not confirmed publication.</p>
+      </div>}
       {operation.history_evidence && <p>{Object.entries(operation.history_evidence).map(([name,value])=>`${name}: ${value ?? 'Unknown'}`).join('; ')}</p>}
       {operation.reason && <p>{operation.reason}</p>}
       {!operation.details_visible && <p>Some evidence is unavailable or restricted; no completion is inferred.</p>}

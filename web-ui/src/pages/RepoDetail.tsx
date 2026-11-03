@@ -1,3 +1,4 @@
+import { canConfirmObservedSkip, runObservedSkip, latestScopedSkipObservation, type ScopedSkipObservation } from '../statusActions';
 import { useStatusObservation } from '../useStatusObservation';
 import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
 import { useRepositorySave } from '../useRepositorySave';
@@ -271,7 +272,9 @@ function RepositoryDetailEditor() {
     retry: detailRetry,
   });
 
-  const skipContextEnabled = detailLive && isAdmin && statusView.canAct && status?.state === 'error_paused';
+  const skipState=useRef<ScopedSkipObservation>({repoId:id,detailLive,administrator:isAdmin,query:statusQuery});
+  skipState.current={repoId:id,detailLive,administrator:isAdmin,query:statusQuery};
+  const skipContextEnabled = !!id && canConfirmObservedSkip(skipState.current,id);
   const { data: skipContextResponse } = useQuery({
     queryKey: ['skip-commit-context', id],
     queryFn: () => api.getSkipCommitContext(id!),
@@ -281,8 +284,10 @@ function RepositoryDetailEditor() {
   });
   const skipContext: SkipCommitContext | null = skipContextResponse?.context ?? null;
 
+  useEffect(()=>{if(!skipContextEnabled){setShowSkipModal(false);setSkipSelectedCount(0);}},[skipContextEnabled]);
+
   const skipMutation = useMutation({
-    mutationFn: (selected: string[]) => {
+    mutationFn: (selected: string[]) => runObservedSkip(()=>latestScopedSkipObservation(queryClient,skipState.current),id!,async () => {
       if (!skipContext?.observed_remote_tip) {
         throw new Error('Observed remote tip is unavailable for exact skip');
       }
@@ -293,7 +298,7 @@ function RepositoryDetailEditor() {
         expected_bridge_tip: skipContext.observed_bridge_tip ?? undefined,
         reason: 'operator_exact_skip',
       });
-    },
+    }),
     onSuccess: () => {
       setShowSkipModal(false);
       setSkipSelectedCount(0);
@@ -1144,7 +1149,7 @@ function RepositoryDetailEditor() {
         </div>
       )}
 
-      {showSkipModal && skipContext && (
+      {showSkipModal && skipContextEnabled && skipContext && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" data-testid="skip-commit-modal">
           <div className="bg-gray-800 border border-gray-600 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
             <h3 className="text-lg font-semibold text-gray-100 mb-2">Skip selected pending commits</h3>
@@ -1179,9 +1184,10 @@ function RepositoryDetailEditor() {
               </button>
               <button
                 type="button"
-                disabled={skipSelectedCount === 0 || skipMutation.isPending}
+                disabled={!skipContextEnabled || skipSelectedCount === 0 || skipMutation.isPending}
                 data-testid="skip-commit-confirm"
                 onClick={() => {
+                  if(!id || !canConfirmObservedSkip(latestScopedSkipObservation(queryClient,skipState.current),id)){setSkipError('Status changed; no Skip request was sent.');return;}
                   const pending = skipContext.pending_commits.filter((c) => !c.excluded);
                   const selected = pending.slice(0, skipSelectedCount).map((c) => c.sha);
                   skipMutation.mutate(selected);

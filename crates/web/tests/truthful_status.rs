@@ -540,3 +540,311 @@ async fn rs116_http_late_pair_active_and_reconciliation_are_not_hidden_by_idle_r
     assert_eq!(kv_snapshot(&state), before);
     server.abort();
 }
+
+fn consistent_idle(state: &AppState, id: &str) {
+    let mut repo = state.db.get_repository(id).unwrap().unwrap();
+    repo.last_svn_rev = 7;
+    repo.last_git_sha = "a".repeat(40);
+    repo.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
+    state.db.update_repository(&repo).unwrap();
+    state
+        .db
+        .set_state(&format!("last_svn_rev_{id}"), "7")
+        .unwrap();
+}
+#[tokio::test]
+async fn rs116_review_removal_dangling_valid_and_foreign_evidence_is_readonly_nonhealthy() {
+    use reposync_core::db::managed_remove::RemovalAdvance;
+    let (addr, state, server, _tmp) = status_fixture(&[("removal-check", "idle")]).await;
+    consistent_idle(&state, "removal-check");
+    assert_eq!(
+        status(addr, Some("removal-check")).await["observation"]["health"],
+        "idle"
+    );
+    for pointer in ["active", "latest"] {
+        let key = format!("managed_remove_v1:{pointer}:removal-check");
+        state.db.set_state(&key, "missing-doc").unwrap();
+        let before = kv_snapshot(&state);
+        let value = status(addr, Some("removal-check")).await;
+        assert!(matches!(
+            value["observation"]["health"].as_str(),
+            Some("unknown" | "held")
+        ));
+        assert_eq!(value["observation"]["evidence_complete"], false);
+        assert_eq!(kv_snapshot(&state), before);
+        state
+            .db
+            .conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&key])
+            .unwrap();
+    }
+    let op = match state
+        .db
+        .prepare_managed_remove("removal-check", "owner", "remove-request")
+        .unwrap()
+    {
+        RemovalAdvance::Cleanup { operation } | RemovalAdvance::Waiting { operation, .. } => {
+            operation
+        }
+        other => panic!("unexpected {other:?}"),
+    };
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("removal-check")).await;
+    assert_eq!(value["observation"]["health"], "held");
+    assert_eq!(value["observation"]["operations"][0]["operation_id"], op.id);
+    assert_eq!(kv_snapshot(&state), before);
+    let key = format!("managed_remove_v1:document:{}", op.id);
+    let mut foreign = serde_json::to_value(op).unwrap();
+    foreign["repo_id"] = "foreign".into();
+    foreign["outcome_detail"] = "foreign-private-marker".into();
+    state.db.set_state(&key, &foreign.to_string()).unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("removal-check")).await;
+    assert_eq!(value["observation"]["evidence_complete"], false);
+    assert_ne!(value["observation"]["health"], "idle");
+    assert!(!value.to_string().contains("foreign-private-marker"));
+    assert_eq!(kv_snapshot(&state), before);
+    state.db.set_state(&key, "{bad").unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("removal-check")).await;
+    assert_eq!(value["observation"]["evidence_complete"], false);
+    assert_eq!(kv_snapshot(&state), before);
+    server.abort();
+}
+#[tokio::test]
+async fn rs116_review_history_shape_oid_scope_and_transient_records_do_not_become_healthy_or_permanent(
+) {
+    use reposync_core::history_inspect::{
+        history_block_key_for_repo, persist_history_block, HistoryInspectReject,
+        REASON_OBSERVED_REMOTE_REWRITE,
+    };
+    let (addr, state, server, _tmp) =
+        status_fixture(&[("history-shape", "idle"), ("history-transient", "idle")]).await;
+    consistent_idle(&state, "history-shape");
+    consistent_idle(&state, "history-transient");
+    assert_eq!(
+        status(addr, Some("history-shape")).await["observation"]["health"],
+        "idle"
+    );
+    let key = history_block_key_for_repo(&state.db, "history-shape").unwrap();
+    let oid = "a".repeat(40);
+    persist_history_block(
+        &state.db,
+        &key,
+        Some("history-shape"),
+        &HistoryInspectReject {
+            reason: REASON_OBSERVED_REMOTE_REWRITE.into(),
+            detail: "genuine stored rewrite refusal".into(),
+            o: Some(oid.clone()),
+            r: Some("b".repeat(40)),
+            l: None,
+        },
+        Some(&oid),
+    )
+    .unwrap();
+    let good: serde_json::Value =
+        serde_json::from_str(&state.db.get_state(&key).unwrap().unwrap()).unwrap();
+    let mut wrong_type = good.clone();
+    wrong_type["durable"] = "false".into();
+    let mut bad_oid = good.clone();
+    bad_oid["p_handled"] = "not-an-oid".into();
+    let mut foreign = good.clone();
+    foreign["repo_id"] = "foreign".into();
+    let mut bad_state = good.clone();
+    bad_state["state"] = false.into();
+    let mut bad_reason = good.clone();
+    bad_reason["reason"] = serde_json::json!([]);
+    for malformed in [
+        serde_json::json!({}),
+        serde_json::json!(7),
+        serde_json::json!([]),
+        wrong_type,
+        bad_oid,
+        foreign,
+        bad_state,
+        bad_reason,
+    ] {
+        state.db.set_state(&key, &malformed.to_string()).unwrap();
+        let before = kv_snapshot(&state);
+        let value = status(addr, Some("history-shape")).await;
+        assert_ne!(value["observation"]["health"], "idle", "{malformed}");
+        assert_eq!(
+            value["observation"]["evidence_complete"], false,
+            "{malformed}"
+        );
+        let op = value["observation"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|op| op["kind"] == "history")
+            .unwrap();
+        assert!(op["operation_id"].is_null());
+        assert!(op["history_evidence"].is_null());
+        assert_eq!(kv_snapshot(&state), before);
+    }
+    state.db.set_state(&key, "{bad-json").unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("history-shape")).await;
+    assert_eq!(value["observation"]["health"], "held");
+    assert_eq!(value["observation"]["evidence_complete"], false);
+    assert_eq!(kv_snapshot(&state), before);
+    state.db.set_state(&key, &good.to_string()).unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("history-shape")).await;
+    assert_eq!(value["observation"]["health"], "held");
+    assert_eq!(value["observation"]["evidence_complete"], true);
+    assert_eq!(kv_snapshot(&state), before);
+    let transient_key = history_block_key_for_repo(&state.db, "history-transient").unwrap();
+    persist_history_block(
+        &state.db,
+        &transient_key,
+        Some("history-transient"),
+        &HistoryInspectReject {
+            reason: "temporary_remote_unavailable".into(),
+            detail: "Fresh observation could not complete".into(),
+            o: None,
+            r: None,
+            l: None,
+        },
+        Some(&oid),
+    )
+    .unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("history-transient")).await;
+    assert_eq!(value["observation"]["health"], "conflict");
+    let op = &value["observation"]["operations"][0];
+    assert_eq!(op["state"], "transient_refusal");
+    assert_eq!(op["held"], false);
+    assert_eq!(kv_snapshot(&state), before);
+    server.abort();
+}
+#[tokio::test]
+async fn rs116_review_late_pair_and_svn_actual_target_schemas_survive_registration_drift_without_leakage(
+) {
+    use reposync_core::db::late_pair_publish_operations::LatePairPublishState;
+    use reposync_core::db::svn_commit_operations::SvnCommitIntent;
+    let (addr, state, server, _tmp) =
+        status_fixture(&[("late-target", "idle"), ("svn-target", "idle")]).await;
+    let pinned = "a".repeat(40);
+    let base = "b".repeat(40);
+    let mut late = state
+        .db
+        .create_late_pair_publish_operation(
+            "late-target",
+            "actor-target-owner",
+            "late-request",
+            "fp",
+            "recorded-feature",
+            "branches/recorded",
+            &pinned,
+            &base,
+            7,
+            6,
+            "late_pair_publish_v1",
+        )
+        .unwrap();
+    late.state = LatePairPublishState::ReconciliationRequired;
+    late.outcome_detail = Some("copy uncertain".into());
+    state.db.update_late_pair_publish_operation(late).unwrap();
+    state.db.conn().execute("UPDATE repositories SET git_branch='different-current',svn_branch='different-current' WHERE id='late-target'",[]).unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("late-target")).await;
+    let op = &value["observation"]["operations"][0];
+    assert_eq!(op["target_ref"], "recorded-feature");
+    assert_eq!(op["target_evidence"]["pinned_git_tip"], pinned);
+    assert_eq!(op["target_evidence"]["baseline_git_sha"], base);
+    assert_eq!(op["target_evidence"]["copy_source_svn_revision"], 6);
+    assert!(op["confirmed_svn_revision"].is_null());
+    assert_eq!(value["observation"]["health"], "held");
+    assert_eq!(kv_snapshot(&state), before);
+    let source = "c".repeat(40);
+    let tree = "d".repeat(40);
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("fixture"), b"before").unwrap();
+    let pre_write_tree =
+        reposync_core::svn_commit::hash_regular_file_tree(snapshot.path()).unwrap();
+    std::fs::write(snapshot.path().join("fixture"), b"after").unwrap();
+    let intended_tree = reposync_core::svn_commit::hash_regular_file_tree(snapshot.path()).unwrap();
+    let svn = state
+        .db
+        .begin_git_to_svn_commit(SvnCommitIntent {
+            repo_id: "svn-target",
+            initiator_id: "actor-target-owner",
+            request_id: "svn-request",
+            target_fingerprint: "fp",
+            source_git_sha: &source,
+            source_git_parent: None,
+            source_git_tree: &tree,
+            target_svn_uuid: "fixture-uuid",
+            target_svn_path: "https://user:credential-marker@fixture.invalid/private",
+            target_svn_root_url: "https://user:credential-marker@fixture.invalid",
+            target_svn_branch_path: "branches/recorded@literal",
+            pre_write_svn_rev: 9,
+            pre_write_svn_tree: &pre_write_tree,
+            projection: "{}",
+            intended_changed_paths: vec![],
+            intended_svn_tree: &intended_tree,
+            author: "fixture",
+            source_message: "private-message-marker",
+        })
+        .unwrap();
+    state
+        .db
+        .hold_git_to_svn_reconciliation("svn-target", &svn.id, "write uncertain")
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE repositories SET svn_branch='different-current' WHERE id='svn-target'",
+            [],
+        )
+        .unwrap();
+    let before = kv_snapshot(&state);
+    let value = status(addr, Some("svn-target")).await;
+    let op = &value["observation"]["operations"][0];
+    assert_eq!(op["target_ref"], "branches/recorded@literal");
+    assert_eq!(op["target_evidence"]["source_git_sha"], source);
+    assert_eq!(op["target_evidence"]["pre_write_svn_revision"], 9);
+    assert!(op["intended_git_sha"].is_null());
+    assert!(op["confirmed_svn_revision"].is_null());
+    assert!(!value.to_string().contains("credential-marker"));
+    assert!(!value.to_string().contains("private-message-marker"));
+    assert_eq!(kv_snapshot(&state), before);
+    actor_session(&state, "target-owner", "user");
+    for id in ["late-target", "svn-target"] {
+        let before = kv_snapshot(&state);
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/api/status?repo_id={id}"))
+            .bearer_auth("target-owner")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value = response.json().await.unwrap();
+        let op = &value["observation"]["operations"][0];
+        assert_eq!(op["details_visible"], true);
+        assert!(op["target_evidence"].is_object());
+        assert!(!value.to_string().contains("credential-marker"));
+        assert!(!value.to_string().contains("private-message-marker"));
+        assert_eq!(kv_snapshot(&state), before);
+    }
+    actor_session(&state, "target-viewer", "user");
+    for id in ["late-target", "svn-target"] {
+        let before = kv_snapshot(&state);
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/api/status?repo_id={id}"))
+            .bearer_auth("target-viewer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let value: serde_json::Value = response.json().await.unwrap();
+        let op = &value["observation"]["operations"][0];
+        assert!(op["target_evidence"].is_null());
+        assert!(op["target_ref"].is_null());
+        assert!(op["intended_git_sha"].is_null());
+        assert_eq!(kv_snapshot(&state), before);
+    }
+    server.abort();
+}

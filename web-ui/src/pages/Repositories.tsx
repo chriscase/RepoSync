@@ -349,6 +349,7 @@ function RepositoriesEditor() {
                     </div>
                   </div>
                 </button>
+                <div className="px-5 pb-4"><RepositoryStatusSummary repoId={repo.id}/></div>
 
                 {/* Branch Pairs inside parent card (recursive) */}
                 <BranchTree repoId={repo.id} childMap={childrenByParent} navigate={navigate} depth={0} />
