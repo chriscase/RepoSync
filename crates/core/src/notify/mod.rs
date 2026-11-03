@@ -46,7 +46,11 @@ impl Notifier {
             teams::TeamsNotifier::new(url.clone())
         });
 
-        Self { slack, email, teams }
+        Self {
+            slack,
+            email,
+            teams,
+        }
     }
 
     /// Send a conflict notification to all configured channels.

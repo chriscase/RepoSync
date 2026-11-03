@@ -23,10 +23,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/ws", get(ws_handler))
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Accept the upgrade unconditionally; auth happens via first message.
     let rx = state.ws_broadcast.subscribe();
     ws.on_upgrade(move |socket| handle_socket(socket, rx, state))
@@ -54,16 +51,13 @@ async fn handle_socket(
     debug!("WebSocket client connected, awaiting auth");
 
     // Check if auth is required (admin password or users exist)
-    let needs_auth = state.config.web.admin_password.is_some()
-        || state.db.count_users().unwrap_or(0) > 0;
+    let needs_auth =
+        state.config.web.admin_password.is_some() || state.db.count_users().unwrap_or(0) > 0;
 
     if needs_auth {
         // Wait up to 5 seconds for the first message to contain auth token
-        let auth_timeout = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            socket.recv(),
-        )
-        .await;
+        let auth_timeout =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv()).await;
 
         let authenticated = match auth_timeout {
             Ok(Some(Ok(Message::Text(text)))) => {

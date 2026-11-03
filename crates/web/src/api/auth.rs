@@ -63,9 +63,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 /// Public (no auth) endpoint returning login page context: whether LDAP is
 /// enabled and the domain so users know which credentials to enter.
-async fn auth_info(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn auth_info(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let db = &state.db;
     let ldap_enabled = db.is_ldap_enabled().unwrap_or(false);
     let ldap_domain = if ldap_enabled {
@@ -101,10 +99,11 @@ async fn login(
     // Rate limiting: max 10 login attempts per IP per 60 seconds
     {
         let ip = addr.ip().to_string();
-        let mut attempts = state.login_attempts.lock().unwrap_or_else(|p| p.into_inner());
-        let (count, window_start) = attempts
-            .entry(ip)
-            .or_insert((0, std::time::Instant::now()));
+        let mut attempts = state
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (count, window_start) = attempts.entry(ip).or_insert((0, std::time::Instant::now()));
         if window_start.elapsed() > std::time::Duration::from_secs(60) {
             *count = 0;
             *window_start = std::time::Instant::now();
@@ -148,25 +147,34 @@ async fn login(
 
         if let Some(ref ldap_config) = ldap_result {
             tracing::debug!("login: before LDAP authenticate for '{}'", username);
-            tracing::info!("Attempting LDAP auth for '{}' against {}", username, ldap_config.url);
+            tracing::info!(
+                "Attempting LDAP auth for '{}' against {}",
+                username,
+                ldap_config.url
+            );
             // LDAP auth is async (uses tokio-native-tls) — run directly
             // LDAP auth with a 5-second timeout to prevent blocking the
             // tokio runtime when the LDAP server is slow or unreachable.
             let ldap_auth_result = match tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 ldap_config.authenticate(username, &body.password),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::warn!("LDAP auth timed out after 5s for '{}'", username);
                     Err(reposync_core::ldap_auth::LdapAuthError::ConnectionFailed(
-                        "LDAP connection timed out after 5 seconds".into()
+                        "LDAP connection timed out after 5 seconds".into(),
                     ))
                 }
             };
             match ldap_auth_result {
                 Ok(ldap_user) => {
-                    tracing::debug!("login: LDAP auth succeeded for '{}', provisioning user", username);
+                    tracing::debug!(
+                        "login: LDAP auth succeeded for '{}', provisioning user",
+                        username
+                    );
                     // LDAP auth succeeded — provision or update local user
                     let (token, expires_at, user_info) = {
                         let db = &state.db;
@@ -189,12 +197,11 @@ async fn login(
                                 .unwrap_or(existing)
                         } else {
                             // Auto-provision new user from LDAP attributes
-                            let random_hash = reposync_core::crypto::hash_password(
-                                &Uuid::new_v4().to_string(),
-                            )
-                            .map_err(|e| {
-                                AppError::Internal(format!("password hashing error: {}", e))
-                            })?;
+                            let random_hash =
+                                reposync_core::crypto::hash_password(&Uuid::new_v4().to_string())
+                                    .map_err(|e| {
+                                    AppError::Internal(format!("password hashing error: {}", e))
+                                })?;
 
                             let now = Utc::now().to_rfc3339();
                             let new_user = reposync_core::models::User {
@@ -209,8 +216,9 @@ async fn login(
                                 updated_at: now,
                             };
 
-                            db.insert_user(&new_user)
-                                .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
+                            db.insert_user(&new_user).map_err(|e| {
+                                AppError::Internal(format!("database error: {}", e))
+                            })?;
                             new_user
                         };
 
@@ -289,7 +297,9 @@ async fn login(
             .map_err(|e| AppError::Internal(format!("password verification error: {}", e)))?;
 
             if !password_valid {
-                return Err(AppError::Unauthorized("invalid username or password".into()));
+                return Err(AppError::Unauthorized(
+                    "invalid username or password".into(),
+                ));
             }
 
             // Create DB session
@@ -334,7 +344,8 @@ async fn login(
 
         if configured_password.is_empty() {
             return Err(AppError::BadRequest(
-                "authentication is not configured (no admin password set and no users created)".into(),
+                "authentication is not configured (no admin password set and no users created)"
+                    .into(),
             ));
         }
 
@@ -347,7 +358,10 @@ async fn login(
             // Legacy plaintext — constant-time comparison
             use subtle::ConstantTimeEq;
             let matches: bool = if body.password.len() == configured_password.len() {
-                body.password.as_bytes().ct_eq(configured_password.as_bytes()).into()
+                body.password
+                    .as_bytes()
+                    .ct_eq(configured_password.as_bytes())
+                    .into()
             } else {
                 false
             };
@@ -521,7 +535,9 @@ pub async fn validate_session(
     // If no admin password is configured AND no users exist, require setup first.
     // Setup endpoints handle their own auth bypass for fresh instances.
     if state.config.web.admin_password.is_none() {
-        let has_users = state.db.count_users()
+        let has_users = state
+            .db
+            .count_users()
             .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
             > 0;
         if !has_users {
@@ -566,7 +582,9 @@ pub async fn validate_session_with_role(
 ) -> Result<(String, String), AppError> {
     // If no admin password is configured AND no users exist, require setup first.
     if state.config.web.admin_password.is_none() {
-        let has_users = state.db.count_users()
+        let has_users = state
+            .db
+            .count_users()
             .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
             > 0;
         if !has_users {

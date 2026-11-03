@@ -5,6 +5,7 @@
 //! conflict detection and resolution, repository clients, and the sync engine.
 
 pub mod busy;
+mod commit_message;
 pub mod config;
 pub mod conflict;
 pub mod crypto;

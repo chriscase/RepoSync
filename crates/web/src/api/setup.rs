@@ -18,7 +18,7 @@ use reposync_core::db::Database;
 use reposync_core::file_policy::FilePolicy;
 use reposync_core::git::GitClient;
 use reposync_core::identity::IdentityMapper;
-use reposync_core::import::{self, ImportConfig, ImportProgress, ImportPhase};
+use reposync_core::import::{self, ImportConfig, ImportPhase, ImportProgress};
 use reposync_core::svn::SvnClient;
 
 use crate::api::auth::validate_session_with_role;
@@ -185,7 +185,8 @@ async fn get_setup_config(
     crate::api::auth::validate_session(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
-    ).await?;
+    )
+    .await?;
 
     let cfg = &state.config;
 
@@ -218,7 +219,11 @@ async fn get_setup_config(
     Ok(Json(SetupConfigResponse {
         svn_url: cfg.svn.url.clone(),
         svn_username: cfg.svn.username.clone(),
-        svn_layout: if cfg.svn.trunk_path.is_empty() { "single".into() } else { "standard".into() },
+        svn_layout: if cfg.svn.trunk_path.is_empty() {
+            "single".into()
+        } else {
+            "standard".into()
+        },
         svn_trunk_path: cfg.svn.trunk_path.clone(),
         svn_password_set,
 
@@ -261,7 +266,8 @@ async fn test_svn_connection(
         crate::api::auth::validate_session(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ).await?;
+        )
+        .await?;
     }
     let url = body.url.trim().to_string();
     let username = body.username.trim().to_string();
@@ -329,7 +335,8 @@ async fn test_git_connection(
         crate::api::auth::validate_session(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ).await?;
+        )
+        .await?;
     }
     let api_url = body.api_url.trim().trim_end_matches('/').to_string();
     let repo = body.repo.trim().to_string();
@@ -341,11 +348,7 @@ async fn test_git_connection(
         }));
     }
 
-    let check_url = if body.provider == "gitea" {
-        format!("{}/repos/{}", api_url, repo)
-    } else {
-        format!("{}/repos/{}", api_url, repo)
-    };
+    let check_url = format!("{}/repos/{}", api_url, repo);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -381,8 +384,7 @@ async fn test_git_connection(
             } else if status.as_u16() == 404 {
                 Ok(Json(TestConnectionResponse {
                     ok: false,
-                    message: "Repository not found (404). Check the repo name and API URL."
-                        .into(),
+                    message: "Repository not found (404). Check the repo name and API URL.".into(),
                 }))
             } else if status.as_u16() == 401 || status.as_u16() == 403 {
                 Ok(Json(TestConnectionResponse {
@@ -432,7 +434,8 @@ async fn apply_config(
         crate::api::auth::validate_session(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ).await?;
+        )
+        .await?;
     }
     let mut warnings = Vec::new();
 
@@ -453,7 +456,10 @@ async fn apply_config(
             let mapping_content = mapping_lines.join("\n");
 
             // Resolve path relative to config file directory
-            let config_dir = state.config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let config_dir = state
+                .config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             let full_mapping_path = if std::path::Path::new(mapping_path).is_absolute() {
                 std::path::PathBuf::from(mapping_path)
             } else {
@@ -461,10 +467,7 @@ async fn apply_config(
             };
 
             if let Err(e) = std::fs::write(&full_mapping_path, &mapping_content) {
-                warnings.push(format!(
-                    "Failed to write identity mapping file: {}",
-                    e
-                ));
+                warnings.push(format!("Failed to write identity mapping file: {}", e));
             } else {
                 info!(
                     path = %full_mapping_path.display(),
@@ -602,7 +605,9 @@ async fn apply_config(
                 cloned_from_id: None,
             };
             match db.insert_repository(&new_repo) {
-                Ok(()) => info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard"),
+                Ok(()) => {
+                    info!(id = %new_repo.id, name = %new_repo.name, "Created repository from setup wizard")
+                }
                 Err(e) => warnings.push(format!("Failed to create repository: {}", e)),
             }
         }
@@ -645,7 +650,8 @@ async fn start_import(
         crate::api::auth::validate_session(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ).await?;
+        )
+        .await?;
     }
     // Check if already running
     {
@@ -683,7 +689,8 @@ async fn import_status(
         crate::api::auth::validate_session(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ).await?;
+        )
+        .await?;
     }
     let p = state.import_progress.read().await;
 
@@ -710,7 +717,8 @@ async fn cancel_import(
         crate::api::auth::validate_session(
             &state,
             headers.get("authorization").and_then(|v| v.to_str().ok()),
-        ).await?;
+        )
+        .await?;
     }
     let mut p = state.import_progress.write().await;
     if p.phase == ImportPhase::Importing {
@@ -871,10 +879,7 @@ async fn spawn_import_task(state: &Arc<AppState>) -> Result<(), AppError> {
                     p.phase = ImportPhase::Completed;
                 }
                 p.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                p.push_log(format!(
-                    "[info] Import complete: {} commits created",
-                    count
-                ));
+                p.push_log(format!("[info] Import complete: {} commits created", count));
                 info!(count, "import completed successfully");
             }
             Err(e) => {
@@ -1028,16 +1033,18 @@ async fn reset_and_reimport(
     let clone_url = format!(
         "https://x-access-token:{}@{}",
         git_token,
-        config
-            .github
-            .clone_url()
-            .trim_start_matches("https://")
+        config.github.clone_url().trim_start_matches("https://")
     );
 
     // git init + empty commit + force push
     let init_cmds = [
         vec!["init", "--initial-branch", branch],
-        vec!["commit", "--allow-empty", "-m", "Reset for full SVN reimport"],
+        vec![
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Reset for full SVN reimport",
+        ],
         vec!["remote", "add", "origin", &clone_url],
         vec!["push", "--force", "origin", branch],
     ];

@@ -35,7 +35,10 @@ pub enum CryptoError {
 
 /// Encrypt a credential value using AES-256-GCM.
 /// Returns `(base64_ciphertext, base64_nonce)`.
-pub fn encrypt_credential(plaintext: &str, key: &[u8; 32]) -> Result<(String, String), CryptoError> {
+pub fn encrypt_credential(
+    plaintext: &str,
+    key: &[u8; 32],
+) -> Result<(String, String), CryptoError> {
     let cipher_key = Key::<Aes256Gcm>::from_slice(key);
     let cipher = Aes256Gcm::new(cipher_key);
 
@@ -47,10 +50,7 @@ pub fn encrypt_credential(plaintext: &str, key: &[u8; 32]) -> Result<(String, St
         .encrypt(nonce, plaintext.as_bytes())
         .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
 
-    Ok((
-        base64_encode(&ciphertext),
-        base64_encode(&nonce_bytes),
-    ))
+    Ok((base64_encode(&ciphertext), base64_encode(&nonce_bytes)))
 }
 
 /// Decrypt a credential value.
@@ -100,8 +100,7 @@ pub fn get_or_create_encryption_key(db: &Database) -> Result<[u8; 32], CryptoErr
 
     // 1. Check env var
     if let Ok(hex_key) = std::env::var("REPOSYNC_ENCRYPTION_KEY") {
-        let bytes = hex::decode(hex_key.trim())
-            .map_err(|_| CryptoError::InvalidKeyLength)?;
+        let bytes = hex::decode(hex_key.trim()).map_err(|_| CryptoError::InvalidKeyLength)?;
         if bytes.len() != 32 {
             return Err(CryptoError::InvalidKeyLength);
         }

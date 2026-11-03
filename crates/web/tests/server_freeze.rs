@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -90,15 +90,10 @@ async fn build_test_server() -> (
     let engine_db = Database::in_memory().expect("engine db");
     engine_db.initialize().expect("engine db init");
 
-    let svn_client = SvnClient::new(
-        "https://svn.test.invalid/repo",
-        "testuser",
-        "",
-    );
+    let svn_client = SvnClient::new("https://svn.test.invalid/repo", "testuser", "");
     let git_client = GitClient::new(&git_repo_path).expect("git client");
-    let identity_mapper = Arc::new(
-        IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"),
-    );
+    let identity_mapper =
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"));
 
     let sync_engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -137,7 +132,12 @@ async fn build_test_server() -> (
     let addr = listener.local_addr().expect("local_addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     // Pre-seed a test session so authenticated endpoints work.
@@ -188,15 +188,10 @@ async fn build_test_server_full() -> (
     let engine_db = Database::in_memory().expect("engine db");
     engine_db.initialize().expect("engine db init");
 
-    let svn_client = SvnClient::new(
-        "https://svn.test.invalid/repo",
-        "testuser",
-        "",
-    );
+    let svn_client = SvnClient::new("https://svn.test.invalid/repo", "testuser", "");
     let git_client = GitClient::new(&git_repo_path).expect("git client");
-    let identity_mapper = Arc::new(
-        IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"),
-    );
+    let identity_mapper =
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"));
 
     let sync_engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -238,7 +233,12 @@ async fn build_test_server_full() -> (
     let addr = listener.local_addr().expect("local_addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     // Pre-seed a test session so authenticated endpoints work.
@@ -277,8 +277,7 @@ async fn build_test_server_with_ldap(
     web_db.initialize().expect("web db init");
 
     // Insert a local user with known bcrypt password hash.
-    let password_hash = reposync_core::crypto::hash_password(test_password)
-        .expect("hash_password");
+    let password_hash = reposync_core::crypto::hash_password(test_password).expect("hash_password");
     let now = chrono::Utc::now().to_rfc3339();
     let user = reposync_core::models::User {
         id: "test-user-1".to_string(),
@@ -312,15 +311,10 @@ async fn build_test_server_with_ldap(
     let engine_db = Database::in_memory().expect("engine db");
     engine_db.initialize().expect("engine db init");
 
-    let svn_client = SvnClient::new(
-        "https://svn.test.invalid/repo",
-        "testuser",
-        "",
-    );
+    let svn_client = SvnClient::new("https://svn.test.invalid/repo", "testuser", "");
     let git_client = GitClient::new(&git_repo_path).expect("git client");
-    let identity_mapper = Arc::new(
-        IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"),
-    );
+    let identity_mapper =
+        Arc::new(IdentityMapper::new(&IdentityConfig::default()).expect("identity mapper"));
 
     let sync_engine = Arc::new(SyncEngine::new(
         config.clone(),
@@ -359,7 +353,12 @@ async fn build_test_server_with_ldap(
     let addr = listener.local_addr().expect("local_addr");
 
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
     });
 
     // Pre-seed a test session so authenticated endpoints work.
@@ -662,13 +661,7 @@ async fn test_sustained_load_under_sync_cycles() {
                 }
 
                 // Update max latency.
-                let _ = max_lat.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    if elapsed_ms > cur {
-                        Some(elapsed_ms)
-                    } else {
-                        None
-                    }
-                });
+                let _ = max_lat.fetch_max(elapsed_ms, Ordering::Relaxed);
 
                 if is_health {
                     // Immediate assertion for health: must be fast.
@@ -734,16 +727,8 @@ async fn test_sustained_load_under_sync_cycles() {
     let worst_health = max_health_latency.load(Ordering::Relaxed);
     let worst_other = max_other_latency.load(Ordering::Relaxed);
 
-    assert!(
-        total > 10,
-        "expected >10 total requests, got {}",
-        total
-    );
-    assert_eq!(
-        failed, 0,
-        "{} out of {} requests failed",
-        failed, total
-    );
+    assert!(total > 10, "expected >10 total requests, got {}", total);
+    assert_eq!(failed, 0, "{} out of {} requests failed", failed, total);
     assert!(
         worst_health < 200,
         "worst health latency {}ms >= 200ms",
@@ -763,8 +748,7 @@ async fn test_sustained_load_under_sync_cycles() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_ldap_auth_timeout_under_load() {
     let test_password = "correct-horse-battery-staple";
-    let (addr, _state, _server, _tmp) =
-        build_test_server_with_ldap(test_password).await;
+    let (addr, _state, _server, _tmp) = build_test_server_with_ldap(test_password).await;
     let base_url = format!("http://{}", addr);
 
     let client = reqwest::Client::builder()
@@ -879,27 +863,26 @@ async fn test_database_wal_contention() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Reader helper: repeatedly call a DB method, track max latency.
-    let spawn_reader = |db: Database,
-                        done: Arc<std::sync::atomic::AtomicBool>,
-                        op: fn(&Database)| {
-        tokio::task::spawn_blocking(move || {
-            let mut max_ms: u64 = 0;
-            let mut count: u64 = 0;
-            while !done.load(Ordering::Acquire) || count < 10 {
-                let t = Instant::now();
-                op(&db);
-                let elapsed_ms = t.elapsed().as_millis() as u64;
-                if elapsed_ms > max_ms {
-                    max_ms = elapsed_ms;
+    let spawn_reader =
+        |db: Database, done: Arc<std::sync::atomic::AtomicBool>, op: fn(&Database)| {
+            tokio::task::spawn_blocking(move || {
+                let mut max_ms: u64 = 0;
+                let mut count: u64 = 0;
+                while !done.load(Ordering::Acquire) || count < 10 {
+                    let t = Instant::now();
+                    op(&db);
+                    let elapsed_ms = t.elapsed().as_millis() as u64;
+                    if elapsed_ms > max_ms {
+                        max_ms = elapsed_ms;
+                    }
+                    count += 1;
+                    if count > 500 {
+                        break; // safety valve
+                    }
                 }
-                count += 1;
-                if count > 500 {
-                    break; // safety valve
-                }
-            }
-            (max_ms, count)
-        })
-    };
+                (max_ms, count)
+            })
+        };
 
     fn read_count_errors(db: &Database) {
         let _ = db.count_errors();
@@ -931,11 +914,7 @@ async fn test_database_wal_contention() {
     .expect("readers timed out — possible WAL deadlock");
 
     for (name, (max_ms, count)) in &results {
-        assert!(
-            *count > 0,
-            "{} did not complete any reads",
-            name
-        );
+        assert!(*count > 0, "{} did not complete any reads", name);
         assert!(
             *max_ms < 100,
             "{} worst read latency was {}ms (expected < 100ms, {} reads)",
@@ -1151,10 +1130,7 @@ async fn test_no_resource_leak_after_many_requests() {
 
     for i in 0..1000 {
         let ep = endpoints[i % endpoints.len()];
-        let resp = client
-            .get(format!("{}{}", base_url, ep))
-            .send()
-            .await;
+        let resp = client.get(format!("{}{}", base_url, ep)).send().await;
         match resp {
             Ok(r) => assert!(
                 r.status().is_success(),
@@ -1225,9 +1201,7 @@ async fn test_commit_map_no_repo_id_does_not_deadlock() {
         let c = client.clone();
         let u = base_url.clone();
         handles.push(tokio::spawn(async move {
-            c.get(format!("{}/api/commit-map?limit=15", u))
-                .send()
-                .await
+            c.get(format!("{}/api/commit-map?limit=15", u)).send().await
         }));
 
         // The other 5 endpoints the frontend fires concurrently.

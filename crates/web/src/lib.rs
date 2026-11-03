@@ -54,11 +54,9 @@ pub struct AppState {
     pub repo_import_progress:
         tokio::sync::RwLock<HashMap<String, Arc<tokio::sync::RwLock<ImportProgress>>>>,
     /// Login attempt tracker for rate limiting (IP -> (count, window_start)).
-    pub login_attempts:
-        std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
+    pub login_attempts: std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
     /// Handles for in-flight import tasks, for graceful shutdown.
-    pub import_handles:
-        tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub import_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -134,14 +132,14 @@ impl WebServer {
             let allow_origin = if origins.is_empty() {
                 // Derive from listen address for dev convenience
                 let origin = format!("http://{}", addr);
-                tower_http::cors::AllowOrigin::exact(origin.parse().unwrap_or_else(|_| {
-                    "http://localhost:3000".parse().unwrap()
-                }))
+                tower_http::cors::AllowOrigin::exact(
+                    origin
+                        .parse()
+                        .unwrap_or_else(|_| "http://localhost:3000".parse().unwrap()),
+                )
             } else {
-                let parsed: Vec<axum::http::HeaderValue> = origins
-                    .iter()
-                    .filter_map(|o| o.parse().ok())
-                    .collect();
+                let parsed: Vec<axum::http::HeaderValue> =
+                    origins.iter().filter_map(|o| o.parse().ok()).collect();
                 tower_http::cors::AllowOrigin::list(parsed)
             };
             CorsLayer::new()
@@ -171,7 +169,8 @@ impl WebServer {
                             StatusCode::OK,
                             [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                             contents,
-                        ).into_response(),
+                        )
+                            .into_response(),
                         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
                     }
                 }
@@ -205,13 +204,16 @@ impl WebServer {
         info!(addr = %addr, "starting web server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(async {
-                // Wait until the process receives a shutdown signal.
-                // The daemon's main.rs drops the web_handle or signals shutdown.
-                tokio::signal::ctrl_c().await.ok();
-            })
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            // Wait until the process receives a shutdown signal.
+            // The daemon's main.rs drops the web_handle or signals shutdown.
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await?;
 
         Ok(())
     }

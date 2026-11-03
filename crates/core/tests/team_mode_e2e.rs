@@ -890,3 +890,125 @@ async fn test_team_mode_forced_failure_persists_audit_entry() {
         "sync_state should be 'error' after failed cycle"
     );
 }
+// #228 uses this branch's existing file:// harness and checkpoint contract.
+// It does not import the epic's durable reconciliation state machine.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_228_legacy_large_message_failure_retry_and_repeat() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(svn_available(), "#228 qualification requires svn/svnadmin");
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc_path = tmp.path().join("seed-wc");
+    svn_checkout(&svn_url, &wc_path);
+    svn_commit_file(&wc_path, ".gitkeep", "", "Initial small SVN commit");
+    let git_work_dir = tmp.path().join("git_work");
+    let git_client = setup_git_with_bare_origin(&git_work_dir, &tmp.path().join("origin.git"));
+    let initial_sha = get_head_sha(&git_work_dir);
+    let message = format!(
+        "{}😀 synthetic legacy squash\n\n{}\nsource-marker: synthetic\n",
+        "a".repeat(119),
+        "é中文😀 '\"\\ multiline\n".repeat(16_384)
+    );
+    assert!(message.len() >= 256 * 1024);
+    std::fs::write(
+        git_work_dir.join("large-message.txt"),
+        "complete synthetic content\n",
+    )
+    .unwrap();
+    let sha = git_client
+        .commit_via_cli(
+            &message,
+            "Fixture User",
+            "fixture@example.invalid",
+            "Fixture User",
+            "fixture@example.invalid",
+            Some("2026-01-02T03:04:05Z"),
+        )
+        .unwrap()
+        .to_string();
+    git_client.push("origin", "main").unwrap();
+    let db_path = tmp.path().join("sync.db");
+    let db = setup_db(&db_path);
+    db.set_state("last_svn_rev", "1").unwrap();
+    db.set_state("last_git_hash", &initial_sha).unwrap();
+    let engine = SyncEngine::new(
+        make_app_config(&svn_url, tmp.path()),
+        db,
+        SvnClient::new(&svn_url, "", ""),
+        git_client,
+        Arc::new(make_identity_mapper()),
+    );
+    let observations = Database::new(&db_path).unwrap();
+    let checkpoint = || {
+        (
+            observations.get_state("last_svn_rev").unwrap(),
+            observations.get_state("last_git_hash").unwrap(),
+        )
+    };
+    let applied = || {
+        observations.conn().query_row(
+        "SELECT COUNT(*) FROM sync_records WHERE git_sha=?1 AND direction='git_to_svn' AND status='applied'",
+        [&sha], |row| row.get::<_, i64>(0),
+    ).unwrap()
+    };
+    let svn = SvnClient::new(&svn_url, "", "");
+    let before_revision = svn.info().await.unwrap().latest_rev;
+    let before_checkpoint = checkpoint();
+    let hook = tmp.path().join("svn_repo/hooks/pre-commit");
+    assert!(!hook.exists());
+    std::fs::write(&hook, "#!/reposync-fixture-absent-interpreter\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failure = engine.run_sync_cycle().await;
+    assert!(
+        matches!(failure, Err(reposync_core::errors::SyncError::SvnError(_))),
+        "{failure:?}"
+    );
+    assert_eq!(svn.info().await.unwrap().latest_rev, before_revision);
+    assert_eq!(checkpoint(), before_checkpoint);
+    assert_eq!(applied(), 0);
+    // This fixture failure is known to precede publication. Observe that fact
+    // before removing the owned hook and retrying; no uncertain-write claim.
+    assert_eq!(
+        svn.log(before_revision, before_revision)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_file(&hook).unwrap();
+    let retried = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(retried.git_to_svn_count, 1);
+    let after_revision = svn.info().await.unwrap().latest_rev;
+    assert_eq!(after_revision, before_revision + 1);
+    assert_eq!(applied(), 1);
+    let log = svn.log(after_revision, after_revision).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0].message,
+        format!("{}\n\n[reposync] synced from Git {}", message, &sha[..8])
+    );
+    assert_eq!(
+        svn.cat("large-message.txt", after_revision).await.unwrap(),
+        "complete synthetic content\n"
+    );
+    let after_checkpoint = checkpoint();
+    assert_eq!(after_checkpoint.1, Some(sha.clone()));
+    let repeated = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (repeated.svn_to_git_count, repeated.git_to_svn_count),
+        (0, 0)
+    );
+    assert_eq!(checkpoint(), after_checkpoint);
+    assert_eq!(svn.info().await.unwrap().latest_rev, after_revision);
+    assert_eq!(applied(), 1);
+    eprintln!(
+        "LEGACY_228_EVIDENCE {}",
+        serde_json::json!({
+            "message_bytes":message.len(), "exact_log_and_marker":true,
+            "known_hook_launch_failure_no_checkpoint":true, "observed_retry_once":true,
+            "quiet_repeat":true, "svn_revision":after_revision, "status":"PASS"
+        })
+    );
+}

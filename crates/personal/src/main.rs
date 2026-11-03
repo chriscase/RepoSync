@@ -23,8 +23,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
-use reposync_core::db::Database;
 use reposync_core::config::GitProvider;
+use reposync_core::db::Database;
 use reposync_core::git::github::GitHubClient;
 use reposync_core::git::GitClient;
 use reposync_core::personal_config::PersonalConfig;
@@ -206,7 +206,8 @@ async fn build_engine(config_path: &str) -> Result<(PersonalSyncEngine, Personal
 
     // Create GitHub client.
     let github_token = config.github.token.as_deref().unwrap_or("");
-    let github_client = GitHubClient::new(&config.github.api_url, github_token, GitProvider::default());
+    let github_client =
+        GitHubClient::new(&config.github.api_url, github_token, GitProvider::default());
 
     let engine = PersonalSyncEngine::new(config.clone(), db, svn_client, git_client, github_client);
     Ok((engine, config))
@@ -320,7 +321,8 @@ async fn cmd_import(config_path: &str, mode: ImportMode) -> Result<()> {
 
     // GitHub client.
     let github_token = config.github.token.as_deref().unwrap_or("");
-    let github_client = GitHubClient::new(&config.github.api_url, github_token, GitProvider::default());
+    let github_client =
+        GitHubClient::new(&config.github.api_url, github_token, GitProvider::default());
 
     // Initialize Git repo for import.
     let git_repo_path = data_dir.join("git-repo");
