@@ -427,6 +427,19 @@ impl<'a> InitialImport<'a> {
                 debug!(rev, skipped, "files skipped by policy during import");
             }
 
+            // This consumer is separate from the ordinary synchronization
+            // loop. A copy alone leaves paths deleted by later revisions in
+            // the workdir, so reconcile and independently verify every full
+            // history revision before its commit or mapping can be accepted.
+            reposync_core::import::remove_stale_files(export_dir.path(), &repo_path)
+                .with_context(|| format!("failed to reconcile stale paths for SVN r{rev}"))?;
+            reposync_core::import::verify_export_projection(export_dir.path(), &repo_path, &policy)
+                .with_context(|| {
+                    format!(
+                        "independent full-history projection verification failed for SVN r{rev}"
+                    )
+                })?;
+
             let message =
                 self.formatter
                     .format_svn_to_git(&entry.message, rev, &entry.author, &entry.date);
