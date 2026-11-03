@@ -215,6 +215,15 @@ impl SvnToGitSync {
             Self::remove_stale_files(export_dir.path(), &repo_path)
                 .with_context(|| format!("failed to remove stale files for r{}", rev))?;
 
+            reposync_core::import::verify_export_projection(
+                export_dir.path(),
+                &repo_path,
+                &self.policy,
+            )
+            .with_context(|| {
+                format!("independent SVN→Git projection verification failed for r{rev}")
+            })?;
+
             // 7. Format the commit message with metadata trailers.
             let commit_message =
                 self.formatter
