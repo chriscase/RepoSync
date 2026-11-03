@@ -133,7 +133,11 @@ impl SvnClient {
     pub async fn commit(&self, path: &Path, message: &str, _author: &str) -> Result<i64, SvnError> {
         let path_str = path.to_string_lossy().to_string();
         let output = self
-            .run_svn_in_dir(path, &["commit", "-m", message, &path_str])
+            .run_svn_in_dir_with_input(
+                path,
+                &["commit", "--file", "-", "--encoding", "UTF-8", &path_str],
+                Some(crate::commit_message::input(message)?),
+            )
             .await?;
 
         // SVN returns exit 0 with empty output when there's nothing to commit.
@@ -531,7 +535,19 @@ impl SvnClient {
     }
 
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
+        self.run_svn_in_dir_with_input(dir, args, None).await
+    }
+
+    async fn run_svn_in_dir_with_input(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: Option<std::fs::File>,
+    ) -> Result<String, SvnError> {
         let mut cmd = Command::new("svn");
+        if let Some(input) = input {
+            cmd.stdin(Stdio::from(input));
+        }
         cmd.current_dir(dir)
             .args(args)
             .arg("--non-interactive")

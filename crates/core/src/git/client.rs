@@ -428,8 +428,14 @@ impl GitClient {
 
         // Build the commit via git CLI with explicit author/committer.
         let author_str = format!("{} <{}>", author_name, author_email);
-        let mut commit_args: Vec<&str> =
-            vec!["commit", "-m", message, "--author", &author_str];
+        let mut commit_args: Vec<&str> = vec![
+            "commit",
+            "--file",
+            "-",
+            "--cleanup=verbatim",
+            "--author",
+            &author_str,
+        ];
         // If the caller supplied an author date (typically the original SVN
         // commit timestamp), thread it through with `--date`. Without this,
         // git defaults to the wallclock and the resulting commit's author
@@ -441,6 +447,9 @@ impl GitClient {
         }
         let commit_output = std::process::Command::new("git")
             .args(&commit_args)
+            .stdin(std::process::Stdio::from(crate::commit_message::input(
+                message,
+            )?))
             .current_dir(repo_path)
             .env("GIT_COMMITTER_NAME", committer_name)
             .env("GIT_COMMITTER_EMAIL", committer_email)
@@ -996,5 +1005,46 @@ mod tests {
             .get_file_content_at_commit(&oid1.to_string(), "nonexistent.txt")
             .unwrap();
         assert!(missing.is_none());
+    }
+    #[test]
+    fn candidate_228_cli_commit_preserves_oversized_verbatim_utf8() {
+        let root = tempfile::tempdir().unwrap();
+        let client = GitClient::init(root.path()).unwrap();
+        client
+            .repo
+            .config()
+            .unwrap()
+            .set_bool("commit.gpgsign", false)
+            .unwrap();
+        std::fs::write(root.path().join("message.txt"), "synthetic content\n").unwrap();
+        let message = format!(
+            "{}\n\n[reposync]\nquotes: '\"\\\n\n",
+            "é中文😀 multiline\n".repeat(16_384)
+        );
+        assert!(message.len() >= 256 * 1024);
+        let oid = client
+            .commit_via_cli(
+                &message,
+                "Fixture User",
+                "fixture@example.invalid",
+                "Fixture User",
+                "fixture@example.invalid",
+                Some("2026-01-02T03:04:05Z"),
+            )
+            .unwrap();
+        let commit = client.repo.find_commit(oid).unwrap();
+        assert_eq!(commit.message_bytes(), message.as_bytes());
+        assert_eq!(commit.author().when().seconds(), 1767323045);
+        assert!(client
+            .commit_via_cli(
+                "quiet repeat",
+                "Fixture User",
+                "fixture@example.invalid",
+                "Fixture User",
+                "fixture@example.invalid",
+                None,
+            )
+            .is_err());
+        assert_eq!(client.repo.head().unwrap().target(), Some(oid));
     }
 }
