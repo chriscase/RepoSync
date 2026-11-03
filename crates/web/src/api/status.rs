@@ -338,8 +338,15 @@ fn disk_usage(path: &Path) -> (u64, u64) {
         let mut buf = MaybeUninit::<libc::statvfs>::uninit();
         if libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) == 0 {
             let stat = buf.assume_init();
-            let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-            let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+            // These fields are u64 on 64-bit Linux. Other ABIs retain
+            // the original widening before multiplication.
+            #[cfg(target_pointer_width = "64")]
+            let (total, free) = (stat.f_blocks * stat.f_frsize, stat.f_bavail * stat.f_frsize);
+            #[cfg(not(target_pointer_width = "64"))]
+            let (total, free) = (
+                stat.f_blocks as u64 * stat.f_frsize as u64,
+                stat.f_bavail as u64 * stat.f_frsize as u64,
+            );
             (free, total)
         } else {
             (0, 0)
@@ -402,7 +409,6 @@ fn process_rss() -> u64 {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             return rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
