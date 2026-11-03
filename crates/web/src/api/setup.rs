@@ -292,45 +292,16 @@ async fn test_svn_connection(
         }));
     }
 
-    let mut args = vec!["info", "--non-interactive", "--username", &username];
     let password = body.password.as_deref().unwrap_or("");
-    if !password.is_empty() {
-        args.push("--password");
-        args.push(password);
-    }
-    args.push(&url);
-    let result = tokio::process::Command::new("svn")
-        .args(&args)
-        .output()
+    let result = reposync_core::svn::SvnClient::new(&url, &username, password)
+        .info()
         .await;
 
     match result {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let info = stdout
-                    .lines()
-                    .find(|l| l.starts_with("Repository Root:") || l.starts_with("URL:"))
-                    .map(|l| l.trim().to_string())
-                    .unwrap_or_else(|| "SVN server responded successfully".into());
-                Ok(Json(TestConnectionResponse {
-                    ok: true,
-                    message: info,
-                }))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let msg = stderr
-                    .lines()
-                    .find(|l| l.contains("E1") || l.contains("Unable"))
-                    .unwrap_or("SVN command failed")
-                    .trim()
-                    .to_string();
-                Ok(Json(TestConnectionResponse {
-                    ok: false,
-                    message: redact_vcs_error_detail(&msg),
-                }))
-            }
-        }
+        Ok(info) => Ok(Json(TestConnectionResponse {
+            ok: true,
+            message: format!("Repository Root: {}", info.root_url),
+        })),
         Err(e) => Ok(Json(TestConnectionResponse {
             ok: false,
             message: format!("Failed to run svn command: {}", e),

@@ -38,7 +38,101 @@ pub struct SvnDiffEntry {
     pub item: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SvnStatusEntry {
+    pub path: String,
+    pub item: String,
+    pub properties: String,
+}
+
+pub fn parse_svn_status_xml(xml: &str) -> Result<Vec<SvnStatusEntry>, SvnError> {
+    let doc =
+        roxmltree::Document::parse(xml).map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+    if !doc.root_element().has_tag_name("status") {
+        return Err(SvnError::XmlParseError(
+            "expected SVN status document".into(),
+        ));
+    }
+    let targets: Vec<_> = doc
+        .root_element()
+        .children()
+        .filter(|n| n.is_element())
+        .collect();
+    if targets.len() != 1
+        || !targets[0].has_tag_name("target")
+        || targets[0].attribute("path") != Some(".")
+    {
+        return Err(SvnError::XmlParseError(
+            "status is not bound to the requested working-copy root".into(),
+        ));
+    }
+    if targets[0]
+        .children()
+        .filter(|n| n.is_element())
+        .any(|n| !n.has_tag_name("entry"))
+    {
+        return Err(SvnError::XmlParseError("unparsed status element".into()));
+    }
+    let mut result = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for node in doc.descendants().filter(|n| n.has_tag_name("entry")) {
+        let path = node
+            .attribute("path")
+            .ok_or_else(|| SvnError::XmlParseError("missing status path".into()))?;
+        if path != "." {
+            super::operand::validate_relative_path(path)?;
+        }
+        if !seen.insert(path.to_owned()) {
+            return Err(SvnError::XmlParseError("duplicate status path".into()));
+        }
+        let statuses: Vec<_> = node.children().filter(|n| n.is_element()).collect();
+        if statuses.len() != 1 || !statuses[0].has_tag_name("wc-status") {
+            return Err(SvnError::XmlParseError(
+                "missing or ambiguous WC status".into(),
+            ));
+        }
+        let status = statuses[0];
+        let item = status
+            .attribute("item")
+            .ok_or_else(|| SvnError::XmlParseError("missing status item".into()))?;
+        let properties = status
+            .attribute("props")
+            .ok_or_else(|| SvnError::XmlParseError("missing property status".into()))?;
+        if !matches!(
+            item,
+            "normal"
+                | "none"
+                | "added"
+                | "modified"
+                | "deleted"
+                | "missing"
+                | "unversioned"
+                | "ignored"
+                | "replaced"
+        ) || !matches!(properties, "none" | "normal" | "modified")
+            || status.attribute("switched") == Some("true")
+            || status.attribute("tree-conflicted") == Some("true")
+        {
+            return Err(SvnError::WorkingCopyError {
+                path: path.into(),
+                detail: "unsupported or conflicted SVN node".into(),
+            });
+        }
+        result.push(SvnStatusEntry {
+            path: path.into(),
+            item: item.into(),
+            properties: properties.into(),
+        });
+    }
+    Ok(result)
+}
+
 pub fn parse_svn_info(xml: &str) -> Result<SvnInfo, SvnError> {
+    let document =
+        roxmltree::Document::parse(xml).map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+    if !document.root_element().has_tag_name("info") {
+        return Err(SvnError::XmlParseError("expected SVN info document".into()));
+    }
     debug!("parsing svn info XML ({} bytes)", xml.len());
     let url = extract_tag_content(xml, "url")
         .ok_or_else(|| SvnError::XmlParseError("missing <url> in svn info".into()))?;
@@ -220,64 +314,67 @@ pub fn parse_svn_copy_history(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
 }
 
 pub fn parse_svn_log(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
-    debug!("parsing svn log XML ({} bytes)", xml.len());
+    let document =
+        roxmltree::Document::parse(xml).map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+    if !document.root_element().has_tag_name("log") {
+        return Err(SvnError::XmlParseError("expected SVN log".into()));
+    }
     let mut entries = Vec::new();
-    let parts: Vec<&str> = xml.split("<logentry").collect();
-    for part in parts.iter().skip(1) {
-        let entry_xml = match part.find("</logentry>") {
-            Some(pos) => &part[..pos],
-            None => part,
+    for entry in document
+        .root_element()
+        .children()
+        .filter(|n| n.has_tag_name("logentry"))
+    {
+        let Some(revision) = entry.attribute("revision").and_then(|v| v.parse().ok()) else {
+            warn!("skipping SVN log entry with missing or unparseable revision attribute");
+            continue;
         };
-        let revision = match extract_attribute_from_fragment(entry_xml, "revision")
-            .and_then(|s| s.parse::<i64>().ok())
-        {
-            Some(rev) => rev,
-            None => {
-                warn!("skipping SVN log entry with missing or unparseable revision attribute");
-                continue;
-            }
+        let field = |name| {
+            entry
+                .children()
+                .find(|n| n.has_tag_name(name))
+                .and_then(|n| n.text())
+                .unwrap_or("")
+                .trim()
+                .to_owned()
         };
-        let author = extract_tag_content(entry_xml, "author").unwrap_or_default();
-        let date = extract_tag_content(entry_xml, "date").unwrap_or_default();
-        let message = extract_tag_content(entry_xml, "msg").unwrap_or_default();
-        let changed_paths = parse_changed_paths(entry_xml);
+        let changed_paths = entry
+            .descendants()
+            .filter(|n| n.has_tag_name("path"))
+            .map(|node| SvnChangedPath {
+                action: node.attribute("action").unwrap_or("").into(),
+                path: node.text().unwrap_or("").into(),
+                copy_from_path: node.attribute("copyfrom-path").map(str::to_owned),
+                copy_from_rev: node.attribute("copyfrom-rev").and_then(|v| v.parse().ok()),
+            })
+            .collect();
         entries.push(SvnLogEntry {
             revision,
-            author,
-            date,
-            message,
+            author: field("author"),
+            date: field("date"),
+            message: field("msg"),
             changed_paths,
         });
     }
-    debug!(count = entries.len(), "parsed svn log entries");
     Ok(entries)
 }
 
 pub fn parse_svn_diff_summarize(xml: &str) -> Result<Vec<SvnDiffEntry>, SvnError> {
-    debug!("parsing svn diff --summarize XML ({} bytes)", xml.len());
-    let mut entries = Vec::new();
-    let parts: Vec<&str> = xml.split("<path ").collect();
-    for part in parts.iter().skip(1) {
-        let fragment = match part.find("</path>") {
-            Some(pos) => &part[..pos],
-            None => continue,
-        };
-        let item = extract_attribute_from_fragment(fragment, "item").unwrap_or_default();
-        let kind_attr = extract_attribute_from_fragment(fragment, "kind").unwrap_or_default();
-        let props = extract_attribute_from_fragment(fragment, "props").unwrap_or_default();
-        let path = match fragment.find('>') {
-            Some(pos) => fragment[pos + 1..].trim().to_string(),
-            None => String::new(),
-        };
-        entries.push(SvnDiffEntry {
-            kind: item,
-            props_changed: props != "none",
-            path,
-            item: kind_attr,
-        });
+    let document =
+        roxmltree::Document::parse(xml).map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+    if !document.root_element().has_tag_name("diff") {
+        return Err(SvnError::XmlParseError("expected SVN diff".into()));
     }
-    debug!(count = entries.len(), "parsed svn diff entries");
-    Ok(entries)
+    Ok(document
+        .descendants()
+        .filter(|n| n.has_tag_name("path"))
+        .map(|node| SvnDiffEntry {
+            kind: node.attribute("item").unwrap_or("").into(),
+            props_changed: node.attribute("props").unwrap_or("none") != "none",
+            path: node.text().unwrap_or("").into(),
+            item: node.attribute("kind").unwrap_or("").into(),
+        })
+        .collect())
 }
 
 fn extract_tag_content(xml: &str, tag: &str) -> Option<String> {
@@ -305,11 +402,19 @@ fn extract_tag_content(xml: &str, tag: &str) -> Option<String> {
 
 /// Unescape standard XML entities.
 fn xml_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    // Decode exactly once, including numeric references. Chained replacement
+    // incorrectly turns the literal filename "&lt;" into "<".
+    let wrapped = format!("<value>{s}</value>");
+    roxmltree::Document::parse(&wrapped)
+        .ok()
+        .map(|doc| {
+            doc.root_element()
+                .children()
+                .filter(|n| n.is_text())
+                .filter_map(|n| n.text())
+                .collect()
+        })
+        .unwrap_or_else(|| s.to_owned())
 }
 
 fn extract_attribute(xml: &str, tag: &str, attr: &str) -> Option<String> {
@@ -318,10 +423,6 @@ fn extract_attribute(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let after_tag = &xml[start_pos + open.len()..];
     let tag_end = after_tag.find('>')?;
     extract_attr_from_str(&after_tag[..tag_end], attr)
-}
-
-fn extract_attribute_from_fragment(fragment: &str, attr: &str) -> Option<String> {
-    extract_attr_from_str(fragment, attr)
 }
 
 fn extract_attr_from_str(s: &str, attr: &str) -> Option<String> {
@@ -338,42 +439,6 @@ fn extract_attr_from_str(s: &str, attr: &str) -> Option<String> {
         return Some(after[..end].to_string());
     }
     None
-}
-
-fn parse_changed_paths(entry_xml: &str) -> Vec<SvnChangedPath> {
-    let mut paths = Vec::new();
-    let paths_block = match entry_xml.find("<paths>") {
-        Some(start) => {
-            let rest = &entry_xml[start..];
-            match rest.find("</paths>") {
-                Some(end) => &rest[..end],
-                None => return paths,
-            }
-        }
-        None => return paths,
-    };
-    let parts: Vec<&str> = paths_block.split("<path").collect();
-    for part in parts.iter().skip(1) {
-        let fragment = match part.find("</path>") {
-            Some(pos) => &part[..pos],
-            None => continue,
-        };
-        let action = extract_attribute_from_fragment(fragment, "action").unwrap_or_default();
-        let copy_from_path = extract_attribute_from_fragment(fragment, "copyfrom-path");
-        let copy_from_rev = extract_attribute_from_fragment(fragment, "copyfrom-rev")
-            .and_then(|s| s.parse::<i64>().ok());
-        let path = match fragment.find('>') {
-            Some(pos) => fragment[pos + 1..].trim().to_string(),
-            None => String::new(),
-        };
-        paths.push(SvnChangedPath {
-            action,
-            path,
-            copy_from_path,
-            copy_from_rev,
-        });
-    }
-    paths
 }
 
 #[cfg(test)]

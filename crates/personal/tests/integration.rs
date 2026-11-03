@@ -8148,3 +8148,75 @@ mod repo_exists_import {
         }
     }
 }
+
+#[tokio::test]
+async fn rs113_personal_apply_preserves_literal_names_and_refuses_control_set_before_write() {
+    assert!(
+        svn_available(),
+        "SVN tools are required; no skipped evidence"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, "seed.txt", "seed", "seed");
+    let work = tmp.path().join("git");
+    let git = setup_git_with_bare_origin(&work, &tmp.path().join("origin.git"));
+    let db = Arc::new(setup_db(&tmp.path().join("sync.db")));
+    let names = ["-dash", "name@HEAD", " space 雪 ", "nested/xml&<name>"];
+    for name in names {
+        let path = work.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"exact personal bytes\n").unwrap();
+    }
+    let sha = git
+        .commit(
+            "#113 literal apply",
+            "Test",
+            "test@example.com",
+            "Test",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    let sync = personal_git_to_svn(&svn_url, db.clone(), wc.clone(), work.clone(), tmp.path());
+    sync.apply_git_changes_to_svn(&github_commit(sha, "#113 literal apply"))
+        .await
+        .unwrap();
+    for name in names {
+        assert_eq!(
+            std::fs::read(wc.join(name)).unwrap(),
+            b"exact personal bytes\n"
+        );
+    }
+    std::fs::write(work.join("ordinary-new"), b"must not be written").unwrap();
+    std::fs::write(work.join("tab\tname"), b"unsupported").unwrap();
+    let sha = git
+        .commit(
+            "#113 refuse whole set",
+            "Test",
+            "test@example.com",
+            "Test",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    let error = sync
+        .apply_git_changes_to_svn(&github_commit(sha, "#113 refuse whole set"))
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("confined repository-relative path"),
+        "{error:#}"
+    );
+    assert!(!wc.join("ordinary-new").exists());
+    assert!(!wc.join("tab\tname").exists());
+    for name in names {
+        assert_eq!(
+            std::fs::read(wc.join(name)).unwrap(),
+            b"exact personal bytes\n"
+        );
+    }
+    assert_eq!(svn_youngest(&svn_url), 1);
+    assert!(db.list_commit_map(10).unwrap().is_empty());
+}

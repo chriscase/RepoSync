@@ -4025,52 +4025,25 @@ async fn test_repo_svn(
         .or_else(|| db.resolve_credential_chain(&id, "secret_svn_password"))
         .unwrap_or_default();
 
-    let svn_url = if svn_branch.is_empty() {
-        svn_url_base
-    } else {
-        format!(
-            "{}/{}",
-            svn_url_base.trim_end_matches('/'),
-            svn_branch.trim_start_matches('/')
-        )
+    let svn_url = match reposync_core::svn::operand::repository_url(&svn_url_base, &svn_branch) {
+        Ok(url) => url,
+        Err(error) => {
+            return Ok(Json(
+                serde_json::json!({"ok":false,"message":redact_vcs_error_detail(&error.to_string())}),
+            ))
+        }
     };
 
-    let result = tokio::process::Command::new("svn")
-        .args([
-            "info",
-            "--non-interactive",
-            "--username",
-            &svn_username,
-            "--password",
-            &password,
-            &svn_url,
-        ])
-        .output()
+    let result = reposync_core::svn::SvnClient::new(&svn_url, &svn_username, &password)
+        .info()
         .await;
 
     match result {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let info = stdout
-                .lines()
-                .find(|l| l.starts_with("Repository Root:") || l.starts_with("URL:"))
-                .unwrap_or("SVN server responded successfully");
-            Ok(Json(
-                serde_json::json!({"ok": true, "message": info.trim()}),
-            ))
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = stderr
-                .lines()
-                .find(|l| l.contains("E1") || l.contains("Unable") || l.contains("Authentication"))
-                .unwrap_or("SVN command failed");
-            Ok(Json(
-                serde_json::json!({"ok": false, "message": redact_vcs_error_detail(msg.trim())}),
-            ))
-        }
-        Err(e) => Ok(Json(
-            serde_json::json!({"ok": false, "message": format!("Failed to run svn: {}", e)}),
+        Ok(info) => Ok(Json(
+            serde_json::json!({"ok":true,"message":format!("Repository Root: {}",info.root_url)}),
+        )),
+        Err(error) => Ok(Json(
+            serde_json::json!({"ok":false,"message":redact_vcs_error_detail(&error.to_string())}),
         )),
     }
 }
