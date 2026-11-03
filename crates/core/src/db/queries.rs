@@ -741,6 +741,10 @@ impl Database {
     }
 
     /// Insert an audit log entry tagged with an optional `repo_id`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Preserve the legacy audit API and all existing callers in the narrow backport"
+    )]
     pub fn insert_audit_log_with_repo(
         &self,
         action: &str,
@@ -1507,17 +1511,19 @@ impl Database {
                     _ => crate::import::ImportPhase::Idle,
                 };
                 let errors: Vec<String> = serde_json::from_str(&errors_json).unwrap_or_default();
-                let mut progress = crate::import::ImportProgress::default();
-                progress.phase = phase;
-                progress.current_rev = current_rev;
-                progress.total_revs = total_revs;
-                progress.commits_created = commits_created as u64;
-                progress.batches_pushed = batches_pushed as u64;
-                progress.lfs_unique_count = lfs_unique_count as u64;
-                progress.files_skipped = files_skipped as u64;
-                progress.errors = errors;
-                progress.started_at = started_at;
-                progress.completed_at = completed_at;
+                let progress = crate::import::ImportProgress {
+                    phase,
+                    current_rev,
+                    total_revs,
+                    commits_created: commits_created as u64,
+                    batches_pushed: batches_pushed as u64,
+                    lfs_unique_count: lfs_unique_count as u64,
+                    files_skipped: files_skipped as u64,
+                    errors,
+                    started_at,
+                    completed_at,
+                    ..Default::default()
+                };
                 Ok(Some(progress))
             }
             Some(Err(e)) => Err(e.into()),

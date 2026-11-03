@@ -368,6 +368,10 @@ pub struct ImportConfig {
 ///
 /// Progress is updated in real-time via `progress` and optionally broadcast
 /// via `ws_broadcast` for the web UI.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Preserve the legacy import API and its callers without an unrelated API redesign"
+)]
 pub async fn run_full_import(
     svn_client: &SvnClient,
     git_client: &Arc<std::sync::Mutex<GitClient>>,

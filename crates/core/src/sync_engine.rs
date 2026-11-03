@@ -1348,18 +1348,17 @@ impl SyncEngine {
                         if action == "D" {
                             return false;
                         }
-                        if !self.allowed_paths.is_empty() {
-                            if !self
+                        if !self.allowed_paths.is_empty()
+                            && !self
                                 .allowed_paths
                                 .iter()
                                 .any(|prefix| path.starts_with(prefix))
-                            {
-                                return true;
-                            }
+                        {
+                            return true;
                         }
                         for pattern in &self.blocked_patterns {
-                            let matches = if pattern.starts_with('*') {
-                                path.ends_with(&pattern[1..])
+                            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
+                                path.ends_with(suffix)
                             } else if pattern.ends_with('/') {
                                 path.starts_with(pattern)
                             } else {
@@ -1717,14 +1716,12 @@ impl SyncEngine {
                         // When using standard layout, only sync files under trunk/
                         // and strip the trunk prefix so git paths are repo-relative.
                         let mapped_path = if let Some(ref prefix) = trunk_prefix {
-                            if let Some(rest) = raw.strip_prefix(prefix.as_str()) {
-                                if rest.is_empty() {
-                                    return None; // skip bare trunk/ directory entry
-                                }
-                                rest.to_string()
-                            } else {
-                                return None; // skip non-trunk paths (branches/, tags/)
+                            // Skip non-trunk paths (branches/, tags/).
+                            let rest = raw.strip_prefix(prefix.as_str())?;
+                            if rest.is_empty() {
+                                return None; // skip bare trunk/ directory entry
                             }
+                            rest.to_string()
                         } else {
                             raw.to_string()
                         };
@@ -2106,8 +2103,7 @@ pub async fn apply_diff_to_path(
     // and begins processing. Without closing, git apply may hang forever.
     {
         let mut stdin = child.stdin.take().ok_or_else(|| {
-            crate::errors::GitError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            crate::errors::GitError::IoError(std::io::Error::other(
                 "failed to open git apply stdin",
             ))
         })?;
@@ -2204,8 +2200,8 @@ pub(crate) fn validate_file_paths_impl(
             }
         }
         for pattern in blocked_patterns {
-            let matches = if pattern.starts_with('*') {
-                path.ends_with(&pattern[1..])
+            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
+                path.ends_with(suffix)
             } else if pattern.ends_with('/') {
                 path.starts_with(pattern)
             } else {
