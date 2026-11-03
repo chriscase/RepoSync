@@ -22,8 +22,29 @@ Every client command places authentication and private configuration options
 before the operand separator. Typed command methods put only data after `--`.
 The internal WC compatibility entry rebuilds its supported verb's option,
 property-value and target roles separately, rejects caller overrides of client
-credentials/configuration/helpers, and preserves the pinned merge source.
-The two web SVN connection probes reuse the same client boundary.
+credentials/configuration/helpers, and preserves the pinned merge source. `merge`'s destination is instead a plain
+validated WCPATH after `--`: SVN does not parse a peg there, so an empty peg
+suffix must not be appended to that role.
+The two web SVN connection probes reuse the same client boundary. Configured
+branches use `configured_branch_url` in import/reimport, setup import, scheduler,
+reconciliation and late-pair clients. These are raw names, not encoded URL
+suffixes: `a%40b` means that literal name and differs from `a@b`. Empty and `/`
+select the root, and a single leading `/` is the existing root-relative spelling.
+Import callers retain their existing empty-branch default of `trunk`.
+
+Repository-root containment is checked in the URL domain before the branch
+suffix is decoded, one validated component at a time, into the literal XML log
+namespace. Encoded separators/dot components and foreign roots refuse. Literal
+percent data is not decoded again. Unrepresentable log names refuse observation
+instead of becoming an empty successful change set. Journal reconciliation does
+not reinterpret a retained namespace that differs from the checked live target.
+
+URL validation errors omit the original URL. Constructor/span/Debug diagnostics
+never expose unvalidated userinfo or query/fragment text, and public probe errors
+use shared redaction. Password refusal remains before launch. The stricter
+registered refresh execution contract still validates its original canonical
+ASCII-only endpoint policy before ordinary URL encoding; #113 does not admit
+previously unsupported refresh authority or make read-only pins executable.
 
 No shell interpolation is introduced. The #228 commit-message path is retained:
 owner-only private file input is attached to stdin for `--file -`, remains alive
@@ -66,7 +87,9 @@ revert and rename/delete; negative sets include tab/newline, traversal,
 administrative names, links and hardlinks. Existing #62 qualified-pair and
 Personal fixtures exercise the actual apply consumers. Exact command results,
 publication, receipt and checkpoint assertions are required; inventory and
-source review alone are not executed acceptance.
+source review alone are not executed acceptance. The branch regression uses
+independent histories for full import: the existing copied-branch historical
+path-relocation limitation is not claimed repaired by this operand story.
 
 Outbound publication records the exact emitted SVN revision in its applied
 receipt and advances the Git cursor. It does not invent advancement of the

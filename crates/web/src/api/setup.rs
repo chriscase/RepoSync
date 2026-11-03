@@ -304,7 +304,10 @@ async fn test_svn_connection(
         })),
         Err(e) => Ok(Json(TestConnectionResponse {
             ok: false,
-            message: format!("Failed to run svn command: {}", e),
+            message: format!(
+                "Failed to run svn command: {}",
+                redact_vcs_error_detail(&e.to_string())
+            ),
         })),
     }
 }
@@ -1143,19 +1146,15 @@ async fn spawn_import_task(
         .clone()
         .or(db_svn_password)
         .unwrap_or_default();
-    let svn_import_url = {
-        let base = config.svn.url.trim_end_matches('/');
-        let trunk = if config.svn.trunk_path.is_empty() {
+    let svn_import_url = reposync_core::svn::operand::configured_branch_url(
+        &config.svn.url,
+        if config.svn.trunk_path.is_empty() {
             "trunk"
         } else {
             &config.svn.trunk_path
-        };
-        if trunk.is_empty() || trunk == "/" {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, trunk.trim_start_matches('/'))
-        }
-    };
+        },
+    )
+    .map_err(|error| AppError::BadRequest(redact_vcs_error_detail(&error.to_string())))?;
     info!(svn_import_url = %svn_import_url, "SVN import URL");
     let cancel_signal = state.import_progress.read().await.cancel_signal.clone();
     let svn_client = SvnClient::new(&svn_import_url, &config.svn.username, &svn_password)

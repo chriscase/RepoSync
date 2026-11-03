@@ -93,16 +93,8 @@ pub fn svn_path_missing(error: &str) -> bool {
         || error.contains("(not found)")
 }
 
-pub fn branch_svn_url(root: &str, branch: &str) -> String {
-    if branch.is_empty() {
-        root.trim_end_matches('/').to_string()
-    } else {
-        format!(
-            "{}/{}",
-            root.trim_end_matches('/'),
-            branch.trim_start_matches('/')
-        )
-    }
+pub fn branch_svn_url(root: &str, branch: &str) -> Result<String, crate::errors::SvnError> {
+    crate::svn::operand::configured_branch_url(root, branch)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -83,37 +83,57 @@ pub struct SvnPathIdentity {
 }
 
 impl SvnPathIdentity {
-    pub fn new(root_url: impl Into<String>, target_url: impl Into<String>) -> Self {
+    pub fn new(
+        root_url: impl Into<String>,
+        target_url: impl Into<String>,
+    ) -> Result<Self, crate::errors::SvnError> {
         svn_path_identity(&root_url.into(), &target_url.into())
     }
 }
 
-/// Derive the canonical branch-relative namespace from pinned SVN URLs.
-pub fn svn_path_identity(root_url: &str, target_url: &str) -> SvnPathIdentity {
-    let root = normalize_svn_url(root_url);
-    let target = normalize_svn_url(target_url);
-    let branch_path = if target == root {
-        String::new()
-    } else if let Some(rest) = target.strip_prefix(&format!("{root}/")) {
-        normalize_policy_path(rest)
+/// Check containment in the encoded URL domain first. Only the suffix's
+/// individual components are then decoded once into SVN XML's literal names.
+/// Invalid/foreign identities never fall back to an unrestricted root.
+pub fn svn_path_identity(
+    root_url: &str,
+    target_url: &str,
+) -> Result<SvnPathIdentity, crate::errors::SvnError> {
+    use crate::svn::operand::{checked_url, decode_url_component, validate_relative_path};
+    let root = checked_url(&normalize_svn_url(root_url))?;
+    let target = checked_url(&normalize_svn_url(target_url))?;
+    let root_text = normalize_svn_url(root.as_str());
+    let target_text = normalize_svn_url(target.as_str());
+    let suffix = if target_text == root_text {
+        ""
     } else {
-        String::new()
+        target_text
+            .strip_prefix(&format!("{root_text}/"))
+            .ok_or_else(|| crate::errors::SvnError::LineageRefused {
+                reason: "svn_target_outside_repository_root".into(),
+                detail: "SVN target does not belong to its reported repository root".into(),
+            })?
     };
-    SvnPathIdentity {
-        root_url: root,
-        branch_path,
+    let branch_path = if suffix.is_empty() {
+        String::new()
+    } else {
+        suffix
+            .split('/')
+            .map(decode_url_component)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/")
+    };
+    if !branch_path.is_empty() {
+        validate_relative_path(&branch_path)?;
     }
+    Ok(SvnPathIdentity {
+        root_url: root_text,
+        branch_path,
+    })
 }
 
-/// Derive a branch identity only when the canonical target belongs to the root.
-/// An unrelated URL must not fall back to the unrestricted repository namespace.
+/// Compatibility Option boundary for callers that classify refusal themselves.
 pub fn checked_svn_path_identity(root_url: &str, target_url: &str) -> Option<SvnPathIdentity> {
-    let root = normalize_svn_url(root_url);
-    let target = normalize_svn_url(target_url);
-    if root.is_empty() || (target != root && !target.starts_with(&format!("{root}/"))) {
-        return None;
-    }
-    Some(svn_path_identity(&root, &target))
+    svn_path_identity(root_url, target_url).ok()
 }
 
 /// Git intent paths are already branch-relative; normalize separators only.
@@ -129,7 +149,14 @@ pub fn svn_log_path_to_branch_relative(
     log_path: &str,
     identity: &SvnPathIdentity,
 ) -> Option<String> {
-    let repo_relative = normalize_policy_path(log_path);
+    // XML paths are already decoded SVN names, never URL- or backslash-
+    // normalized. Unsupported components must not turn into another file.
+    let repo_relative = log_path.trim_start_matches('/');
+    let checked = repo_relative.strip_suffix('/').unwrap_or(repo_relative);
+    if !checked.is_empty() {
+        crate::svn::operand::validate_relative_path(checked).ok()?;
+    }
+    let repo_relative = repo_relative.to_string();
     if identity.branch_path.is_empty() {
         return Some(repo_relative);
     }
@@ -816,24 +843,30 @@ mod tests {
     #[test]
     fn svn_path_identity_maps_trunk_and_branches() {
         let root = "file:///srv/repo";
-        assert_eq!(svn_path_identity(root, root).branch_path, "");
+        assert_eq!(svn_path_identity(root, root).unwrap().branch_path, "");
         assert_eq!(
-            svn_path_identity(root, "file:///srv/repo/trunk").branch_path,
+            svn_path_identity(root, "file:///srv/repo/trunk")
+                .unwrap()
+                .branch_path,
             "trunk"
         );
         assert_eq!(
-            svn_path_identity(root, "file:///srv/repo/branches/feature").branch_path,
+            svn_path_identity(root, "file:///srv/repo/branches/feature")
+                .unwrap()
+                .branch_path,
             "branches/feature"
         );
         assert_eq!(
-            svn_path_identity(root, "file:///srv/repo/projects/app").branch_path,
+            svn_path_identity(root, "file:///srv/repo/projects/app")
+                .unwrap()
+                .branch_path,
             "projects/app"
         );
     }
 
     #[test]
     fn svn_log_path_maps_into_branch_relative_namespace() {
-        let trunk = SvnPathIdentity::new("file:///repo", "file:///repo/trunk");
+        let trunk = SvnPathIdentity::new("file:///repo", "file:///repo/trunk").unwrap();
         assert_eq!(
             svn_log_path_to_branch_relative("/trunk/feature.txt", &trunk),
             Some("feature.txt".into())
@@ -842,7 +875,7 @@ mod tests {
             svn_log_path_to_branch_relative("trunk/nested/x.txt", &trunk),
             Some("nested/x.txt".into())
         );
-        let branch = SvnPathIdentity::new("file:///repo", "file:///repo/branches/team");
+        let branch = SvnPathIdentity::new("file:///repo", "file:///repo/branches/team").unwrap();
         assert_eq!(
             svn_log_path_to_branch_relative("/branches/team/a.txt", &branch),
             Some("a.txt".into())
@@ -851,7 +884,7 @@ mod tests {
             svn_log_path_to_branch_relative("/branches/team-other/a.txt", &branch),
             None
         );
-        let root = SvnPathIdentity::new("file:///repo", "file:///repo");
+        let root = SvnPathIdentity::new("file:///repo", "file:///repo").unwrap();
         assert_eq!(
             svn_log_path_to_branch_relative("/feature.txt", &root),
             Some("feature.txt".into())
@@ -1040,7 +1073,7 @@ mod tests {
 
     #[test]
     fn svn_log_path_rejects_sibling_same_basename_prefix() {
-        let allow = SvnPathIdentity::new("file:///repo", "file:///repo/allow");
+        let allow = SvnPathIdentity::new("file:///repo", "file:///repo/allow").unwrap();
         assert_eq!(svn_log_path_to_branch_relative("/allow.txt", &allow), None);
         assert_eq!(
             svn_log_path_to_branch_relative("/allow/x.txt", &allow),

@@ -275,3 +275,230 @@ async fn rs113_external_properties_refuse_without_materializing_or_publishing_om
         .unwrap();
     client.require_supported_working_copy(&wc).await.unwrap();
 }
+
+#[tokio::test]
+async fn rs113_merge_destination_is_a_plain_wcpath_not_a_peg_target() {
+    let (root, client) = fixture();
+    let seed = root.path().join("seed");
+    client.checkout_head(&seed).await.unwrap();
+    let target = root.path().join("destination@literal");
+    client.checkout_head(&target).await.unwrap();
+    std::fs::write(seed.join("new.txt"), b"merged exact bytes\n").unwrap();
+    client.add(&seed, &["new.txt"]).await.unwrap();
+    let revision = client.commit(&seed, "source change", "").await.unwrap();
+    let source = literal_url(client.url(), Some(revision)).unwrap();
+    client
+        .run_svn_in_dir_public(&target, &["merge", "-r", "0:1", &source, "."])
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(target.join("new.txt")).unwrap(),
+        b"merged exact bytes\n"
+    );
+    assert!(!target.join("@").exists());
+    assert_eq!(
+        client.info().await.unwrap().latest_rev,
+        1,
+        "merge does not publish"
+    );
+    let args = crate::svn::operand::working_copy_arguments(
+        &target,
+        &["merge", "-r", "0:1", &source, target.to_str().unwrap()],
+    )
+    .unwrap();
+    assert_eq!(args.last().unwrap(), target.to_str().unwrap());
+}
+
+#[test]
+fn rs113_info_log_uri_components_decode_once_after_containment() {
+    use crate::path_projection::{checked_svn_path_identity, svn_log_path_to_branch_relative};
+    use crate::svn::parser::{parse_svn_info, parse_svn_log};
+    for (encoded, literal, decoy) in [
+        ("a%20b", "a b", "a%20b"),
+        ("%E9%9B%AA", "雪", "%E9%9B%AA"),
+        ("a%2540b", "a%40b", "a@b"),
+        ("a@b", "a@b", "a%40b"),
+        ("a%23b%3Fc", "a#b?c", "a"),
+    ] {
+        let info = parse_svn_info(&format!("<info><entry revision=\"7\"><url>file:///repo/branches/{encoded}</url><repository><root>file:///repo</root><uuid>fixture</uuid></repository></entry></info>")).unwrap();
+        let identity = checked_svn_path_identity(&info.root_url, &info.url).unwrap();
+        assert_eq!(identity.branch_path, format!("branches/{literal}"));
+        let log = parse_svn_log(&format!("<log><logentry revision=\"7\"><author>fixture</author><date>2026-11-03T00:00:00Z</date><paths><path action=\"A\" copyfrom-path=\"/branches/{literal}/old.txt\" copyfrom-rev=\"6\">/branches/{literal}/new.txt</path></paths><msg>literal</msg></logentry></log>")).unwrap();
+        let path = &log[0].changed_paths[0];
+        assert_eq!(
+            svn_log_path_to_branch_relative(&path.path, &identity).as_deref(),
+            Some("new.txt")
+        );
+        assert_eq!(
+            svn_log_path_to_branch_relative(path.copy_from_path.as_deref().unwrap(), &identity)
+                .as_deref(),
+            Some("old.txt")
+        );
+        for wrong in [
+            format!("/branches/{decoy}/new.txt"),
+            format!("/branches/{literal}-sibling/new.txt"),
+        ] {
+            assert_eq!(svn_log_path_to_branch_relative(&wrong, &identity), None);
+        }
+    }
+    for target in [
+        "file:///repo-other/branches/a",
+        "https://foreign.invalid/repo/branches/a",
+        "file:///repo/branches/a%2fb",
+        "file:///repo/branches/%2e%2e/a",
+        "file:///repo/branches/a%5Cb",
+    ] {
+        assert!(
+            checked_svn_path_identity("file:///repo", target).is_none(),
+            "{target}"
+        );
+    }
+    let malformed = r#"<log><logentry revision="7"><paths><path action="M">/branches/a\b/file.txt</path></paths></logentry></log>"#;
+    assert!(
+        parse_svn_log(malformed).is_err(),
+        "unrepresentable log names must refuse, not disappear as empty continuation"
+    );
+    assert_eq!(
+        checked_svn_path_identity("file:///repo", "file:///repo")
+            .unwrap()
+            .branch_path,
+        ""
+    );
+}
+
+#[tokio::test]
+async fn rs113_url_userinfo_refuses_without_secret_in_trace_debug_or_error() {
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<String>>);
+    struct Fields<'a>(&'a mut String);
+    impl tracing::field::Visit for Fields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            write!(self.0, "{}={value:?};", field.name()).unwrap();
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            attrs.record(&mut Fields(&mut self.0.lock().unwrap()));
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, record: &tracing::span::Record<'_>) {
+            record.record(&mut Fields(&mut self.0.lock().unwrap()));
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut Fields(&mut self.0.lock().unwrap()));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+    for url in [
+        "http://alice:synthetic-secret@127.0.0.1:1/repo",
+        "http://alice%3Asynthetic%2Dsecret@127.0.0.1:1/repo",
+        "HTTP://alice:synthetic-secret@127.0.0.1:1/repo",
+        "file://alice:synthetic-secret@localhost/repo",
+    ] {
+        let capture = Capture(Arc::new(Mutex::new(String::new())));
+        let client =
+            tracing::subscriber::with_default(capture.clone(), || SvnClient::new(url, "", ""));
+        let error = client
+            .info()
+            .with_subscriber(capture.clone())
+            .await
+            .unwrap_err();
+        let trace = capture.0.lock().unwrap().clone();
+        assert!(
+            trace.contains("created SvnClient"),
+            "constructor trace must actually be captured: {trace}"
+        );
+        assert!(trace.contains("REDACTED"), "{trace}");
+        let observed = format!("{client:?}\n{error}\n{trace}");
+        assert!(!observed.contains("synthetic-secret"), "{observed}");
+        assert!(!observed.contains("synthetic%2Dsecret"), "{observed}");
+        assert!(observed.contains("REDACTED"), "{observed}");
+        assert!(
+            matches!(error, crate::errors::SvnError::WorkingCopyError { .. }),
+            "URL must refuse at pre-launch validation: {error}"
+        );
+        assert_eq!(
+            client.command_stderr(b"failure with separate-secret"),
+            "failure with separate-secret"
+        );
+    }
+    let client = SvnClient::new("file:///not-present-rs113", "fixture", "separate-secret");
+    assert_eq!(
+        client.command_stderr(b"failed separate-secret http://u:embedded-secret@127.0.0.1:1/"),
+        "failed [REDACTED] http://[REDACTED]@127.0.0.1:1/"
+    );
+}
+
+#[tokio::test]
+async fn rs113_configured_branch_builders_select_literal_nodes_and_root_controls() {
+    use crate::svn::operand::configured_branch_url;
+    let (root, client) = fixture();
+    let seed = root.path().join("seed");
+    client.checkout_head(&seed).await.unwrap();
+    let names = [
+        "branches/a%40b",
+        "branches/a@b",
+        "branches/hash#query? 雪",
+        "trunk",
+    ];
+    for (index, name) in names.iter().enumerate() {
+        let file = format!("{name}/identity.txt");
+        ConfinedWorkingCopy::open(&seed)
+            .unwrap()
+            .write_file(&file, format!("node-{index}\n").as_bytes())
+            .unwrap();
+        client.add_with_retry(&seed, &[&file]).await.unwrap();
+    }
+    let revision = client
+        .commit(&seed, "distinct literal branch nodes", "")
+        .await
+        .unwrap();
+    for (index, name) in names.iter().enumerate() {
+        let ordinary = configured_branch_url(client.url(), name).unwrap();
+        assert_eq!(
+            crate::pair_refresh::branch_svn_url(client.url(), name).unwrap(),
+            ordinary
+        );
+        assert_eq!(
+            configured_branch_url(client.url(), &format!("/{name}")).unwrap(),
+            ordinary
+        );
+        let probe = SvnClient::new(&ordinary, "", "");
+        let info = probe.info().await.unwrap();
+        assert_eq!(info.url, ordinary);
+        assert_eq!(
+            probe.cat("identity.txt", revision).await.unwrap(),
+            format!("node-{index}\n")
+        );
+    }
+    for branch in ["", "/"] {
+        assert_eq!(
+            configured_branch_url(client.url(), branch).unwrap(),
+            client.url()
+        );
+    }
+    for branch in [
+        "//trunk",
+        "branches/../trunk",
+        "branches//trunk",
+        "bad\nname",
+    ] {
+        assert!(configured_branch_url(client.url(), branch).is_err());
+    }
+    assert_eq!(client.info().await.unwrap().latest_rev, revision);
+    assert_eq!(
+        client
+            .cat("branches/a@b/identity.txt", revision)
+            .await
+            .unwrap(),
+        "node-1\n"
+    );
+}

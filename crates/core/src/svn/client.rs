@@ -29,11 +29,25 @@ pub struct SvnClient {
     refresh_config: Option<Arc<tempfile::TempDir>>,
 }
 
+// Never log unvalidated userinfo/query text, including unsupported or malformed
+// URLs that will be refused before launch. This does not alter the source URL.
+fn diagnostic_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return "[REDACTED invalid SVN URL]".into();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return "[REDACTED SVN URL userinfo]".into();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.into()
+}
+
 // Custom Debug implementation that redacts the password field.
 impl fmt::Debug for SvnClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SvnClient")
-            .field("url", &self.url)
+            .field("url", &diagnostic_url(&self.url))
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .finish()
@@ -78,7 +92,7 @@ impl SvnClient {
             cancel: None,
             refresh_config: None,
         };
-        info!(url = %client.url, username = %client.username, "created SvnClient");
+        info!(url = %diagnostic_url(&client.url), username = %client.username, "created SvnClient");
         client
     }
 
@@ -126,7 +140,7 @@ impl SvnClient {
     }
 
     fn command_stderr(&self, bytes: &[u8]) -> String {
-        let stderr = String::from_utf8_lossy(bytes).to_string();
+        let stderr = crate::errors::redact_vcs_error_detail(&String::from_utf8_lossy(bytes));
         if !self.password.is_empty() {
             stderr.replace(&self.password, "[REDACTED]")
         } else {
@@ -210,7 +224,7 @@ impl SvnClient {
         self.username = username.into();
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn info(&self) -> Result<SvnInfo, SvnError> {
         let output = self
             .run_svn(&["info", "--xml", "--", &literal_url(&self.url, None)?])
@@ -228,7 +242,7 @@ impl SvnClient {
 
     /// `svn info` at a peg revision so identity is the selected snapshot,
     /// not whatever HEAD has become.
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn info_at_rev(&self, rev: i64) -> Result<SvnInfo, SvnError> {
         if rev < 1 {
             return Err(SvnError::RevisionNotFound(rev));
@@ -238,7 +252,7 @@ impl SvnClient {
         parse_svn_info(&output)
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn log(&self, start_rev: i64, end_rev: i64) -> Result<Vec<SvnLogEntry>, SvnError> {
         let end_str = if end_rev < 0 {
             "HEAD".to_string()
@@ -316,7 +330,7 @@ impl SvnClient {
         super::parser::parse_svn_copy_history(&output)
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn diff(&self, rev: i64) -> Result<Vec<SvnDiffEntry>, SvnError> {
         if rev < 1 {
             return Err(SvnError::RevisionNotFound(rev));
@@ -336,7 +350,7 @@ impl SvnClient {
         parse_svn_diff_summarize(&output)
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn diff_full(&self, rev: i64) -> Result<String, SvnError> {
         if rev < 1 {
             return Err(SvnError::RevisionNotFound(rev));
@@ -369,7 +383,7 @@ impl SvnClient {
         .await
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn checkout(&self, path: &Path, rev: i64) -> Result<(), SvnError> {
         let rev_str = rev.to_string();
         let path_str = local_destination(path)?;
@@ -461,7 +475,7 @@ impl SvnClient {
     }
 
     /// Checkout the SVN repository at HEAD into the given directory.
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn checkout_head(&self, path: &Path) -> Result<(), SvnError> {
         let path_str = local_destination(path)?;
         self.run_svn(&[
@@ -514,7 +528,7 @@ impl SvnClient {
         Ok(rev)
     }
 
-    #[instrument(skip(self, prop_value), fields(url = %self.url, rev, prop_name))]
+    #[instrument(skip(self, prop_value), fields(url = %diagnostic_url(&self.url), rev, prop_name))]
     pub async fn set_rev_prop(
         &self,
         rev: i64,
@@ -537,7 +551,7 @@ impl SvnClient {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn list_branches(&self, branches_path: &str) -> Result<Vec<String>, SvnError> {
         let branches_url = literal_url(&repository_url(&self.url, branches_path)?, None)?;
         let output = self
@@ -560,7 +574,7 @@ impl SvnClient {
         Ok(branches)
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn create_branch(
         &self,
         name: &str,
@@ -614,7 +628,7 @@ impl SvnClient {
     }
 
     /// Delete an SVN branch (or directory) from the repository.
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn delete_branch(&self, branch_path: &str) -> Result<(), SvnError> {
         let branch_url = literal_url(&repository_url(&self.url, branch_path)?, None)?;
         let message = format!("Delete branch {}", branch_path);
@@ -642,7 +656,7 @@ impl SvnClient {
         }
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn export(&self, path: &str, rev: i64, dest: &Path) -> Result<(), SvnError> {
         let src_url = repository_url(&self.url, path)?;
         self.require_supported_export_nodes(&src_url, rev).await?;
@@ -676,7 +690,7 @@ impl SvnClient {
     }
 
     /// Export at a given depth (e.g. "immediates" for top-level only).
-    #[instrument(skip(self), fields(url = %self.url, rev, depth))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev, depth))]
     pub async fn export_depth(
         &self,
         path: &str,
@@ -918,7 +932,7 @@ impl SvnClient {
     /// at rev N" — which fails for files that were renamed or deleted
     /// in any later revision. With the peg, the server treats `url` as
     /// a path that existed at rev N, which is what we actually want.
-    #[instrument(skip(self), fields(file_path = %file_path, rev))]
+    #[instrument(skip(self, file_path), fields(rev))]
     pub async fn cat(&self, file_path: &str, rev: i64) -> Result<String, SvnError> {
         let base_url = if reqwest::Url::parse(file_path).is_ok() {
             let base = super::operand::checked_url(&self.url)?;

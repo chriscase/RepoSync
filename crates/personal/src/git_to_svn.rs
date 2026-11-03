@@ -664,7 +664,7 @@ impl GitToSvnSync {
                 &info.url,
                 "{}",
             );
-            let identity = svn_path_identity(&info.root_url, &info.url);
+            let identity = svn_path_identity(&info.root_url, &info.url).context("invalid SVN target namespace")?;
             let request_id = format!("git-{}", commit.sha);
             let git_author = commit.commit.author.name.as_str();
             let op = self

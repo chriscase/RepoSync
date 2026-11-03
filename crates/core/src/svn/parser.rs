@@ -347,7 +347,17 @@ pub fn parse_svn_log(xml: &str) -> Result<Vec<SvnLogEntry>, SvnError> {
                 copy_from_path: node.attribute("copyfrom-path").map(str::to_owned),
                 copy_from_rev: node.attribute("copyfrom-rev").and_then(|v| v.parse().ok()),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for changed in &changed_paths {
+            for path in
+                std::iter::once(changed.path.as_str()).chain(changed.copy_from_path.as_deref())
+            {
+                let relative = path.strip_prefix('/').unwrap_or(path);
+                if path != "/" {
+                    super::operand::validate_relative_path(relative)?;
+                }
+            }
+        }
         entries.push(SvnLogEntry {
             revision,
             author: field("author"),

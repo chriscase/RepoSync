@@ -4,7 +4,7 @@ use crate::errors::SvnError;
 
 fn refused(value: &str, detail: &str) -> SvnError {
     SvnError::WorkingCopyError {
-        path: value.into(),
+        path: crate::errors::redact_vcs_error_detail(value),
         detail: detail.into(),
     }
 }
@@ -38,13 +38,37 @@ pub fn literal_path(value: &str) -> Result<String, SvnError> {
     Ok(format!("{value}@"))
 }
 
+/// Decode one URI path component exactly once. Separators may not be encoded
+/// into a component: URL containment is established before deriving log paths.
+pub(crate) fn decode_url_component(component: &str) -> Result<String, SvnError> {
+    let bytes = component.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let pair = bytes
+                .get(at + 1..at + 3)
+                .ok_or_else(|| refused("[SVN URL]", "invalid URL escape"))?;
+            let hex = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
+            let hi = hex(pair[0]).ok_or_else(|| refused("[SVN URL]", "invalid URL escape"))?;
+            let lo = hex(pair[1]).ok_or_else(|| refused("[SVN URL]", "invalid URL escape"))?;
+            decoded.push(hi * 16 + lo);
+            at += 3;
+        } else {
+            decoded.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| refused("[SVN URL]", "URL path must be UTF-8"))
+}
+
 /// Validate a configured URL separately from a repository-relative filename.
 pub fn checked_url(value: &str) -> Result<reqwest::Url, SvnError> {
     // URL parsers normalize dot segments and discard ASCII tab/newline. Refuse
     // that evidence before parsing rather than silently selecting another node.
     if value.trim() != value || value.chars().any(char::is_control) {
         return Err(refused(
-            value,
+            "[REDACTED SVN URL]",
             "SVN URL must not contain discarded whitespace",
         ));
     }
@@ -54,44 +78,29 @@ pub fn checked_url(value: &str) -> Result<reqwest::Url, SvnError> {
         .map(|(_, path)| path)
         .unwrap_or("");
     if raw_path.starts_with('/') || raw_path.contains("//") {
-        return Err(refused(value, "empty SVN URL path component"));
+        return Err(refused(
+            "[REDACTED SVN URL]",
+            "empty SVN URL path component",
+        ));
     }
     for component in raw_path
         .trim_end_matches('/')
         .split('/')
         .filter(|c| !c.is_empty())
     {
-        let bytes = component.as_bytes();
-        let mut decoded = Vec::new();
-        let mut at = 0;
-        while at < bytes.len() {
-            if bytes[at] == b'%' {
-                let pair = bytes
-                    .get(at + 1..at + 3)
-                    .ok_or_else(|| refused(value, "invalid URL escape"))?;
-                let hex = |b: u8| (b as char).to_digit(16).map(|v| v as u8);
-                let hi = hex(pair[0]).ok_or_else(|| refused(value, "invalid URL escape"))?;
-                let lo = hex(pair[1]).ok_or_else(|| refused(value, "invalid URL escape"))?;
-                decoded.push(hi * 16 + lo);
-                at += 3;
-            } else {
-                decoded.push(bytes[at]);
-                at += 1;
-            }
-        }
-        let component =
-            std::str::from_utf8(&decoded).map_err(|_| refused(value, "URL path must be UTF-8"))?;
-        if matches!(component, "." | "..")
+        let component = decode_url_component(component)?;
+        if matches!(component.as_str(), "." | "..")
             || component.contains(['/', '\\'])
             || component.chars().any(char::is_control)
         {
             return Err(refused(
-                value,
+                "[REDACTED SVN URL]",
                 "nonliteral or unsupported SVN URL component",
             ));
         }
     }
-    let url = reqwest::Url::parse(value).map_err(|_| refused(value, "invalid SVN URL"))?;
+    let url =
+        reqwest::Url::parse(value).map_err(|_| refused("[REDACTED SVN URL]", "invalid SVN URL"))?;
     if !matches!(url.scheme(), "file" | "http" | "https" | "svn" | "svn+ssh")
         || url.query().is_some()
         || url.fragment().is_some()
@@ -99,7 +108,10 @@ pub fn checked_url(value: &str) -> Result<reqwest::Url, SvnError> {
         || url.password().is_some()
         || (!url.username().is_empty() && url.scheme() != "svn+ssh")
     {
-        return Err(refused(value, "unsupported SVN URL authority or suffix"));
+        return Err(refused(
+            "[REDACTED SVN URL]",
+            "unsupported SVN URL authority or suffix",
+        ));
     }
     Ok(url)
 }
@@ -124,6 +136,13 @@ pub fn repository_url(base: &str, path: &str) -> Result<String, SvnError> {
             .extend(path.split('/'));
     }
     Ok(url.into())
+}
+
+/// Configured branches are raw repository-relative names, not URI suffixes.
+/// Empty and `/` select the configured root; one leading slash is the legacy
+/// root-relative spelling. Repeated separators and dot components still refuse.
+pub fn configured_branch_url(base: &str, branch: &str) -> Result<String, SvnError> {
+    repository_url(base, branch.strip_prefix('/').unwrap_or(branch))
 }
 
 pub fn local_destination(path: &std::path::Path) -> Result<&str, SvnError> {
@@ -224,6 +243,26 @@ pub fn working_copy_arguments(
                 .parse()
                 .map_err(|_| refused(value, "invalid merge peg"))?;
             result.push(literal_url(url, Some(revision))?);
+        } else if *verb == "merge" {
+            if index != 1 {
+                return Err(refused(
+                    value,
+                    "merge requires one working-copy destination",
+                ));
+            }
+            if *value != "." {
+                let path = std::path::Path::new(value);
+                let relative = if path.is_absolute() {
+                    path.strip_prefix(root)
+                        .map_err(|_| refused(value, "merge destination escapes root"))?
+                } else {
+                    path
+                };
+                if !relative.as_os_str().is_empty() {
+                    validate_relative_path(local_destination(relative)?)?;
+                }
+            }
+            result.push((*value).into());
         } else if reqwest::Url::parse(value).is_ok() {
             result.push(literal_url(value, None)?);
         } else if *value == "." {

@@ -582,15 +582,7 @@ fn assert_fixture_owned(path: &Path) {
 }
 
 fn branch_svn_url(repo_root: &str, svn_branch: &str) -> String {
-    if svn_branch.is_empty() {
-        repo_root.to_string()
-    } else {
-        format!(
-            "{}/{}",
-            repo_root.trim_end_matches('/'),
-            svn_branch.trim_start_matches('/')
-        )
-    }
+    reposync_core::svn::operand::configured_branch_url(repo_root, svn_branch).unwrap()
 }
 
 fn copy_export_tree(source: &Path, dest: &Path) {
@@ -14521,4 +14513,137 @@ async fn rs113_engine_unsupported_component_preserves_svn_and_applied_checkpoint
         .cat("ordinary.txt", before)
         .await
         .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs113_engine_encoded_branch_does_not_drop_changes_or_select_decoy() {
+    let pair =
+        QualifiedPair::new_with_svn_branch("rs113-encoded-branch", "branches/a%40b 雪#?").await;
+    let root = SvnClient::new(&pair.svn_repo_root, "", "");
+    root.create_branch(
+        "a@b 雪#?",
+        "branches/a%40b 雪#?",
+        "branches",
+        svn_youngest(&pair.svn_repo_root),
+    )
+    .await
+    .unwrap();
+    let decoy_url = branch_svn_url(&pair.svn_repo_root, "branches/a@b 雪#?");
+    let decoy_wc = pair.tmp.path().join("decoy");
+    SvnClient::new(&decoy_url, "", "")
+        .checkout_head(&decoy_wc)
+        .await
+        .unwrap();
+    let decoy_rev = svn_commit_file(
+        &decoy_wc,
+        "origin.txt",
+        "decoy must remain unchanged\n",
+        "different decoy history",
+    );
+    let inbound = svn_commit_file(
+        &pair.wc,
+        "origin.txt",
+        "literal branch inbound\n",
+        "intended literal branch history",
+    );
+    let stats = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((stats.svn_to_git_count, stats.git_to_svn_count), (1, 0));
+    assert_eq!(
+        std::fs::read_to_string(pair.bridge.join("origin.txt")).unwrap(),
+        "literal branch inbound\n"
+    );
+    let sha = get_head_sha(&pair.bridge);
+    let mapped: i64 = pair.engine.db().conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND svn_rev=?2 AND git_sha=?3 AND status='applied'",rusqlite::params![&pair.repo_id,inbound,&sha],|r|r.get(0)).unwrap();
+    assert_eq!(mapped, 1);
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        (inbound, sha)
+    );
+    git_cli(&pair.developer, &["pull", "--ff-only"]);
+    let outgoing = pair.developer_commit(
+        "outbound.txt",
+        "only intended target\n",
+        "outbound literal target",
+    );
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let newest = svn_youngest(&pair.svn_repo_root);
+    let intended = SvnClient::new(&pair.svn_url, "", "");
+    let decoy = SvnClient::new(&decoy_url, "", "");
+    assert_eq!(
+        intended.cat("outbound.txt", newest).await.unwrap(),
+        "only intended target\n"
+    );
+    assert_eq!(
+        decoy.cat("origin.txt", newest).await.unwrap(),
+        "decoy must remain unchanged\n"
+    );
+    assert!(decoy.cat("outbound.txt", newest).await.is_err());
+    assert_eq!(decoy.last_changed_revision().await.unwrap(), decoy_rev);
+    assert_eq!(
+        pair.engine
+            .db()
+            .get_repo_watermark(&pair.repo_id)
+            .unwrap()
+            .1,
+        outgoing
+    );
+    let repeat = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(svn_youngest(&pair.svn_repo_root), newest);
+    let held_sha = pair.developer_commit(
+        "held.txt",
+        "reconcile exact target\n",
+        "lost reply on literal branch",
+    );
+    git_cli(&pair.developer, &["push", "origin", "HEAD:main"]);
+    let before_hold = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", &pair.repo_id);
+    let held = pair.engine.run_sync_cycle().await;
+    drop(fault);
+    assert!(
+        matches!(held, Err(SyncError::SvnCommitHeld { .. })),
+        "{held:?}"
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        before_hold
+    );
+    let after_effect = svn_youngest(&pair.svn_repo_root);
+    assert_eq!(after_effect, newest + 1);
+    let repo = pair
+        .engine
+        .db()
+        .get_repository(&pair.repo_id)
+        .unwrap()
+        .unwrap();
+    let reconciled =
+        reposync_core::auto_reconcile::reconcile_held_external_writes_with_resolved_credentials(
+            pair.engine.db(),
+            &repo,
+            Some(&pair.bridge),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.attempts.len(), 1);
+    assert!(reconciled.attempts[0].finalized, "{reconciled:?}");
+    assert_eq!(
+        pair.engine
+            .db()
+            .get_repo_watermark(&pair.repo_id)
+            .unwrap()
+            .1,
+        held_sha
+    );
+    assert_eq!(
+        intended.cat("held.txt", after_effect).await.unwrap(),
+        "reconcile exact target\n"
+    );
+    assert!(decoy.cat("held.txt", after_effect).await.is_err());
+    let repeat = pair.engine.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(svn_youngest(&pair.svn_repo_root), after_effect);
 }
