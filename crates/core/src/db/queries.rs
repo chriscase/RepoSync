@@ -2716,14 +2716,24 @@ impl Database {
             &held_conn,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        super::pair_refresh_operations::require_no_pair_refresh_hold(&conn, None)?;
-        if super::managed_remove::new_work_blocked(&conn, &repo.id)? {
+        Self::insert_repository_tx(&conn, repo)?;
+        conn.commit()?;
+        debug!(id = %repo.id, name = %repo.name, "inserted repository");
+        Ok(())
+    }
+
+    fn insert_repository_tx(
+        conn: &rusqlite::Connection,
+        repo: &models::Repository,
+    ) -> Result<(), DatabaseError> {
+        super::pair_refresh_operations::require_no_pair_refresh_hold(conn, None)?;
+        if super::managed_remove::new_work_blocked(conn, &repo.id)? {
             return Err(DatabaseError::Other(
                 "stale job cannot recreate a removed repository".into(),
             ));
         }
         if let Some(parent_id) = &repo.parent_id {
-            if super::managed_remove::new_work_blocked(&conn, parent_id)? {
+            if super::managed_remove::new_work_blocked(conn, parent_id)? {
                 return Err(DatabaseError::Other(
                     "parent removal blocks a new child registration".into(),
                 ));
@@ -2768,16 +2778,20 @@ impl Database {
         let repo_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
         if repo_count > 1 {
-            crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(&conn)?;
+            crate::db::repo_scope_identity::revoke_legacy_repo_id_kv_reads(conn)?;
         }
-        conn.commit()?;
-        debug!(id = %repo.id, name = %repo.name, "inserted repository");
         Ok(())
     }
 
     /// Get a repository by ID.
     pub fn get_repository(&self, id: &str) -> Result<Option<models::Repository>, DatabaseError> {
-        let conn = self.conn();
+        Self::get_repository_tx(&self.conn(), id)
+    }
+
+    fn get_repository_tx(
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<Option<models::Repository>, DatabaseError> {
         let mut stmt = conn.prepare(
             "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url
              FROM repositories WHERE id = ?1",
@@ -2916,10 +2930,20 @@ impl Database {
     pub fn update_repository(&self, repo: &models::Repository) -> Result<(), DatabaseError> {
         let conn = self.conn();
         let tx = conn.unchecked_transaction()?;
+        Self::update_repository_tx(&tx, repo)?;
+        tx.commit()?;
+        debug!(id = %repo.id, name = %repo.name, "updated repository");
+        Ok(())
+    }
+
+    fn update_repository_tx(
+        tx: &rusqlite::Connection,
+        repo: &models::Repository,
+    ) -> Result<(), DatabaseError> {
         super::pair_refresh_operations::require_no_pair_refresh_registration_mutation(
-            &tx, &repo.id,
+            tx, &repo.id,
         )?;
-        if super::managed_remove::new_work_blocked(&tx, &repo.id)? {
+        if super::managed_remove::new_work_blocked(tx, &repo.id)? {
             return Err(DatabaseError::Other(
                 "repository removal is in progress or completed; refusing to rewrite the registration"
                     .into(),
@@ -2963,8 +2987,6 @@ impl Database {
                 id: repo.id.clone(),
             });
         }
-        tx.commit()?;
-        debug!(id = %repo.id, name = %repo.name, "updated repository");
         Ok(())
     }
 
@@ -3384,6 +3406,487 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+// #115: request receipts belong to the same SQLite transaction as their effects.
+// They are not execution permits and never contain credential plaintext.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositorySaveKind {
+    Create,
+    Configuration,
+    Credentials,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositorySaveReceipt {
+    pub version: u8,
+    pub request_id: String,
+    pub kind: RepositorySaveKind,
+    pub repo_id: String,
+    pub configuration_updated_at: String,
+    pub credential_fields: Vec<String>,
+    pub propagated_repositories: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositorySaveRecord {
+    actor: String,
+    receipt: RepositorySaveReceipt,
+    scope_uuid: String,
+    payload_mac: String,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum RepositorySaveError {
+    #[error("invalid save request identity")]
+    InvalidRequest,
+    #[error("save request conflicts with a previous request or changed registration; no write was replayed")]
+    Conflict,
+    #[error("repository or save request not found")]
+    NotFound,
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+}
+
+const REPOSITORY_SAVE_KEY: &str = "repository-save:v1:mac-key";
+const REPOSITORY_SAVE_PREFIX: &str = "repository-save:v1:request:";
+
+fn repository_save_key(actor: &str, request_id: &str) -> Result<String, RepositorySaveError> {
+    use sha2::{Digest, Sha256};
+    if actor.is_empty()
+        || uuid::Uuid::parse_str(request_id)
+            .ok()
+            .is_none_or(|id| id.to_string() != request_id)
+    {
+        return Err(RepositorySaveError::InvalidRequest);
+    }
+    let encoded = serde_json::to_vec(&(actor, request_id))
+        .map_err(|e| DatabaseError::Other(e.to_string()))?;
+    Ok(format!(
+        "{REPOSITORY_SAVE_PREFIX}{}",
+        hex::encode(Sha256::digest(encoded))
+    ))
+}
+
+fn repository_save_record(
+    tx: &rusqlite::Connection,
+    actor: &str,
+    request_id: &str,
+) -> Result<Option<RepositorySaveRecord>, RepositorySaveError> {
+    let key = repository_save_key(actor, request_id)?;
+    let raw: Option<String> = tx
+        .query_row("SELECT value FROM kv_state WHERE key=?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(DatabaseError::from)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let record: RepositorySaveRecord = serde_json::from_str(&raw)
+        .map_err(|_| DatabaseError::Other("invalid repository save receipt".into()))?;
+    if record.actor != actor
+        || record.receipt.version != 1
+        || record.receipt.request_id != request_id
+        || hex::decode(&record.payload_mac)
+            .ok()
+            .is_none_or(|mac| mac.len() != 32)
+    {
+        return Err(DatabaseError::Other("invalid repository save receipt".into()).into());
+    }
+    let key: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [REPOSITORY_SAVE_KEY],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(DatabaseError::from)?;
+    if key
+        .as_ref()
+        .and_then(|v| hex::decode(v).ok())
+        .is_none_or(|v| v.len() != 32)
+    {
+        return Err(DatabaseError::Other(
+            "repository save key is missing or invalid; receipts were preserved".into(),
+        )
+        .into());
+    }
+    let scope: Option<String> = tx
+        .query_row(
+            "SELECT scope_uuid FROM repositories WHERE id=?1",
+            [&record.receipt.repo_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(DatabaseError::from)?;
+    if scope.as_deref() != Some(&record.scope_uuid) {
+        return Err(RepositorySaveError::Conflict);
+    }
+    Ok(Some(record))
+}
+
+fn repository_save_mac_key(tx: &rusqlite::Connection) -> Result<[u8; 32], DatabaseError> {
+    use rand::RngCore;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT value FROM kv_state WHERE key=?1",
+            [REPOSITORY_SAVE_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        return hex::decode(existing)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| DatabaseError::Other("invalid repository save key".into()));
+    }
+    let receipts: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM kv_state WHERE key LIKE 'repository-save:v1:request:%')",
+        [],
+        |r| r.get(0),
+    )?;
+    if receipts {
+        return Err(DatabaseError::Other(
+            "repository save key is missing; receipts were preserved".into(),
+        ));
+    }
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut key)
+        .map_err(|e| DatabaseError::Other(format!("save key generation failed: {e}")))?;
+    // Dedicated internal receipt key. Do not read/rotate the existing encryption key.
+    tx.execute(
+        "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+        params![
+            REPOSITORY_SAVE_KEY,
+            hex::encode(key),
+            Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(key)
+}
+
+fn repository_payload_mac(
+    key: &[u8],
+    actor: &str,
+    request_id: &str,
+    kind: RepositorySaveKind,
+    repo_id: Option<&str>,
+    payload: &[u8],
+) -> Result<hmac::Hmac<sha2::Sha256>, DatabaseError> {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key)
+        .map_err(|_| DatabaseError::Other("invalid save MAC key".into()))?;
+    mac.update(b"reposync/repository-save/payload/v1\0");
+    let context = serde_json::to_vec(&(actor, request_id, kind, repo_id))
+        .map_err(|e| DatabaseError::Other(e.to_string()))?;
+    mac.update(&(context.len() as u64).to_be_bytes());
+    mac.update(&context);
+    mac.update(payload);
+    Ok(mac)
+}
+
+impl Database {
+    fn repository_save_once<F>(
+        &self,
+        actor: &str,
+        request_id: &str,
+        kind: RepositorySaveKind,
+        repo_id: Option<&str>,
+        payload: &[u8],
+        effect: F,
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<RepositorySaveReceipt, RepositorySaveError>,
+    {
+        use hmac::Mac;
+        let storage_key = repository_save_key(actor, request_id)?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(DatabaseError::from)?;
+        let prior = repository_save_record(&tx, actor, request_id)?;
+        let key = repository_save_mac_key(&tx)?;
+        let mac = repository_payload_mac(&key, actor, request_id, kind, repo_id, payload)?;
+        if let Some(prior) = prior {
+            if prior.receipt.kind != kind || repo_id.is_some_and(|id| id != prior.receipt.repo_id) {
+                return Err(RepositorySaveError::Conflict);
+            }
+            let expected =
+                hex::decode(&prior.payload_mac).map_err(|_| RepositorySaveError::Conflict)?;
+            mac.verify_slice(&expected)
+                .map_err(|_| RepositorySaveError::Conflict)?;
+            // Known commit, not another write. Later settings/credentials stay untouched.
+            tx.commit().map_err(DatabaseError::from)?;
+            return Ok(prior.receipt);
+        }
+        let payload_mac = hex::encode(mac.finalize().into_bytes());
+        let receipt = effect(&tx)?;
+        let scope_uuid: String = tx
+            .query_row(
+                "SELECT scope_uuid FROM repositories WHERE id=?1",
+                [&receipt.repo_id],
+                |r| r.get(0),
+            )
+            .map_err(DatabaseError::from)?;
+        let record = RepositorySaveRecord {
+            actor: actor.into(),
+            receipt: receipt.clone(),
+            scope_uuid,
+            payload_mac,
+        };
+        let value =
+            serde_json::to_string(&record).map_err(|e| DatabaseError::Other(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3)",
+            params![storage_key, value, Utc::now().to_rfc3339()],
+        )
+        .map_err(DatabaseError::from)?;
+        tx.commit().map_err(DatabaseError::from)?;
+        Ok(receipt)
+    }
+
+    /// Read-only historical confirmation before optional mutation preflights. No key,
+    /// registration or receipt is created, and matching never replays a prior effect.
+    pub fn verified_repository_save_receipt(
+        &self,
+        actor: &str,
+        request_id: &str,
+        kind: RepositorySaveKind,
+        repo_id: Option<&str>,
+        payload: &[u8],
+    ) -> Result<Option<RepositorySaveReceipt>, RepositorySaveError> {
+        use hmac::Mac;
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(DatabaseError::from)?;
+        let Some(record) = repository_save_record(&tx, actor, request_id)? else {
+            return Ok(None);
+        };
+        if record.receipt.kind != kind || repo_id.is_some_and(|id| id != record.receipt.repo_id) {
+            return Err(RepositorySaveError::Conflict);
+        }
+        // An existing receipt makes a missing key an error; the helper cannot rotate it.
+        let key = repository_save_mac_key(&tx)?;
+        let mac = repository_payload_mac(&key, actor, request_id, kind, repo_id, payload)?;
+        mac.verify_slice(
+            &hex::decode(&record.payload_mac).map_err(|_| RepositorySaveError::Conflict)?,
+        )
+        .map_err(|_| RepositorySaveError::Conflict)?;
+        tx.commit().map_err(DatabaseError::from)?;
+        Ok(Some(record.receipt))
+    }
+
+    pub fn repository_save_receipt(
+        &self,
+        actor: &str,
+        request_id: &str,
+    ) -> Result<Option<RepositorySaveReceipt>, RepositorySaveError> {
+        Ok(repository_save_record(&self.conn(), actor, request_id)?.map(|r| r.receipt))
+    }
+
+    pub fn create_repository_once(
+        &self,
+        repo: &models::Repository,
+        actor: &str,
+        request_id: &str,
+        payload: &[u8],
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        self.repository_save_once(
+            actor,
+            request_id,
+            RepositorySaveKind::Create,
+            None,
+            payload,
+            |tx| {
+                Self::insert_repository_tx(tx, repo)?;
+                Ok(RepositorySaveReceipt {
+                    version: 1,
+                    request_id: request_id.into(),
+                    kind: RepositorySaveKind::Create,
+                    repo_id: repo.id.clone(),
+                    configuration_updated_at: repo.updated_at.clone(),
+                    credential_fields: vec![],
+                    propagated_repositories: 0,
+                })
+            },
+        )
+    }
+
+    pub fn update_repository_once(
+        &self,
+        repo: &models::Repository,
+        actor: &str,
+        request_id: &str,
+        expected_updated_at: Option<&str>,
+        payload: &[u8],
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        self.repository_save_once(
+            actor,
+            request_id,
+            RepositorySaveKind::Configuration,
+            Some(&repo.id),
+            payload,
+            |tx| {
+                let current =
+                    Self::get_repository_tx(tx, &repo.id)?.ok_or(RepositorySaveError::NotFound)?;
+                if expected_updated_at.is_some_and(|expected| expected != current.updated_at) {
+                    return Err(RepositorySaveError::Conflict);
+                }
+                let mut updated = repo.clone();
+                // A settings save never restores a stale runtime snapshot over a live cursor.
+                updated.created_by = current.created_by;
+                updated.created_at = current.created_at;
+                updated.parent_id = current.parent_id;
+                updated.last_svn_rev = current.last_svn_rev;
+                updated.last_git_sha = current.last_git_sha;
+                updated.last_sync_at = current.last_sync_at;
+                updated.sync_status = current.sync_status;
+                updated.total_syncs = current.total_syncs;
+                updated.total_errors = current.total_errors;
+                updated.consecutive_errors = current.consecutive_errors;
+                updated.teams_webhook_url = current.teams_webhook_url;
+                Self::update_repository_tx(tx, &updated)?;
+                Ok(RepositorySaveReceipt {
+                    version: 1,
+                    request_id: request_id.into(),
+                    kind: RepositorySaveKind::Configuration,
+                    repo_id: repo.id.clone(),
+                    configuration_updated_at: updated.updated_at,
+                    credential_fields: vec![],
+                    propagated_repositories: 0,
+                })
+            },
+        )
+    }
+
+    /// Preserve the existing explicit-empty revocation and nonempty descendant propagation
+    /// policy, but commit both credential fields and every descendant write atomically.
+    fn save_repository_credentials_tx(
+        tx: &rusqlite::Connection,
+        repo_id: &str,
+        password: Option<&str>,
+        token: Option<&str>,
+        expected_updated_at: Option<&str>,
+    ) -> Result<(Vec<String>, usize, String), RepositorySaveError> {
+        let updated_at: String = tx
+            .query_row(
+                "SELECT updated_at FROM repositories WHERE id=?1",
+                [repo_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(DatabaseError::from)?
+            .ok_or(RepositorySaveError::NotFound)?;
+        if expected_updated_at.is_some_and(|expected| expected != updated_at) {
+            return Err(RepositorySaveError::Conflict);
+        }
+        let mut descendants = vec![];
+        let mut pending =
+            if password.is_some_and(|v| !v.is_empty()) || token.is_some_and(|v| !v.is_empty()) {
+                vec![repo_id.to_owned()]
+            } else {
+                vec![]
+            };
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                return Err(DatabaseError::Other("credential lineage is cyclic".into()).into());
+            }
+            let mut stmt = tx
+                .prepare("SELECT id FROM repositories WHERE parent_id=?1 ORDER BY id")
+                .map_err(DatabaseError::from)?;
+            for child in stmt
+                .query_map([id], |r| r.get::<_, String>(0))
+                .map_err(DatabaseError::from)?
+            {
+                let child = child.map_err(DatabaseError::from)?;
+                pending.push(child.clone());
+                descendants.push(child);
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut fields = vec![];
+        let mut propagated = std::collections::HashSet::new();
+        for (field, prefix, value) in [
+            ("svn_password", "secret_svn_password", password),
+            ("git_token", "secret_git_token", token),
+        ] {
+            if let Some(value) = value {
+                fields.push(field.into());
+                let targets = std::iter::once(repo_id).chain(
+                    descendants
+                        .iter()
+                        .filter(|_| !value.is_empty())
+                        .map(String::as_str),
+                );
+                for target in targets {
+                    tx.execute("INSERT INTO kv_state(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![format!("{prefix}_{target}"),value,now]).map_err(DatabaseError::from)?;
+                    if target != repo_id {
+                        propagated.insert(target.to_owned());
+                    }
+                }
+            }
+        }
+        Ok((fields, propagated.len(), updated_at))
+    }
+
+    pub fn save_repository_credentials(
+        &self,
+        repo_id: &str,
+        password: Option<&str>,
+        token: Option<&str>,
+        actor: &str,
+        request_id: Option<&str>,
+        expected_updated_at: Option<&str>,
+    ) -> Result<RepositorySaveReceipt, RepositorySaveError> {
+        if request_id.is_some() && password.is_none() && token.is_none() {
+            return Err(RepositorySaveError::InvalidRequest);
+        }
+        let effect = |tx: &rusqlite::Connection| {
+            let (fields, propagated, updated_at) = Self::save_repository_credentials_tx(
+                tx,
+                repo_id,
+                password,
+                token,
+                expected_updated_at,
+            )?;
+            Ok(RepositorySaveReceipt {
+                version: 1,
+                request_id: request_id.unwrap_or("").into(),
+                kind: RepositorySaveKind::Credentials,
+                repo_id: repo_id.into(),
+                configuration_updated_at: updated_at,
+                credential_fields: fields,
+                propagated_repositories: propagated,
+            })
+        };
+        if let Some(request_id) = request_id {
+            // The request MAC covers credential bytes, but neither plaintext nor an
+            // offline-guessable unkeyed credential digest is stored in a receipt.
+            let payload = serde_json::to_vec(&(password, token, expected_updated_at))
+                .map_err(|e| DatabaseError::Other(e.to_string()))?;
+            self.repository_save_once(
+                actor,
+                request_id,
+                RepositorySaveKind::Credentials,
+                Some(repo_id),
+                &payload,
+                effect,
+            )
+        } else {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(DatabaseError::from)?;
+            let receipt = effect(&tx)?;
+            tx.commit().map_err(DatabaseError::from)?;
+            Ok(receipt)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4481,5 +4984,294 @@ mod tests {
             .list_audit_log_by_action("errors_acknowledged", 100)
             .unwrap()
             .is_empty());
+    }
+    fn save_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    #[test]
+    fn rs115_create_lost_response_reuses_id_and_never_recreates_or_overwrites() {
+        let db = setup_db();
+        let repo = create_test_repo(&db, "seed", "Seed");
+        let mut desired = repo.clone();
+        desired.id = "repo-first".into();
+        desired.name = "First".into();
+        let request = save_id();
+        let first = db
+            .create_repository_once(&desired, "actor-a", &request, b"same-public-create")
+            .unwrap();
+        desired.id = "repo-retry-unused".into();
+        let replay = db
+            .create_repository_once(&desired, "actor-a", &request, b"same-public-create")
+            .unwrap();
+        assert_eq!(first.repo_id, replay.repo_id);
+        assert!(db.get_repository("repo-retry-unused").unwrap().is_none());
+        assert!(db
+            .create_repository_once(&desired, "actor-a", &request, b"changed-public-create")
+            .is_err());
+        let mut newer = db.get_repository(&first.repo_id).unwrap().unwrap();
+        newer.name = "Later administrator edit".into();
+        db.update_repository(&newer).unwrap();
+        db.create_repository_once(&desired, "actor-a", &request, b"same-public-create")
+            .unwrap();
+        assert_eq!(
+            db.get_repository(&first.repo_id).unwrap().unwrap().name,
+            "Later administrator edit"
+        );
+        assert!(db
+            .repository_save_receipt("actor-b", &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.list_repositories().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rs115_configuration_receipt_and_stale_version_preserve_live_cursors() {
+        let db = setup_db();
+        let original = create_test_repo(&db, "a", "A");
+        let mut desired = original.clone();
+        desired.name = "Edited".into();
+        desired.updated_at = "2026-11-03T12:00:00Z".into();
+        db.conn().execute("UPDATE repositories SET last_svn_rev=105,last_git_sha='live',total_syncs=8,total_errors=9 WHERE id='a'",[]).unwrap();
+        let request = save_id();
+        let receipt = db
+            .update_repository_once(
+                &desired,
+                "admin",
+                &request,
+                Some(&original.updated_at),
+                b"edit-a",
+            )
+            .unwrap();
+        let actual = db.get_repository("a").unwrap().unwrap();
+        assert_eq!(actual.name, "Edited");
+        assert_eq!(actual.last_svn_rev, 105);
+        assert_eq!(actual.last_git_sha, "live");
+        assert_eq!(actual.total_syncs, 8);
+        assert_eq!(actual.total_errors, 9);
+        assert!(db
+            .update_repository_once(
+                &desired,
+                "admin",
+                &save_id(),
+                Some(&original.updated_at),
+                b"stale"
+            )
+            .is_err());
+        assert_eq!(
+            db.verified_repository_save_receipt(
+                "admin",
+                &request,
+                RepositorySaveKind::Configuration,
+                Some("a"),
+                b"edit-a"
+            )
+            .unwrap()
+            .unwrap()
+            .configuration_updated_at,
+            receipt.configuration_updated_at
+        );
+        assert!(db
+            .verified_repository_save_receipt(
+                "admin",
+                &request,
+                RepositorySaveKind::Configuration,
+                Some("a"),
+                b"different"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn rs115_credential_batch_failure_rolls_back_both_fields_and_every_descendant() {
+        let db = setup_db();
+        create_test_repo(&db, "parent", "Parent");
+        let mut child = create_test_repo(&db, "child", "Child");
+        child.parent_id = Some("parent".into());
+        db.update_repository(&child).unwrap();
+        db.set_state("secret_svn_password_parent", "old-svn")
+            .unwrap();
+        db.set_state("secret_git_token_parent", "old-git").unwrap();
+        db.set_state("secret_svn_password_child", "child-svn")
+            .unwrap();
+        db.set_state("secret_git_token_child", "child-git").unwrap();
+        db.set_state("encryption_key", "unchanged-existing-key")
+            .unwrap();
+        db.conn().execute_batch("CREATE TRIGGER reject_child_git BEFORE INSERT ON kv_state WHEN NEW.key='secret_git_token_child' BEGIN SELECT RAISE(ABORT,'injected credential write failure'); END;").unwrap();
+        let request = save_id();
+        assert!(db
+            .save_repository_credentials(
+                "parent",
+                Some("new-svn"),
+                Some("new-git"),
+                "admin",
+                Some(&request),
+                None
+            )
+            .is_err());
+        for (key, value) in [
+            ("secret_svn_password_parent", "old-svn"),
+            ("secret_git_token_parent", "old-git"),
+            ("secret_svn_password_child", "child-svn"),
+            ("secret_git_token_child", "child-git"),
+        ] {
+            assert_eq!(db.get_state(key).unwrap().as_deref(), Some(value));
+        }
+        assert!(db
+            .repository_save_receipt("admin", &request)
+            .unwrap()
+            .is_none());
+        assert!(db.get_state(REPOSITORY_SAVE_KEY).unwrap().is_none());
+        assert_eq!(
+            db.get_state("encryption_key").unwrap().as_deref(),
+            Some("unchanged-existing-key")
+        );
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_child_git")
+            .unwrap();
+        let receipt = db
+            .save_repository_credentials(
+                "parent",
+                Some("new-svn"),
+                Some("new-git"),
+                "admin",
+                Some(&request),
+                None,
+            )
+            .unwrap();
+        assert_eq!(receipt.propagated_repositories, 1);
+        assert_eq!(
+            db.get_state("secret_svn_password_child")
+                .unwrap()
+                .as_deref(),
+            Some("new-svn")
+        );
+        assert_eq!(
+            db.get_state("secret_git_token_parent").unwrap().as_deref(),
+            Some("new-git")
+        );
+    }
+
+    #[test]
+    fn rs115_credential_replay_cannot_overwrite_a_newer_save_or_change_payload() {
+        let db = setup_db();
+        create_test_repo(&db, "a", "A");
+        create_test_repo(&db, "b", "B");
+        let request = save_id();
+        db.save_repository_credentials(
+            "a",
+            Some("synthetic-secret-old"),
+            None,
+            "admin",
+            Some(&request),
+            None,
+        )
+        .unwrap();
+        db.save_repository_credentials(
+            "a",
+            Some("synthetic-secret-new"),
+            None,
+            "admin",
+            Some(&save_id()),
+            None,
+        )
+        .unwrap();
+        db.save_repository_credentials(
+            "a",
+            Some("synthetic-secret-old"),
+            None,
+            "admin",
+            Some(&request),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_state("secret_svn_password_a").unwrap().as_deref(),
+            Some("synthetic-secret-new")
+        );
+        assert!(db
+            .save_repository_credentials(
+                "a",
+                Some("different"),
+                None,
+                "admin",
+                Some(&request),
+                None
+            )
+            .is_err());
+        assert!(db
+            .save_repository_credentials(
+                "b",
+                Some("synthetic-secret-old"),
+                None,
+                "admin",
+                Some(&request),
+                None
+            )
+            .is_err());
+        assert!(db.get_state("secret_svn_password_b").unwrap().is_none());
+        let key = repository_save_key("admin", &request).unwrap();
+        let stored = db.get_state(&key).unwrap().unwrap();
+        assert!(!stored.contains("synthetic-secret-old"));
+        let exposed = serde_json::to_string(
+            &db.repository_save_receipt("admin", &request)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!exposed.contains("secret-old"));
+        assert!(!exposed.contains("payload_mac"));
+    }
+
+    #[test]
+    fn rs115_revocation_and_absence_keep_existing_credential_semantics() {
+        let db = setup_db();
+        create_test_repo(&db, "a", "A");
+        let mut child = create_test_repo(&db, "c", "C");
+        child.parent_id = Some("a".into());
+        db.update_repository(&child).unwrap();
+        db.set_state("secret_svn_password_a", "parent").unwrap();
+        db.set_state("secret_git_token_a", "keep-token").unwrap();
+        db.set_state("secret_svn_password_c", "child").unwrap();
+        db.save_repository_credentials("a", Some(""), None, "admin", Some(&save_id()), None)
+            .unwrap();
+        assert_eq!(
+            db.get_state("secret_svn_password_a").unwrap().as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            db.get_state("secret_svn_password_c").unwrap().as_deref(),
+            Some("child")
+        );
+        assert_eq!(
+            db.get_state("secret_git_token_a").unwrap().as_deref(),
+            Some("keep-token")
+        );
+    }
+
+    #[test]
+    fn rs115_receipt_scope_and_key_loss_refuse_without_recreation_or_rotation() {
+        let db = setup_db();
+        let repo = create_test_repo(&db, "a", "A");
+        let request = save_id();
+        db.update_repository_once(&repo, "admin", &request, None, b"original")
+            .unwrap();
+        let storage = repository_save_key("admin", &request).unwrap();
+        let original = db.get_state(&storage).unwrap().unwrap();
+        db.conn()
+            .execute(
+                "UPDATE repositories SET scope_uuid=?1 WHERE id='a'",
+                [uuid::Uuid::new_v4().to_string()],
+            )
+            .unwrap();
+        assert!(db.repository_save_receipt("admin", &request).is_err());
+        assert_eq!(db.get_state(&storage).unwrap().unwrap(), original);
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [REPOSITORY_SAVE_KEY])
+            .unwrap();
+        assert!(db
+            .create_repository_once(&repo, "admin", &save_id(), b"cannot-rotate")
+            .is_err());
+        assert!(db.get_state(REPOSITORY_SAVE_KEY).unwrap().is_none());
     }
 }

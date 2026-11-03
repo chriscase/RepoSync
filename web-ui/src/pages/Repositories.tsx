@@ -1,5 +1,8 @@
-import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useRepositorySave } from '../useRepositorySave';
+import { samePublicConfiguration, retainUnsavedCredentials, sameImportPreferences, canContinueWithPreferences, repositoryEditorKey, publicConfiguration } from '../repositorySave';
+import RepositorySaveNotice from '../components/RepositorySaveNotice';
+import { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { api, type Repository, type SyncStatus } from '../api';
 import {
@@ -110,6 +113,11 @@ const defaultForm: AddRepoForm = {
 };
 
 export default function Repositories() {
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',session:localStorage.getItem('session_token')});
+  return <RepositoriesEditor key={key} />;
+}
+
+function RepositoriesEditor() {
   const navigate = useNavigate();
   const location = useLocation();
   const removalNotice = readBranchPairRemovalNotice(location.state) ?? readPersistedBranchPairRemovalNotice();
@@ -126,6 +134,23 @@ export default function Repositories() {
   const [gitTestResult, setGitTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [svnTesting, setSvnTesting] = useState(false);
   const [gitTesting, setGitTesting] = useState(false);
+  const saveFlow=useRepositorySave(undefined,showAddModal);
+  const [saveMessage,setSaveMessage]=useState<string | null>(null);
+  const [saveError,setSaveError]=useState<string | null>(null);
+  const currentForm=useRef(form);currentForm.current=form;
+  const dialogVersion=useRef(0);
+  useEffect(()=>{
+    if(showAddModal && saveFlow.initial) {
+      const previous=saveFlow.initial;
+      setForm({...defaultForm,...(previous.draftConfiguration ?? previous.configuration),svn_password:'',git_token:'',
+        initial_import_mode:((previous.draftPreferences ?? previous.preferences)?.importMode ?? DEFAULT_REPO_IMPORT_MODE) as RepoImportMode,
+        initial_svn_revision:(previous.draftPreferences ?? previous.preferences)?.svnRevision ?? 'HEAD'});
+    }
+  },[showAddModal,saveFlow.initial]);
+  useEffect(()=>{
+    if(saveFlow.attempt?.repoId) void queryClient.invalidateQueries({queryKey:['repos']});
+  },[saveFlow.attempt?.repoId,queryClient]);
+
 
   const { data: repos, isLoading, isError, error } = useQuery({
     queryKey: ['repos'],
@@ -159,42 +184,52 @@ export default function Repositories() {
 
   const statusMap = statusQueries.data ?? new Map<string, SyncStatus>();
 
-  const createMutation = useMutation({
-    mutationFn: async (data: AddRepoForm) => {
-      const { svn_password, git_token, initial_import_mode, initial_svn_revision, ...repoData } =
-        data;
-      void initial_import_mode;
-      void initial_svn_revision;
-      const created = await api.createRepo(repoData);
-      // Save credentials for the newly created repo
-      if (svn_password || git_token) {
-        const credData: { svn_password?: string; git_token?: string } = {};
-        if (svn_password) credData.svn_password = svn_password;
-        if (git_token) credData.git_token = git_token;
-        await api.saveRepoCredentials(created.id, credData);
-      }
-      return created;
-    },
-    onSuccess: (created) => {
-      queryClient.invalidateQueries({ queryKey: ['repos'] });
-      setShowAddModal(false);
-      const prefs = {
-        importMode: form.initial_import_mode,
-        svnRevision: form.initial_svn_revision,
-      };
-      setForm({ ...defaultForm });
-      setSvnTestResult(null);
-      setGitTestResult(null);
-      navigate(`/repos/${created.id}`, { state: { importPrefs: prefs } });
-    },
-  });
-
   function setField<K extends keyof AddRepoForm>(key: K, value: AddRepoForm[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    const next={...currentForm.current,[key]:value};currentForm.current=next;setForm(next);
+    saveFlow.rememberDraft(next,{importMode:next.initial_import_mode,svnRevision:next.initial_svn_revision});
   }
-
-  function handleCreate() {
-    createMutation.mutate(form);
+  async function loadCurrentSettingsForReview() {
+    const generation=dialogVersion.current;
+    try {
+      const current=await saveFlow.loadCurrentForReview();
+      if(!saveFlow.viewActive() || generation!==dialogVersion.current)return;
+      setForm(previous=>({...previous,...publicConfiguration(current),svn_password:'',git_token:''}));setSaveError(null);setSaveMessage('Review these current settings on the existing ID. Required credentials were cleared.');
+    } catch(cause) {if(saveFlow.viewActive() && generation===dialogVersion.current)setSaveError(cause instanceof Error ? cause.message : 'Current settings could not be read.');}
+  }
+  function useReviewedSettings() {
+    const live=currentForm.current;
+    try {saveFlow.useReviewedSettings(live,{svn_password:live.svn_password || undefined,git_token:live.git_token || undefined},{importMode:live.initial_import_mode,svnRevision:live.initial_svn_revision});setSaveError(null);setSaveMessage('New save prepared on the existing repository; earlier outcomes are retained.');}
+    catch(cause) {setSaveError(cause instanceof Error ? cause.message : 'Reviewed recovery could not be prepared.');}
+  }
+  function openAdd() {dialogVersion.current++;setSaveMessage(null);setSaveError(null);setShowAddModal(true);}
+  function closeAdd() {
+    saveFlow.rememberDraft(currentForm.current,{importMode:currentForm.current.initial_import_mode,svnRevision:currentForm.current.initial_svn_revision});dialogVersion.current++;setShowAddModal(false);
+    setForm({...defaultForm});setSaveError(null);setSaveMessage(null);
+  }
+  async function handleCreate() {
+    const generation=dialogVersion.current;
+    const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
+    try {
+      if(canContinueWithPreferences(saveFlow.attempt,submitted,{svn_password:submitted.svn_password,git_token:submitted.git_token})) {
+        const previous=saveFlow.attempt;saveFlow.finish(previous.configRequestId);setShowAddModal(false);setForm({...defaultForm});
+        navigate(`/repos/${previous.repoId}`,{state:{importPrefs:{importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision}}});return;
+      }
+      const result=await saveFlow.save(submitted,{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},undefined,
+        {importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision});
+      if(!result.viewActive || dialogVersion.current!==generation)return;
+      void queryClient.invalidateQueries({queryKey:['repos']});
+      const live=currentForm.current;
+      const same= samePublicConfiguration(live,result.configuration)
+        && (live.svn_password || '')===(result.credentials.svn_password || '')
+        && (live.git_token || '')===(result.credentials.git_token || '')
+        && sameImportPreferences({importMode:live.initial_import_mode,svnRevision:live.initial_svn_revision},result.preferences);
+      if(!same) {setForm(previous=>({...previous,...retainUnsavedCredentials(previous,result.credentials)}));setSaveMessage('The earlier save completed on the existing ID. Newer entered changes remain unsaved; save again to update that registration.');return;}
+      saveFlow.finish(result.attempt.configRequestId);
+      setShowAddModal(false);setForm({...defaultForm});setSvnTestResult(null);setGitTestResult(null);
+      navigate(`/repos/${result.attempt.repoId}`,{state:{importPrefs:{importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision}}});
+    } catch(cause) {
+      if(saveFlow.viewActive() && dialogVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; the recovery record was retained.');
+    }
   }
 
   async function handleTestSvn() {
@@ -283,7 +318,7 @@ export default function Repositories() {
         </div>
         {isAdmin && (
           <button
-            onClick={() => setShowAddModal(true)}
+            onClick={openAdd}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
           >
             <Plus className="w-4 h-4" />
@@ -303,7 +338,7 @@ export default function Repositories() {
           </p>
           {isAdmin && (
             <button
-              onClick={() => setShowAddModal(true)}
+              onClick={openAdd}
               className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
             >
               <Plus className="w-4 h-4" />
@@ -409,7 +444,7 @@ export default function Repositories() {
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
               <h2 className="text-lg font-semibold text-gray-100">Add Repository</h2>
               <button
-                onClick={() => { setShowAddModal(false); setForm({ ...defaultForm }); createMutation.reset(); }}
+                onClick={closeAdd}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -417,11 +452,8 @@ export default function Repositories() {
             </div>
 
             <div className="p-6 space-y-6">
-              {createMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
-                  Failed to create repository: {createMutation.error?.message}
-                </div>
-              )}
+              <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />
+              {saveMessage && <p role="status" className="text-yellow-300">{saveMessage}</p>}
 
               {/* Name */}
               <div>
@@ -672,18 +704,18 @@ export default function Repositories() {
             {/* Modal footer */}
             <div className="flex items-center justify-end gap-3 p-6 border-t border-gray-700">
               <button
-                onClick={() => { setShowAddModal(false); setForm({ ...defaultForm }); createMutation.reset(); }}
+                onClick={closeAdd}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
               >
                 Cancel
               </button>
               <button
                 onClick={handleCreate}
-                disabled={createMutation.isPending || !form.name.trim()}
+                disabled={saveFlow.pending || !form.name.trim()}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <Plus className="w-4 h-4" />
-                {createMutation.isPending ? 'Creating...' : 'Create Repository'}
+                {saveFlow.pending ? 'Saving...' : saveFlow.attempt?.repoId ? 'Resume / Save on Existing ID' : saveFlow.attempt ? 'Resume Same Save Request' : 'Create Repository'}
               </button>
             </div>
           </div>

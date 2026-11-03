@@ -1,7 +1,10 @@
+import { useRepositorySave } from '../useRepositorySave';
+import { samePublicConfiguration, retainUnsavedCredentials, repositoryEditorKey, type PublicConfiguration } from '../repositorySave';
+import RepositorySaveNotice from '../components/RepositorySaveNotice';
 import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
@@ -95,6 +98,12 @@ const selectClass =
   'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 export default function RepoDetail() {
+  const {id}=useParams<{id:string}>();
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',targetId:id,session:localStorage.getItem('session_token')});
+  return <RepositoryDetailEditor key={key} />;
+}
+
+function RepositoryDetailEditor() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -109,7 +118,14 @@ export default function RepoDetail() {
 
   const [syncTriggered, setSyncTriggered] = useState(false);
   const [editing, setEditing] = useState(false);
+  const saveFlow=useRepositorySave(id,editing);
+  const [saveMessage,setSaveMessage]=useState<string | null>(null);
+  const [saveError,setSaveError]=useState<string | null>(null);
+  const editVersion=useRef(0);
+  const restoredSave=useRef<string | null>(null);
+
   const [form, setForm] = useState<EditForm | null>(null);
+  const currentForm=useRef(form);currentForm.current=form;
   const [showDisableConfirm, setShowDisableConfirm] = useState(false);
   const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
   const [removalReceipt, setRemovalReceipt] = useState<ManagedRemovalReceipt | null>(null);
@@ -321,16 +337,6 @@ export default function RepoDetail() {
       queryClient.invalidateQueries({ queryKey: ['repo', id] });
       queryClient.invalidateQueries({ queryKey: ['status', id] });
       setTimeout(() => setSyncTriggered(false), 3000);
-    },
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: (data: Partial<Repository>) => api.updateRepo(id!, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['repo', id] });
-      queryClient.invalidateQueries({ queryKey: ['repos'] });
-      setEditing(false);
-      setForm(null);
     },
   });
 
@@ -558,42 +564,68 @@ export default function RepoDetail() {
   }
   const auditGroups = groupAuditEntries(auditEntries);
 
+  useEffect(()=>{
+    const previous=saveFlow.initial;
+    if(editing && previous && repo && restoredSave.current!==previous.configRequestId) {
+      try {setForm(repoToForm({...repo,...(previous.draftConfiguration ?? previous.configuration)}));restoredSave.current=previous.configRequestId;}
+      catch {setSaveError('The recovery draft could not be read. Keep the existing repository ID and review its settings.');}
+    }
+  },[editing,saveFlow.initial,repo]);
+  useEffect(()=>{
+    if(saveFlow.attempt?.configurationReceipt) {
+      void queryClient.invalidateQueries({queryKey:['repo',id]});
+      void queryClient.invalidateQueries({queryKey:['repos']});
+    }
+  },[saveFlow.attempt?.configurationReceipt,id,queryClient]);
+
+  function editConfiguration(value: EditForm): PublicConfiguration {
+    const {svn_password,git_token,allowed_paths,blocked_patterns,...data}=value;
+    void svn_password;void git_token;
+    return {...data,
+      allowed_paths:allowed_paths.trim() ? JSON.stringify(allowed_paths.split('\n').map(v=>v.trim()).filter(Boolean)) : null,
+      blocked_patterns:blocked_patterns.trim() ? JSON.stringify(blocked_patterns.split('\n').map(v=>v.trim()).filter(Boolean)) : null};
+  }
   function startEdit() {
-    if (!repo) return;
-    setForm(repoToForm(repo));
-    setEditing(true);
+    if(!repo)return;editVersion.current++;restoredSave.current=null;
+    setForm(repoToForm(repo));setEditing(true);setSaveError(null);setSaveMessage(null);
   }
-
+  async function loadCurrentSettingsForReview() {
+    const generation=editVersion.current;
+    try {
+      const current=await saveFlow.loadCurrentForReview();
+      if(!saveFlow.viewActive() || generation!==editVersion.current)return;
+      setForm(repoToForm(current));setSaveError(null);setSaveMessage('Review these current settings. Required credential fields were cleared; choose a new save explicitly.');
+      void queryClient.invalidateQueries({queryKey:['repo',id]});
+    } catch(cause) {if(saveFlow.viewActive() && generation===editVersion.current)setSaveError(cause instanceof Error ? cause.message : 'Current settings could not be read.');}
+  }
+  function useReviewedSettings() {
+    if(!currentForm.current)return;
+    try {saveFlow.useReviewedSettings(editConfiguration(currentForm.current),{svn_password:currentForm.current.svn_password || undefined,git_token:currentForm.current.git_token || undefined});setSaveError(null);setSaveMessage('New attempt prepared on the same repository. Save will submit only the reviewed snapshot.');}
+    catch(cause) {setSaveError(cause instanceof Error ? cause.message : 'Reviewed recovery could not be prepared.');}
+  }
   function cancelEdit() {
-    setEditing(false);
-    setForm(null);
+    if(currentForm.current)saveFlow.rememberDraft(editConfiguration(currentForm.current));
+    editVersion.current++;setEditing(false);setForm(null);setSaveError(null);setSaveMessage(null);
   }
-
   async function handleSave() {
-    if (!form) return;
-    // Save repo config (exclude credential fields, convert path rules to JSON)
-    const { svn_password, git_token, allowed_paths, blocked_patterns, ...repoData } = form;
-    const pathData = {
-      ...repoData,
-      allowed_paths: allowed_paths.trim()
-        ? JSON.stringify(allowed_paths.split('\n').map(s => s.trim()).filter(Boolean))
-        : null,
-      blocked_patterns: blocked_patterns.trim()
-        ? JSON.stringify(blocked_patterns.split('\n').map(s => s.trim()).filter(Boolean))
-        : null,
-    };
-    updateMutation.mutate(pathData);
-    // Save credentials if provided
-    if (svn_password || git_token) {
-      const credData: { svn_password?: string; git_token?: string } = {};
-      if (svn_password) credData.svn_password = svn_password;
-      if (git_token) credData.git_token = git_token;
-      try {
-        await api.saveRepoCredentials(id!, credData);
-        queryClient.invalidateQueries({ queryKey: ['repo-credentials', id] });
-      } catch (e) {
-        // update mutation error will show in UI
+    if(!currentForm.current || !repo)return;
+    const generation=editVersion.current;
+    const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
+    try {
+      const result=await saveFlow.save(editConfiguration(submitted),{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},repo.updated_at);
+      if(!result.viewActive || editVersion.current!==generation)return;
+      void queryClient.invalidateQueries({queryKey:['repo',id]});void queryClient.invalidateQueries({queryKey:['repos']});
+      void queryClient.invalidateQueries({queryKey:['repo-credentials',id]});
+      const live=currentForm.current;
+      if(!live || !samePublicConfiguration(editConfiguration(live),result.configuration)
+        || (live.svn_password || '')!==(result.credentials.svn_password || '')
+        || (live.git_token || '')!==(result.credentials.git_token || '')) {
+        setForm(previous=>previous ? {...previous,...retainUnsavedCredentials(previous,result.credentials)} : previous);
+        setSaveMessage('The earlier save completed. Newer entered changes remain unsaved; save again after reviewing the refreshed settings.');return;
       }
+      saveFlow.finish(result.attempt.configRequestId);setEditing(false);setForm(null);
+    } catch(cause) {
+      if(saveFlow.viewActive() && editVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; recovery data was retained.');
     }
   }
 
@@ -658,7 +690,9 @@ export default function RepoDetail() {
   }
 
   function setField<K extends keyof EditForm>(key: K, value: EditForm[K]) {
-    setForm((prev) => (prev ? { ...prev, [key]: value } : prev));
+    const next=currentForm.current ? {...currentForm.current,[key]:value} : null;
+    currentForm.current=next;setForm(next);
+    if(next)saveFlow.rememberDraft(editConfiguration(next));
   }
 
   useEffect(() => {
@@ -813,11 +847,11 @@ export default function RepoDetail() {
             <>
               <button
                 onClick={handleSave}
-                disabled={updateMutation.isPending}
+                disabled={saveFlow.pending}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <Save className="w-4 h-4" />
-                {updateMutation.isPending ? 'Saving...' : 'Save'}
+                {saveFlow.pending ? 'Saving...' : 'Save'}
               </button>
               <button
                 onClick={cancelEdit}
@@ -856,11 +890,8 @@ export default function RepoDetail() {
           Failed to trigger sync: {syncMutation.error?.message}
         </div>
       )}
-      {updateMutation.isError && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm">
-          Failed to save: {updateMutation.error?.message}
-        </div>
-      )}
+      {editing && <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />}
+      {editing && saveMessage && <p role="status" className="text-yellow-300 mb-3">{saveMessage}</p>}
 
       {/* Config Cards - SVN and Git side by side */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
