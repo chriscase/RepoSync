@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 
+#[path = "status_observation.rs"]
+mod observation;
+
 /// Optional query parameter to scope status to a specific repository.
 #[derive(Deserialize)]
 struct RepoQuery {
@@ -35,6 +38,7 @@ struct HealthResponse {
 /// Status response wrapping the core SyncStatus.
 #[derive(Serialize)]
 struct StatusResponse {
+    observation: observation::Observation,
     state: String,
     last_sync_at: Option<String>,
     last_svn_revision: Option<i64>,
@@ -125,7 +129,7 @@ async fn get_status(
     headers: axum::http::HeaderMap,
     Query(query): Query<RepoQuery>,
 ) -> Result<Json<StatusResponse>, AppError> {
-    crate::api::auth::validate_session(
+    let (actor, role) = crate::api::auth::validate_session_with_role(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
@@ -141,7 +145,18 @@ async fn get_status(
             .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
             .ok_or_else(|| AppError::NotFound(format!("repository {} not found", repo_id)))?;
 
-        let active_conflicts = db.count_active_conflicts_for_repo(repo_id).unwrap_or(0);
+        let active_conflicts = db
+            .count_active_conflicts_for_repo(repo_id)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let total_conflicts: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM conflicts WHERE repo_id=?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let observation = observation::repository(&state, &repo, &actor, role == "admin");
 
         let errors = db
             .error_snapshot(&ErrorScope::Repository {
@@ -150,6 +165,7 @@ async fn get_status(
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
         return Ok(Json(StatusResponse {
+            observation,
             state: repo.sync_status,
             last_sync_at: repo.last_sync_at,
             last_svn_revision: if repo.last_svn_rev != 0 {
@@ -163,7 +179,7 @@ async fn get_status(
                 Some(repo.last_git_sha)
             },
             total_syncs: repo.total_syncs,
-            total_conflicts: 0,
+            total_conflicts,
             active_conflicts,
             total_errors: errors.count,
             last_error_at: errors.last_error_at,
@@ -176,7 +192,9 @@ async fn get_status(
     // repos exist; otherwise read the legacy global kv_state key.
     let state_str = reposync_core::sync_status::resolve_unscoped_sync_state(db)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    let last_sync_str = db.get_state("last_sync_at").unwrap_or(None);
+    let last_sync_str = db
+        .get_state("last_sync_at")
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let last_sync_at = last_sync_str.and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(&s)
             .ok()
@@ -184,19 +202,37 @@ async fn get_status(
     });
     let last_svn_rev = db
         .get_state("last_svn_rev")
-        .unwrap_or(None)
+        .map_err(|e| AppError::Internal(e.to_string()))?
         .and_then(|s| s.parse::<i64>().ok())
-        .or_else(|| db.get_last_svn_revision().ok().flatten());
+        .or(db
+            .get_last_svn_revision()
+            .map_err(|e| AppError::Internal(e.to_string()))?);
     let last_git_hash = reposync_core::sync_status::resolve_unscoped_last_git_hash(db)
         .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-    let total_syncs = db.count_sync_records().unwrap_or(0);
-    let total_conflicts = db.count_all_conflicts().unwrap_or(0);
-    let active_conflicts = db.count_active_conflicts().unwrap_or(0);
+    let total_syncs = db
+        .count_sync_records()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let total_conflicts = db
+        .count_all_conflicts()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let active_conflicts = db
+        .count_active_conflicts()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     let errors = db
         .error_snapshot(&ErrorScope::All {})
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let repos = db
+        .list_repositories()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let observation = observation::aggregate(
+        repos
+            .iter()
+            .map(|repo| observation::repository(&state, repo, &actor, role == "admin"))
+            .collect(),
+    );
     Ok(Json(StatusResponse {
+        observation,
         state: state_str,
         last_sync_at,
         last_svn_revision: last_svn_rev,

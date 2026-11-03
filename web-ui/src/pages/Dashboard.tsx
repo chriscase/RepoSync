@@ -1,7 +1,8 @@
-import { errorStatusQuery, refreshErrorStatus } from '../errorStatus';
+import { useStatusObservation } from '../useStatusObservation';
+import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
+import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
-import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useState, useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
@@ -22,10 +23,14 @@ export default function Dashboard() {
 
   const activeRepoId = selectedRepoId !== 'all' ? selectedRepoId : undefined;
 
-  const { data: status, isLoading: statusLoading, isError, error } = useQuery({
+  const statusQuery = useQuery({
     ...errorStatusQuery(activeRepoId),
     refetchInterval: 5000,
   });
+
+  const {data:status,isError}=statusQuery;
+  const statusView=useStatusObservation(statusQuery);
+  const errorCard=errorStatusView(status,isError);
 
   const { data: recentActivity } = useQuery({
     queryKey: ['audit', 'recent', activeRepoId],
@@ -71,18 +76,6 @@ export default function Dashboard() {
     () => (syncRecords?.entries ?? []).map(r => syncRecordToActivityEvent(r, r.repo_id ? repoNameMap.get(r.repo_id) || 'Unknown' : repoName)),
     [syncRecords, repoName, repoNameMap],
   );
-
-  if (statusLoading) {
-    return <LoadingSpinner />;
-  }
-
-  if (isError) {
-    return (
-      <div className="text-center py-8 text-red-400">
-        Error loading status: {error?.message ?? 'Unknown error'}
-      </div>
-    );
-  }
 
   const formatUptime = (secs: number) => {
     const days = Math.floor(secs / 86400);
@@ -168,8 +161,8 @@ export default function Dashboard() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1">
                         <span className="font-semibold text-sm text-gray-100 truncate">{repo.name}</span>
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${repo.enabled ? 'bg-green-900/60 text-green-300' : 'bg-gray-700 text-gray-400'}`}>
-                          {repo.enabled ? 'Enabled' : 'Disabled'}
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${repo.enabled ? 'bg-blue-900/60 text-blue-300' : 'bg-gray-700 text-gray-400'}`}>
+                          {repo.enabled ? 'Configured enabled' : 'Configured disabled'}
                         </span>
                       </div>
                       <div className="flex items-center gap-1 text-xs text-gray-400 mb-0.5">
@@ -180,20 +173,10 @@ export default function Dashboard() {
                         <GitBranch className="w-3 h-3 text-purple-400" />
                         <span className="truncate">{repo.git_repo}</span>
                       </div>
-                      <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
-                        {repo.enabled ? (
-                          <span className="flex items-center gap-1">
-                            <span className="relative w-2 h-2"><span className="absolute inset-0 rounded-full bg-green-400 animate-ping opacity-40" /><span className="relative block w-2 h-2 rounded-full bg-green-400" /></span>
-                            <span className="text-green-300">Active</span>
-                          </span>
-                        ) : (
-                          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-gray-500" /><span>Disabled</span></span>
-                        )}
-                        <span>{formatTimeAgo(repo.updated_at)}</span>
-                      </div>
                     </div>
                   </div>
                 </button>
+                <div className="px-5 pb-4"><RepositoryStatusSummary repoId={repo.id}/></div>
                 {/* Branch pairs inside card (recursive) */}
                 <DashboardBranchTree repoId={repo.id} childMap={childMap} navigate={navigate} depth={0} />
               </div>
@@ -204,59 +187,54 @@ export default function Dashboard() {
         );
       })()}
 
+      <StatusObservationPanel view={statusView}/>
       {/* Status Cards */}
       <div className="mb-1">
         <span className="text-xs text-blue-400">{repoContextLabel}</span>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
         <StatusCard
-          title="Sync State"
-          value={status?.state ?? 'unknown'}
-          color={
-            status?.state === 'idle'
-              ? 'green'
-              : status?.state === 'error'
-                ? 'red'
-                : 'yellow'
-          }
+          title="Effective sync health"
+          value={statusView.healthLabel}
+          color={statusView.health==='idle' ? 'green':'gray'}
         />
         <StatusCard
           title="Total Syncs"
-          value={String(status?.total_syncs ?? 0)}
+          value={statusView.metric('total_syncs')}
           color="blue"
           onClick={() => navigate('/audit')}
         />
         <StatusCard
           title="Active Conflicts"
-          value={String(status?.active_conflicts ?? 0)}
-          color={status?.active_conflicts ? 'red' : 'green'}
+          value={statusView.metric('active_conflicts')}
+          color={status?.active_conflicts ? 'red' : 'gray'}
           onClick={() => navigate('/conflicts')}
         />
         <StatusCard
           title="Errors (24h)"
-          value={String(status?.total_errors ?? 0)}
+          value={statusView.metric('total_errors')}
           color={status?.total_errors ? 'red' : 'gray'}
           onClick={() => navigate(`/audit?success=false${activeRepoId ? `&repo_id=${encodeURIComponent(activeRepoId)}` : ''}`)}
           subtitle={
             status?.last_error_at
               ? `Last: ${formatTimeAgo(status.last_error_at)}`
-              : 'No recent errors'
+              : errorCard.description
           }
           action={
             <ErrorAcknowledgement key={activeRepoId ?? 'all'} scope={errorScope(activeRepoId)}
-              repositoryName={repoContextLabel} observation={status?.error_observation}
-              count={status?.total_errors ?? 0}
+              repositoryName={repoContextLabel} observation={errorCard.observation}
+              count={errorCard.count}
               onSuccess={() => { void refreshErrorStatus(queryClient); }} />
           }
         />
         <StatusCard
           title="Uptime"
-          value={status ? formatUptime(status.uptime_secs) : '-'}
+          value={status?.observation?.uptime_available ? formatUptime(status.uptime_secs) : 'Unavailable'}
           color="gray"
         />
         <StatusCard
           title="Last Sync"
-          value={status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : 'Never'}
+          value={status?.observation?.scope==='aggregate' ? 'See scoped observations' : status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : status ? 'Not recorded':'Unknown'}
           color="gray"
         />
       </div>
@@ -276,7 +254,7 @@ export default function Dashboard() {
             <p className="text-lg font-mono text-gray-100">
               {status?.last_svn_revision != null
                 ? `r${status.last_svn_revision}`
-                : 'Not synced'}
+                : status ? 'Not recorded':'Unknown'}
             </p>
           </div>
           <div>
@@ -284,7 +262,7 @@ export default function Dashboard() {
             <p className="text-lg font-mono truncate text-gray-100">
               {status?.last_git_hash
                 ? status.last_git_hash.substring(0, 12)
-                : 'Not synced'}
+                : status ? 'Not recorded':'Unknown'}
             </p>
           </div>
           <div>
@@ -292,13 +270,13 @@ export default function Dashboard() {
             <p className="text-lg text-gray-100">
               {status?.last_sync_at
                 ? new Date(status.last_sync_at).toLocaleString()
-                : 'Never'}
+                : status ? 'Not recorded':'Unknown'}
             </p>
           </div>
           <div>
             <span className="text-sm text-gray-400">Total Conflicts</span>
             <p className="text-lg text-gray-100">
-              {status?.total_conflicts ?? 0}
+              {statusView.metric('total_conflicts')}
             </p>
           </div>
         </div>
@@ -509,10 +487,10 @@ function DashboardBranchTree({
             <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
             <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
             <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] text-gray-600">{formatTimeAgo(child.updated_at)}</span>
-              {child.enabled ? <span className="w-1.5 h-1.5 rounded-full bg-green-400" /> : <span className="w-1.5 h-1.5 rounded-full bg-gray-500" />}
+              <span className="text-[10px] text-gray-400">Configuration: {child.enabled ? 'enabled':'disabled'}</span>
             </span>
           </button>
+          <RepositoryStatusSummary repoId={child.id}/>
           <DashboardBranchTree repoId={child.id} childMap={childMap} navigate={navigate} depth={depth + 1} />
         </div>
       ))}

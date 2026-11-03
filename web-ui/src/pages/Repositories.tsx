@@ -1,10 +1,11 @@
+import RepositoryStatusSummary from '../components/StatusObservation';
 import { useRepositorySave } from '../useRepositorySave';
 import { samePublicConfiguration, retainUnsavedCredentials, sameImportPreferences, canContinueWithPreferences, repositoryEditorKey, publicConfiguration } from '../repositorySave';
 import RepositorySaveNotice from '../components/RepositorySaveNotice';
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { api, type Repository, type SyncStatus } from '../api';
+import { api, type Repository } from '../api';
 import {
   DEFAULT_REPO_IMPORT_MODE,
   type RepoImportMode,
@@ -14,10 +15,8 @@ import { readBranchPairRemovalNotice, readPersistedBranchPairRemovalNotice } fro
 import BranchPairRemovalNotice from '../components/BranchPairRemovalNotice';
 import ManagedRemovalReceiptNotice from '../components/ManagedRemovalReceiptNotice';
 import { readAllManagedRemovalReceipts, shouldDisplayManagedRemovalReceipt } from '../managedRemoval';
-import { GitBranch, Plus, Database, Clock, X, ArrowRight, AlertTriangle, RefreshCw } from 'lucide-react';
+import { GitBranch, Plus, Database, Clock, X, ArrowRight } from 'lucide-react';
 import { getStoredUser } from '../utils/auth';
-import { formatTimeAgo } from '../utils/time';
-import { syncStateVisual } from '../utils/syncStateColor';
 
 /** Custom SVG icon: two circular sync arrows, one blue (SVN) and one purple (Git) */
 function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
@@ -42,27 +41,6 @@ function SyncArrowsIcon({ className = 'w-8 h-8' }: { className?: string }) {
       />
       <path d="M10 22 L8 18 L12 18" fill="#a855f7" />
     </svg>
-  );
-}
-
-/** Status dot with optional pulsing animation for active state */
-function StatusDot({ state, enabled }: { state?: string; enabled: boolean }) {
-  const visual = syncStateVisual(state, enabled);
-  if (visual === 'disabled') {
-    return <span className="w-2.5 h-2.5 rounded-full bg-gray-500 flex-shrink-0" />;
-  }
-  if (visual === 'error') {
-    return <span className="w-2.5 h-2.5 rounded-full bg-red-400 flex-shrink-0" />;
-  }
-  if (visual === 'attention') {
-    return <span className="w-2.5 h-2.5 rounded-full bg-yellow-400 flex-shrink-0" />;
-  }
-  const color = visual === 'healthy' ? 'bg-green-400' : 'bg-blue-400';
-  return (
-    <span className="relative flex-shrink-0 w-2.5 h-2.5">
-      <span className={`absolute inset-0 rounded-full ${color} animate-ping opacity-40`} />
-      <span className={`relative block w-2.5 h-2.5 rounded-full ${color}`} />
-    </span>
   );
 }
 
@@ -157,32 +135,8 @@ function RepositoriesEditor() {
     queryFn: api.getRepos,
   });
 
-  // Fetch per-repo statuses for all parent repos
-  const repoList = repos ?? [];
-  const parents = repoList.filter((r) => !r.parent_id);
-  const parentIds = parents.map((r) => r.id);
-
-  const statusQueries = useQuery({
-    queryKey: ['repo-statuses', parentIds],
-    queryFn: async () => {
-      const results = new Map<string, SyncStatus>();
-      await Promise.all(
-        parentIds.map(async (id) => {
-          try {
-            const s = await api.getStatus(id);
-            results.set(id, s);
-          } catch {
-            // ignore - status may not be available
-          }
-        }),
-      );
-      return results;
-    },
-    enabled: parentIds.length > 0,
-    refetchInterval: 15000,
-  });
-
-  const statusMap = statusQueries.data ?? new Map<string, SyncStatus>();
+  const repoList=repos ?? [];
+  const parents=repoList.filter(repo=>!repo.parent_id);
 
   function setField<K extends keyof AddRepoForm>(key: K, value: AddRepoForm[K]) {
     const next={...currentForm.current,[key]:value};currentForm.current=next;setForm(next);
@@ -349,11 +303,6 @@ function RepositoriesEditor() {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
           {parents.map((repo: Repository) => {
-            const status = statusMap.get(repo.id);
-            const lastSync = status?.last_sync_at ?? repo.updated_at;
-            const totalSyncs = status?.total_syncs ?? 0;
-            const activeConflicts = status?.active_conflicts ?? 0;
-
             return (
               <div key={repo.id} className="group/card bg-gray-800/60 border border-gray-700 rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors">
                 {/* Parent Repo Card */}
@@ -377,11 +326,11 @@ function RepositoriesEditor() {
                         <span
                           className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium flex-shrink-0 ${
                             repo.enabled
-                              ? 'bg-green-900/50 text-green-300'
+                              ? 'bg-blue-900/50 text-blue-300'
                               : 'bg-gray-700 text-gray-400'
                           }`}
                         >
-                          {repo.enabled ? 'Enabled' : 'Disabled'}
+                          {repo.enabled ? 'Configured enabled' : 'Configured disabled'}
                         </span>
                       </div>
 
@@ -397,33 +346,6 @@ function RepositoriesEditor() {
                         </div>
                       </div>
 
-                      {/* Stats Row */}
-                      <div className="flex items-center gap-5 text-xs text-gray-500">
-                        <div className="flex items-center gap-1.5">
-                          <StatusDot state={status?.state} enabled={repo.enabled} />
-                          <span className="text-gray-400">
-                            {status?.state === 'error' || status?.state === 'failed'
-                              ? 'Error'
-                              : repo.enabled
-                                ? 'Active'
-                                : 'Disabled'}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <Clock className="w-3 h-3" />
-                          <span>{formatTimeAgo(lastSync)}</span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <RefreshCw className="w-3 h-3" />
-                          <span>{totalSyncs} syncs</span>
-                        </div>
-                        {activeConflicts > 0 && (
-                          <div className="flex items-center gap-1.5 text-red-400">
-                            <AlertTriangle className="w-3 h-3" />
-                            <span>{activeConflicts} conflict{activeConflicts !== 1 ? 's' : ''}</span>
-                          </div>
-                        )}
-                      </div>
                     </div>
                   </div>
                 </button>
@@ -764,10 +686,10 @@ function BranchTree({
             <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
             <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
             <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
-              <span className="text-[10px] text-gray-600">{formatTimeAgo(child.updated_at)}</span>
-              <StatusDot state={undefined} enabled={child.enabled} />
+              <span className="text-[10px] text-gray-400">Configuration: {child.enabled ? 'enabled':'disabled'}</span>
             </span>
           </button>
+          <RepositoryStatusSummary repoId={child.id}/>
           {/* Recurse into this child's children */}
           <BranchTree repoId={child.id} childMap={childMap} navigate={navigate} depth={depth + 1} />
         </div>

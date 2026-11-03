@@ -1,3 +1,5 @@
+import { useStatusObservation } from '../useStatusObservation';
+import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
 import { useRepositorySave } from '../useRepositorySave';
 import { samePublicConfiguration, retainUnsavedCredentials, repositoryEditorKey, type PublicConfiguration } from '../repositorySave';
 import RepositorySaveNotice from '../components/RepositorySaveNotice';
@@ -170,12 +172,14 @@ function RepositoryDetailEditor() {
   const detailLive = !!id && id !== retiredId && !repoMissing;
 
   // Status query scoped to this repo. Stop it once this detail is gone.
-  const { data: status, isError: statusUnavailable } = useQuery<SyncStatus>({
+  const statusQuery = useQuery<SyncStatus>({
     ...errorStatusQuery(id),
     refetchInterval: (query) => (detailLive && !isNotFoundError(query.state.error) ? 5000 : false),
     retry: (failureCount, queryError) => !isNotFoundError(queryError) && failureCount < 2,
     enabled: detailLive,
   });
+  const {data:status,isError:statusUnavailable}=statusQuery;
+  const statusView=useStatusObservation(statusQuery);
   const errorCard = errorStatusView(status, statusUnavailable);
 
   // Sync records
@@ -267,7 +271,7 @@ function RepositoryDetailEditor() {
     retry: detailRetry,
   });
 
-  const skipContextEnabled = detailLive && isAdmin && status?.state === 'error_paused';
+  const skipContextEnabled = detailLive && isAdmin && statusView.canAct && status?.state === 'error_paused';
   const { data: skipContextResponse } = useQuery({
     queryKey: ['skip-commit-context', id],
     queryFn: () => api.getSkipCommitContext(id!),
@@ -812,11 +816,11 @@ function RepositoryDetailEditor() {
           <span
             className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-medium ${
               repo.enabled
-                ? 'bg-green-900/50 text-green-300'
+                ? 'bg-blue-900/50 text-blue-300'
                 : 'bg-gray-700 text-gray-400'
             }`}
           >
-            {repo.enabled ? 'Sync enabled' : 'Sync paused'}
+            {repo.enabled ? 'Sync configured enabled' : 'Sync configured disabled'}
           </span>
         </div>
         <div className="flex items-center gap-3">
@@ -875,7 +879,7 @@ function RepositoryDetailEditor() {
           )}
           <button
             onClick={() => syncMutation.mutate()}
-            disabled={syncMutation.isPending || syncTriggered}
+            disabled={syncMutation.isPending || syncTriggered || !statusView.canAct}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-medium transition-colors"
           >
             <RefreshCw className={`w-4 h-4 ${syncMutation.isPending ? 'animate-spin' : ''}`} />
@@ -1096,7 +1100,7 @@ function RepositoryDetailEditor() {
       {/* ===== NEW DASHBOARD SECTIONS ===== */}
 
       {/* Circuit Breaker: Error Paused Banner */}
-      {status?.state === 'error_paused' && isAdmin && (
+      {statusView.canAct && status?.state === 'error_paused' && isAdmin && (
         <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 flex items-center justify-between">
           <div>
             <p className="text-red-300 font-medium">Sync Paused — Permanent Error</p>
@@ -1191,33 +1195,28 @@ function RepositoryDetailEditor() {
         </div>
       )}
 
+      <StatusObservationPanel view={statusView}/>
       {/* Status Cards Row */}
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <StatusCard
-          title="Sync State"
-          value={status?.state ?? 'unknown'}
-          color={
-            status?.state === 'idle'
-              ? 'green'
-              : status?.state === 'error'
-                ? 'red'
-                : 'yellow'
-          }
+          title="Effective sync health"
+          value={statusView.healthLabel}
+          color={statusView.health==='idle' ? 'green':'gray'}
         />
         <StatusCard
           title="Last Sync"
-          value={status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : 'Never'}
+          value={status?.last_sync_at ? formatTimeAgo(status.last_sync_at) : status ? 'Not recorded':'Unknown'}
           color="gray"
         />
         <StatusCard
           title="Total Syncs"
-          value={String(status?.total_syncs ?? 0)}
+          value={statusView.metric('total_syncs')}
           color="blue"
         />
         <StatusCard
           title="Active Conflicts"
-          value={String(status?.active_conflicts ?? 0)}
-          color={status?.active_conflicts ? 'red' : 'green'}
+          value={statusView.metric('active_conflicts')}
+          color={status?.active_conflicts ? 'red' : 'gray'}
           onClick={() => navigate('/conflicts')}
         />
         <StatusCard
@@ -1334,7 +1333,7 @@ function RepositoryDetailEditor() {
             <table className="min-w-full divide-y divide-gray-700">
               <thead>
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Sync configuration</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Action</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Author</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Details</th>
@@ -1537,8 +1536,8 @@ function RepositoryDetailEditor() {
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Name</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">SVN Branch</th>
                   <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Git Branch</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Status</th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Last Sync</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Sync configuration</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase">Health / freshness</th>
                   {isAdmin && <th className="px-6 py-3 text-right text-xs font-medium text-gray-400 uppercase"></th>}
                 </tr>
               </thead>
@@ -1555,12 +1554,12 @@ function RepositoryDetailEditor() {
                     <td className="px-6 py-3 text-sm font-mono text-purple-400">{bp.git_branch}</td>
                     <td className="px-6 py-3">
                       <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
-                        bp.enabled ? 'bg-green-900/50 text-green-300' : 'bg-gray-700 text-gray-400'
+                        bp.enabled ? 'bg-blue-900/50 text-blue-300' : 'bg-gray-700 text-gray-400'
                       }`}>
-                        {bp.enabled ? 'Active' : 'Disabled'}
+                        {bp.enabled ? 'Configured enabled' : 'Configured disabled'}
                       </span>
                     </td>
-                    <td className="px-6 py-3 text-sm text-gray-400">{formatTimeAgo(bp.updated_at)}</td>
+                    <td className="px-6 py-3 text-sm text-gray-400"><RepositoryStatusSummary repoId={bp.id}/></td>
                     {isAdmin && (
                       <td className="px-6 py-3 text-right">
                         <div className="inline-flex items-center gap-2">
