@@ -1,3 +1,4 @@
+import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
 import React, { useEffect, useState } from 'react';
@@ -153,13 +154,13 @@ export default function RepoDetail() {
   const detailLive = !!id && id !== retiredId && !repoMissing;
 
   // Status query scoped to this repo. Stop it once this detail is gone.
-  const { data: status } = useQuery<SyncStatus>({
-    queryKey: ['status', id],
-    queryFn: () => fetch(`/api/status?repo_id=${id}`, { headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` } }).then(r => r.json()),
+  const { data: status, isError: statusUnavailable } = useQuery<SyncStatus>({
+    ...errorStatusQuery(id),
     refetchInterval: (query) => (detailLive && !isNotFoundError(query.state.error) ? 5000 : false),
     retry: (failureCount, queryError) => !isNotFoundError(queryError) && failureCount < 2,
     enabled: detailLive,
   });
+  const errorCard = errorStatusView(status, statusUnavailable);
 
   // Sync records
   const detailRetry = (failureCount: number, queryError: unknown) =>
@@ -1190,19 +1191,19 @@ export default function RepoDetail() {
         />
         <StatusCard
           title="Errors (24h)"
-          value={String(status?.total_errors ?? 0)}
-          color={status?.total_errors ? 'red' : 'gray'}
+          value={errorCard.value}
+          color={errorCard.count ? 'red' : 'gray'}
           subtitle={
-            status?.last_error_at
-              ? `Last: ${formatTimeAgo(status.last_error_at)}`
-              : 'No recent errors'
+            errorCard.lastErrorAt
+              ? `Last: ${formatTimeAgo(errorCard.lastErrorAt)}`
+              : errorCard.description
           }
           onClick={() => navigate(`/audit?success=false&repo_id=${id}`)}
           action={
             <ErrorAcknowledgement key={id ?? 'all'} scope={errorScope(id)}
-              repositoryName={repo?.name ?? id ?? ''} observation={status?.error_observation}
-              count={status?.total_errors ?? 0}
-              onSuccess={() => { void queryClient.invalidateQueries({ queryKey: ['repo-status', id] }); }} />
+              repositoryName={repo?.name ?? id ?? ''} observation={errorCard.observation}
+              count={errorCard.count}
+              onSuccess={() => { void refreshErrorStatus(queryClient); }} />
           }
         />
       </div>

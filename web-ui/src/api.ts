@@ -315,7 +315,7 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   getStatus: (repoId?: string) => {
-    const params = repoId ? `?repo_id=${repoId}` : '';
+    const params = repoId ? `?repo_id=${encodeURIComponent(repoId)}` : '';
     return fetchJson<SyncStatus>(`/status${params}`);
   },
 

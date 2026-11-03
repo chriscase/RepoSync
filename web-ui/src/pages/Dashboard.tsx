@@ -1,3 +1,4 @@
+import { errorStatusQuery, refreshErrorStatus } from '../errorStatus';
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
 import { LoadingSpinner } from '../components/LoadingSpinner';
@@ -22,8 +23,7 @@ export default function Dashboard() {
   const activeRepoId = selectedRepoId !== 'all' ? selectedRepoId : undefined;
 
   const { data: status, isLoading: statusLoading, isError, error } = useQuery({
-    queryKey: ['status', activeRepoId],
-    queryFn: () => api.getStatus(activeRepoId),
+    ...errorStatusQuery(activeRepoId),
     refetchInterval: 5000,
   });
 
@@ -246,7 +246,7 @@ export default function Dashboard() {
             <ErrorAcknowledgement key={activeRepoId ?? 'all'} scope={errorScope(activeRepoId)}
               repositoryName={repoContextLabel} observation={status?.error_observation}
               count={status?.total_errors ?? 0}
-              onSuccess={() => { void queryClient.invalidateQueries({ queryKey: ['status'] }); }} />
+              onSuccess={() => { void refreshErrorStatus(queryClient); }} />
           }
         />
         <StatusCard
