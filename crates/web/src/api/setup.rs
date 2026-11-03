@@ -348,11 +348,7 @@ async fn test_git_connection(
         }));
     }
 
-    let check_url = if body.provider == "gitea" {
-        format!("{}/repos/{}", api_url, repo)
-    } else {
-        format!("{}/repos/{}", api_url, repo)
-    };
+    let check_url = format!("{}/repos/{}", api_url, repo);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

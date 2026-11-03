@@ -57,7 +57,7 @@ async fn seed_data(
     // -----------------------------------------------------------------------
     // 1. Identity Mappings (stored in kv_state as JSON for the frontend)
     // -----------------------------------------------------------------------
-    let identity_mappings = vec![
+    let identity_mappings = [
         ("jdoe", "John Doe", "john.doe@mentorg.com"),
         ("asmith", "Alice Smith", "alice.smith@mentorg.com"),
         ("bwilson", "Bob Wilson", "bob.wilson@mentorg.com"),

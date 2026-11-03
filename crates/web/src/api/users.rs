@@ -384,7 +384,7 @@ async fn create_credential(
     let db = &state.db;
 
     // Get encryption key
-    let enc_key = reposync_core::crypto::get_or_create_encryption_key(&db)
+    let enc_key = reposync_core::crypto::get_or_create_encryption_key(db)
         .map_err(|e| AppError::Internal(format!("encryption key error: {}", e)))?;
 
     // Encrypt the credential value
