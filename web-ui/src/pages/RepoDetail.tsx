@@ -1,3 +1,6 @@
+import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
+import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
+import { errorScope } from '../errorAcknowledgement';
 import React, { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
@@ -151,13 +154,13 @@ export default function RepoDetail() {
   const detailLive = !!id && id !== retiredId && !repoMissing;
 
   // Status query scoped to this repo. Stop it once this detail is gone.
-  const { data: status } = useQuery<SyncStatus>({
-    queryKey: ['status', id],
-    queryFn: () => fetch(`/api/status?repo_id=${id}`, { headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` } }).then(r => r.json()),
+  const { data: status, isError: statusUnavailable } = useQuery<SyncStatus>({
+    ...errorStatusQuery(id),
     refetchInterval: (query) => (detailLive && !isNotFoundError(query.state.error) ? 5000 : false),
     retry: (failureCount, queryError) => !isNotFoundError(queryError) && failureCount < 2,
     enabled: detailLive,
   });
+  const errorCard = errorStatusView(status, statusUnavailable);
 
   // Sync records
   const detailRetry = (failureCount: number, queryError: unknown) =>
@@ -1188,21 +1191,19 @@ export default function RepoDetail() {
         />
         <StatusCard
           title="Errors (24h)"
-          value={String(status?.total_errors ?? 0)}
-          color={status?.total_errors ? 'red' : 'gray'}
+          value={errorCard.value}
+          color={errorCard.count ? 'red' : 'gray'}
           subtitle={
-            status?.last_error_at
-              ? `Last: ${formatTimeAgo(status.last_error_at)}`
-              : 'No recent errors'
+            errorCard.lastErrorAt
+              ? `Last: ${formatTimeAgo(errorCard.lastErrorAt)}`
+              : errorCard.description
           }
           onClick={() => navigate(`/audit?success=false&repo_id=${id}`)}
-          onClear={
-            (status?.total_errors ?? 0) > 0
-              ? async () => {
-                  await api.resetErrors(id);
-                  queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
-                }
-              : undefined
+          action={
+            <ErrorAcknowledgement key={id ?? 'all'} scope={errorScope(id)}
+              repositoryName={repo?.name ?? id ?? ''} observation={errorCard.observation}
+              count={errorCard.count}
+              onSuccess={() => { void refreshErrorStatus(queryClient); }} />
           }
         />
       </div>
@@ -2285,14 +2286,14 @@ function StatusCard({
   color,
   onClick,
   subtitle,
-  onClear,
+  action,
 }: {
   title: string;
   value: string;
   color: string;
   onClick?: () => void;
   subtitle?: string;
-  onClear?: () => void;
+  action?: React.ReactNode;
 }) {
   const colorClasses: Record<string, string> = {
     green: 'bg-green-900/30 border-green-700',
@@ -2313,17 +2314,7 @@ function StatusCard({
     >
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-400">{title}</p>
-        {onClear && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onClear();
-            }}
-            className="text-xs text-gray-400 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded border border-gray-600 hover:border-red-500/50"
-          >
-            Clear
-          </button>
-        )}
+        {action}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
       {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
