@@ -1,5 +1,5 @@
 import { useRepositorySave } from '../useRepositorySave';
-import { samePublicConfiguration, retainUnsavedCredentials, type PublicConfiguration } from '../repositorySave';
+import { samePublicConfiguration, retainUnsavedCredentials, repositoryEditorKey, type PublicConfiguration } from '../repositorySave';
 import RepositorySaveNotice from '../components/RepositorySaveNotice';
 import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
@@ -98,6 +98,12 @@ const selectClass =
   'w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
 
 export default function RepoDetail() {
+  const {id}=useParams<{id:string}>();
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',targetId:id,session:localStorage.getItem('session_token')});
+  return <RepositoryDetailEditor key={key} />;
+}
+
+function RepositoryDetailEditor() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -583,6 +589,20 @@ export default function RepoDetail() {
     if(!repo)return;editVersion.current++;restoredSave.current=null;
     setForm(repoToForm(repo));setEditing(true);setSaveError(null);setSaveMessage(null);
   }
+  async function loadCurrentSettingsForReview() {
+    const generation=editVersion.current;
+    try {
+      const current=await saveFlow.loadCurrentForReview();
+      if(!saveFlow.viewActive() || generation!==editVersion.current)return;
+      setForm(repoToForm(current));setSaveError(null);setSaveMessage('Review these current settings. Required credential fields were cleared; choose a new save explicitly.');
+      void queryClient.invalidateQueries({queryKey:['repo',id]});
+    } catch(cause) {if(saveFlow.viewActive() && generation===editVersion.current)setSaveError(cause instanceof Error ? cause.message : 'Current settings could not be read.');}
+  }
+  function useReviewedSettings() {
+    if(!currentForm.current)return;
+    try {saveFlow.useReviewedSettings(editConfiguration(currentForm.current),{svn_password:currentForm.current.svn_password || undefined,git_token:currentForm.current.git_token || undefined});setSaveError(null);setSaveMessage('New attempt prepared on the same repository. Save will submit only the reviewed snapshot.');}
+    catch(cause) {setSaveError(cause instanceof Error ? cause.message : 'Reviewed recovery could not be prepared.');}
+  }
   function cancelEdit() {
     if(currentForm.current)saveFlow.rememberDraft(editConfiguration(currentForm.current));
     editVersion.current++;setEditing(false);setForm(null);setSaveError(null);setSaveMessage(null);
@@ -605,7 +625,7 @@ export default function RepoDetail() {
       }
       saveFlow.finish(result.attempt.configRequestId);setEditing(false);setForm(null);
     } catch(cause) {
-      if(editVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; recovery data was retained.');
+      if(saveFlow.viewActive() && editVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; recovery data was retained.');
     }
   }
 
@@ -870,7 +890,7 @@ export default function RepoDetail() {
           Failed to trigger sync: {syncMutation.error?.message}
         </div>
       )}
-      {editing && <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} />}
+      {editing && <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />}
       {editing && saveMessage && <p role="status" className="text-yellow-300 mb-3">{saveMessage}</p>}
 
       {/* Config Cards - SVN and Git side by side */}

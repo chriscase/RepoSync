@@ -2,6 +2,7 @@ import type { Repository, RepositorySaveReceipt } from './api';
 
 export type CredentialInputs = { svn_password?: string; git_token?: string };
 export type PublicConfiguration = Partial<Repository>;
+export type ImportPreferences = { importMode: string; svnRevision: string };
 export type SaveStage = 'pending' | 'saved' | 'unknown' | 'failed' | 'conflict';
 export interface RepositorySaveAttempt {
   version: 1;
@@ -18,7 +19,31 @@ export interface RepositorySaveAttempt {
   configurationReceipt?: RepositorySaveReceipt;
   protocolFailure?: 'configuration' | 'credentials';
   draftConfiguration?: PublicConfiguration;
-  preferences?: { importMode: string; svnRevision: string };
+  preferences?: ImportPreferences;
+  draftPreferences?: ImportPreferences;
+  priorAttempts?: RepositorySaveEvidence[];
+}
+
+type RepositorySaveEvidence = Pick<RepositorySaveAttempt, 'repoId' | 'configuration' | 'configRequestId' | 'credentialRequestId' | 'expectedUpdatedAt' | 'configurationStage' | 'credentialStage' | 'configurationReceipt' | 'protocolFailure'>;
+function saveEvidence(a: RepositorySaveEvidence): RepositorySaveEvidence {
+  return {repoId:a.repoId,configuration:publicConfiguration(a.configuration),configRequestId:a.configRequestId,
+    credentialRequestId:a.credentialRequestId,expectedUpdatedAt:a.expectedUpdatedAt,configurationStage:a.configurationStage,
+    credentialStage:a.credentialStage,configurationReceipt:a.configurationReceipt ? cleanReceipt(a.configurationReceipt) : undefined,protocolFailure:a.protocolFailure};
+}
+export function repositorySaveConflict(a: RepositorySaveAttempt): boolean {
+  return a.configurationStage==='conflict' || a.credentialStage==='conflict' || !!a.protocolFailure;
+}
+
+export interface RepositoryEditorIdentity {owner: string; targetId?: string; session: string | null}
+export function repositoryEditorKey(value: RepositoryEditorIdentity): string { return JSON.stringify([value.owner,value.targetId,value.session]); }
+/** Used at the actual keyed editor/hook boundary; retired scopes cannot send or update replacement views. */
+export class RepositoryEditorOwnership {
+  private retired=false;
+  constructor(private readonly origin: RepositoryEditorIdentity, private readonly current:()=>RepositoryEditorIdentity) {}
+  isCurrent(): boolean {return !this.retired && repositoryEditorKey(this.origin)===repositoryEditorKey(this.current());}
+  assertCurrent(): void {if(!this.isCurrent())throw new Error('The repository or login context changed. Reopen the correct repository; the earlier recovery record was retained.');}
+  retire(): void {this.retired=true;}
+  setActive(active: boolean): void {this.retired=!active;}
 }
 
 const PUBLIC_FIELDS = [
@@ -83,7 +108,7 @@ export class RepositorySaveJournal {
   write(attempt: RepositorySaveAttempt, replaceDraft = false): void {
     const current=this.read();
     if (!replaceDraft && current && current.configRequestId===attempt.configRequestId) {
-      attempt={...attempt,draftConfiguration:current.draftConfiguration ?? attempt.draftConfiguration};
+      attempt={...attempt,draftConfiguration:current.draftConfiguration ?? attempt.draftConfiguration,draftPreferences:current.draftPreferences ?? attempt.draftPreferences};
     }
     // Construct the record explicitly; do not serialize a form or a mutation's variables.
     this.storage.setItem(this.key, JSON.stringify({
@@ -92,12 +117,12 @@ export class RepositorySaveJournal {
       configRequestId: attempt.configRequestId, credentialRequestId: attempt.credentialRequestId,
       credentialFields: attempt.credentialFields, configurationStage: attempt.configurationStage,
       credentialStage: attempt.credentialStage, protocolFailure: attempt.protocolFailure, configurationReceipt: attempt.configurationReceipt ? cleanReceipt(attempt.configurationReceipt) : undefined,
-      preferences: attempt.preferences,
+      preferences: attempt.preferences, draftPreferences:attempt.draftPreferences, priorAttempts:attempt.priorAttempts?.map(saveEvidence),
     }));
   }
-  rememberDraft(configuration: PublicConfiguration): void {
+  rememberDraft(configuration: PublicConfiguration, preferences?: ImportPreferences): void {
     const saved=this.read();
-    if(saved)this.write({...saved,draftConfiguration:publicConfiguration(configuration)},true);
+    if(saved)this.write({...saved,draftConfiguration:publicConfiguration(configuration),draftPreferences:preferences ?? saved.draftPreferences},true);
   }
   clear(): void { this.storage.removeItem(this.key); }
 }
@@ -127,8 +152,10 @@ export function prepareRepositorySaveAttempt(previous: RepositorySaveAttempt | n
   configuration: PublicConfiguration, inputs: CredentialInputs,
   options: {owner: string; targetId?: string; expectedUpdatedAt?: string; preferences?: RepositorySaveAttempt['preferences']}): {attempt: RepositorySaveAttempt; replacePrivateInputs: boolean} {
   const clean=publicConfiguration(configuration);
+  // Neither absent target equality nor an ordinary Resume is a reviewed recovery decision.
+  if(previous && repositorySaveConflict(previous))return {attempt:previous,replacePrivateInputs:false};
   if(!previous || (repositorySaveComplete(previous) && (!samePublicConfiguration(previous.configuration,clean) || !!inputs.svn_password || !!inputs.git_token))
-    || ((previous.configurationStage==='conflict' || !!previous.protocolFailure) && options.targetId===previous.repoId)) {
+    ) {
     const attempt=beginRepositorySave(options.owner,previous?.repoId || options.targetId ? 'update':'create',clean,inputs,
       previous?.repoId ?? options.targetId,options.expectedUpdatedAt ?? previous?.configurationReceipt?.configuration_updated_at);
     if(previous && !repositorySaveComplete(previous)) {
@@ -136,6 +163,7 @@ export function prepareRepositorySaveAttempt(previous: RepositorySaveAttempt | n
       attempt.credentialStage=attempt.credentialFields.length ? 'pending':'not_required';
     }
     attempt.preferences=options.preferences ?? previous?.preferences;
+    attempt.priorAttempts=previous ? [...(previous.priorAttempts ?? []),saveEvidence(previous)] : undefined;
     return {attempt,replacePrivateInputs:true};
   }
   if(!previous.configurationReceipt && previous.configurationStage!=='saved') {
@@ -145,6 +173,27 @@ export function prepareRepositorySaveAttempt(previous: RepositorySaveAttempt | n
     return {attempt:{...previous,configuration:clean,credentialFields:fields,credentialStage:fields.length ? 'pending':'not_required'},replacePrivateInputs:true};
   }
   return {attempt:previous,replacePrivateInputs:false};
+}
+
+/** Explicit user decision after fetching/reviewing current settings on the retained ID. No network writes. */
+export function beginReviewedRepositorySave(previous: RepositorySaveAttempt, current: Pick<Repository,'id'|'updated_at'>,
+  configuration: PublicConfiguration, inputs: CredentialInputs, owner: string, preferences?: ImportPreferences): RepositorySaveAttempt {
+  if(!repositorySaveConflict(previous) || previous.owner!==owner || !previous.repoId || previous.repoId!==current.id
+    || !Number.isFinite(Date.parse(current.updated_at)))throw new Error('Review current settings on the retained repository before starting a new save.');
+  const next=beginRepositorySave(owner,'update',configuration,inputs,current.id,current.updated_at);
+  next.credentialFields=Array.from(new Set([...previous.credentialFields,...next.credentialFields]));
+  next.credentialStage=next.credentialFields.length ? 'pending':'not_required';
+  next.priorAttempts=[...(previous.priorAttempts ?? []),saveEvidence(previous)];
+  next.preferences=preferences ?? previous.draftPreferences ?? previous.preferences;
+  return next;
+}
+export function sameImportPreferences(a?: ImportPreferences,b?: ImportPreferences): boolean {
+  return a?.importMode===b?.importMode && a?.svnRevision===b?.svnRevision;
+}
+/** A preference-only continuation is navigation, never another configuration/credential mutation. */
+export function canContinueWithPreferences(a: RepositorySaveAttempt | null, configuration: PublicConfiguration, inputs: CredentialInputs): a is RepositorySaveAttempt {
+  return !!a && repositorySaveComplete(a) && !!a.repoId && samePublicConfiguration(a.configuration,configuration)
+    && !inputs.svn_password && !inputs.git_token;
 }
 
 export interface RepositorySaveTransport {
@@ -201,6 +250,7 @@ export async function runRepositorySave(attempt: RepositorySaveAttempt, inputs: 
   let state = { ...attempt };
   const store = () => { changed({ ...state }); journal.write(state); };
   store(); // Storage failures prevent the first network mutation.
+  if(repositorySaveConflict(state) && !state.protocolFailure)throw new RepositorySaveFailure('This save conflicts with current settings. Load and review the current settings on this existing repository before deliberately starting a new save.',state);
   if(state.protocolFailure) throw new RepositorySaveFailure('This server did not provide the required durable save confirmation. No write will be blindly retried. Review the existing repository ID and use a matching API version before a new save.',state);
   { // Confirm the configuration receipt on every resume; journal flags are not server proof.
     let responseId: string | undefined;
@@ -211,7 +261,7 @@ export async function runRepositorySave(attempt: RepositorySaveAttempt, inputs: 
       state = { ...state, repoId: receipt.repo_id, configurationReceipt: receipt, configurationStage: 'saved' };
       store(); // Retain the created ID before any credential request can start.
     } catch (error) {
-      state = { ...state, configurationStage: error instanceof SaveConfirmationError ? 'conflict' : 'unknown',
+      state = { ...state, configurationStage: error instanceof SaveConfirmationError || (error as {status?:number}).status===409 ? 'conflict' : 'unknown',
         ...(error instanceof SaveConfirmationError ? {protocolFailure:'configuration' as const,repoId:state.repoId ?? responseId} : {}) };
       // A reused key may have committed an earlier draft; preserve its ID without
       // claiming that newly edited fields were applied or proceeding to credentials.
@@ -251,7 +301,7 @@ export async function runRepositorySave(attempt: RepositorySaveAttempt, inputs: 
       state = { ...state, credentialStage: 'saved' };
       store();
     } catch (error) {
-      state = { ...state, credentialStage: 'unknown',...(error instanceof SaveConfirmationError ? {protocolFailure:'credentials' as const} : {}) }; store();
+      state = { ...state, credentialStage: (error as {status?:number}).status===409 ? 'conflict' : 'unknown',...(error instanceof SaveConfirmationError ? {protocolFailure:'credentials' as const} : {}) }; store();
       throw new RepositorySaveFailure(`Configuration saved on repository ${state.repoId}; credentials are not confirmed. ${error instanceof Error ? error.message : 'Retry credentials on this existing ID.'}`, state);
     }
   }

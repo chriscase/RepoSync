@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError, type Repository, type RepositorySaveReceipt } from './api';
 import {
+  beginReviewedRepositorySave, RepositoryEditorOwnership, repositoryEditorKey, sameImportPreferences, canContinueWithPreferences,
   beginRepositorySave, prepareRepositorySaveAttempt, publicConfiguration, submittedCredentialSnapshot, retainUnsavedCredentials, RepositorySaveJournal, repositorySaveComplete,
   runRepositorySave, samePublicConfiguration,
   type PublicConfiguration, type JournalStorage, type RepositorySaveAttempt, type RepositorySaveTransport,
@@ -215,4 +216,88 @@ it('#115 only actually submitted credential fields count as confirmed form value
 it('#115 a completed old snapshot clears only confirmed bytes and preserves newer secret edits',()=>{
   expect(retainUnsavedCredentials({svn_password:'confirmed',git_token:'newer-unsaved'},
     {svn_password:'confirmed',git_token:'previous-token'})).toEqual({svn_password:'',git_token:'newer-unsaved'});
+});
+
+describe('#115 whole-story review corrections',()=>{
+  it.each([{}, {save_receipt:{request_id:'wrong'}}, {save_receipt:undefined}])('RS115-1 prepare/reload/retry preserves an ID-less malformed-response latch: %j',async malformed=>{
+    const f=fixture();f.transport.configuration=async()=>{f.state.configCalls++;f.state.configEffects++;return malformed as Repository;};
+    const first=prepareRepositorySaveAttempt(null,configuration,secrets,{owner:'actor'}).attempt;
+    await expect(runRepositorySave(first,secrets,f.journal,f.transport)).rejects.toThrow('did not match');
+    const saved=f.journal.read()!;expect(saved.repoId).toBeUndefined();expect(saved.protocolFailure).toBe('configuration');
+    const retry=prepareRepositorySaveAttempt(saved,configuration,secrets,{owner:'actor'}).attempt;
+    expect(retry.configRequestId).toBe(first.configRequestId);expect(retry.credentialRequestId).toBe(first.credentialRequestId);
+    await expect(runRepositorySave(retry,secrets,f.journal,f.transport)).rejects.toThrow('No write will be blindly retried');
+    expect(f.state.configEffects).toBe(1);expect(f.state.configCalls).toBe(1);expect(f.state.credentialCalls).toBe(0);
+    expect(()=>beginReviewedRepositorySave(saved,{id:'unverified',updated_at:time},configuration,secrets,'actor')).toThrow('retained repository');
+  });
+  function versionedFixture(){
+    const f=fixture(),t2='2026-11-03T18:01:00Z',t3='2026-11-03T18:02:00Z';
+    const live={version:time,configuration:{...configuration,poll_interval_secs:99},credentialValue:'later-unrelated-secret',configEffects:0,credentialEffects:0};
+    const known=new Map<string,RepositorySaveReceipt>();
+    const transport:RepositorySaveTransport={
+      configuration:async a=>{
+        f.state.configCalls++;let prior=known.get(a.configRequestId);
+        if(!prior){if(a.expectedUpdatedAt!==live.version)throw new ApiError(409,'settings changed');live.configuration={...live.configuration,...a.configuration};live.version=live.version===time ? t2:t3;live.configEffects++;prior={...receipt(a),configuration_updated_at:live.version};known.set(a.configRequestId,prior);}
+        return {id:a.repoId,updated_at:live.version,save_receipt:prior} as Repository;
+      },
+      credentials:async(a,input)=>{if(a.configurationReceipt?.configuration_updated_at!==live.version)throw new ApiError(409,'settings changed before credentials');live.credentialEffects++;live.credentialValue=input.git_token!;return {ok:true,save_receipt:{...receipt(a,true),configuration_updated_at:live.version}};},
+      lookup:async id=>{const found=known.get(id);if(!found)throw new ApiError(404,'not found');return found;},
+    };
+    return {...f,t2,t3,live,transport};
+  }
+  it('RS115-2 no-receipt stale configuration refuses Resume and supports explicit reviewed same-ID recovery',async()=>{
+    const f=versionedFixture();f.live.version=f.t2;const input={git_token:'selected-new'};
+    const old=beginRepositorySave('actor','update',configuration,input,'repo-a',time);
+    await expect(runRepositorySave(old,input,f.journal,f.transport)).rejects.toThrow('settings changed');
+    const conflict=f.journal.read()!;expect(conflict.configurationStage).toBe('conflict');expect(conflict.configurationReceipt).toBeUndefined();
+    const resume=prepareRepositorySaveAttempt(conflict,configuration,input,{owner:'actor',targetId:'repo-a',expectedUpdatedAt:f.t2});
+    await expect(runRepositorySave(resume.attempt,input,f.journal,f.transport)).rejects.toThrow('Load and review');expect(f.state.configCalls).toBe(1);expect(f.live.configEffects).toBe(0);
+    const next=beginReviewedRepositorySave(conflict,{id:'repo-a',updated_at:f.live.version},{...f.live.configuration,name:'selected current snapshot'},input,'actor');
+    expect(next.configRequestId).not.toBe(old.configRequestId);expect(next.credentialRequestId).not.toBe(old.credentialRequestId);
+    const done=await runRepositorySave(next,input,f.journal,f.transport);expect(repositorySaveComplete(done)).toBe(true);expect(done.repoId).toBe('repo-a');
+    expect(f.live.configuration.poll_interval_secs).toBe(99);expect(f.live.configuration.name).toBe('selected current snapshot');expect(f.live.configEffects).toBe(1);expect(f.live.credentialEffects).toBe(1);
+    expect(f.journal.read()?.priorAttempts?.[0].configRequestId).toBe(old.configRequestId);expect(f.journal.read()?.priorAttempts?.[0].configurationStage).toBe('conflict');
+  });
+  it('RS115-2 later settings between configuration and credentials retain the old receipt and permit deliberate fresh recovery',async()=>{
+    const f=versionedFixture(),input={git_token:'selected-new'};const old=beginRepositorySave('actor','update',configuration,input,'repo-a',time),original=f.transport.credentials;
+    f.transport.credentials=async(a,i,signal)=>{f.live.version=f.t3;f.live.configuration.poll_interval_secs=777;return original(a,i,signal);};
+    await expect(runRepositorySave(old,input,f.journal,f.transport)).rejects.toThrow('settings changed before credentials');
+    const conflict=f.journal.read()!;expect(conflict.configurationStage).toBe('saved');expect(conflict.credentialStage).toBe('conflict');expect(conflict.configurationReceipt?.configuration_updated_at).toBe(f.t2);
+    const resume=prepareRepositorySaveAttempt(conflict,configuration,input,{owner:'actor',targetId:'repo-a',expectedUpdatedAt:f.t3});
+    await expect(runRepositorySave(resume.attempt,input,f.journal,f.transport)).rejects.toThrow('Load and review');expect(f.live.configEffects).toBe(1);expect(f.live.credentialEffects).toBe(0);expect(f.live.credentialValue).toBe('later-unrelated-secret');
+    f.transport.credentials=original;const fresh={git_token:'explicitly-reentered'};
+    const next=beginReviewedRepositorySave(conflict,{id:'repo-a',updated_at:f.live.version},f.live.configuration,fresh,'actor');
+    const done=await runRepositorySave(next,fresh,f.journal,f.transport);expect(repositorySaveComplete(done)).toBe(true);expect(done.repoId).toBe('repo-a');expect(f.live.configuration.poll_interval_secs).toBe(777);expect(f.live.credentialValue).toBe(fresh.git_token);
+    expect(f.journal.read()?.priorAttempts?.[0].configurationReceipt).toEqual(conflict.configurationReceipt);expect(f.journal.read()?.priorAttempts?.[0].credentialStage).toBe('conflict');
+  });
+  it('RS115-3 actual editor ownership blocks A-to-B rebinding and keeps both journals independent',async()=>{
+    const f=fixture(),origin={owner:'actor',targetId:'A',session:'old'};let current={...origin};const owner=new RepositoryEditorOwnership(origin,()=>current);
+    const a=new RepositorySaveJournal('actor','repo:A',f.storage),b=new RepositorySaveJournal('actor','repo:B',f.storage);
+    a.write(beginRepositorySave('actor','update',configuration,secrets,'A',time));current={...current,targetId:'B'};
+    expect(()=>owner.assertCurrent()).toThrow('context changed');expect(b.read()).toBeNull();expect(a.read()?.configuration).toEqual(configuration);
+    expect(repositoryEditorKey(origin)).not.toBe(repositoryEditorKey(current));
+    const bOwner=new RepositoryEditorOwnership(current,()=>current),bInput={git_token:'B-only'};
+    const transport:RepositorySaveTransport={...f.transport,configuration:async(s,signal)=>{bOwner.assertCurrent();expect(s.repoId).toBe('B');expect(s.configuration.name).toBe('B only');return f.transport.configuration(s,signal);},credentials:async(s,i,signal)=>{bOwner.assertCurrent();expect(i).toEqual(bInput);return f.transport.credentials(s,i,signal);}};
+    await runRepositorySave(beginRepositorySave('actor','update',{...configuration,name:'B only'},bInput,'B',time),bInput,b,transport);
+    expect(a.read()?.repoId).toBe('A');expect(b.read()?.repoId).toBe('B');
+  });
+  it.each(['route','actor','session'] as const)('RS115-3 pending old callbacks/effects cannot advance a replacement %s view',async change=>{
+    const f=fixture();let current={owner:'actor',targetId:'A',session:'old'};const owner=new RepositoryEditorOwnership({...current},()=>current);let callbacks=0,oldErrors=0,release!:()=>void;
+    const gate=new Promise<void>(resolve=>{release=resolve;}),configurationCall=f.transport.configuration,credentialCall=f.transport.credentials;
+    f.transport.configuration=async(a,signal)=>{owner.assertCurrent();await gate;return configurationCall(a,signal);};f.transport.credentials=async(...args)=>{owner.assertCurrent();return credentialCall(...args);};
+    const running=runRepositorySave(f.attempt,secrets,f.journal,f.transport,()=>{if(owner.isCurrent())callbacks++;}).catch(error=>{if(owner.isCurrent())oldErrors++;throw error;});const before=callbacks;
+    current=change==='route' ? {...current,targetId:'B'} : change==='actor' ? {...current,owner:'other'} : {...current,session:'new'};owner.retire();release();
+    await expect(running).rejects.toThrow('context changed');expect(callbacks).toBe(before);expect(oldErrors).toBe(0);expect(f.state.credentialCalls).toBe(0);expect(f.journal.read()?.repoId).toBe('repo-created');expect(f.journal.read()?.credentialStage).toBe('unknown');
+  });
+  const changedPreferences=[{importMode:'snapshot',svnRevision:'HEAD'},{importMode:'full_history',svnRevision:'42'},{importMode:'snapshot',svnRevision:'42'}];
+  it.each(changedPreferences.flatMap(preferences=>[false,true].map(credentialsDelayed=>({preferences,credentialsDelayed}))))('RS115-4 preference-only edits survive delayed stages and reopen: %j',async({preferences,credentialsDelayed})=>{
+    const f=fixture();f.attempt.preferences={importMode:'full_history',svnRevision:'HEAD'};let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+    if(credentialsDelayed){const original=f.transport.credentials;f.transport.credentials=async(...args)=>{await gate;return original(...args);};}else f.state.gate=gate;
+    const running=runRepositorySave(f.attempt,secrets,f.journal,f.transport);if(credentialsDelayed)await new Promise(resolve=>setTimeout(resolve,0));
+    f.journal.rememberDraft(configuration,preferences);const reopened=new RepositorySaveJournal('actor','create',f.storage);expect(reopened.read()?.draftPreferences).toEqual(preferences);
+    release();const done=await running;expect(sameImportPreferences(preferences,done.preferences)).toBe(false);expect(reopened.read()?.draftPreferences).toEqual(preferences);
+    const effects=[f.state.configEffects,f.state.credentialEffects];expect(canContinueWithPreferences(done,configuration,{})).toBe(true);
+    expect({repoId:done.repoId,preferences:reopened.read()?.draftPreferences}).toEqual({repoId:'repo-created',preferences});
+    expect([f.state.configEffects,f.state.credentialEffects]).toEqual(effects);expect(done.configRequestId).toBe(f.attempt.configRequestId);expect(canContinueWithPreferences(done,{...configuration,name:'not just preferences'},{})).toBe(false);
+  });
 });

@@ -1,5 +1,5 @@
 import { useRepositorySave } from '../useRepositorySave';
-import { samePublicConfiguration, retainUnsavedCredentials } from '../repositorySave';
+import { samePublicConfiguration, retainUnsavedCredentials, sameImportPreferences, canContinueWithPreferences, repositoryEditorKey, publicConfiguration } from '../repositorySave';
 import RepositorySaveNotice from '../components/RepositorySaveNotice';
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -113,6 +113,11 @@ const defaultForm: AddRepoForm = {
 };
 
 export default function Repositories() {
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',session:localStorage.getItem('session_token')});
+  return <RepositoriesEditor key={key} />;
+}
+
+function RepositoriesEditor() {
   const navigate = useNavigate();
   const location = useLocation();
   const removalNotice = readBranchPairRemovalNotice(location.state) ?? readPersistedBranchPairRemovalNotice();
@@ -138,8 +143,8 @@ export default function Repositories() {
     if(showAddModal && saveFlow.initial) {
       const previous=saveFlow.initial;
       setForm({...defaultForm,...(previous.draftConfiguration ?? previous.configuration),svn_password:'',git_token:'',
-        initial_import_mode:(previous.preferences?.importMode ?? DEFAULT_REPO_IMPORT_MODE) as RepoImportMode,
-        initial_svn_revision:previous.preferences?.svnRevision ?? 'HEAD'});
+        initial_import_mode:((previous.draftPreferences ?? previous.preferences)?.importMode ?? DEFAULT_REPO_IMPORT_MODE) as RepoImportMode,
+        initial_svn_revision:(previous.draftPreferences ?? previous.preferences)?.svnRevision ?? 'HEAD'});
     }
   },[showAddModal,saveFlow.initial]);
   useEffect(()=>{
@@ -181,17 +186,34 @@ export default function Repositories() {
 
   function setField<K extends keyof AddRepoForm>(key: K, value: AddRepoForm[K]) {
     const next={...currentForm.current,[key]:value};currentForm.current=next;setForm(next);
-    saveFlow.rememberDraft(next);
+    saveFlow.rememberDraft(next,{importMode:next.initial_import_mode,svnRevision:next.initial_svn_revision});
+  }
+  async function loadCurrentSettingsForReview() {
+    const generation=dialogVersion.current;
+    try {
+      const current=await saveFlow.loadCurrentForReview();
+      if(!saveFlow.viewActive() || generation!==dialogVersion.current)return;
+      setForm(previous=>({...previous,...publicConfiguration(current),svn_password:'',git_token:''}));setSaveError(null);setSaveMessage('Review these current settings on the existing ID. Required credentials were cleared.');
+    } catch(cause) {if(saveFlow.viewActive() && generation===dialogVersion.current)setSaveError(cause instanceof Error ? cause.message : 'Current settings could not be read.');}
+  }
+  function useReviewedSettings() {
+    const live=currentForm.current;
+    try {saveFlow.useReviewedSettings(live,{svn_password:live.svn_password || undefined,git_token:live.git_token || undefined},{importMode:live.initial_import_mode,svnRevision:live.initial_svn_revision});setSaveError(null);setSaveMessage('New save prepared on the existing repository; earlier outcomes are retained.');}
+    catch(cause) {setSaveError(cause instanceof Error ? cause.message : 'Reviewed recovery could not be prepared.');}
   }
   function openAdd() {dialogVersion.current++;setSaveMessage(null);setSaveError(null);setShowAddModal(true);}
   function closeAdd() {
-    saveFlow.rememberDraft(currentForm.current);dialogVersion.current++;setShowAddModal(false);
+    saveFlow.rememberDraft(currentForm.current,{importMode:currentForm.current.initial_import_mode,svnRevision:currentForm.current.initial_svn_revision});dialogVersion.current++;setShowAddModal(false);
     setForm({...defaultForm});setSaveError(null);setSaveMessage(null);
   }
   async function handleCreate() {
     const generation=dialogVersion.current;
     const submitted={...currentForm.current};setSaveError(null);setSaveMessage(null);
     try {
+      if(canContinueWithPreferences(saveFlow.attempt,submitted,{svn_password:submitted.svn_password,git_token:submitted.git_token})) {
+        const previous=saveFlow.attempt;saveFlow.finish(previous.configRequestId);setShowAddModal(false);setForm({...defaultForm});
+        navigate(`/repos/${previous.repoId}`,{state:{importPrefs:{importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision}}});return;
+      }
       const result=await saveFlow.save(submitted,{svn_password:submitted.svn_password || undefined,git_token:submitted.git_token || undefined},undefined,
         {importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision});
       if(!result.viewActive || dialogVersion.current!==generation)return;
@@ -199,13 +221,14 @@ export default function Repositories() {
       const live=currentForm.current;
       const same= samePublicConfiguration(live,result.configuration)
         && (live.svn_password || '')===(result.credentials.svn_password || '')
-        && (live.git_token || '')===(result.credentials.git_token || '');
+        && (live.git_token || '')===(result.credentials.git_token || '')
+        && sameImportPreferences({importMode:live.initial_import_mode,svnRevision:live.initial_svn_revision},result.preferences);
       if(!same) {setForm(previous=>({...previous,...retainUnsavedCredentials(previous,result.credentials)}));setSaveMessage('The earlier save completed on the existing ID. Newer entered changes remain unsaved; save again to update that registration.');return;}
       saveFlow.finish(result.attempt.configRequestId);
       setShowAddModal(false);setForm({...defaultForm});setSvnTestResult(null);setGitTestResult(null);
       navigate(`/repos/${result.attempt.repoId}`,{state:{importPrefs:{importMode:submitted.initial_import_mode,svnRevision:submitted.initial_svn_revision}}});
     } catch(cause) {
-      if(dialogVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; the recovery record was retained.');
+      if(saveFlow.viewActive() && dialogVersion.current===generation)setSaveError(cause instanceof Error ? cause.message : 'Save is not confirmed; the recovery record was retained.');
     }
   }
 
@@ -429,7 +452,7 @@ export default function Repositories() {
             </div>
 
             <div className="p-6 space-y-6">
-              <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} />
+              <RepositorySaveNotice attempt={saveFlow.attempt} error={saveError ?? saveFlow.error} pending={saveFlow.pending} onLoadCurrent={loadCurrentSettingsForReview} onUseReviewed={useReviewedSettings} reviewed={!!saveFlow.reviewedCurrent} />
               {saveMessage && <p role="status" className="text-yellow-300">{saveMessage}</p>}
 
               {/* Name */}
