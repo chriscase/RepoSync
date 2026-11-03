@@ -571,6 +571,23 @@ impl GitToSvnSync {
             .await
             .context("svn update failed")?;
 
+        self.svn
+            .require_supported_working_copy(&self.svn_wc_path)
+            .await
+            .context("unsupported SVN node properties before Personal apply")?;
+        let before = self
+            .svn
+            .status_entries(&self.svn_wc_path)
+            .await
+            .context("failed to inspect working-copy state before apply")?;
+        if before.iter().any(|entry| {
+            matches!(
+                entry.item.as_str(),
+                "modified" | "added" | "deleted" | "missing" | "replaced"
+            ) || entry.properties == "modified"
+        }) {
+            anyhow::bail!("working copy contains pre-existing pending changes; refusing apply before mutation");
+        }
         let mut apply_ownership = ApplyAbortOwnership::default();
         let replay_result: Result<i64> = async {
             let info = self
@@ -589,11 +606,18 @@ impl GitToSvnSync {
             // 3. Detect status changes and stage them.
             let status_output = self
                 .svn
-                .status(&self.svn_wc_path)
+                .status_entries(&self.svn_wc_path)
                 .await
                 .context("svn status failed")?;
 
-            let (added, deleted) = parse_svn_status(&status_output);
+            // Only this projection's owned paths may be staged. A recursive
+            // unversioned-directory status entry is never a staging authority.
+            let added = apply_ownership.new_files.clone();
+            let deleted: Vec<String> = status_output.iter().filter(|entry| entry.item == "missing" && apply_ownership.touched_paths.contains(&entry.path)).map(|entry| entry.path.clone()).collect();
+            if status_output.iter().any(|entry| (matches!(entry.item.as_str(), "added" | "modified" | "deleted" | "replaced") || entry.properties == "modified")
+                && !apply_ownership.touched_paths.contains(&entry.path) && !apply_ownership.created_dirs.contains(&entry.path)) {
+                anyhow::bail!("working copy changed outside this projection; refusing publication");
+            }
 
             if !added.is_empty() {
                 let refs: Vec<&str> = added.iter().map(|s| s.as_str()).collect();
@@ -614,7 +638,7 @@ impl GitToSvnSync {
             }
 
             // If there are no changes, the commit is a no-op (e.g., merge-only commits).
-            if status_output.trim().is_empty() && added.is_empty() && deleted.is_empty() {
+            if status_output.is_empty() && added.is_empty() && deleted.is_empty() {
                 warn!(
                     git_sha = %commit.sha,
                     "no file changes detected, performing empty-diff commit for traceability"
@@ -640,7 +664,7 @@ impl GitToSvnSync {
                 &info.url,
                 "{}",
             );
-            let identity = svn_path_identity(&info.root_url, &info.url);
+            let identity = svn_path_identity(&info.root_url, &info.url).context("invalid SVN target namespace")?;
             let request_id = format!("git-{}", commit.sha);
             let git_author = commit.commit.author.name.as_str();
             let op = self
@@ -898,6 +922,15 @@ impl GitToSvnSync {
         }
 
         let file_changes = projected.into_file_contents();
+        self.svn
+            .require_supported_working_copy(&self.svn_wc_path)
+            .await
+            .context("unsupported SVN node properties before projected write")?;
+        let confined =
+            reposync_core::svn::working_copy::ConfinedWorkingCopy::open(&self.svn_wc_path)?;
+        confined
+            .preflight(file_changes.iter().map(|(_, path, _)| path.as_str()))
+            .context("unsupported destination in projected SVN write set")?;
         for (action, file_path, content) in &file_changes {
             validate_apply_rel_path(file_path)?;
 
@@ -907,8 +940,8 @@ impl GitToSvnSync {
                     // so `svn status` picks it up as missing.
                     refuse_apply_path_symlink_ancestors(&self.svn_wc_path, file_path)?;
                     let dst = confined_apply_path(&self.svn_wc_path, file_path)?;
-                    if dst.exists() {
-                        std::fs::remove_file(&dst).with_context(|| {
+                    if confined.inspect_file(file_path)? {
+                        confined.remove_file(file_path).with_context(|| {
                             format!("failed to remove deleted file: {}", dst.display())
                         })?;
                     }
@@ -970,11 +1003,13 @@ impl GitToSvnSync {
 
                                 refuse_apply_path_symlink_ancestors(&self.svn_wc_path, file_path)?;
                                 let dst = confined_apply_path(&self.svn_wc_path, file_path)?;
-                                let file_preexisted = std::fs::symlink_metadata(&dst).is_ok();
+                                let file_preexisted = confined.inspect_file(file_path)?;
                                 ensure_apply_parent_dirs(&self.svn_wc_path, file_path, ownership)?;
-                                std::fs::write(&dst, &write_content).with_context(|| {
-                                    format!("failed to write file: {}", dst.display())
-                                })?;
+                                confined
+                                    .write_file(file_path, &write_content)
+                                    .with_context(|| {
+                                        format!("failed to write file: {}", dst.display())
+                                    })?;
                                 ownership.touched_paths.push(file_path.clone());
                                 if !file_preexisted {
                                     ownership.new_files.push(file_path.clone());
@@ -1028,11 +1063,13 @@ impl GitToSvnSync {
 
                                 refuse_apply_path_symlink_ancestors(&self.svn_wc_path, file_path)?;
                                 let dst = confined_apply_path(&self.svn_wc_path, file_path)?;
-                                let file_preexisted = std::fs::symlink_metadata(&dst).is_ok();
+                                let file_preexisted = confined.inspect_file(file_path)?;
                                 ensure_apply_parent_dirs(&self.svn_wc_path, file_path, ownership)?;
-                                std::fs::write(&dst, &write_content).with_context(|| {
-                                    format!("failed to write file: {}", dst.display())
-                                })?;
+                                confined
+                                    .write_file(file_path, &write_content)
+                                    .with_context(|| {
+                                        format!("failed to write file: {}", dst.display())
+                                    })?;
                                 ownership.touched_paths.push(file_path.clone());
                                 if !file_preexisted {
                                     ownership.new_files.push(file_path.clone());
@@ -1583,44 +1620,9 @@ fn apply_abort_cleanliness_scope(ownership: &ApplyAbortOwnership) -> Vec<String>
 /// Refuse apply when any existing path component under the WC root is a symlink.
 fn refuse_apply_path_symlink_ancestors(wc_root: &Path, rel: &str) -> Result<()> {
     validate_apply_rel_path(rel)?;
-    let wc_meta = std::fs::symlink_metadata(wc_root).with_context(|| {
-        format!(
-            "failed to read SVN working copy root metadata: {}",
-            wc_root.display()
-        )
-    })?;
-    if wc_meta.file_type().is_symlink() {
-        anyhow::bail!(
-            "SVN working copy root is a symlink; refusing apply for '{}'",
-            rel
-        );
-    }
-
-    let mut built = wc_root.to_path_buf();
-    for component in Path::new(rel).components() {
-        if let Component::Normal(name) = component {
-            built = built.join(name);
-            let meta = match std::fs::symlink_metadata(&built) {
-                Ok(meta) => meta,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "failed to inspect apply path component: {}",
-                            built.display()
-                        )
-                    });
-                }
-            };
-            if meta.file_type().is_symlink() {
-                anyhow::bail!(
-                    "refusing apply through symlink at '{}' (requested '{}')",
-                    built.display(),
-                    rel
-                );
-            }
-        }
-    }
+    reposync_core::svn::working_copy::ConfinedWorkingCopy::open(wc_root)?
+        .inspect_file(rel)
+        .context("refusing unsupported or symlinked apply path")?;
     Ok(())
 }
 
@@ -1630,6 +1632,7 @@ fn confined_apply_path(wc_root: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 fn validate_apply_rel_path(path: &str) -> Result<()> {
+    reposync_core::svn::operand::validate_relative_path(path)?;
     if path.is_empty() {
         anyhow::bail!("apply path must not be empty");
     }
@@ -1663,35 +1666,15 @@ fn validate_apply_ownership_paths(ownership: &ApplyAbortOwnership) -> Result<()>
     Ok(())
 }
 
-fn rel_path_under_wc(wc_root: &Path, dir: &Path) -> Result<String> {
-    let rel = dir
-        .strip_prefix(wc_root)
-        .with_context(|| format!("path escapes SVN working copy: {}", dir.display()))?;
-    Ok(rel.to_string_lossy().replace('\\', "/"))
-}
-
 fn record_apply_parent_dirs_if_missing(
     wc_root: &Path,
     file_rel: &str,
     ownership: &mut ApplyAbortOwnership,
 ) -> Result<()> {
-    let file_path = wc_root.join(file_rel);
-    let mut parents = Vec::new();
-    let mut current = file_path.parent();
-    while let Some(dir) = current {
-        if dir == wc_root {
-            break;
-        }
-        parents.push(dir.to_path_buf());
-        current = dir.parent();
-    }
-    parents.reverse();
-    for dir in parents {
-        if std::fs::symlink_metadata(&dir).is_err() {
-            let rel = rel_path_under_wc(wc_root, &dir)?;
-            if !ownership.created_dirs.contains(&rel) {
-                ownership.created_dirs.push(rel);
-            }
+    let confined = reposync_core::svn::working_copy::ConfinedWorkingCopy::open(wc_root)?;
+    for relative in confined.missing_parent_directories(file_rel)? {
+        if !ownership.created_dirs.contains(&relative) {
+            ownership.created_dirs.push(relative);
         }
     }
     Ok(())
@@ -1703,13 +1686,8 @@ fn ensure_apply_parent_dirs(
     ownership: &mut ApplyAbortOwnership,
 ) -> Result<()> {
     record_apply_parent_dirs_if_missing(wc_root, file_rel, ownership)?;
-    let file_path = wc_root.join(file_rel);
-    if let Some(parent) = file_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-        }
-    }
+    // Actual creation is performed by the descriptor-relative file writer.
+    // Retain intended missing parents first for abort cleanup if it fails.
     Ok(())
 }
 
@@ -1774,14 +1752,18 @@ async fn restore_apply_abort_on_wc(
         .context("failed to remove apply-created files and directories")?;
 
     let final_status = svn
-        .status(wc_root)
+        .status_entries(wc_root)
         .await
         .context("svn status failed while verifying restored working copy")?;
     let scope = apply_abort_cleanliness_scope(ownership);
-    if !are_apply_paths_clean(&final_status, &scope) {
+    if final_status.iter().any(|entry| {
+        scope
+            .iter()
+            .any(|path| apply_abort_status_in_scope(&entry.path, path))
+    }) {
         anyhow::bail!(
-            "SVN working copy still dirty on touched apply paths after abort restore: {}",
-            final_status.trim()
+            "SVN working copy still dirty on touched apply paths after abort restore: {:?}",
+            final_status
         );
     }
 
@@ -1794,27 +1776,19 @@ async fn restore_apply_abort_on_wc(
 }
 
 fn remove_apply_created_paths(wc_root: &Path, ownership: &ApplyAbortOwnership) -> Result<()> {
+    let confined = reposync_core::svn::working_copy::ConfinedWorkingCopy::open(wc_root)?;
     for rel in &ownership.new_files {
         validate_apply_rel_path(rel)?;
         let full = wc_root.join(rel);
-        if full
-            .symlink_metadata()
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-        {
-            std::fs::remove_file(&full).with_context(|| {
-                format!("failed to remove apply-created file: {}", full.display())
-            })?;
-        }
+        confined
+            .remove_file(rel)
+            .with_context(|| format!("failed to remove apply-created file: {}", full.display()))?;
     }
 
     for rel in ownership.created_dirs.iter().rev() {
         validate_apply_rel_path(rel)?;
         let full = wc_root.join(rel);
-        if !full.is_dir() {
-            continue;
-        }
-        match std::fs::remove_dir(&full) {
+        match confined.remove_empty_directory(rel) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
@@ -1851,6 +1825,7 @@ fn remove_apply_created_paths(wc_root: &Path, ownership: &ApplyAbortOwnership) -
 /// Returns `(added, deleted)` where:
 /// - `added` contains paths of unversioned files to `svn add`.
 /// - `deleted` contains paths of missing files to `svn rm`.
+#[cfg(test)]
 fn parse_svn_status(output: &str) -> (Vec<String>, Vec<String>) {
     let mut added = Vec::new();
     let mut deleted = Vec::new();

@@ -137,14 +137,21 @@ pub async fn observed_svn_tree_at_revision(
     hash_regular_file_tree(&dest).map_err(SvnError::IoError)
 }
 
-fn operation_path_identity(op: &SvnCommitOperation, live_root_url: &str) -> SvnPathIdentity {
-    if !op.target_svn_root_url.is_empty() {
-        return SvnPathIdentity {
-            root_url: op.target_svn_root_url.clone(),
-            branch_path: op.target_svn_branch_path.clone(),
-        };
+fn operation_path_identity(
+    op: &SvnCommitOperation,
+    live_root_url: &str,
+) -> Result<SvnPathIdentity, SvnError> {
+    let identity = svn_path_identity(live_root_url, &op.target_svn_path)?;
+    if !op.target_svn_root_url.is_empty()
+        && (crate::path_projection::normalize_svn_url(&op.target_svn_root_url) != identity.root_url
+            || op.target_svn_branch_path != identity.branch_path)
+    {
+        return Err(SvnError::LineageRefused {
+            reason: "svn_journal_namespace_mismatch".into(),
+            detail: "retained journal namespace differs from the checked live target; no reinterpretation".into(),
+        });
     }
-    svn_path_identity(live_root_url, &op.target_svn_path)
+    Ok(identity)
 }
 
 fn paths_match(
@@ -307,7 +314,14 @@ pub async fn inspect_git_to_svn_commit(
             reason: "successor revision does not carry the durable operation identity".into(),
         };
     }
-    let identity = operation_path_identity(op, &info.root_url);
+    let identity = match operation_path_identity(op, &info.root_url) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return SvnCommitInspect::Conflict {
+                reason: error.to_string(),
+            }
+        }
+    };
     let raw_observed: Vec<IntendedPath> = entry
         .changed_paths
         .iter()

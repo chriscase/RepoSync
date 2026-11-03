@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, info, instrument, trace, warn};
 
+use super::operand::{literal_path, literal_url, local_destination, repository_url};
 use super::parser::{
     parse_svn_diff_summarize, parse_svn_info, parse_svn_log, SvnDiffEntry, SvnInfo, SvnLogEntry,
 };
@@ -28,11 +29,25 @@ pub struct SvnClient {
     refresh_config: Option<Arc<tempfile::TempDir>>,
 }
 
+// Never log unvalidated userinfo/query text, including unsupported or malformed
+// URLs that will be refused before launch. This does not alter the source URL.
+fn diagnostic_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return "[REDACTED invalid SVN URL]".into();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return "[REDACTED SVN URL userinfo]".into();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.into()
+}
+
 // Custom Debug implementation that redacts the password field.
 impl fmt::Debug for SvnClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SvnClient")
-            .field("url", &self.url)
+            .field("url", &diagnostic_url(&self.url))
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .finish()
@@ -77,7 +92,7 @@ impl SvnClient {
             cancel: None,
             refresh_config: None,
         };
-        info!(url = %client.url, username = %client.username, "created SvnClient");
+        info!(url = %diagnostic_url(&client.url), username = %client.username, "created SvnClient");
         client
     }
 
@@ -125,8 +140,8 @@ impl SvnClient {
     }
 
     fn command_stderr(&self, bytes: &[u8]) -> String {
-        let stderr = String::from_utf8_lossy(bytes).to_string();
-        if self.refresh_config.is_some() && !self.password.is_empty() {
+        let stderr = crate::errors::redact_vcs_error_detail(&String::from_utf8_lossy(bytes));
+        if !self.password.is_empty() {
             stderr.replace(&self.password, "[REDACTED]")
         } else {
             stderr
@@ -181,7 +196,8 @@ impl SvnClient {
             "empty",
             "-r",
             &revision.to_string(),
-            &format!("{}@{}", self.url, revision),
+            "--",
+            &literal_url(&self.url, Some(revision))?,
         ])
         .await
     }
@@ -208,31 +224,35 @@ impl SvnClient {
         self.username = username.into();
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn info(&self) -> Result<SvnInfo, SvnError> {
-        let output = self.run_svn(&["info", "--xml", &self.url]).await?;
+        let output = self
+            .run_svn(&["info", "--xml", "--", &literal_url(&self.url, None)?])
+            .await?;
         parse_svn_info(&output)
     }
 
     /// Last changed revision of this URL. Repository HEAD is not path identity.
     pub async fn last_changed_revision(&self) -> Result<i64, SvnError> {
-        let output = self.run_svn(&["info", "--xml", &self.url]).await?;
+        let output = self
+            .run_svn(&["info", "--xml", "--", &literal_url(&self.url, None)?])
+            .await?;
         super::parser::parse_svn_last_changed_revision(&output)
     }
 
     /// `svn info` at a peg revision so identity is the selected snapshot,
     /// not whatever HEAD has become.
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn info_at_rev(&self, rev: i64) -> Result<SvnInfo, SvnError> {
         if rev < 1 {
             return Err(SvnError::RevisionNotFound(rev));
         }
-        let peg_url = format!("{}@{}", self.url, rev);
-        let output = self.run_svn(&["info", "--xml", &peg_url]).await?;
+        let peg_url = literal_url(&self.url, Some(rev))?;
+        let output = self.run_svn(&["info", "--xml", "--", &peg_url]).await?;
         parse_svn_info(&output)
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn log(&self, start_rev: i64, end_rev: i64) -> Result<Vec<SvnLogEntry>, SvnError> {
         let end_str = if end_rev < 0 {
             "HEAD".to_string()
@@ -241,7 +261,15 @@ impl SvnClient {
         };
         let rev_range = format!("{}:{}", start_rev, end_str);
         let output = self
-            .run_svn(&["log", "--xml", "--verbose", "-r", &rev_range, &self.url])
+            .run_svn(&[
+                "log",
+                "--xml",
+                "--verbose",
+                "-r",
+                &rev_range,
+                "--",
+                &literal_url(&self.url, None)?,
+            ])
             .await?;
         parse_svn_log(&output)
     }
@@ -257,9 +285,9 @@ impl SvnClient {
             return Err(SvnError::XmlParseError("invalid proof log range".into()));
         }
         let range = format!("{start_rev}:{end_rev}");
-        let target = format!("{}@{end_rev}", self.url);
+        let target = literal_url(&self.url, Some(end_rev))?;
         let output = self
-            .run_svn(&["log", "--xml", "--verbose", "-r", &range, &target])
+            .run_svn(&["log", "--xml", "--verbose", "-r", &range, "--", &target])
             .await?;
         let entries = super::parser::parse_svn_copy_history(&output)?;
         let mut revisions = std::collections::BTreeSet::new();
@@ -286,7 +314,7 @@ impl SvnClient {
             return Err(SvnError::RevisionNotFound(peg_revision));
         }
         let range = format!("{peg_revision}:1");
-        let target = format!("{}@{peg_revision}", self.url);
+        let target = literal_url(&self.url, Some(peg_revision))?;
         let output = self
             .run_svn(&[
                 "log",
@@ -295,25 +323,34 @@ impl SvnClient {
                 "--stop-on-copy",
                 "-r",
                 &range,
+                "--",
                 &target,
             ])
             .await?;
         super::parser::parse_svn_copy_history(&output)
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn diff(&self, rev: i64) -> Result<Vec<SvnDiffEntry>, SvnError> {
         if rev < 1 {
             return Err(SvnError::RevisionNotFound(rev));
         }
         let rev_range = format!("{}:{}", rev - 1, rev);
         let output = self
-            .run_svn(&["diff", "--summarize", "--xml", "-r", &rev_range, &self.url])
+            .run_svn(&[
+                "diff",
+                "--summarize",
+                "--xml",
+                "-r",
+                &rev_range,
+                "--",
+                &literal_url(&self.url, Some(rev))?,
+            ])
             .await?;
         parse_svn_diff_summarize(&output)
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn diff_full(&self, rev: i64) -> Result<String, SvnError> {
         if rev < 1 {
             return Err(SvnError::RevisionNotFound(rev));
@@ -322,8 +359,9 @@ impl SvnClient {
         // Peg at rev so the URL is resolved as it existed at that
         // revision — important for branch pairs whose branch path was
         // deleted in later revisions.
-        let peg_url = format!("{}@{}", self.url, rev);
-        self.run_svn(&["diff", "-r", &rev_range, &peg_url]).await
+        let peg_url = literal_url(&self.url, Some(rev))?;
+        self.run_svn(&["diff", "-r", &rev_range, "--", &peg_url])
+            .await
     }
 
     /// Inspect file-content changes without SVN properties when deciding
@@ -333,17 +371,32 @@ impl SvnClient {
             return Err(SvnError::RevisionNotFound(rev));
         }
         let rev_range = format!("{}:{}", rev - 1, rev);
-        let peg_url = format!("{}@{}", self.url, rev);
-        self.run_svn(&["diff", "--ignore-properties", "-r", &rev_range, &peg_url])
-            .await
+        let peg_url = literal_url(&self.url, Some(rev))?;
+        self.run_svn(&[
+            "diff",
+            "--ignore-properties",
+            "-r",
+            &rev_range,
+            "--",
+            &peg_url,
+        ])
+        .await
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn checkout(&self, path: &Path, rev: i64) -> Result<(), SvnError> {
         let rev_str = rev.to_string();
-        let path_str = path.to_string_lossy().to_string();
-        self.run_svn(&["checkout", "-r", &rev_str, &self.url, &path_str])
-            .await?;
+        let path_str = local_destination(path)?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "-r",
+            &rev_str,
+            "--",
+            &literal_url(&self.url, Some(rev))?,
+            path_str,
+        ])
+        .await?;
         info!(path = %path.display(), rev, "svn checkout completed");
         Ok(())
     }
@@ -366,7 +419,8 @@ impl SvnClient {
             "--ignore-externals",
             "-r",
             &rev.to_string(),
-            &format!("{}@{}", self.url, rev),
+            "--",
+            &literal_url(&self.url, Some(rev))?,
             destination,
         ])
         .await?;
@@ -393,7 +447,8 @@ impl SvnClient {
             "infinity",
             "-r",
             &rev.to_string(),
-            &format!("{}@{}", self.url, rev),
+            "--",
+            &literal_url(&self.url, Some(rev))?,
             destination,
         ])
         .await?;
@@ -413,27 +468,44 @@ impl SvnClient {
             "--show-inherited-props",
             "-r",
             &rev.to_string(),
-            &format!("{}@{}", self.url, rev),
+            "--",
+            &literal_url(&self.url, Some(rev))?,
         ])
         .await
     }
 
     /// Checkout the SVN repository at HEAD into the given directory.
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn checkout_head(&self, path: &Path) -> Result<(), SvnError> {
-        let path_str = path.to_string_lossy().to_string();
-        self.run_svn(&["checkout", &self.url, &path_str]).await?;
+        let path_str = local_destination(path)?;
+        self.run_svn(&[
+            "checkout",
+            "--ignore-externals",
+            "--",
+            &literal_url(&self.url, None)?,
+            path_str,
+        ])
+        .await?;
         info!(path = %path.display(), "svn checkout (HEAD) completed");
         Ok(())
     }
 
     #[instrument(skip(self, message), fields(path = %path.display()))]
     pub async fn commit(&self, path: &Path, message: &str, _author: &str) -> Result<i64, SvnError> {
-        let path_str = path.to_string_lossy().to_string();
+        self.require_supported_working_copy(path).await?;
+        let path_str = local_destination(path)?;
         let output = self
             .run_svn_in_dir_with_input(
                 path,
-                &["commit", "--file", "-", "--encoding", "UTF-8", &path_str],
+                &[
+                    "commit",
+                    "--file",
+                    "-",
+                    "--encoding",
+                    "UTF-8",
+                    "--",
+                    &format!("{path_str}@"),
+                ],
                 Some(crate::commit_message::input(message)?),
             )
             .await?;
@@ -456,7 +528,7 @@ impl SvnClient {
         Ok(rev)
     }
 
-    #[instrument(skip(self, prop_value), fields(url = %self.url, rev, prop_name))]
+    #[instrument(skip(self, prop_value), fields(url = %diagnostic_url(&self.url), rev, prop_name))]
     pub async fn set_rev_prop(
         &self,
         rev: i64,
@@ -469,29 +541,40 @@ impl SvnClient {
             "--revprop",
             "-r",
             &rev_str,
+            "--",
             prop_name,
             prop_value,
-            &self.url,
+            &literal_url(&self.url, None)?,
         ])
         .await?;
         debug!(rev, prop_name, "set revision property");
         Ok(())
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn list_branches(&self, branches_path: &str) -> Result<Vec<String>, SvnError> {
-        let branches_url = format!("{}/{}", self.url, branches_path);
-        let output = self.run_svn(&["list", &branches_url]).await?;
-        let branches: Vec<String> = output
-            .lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.trim_end_matches('/').to_string())
-            .collect();
+        let branches_url = literal_url(&repository_url(&self.url, branches_path)?, None)?;
+        let output = self
+            .run_svn(&["list", "--xml", "--", &branches_url])
+            .await?;
+        let document = roxmltree::Document::parse(&output)
+            .map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+        let branches: Vec<String> = document
+            .descendants()
+            .filter(|n| n.has_tag_name("entry"))
+            .map(|n| {
+                n.children()
+                    .find(|n| n.has_tag_name("name"))
+                    .and_then(|n| n.text())
+                    .map(str::to_owned)
+                    .ok_or_else(|| SvnError::XmlParseError("missing SVN list name".into()))
+            })
+            .collect::<Result<_, _>>()?;
         debug!(count = branches.len(), "listed branches");
         Ok(branches)
     }
 
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn create_branch(
         &self,
         name: &str,
@@ -499,28 +582,22 @@ impl SvnClient {
         branches_path: &str,
         source_rev: i64,
     ) -> Result<(), SvnError> {
-        // Guard against path traversal in branch names
-        if name.contains("..") || branches_path.contains("..") || source_path.contains("..") {
-            return Err(SvnError::CommandFailed {
-                exit_code: 1,
-                stderr: "path traversal ('..') not allowed in branch names".to_string(),
-            });
-        }
-
-        let src_url = format!("{}/{}", self.url, source_path);
-        let dest_url = format!("{}/{}/{}", self.url, branches_path, name);
+        let src_url = literal_url(&repository_url(&self.url, source_path)?, Some(source_rev))?;
+        let branch = format!("{branches_path}/{name}");
+        let dest_url = literal_url(&repository_url(&self.url, &branch)?, None)?;
         let rev_str = source_rev.to_string();
 
         // Ensure the parent directory exists (e.g., branches/dev/ for branches/dev/james-wilson).
         // svn copy fails if intermediate directories are missing.
-        let parent_url = format!("{}/{}", self.url, branches_path);
+        let parent_url = literal_url(&repository_url(&self.url, branches_path)?, None)?;
         match self
             .run_svn(&[
                 "mkdir",
                 "--parents",
-                &parent_url,
                 "-m",
                 &format!("Create directory {}", branches_path),
+                "--",
+                &parent_url,
             ])
             .await
         {
@@ -542,24 +619,23 @@ impl SvnClient {
             "Create branch {} from {} at r{}",
             name, source_path, source_rev
         );
-        self.run_svn(&["copy", "-r", &rev_str, &src_url, &dest_url, "-m", &message])
-            .await?;
+        self.run_svn(&[
+            "copy", "-r", &rev_str, "-m", &message, "--", &src_url, &dest_url,
+        ])
+        .await?;
         info!(name, source_rev, "created branch");
         Ok(())
     }
 
     /// Delete an SVN branch (or directory) from the repository.
-    #[instrument(skip(self), fields(url = %self.url))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url)))]
     pub async fn delete_branch(&self, branch_path: &str) -> Result<(), SvnError> {
-        if branch_path.contains("..") {
-            return Err(SvnError::CommandFailed {
-                exit_code: 1,
-                stderr: "path traversal ('..') not allowed in branch path".to_string(),
-            });
-        }
-        let branch_url = format!("{}/{}", self.url, branch_path);
+        let branch_url = literal_url(&repository_url(&self.url, branch_path)?, None)?;
         let message = format!("Delete branch {}", branch_path);
-        match self.run_svn(&["rm", &branch_url, "-m", &message]).await {
+        match self
+            .run_svn(&["rm", "-m", &message, "--", &branch_url])
+            .await
+        {
             Ok(_) => {
                 info!(branch_path, "deleted SVN branch");
                 Ok(())
@@ -580,20 +656,26 @@ impl SvnClient {
         }
     }
 
-    #[instrument(skip(self), fields(url = %self.url, rev))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev))]
     pub async fn export(&self, path: &str, rev: i64, dest: &Path) -> Result<(), SvnError> {
-        let src_url = if path.is_empty() {
-            self.url.clone()
-        } else {
-            format!("{}/{}", self.url, path)
-        };
+        let src_url = repository_url(&self.url, path)?;
+        self.require_supported_export_nodes(&src_url, rev).await?;
         let rev_str = rev.to_string();
-        let dest_str = dest.to_string_lossy().to_string();
+        let dest_str = local_destination(dest)?;
         // Peg the path at `rev` so export stays on the pinned snapshot even
         // if the live URL is later deleted, copied, or advanced.
-        let peg_url = format!("{}@{}", src_url, rev);
-        self.run_svn(&["export", "--force", "-r", &rev_str, &peg_url, &dest_str])
-            .await?;
+        let peg_url = literal_url(&src_url, Some(rev))?;
+        self.run_svn(&[
+            "export",
+            "--force",
+            "--ignore-externals",
+            "-r",
+            &rev_str,
+            "--",
+            &peg_url,
+            dest_str,
+        ])
+        .await?;
         info!(dest = %dest.display(), rev, "svn export completed");
         Ok(())
     }
@@ -602,13 +684,13 @@ impl SvnClient {
     /// verifier conservatively refuses any property until its mapping is
     /// explicitly defined; export alone does not include property evidence.
     pub async fn file_properties_at_rev(&self, path: &str, rev: i64) -> Result<String, SvnError> {
-        let url = format!("{}/{}@{}", self.url.trim_end_matches('/'), path, rev);
-        self.run_svn(&["proplist", "--xml", "-r", &rev.to_string(), &url])
+        let url = literal_url(&repository_url(&self.url, path)?, Some(rev))?;
+        self.run_svn(&["proplist", "--xml", "-r", &rev.to_string(), "--", &url])
             .await
     }
 
     /// Export at a given depth (e.g. "immediates" for top-level only).
-    #[instrument(skip(self), fields(url = %self.url, rev, depth))]
+    #[instrument(skip(self), fields(url = %diagnostic_url(&self.url), rev, depth))]
     pub async fn export_depth(
         &self,
         path: &str,
@@ -616,15 +698,21 @@ impl SvnClient {
         dest: &Path,
         depth: &str,
     ) -> Result<(), SvnError> {
-        let src_url = if path.is_empty() {
-            self.url.clone()
-        } else {
-            format!("{}/{}", self.url, path)
-        };
+        let src_url = repository_url(&self.url, path)?;
+        self.require_supported_export_nodes(&src_url, rev).await?;
         let rev_str = rev.to_string();
-        let dest_str = dest.to_string_lossy().to_string();
+        let dest_str = local_destination(dest)?;
         self.run_svn(&[
-            "export", "--force", "-r", &rev_str, "--depth", depth, &src_url, &dest_str,
+            "export",
+            "--force",
+            "--ignore-externals",
+            "-r",
+            &rev_str,
+            "--depth",
+            depth,
+            "--",
+            &literal_url(&src_url, Some(rev))?,
+            dest_str,
         ])
         .await?;
         debug!(dest = %dest.display(), rev, depth, "svn export (depth) completed");
@@ -636,7 +724,9 @@ impl SvnClient {
     /// Run `svn update` on a working copy.
     #[instrument(skip(self), fields(path = %path.display()))]
     pub async fn update(&self, path: &Path) -> Result<String, SvnError> {
-        let output = self.run_svn_in_dir(path, &["update"]).await?;
+        let output = self
+            .run_svn_in_dir(path, &["update", "--ignore-externals", "--", ".@"])
+            .await?;
         info!(path = %path.display(), "svn update completed");
         Ok(output)
     }
@@ -647,8 +737,16 @@ impl SvnClient {
         if files.is_empty() {
             return Ok(());
         }
-        let mut args = vec!["revert"];
-        args.extend_from_slice(files);
+        let confined = super::working_copy::ConfinedWorkingCopy::open(path)?;
+        for file in files {
+            confined.inspect_operand(file, true)?;
+        }
+        let encoded = files
+            .iter()
+            .map(|p| literal_path(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut args = vec!["revert", "--"];
+        args.extend(encoded.iter().map(String::as_str));
         self.run_svn_in_dir(path, &args).await?;
         debug!(count = files.len(), "svn revert completed");
         Ok(())
@@ -657,7 +755,8 @@ impl SvnClient {
     /// Revert every local change under a working-copy root.
     #[instrument(skip(self), fields(path = %path.display()))]
     pub async fn revert_recursive(&self, path: &Path) -> Result<(), SvnError> {
-        self.run_svn_in_dir(path, &["revert", "-R", "."]).await?;
+        self.run_svn_in_dir(path, &["revert", "-R", "--", ".@"])
+            .await?;
         debug!(path = %path.display(), "svn revert -R completed");
         Ok(())
     }
@@ -668,9 +767,24 @@ impl SvnClient {
         if files.is_empty() {
             return Ok(());
         }
+        let confined = super::working_copy::ConfinedWorkingCopy::open(path)?;
         for file in files {
-            self.run_svn_in_dir(path, &["add", "--force", "--parents", file])
-                .await?;
+            confined.inspect_operand(file, true)?;
+        }
+        for file in files {
+            self.run_svn_in_dir(
+                path,
+                &[
+                    "add",
+                    "--force",
+                    "--parents",
+                    "--depth",
+                    "empty",
+                    "--",
+                    &literal_path(file)?,
+                ],
+            )
+            .await?;
         }
         debug!(count = files.len(), "svn add completed");
         Ok(())
@@ -681,59 +795,9 @@ impl SvnClient {
     /// parent-node errors because we always add from a versioned parent
     /// downward, letting SVN handle the entire subtree at once.
     pub async fn add_with_retry(&self, wc_path: &Path, files: &[&str]) -> Result<(), SvnError> {
-        if files.is_empty() {
-            return Ok(());
-        }
-
-        // Find topmost new directories that need adding.
-        // A "new" directory is one that exists on disk but whose parent
-        // IS versioned in SVN (i.e., the parent is part of the checkout).
-        // We detect this by checking `svn info` on each ancestor.
-        let mut top_dirs_added: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        for file in files {
-            let file_path = std::path::Path::new(file);
-
-            // Walk up from the file's parent to find the topmost unversioned dir
-            let mut topmost_new: Option<String> = None;
-            let mut cur = file_path.parent();
-            while let Some(p) = cur {
-                if p.as_os_str().is_empty() {
-                    break;
-                }
-                let dir_str = p.to_string_lossy().to_string();
-                // Check if this directory is versioned by running svn info
-                let info_result = self.run_svn_in_dir(wc_path, &["info", &dir_str]).await;
-                if info_result.is_err() {
-                    // Not versioned — this might be the topmost new dir
-                    topmost_new = Some(dir_str);
-                } else {
-                    // Versioned — stop walking up
-                    break;
-                }
-                cur = p.parent();
-            }
-
-            if let Some(ref top_dir) = topmost_new {
-                if !top_dirs_added.contains(top_dir) {
-                    debug!(dir = %top_dir, "adding new directory tree to SVN");
-                    // Add the topmost new directory — SVN will recursively
-                    // add everything inside it since --force doesn't skip
-                    // unversioned contents.
-                    self.run_svn_in_dir(wc_path, &["add", "--force", top_dir])
-                        .await?;
-                    top_dirs_added.insert(top_dir.clone());
-                }
-                // File is already added by the recursive dir add
-            } else {
-                // Parent is versioned, just add the file directly
-                self.run_svn_in_dir(wc_path, &["add", "--force", file])
-                    .await?;
-            }
-        }
-        debug!(count = files.len(), "svn add completed");
-        Ok(())
+        // --parents stages only ancestors; --depth empty never recursively
+        // admits neighboring files outside the supplied projection.
+        self.add(wc_path, files).await
     }
 
     /// Run `svn rm` on files in a working copy.
@@ -742,8 +806,16 @@ impl SvnClient {
         if files.is_empty() {
             return Ok(());
         }
-        let mut args = vec!["rm", "--force"];
-        args.extend(files);
+        let confined = super::working_copy::ConfinedWorkingCopy::open(path)?;
+        for file in files {
+            confined.inspect_file(file)?;
+        }
+        let encoded = files
+            .iter()
+            .map(|p| literal_path(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut args = vec!["rm", "--force", "--"];
+        args.extend(encoded.iter().map(String::as_str));
         self.run_svn_in_dir(path, &args).await?;
         debug!(count = files.len(), "svn rm completed");
         Ok(())
@@ -755,6 +827,103 @@ impl SvnClient {
         self.run_svn_in_dir(path, &["status"]).await
     }
 
+    fn require_supported_node_properties(xml: &str) -> Result<(), SvnError> {
+        let document =
+            roxmltree::Document::parse(xml).map_err(|e| SvnError::XmlParseError(e.to_string()))?;
+        if !document.root_element().has_tag_name("properties") {
+            return Err(SvnError::XmlParseError(
+                "missing SVN node property evidence".into(),
+            ));
+        }
+        for node in document
+            .descendants()
+            .filter(|n| n.has_tag_name("property"))
+        {
+            if matches!(
+                node.attribute("name"),
+                Some("svn:externals" | "svn:special")
+            ) {
+                return Err(SvnError::WorkingCopyError {
+                    path: "[SVN node]".into(),
+                    detail:
+                        "unsupported SVN external or special node; refusing before content mutation"
+                            .into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn require_supported_export_nodes(
+        &self,
+        url: &str,
+        revision: i64,
+    ) -> Result<(), SvnError> {
+        let target = literal_url(url, Some(revision))?;
+        let xml = self
+            .run_svn(&[
+                "proplist",
+                "--xml",
+                "--verbose",
+                "--recursive",
+                "--show-inherited-props",
+                "-r",
+                &revision.to_string(),
+                "--",
+                &target,
+            ])
+            .await?;
+        Self::require_supported_node_properties(&xml)
+    }
+
+    /// Ignoring externals is containment, not proof that omitted work is safe.
+    /// Content writers must explicitly refuse these declared node semantics.
+    pub async fn require_supported_working_copy(&self, path: &Path) -> Result<(), SvnError> {
+        let xml = self
+            .run_svn_in_dir(
+                path,
+                &[
+                    "proplist",
+                    "--xml",
+                    "--verbose",
+                    "--recursive",
+                    "--show-inherited-props",
+                    "--",
+                    ".@",
+                ],
+            )
+            .await?;
+        Self::require_supported_node_properties(&xml)
+    }
+
+    /// Machine-readable paths; line-oriented display is not a write oracle.
+    pub async fn status_entries(
+        &self,
+        path: &Path,
+    ) -> Result<Vec<super::parser::SvnStatusEntry>, SvnError> {
+        let xml = self
+            .run_svn_in_dir(path, &["status", "--xml", "--no-ignore", "--", ".@"])
+            .await?;
+        super::parser::parse_svn_status_xml(&xml)
+    }
+
+    pub async fn add_directory(&self, path: &Path, directory: &str) -> Result<(), SvnError> {
+        super::working_copy::ConfinedWorkingCopy::open(path)?.inspect_directory(directory)?;
+        self.run_svn_in_dir(
+            path,
+            &[
+                "add",
+                "--force",
+                "--depth",
+                "empty",
+                "--",
+                &literal_path(directory)?,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Get the content of a file at a specific revision.
     ///
     /// Uses peg-revision syntax (`url@N`) so the path is resolved *in
@@ -763,29 +932,40 @@ impl SvnClient {
     /// at rev N" — which fails for files that were renamed or deleted
     /// in any later revision. With the peg, the server treats `url` as
     /// a path that existed at rev N, which is what we actually want.
-    #[instrument(skip(self), fields(file_path = %file_path, rev))]
+    #[instrument(skip(self, file_path), fields(rev))]
     pub async fn cat(&self, file_path: &str, rev: i64) -> Result<String, SvnError> {
-        let rev_str = rev.to_string();
-        let base_url = if file_path.starts_with("http://") || file_path.starts_with("https://") {
-            file_path.to_string()
+        let base_url = if reqwest::Url::parse(file_path).is_ok() {
+            let base = super::operand::checked_url(&self.url)?;
+            let target = super::operand::checked_url(file_path)?;
+            let prefix = format!("{}/", base.path().trim_end_matches('/'));
+            if base.scheme() != target.scheme()
+                || base.host_str() != target.host_str()
+                || base.port_or_known_default() != target.port_or_known_default()
+                || base.username() != target.username()
+                || (base.path() != target.path() && !target.path().starts_with(&prefix))
+            {
+                return Err(SvnError::WorkingCopyError {
+                    path: file_path.into(),
+                    detail: "cat URL escapes configured SVN source".into(),
+                });
+            }
+            target.to_string()
         } else {
-            format!("{}/{}", self.url, file_path)
+            repository_url(&self.url, file_path)?
         };
-        // Append the peg revision. SVN URLs can contain '@' in path
-        // segments, but the peg must be the last '@'. Escape any
-        // existing '@' by doubling: svn accepts `path@@REV` to mean
-        // "path named `path@` at peg REV" when the path has a literal
-        // '@'. Simpler: append `@REV` — if the path has no '@' this is
-        // unambiguous, and we don't expect SVN paths with '@' in them.
-        let peg_url = format!("{}@{}", base_url, rev_str);
-        self.run_svn(&["cat", &peg_url]).await
+        let peg_url = literal_url(&base_url, Some(rev))?;
+        self.run_svn(&["cat", "-r", &rev.to_string(), "--", &peg_url])
+            .await
     }
 
     // -- Internal helpers ----------------------------------------------------
 
     async fn run_svn(&self, args: &[&str]) -> Result<String, SvnError> {
         let mut cmd = self.svn_command();
-        cmd.args(args)
+        let (verb, rest) = args
+            .split_first()
+            .ok_or_else(|| SvnError::XmlParseError("missing SVN command".into()))?;
+        cmd.arg(verb)
             .arg("--non-interactive")
             .arg("--no-auth-cache")
             .arg("--username")
@@ -795,6 +975,7 @@ impl SvnClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.apply_refresh_configuration(&mut cmd);
+        cmd.args(rest);
         record_svn_diag(&cmd);
 
         debug!(cmd = ?format!("svn {}", args.join(" ")), "running svn command");
@@ -814,7 +995,16 @@ impl SvnClient {
             warn!(exit_code, %stderr, "svn command failed");
             return Err(SvnError::CommandFailed { exit_code, stderr });
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stdout = if args
+            .iter()
+            .take_while(|arg| **arg != "--")
+            .any(|arg| *arg == "--xml")
+        {
+            String::from_utf8(output.stdout)
+                .map_err(|_| SvnError::XmlParseError("SVN XML output is not UTF-8".into()))?
+        } else {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
         trace!(
             cmd = args[0],
             exit_code = output.status.code().unwrap_or(0),
@@ -824,13 +1014,41 @@ impl SvnClient {
         Ok(stdout)
     }
 
-    /// Public wrapper for running SVN commands in a working copy directory.
+    /// Checked compatibility entry for the supported internal WC verbs.
+    /// Option, property-value and target roles are rebuilt before invocation;
+    /// this is not an arbitrary command/configuration override interface.
     pub async fn run_svn_in_dir_public(
         &self,
         dir: &Path,
         args: &[&str],
     ) -> Result<String, SvnError> {
-        self.run_svn_in_dir(dir, args).await
+        let encoded = super::operand::working_copy_arguments(dir, args)?;
+        let base = super::operand::checked_url(&self.url)?;
+        let scalars = match args.first().copied() {
+            Some("propset") => 2,
+            Some("propdel") => 1,
+            _ => 0,
+        };
+        let separator = encoded
+            .iter()
+            .position(|v| v == "--")
+            .expect("encoded command has separator");
+        for value in encoded.iter().skip(separator + 1 + scalars) {
+            if let Ok(target) = reqwest::Url::parse(value) {
+                if base.scheme() != target.scheme()
+                    || base.host_str() != target.host_str()
+                    || base.port_or_known_default() != target.port_or_known_default()
+                    || base.username() != target.username()
+                {
+                    return Err(SvnError::WorkingCopyError {
+                        path: value.clone(),
+                        detail: "working-copy command cannot change SVN authority".into(),
+                    });
+                }
+            }
+        }
+        let args: Vec<&str> = encoded.iter().map(String::as_str).collect();
+        self.run_svn_in_dir(dir, &args).await
     }
 
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
@@ -843,12 +1061,29 @@ impl SvnClient {
         args: &[&str],
         input: Option<std::fs::File>,
     ) -> Result<String, SvnError> {
+        // A working-copy root itself must not be a planted symlink. Hold the
+        // verified descriptor through spawn/completion like the other owners.
+        let _working_directory = super::working_copy::ConfinedWorkingCopy::open(dir)?;
+        match std::fs::symlink_metadata(dir.join(".svn")) {
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                return Err(SvnError::WorkingCopyError {
+                    path: dir.display().to_string(),
+                    detail: "unsupported SVN administrative node".into(),
+                })
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let mut cmd = self.svn_command();
         if let Some(input) = input {
             cmd.stdin(Stdio::from(input));
         }
+        let (verb, rest) = args
+            .split_first()
+            .ok_or_else(|| SvnError::XmlParseError("missing SVN command".into()))?;
         cmd.current_dir(dir)
-            .args(args)
+            .arg(verb)
             .arg("--non-interactive")
             .arg("--no-auth-cache")
             .arg("--username")
@@ -858,6 +1093,7 @@ impl SvnClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.apply_refresh_configuration(&mut cmd);
+        cmd.args(rest);
         record_svn_diag(&cmd);
 
         debug!(cmd = ?format!("svn {} (in {})", args.join(" "), dir.display()), "running svn command in dir");
@@ -879,7 +1115,16 @@ impl SvnClient {
         }
         // Combine stdout and stderr — some SVN operations (especially commit)
         // output the "Committed revision N" line to stderr, not stdout.
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stdout = if args
+            .iter()
+            .take_while(|arg| **arg != "--")
+            .any(|arg| *arg == "--xml")
+        {
+            String::from_utf8(output.stdout)
+                .map_err(|_| SvnError::XmlParseError("SVN XML output is not UTF-8".into()))?
+        } else {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
         let stderr = self.command_stderr(&output.stderr);
         if stdout.is_empty() && !stderr.is_empty() {
             debug!(stderr = %stderr, "svn command produced no stdout, using stderr");
@@ -986,3 +1231,7 @@ mod tests {
         assert_eq!(client.url(), "https://svn.example.com/repo");
     }
 }
+
+#[cfg(test)]
+#[path = "literal_tests.rs"]
+mod literal_tests;

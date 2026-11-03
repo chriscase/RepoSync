@@ -143,7 +143,17 @@ fn require_supported(source: &Source) -> Result<(), DatabaseError> {
 }
 
 fn svn_url(source: &Source) -> Result<String, DatabaseError> {
-    let raw = super::branch_svn_url(&source.svn_url, &source.svn_branch);
+    // Preserve the execution contract's existing canonical ASCII-only policy
+    // BEFORE ordinary literal URL encoding. Encoding cannot admit new authority.
+    let raw = if source.svn_branch.is_empty() {
+        source.svn_url.trim_end_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            source.svn_url.trim_end_matches('/'),
+            source.svn_branch.trim_start_matches('/')
+        )
+    };
     let url = reqwest::Url::parse(&raw).map_err(|_| refused("invalid SVN endpoint"))?;
     if !matches!(url.scheme(), "https" | "http" | "svn" | "file")
         || !url.username().is_empty()
@@ -168,7 +178,12 @@ fn svn_url(source: &Source) -> Result<String, DatabaseError> {
     {
         return Err(refused("unsupported or noncanonical SVN endpoint"));
     }
-    Ok(raw)
+    let encoded = super::branch_svn_url(source.svn_url.trim_end_matches('/'), &source.svn_branch)
+        .map_err(|_| refused("unsupported or noncanonical SVN endpoint"))?;
+    if encoded != raw {
+        return Err(refused("unsupported or noncanonical SVN endpoint"));
+    }
+    Ok(encoded)
 }
 
 pub(crate) fn capture_execution_configuration(

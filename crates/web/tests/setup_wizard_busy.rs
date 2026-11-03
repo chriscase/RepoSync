@@ -210,6 +210,7 @@ token_env = ""
     );
     let app = Router::new()
         .merge(api::setup::routes())
+        .merge(api::repos::routes())
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1062,4 +1063,161 @@ async fn candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation() 
         })
     );
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs113_setup_probe_rejects_embedded_credentials_without_public_disclosure() {
+    let (addr, _state, server, _tmp, _repo_id, _bare) = setup_wizard_fixture().await;
+    let client = authed_client();
+    // An open listener is a spawn/connection canary. URL validation must refuse
+    // before invoking SVN; the response must not echo either userinfo spelling.
+    let canary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for userinfo in ["alice:synthetic-secret", "alice%3Asynthetic%2Dsecret"] {
+        let result = client.post(format!("http://{addr}/api/setup/test-svn"))
+            .json(&serde_json::json!({"url":format!("http://{userinfo}@{}/repo",canary.local_addr().unwrap()),"username":"","password":""}))
+            .send().await.unwrap();
+        assert!(result.status().is_success());
+        let body: serde_json::Value = result.json().await.unwrap();
+        assert_eq!(body["ok"], false);
+        let text = body["message"].as_str().unwrap();
+        assert!(text.contains("unsupported SVN URL authority"), "{text}");
+        assert!(text.contains("REDACTED"), "{text}");
+        assert!(
+            !text.contains("synthetic-secret") && !text.contains("synthetic%2Dsecret"),
+            "{text}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), canary.accept())
+                .await
+                .is_err(),
+            "rejected URL must not open an SVN connection"
+        );
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs113_repo_probe_and_full_import_use_the_same_literal_branch() {
+    let (addr, state, server, tmp, repo_id, bare) = setup_wizard_fixture().await;
+    let client = authed_client();
+    let mut repo = state.db.get_repository(&repo_id).unwrap().unwrap();
+    let root = SvnClient::new(&repo.svn_url, "fixture", "");
+    let intended_url =
+        reposync_core::svn::operand::configured_branch_url(&repo.svn_url, "branches/a%40b 雪#?")
+            .unwrap();
+    let decoy_url =
+        reposync_core::svn::operand::configured_branch_url(&repo.svn_url, "branches/a@b 雪#?")
+            .unwrap();
+    // Independent nodes have no copy-history path relocation. That separate
+    // full-history-import limitation is not hidden by this operand regression.
+    for (index, (url, content)) in [
+        (intended_url, "literal import\n"),
+        (decoy_url.clone(), "decoy import\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let target = reposync_core::svn::operand::literal_url(url, None).unwrap();
+        let made = Command::new("svn")
+            .args([
+                "mkdir",
+                "--parents",
+                "-m",
+                "independent branch layout",
+                "--",
+                &target,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let svn = SvnClient::new(url, "fixture", "");
+        let wc = tmp.path().join(format!("branch-{index}"));
+        svn.checkout_head(&wc).await.unwrap();
+        std::fs::write(wc.join("history.txt"), content).unwrap();
+        svn.add(&wc, &["history.txt"]).await.unwrap();
+        svn.commit(&wc, "distinct branch payload", "fixture")
+            .await
+            .unwrap();
+    }
+    repo.svn_branch = "branches/a%40b 雪#?".into();
+    state.db.update_repository(&repo).unwrap();
+    let revision = root.info().await.unwrap().latest_rev;
+    let probe: serde_json::Value = client
+        .post(format!("http://{addr}/api/repos/{repo_id}/test-svn"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(probe["ok"], true, "{probe}");
+    let started: serde_json::Value = client
+        .post(format!("http://{addr}/api/repos/{repo_id}/import"))
+        .header("x-request-id", "rs113-literal-import")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(started["ok"], true, "{started}");
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status: serde_json::Value = client
+                .get(format!("http://{addr}/api/repos/{repo_id}/import/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if matches!(
+                status["lifecycle"].as_str(),
+                Some("completed" | "failed" | "reconciliation_required")
+            ) && !reposync_core::busy::is_busy(&repo_id)
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("literal import must finish with observed idle");
+    assert_eq!(completed["lifecycle"], "completed", "{completed}");
+    let git = git2::Repository::open_bare(&bare).unwrap();
+    let commit = git
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    let tree = commit.tree().unwrap();
+    let entry = tree.get_path(Path::new("history.txt")).unwrap();
+    assert_eq!(
+        git.find_blob(entry.id()).unwrap().content(),
+        b"literal import\n"
+    );
+    let checkpoint = state.db.get_repo_watermark(&repo_id).unwrap();
+    assert_eq!(checkpoint.1, commit.id().to_string());
+    assert!(checkpoint.0 >= 3 && checkpoint.0 <= revision);
+    let mapped: i64 = state.db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND direction='svn_to_git' AND git_sha=?2 AND status='applied'",rusqlite::params![&repo_id,checkpoint.1],|r|r.get(0)).unwrap();
+    assert_eq!(mapped, 1);
+    assert_eq!(
+        root.info().await.unwrap().latest_rev,
+        revision,
+        "import must not mutate SVN or decoy"
+    );
+    assert_eq!(
+        SvnClient::new(decoy_url, "fixture", "")
+            .cat("history.txt", revision)
+            .await
+            .unwrap(),
+        "decoy import\n"
+    );
+    server.abort();
+    let _ = server.await;
 }

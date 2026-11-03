@@ -343,7 +343,7 @@ fn parent_svn_branch_path(parent: &Repository) -> String {
 }
 
 fn normalize_svn_repo_path(path: &str) -> String {
-    path.trim().trim_start_matches('/').to_string()
+    path.trim_start_matches('/').to_string()
 }
 
 /// When the SVN target already exists, prove it is our journaled copy (not a foreign branch).
@@ -354,11 +354,12 @@ async fn verify_existing_svn_target_matches_copy_intent(
     expected_source_path: &str,
     expected_copy_rev: i64,
 ) -> Result<i64, LatePairPublishRefusal> {
-    let target_url = format!(
-        "{}/{}",
-        parent.svn_url.trim_end_matches('/'),
-        svn_branch.trim_start_matches('/')
-    );
+    let target_url = crate::svn::operand::configured_branch_url(&parent.svn_url, svn_branch)
+        .map_err(|error| LatePairPublishRefusal {
+            reason: "invalid_svn_target".into(),
+            detail: redact_vcs_error_detail(&error.to_string()),
+            plan: None,
+        })?;
     let target = SvnClient::new(&target_url, &parent.svn_username, svn_password);
     let branch_tip = target
         .last_changed_revision()
@@ -594,11 +595,12 @@ async fn svn_copy_at_baseline(
                 }
             }
         })?;
-    let target_url = format!(
-        "{}/{}",
-        parent.svn_url.trim_end_matches('/'),
-        svn_branch.trim_start_matches('/')
-    );
+    let target_url = crate::svn::operand::configured_branch_url(&parent.svn_url, svn_branch)
+        .map_err(|error| LatePairPublishRefusal {
+            reason: "invalid_svn_target".into(),
+            detail: redact_vcs_error_detail(&error.to_string()),
+            plan: None,
+        })?;
     let target = SvnClient::new(&target_url, &parent.svn_username, svn_password);
     let info = target.info().await.map_err(|e| LatePairPublishRefusal {
         reason: "svn_copy_failed".into(),
@@ -633,15 +635,12 @@ async fn replay_pending_git(
     if handled.as_deref() == Some(pinned_tip) {
         return Ok(vec![]);
     }
-    let svn_url = if child.svn_branch.is_empty() {
-        child.svn_url.clone()
-    } else {
-        format!(
-            "{}/{}",
-            child.svn_url.trim_end_matches('/'),
-            child.svn_branch.trim_start_matches('/')
-        )
-    };
+    let svn_url = crate::svn::operand::configured_branch_url(&child.svn_url, &child.svn_branch)
+        .map_err(|error| LatePairPublishRefusal {
+            reason: "invalid_svn_target".into(),
+            detail: redact_vcs_error_detail(&error.to_string()),
+            plan: None,
+        })?;
     let svn_client = SvnClient::new(&svn_url, &child.svn_username, svn_password);
     let git_client = GitClient::new(git_workdir).map_err(|e| LatePairPublishRefusal {
         reason: "git_workdir_failed".into(),

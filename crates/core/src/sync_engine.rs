@@ -3459,7 +3459,8 @@ impl SyncEngine {
         let projection = self.no_target_projection();
         let fingerprint =
             svn_commit_target_fingerprint(rid, &info.uuid, svn.url(), &info.url, &projection);
-        let identity = crate::path_projection::svn_path_identity(&info.root_url, &info.url);
+        let identity = crate::path_projection::svn_path_identity(&info.root_url, &info.url)
+            .map_err(SyncError::SvnError)?;
         let op = self
             .db
             .begin_git_to_svn_commit(SvnCommitIntent {
@@ -3662,6 +3663,9 @@ impl SyncEngine {
                 }
             }
             let file_contents = projected.into_file_contents();
+            for (_, path, _) in &file_contents {
+                crate::svn::operand::validate_relative_path(path).map_err(SyncError::SvnError)?;
+            }
             if let Err(violations) = validate_file_paths_impl(
                 &self.allowed_paths,
                 &self.blocked_patterns,
@@ -3772,6 +3776,16 @@ impl SyncEngine {
                 }
             }
 
+            let svn_write_client = self
+                .svn_client
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            svn_write_client
+                .require_supported_working_copy(svn_wc_dir.path())
+                .await
+                .map_err(SyncError::SvnError)?;
+
             // 3. Copy changed files from Git into the SVN working copy.
             //    If a file is marked as modified ("M") in Git but does not
             //    exist in the SVN working copy, treat it as an add so that
@@ -3780,19 +3794,27 @@ impl SyncEngine {
             let mut added_files = Vec::new();
             let mut deleted_files = Vec::new();
 
+            let confined = crate::svn::working_copy::ConfinedWorkingCopy::open(svn_wc_dir.path())
+                .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
+            confined
+                .preflight(file_contents.iter().map(|(_, path, _)| path.as_str()))
+                .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
             for (action, file_path, content) in &file_contents {
                 let dst = svn_wc_dir.path().join(file_path);
+                let existed = confined
+                    .inspect_file(file_path)
+                    .map_err(|e| SyncError::GitError(crate::errors::GitError::IoError(e)))?;
                 debug!(
                     sha = %change.sha,
                     action = %action,
                     file_path = %file_path,
                     dst = %dst.display(),
-                    dst_exists = dst.exists(),
+                    dst_exists = existed,
                     "processing file change"
                 );
                 match action.as_str() {
                     "D" => {
-                        if dst.exists() {
+                        if existed {
                             deleted_files.push(file_path.as_str());
                         } else {
                             debug!(
@@ -3803,12 +3825,7 @@ impl SyncEngine {
                     }
                     "A" => {
                         if let Some(content) = content {
-                            if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            }
-                            std::fs::write(&dst, content).map_err(|e| {
+                            confined.write_file(file_path, content).map_err(|e| {
                                 SyncError::GitError(crate::errors::GitError::IoError(e))
                             })?;
                             added_files.push(file_path.as_str());
@@ -3817,13 +3834,8 @@ impl SyncEngine {
                     _ => {
                         // Modified: overwrite content.
                         if let Some(content) = content {
-                            let file_is_new = !dst.exists();
-                            if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent).map_err(|e| {
-                                    SyncError::GitError(crate::errors::GitError::IoError(e))
-                                })?;
-                            }
-                            std::fs::write(&dst, content).map_err(|e| {
+                            let file_is_new = !existed;
+                            confined.write_file(file_path, content).map_err(|e| {
                                 SyncError::GitError(crate::errors::GitError::IoError(e))
                             })?;
                             // If the file didn't exist in the SVN working copy,
@@ -3884,15 +3896,9 @@ impl SyncEngine {
                 // Add each directory individually, shallowest first.
                 // --force makes it a no-op for already-versioned dirs.
                 for dir in &dirs_to_add {
-                    let full = svn_wc_dir.path().join(dir);
-                    if full.is_dir() {
-                        svn.run_svn_in_dir_public(
-                            svn_wc_dir.path(),
-                            &["add", "--force", "--depth", "empty", dir],
-                        )
+                    svn.add_directory(svn_wc_dir.path(), dir)
                         .await
                         .map_err(SyncError::SvnError)?;
-                    }
                 }
 
                 // Now add the actual files — parents are guaranteed registered.
@@ -3921,7 +3927,7 @@ impl SyncEngine {
                             },
                         ));
                     }
-                    svn.run_svn_in_dir_public(svn_wc_dir.path(), &["add", "--force", file])
+                    svn.add(svn_wc_dir.path(), &[*file])
                         .await
                         .map_err(SyncError::SvnError)?;
                 }
@@ -3937,20 +3943,20 @@ impl SyncEngine {
             //     If SVN sees no modifications, skip this commit gracefully
             //     instead of failing to parse an empty commit output.
             let svn_status = svn
-                .status(svn_wc_dir.path())
+                .status_entries(svn_wc_dir.path())
                 .await
                 .map_err(SyncError::SvnError)?;
-            let has_changes = svn_status.lines().any(|line| {
-                let trimmed = line.trim();
-                !trimmed.is_empty()
-                    && !trimmed.starts_with('?')  // unversioned
-                    && !trimmed.starts_with('X') // externals
+            let has_changes = svn_status.iter().any(|entry| {
+                matches!(
+                    entry.item.as_str(),
+                    "added" | "modified" | "deleted" | "replaced"
+                ) || entry.properties == "modified"
             });
             if !has_changes {
                 warn!(
                     sha = %change.sha,
                     svn_url = %svn_url_for_log,
-                    svn_status = %svn_status,
+                    svn_status = ?svn_status,
                     file_count = file_contents.len(),
                     added = added_files.len(),
                     deleted = deleted_files.len(),
@@ -3993,7 +3999,7 @@ impl SyncEngine {
 
             debug!(
                 sha = %change.sha,
-                svn_status = %svn_status,
+                svn_status = ?svn_status,
                 "SVN working copy has pending changes, committing"
             );
 

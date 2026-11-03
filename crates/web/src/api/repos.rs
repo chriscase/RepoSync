@@ -1626,19 +1626,15 @@ async fn start_repo_import(
     );
 
     // 5. Build SVN import URL
-    let svn_import_url = {
-        let base = repo.svn_url.trim_end_matches('/');
-        let branch = if repo.svn_branch.is_empty() {
+    let svn_import_url = reposync_core::svn::operand::configured_branch_url(
+        &repo.svn_url,
+        if repo.svn_branch.is_empty() {
             "trunk"
         } else {
             &repo.svn_branch
-        };
-        if branch.is_empty() || branch == "/" {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, branch.trim_start_matches('/'))
-        }
-    };
+        },
+    )
+    .map_err(|error| AppError::BadRequest(redact_vcs_error_detail(&error.to_string())))?;
 
     info!(repo_id = %id, svn_import_url = %svn_import_url, "starting per-repo import");
 
@@ -2434,19 +2430,15 @@ async fn resume_repo_import(
     let git_token_state = db.resolve_credential_chain_state(&id, "secret_git_token");
     let git_token = git_token_state.value.clone();
 
-    let svn_import_url = {
-        let base = repo.svn_url.trim_end_matches('/');
-        let branch = if repo.svn_branch.is_empty() {
+    let svn_import_url = reposync_core::svn::operand::configured_branch_url(
+        &repo.svn_url,
+        if repo.svn_branch.is_empty() {
             "trunk"
         } else {
             &repo.svn_branch
-        };
-        if branch.is_empty() || branch == "/" {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, branch.trim_start_matches('/'))
-        }
-    };
+        },
+    )
+    .map_err(|error| AppError::BadRequest(redact_vcs_error_detail(&error.to_string())))?;
     let svn_client = SvnClient::new(&svn_import_url, &repo.svn_username, &svn_password)
         .with_cancel_signal(progress.read().await.cancel_signal.clone());
     let git_client = Arc::new(std::sync::Mutex::new(
@@ -3463,20 +3455,23 @@ async fn attach_svn_probe(
     let svn_password = db
         .resolve_credential_chain(&parent.id, "secret_svn_password")
         .unwrap_or_default();
-    let parent_svn_url = if parent.svn_branch.is_empty() {
-        parent.svn_url.clone()
-    } else {
-        format!(
-            "{}/{}",
-            parent.svn_url.trim_end_matches('/'),
-            parent.svn_branch.trim_start_matches('/')
-        )
+    let urls =
+        reposync_core::svn::operand::configured_branch_url(&parent.svn_url, &parent.svn_branch)
+            .and_then(|parent_url| {
+                reposync_core::svn::operand::configured_branch_url(
+                    &parent.svn_url,
+                    &plan.svn_branch,
+                )
+                .map(|target_url| (parent_url, target_url))
+            });
+    let (parent_svn_url, target_url) = match urls {
+        Ok(urls) => urls,
+        Err(error) => {
+            plan.unknowns
+                .push(redact_vcs_error_detail(&error.to_string()));
+            return;
+        }
     };
-    let target_url = format!(
-        "{}/{}",
-        parent.svn_url.trim_end_matches('/'),
-        plan.svn_branch.trim_start_matches('/')
-    );
     let parent_client = SvnClient::new(&parent_svn_url, &parent.svn_username, &svn_password);
     let target_client = SvnClient::new(&target_url, &parent.svn_username, &svn_password);
     let (probe, pending) = probe_svn_target(
@@ -3592,8 +3587,10 @@ async fn preview_pair_refresh(
     let pair_password = db
         .resolve_credential_chain(&pair.id, "secret_svn_password")
         .unwrap_or_default();
-    let parent_url = branch_svn_url(&parent.svn_url, &parent.svn_branch);
-    let pair_url = branch_svn_url(&pair.svn_url, &pair.svn_branch);
+    let parent_url = branch_svn_url(&parent.svn_url, &parent.svn_branch)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let pair_url = branch_svn_url(&pair.svn_url, &pair.svn_branch)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let parent_client = SvnClient::new(&parent_url, &parent.svn_username, &parent_password);
     let pair_client = SvnClient::new(&pair_url, &pair.svn_username, &pair_password);
     let parent_pin = read_svn_pin(
@@ -4025,52 +4022,28 @@ async fn test_repo_svn(
         .or_else(|| db.resolve_credential_chain(&id, "secret_svn_password"))
         .unwrap_or_default();
 
-    let svn_url = if svn_branch.is_empty() {
-        svn_url_base
-    } else {
-        format!(
-            "{}/{}",
-            svn_url_base.trim_end_matches('/'),
-            svn_branch.trim_start_matches('/')
-        )
+    let svn_url = match reposync_core::svn::operand::configured_branch_url(
+        &svn_url_base,
+        &svn_branch,
+    ) {
+        Ok(url) => url,
+        Err(error) => {
+            return Ok(Json(
+                serde_json::json!({"ok":false,"message":redact_vcs_error_detail(&error.to_string())}),
+            ))
+        }
     };
 
-    let result = tokio::process::Command::new("svn")
-        .args([
-            "info",
-            "--non-interactive",
-            "--username",
-            &svn_username,
-            "--password",
-            &password,
-            &svn_url,
-        ])
-        .output()
+    let result = reposync_core::svn::SvnClient::new(&svn_url, &svn_username, &password)
+        .info()
         .await;
 
     match result {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let info = stdout
-                .lines()
-                .find(|l| l.starts_with("Repository Root:") || l.starts_with("URL:"))
-                .unwrap_or("SVN server responded successfully");
-            Ok(Json(
-                serde_json::json!({"ok": true, "message": info.trim()}),
-            ))
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let msg = stderr
-                .lines()
-                .find(|l| l.contains("E1") || l.contains("Unable") || l.contains("Authentication"))
-                .unwrap_or("SVN command failed");
-            Ok(Json(
-                serde_json::json!({"ok": false, "message": redact_vcs_error_detail(msg.trim())}),
-            ))
-        }
-        Err(e) => Ok(Json(
-            serde_json::json!({"ok": false, "message": format!("Failed to run svn: {}", e)}),
+        Ok(info) => Ok(Json(
+            serde_json::json!({"ok":true,"message":format!("Repository Root: {}",info.root_url)}),
+        )),
+        Err(error) => Ok(Json(
+            serde_json::json!({"ok":false,"message":redact_vcs_error_detail(&error.to_string())}),
         )),
     }
 }

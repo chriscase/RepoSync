@@ -970,14 +970,15 @@ impl Scheduler {
             );
 
             // Build SVN URL: repo.svn_url + repo.svn_branch
-            let svn_url = if repo.svn_branch.is_empty() {
-                repo.svn_url.clone()
-            } else {
-                format!(
-                    "{}/{}",
-                    repo.svn_url.trim_end_matches('/'),
-                    repo.svn_branch.trim_start_matches('/')
-                )
+            let svn_url = match reposync_core::svn::operand::configured_branch_url(
+                &repo.svn_url,
+                &repo.svn_branch,
+            ) {
+                Ok(url) => url,
+                Err(error) => {
+                    warn!(repo_id = %repo.id, error = %error, "invalid literal SVN branch; skipping sync");
+                    continue;
+                }
             };
 
             if svn_password.is_none() {
@@ -1634,6 +1635,145 @@ mod cancellation_tests {
             config,
         );
         (scheduler, git_repo_path)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rs113_actual_scheduler_selects_literal_branch_not_decoded_decoy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "rs113-scheduler";
+        let (mut scheduler, git_path) = scheduler_fixture(&tmp, id, "2000-01-01T00:00:00Z");
+        scheduler.app_config.identity.email_domain = Some("example.invalid".into());
+        let repository = tmp.path().join("svn");
+        assert!(std::process::Command::new("svnadmin")
+            .arg("create")
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success());
+        let root_url = format!("file://{}", repository.display());
+        let svn = SvnClient::new(&root_url, "fixture", "");
+        let wc = tmp.path().join("wc");
+        svn.checkout_head(&wc).await.unwrap();
+        let confined = reposync_core::svn::working_copy::ConfinedWorkingCopy::open(&wc).unwrap();
+        for (name, bytes) in [
+            (
+                "branches/a%40b 雪#?/identity.txt",
+                b"intended before\n".as_slice(),
+            ),
+            (
+                "branches/a@b 雪#?/identity.txt",
+                b"untouched decoy\n".as_slice(),
+            ),
+        ] {
+            confined.write_file(name, bytes).unwrap();
+            svn.add_with_retry(&wc, &[name]).await.unwrap();
+        }
+        let baseline = svn
+            .commit(&wc, "distinct branch identities", "fixture")
+            .await
+            .unwrap();
+        let bare_path = tmp.path().join("local/fixture.git");
+        std::fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
+        fn git_at(path: &std::path::Path, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        }
+        git_at(tmp.path(), &["init", "--bare", bare_path.to_str().unwrap()]);
+        std::fs::create_dir_all(&git_path).unwrap();
+        git_at(&git_path, &["init"]);
+        git_at(&git_path, &["config", "user.name", "Fixture"]);
+        git_at(
+            &git_path,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        std::fs::write(git_path.join("identity.txt"), "intended before\n").unwrap();
+        git_at(&git_path, &["add", "--", "identity.txt"]);
+        git_at(&git_path, &["commit", "-m", "verified fixture baseline"]);
+        git_at(&git_path, &["branch", "-M", "main"]);
+        git_at(
+            &git_path,
+            &["remote", "add", "origin", bare_path.to_str().unwrap()],
+        );
+        git_at(&git_path, &["push", "origin", "main"]);
+        let oid = git_at(&git_path, &["rev-parse", "HEAD"]);
+        let mut repo = scheduler.db.get_repository(id).unwrap().unwrap();
+        repo.svn_url = root_url.clone();
+        repo.svn_branch = "branches/a%40b 雪#?".into();
+        repo.git_api_url = format!("file://{}", tmp.path().display());
+        repo.last_svn_rev = baseline;
+        repo.last_git_sha = oid.to_string();
+        scheduler.db.update_repository(&repo).unwrap();
+        let now = Utc::now();
+        reposync_core::echo_receipt_scope::write_scoped_last_git_sha_kv(
+            &scheduler.db.conn(),
+            id,
+            &oid.to_string(),
+            &now.to_rfc3339(),
+        )
+        .unwrap();
+        scheduler
+            .db
+            .set_state(&format!("last_svn_rev_{id}"), &baseline.to_string())
+            .unwrap();
+        scheduler
+            .db
+            .insert_sync_record(&reposync_core::models::SyncRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: Some(id.into()),
+                svn_revision: Some(baseline),
+                git_hash: Some(oid.to_string()),
+                direction: reposync_core::models::SyncDirection::SvnToGit,
+                author: "fixture".into(),
+                message: "verified fixture baseline".into(),
+                timestamp: now,
+                synced_at: now,
+                status: reposync_core::models::SyncRecordStatus::Applied,
+            })
+            .unwrap();
+        confined
+            .write_file("branches/a%40b 雪#?/identity.txt", b"intended after\n")
+            .unwrap();
+        let revision = svn
+            .commit(&wc, "intended branch only", "fixture")
+            .await
+            .unwrap();
+        scheduler.maybe_run_repo_cycles().await;
+        let mut handles = scheduler.sync_handles.lock().await;
+        assert_eq!(handles.len(), 1, "actual scheduler must admit this worker");
+        (&mut handles[0]).await.unwrap();
+        handles.clear();
+        let observed_repo = scheduler.db.get_repository(id).unwrap().unwrap();
+        assert_eq!(
+            observed_repo.total_errors,
+            0,
+            "{observed_repo:?}; audit={:?}",
+            scheduler.db.list_audit_log(10, 0).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(git_path.join("identity.txt")).unwrap(),
+            b"intended after\n"
+        );
+        let checkpoint = scheduler.db.get_repo_watermark(id).unwrap();
+        assert_eq!(checkpoint.0, revision);
+        assert_ne!(checkpoint.1, oid.to_string());
+        let applied: i64 = scheduler.db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND svn_rev=?2 AND git_sha=?3 AND direction='svn_to_git' AND status='applied'",rusqlite::params![id,revision,checkpoint.1],|r|r.get(0)).unwrap();
+        assert_eq!(applied, 1);
+        assert_eq!(
+            svn.cat("branches/a@b 雪#?/identity.txt", revision)
+                .await
+                .unwrap(),
+            "untouched decoy\n"
+        );
+        assert_eq!(svn.info().await.unwrap().latest_rev, revision);
     }
 
     #[tokio::test]
