@@ -1,3 +1,5 @@
+import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
+import { errorScope } from '../errorAcknowledgement';
 import React, { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
@@ -1196,13 +1198,11 @@ export default function RepoDetail() {
               : 'No recent errors'
           }
           onClick={() => navigate(`/audit?success=false&repo_id=${id}`)}
-          onClear={
-            (status?.total_errors ?? 0) > 0
-              ? async () => {
-                  await api.resetErrors(id);
-                  queryClient.invalidateQueries({ queryKey: ['repo-status', id] });
-                }
-              : undefined
+          action={
+            <ErrorAcknowledgement key={id ?? 'all'} scope={errorScope(id)}
+              repositoryName={repo?.name ?? id ?? ''} observation={status?.error_observation}
+              count={status?.total_errors ?? 0}
+              onSuccess={() => { void queryClient.invalidateQueries({ queryKey: ['repo-status', id] }); }} />
           }
         />
       </div>
@@ -2285,14 +2285,14 @@ function StatusCard({
   color,
   onClick,
   subtitle,
-  onClear,
+  action,
 }: {
   title: string;
   value: string;
   color: string;
   onClick?: () => void;
   subtitle?: string;
-  onClear?: () => void;
+  action?: React.ReactNode;
 }) {
   const colorClasses: Record<string, string> = {
     green: 'bg-green-900/30 border-green-700',
@@ -2313,17 +2313,7 @@ function StatusCard({
     >
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-400">{title}</p>
-        {onClear && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onClear();
-            }}
-            className="text-xs text-gray-400 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded border border-gray-600 hover:border-red-500/50"
-          >
-            Clear
-          </button>
-        )}
+        {action}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
       {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}

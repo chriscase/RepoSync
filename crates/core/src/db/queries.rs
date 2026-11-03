@@ -9,6 +9,71 @@ use super::Database;
 use crate::errors::DatabaseError;
 use crate::models;
 
+/// Explicit acknowledgement scope; absence never means “all”.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ErrorScope {
+    All {},
+    Repository { repo_id: String },
+}
+
+impl ErrorScope {
+    fn repo_id(&self) -> Option<&str> {
+        match self {
+            Self::All {} => None,
+            Self::Repository { repo_id } => Some(repo_id),
+        }
+    }
+}
+
+/// Finite observation boundary, with IDs encoded as strings for JavaScript safety.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ErrorObservation {
+    pub through_id: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug)]
+pub struct ErrorSnapshot {
+    pub count: i64,
+    pub last_error_at: Option<String>,
+    pub observation: ErrorObservation,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErrorAcknowledgementError {
+    #[error("invalid error observation")]
+    InvalidObservation,
+    #[error("repository not found")]
+    UnknownRepository,
+    #[error(transparent)]
+    Database(#[from] DatabaseError),
+}
+
+// Only versioned, well-formed success events dismiss failures. Unknown or malformed
+// metadata leaves the original failure visible. Original rows are never changed.
+const UNACKNOWLEDGED_ERROR: &str = r#"
+    e.success = 0 AND NOT EXISTS (
+        SELECT 1 FROM audit_log a,
+        json_each(CASE WHEN json_valid(a.details) THEN CASE WHEN json_type(a.details) = 'object' THEN json_array(json(a.details)) ELSE '[]' END ELSE '[]' END) j
+        WHERE a.action = 'errors_acknowledged' AND a.success = 1 AND a.id > e.id
+          AND a.author IS NOT NULL AND length(a.author) > 0
+          AND json_extract(j.value, '$.schema') = 'reposync.error-ack.v1'
+          AND typeof(json_extract(j.value, '$.through_id')) = 'integer'
+          AND json_extract(j.value, '$.through_id') >= 0
+          AND json_extract(j.value, '$.through_id') < a.id
+          AND json_type(j.value, '$.observed_at') = 'text'
+          AND typeof(json_extract(j.value, '$.acknowledged')) = 'integer'
+          AND json_extract(j.value, '$.acknowledged') > 0
+          AND json_extract(j.value, '$.through_id') >= e.id
+          AND julianday(e.created_at) > julianday(json_extract(j.value, '$.observed_at'), '-1 day')
+          AND julianday(e.created_at) <= julianday(json_extract(j.value, '$.observed_at'))
+          AND julianday(a.created_at) >= julianday(json_extract(j.value, '$.observed_at'))
+          AND ((json_extract(j.value, '$.scope') = 'all' AND a.repo_id IS NULL)
+            OR (json_extract(j.value, '$.scope') = 'repository' AND a.repo_id = e.repo_id))
+    )"#;
+
 // ---------------------------------------------------------------------------
 // Domain structs returned by queries
 // ---------------------------------------------------------------------------
@@ -1269,14 +1334,128 @@ impl Database {
         Ok(entries)
     }
 
-    /// Count audit entries that represent failures in the last 24 hours.
+    /// Count unacknowledged failures in the rolling 24-hour window (also used by CLI).
     pub fn count_errors(&self) -> Result<i64, DatabaseError> {
-        let conn = self.conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM audit_log WHERE success = 0 AND created_at > datetime('now', '-24 hours')",
-            [],
+        Ok(self.error_snapshot(&ErrorScope::All {})?.count)
+    }
+
+    /// Read count, active timestamp and acknowledgement boundary under one connection lock.
+    pub fn error_snapshot(&self, scope: &ErrorScope) -> Result<ErrorSnapshot, DatabaseError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let observed_at = Utc::now().to_rfc3339();
+        let sql = format!(
+            "SELECT COUNT(*), strftime('%Y-%m-%dT%H:%M:%fZ', MAX(julianday(e.created_at))) FROM audit_log e WHERE {UNACKNOWLEDGED_ERROR}
+             AND (?1 IS NULL OR e.repo_id = ?1)
+             AND julianday(e.created_at) > julianday(?2, '-1 day')
+             AND julianday(e.created_at) <= julianday(?2)"
+        );
+        let (count, last_error_at) =
+            tx.query_row(&sql, params![scope.repo_id(), observed_at], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let through_id: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM audit_log WHERE ?1 IS NULL OR repo_id = ?1",
+            params![scope.repo_id()],
             |row| row.get(0),
         )?;
+        tx.commit()?;
+        Ok(ErrorSnapshot {
+            count,
+            last_error_at,
+            observation: ErrorObservation {
+                through_id: through_id.to_string(),
+                observed_at,
+            },
+        })
+    }
+
+    /// Append acknowledgement metadata atomically. No failure, cumulative repository
+    /// counter, sync checkpoint or hold is updated. A retry with the same observation
+    /// cannot dismiss later arrivals and does not append another event.
+    pub fn acknowledge_errors(
+        &self,
+        scope: &ErrorScope,
+        observation: &ErrorObservation,
+        actor: &str,
+    ) -> Result<i64, ErrorAcknowledgementError> {
+        use ErrorAcknowledgementError as AckError;
+        let through_id: i64 = observation
+            .through_id
+            .parse()
+            .map_err(|_| AckError::InvalidObservation)?;
+        let observed = DateTime::parse_from_rfc3339(&observation.observed_at)
+            .map_err(|_| AckError::InvalidObservation)?;
+        let now = Utc::now();
+        if through_id < 0
+            || through_id.to_string() != observation.through_id
+            || observed > now
+            || actor.is_empty()
+            || scope.repo_id().is_some_and(str::is_empty)
+        {
+            return Err(AckError::InvalidObservation);
+        }
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(DatabaseError::from)?;
+        if let Some(repo_id) = scope.repo_id() {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM repositories WHERE id = ?1)",
+                    [repo_id],
+                    |row| row.get(0),
+                )
+                .map_err(DatabaseError::from)?;
+            if !exists {
+                return Err(AckError::UnknownRepository);
+            }
+        }
+        let maximum: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM audit_log WHERE ?1 IS NULL OR repo_id = ?1",
+                params![scope.repo_id()],
+                |row| row.get(0),
+            )
+            .map_err(DatabaseError::from)?;
+        if through_id > maximum {
+            return Err(AckError::InvalidObservation);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM audit_log e WHERE {UNACKNOWLEDGED_ERROR}
+            AND (?1 IS NULL OR e.repo_id = ?1) AND e.id <= ?2
+            AND julianday(e.created_at) > julianday(?3, '-1 day')
+            AND julianday(e.created_at) <= julianday(?3)
+            AND julianday(e.created_at) > julianday(?4, '-1 day')"
+        );
+        let count: i64 = tx
+            .query_row(
+                &sql,
+                params![
+                    scope.repo_id(),
+                    through_id,
+                    observation.observed_at,
+                    now.to_rfc3339()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(DatabaseError::from)?;
+        if count > 0 {
+            let details = serde_json::json!({
+                "schema": "reposync.error-ack.v1",
+                "scope": if scope.repo_id().is_some() { "repository" } else { "all" },
+                "through_id": through_id, "observed_at": observation.observed_at,
+                "acknowledged": count,
+            })
+            .to_string();
+            tx.execute(
+                "INSERT INTO audit_log (action, author, details, created_at, success, repo_id)
+                VALUES ('errors_acknowledged', ?1, ?2, ?3, 1, ?4)",
+                params![actor, details, now.to_rfc3339(), scope.repo_id()],
+            )
+            .map_err(DatabaseError::from)?;
+        }
+        tx.commit().map_err(DatabaseError::from)?;
         Ok(count)
     }
 
@@ -1286,14 +1465,6 @@ impl Database {
         let mut stmt = conn.prepare("SELECT MAX(created_at) FROM audit_log WHERE success = 0")?;
         let result: Option<String> = stmt.query_row([], |row| row.get(0))?;
         Ok(result)
-    }
-
-    /// Delete all error entries from the audit log.
-    /// Returns the number of rows deleted.
-    pub fn clear_errors(&self) -> Result<usize, DatabaseError> {
-        let conn = self.conn();
-        let deleted = conn.execute("DELETE FROM audit_log WHERE success = 0", [])?;
-        Ok(deleted)
     }
 
     // -- kv_state -----------------------------------------------------------
@@ -1483,15 +1654,13 @@ impl Database {
         }
     }
 
-    /// Count errors in the last 24 hours for a specific repository.
+    /// Count unacknowledged errors in the last 24 hours for one repository.
     pub fn count_errors_for_repo(&self, repo_id: &str) -> Result<i64, DatabaseError> {
-        let conn = self.conn();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM audit_log WHERE success = 0 AND repo_id = ?1 AND created_at > datetime('now', '-24 hours')",
-            params![repo_id],
-            |row| row.get(0),
-        )?;
-        Ok(count)
+        Ok(self
+            .error_snapshot(&ErrorScope::Repository {
+                repo_id: repo_id.into(),
+            })?
+            .count)
     }
 
     /// Get the most recent error timestamp for a specific repository.
@@ -1501,22 +1670,6 @@ impl Database {
             .prepare("SELECT MAX(created_at) FROM audit_log WHERE success = 0 AND repo_id = ?1")?;
         let result: Option<String> = stmt.query_row(params![repo_id], |row| row.get(0))?;
         Ok(result)
-    }
-
-    /// Delete error entries from audit_log for a specific repository.
-    pub fn clear_errors_for_repo(&self, repo_id: &str) -> Result<usize, DatabaseError> {
-        let conn = self.conn();
-        let count = conn.execute(
-            "DELETE FROM audit_log WHERE success = 0 AND repo_id = ?1",
-            params![repo_id],
-        )?;
-        // Also reset the cumulative total_errors column
-        let _ = conn.execute(
-            "UPDATE repositories SET total_errors = 0 WHERE id = ?1",
-            params![repo_id],
-        );
-        info!(repo_id, count, "cleared error entries for repo");
-        Ok(count)
     }
 
     /// Hard-delete a repository and all associated data from all tables.
@@ -4123,5 +4276,210 @@ mod tests {
 
         let state = db.resolve_credential_chain_state("repo_a", "secret_git_token");
         assert_eq!(state, CredentialChainState::not_found());
+    }
+    fn ack_failure(db: &Database, repo: Option<&str>, created: &str) -> i64 {
+        let conn = db.conn();
+        conn.execute("INSERT INTO audit_log (action,direction,svn_rev,git_sha,author,details,created_at,success,repo_id)
+            VALUES ('sync_failed','svn_to_git',42,'original-hash','original-author','operation-id=original; raw failure',?1,0,?2)", params![created,repo]).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn rs114_scoped_ack_preserves_originals_counters_history_and_later_errors() {
+        let db = setup_db();
+        create_test_repo(&db, "a", "A");
+        create_test_repo(&db, "b", "B");
+        db.conn()
+            .execute("UPDATE repositories SET total_errors=7", [])
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let a = ack_failure(&db, Some("a"), &now);
+        ack_failure(&db, Some("b"), &now);
+        ack_failure(&db, None, &now);
+        let before = db
+            .list_audit_log(100, 0)
+            .unwrap()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>();
+        let historical_last = db.last_error_at().unwrap();
+        let scope = ErrorScope::Repository {
+            repo_id: "a".into(),
+        };
+        let observed = db.error_snapshot(&scope).unwrap();
+        assert_eq!(observed.count, 1);
+        assert_eq!(
+            db.acknowledge_errors(&scope, &observed.observation, "admin-a")
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.count_errors_for_repo("a").unwrap(), 0);
+        assert_eq!(db.count_errors_for_repo("b").unwrap(), 1);
+        assert_eq!(db.count_errors().unwrap(), 2, "CLI reports active failures");
+        assert_eq!(
+            db.last_error_at().unwrap(),
+            historical_last,
+            "engine retains history"
+        );
+        assert_eq!(db.last_error_at_for_repo("a").unwrap(), Some(now.clone()));
+        assert_eq!(db.get_repository("a").unwrap().unwrap().total_errors, 7);
+        let original = db
+            .list_audit_log(100, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| !e.success)
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>();
+        assert_eq!(original, before);
+        let later = ack_failure(&db, Some("a"), &Utc::now().to_rfc3339());
+        assert!(later > a);
+        assert_eq!(
+            db.acknowledge_errors(&scope, &observed.observation, "admin-a")
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.count_errors_for_repo("a").unwrap(), 1);
+        assert_eq!(
+            db.list_audit_log_by_action("errors_acknowledged", 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        let all = db.error_snapshot(&ErrorScope::All {}).unwrap();
+        assert_eq!(
+            db.acknowledge_errors(&ErrorScope::All {}, &all.observation, "admin-b")
+                .unwrap(),
+            3
+        );
+        assert_eq!(db.count_errors().unwrap(), 0);
+        assert!(db
+            .error_snapshot(&ErrorScope::All {})
+            .unwrap()
+            .last_error_at
+            .is_none());
+        assert_eq!(
+            db.list_audit_log(100, 0)
+                .unwrap()
+                .iter()
+                .filter(|e| !e.success)
+                .count(),
+            4
+        );
+        assert_eq!(
+            db.conn()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            13
+        );
+    }
+
+    #[test]
+    fn rs114_ack_rolling_window_uses_dates_and_ignores_malformed_events() {
+        let db = setup_db();
+        ack_failure(
+            &db,
+            None,
+            &(Utc::now() - chrono::Duration::hours(25)).to_rfc3339(),
+        );
+        ack_failure(
+            &db,
+            None,
+            &(Utc::now() - chrono::Duration::hours(23))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        );
+        ack_failure(&db, None, &Utc::now().to_rfc3339());
+        for details in [
+            "invalid-json",
+            "null",
+            "42",
+            "\"string\"",
+            "[]",
+            "{}",
+            r#"{"schema":"unknown"}"#,
+        ] {
+            db.insert_audit_log(
+                "errors_acknowledged",
+                None,
+                None,
+                None,
+                Some("admin"),
+                Some(details),
+                true,
+            )
+            .unwrap();
+        }
+        let invalid = serde_json::json!({"schema":"reposync.error-ack.v1", "scope":"all",
+            "through_id":9223372036854775808_u64, "observed_at":Utc::now().to_rfc3339(), "acknowledged":2}).to_string();
+        db.insert_audit_log(
+            "errors_acknowledged",
+            None,
+            None,
+            None,
+            Some("admin"),
+            Some(&invalid),
+            true,
+        )
+        .unwrap();
+        assert_eq!(db.count_errors().unwrap(), 2);
+        let observed = db.error_snapshot(&ErrorScope::All {}).unwrap();
+        assert_eq!(
+            db.acknowledge_errors(&ErrorScope::All {}, &observed.observation, "admin")
+                .unwrap(),
+            2
+        );
+        assert_eq!(db.count_errors().unwrap(), 0);
+        assert_eq!(
+            db.list_audit_log(100, 0)
+                .unwrap()
+                .iter()
+                .filter(|e| !e.success)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn rs114_ack_refuses_invalid_boundaries_and_rolls_back_failed_receipt() {
+        let db = setup_db();
+        ack_failure(&db, None, &Utc::now().to_rfc3339());
+        let observation = db.error_snapshot(&ErrorScope::All {}).unwrap().observation;
+        for through_id in ["-1", "01", "+1", "9223372036854775808", "999", ""] {
+            let invalid = ErrorObservation {
+                through_id: through_id.into(),
+                ..observation.clone()
+            };
+            assert!(matches!(
+                db.acknowledge_errors(&ErrorScope::All {}, &invalid, "admin"),
+                Err(ErrorAcknowledgementError::InvalidObservation)
+            ));
+        }
+        let future = ErrorObservation {
+            observed_at: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            ..observation.clone()
+        };
+        assert!(db
+            .acknowledge_errors(&ErrorScope::All {}, &future, "admin")
+            .is_err());
+        assert!(matches!(
+            db.acknowledge_errors(
+                &ErrorScope::Repository {
+                    repo_id: "missing".into()
+                },
+                &observation,
+                "admin"
+            ),
+            Err(ErrorAcknowledgementError::UnknownRepository)
+        ));
+        db.conn().execute_batch("CREATE TRIGGER reject_ack BEFORE INSERT ON audit_log WHEN NEW.action='errors_acknowledged' BEGIN SELECT RAISE(ABORT,'injected write failure'); END;").unwrap();
+        assert!(matches!(
+            db.acknowledge_errors(&ErrorScope::All {}, &observation, "admin"),
+            Err(ErrorAcknowledgementError::Database(_))
+        ));
+        assert_eq!(db.count_errors().unwrap(), 1);
+        assert!(db
+            .list_audit_log_by_action("errors_acknowledged", 100)
+            .unwrap()
+            .is_empty());
     }
 }

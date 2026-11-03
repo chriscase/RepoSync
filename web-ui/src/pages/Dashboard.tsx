@@ -1,3 +1,5 @@
+import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
+import { errorScope } from '../errorAcknowledgement';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useState, useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -234,19 +236,17 @@ export default function Dashboard() {
           title="Errors (24h)"
           value={String(status?.total_errors ?? 0)}
           color={status?.total_errors ? 'red' : 'gray'}
-          onClick={() => navigate('/audit?success=false')}
+          onClick={() => navigate(`/audit?success=false${activeRepoId ? `&repo_id=${encodeURIComponent(activeRepoId)}` : ''}`)}
           subtitle={
             status?.last_error_at
               ? `Last: ${formatTimeAgo(status.last_error_at)}`
               : 'No recent errors'
           }
-          onClear={
-            (status?.total_errors ?? 0) > 0
-              ? async () => {
-                  await api.resetErrors();
-                  queryClient.invalidateQueries({ queryKey: ['status'] });
-                }
-              : undefined
+          action={
+            <ErrorAcknowledgement key={activeRepoId ?? 'all'} scope={errorScope(activeRepoId)}
+              repositoryName={repoContextLabel} observation={status?.error_observation}
+              count={status?.total_errors ?? 0}
+              onSuccess={() => { void queryClient.invalidateQueries({ queryKey: ['status'] }); }} />
           }
         />
         <StatusCard
@@ -435,14 +435,14 @@ function StatusCard({
   color,
   onClick,
   subtitle,
-  onClear,
+  action,
 }: {
   title: string;
   value: string;
   color: string;
   onClick?: () => void;
   subtitle?: string;
-  onClear?: () => void;
+  action?: React.ReactNode;
 }) {
   const colorClasses: Record<string, string> = {
     green: 'bg-green-900/30 border-green-700',
@@ -466,17 +466,7 @@ function StatusCard({
     >
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-400">{title}</p>
-        {onClear && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onClear();
-            }}
-            className="text-xs text-gray-400 hover:text-red-400 transition-colors px-1.5 py-0.5 rounded border border-gray-600 hover:border-red-500/50"
-          >
-            Clear
-          </button>
-        )}
+        {action}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
       {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}

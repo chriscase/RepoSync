@@ -1,3 +1,4 @@
+import type { ErrorObservation, ErrorScope } from './errorAcknowledgement';
 import { buildBranchPairDeleteQuery } from './branchPairDeletion';
 import type { BranchPairRemovalResult } from './branchPairRemoval';
 import type { ManagedRemovalStatus } from './managedRemoval';
@@ -15,6 +16,7 @@ export interface SyncStatus {
   active_conflicts: number;
   total_errors: number;
   last_error_at: string | null;
+  error_observation: ErrorObservation;
   uptime_secs: number;
 }
 
@@ -348,21 +350,11 @@ export const api = {
     return fetchJson<AuditListResponse>(`/audit?${params.toString()}`);
   },
 
-  resetErrors: async (repoId?: string): Promise<{ok: boolean, cleared: number}> => {
-    const token = localStorage.getItem('session_token');
-    const url = repoId
-      ? `${API_BASE}/status/reset-errors?repo_id=${encodeURIComponent(repoId)}`
-      : `${API_BASE}/status/reset-errors`;
-    const res = await fetch(url, {
+  acknowledgeErrors: (scope: ErrorScope, observation: ErrorObservation) =>
+    fetchJson<{ ok: boolean; acknowledged: number }>('/status/acknowledge-errors', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-    });
-    if (!res.ok) throw new Error('Failed to reset errors');
-    return res.json();
-  },
+      body: JSON.stringify({ scope, observation }),
+    }),
 
   getIdentityMappings: () => fetchJson<AuthorMapping[]>('/config/identity'),
 

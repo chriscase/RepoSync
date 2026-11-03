@@ -3,9 +3,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{rejection::JsonRejection, Query, RawQuery, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use reposync_core::db::queries::{ErrorAcknowledgementError, ErrorObservation, ErrorScope};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
@@ -43,6 +44,7 @@ struct StatusResponse {
     active_conflicts: i64,
     total_errors: i64,
     last_error_at: Option<String>,
+    error_observation: ErrorObservation,
     uptime_secs: u64,
 }
 
@@ -81,7 +83,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/api/status", get(get_status))
         .route("/api/status/health", get(health_check))
         .route("/api/status/system", get(get_system_metrics))
-        .route("/api/status/reset-errors", post(reset_errors))
+        .route("/api/status/acknowledge-errors", post(acknowledge_errors))
+        // Compatibility route requires the same explicit JSON contract; never deletes.
+        .route("/api/status/reset-errors", post(acknowledge_errors))
 }
 
 fn health_http(service: &crate::SchedulerServiceState) -> (axum::http::StatusCode, HealthResponse) {
@@ -139,11 +143,11 @@ async fn get_status(
 
         let active_conflicts = db.count_active_conflicts_for_repo(repo_id).unwrap_or(0);
 
-        // Use 24h rolling window for errors (same as global status)
-        let errors_24h = db
-            .count_errors_for_repo(repo_id)
-            .unwrap_or(repo.total_errors);
-        let last_error = db.last_error_at_for_repo(repo_id).unwrap_or(None);
+        let errors = db
+            .error_snapshot(&ErrorScope::Repository {
+                repo_id: repo_id.clone(),
+            })
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
         return Ok(Json(StatusResponse {
             state: repo.sync_status,
@@ -161,8 +165,9 @@ async fn get_status(
             total_syncs: repo.total_syncs,
             total_conflicts: 0,
             active_conflicts,
-            total_errors: errors_24h,
-            last_error_at: last_error,
+            total_errors: errors.count,
+            last_error_at: errors.last_error_at,
+            error_observation: errors.observation,
             uptime_secs: 0,
         }));
     }
@@ -187,8 +192,9 @@ async fn get_status(
     let total_syncs = db.count_sync_records().unwrap_or(0);
     let total_conflicts = db.count_all_conflicts().unwrap_or(0);
     let active_conflicts = db.count_active_conflicts().unwrap_or(0);
-    let total_errors = db.count_errors().unwrap_or(0);
-    let last_error_at = db.get_state("last_error_at").unwrap_or(None);
+    let errors = db
+        .error_snapshot(&ErrorScope::All {})
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(StatusResponse {
         state: state_str,
@@ -198,57 +204,66 @@ async fn get_status(
         total_syncs,
         total_conflicts,
         active_conflicts,
-        total_errors,
-        last_error_at,
+        total_errors: errors.count,
+        last_error_at: errors.last_error_at,
+        error_observation: errors.observation,
         uptime_secs: 0, // TODO: track in AppState
     }))
 }
 
-async fn reset_errors(
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeErrorsRequest {
+    scope: ErrorScope,
+    observation: ErrorObservation,
+}
+
+async fn acknowledge_errors(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    Query(query): Query<RepoQuery>,
+    RawQuery(query): RawQuery,
+    body: Result<Json<AcknowledgeErrorsRequest>, JsonRejection>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    crate::api::auth::validate_session(
-        &state,
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-    )
-    .await?;
-
-    let db = &state.db;
-
-    let cleared = if let Some(ref repo_id) = query.repo_id {
-        // Clear errors for a specific repo (also resets total_errors column)
-        db.clear_errors_for_repo(repo_id)
-            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-    } else {
-        // Clear all errors
-        db.clear_errors()
-            .map_err(|e| AppError::Internal(format!("database error: {}", e)))?
-    };
-
-    let _ = db.insert_audit_log(
-        "errors_cleared",
-        query.repo_id.as_deref(),
-        None,
-        None,
-        None,
-        Some(&format!(
-            "Cleared {} error entries{}",
-            cleared,
-            query
-                .repo_id
-                .as_ref()
-                .map(|id| format!(" for repo {}", id))
-                .unwrap_or_default()
-        )),
-        true,
-    );
-
-    Ok(Json(serde_json::json!({
-        "ok": true,
-        "cleared": cleared
-    })))
+    let authorization = headers.get("authorization").and_then(|v| v.to_str().ok());
+    // Authentication precedes request validation. Unauthenticated requests are 401,
+    // while a valid non-admin session is 403, including malformed request bodies.
+    if authorization
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .is_none_or(str::is_empty)
+        || (state.config.web.admin_password.is_none()
+            && state
+                .db
+                .count_users()
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                == 0)
+    {
+        return Err(AppError::Unauthorized("authentication required".into()));
+    }
+    let (actor, role) = crate::api::auth::validate_session_with_role(&state, authorization).await?;
+    if role != "admin" {
+        return Err(AppError::Forbidden(
+            "administrator role required to acknowledge errors".into(),
+        ));
+    }
+    if query.is_some_and(|q| !q.is_empty()) {
+        return Err(AppError::BadRequest(
+            "scope must be explicit in the JSON body; query scope is not accepted".into(),
+        ));
+    }
+    let Json(request) = body.map_err(|_| {
+        AppError::BadRequest("explicit scope and status observation required".into())
+    })?;
+    let acknowledged = state
+        .db
+        .acknowledge_errors(&request.scope, &request.observation, &actor)
+        .map_err(|e| match e {
+            ErrorAcknowledgementError::InvalidObservation => AppError::BadRequest(e.to_string()),
+            ErrorAcknowledgementError::UnknownRepository => AppError::NotFound(e.to_string()),
+            ErrorAcknowledgementError::Database(_) => AppError::Internal(e.to_string()),
+        })?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "acknowledged": acknowledged }),
+    ))
 }
 
 async fn get_system_metrics(
