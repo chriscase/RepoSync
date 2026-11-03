@@ -44,6 +44,7 @@ SCENARIOS=(
   "R17_SVNSERVE_JOB_ISOLATION:scenario_r17_svnserve_job_isolation"
   "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT:scenario_r01_svnserve_multi_commit_svn_to_git"
   "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN:scenario_r01_svnserve_multi_commit_git_to_svn"
+  "R01_SVNSERVE_LARGE_MESSAGE_RETRY:scenario_r01_svnserve_large_message_retry"
   "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE:scenario_r16_svnserve_git_remote_unreachable"
   "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE:scenario_r16_svnserve_svn_remote_unreachable"
   "R16_SVNSERVE_SVN_AUTH_DENIED:scenario_r16_svnserve_svn_auth_denied"
