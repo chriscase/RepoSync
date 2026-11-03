@@ -55,7 +55,15 @@ exercise the production verifier itself, unchanged destination on whole-source
 refusal, owner-execute semantics, unexpected destination bytes, literal paths,
 and unsupported committed types. The real pinned-SVN snapshot regression
 checks raw policy inputs, exported bytes/mode, a real Git commit, HEAD advancing
-after the pin and independent mismatch refusal. Existing Personal LFS, cycle,
+after the pin and independent mismatch refusal. Actual Personal Full import
+regressions check two revision-specific Git trees/mappings, deletion and controlled
+removal of destination-only paths. Ordinary Personal attributes regressions cover
+blank/duplicate lines, CRLF, no final LF, owner-execute and historical markers.
+These use a non-self-applying `*.txt` attribute rule so Git's own text conversion
+does not confound the raw attributes-byte assertions. The prior self-applying
+`* text=auto` CRLF fixture failure is retained separately; it is not presented as
+a copier defect or as proof that arbitrary Git attribute transformations are
+modeled by this verifier. Existing Personal LFS, cycle,
 snapshot and cancellation/reconcile controls must be qualified on the exact
 candidate, with counts and raw logs recorded separately.
 

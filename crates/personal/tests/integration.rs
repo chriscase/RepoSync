@@ -8220,3 +8220,206 @@ async fn rs113_personal_apply_preserves_literal_names_and_refuses_control_set_be
     assert_eq!(svn_youngest(&svn_url), 1);
     assert!(db.list_commit_map(10).unwrap().is_empty());
 }
+
+/// Exercise the distinct InitialImport::Full caller, including deletion and
+/// destination-only reconciliation before a mapping or push can be accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs88_personal_full_history_reconciles_each_raw_revision_before_mapping() {
+    use reposync_core::config::GitProvider;
+    use reposync_core::git::github::GitHubClient;
+    use reposync_personal::initial_import::{ImportMode, InitialImport};
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("wc");
+    svn_checkout(&svn_url, &wc);
+    assert_eq!(
+        svn_commit_files(
+            &wc,
+            &[
+                ("gone.txt", "gone\n"),
+                ("keep.txt", "before\n"),
+                (".gitattributes", "* text=auto\n\n"),
+                ("omit.tmp", "policy\n")
+            ],
+            "first"
+        ),
+        1
+    );
+    assert!(Command::new("svn")
+        .args(["rm", wc.join("gone.txt").to_str().unwrap()])
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        svn_commit_file(&wc, "keep.txt", "after\n", "delete and update"),
+        2
+    );
+    let work = tmp.path().join("git");
+    let bare = tmp.path().join("origin.git");
+    git2::Repository::init_bare(&bare).unwrap();
+    let client = Arc::new(Mutex::new(GitClient::init(&work).unwrap()));
+    git2::Repository::open(&work)
+        .unwrap()
+        .remote("origin", bare.to_str().unwrap())
+        .unwrap();
+    git_cmd(&work, &["checkout", "-b", "main"]);
+    std::fs::write(work.join("destination-only"), b"must not be committed").unwrap();
+    let database = setup_db(&tmp.path().join("db.sqlite"));
+    let (api_url, stub) = spawn_github_exists_stub();
+    let mut config = make_test_config(&svn_url, tmp.path());
+    config.github.api_url = api_url;
+    config.options.ignore_patterns = vec!["*.tmp".into()];
+    let svn = SvnClient::new(&svn_url, "", "");
+    let github = GitHubClient::new(&config.github.api_url, "unused", GitProvider::GitHub);
+    let formatter = CommitFormatter::new(&config.commit_format);
+    let importer = InitialImport {
+        svn_client: &svn,
+        git_client: &client,
+        github_client: &github,
+        db: &database,
+        config: &config,
+        formatter: &formatter,
+    };
+    assert_eq!(importer.import(ImportMode::Full).await.unwrap(), 2);
+    stub.join().unwrap();
+    let maps = database.list_commit_map(10).unwrap();
+    assert_eq!(maps.len(), 2);
+    let remote = git2::Repository::open_bare(&bare).unwrap();
+    let tip = remote
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    for revision in [1, 2] {
+        let mapping = maps.iter().find(|row| row.svn_rev == revision).unwrap();
+        assert_eq!(mapping.repo_id.as_deref(), Some(PERSONAL_SCOPE_KEY));
+        let commit = remote
+            .find_commit(git2::Oid::from_str(&mapping.git_sha).unwrap())
+            .unwrap();
+        let tree = commit.tree().unwrap();
+        let paths: Vec<_> = tree
+            .iter()
+            .map(|entry| entry.name().unwrap().to_owned())
+            .collect();
+        let expected = if revision == 1 {
+            vec![".gitattributes", "gone.txt", "keep.txt"]
+        } else {
+            vec![".gitattributes", "keep.txt"]
+        };
+        assert_eq!(paths, expected);
+        assert_eq!(
+            remote
+                .find_blob(tree.get_name("keep.txt").unwrap().id())
+                .unwrap()
+                .content(),
+            if revision == 1 {
+                b"before\n".as_slice()
+            } else {
+                b"after\n".as_slice()
+            }
+        );
+        assert_eq!(
+            remote
+                .find_blob(tree.get_name(".gitattributes").unwrap().id())
+                .unwrap()
+                .content(),
+            b"* text=auto\n\n"
+        );
+        if revision == 2 {
+            assert_eq!(tip.id(), commit.id());
+        }
+    }
+    assert_eq!(
+        database.get_watermark("svn_rev").unwrap().as_deref(),
+        Some("2")
+    );
+    assert!(!work.join("destination-only").exists());
+    assert!(!work.join("gone.txt").exists());
+    assert!(!work.join("omit.tmp").exists());
+}
+
+#[tokio::test]
+async fn rs88_personal_ordinary_attributes_preserve_raw_bytes_and_mode_with_history() {
+    for historical_marker in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let svn_url = create_svn_repo(tmp.path());
+        let wc = tmp.path().join("wc");
+        svn_checkout(&svn_url, &wc);
+        std::fs::write(wc.join(".gitattributes"), "*.txt text=auto\n\n").unwrap();
+        assert!(Command::new("svn")
+            .args(["add", wc.join(".gitattributes").to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("svn")
+            .args([
+                "propset",
+                "svn:executable",
+                "*",
+                wc.join(".gitattributes").to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let work = tmp.path().join("git");
+        let bare = tmp.path().join("origin.git");
+        let client = Arc::new(Mutex::new(setup_git_with_bare_origin(&work, &bare)));
+        if historical_marker {
+            reposync_core::lfs::ensure_lfs_tracked(&work, "*.historical").unwrap();
+        }
+        let database = Arc::new(setup_db(&tmp.path().join("db.sqlite")));
+        let config = make_test_config(&svn_url, tmp.path());
+        let syncer = SvnToGitSync::new(
+            SvnClient::new(&svn_url, "", ""),
+            client.clone(),
+            database.clone(),
+            config,
+        );
+        for (index, body) in [
+            "*.txt text=auto\n\n",
+            "*.txt text=auto\r\n",
+            "*.txt text=auto",
+            "*.txt text=auto\n*.txt text=auto\n",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let revision = svn_commit_file(&wc, ".gitattributes", body, "ordinary attributes");
+            assert_eq!(revision, index as i64 + 1);
+            // Bind the assertion to real exported bytes. The *.txt rule does
+            // not apply Git CRLF conversion to .gitattributes itself.
+            let exported = TempDir::new().unwrap();
+            SvnClient::new(&svn_url, "", "")
+                .export("", revision, exported.path())
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(exported.path().join(".gitattributes")).unwrap(),
+                body.as_bytes()
+            );
+            assert_eq!(syncer.sync().await.unwrap(), 1);
+            let repo = git2::Repository::open_bare(&bare).unwrap();
+            let commit = repo
+                .find_reference("refs/heads/main")
+                .unwrap()
+                .peel_to_commit()
+                .unwrap();
+            let tree = commit.tree().unwrap();
+            let attributes = tree.get_name(".gitattributes").unwrap();
+            assert_eq!(attributes.filemode(), 0o100755);
+            assert_eq!(
+                repo.find_blob(attributes.id()).unwrap().content(),
+                body.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(work.join(".gitattributes")).unwrap(),
+                body.as_bytes()
+            );
+            let mappings = database.list_commit_map(20).unwrap();
+            assert!(mappings
+                .iter()
+                .any(|row| row.svn_rev == revision && row.git_sha == commit.id().to_string()));
+            assert_eq!(syncer.sync().await.unwrap(), 0);
+        }
+    }
+}

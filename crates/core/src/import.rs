@@ -1995,6 +1995,23 @@ fn reconcile_root_gitattributes(dst_root: &Path, src_path: &Path, dst_path: &Pat
             );
         }
         if src_meta.file_type().is_file() {
+            // The copier has already published this exact ordinary export
+            // file. Do not normalize its whitespace, line endings or mode,
+            // even if a historical engine LFS marker exists. Current LFS
+            // generation has a different body and still takes the explicit
+            // merge path below. Check bytes without decoding ordinary data.
+            if dst_kind.is_file {
+                let dest_meta = std::fs::symlink_metadata(dst_path)?;
+                if !is_hardlink_alias(&dest_meta)
+                    && hash_regular_file_no_follow(dst_path)?
+                        == hash_regular_file_no_follow(src_path)?
+                {
+                    // Keep the copier's actual mode too: a current generated
+                    // LFS attributes file is 0644 even when its bytes happen
+                    // to equal an executable source attributes file.
+                    return Ok(true);
+                }
+            }
             let dest_was_symlink = dst_kind.is_symlink;
             let dest_body = if dst_kind.is_file {
                 Some(read_regular_file_no_follow(dst_path).with_context(|| {
@@ -5569,6 +5586,86 @@ mod rs88_production_projection_tests {
         let db = Database::in_memory().unwrap();
         db.initialize().unwrap();
         db
+    }
+
+    #[test]
+    fn rs88_stale_reconciliation_preserves_ordinary_attributes_and_requires_current_lfs_rules() {
+        for historical in [false, true] {
+            for body in [
+                b"* text=auto\n\n".as_slice(),
+                b"* text=auto\r\n",
+                b"* text=auto",
+                b"* text=auto\n* text=auto\n",
+                b"# opaque \xff\n",
+            ] {
+                let source = tempfile::tempdir().unwrap();
+                let dest = tempfile::tempdir().unwrap();
+                std::fs::create_dir(dest.path().join(".git")).unwrap();
+                if historical {
+                    crate::lfs::ensure_lfs_tracked(dest.path(), "*.old").unwrap();
+                }
+                std::fs::write(source.path().join(".gitattributes"), body).unwrap();
+                std::fs::set_permissions(
+                    source.path().join(".gitattributes"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                let policy = FilePolicy::new(0, vec![]);
+                copy_tree_with_policy(source.path(), dest.path(), &policy, &db()).unwrap();
+                remove_stale_files(source.path(), dest.path()).unwrap();
+                assert!(verify_export_projection(source.path(), dest.path(), &policy).is_ok());
+                assert_eq!(
+                    std::fs::read(dest.path().join(".gitattributes")).unwrap(),
+                    body
+                );
+                assert_ne!(
+                    std::fs::metadata(dest.path().join(".gitattributes"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o100,
+                    0
+                );
+            }
+        }
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dest.path().join(".git")).unwrap();
+        std::fs::write(source.path().join("payload.bin"), b"large payload").unwrap();
+        std::fs::write(
+            source.path().join(".gitattributes"),
+            b"*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            source.path().join(".gitattributes"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let policy = FilePolicy::with_lfs(0, vec![], 0, &["*.bin".into()]);
+        copy_tree_with_policy(source.path(), dest.path(), &policy, &db()).unwrap();
+        remove_stale_files(source.path(), dest.path()).unwrap();
+        assert!(verify_export_projection(source.path(), dest.path(), &policy).is_ok());
+        assert_eq!(
+            std::fs::metadata(dest.path().join(".gitattributes"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o100,
+            0
+        );
+        std::fs::remove_file(
+            dest.path()
+                .join(".git")
+                .join(crate::lfs::ENGINE_LFS_PATTERN_MARKER),
+        )
+        .unwrap();
+        assert!(
+            verify_export_projection(source.path(), dest.path(), &policy)
+                .unwrap_err()
+                .to_string()
+                .contains("missing engine LFS provenance")
+        );
     }
 
     #[test]
