@@ -92,12 +92,8 @@ impl GitClient {
         // Set HEAD as a symbolic reference (it's fine if the target doesn't
         // exist yet — that's what "unborn" HEAD means, and the first commit
         // will materialize it).
-        self.repo.reference_symbolic(
-            "HEAD",
-            &target_ref,
-            true,
-            "reposync: align HEAD with configured branch",
-        )?;
+        self.repo
+            .reference_symbolic("HEAD", &target_ref, true, "reposync: align HEAD with configured branch")?;
         info!(branch, "aligned HEAD to refs/heads/{}", branch);
         Ok(())
     }
@@ -109,15 +105,20 @@ impl GitClient {
     /// Get the current HEAD commit SHA.
     pub fn head_sha(&self) -> Result<String, GitError> {
         let head = self.repo.head().map_err(GitError::from)?;
-        let oid = head.peel_to_commit().map_err(GitError::from)?.id();
+        let oid = head
+            .peel_to_commit()
+            .map_err(GitError::from)?
+            .id();
         Ok(oid.to_string())
     }
 
     /// Hard-reset HEAD to a specific commit SHA.
     /// Used to roll back failed pushes so bad commits don't accumulate.
     pub fn reset_hard(&self, sha: &str) -> Result<(), GitError> {
-        let oid = git2::Oid::from_str(sha).map_err(GitError::Git2Error)?;
-        let commit = self.repo.find_commit(oid).map_err(GitError::from)?;
+        let oid = git2::Oid::from_str(sha)
+            .map_err(|e| GitError::Git2Error(e))?;
+        let commit = self.repo.find_commit(oid)
+            .map_err(GitError::from)?;
         self.repo
             .reset(commit.as_object(), git2::ResetType::Hard, None)
             .map_err(GitError::from)?;
@@ -205,10 +206,9 @@ impl GitClient {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GitError::Git2Error(git2::Error::from_str(&format!(
-                "git fetch failed: {}",
-                stderr.trim()
-            ))));
+            return Err(GitError::Git2Error(git2::Error::from_str(
+                &format!("git fetch failed: {}", stderr.trim())
+            )));
         }
         debug!("fetch completed");
         Ok(())
@@ -250,15 +250,15 @@ impl GitClient {
             if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
                 info!(
                     remote = remote_name,
-                    branch, "remote has no '{}' branch yet; treating as empty remote", branch
+                    branch,
+                    "remote has no '{}' branch yet; treating as empty remote",
+                    branch
                 );
                 return Ok(());
             }
-            return Err(GitError::Git2Error(git2::Error::from_str(&format!(
-                "git reset --hard {} failed: {}",
-                remote_ref,
-                stderr.trim()
-            ))));
+            return Err(GitError::Git2Error(git2::Error::from_str(
+                &format!("git reset --hard {} failed: {}", remote_ref, stderr.trim())
+            )));
         }
         info!("pull completed");
         Ok(())
@@ -306,20 +306,22 @@ impl GitClient {
         // use `Signature::new`; otherwise fall back to wallclock via
         // `Signature::now`. A parse failure falls back to wallclock with
         // a warning rather than aborting the commit.
-        let author = match author_date.and_then(|d| match chrono::DateTime::parse_from_rfc3339(d) {
-            Ok(dt) => Some(dt),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    date = %d,
-                    "failed to parse SVN author date; falling back to wallclock"
-                );
-                None
+        let author = match author_date.and_then(|d| {
+            match chrono::DateTime::parse_from_rfc3339(d) {
+                Ok(dt) => Some(dt),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        date = %d,
+                        "failed to parse SVN author date; falling back to wallclock"
+                    );
+                    None
+                }
             }
         }) {
             Some(dt) => {
                 let secs = dt.timestamp();
-                let offset_mins = dt.offset().local_minus_utc() / 60;
+                let offset_mins = (dt.offset().local_minus_utc() / 60) as i32;
                 let time = git2::Time::new(secs, offset_mins);
                 Signature::new(author_name, author_email, &time)?
             }
@@ -426,14 +428,8 @@ impl GitClient {
 
         // Build the commit via git CLI with explicit author/committer.
         let author_str = format!("{} <{}>", author_name, author_email);
-        let mut commit_args: Vec<&str> = vec![
-            "commit",
-            "--file",
-            "-",
-            "--cleanup=verbatim",
-            "--author",
-            &author_str,
-        ];
+        let mut commit_args: Vec<&str> =
+            vec!["commit", "-m", message, "--author", &author_str];
         // If the caller supplied an author date (typically the original SVN
         // commit timestamp), thread it through with `--date`. Without this,
         // git defaults to the wallclock and the resulting commit's author
@@ -445,9 +441,6 @@ impl GitClient {
         }
         let commit_output = std::process::Command::new("git")
             .args(&commit_args)
-            .stdin(std::process::Stdio::from(crate::commit_message::input(
-                message,
-            )?))
             .current_dir(repo_path)
             .env("GIT_COMMITTER_NAME", committer_name)
             .env("GIT_COMMITTER_EMAIL", committer_email)
@@ -473,9 +466,7 @@ impl GitClient {
             .output()
             .map_err(GitError::IoError)?;
 
-        let sha_str = String::from_utf8_lossy(&rev_output.stdout)
-            .trim()
-            .to_string();
+        let sha_str = String::from_utf8_lossy(&rev_output.stdout).trim().to_string();
         let oid = Oid::from_str(&sha_str).map_err(|e| {
             error!(sha = %sha_str, error = %e, "failed to parse commit SHA");
             e
@@ -517,12 +508,14 @@ impl GitClient {
             .to_path_buf()
     }
 
-    fn push_impl(&self, remote_name: &str, branch: &str, force: bool) -> Result<(), GitError> {
+    fn push_impl(
+        &self,
+        remote_name: &str,
+        branch: &str,
+        force: bool,
+    ) -> Result<(), GitError> {
         let start = std::time::Instant::now();
-        info!(
-            remote = remote_name,
-            branch, force, "pushing via git CLI (LFS-compatible)"
-        );
+        info!(remote = remote_name, branch, force, "pushing via git CLI (LFS-compatible)");
 
         let repo_path = self.repo.workdir().unwrap_or_else(|| self.repo.path());
 
@@ -979,14 +972,10 @@ mod tests {
         let client = GitClient::new(dir.path()).unwrap();
 
         std::fs::write(dir.path().join("data.txt"), "version 1").unwrap();
-        let oid1 = client
-            .commit("v1", "T", "t@t.com", "T", "t@t.com", None)
-            .unwrap();
+        let oid1 = client.commit("v1", "T", "t@t.com", "T", "t@t.com", None).unwrap();
 
         std::fs::write(dir.path().join("data.txt"), "version 2").unwrap();
-        let oid2 = client
-            .commit("v2", "T", "t@t.com", "T", "t@t.com", None)
-            .unwrap();
+        let oid2 = client.commit("v2", "T", "t@t.com", "T", "t@t.com", None).unwrap();
 
         // Read content at commit 1
         let content1 = client
@@ -1007,46 +996,5 @@ mod tests {
             .get_file_content_at_commit(&oid1.to_string(), "nonexistent.txt")
             .unwrap();
         assert!(missing.is_none());
-    }
-    #[test]
-    fn candidate_228_cli_commit_preserves_oversized_verbatim_utf8() {
-        let root = tempfile::tempdir().unwrap();
-        let client = GitClient::init(root.path()).unwrap();
-        client
-            .repo
-            .config()
-            .unwrap()
-            .set_bool("commit.gpgsign", false)
-            .unwrap();
-        std::fs::write(root.path().join("message.txt"), "synthetic content\n").unwrap();
-        let message = format!(
-            "{}\n\n[reposync]\nquotes: '\"\\\n\n",
-            "é中文😀 multiline\n".repeat(16_384)
-        );
-        assert!(message.len() >= 256 * 1024);
-        let oid = client
-            .commit_via_cli(
-                &message,
-                "Fixture User",
-                "fixture@example.invalid",
-                "Fixture User",
-                "fixture@example.invalid",
-                Some("2026-01-02T03:04:05Z"),
-            )
-            .unwrap();
-        let commit = client.repo.find_commit(oid).unwrap();
-        assert_eq!(commit.message_bytes(), message.as_bytes());
-        assert_eq!(commit.author().when().seconds(), 1767323045);
-        assert!(client
-            .commit_via_cli(
-                "quiet repeat",
-                "Fixture User",
-                "fixture@example.invalid",
-                "Fixture User",
-                "fixture@example.invalid",
-                None,
-            )
-            .is_err());
-        assert_eq!(client.repo.head().unwrap().target(), Some(oid));
     }
 }

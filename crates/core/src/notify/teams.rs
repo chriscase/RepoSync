@@ -85,11 +85,12 @@ impl TeamsNotifier {
         };
 
         if let Some(body) = card_body {
-            let repo_name = event
-                .get("repo_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            info!(event_type, repo_name, "sending Teams notification");
+            let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            info!(
+                event_type,
+                repo_name,
+                "sending Teams notification"
+            );
             if let Err(e) = self.send_card(body).await {
                 warn!(error = %e, event_type, repo_name, "failed to send Teams notification");
             } else {
@@ -123,24 +124,15 @@ impl TeamsNotifier {
     // --- Event formatters ---
 
     fn format_sync_completed(&self, event: &serde_json::Value) -> Option<serde_json::Value> {
-        let svn_to_git = event
-            .get("svn_to_git")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let git_to_svn = event
-            .get("git_to_svn")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let svn_to_git = event.get("svn_to_git").and_then(|v| v.as_i64()).unwrap_or(0);
+        let git_to_svn = event.get("git_to_svn").and_then(|v| v.as_i64()).unwrap_or(0);
 
         // Skip no-change cycles to avoid flooding
         if svn_to_git == 0 && git_to_svn == 0 {
             return None;
         }
 
-        let repo_name = event
-            .get("repo_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown");
+        let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
         let conflicts = event.get("conflicts").and_then(|v| v.as_i64()).unwrap_or(0);
         let total_commits = svn_to_git + git_to_svn;
 
@@ -211,33 +203,21 @@ impl TeamsNotifier {
                 }));
 
                 for commit in commits.iter().take(10) {
-                    let author = commit
-                        .get("author")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown");
+                    let author = commit.get("author").and_then(|v| v.as_str()).unwrap_or("Unknown");
                     let message = commit.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    let rev_id = commit
-                        .get("revision_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let files_changed = commit
-                        .get("files_changed")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let direction = commit
-                        .get("direction")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let rev_id = commit.get("revision_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let files_changed = commit.get("files_changed").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let direction = commit.get("direction").and_then(|v| v.as_str()).unwrap_or("");
 
-                    let direction_icon = if direction == "svn_to_git" {
-                        "→Git"
-                    } else {
-                        "→SVN"
-                    };
+                    let direction_icon = if direction == "svn_to_git" { "→Git" } else { "→SVN" };
 
                     // First line as summary, rest as details
                     let first_line = message.lines().next().unwrap_or("(no message)");
-                    let summary = truncate_for_card(first_line, 120);
+                    let summary = if first_line.len() > 120 {
+                        format!("{}…", &first_line[..120])
+                    } else {
+                        first_line.to_string()
+                    };
 
                     // Commit entry with author, rev, direction, and file count
                     body.push(json!({
@@ -279,7 +259,11 @@ impl TeamsNotifier {
                     arr.iter()
                         .filter_map(|v| v.as_str())
                         .map(|s| {
-                            let truncated = truncate_for_card(s, 100);
+                            let truncated = if s.len() > 100 {
+                                format!("{}…", &s[..100])
+                            } else {
+                                s.to_string()
+                            };
                             format!("• {}", truncated)
                         })
                         .collect()
@@ -302,18 +286,9 @@ impl TeamsNotifier {
     }
 
     fn format_sync_failed(&self, event: &serde_json::Value) -> serde_json::Value {
-        let repo_name = event
-            .get("repo_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown");
-        let error = event
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown error");
-        let is_permanent = event
-            .get("is_permanent")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("Unknown");
+        let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error");
+        let is_permanent = event.get("is_permanent").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let (icon, title) = if is_permanent {
             ("🛑", "Sync failed — permanent error")
@@ -322,7 +297,11 @@ impl TeamsNotifier {
         };
 
         // Truncate error message for card display
-        let short_error = truncate_for_card(error, 300);
+        let short_error = if error.len() > 300 {
+            format!("{}…", &error[..300])
+        } else {
+            error.to_string()
+        };
 
         json!([
             {
@@ -346,21 +325,12 @@ impl TeamsNotifier {
 
     fn format_import_progress(&self, event: &serde_json::Value) -> Option<serde_json::Value> {
         let phase = event.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-        let repo_name = event
-            .get("repo_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Repository");
+        let repo_name = event.get("repo_name").and_then(|v| v.as_str()).unwrap_or("Repository");
 
         match phase {
             "completed" => {
-                let total_revs = event
-                    .get("total_revs")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let commits = event
-                    .get("commits_created")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let total_revs = event.get("total_revs").and_then(|v| v.as_i64()).unwrap_or(0);
+                let commits = event.get("commits_created").and_then(|v| v.as_i64()).unwrap_or(0);
 
                 Some(json!([
                     {
@@ -382,7 +352,11 @@ impl TeamsNotifier {
             }
             "failed" => {
                 let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("");
-                let short_error = truncate_for_card(error, 300);
+                let short_error = if error.len() > 300 {
+                    format!("{}…", &error[..300])
+                } else {
+                    error.to_string()
+                };
 
                 let mut body = vec![json!({
                     "type": "TextBlock",
@@ -411,11 +385,7 @@ impl TeamsNotifier {
 }
 
 /// Format a branch pair creation event as a Teams card body.
-pub fn format_branch_created(
-    repo_name: &str,
-    git_branch: &str,
-    svn_branch: &str,
-) -> serde_json::Value {
+pub fn format_branch_created(repo_name: &str, git_branch: &str, svn_branch: &str) -> serde_json::Value {
     json!([
         {
             "type": "TextBlock",
@@ -456,11 +426,7 @@ pub fn format_branch_deleted(repo_name: &str, git_branch: &str) -> serde_json::V
 }
 
 /// Format a path violation event as a Teams card body.
-pub fn format_path_violation(
-    repo_name: &str,
-    violations: &[String],
-    skipped_all: bool,
-) -> serde_json::Value {
+pub fn format_path_violation(repo_name: &str, violations: &[String], skipped_all: bool) -> serde_json::Value {
     let (icon, title) = if skipped_all {
         ("⚠️", "Commit skipped — all files violate path rules")
     } else {
@@ -469,11 +435,7 @@ pub fn format_path_violation(
 
     let violation_text = if violations.len() > 5 {
         let shown: Vec<&str> = violations.iter().take(5).map(|s| s.as_str()).collect();
-        format!(
-            "{}  \nand {} more",
-            shown.join("  \n"),
-            violations.len() - 5
-        )
+        format!("{}  \nand {} more", shown.join("  \n"), violations.len() - 5)
     } else {
         violations.join("  \n")
     };
@@ -517,18 +479,6 @@ pub fn format_circuit_breaker(repo_name: &str, consecutive_errors: i64) -> serde
             "color": "Attention"
         }
     ])
-}
-
-/// Preserve the existing byte budgets while backing up to a UTF-8 boundary.
-fn truncate_for_card(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
 }
 
 #[cfg(test)]
@@ -625,49 +575,5 @@ mod tests {
         let card = format_path_violation("Test Repo", &violations, false);
         let card_str = card.to_string();
         assert!(card_str.contains("and 3 more"));
-    }
-    #[test]
-    fn candidate_228_unicode_crossing_all_card_byte_limits_is_safe() {
-        let notifier = TeamsNotifier::new("https://example.invalid".into());
-        for character in ["é", "界", "😀"] {
-            let prefix = "a".repeat(119);
-            let rich = notifier
-                .format_sync_completed(&json!({
-                    "git_to_svn":1,"commits":[{"message":format!("{prefix}{character}tail\nbody") }]
-                }))
-                .unwrap();
-            assert!(rich.to_string().contains(&format!("{prefix}…")));
-            assert!(!rich.to_string().contains("tail"));
-            let prefix = "a".repeat(99);
-            let legacy = notifier
-                .format_sync_completed(&json!({
-                    "svn_to_git":1,"messages":[format!("{prefix}{character}tail")]
-                }))
-                .unwrap();
-            assert!(legacy.to_string().contains(&format!("• {prefix}…")));
-            let prefix = "a".repeat(299);
-            let error = format!("{prefix}{character}tail");
-            let failed = notifier.format_sync_failed(&json!({"error":error}));
-            assert!(failed.to_string().contains(&format!("{prefix}…")));
-            let import = notifier
-                .format_import_progress(&json!({"phase":"failed","error":error}))
-                .unwrap();
-            assert!(import.to_string().contains(&format!("{prefix}…")));
-        }
-    }
-
-    #[test]
-    fn candidate_228_ascii_and_short_unicode_display_remain_unchanged() {
-        for limit in [100, 120, 300] {
-            assert_eq!(truncate_for_card("é界😀", limit), "é界😀");
-            assert_eq!(
-                truncate_for_card(&"x".repeat(limit), limit),
-                "x".repeat(limit)
-            );
-            assert_eq!(
-                truncate_for_card(&"x".repeat(limit + 1), limit),
-                format!("{}…", "x".repeat(limit))
-            );
-        }
     }
 }

@@ -161,10 +161,7 @@ impl SyncEngine {
     }
 
     /// Validate file paths against allowed/blocked rules.
-    fn validate_file_paths(
-        &self,
-        files: &[(String, String, Option<Vec<u8>>)],
-    ) -> Result<(), Vec<String>> {
+    fn validate_file_paths(&self, files: &[(String, String, Option<Vec<u8>>)]) -> Result<(), Vec<String>> {
         validate_file_paths_impl(&self.allowed_paths, &self.blocked_patterns, files)
     }
 
@@ -283,9 +280,7 @@ impl SyncEngine {
     pub fn get_status(&self) -> Result<crate::models::SyncStatus, SyncError> {
         // Use the consolidated summary query to reduce mutex acquisitions
         // (1 query instead of 8+ separate queries).
-        let summary = self
-            .db
-            .get_status_summary(self.repo_id.as_deref())
+        let summary = self.db.get_status_summary(self.repo_id.as_deref())
             .map_err(SyncError::DatabaseError)?;
 
         let last_sync_at = summary.last_sync_at.and_then(|s| {
@@ -448,11 +443,7 @@ impl SyncEngine {
                 .map_err(SyncError::IdentityError)?;
 
             // 1. Get the SVN diff for this revision.
-            let svn = self
-                .svn_client
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
+            let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
             let diff = svn
                 .diff_full(change.revision)
                 .await
@@ -473,8 +464,13 @@ impl SyncEngine {
             let processed_diff = if self.config.svn.layout == SvnLayout::Standard {
                 let tp = self.config.svn.trunk_path.trim_matches('/');
                 if !tp.is_empty() {
-                    diff.replace(&format!("a/{}/", tp), "a/")
-                        .replace(&format!("b/{}/", tp), "b/")
+                    diff.replace(
+                        &format!("a/{}/", tp),
+                        "a/",
+                    ).replace(
+                        &format!("b/{}/", tp),
+                        "b/",
+                    )
                 } else {
                     diff
                 }
@@ -523,8 +519,7 @@ impl SyncEngine {
                             let rel = if branch_prefix.is_empty() {
                                 raw
                             } else {
-                                raw.strip_prefix(&format!("{}/", branch_prefix))
-                                    .unwrap_or(raw)
+                                raw.strip_prefix(&format!("{}/", branch_prefix)).unwrap_or(raw)
                             };
                             if repo_path.join(rel).exists() {
                                 info!(path = rel, "git apply placed file at correct path");
@@ -554,15 +549,13 @@ impl SyncEngine {
             // to commit and falling back to a full SVN export would create a
             // massive commit touching every file, which can trigger remote
             // pre-receive hook rejections and OOM on push.
-            if !diff_applied && processed_diff.trim().is_empty() && change.changed_files.is_empty()
-            {
+            if !diff_applied && processed_diff.trim().is_empty() && change.changed_files.is_empty() {
                 info!(
                     rev = change.revision,
                     "skipping SVN revision with empty diff and no changed files (metadata-only)"
                 );
                 // Advance the watermark so we don't re-process this revision.
-                let per_repo_key = self
-                    .effective_repo_id()
+                let per_repo_key = self.effective_repo_id()
                     .map(|rid| format!("last_svn_rev_{}", rid));
                 if let Some(ref key) = per_repo_key {
                     let _ = self.db.set_state(key, &change.revision.to_string());
@@ -611,8 +604,7 @@ impl SyncEngine {
                         // bare branch-root dir entry — nothing file-level to materialize
                         ""
                     } else {
-                        raw.strip_prefix(&format!("{}/", branch_prefix))
-                            .unwrap_or(raw)
+                        raw.strip_prefix(&format!("{}/", branch_prefix)).unwrap_or(raw)
                     };
                     if rel.is_empty() {
                         continue;
@@ -702,8 +694,7 @@ impl SyncEngine {
                         let path = if self.config.svn.layout == SvnLayout::Standard {
                             let tp = self.config.svn.trunk_path.trim_matches('/');
                             if !tp.is_empty() {
-                                cf.path
-                                    .strip_prefix(&format!("/{}/", tp))
+                                cf.path.strip_prefix(&format!("/{}/", tp))
                                     .or_else(|| cf.path.strip_prefix(&format!("{}/", tp)))
                                     .unwrap_or(&cf.path)
                             } else {
@@ -713,11 +704,7 @@ impl SyncEngine {
                             &cf.path
                         };
                         let clean = path.trim_start_matches('/');
-                        if clean.is_empty() {
-                            None
-                        } else {
-                            Some(clean.to_string())
-                        }
+                        if clean.is_empty() { None } else { Some(clean.to_string()) }
                     })
                     .collect();
 
@@ -974,9 +961,7 @@ impl SyncEngine {
                     new_git_sha = %&git_sha[..12.min(git_sha.len())],
                     "watermark updated"
                 );
-                let _ = self
-                    .db
-                    .update_repo_watermark(rid, change.revision, &git_sha);
+                let _ = self.db.update_repo_watermark(rid, change.revision, &git_sha);
                 let _ = self.db.increment_repo_sync_count(rid);
             }
 
@@ -1072,49 +1057,38 @@ impl SyncEngine {
             // 1b. EARLY filter: remove files that don't match allowed_paths
             // BEFORE copying to SVN WC. This prevents svn add from failing
             // on paths like SLS/ that don't exist in the SVN branch structure.
-            let file_contents: Vec<(String, String, Option<Vec<u8>>)> =
-                if !self.allowed_paths.is_empty() {
-                    file_contents
-                        .into_iter()
-                        .filter(|(action, path, _)| {
-                            if action == "D" {
-                                // Allow deletes even for blocked paths
-                                true
-                            } else if self
-                                .allowed_paths
-                                .iter()
-                                .any(|prefix| path.starts_with(prefix))
-                            {
-                                true
-                            } else {
-                                debug!(
-                                    sha = %change.sha,
-                                    path = %path,
-                                    "early filter: skipping file not under allowed_paths"
-                                );
-                                false
-                            }
-                        })
-                        .collect()
-                } else {
-                    file_contents
-                };
+            let file_contents: Vec<(String, String, Option<Vec<u8>>)> = if !self.allowed_paths.is_empty() {
+                file_contents
+                    .into_iter()
+                    .filter(|(action, path, _)| {
+                        if action == "D" {
+                            // Allow deletes even for blocked paths
+                            true
+                        } else if self.allowed_paths.iter().any(|prefix| path.starts_with(prefix)) {
+                            true
+                        } else {
+                            debug!(
+                                sha = %change.sha,
+                                path = %path,
+                                "early filter: skipping file not under allowed_paths"
+                            );
+                            false
+                        }
+                    })
+                    .collect()
+            } else {
+                file_contents
+            };
 
             if file_contents.is_empty() {
                 // All files were filtered out — advance watermark and skip
                 let _ = self.db.set_state("last_git_hash", &change.sha);
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self
-                        .db
-                        .set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                    let current_svn_rev = self
-                        .db
-                        .get_repo_watermark(rid)
+                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
+                    let current_svn_rev = self.db.get_repo_watermark(rid)
                         .map(|(rev, _)| rev)
                         .unwrap_or(0);
-                    let _ = self
-                        .db
-                        .update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
                 }
                 continue;
             }
@@ -1122,11 +1096,7 @@ impl SyncEngine {
             // 2. Prepare SVN working copy: checkout on first use, update thereafter.
             let svn_url_for_log;
             {
-                let svn = self
-                    .svn_client
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 svn_url_for_log = svn.url().to_string();
                 if !svn_wc_initialized {
                     debug!(
@@ -1216,11 +1186,7 @@ impl SyncEngine {
             }
 
             // 4. Stage changes in SVN.
-            let svn = self
-                .svn_client
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone();
+            let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
             // Stage ALL changes at once using `svn add --force .` from the
             // WC root. This recursively adds every unversioned file and
@@ -1245,9 +1211,7 @@ impl SyncEngine {
                     let p = std::path::Path::new(file_path);
                     let mut cur = p.parent();
                     while let Some(dir) = cur {
-                        if dir.as_os_str().is_empty() {
-                            break;
-                        }
+                        if dir.as_os_str().is_empty() { break; }
                         let ds = dir.to_string_lossy().to_string();
                         if !dirs_to_add.contains(&ds) {
                             dirs_to_add.push(ds);
@@ -1263,20 +1227,19 @@ impl SyncEngine {
                 for dir in &dirs_to_add {
                     let full = svn_wc_dir.path().join(dir);
                     if full.is_dir() {
-                        let _ = svn
-                            .run_svn_in_dir_public(
-                                svn_wc_dir.path(),
-                                &["add", "--force", "--depth", "empty", dir],
-                            )
-                            .await;
+                        let _ = svn.run_svn_in_dir_public(
+                            svn_wc_dir.path(),
+                            &["add", "--force", "--depth", "empty", dir],
+                        ).await;
                     }
                 }
 
                 // Now add the actual files — parents are guaranteed registered.
                 for file in &added_files {
-                    let _ = svn
-                        .run_svn_in_dir_public(svn_wc_dir.path(), &["add", "--force", file])
-                        .await;
+                    let _ = svn.run_svn_in_dir_public(
+                        svn_wc_dir.path(),
+                        &["add", "--force", file],
+                    ).await;
                 }
             }
             if !deleted_files.is_empty() {
@@ -1297,7 +1260,7 @@ impl SyncEngine {
                 let trimmed = line.trim();
                 !trimmed.is_empty()
                     && !trimmed.starts_with('?')  // unversioned
-                    && !trimmed.starts_with('X') // externals
+                    && !trimmed.starts_with('X')  // externals
             });
             if !has_changes {
                 warn!(
@@ -1314,18 +1277,11 @@ impl SyncEngine {
                 // commit on the next cycle.
                 let _ = self.db.set_state("last_git_hash", &change.sha);
                 if let Some(rid) = self.effective_repo_id() {
-                    let _ = self
-                        .db
-                        .set_state(&format!("last_git_sha_{}", rid), &change.sha);
+                    let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
                     // Preserve existing SVN watermark — only update git_sha
-                    let current_svn_rev = self
-                        .db
-                        .get_repo_watermark(rid)
-                        .map(|(rev, _)| rev)
-                        .unwrap_or(0);
-                    let _ = self
-                        .db
-                        .update_repo_watermark(rid, current_svn_rev, &change.sha);
+                    let current_svn_rev = self.db.get_repo_watermark(rid)
+                        .map(|(rev, _)| rev).unwrap_or(0);
+                    let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
                 }
                 continue;
             }
@@ -1345,28 +1301,21 @@ impl SyncEngine {
                 let violating_paths: Vec<String> = file_contents
                     .iter()
                     .filter(|(action, path, _)| {
-                        if action == "D" {
-                            return false;
-                        }
-                        if !self.allowed_paths.is_empty()
-                            && !self
-                                .allowed_paths
-                                .iter()
-                                .any(|prefix| path.starts_with(prefix))
-                        {
-                            return true;
+                        if action == "D" { return false; }
+                        if !self.allowed_paths.is_empty() {
+                            if !self.allowed_paths.iter().any(|prefix| path.starts_with(prefix)) {
+                                return true;
+                            }
                         }
                         for pattern in &self.blocked_patterns {
-                            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
-                                path.ends_with(suffix)
+                            let matches = if pattern.starts_with('*') {
+                                path.ends_with(&pattern[1..])
                             } else if pattern.ends_with('/') {
                                 path.starts_with(pattern)
                             } else {
                                 path == pattern || path.starts_with(&format!("{}/", pattern))
                             };
-                            if matches {
-                                return true;
-                            }
+                            if matches { return true; }
                         }
                         false
                     })
@@ -1409,11 +1358,7 @@ impl SyncEngine {
 
                 // Revert violating files from SVN working copy
                 let revert_paths: Vec<&str> = violating_paths.iter().map(|s| s.as_str()).collect();
-                let svn = self
-                    .svn_client
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 if let Err(e) = svn.revert_files(svn_wc_dir.path(), &revert_paths).await {
                     warn!(error = %e, "failed to revert violating files, skipping commit");
                     if let Some(rid) = self.effective_repo_id() {
@@ -1456,11 +1401,7 @@ impl SyncEngine {
             // for E155011 "out of date" errors. The WC may be stale if a
             // previous commit in this batch advanced the server HEAD.
             {
-                let svn = self
-                    .svn_client
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .clone();
+                let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
                 let _ = svn.update(svn_wc_dir.path()).await;
             }
 
@@ -1482,11 +1423,7 @@ impl SyncEngine {
                         sha = %change.sha,
                         "svn commit got 'out of date' — updating WC and retrying"
                     );
-                    let svn = self
-                        .svn_client
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .clone();
+                    let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     let _ = svn.update(svn_wc_dir.path()).await;
                     svn_commit_result = svn
                         .commit(svn_wc_dir.path(), &commit_message, &svn_username)
@@ -1507,17 +1444,11 @@ impl SyncEngine {
                     // Advance git watermark so we don't retry this commit
                     let _ = self.db.set_state("last_git_hash", &change.sha);
                     if let Some(rid) = self.effective_repo_id() {
-                        let _ = self
-                            .db
-                            .set_state(&format!("last_git_sha_{}", rid), &change.sha);
-                        let current_svn_rev = self
-                            .db
-                            .get_repo_watermark(rid)
+                        let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
+                        let current_svn_rev = self.db.get_repo_watermark(rid)
                             .map(|(rev, _)| rev)
                             .unwrap_or(0);
-                        let _ = self
-                            .db
-                            .update_repo_watermark(rid, current_svn_rev, &change.sha);
+                        let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
                     }
                     continue;
                 }
@@ -1549,18 +1480,12 @@ impl SyncEngine {
             // (bidirectional race condition / data loss).
             let _ = self.db.set_state("last_git_hash", &change.sha);
             if let Some(rid) = self.effective_repo_id() {
-                let _ = self
-                    .db
-                    .set_state(&format!("last_git_sha_{}", rid), &change.sha);
+                let _ = self.db.set_state(&format!("last_git_sha_{}", rid), &change.sha);
                 // Only advance git SHA in repo table; preserve SVN rev watermark
-                let current_svn_rev = self
-                    .db
-                    .get_repo_watermark(rid)
+                let current_svn_rev = self.db.get_repo_watermark(rid)
                     .map(|(rev, _)| rev)
                     .unwrap_or(0);
-                let _ = self
-                    .db
-                    .update_repo_watermark(rid, current_svn_rev, &change.sha);
+                let _ = self.db.update_repo_watermark(rid, current_svn_rev, &change.sha);
                 let _ = self.db.increment_repo_sync_count(rid);
             }
 
@@ -1638,9 +1563,7 @@ impl SyncEngine {
                     detected_rev = detected,
                     "Auto-detected last synced revision from existing git history"
                 );
-                let _ = self
-                    .db
-                    .set_state(&self.svn_rev_key(), &detected.to_string());
+                let _ = self.db.set_state(&self.svn_rev_key(), &detected.to_string());
                 // Also persist to the repo table if available
                 if let Some(rid) = self.effective_repo_id() {
                     let _ = self.db.update_repo_watermark(rid, detected, "");
@@ -1670,11 +1593,7 @@ impl SyncEngine {
 
         info!(since_rev = last_rev, "fetching SVN changes");
 
-        let svn = self
-            .svn_client
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let svn = self.svn_client.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let svn_info = svn.info().await.map_err(SyncError::SvnError)?;
         let head_rev = svn_info.latest_rev;
 
@@ -1716,12 +1635,14 @@ impl SyncEngine {
                         // When using standard layout, only sync files under trunk/
                         // and strip the trunk prefix so git paths are repo-relative.
                         let mapped_path = if let Some(ref prefix) = trunk_prefix {
-                            // Skip non-trunk paths (branches/, tags/).
-                            let rest = raw.strip_prefix(prefix.as_str())?;
-                            if rest.is_empty() {
-                                return None; // skip bare trunk/ directory entry
+                            if let Some(rest) = raw.strip_prefix(prefix.as_str()) {
+                                if rest.is_empty() {
+                                    return None; // skip bare trunk/ directory entry
+                                }
+                                rest.to_string()
+                            } else {
+                                return None; // skip non-trunk paths (branches/, tags/)
                             }
-                            rest.to_string()
                         } else {
                             raw.to_string()
                         };
@@ -1754,11 +1675,9 @@ impl SyncEngine {
         })?;
 
         // Check per-repo key first, then global key, then commit_map fallback.
-        let per_repo_key = self
-            .effective_repo_id()
+        let per_repo_key = self.effective_repo_id()
             .map(|rid| format!("last_git_sha_{}", rid));
-        let repo_table_sha = self
-            .effective_repo_id()
+        let repo_table_sha = self.effective_repo_id()
             .and_then(|rid| self.db.get_repo_watermark(rid).ok())
             .map(|(_, sha)| sha)
             .filter(|s| !s.is_empty());
@@ -1770,30 +1689,16 @@ impl SyncEngine {
             // Per-repo kv_state key
             match self.db.get_state(key).map_err(SyncError::DatabaseError)? {
                 Some(s) if !s.is_empty() => Some(s),
-                _ => match self
-                    .db
-                    .get_state("last_git_hash")
-                    .map_err(SyncError::DatabaseError)?
-                {
+                _ => match self.db.get_state("last_git_hash").map_err(SyncError::DatabaseError)? {
                     Some(s) if !s.is_empty() => Some(s),
-                    _ => self
-                        .db
-                        .get_last_git_hash()
-                        .map_err(SyncError::DatabaseError)?,
+                    _ => self.db.get_last_git_hash().map_err(SyncError::DatabaseError)?,
                 },
             }
         } else {
             // Global fallback
-            match self
-                .db
-                .get_state("last_git_hash")
-                .map_err(SyncError::DatabaseError)?
-            {
+            match self.db.get_state("last_git_hash").map_err(SyncError::DatabaseError)? {
                 Some(s) if !s.is_empty() => Some(s),
-                _ => self
-                    .db
-                    .get_last_git_hash()
-                    .map_err(SyncError::DatabaseError)?,
+                _ => self.db.get_last_git_hash().map_err(SyncError::DatabaseError)?,
             }
         };
 
@@ -2102,11 +2007,12 @@ pub async fn apply_diff_to_path(
     // Write diff to stdin and explicitly close it so git apply sees EOF
     // and begins processing. Without closing, git apply may hang forever.
     {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            crate::errors::GitError::IoError(std::io::Error::other(
-                "failed to open git apply stdin",
-            ))
-        })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| crate::errors::GitError::IoError(
+                std::io::Error::new(std::io::ErrorKind::Other, "failed to open git apply stdin")
+            ))?;
         use tokio::io::AsyncWriteExt;
         stdin
             .write_all(diff_content.as_bytes())
@@ -2187,21 +2093,16 @@ pub(crate) fn validate_file_paths_impl(
     }
     let mut violations = Vec::new();
     for (action, path, _) in files {
-        if action == "D" {
-            continue;
-        }
+        if action == "D" { continue; }
         if !allowed_paths.is_empty() {
             let allowed = allowed_paths.iter().any(|prefix| path.starts_with(prefix));
             if !allowed {
-                violations.push(format!(
-                    "'{}' not under allowed paths {:?}",
-                    path, allowed_paths
-                ));
+                violations.push(format!("'{}' not under allowed paths {:?}", path, allowed_paths));
             }
         }
         for pattern in blocked_patterns {
-            let matches = if let Some(suffix) = pattern.strip_prefix('*') {
-                path.ends_with(suffix)
+            let matches = if pattern.starts_with('*') {
+                path.ends_with(&pattern[1..])
             } else if pattern.ends_with('/') {
                 path.starts_with(pattern)
             } else {
@@ -2212,11 +2113,7 @@ pub(crate) fn validate_file_paths_impl(
             }
         }
     }
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(violations)
-    }
+    if violations.is_empty() { Ok(()) } else { Err(violations) }
 }
 
 #[cfg(test)]

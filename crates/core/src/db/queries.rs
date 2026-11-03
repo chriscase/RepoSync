@@ -735,16 +735,10 @@ impl Database {
         details: Option<&str>,
         success: bool,
     ) -> Result<i64, DatabaseError> {
-        self.insert_audit_log_with_repo(
-            action, direction, svn_rev, git_sha, author, details, success, None,
-        )
+        self.insert_audit_log_with_repo(action, direction, svn_rev, git_sha, author, details, success, None)
     }
 
     /// Insert an audit log entry tagged with an optional `repo_id`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Preserve the legacy audit API and all existing callers in the narrow backport"
-    )]
     pub fn insert_audit_log_with_repo(
         &self,
         action: &str,
@@ -796,11 +790,7 @@ impl Database {
     }
 
     /// List recent audit-log entries with optional offset for pagination.
-    pub fn list_audit_log(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<AuditLogEntry>, DatabaseError> {
+    pub fn list_audit_log(&self, limit: u32, offset: u32) -> Result<Vec<AuditLogEntry>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, action, direction, svn_rev, git_sha, author, details, created_at, success, repo_id
@@ -949,7 +939,9 @@ impl Database {
     /// Return the timestamp of the most recent error, if any.
     pub fn last_error_at(&self) -> Result<Option<String>, DatabaseError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT MAX(created_at) FROM audit_log WHERE success = 0")?;
+        let mut stmt = conn.prepare(
+            "SELECT MAX(created_at) FROM audit_log WHERE success = 0",
+        )?;
         let result: Option<String> = stmt.query_row([], |row| row.get(0))?;
         Ok(result)
     }
@@ -1058,8 +1050,9 @@ impl Database {
     /// Get the most recent error timestamp for a specific repository.
     pub fn last_error_at_for_repo(&self, repo_id: &str) -> Result<Option<String>, DatabaseError> {
         let conn = self.conn();
-        let mut stmt = conn
-            .prepare("SELECT MAX(created_at) FROM audit_log WHERE success = 0 AND repo_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT MAX(created_at) FROM audit_log WHERE success = 0 AND repo_id = ?1",
+        )?;
         let result: Option<String> = stmt.query_row(params![repo_id], |row| row.get(0))?;
         Ok(result)
     }
@@ -1086,14 +1079,17 @@ impl Database {
         let conn = self.conn();
         conn.execute_batch("BEGIN TRANSACTION")?;
 
-        let tables_with_repo_id = ["sync_records", "commit_map", "conflicts", "audit_log"];
+        let tables_with_repo_id = [
+            "sync_records",
+            "commit_map",
+            "conflicts",
+            "audit_log",
+        ];
         for table in &tables_with_repo_id {
             let sql = format!("DELETE FROM {} WHERE repo_id = ?1", table);
             match conn.execute(&sql, params![repo_id]) {
                 Ok(n) => debug!(table, repo_id, count = n, "deleted records"),
-                Err(e) => {
-                    debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping")
-                }
+                Err(e) => debug!(table, repo_id, error = %e, "table may not have repo_id column, skipping"),
             }
         }
 
@@ -1105,7 +1101,10 @@ impl Database {
         );
 
         // Delete the repository row itself
-        conn.execute("DELETE FROM repositories WHERE id = ?1", params![repo_id])?;
+        conn.execute(
+            "DELETE FROM repositories WHERE id = ?1",
+            params![repo_id],
+        )?;
 
         conn.execute_batch("COMMIT")?;
         info!(repo_id, "hard-deleted repository and all associated data");
@@ -1115,11 +1114,7 @@ impl Database {
     /// Advance ALL watermark locations atomically for a given repo.
     /// Updates repositories table, per-repo kv_state, and global kv_state.
     /// Used by "skip commit" and path validation to move past a failing commit.
-    pub fn advance_all_watermarks(
-        &self,
-        repo_id: &str,
-        git_sha: &str,
-    ) -> Result<(), DatabaseError> {
+    pub fn advance_all_watermarks(&self, repo_id: &str, git_sha: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
         conn.execute_batch("BEGIN TRANSACTION")?;
 
@@ -1510,20 +1505,19 @@ impl Database {
                     "cancelled" => crate::import::ImportPhase::Cancelled,
                     _ => crate::import::ImportPhase::Idle,
                 };
-                let errors: Vec<String> = serde_json::from_str(&errors_json).unwrap_or_default();
-                let progress = crate::import::ImportProgress {
-                    phase,
-                    current_rev,
-                    total_revs,
-                    commits_created: commits_created as u64,
-                    batches_pushed: batches_pushed as u64,
-                    lfs_unique_count: lfs_unique_count as u64,
-                    files_skipped: files_skipped as u64,
-                    errors,
-                    started_at,
-                    completed_at,
-                    ..Default::default()
-                };
+                let errors: Vec<String> =
+                    serde_json::from_str(&errors_json).unwrap_or_default();
+                let mut progress = crate::import::ImportProgress::default();
+                progress.phase = phase;
+                progress.current_rev = current_rev;
+                progress.total_revs = total_revs;
+                progress.commits_created = commits_created as u64;
+                progress.batches_pushed = batches_pushed as u64;
+                progress.lfs_unique_count = lfs_unique_count as u64;
+                progress.files_skipped = files_skipped as u64;
+                progress.errors = errors;
+                progress.started_at = started_at;
+                progress.completed_at = completed_at;
                 Ok(Some(progress))
             }
             Some(Err(e)) => Err(e.into()),
@@ -1536,7 +1530,8 @@ impl Database {
     /// Count total users in the database.
     pub fn count_users(&self) -> Result<i64, DatabaseError> {
         let conn = self.conn();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -1590,10 +1585,7 @@ impl Database {
     }
 
     /// Get a user by username.
-    pub fn get_user_by_username(
-        &self,
-        username: &str,
-    ) -> Result<Option<models::User>, DatabaseError> {
+    pub fn get_user_by_username(&self, username: &str) -> Result<Option<models::User>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, username, display_name, email, password_hash, role, enabled, created_at, updated_at
@@ -1767,10 +1759,7 @@ impl Database {
     }
 
     /// Get a specific credential by ID.
-    pub fn get_user_credential(
-        &self,
-        cred_id: &str,
-    ) -> Result<Option<models::UserCredential>, DatabaseError> {
+    pub fn get_user_credential(&self, cred_id: &str) -> Result<Option<models::UserCredential>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, user_id, service, server_url, username, encrypted_value, nonce, created_at, updated_at
@@ -1867,7 +1856,10 @@ impl Database {
     pub fn prune_expired_sessions(&self) -> Result<usize, DatabaseError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn();
-        let deleted = conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?;
+        let deleted = conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ?1",
+            params![now],
+        )?;
         if deleted > 0 {
             debug!(deleted, "pruned expired sessions");
         }
@@ -1920,8 +1912,7 @@ impl Database {
             None
         };
 
-        let tls_verify = self
-            .get_state("ldap_tls_verify")?
+        let tls_verify = self.get_state("ldap_tls_verify")?
             .map(|v| v != "false")
             .unwrap_or(true);
 
@@ -1952,7 +1943,10 @@ impl Database {
         self.set_state("ldap_display_name_attr", &config.display_name_attr)?;
         self.set_state("ldap_email_attr", &config.email_attr)?;
         self.set_state("ldap_group_attr", &config.group_attr)?;
-        self.set_state("ldap_bind_dn", config.bind_dn.as_deref().unwrap_or(""))?;
+        self.set_state(
+            "ldap_bind_dn",
+            config.bind_dn.as_deref().unwrap_or(""),
+        )?;
 
         // Encrypt and store bind password.
         if let Some(ref pw) = config.bind_password {
@@ -2045,11 +2039,11 @@ impl Database {
                 auto_merge: row.get::<_, i32>(12)? != 0,
                 enabled: row.get::<_, i32>(13)? != 0,
                 created_by: row.get(14)?,
-                parent_id: row.get(23)?,
-                allowed_paths: row.get(24)?,
-                blocked_patterns: row.get(25)?,
-                consecutive_errors: row.get(26)?,
-                teams_webhook_url: row.get(27)?,
+                    parent_id: row.get(23)?,
+                    allowed_paths: row.get(24)?,
+                    blocked_patterns: row.get(25)?,
+                    consecutive_errors: row.get(26)?,
+                    teams_webhook_url: row.get(27)?,
                 cloned_from_id: row.get(28)?,
                 created_at: row.get(15)?,
                 updated_at: row.get(16)?,
@@ -2093,7 +2087,7 @@ impl Database {
                     auto_merge: row.get::<_, i32>(12)? != 0,
                     enabled: row.get::<_, i32>(13)? != 0,
                     created_by: row.get(14)?,
-                    parent_id: row.get(23)?,
+                        parent_id: row.get(23)?,
                     allowed_paths: row.get(24)?,
                     blocked_patterns: row.get(25)?,
                     consecutive_errors: row.get(26)?,
@@ -2114,10 +2108,7 @@ impl Database {
     }
 
     /// List child repositories (branch pairs) for a given parent.
-    pub fn list_child_repositories(
-        &self,
-        parent_id: &str,
-    ) -> Result<Vec<models::Repository>, DatabaseError> {
+    pub fn list_child_repositories(&self, parent_id: &str) -> Result<Vec<models::Repository>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, cloned_from_id
@@ -2141,7 +2132,7 @@ impl Database {
                     auto_merge: row.get::<_, i32>(12)? != 0,
                     enabled: row.get::<_, i32>(13)? != 0,
                     created_by: row.get(14)?,
-                    parent_id: row.get(23)?,
+                        parent_id: row.get(23)?,
                     allowed_paths: row.get(24)?,
                     blocked_patterns: row.get(25)?,
                     consecutive_errors: row.get(26)?,
@@ -2164,10 +2155,7 @@ impl Database {
     /// List repositories that were duplicated from `source_id` (i.e. rows
     /// with `cloned_from_id = source_id`). Used by the catch-up indicator
     /// and the "siblings of this duplicate" lineage view.
-    pub fn list_clones_of(
-        &self,
-        source_id: &str,
-    ) -> Result<Vec<models::Repository>, DatabaseError> {
+    pub fn list_clones_of(&self, source_id: &str) -> Result<Vec<models::Repository>, DatabaseError> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, svn_url, svn_branch, svn_username, git_provider, git_api_url, git_repo, git_branch, sync_mode, poll_interval_secs, lfs_threshold_mb, auto_merge, enabled, created_by, created_at, updated_at, last_svn_rev, last_git_sha, last_sync_at, sync_status, total_syncs, total_errors, parent_id, allowed_paths, blocked_patterns, consecutive_errors, teams_webhook_url, cloned_from_id
@@ -2311,10 +2299,7 @@ impl Database {
             "UPDATE repositories SET last_svn_rev = MAX(last_svn_rev, ?1) WHERE id = ?2",
             params![svn_rev, repo_id],
         )?;
-        debug!(
-            repo_id,
-            svn_rev, "advanced SVN watermark (metadata-only skip)"
-        );
+        debug!(repo_id, svn_rev, "advanced SVN watermark (metadata-only skip)");
         Ok(())
     }
 
@@ -2365,7 +2350,9 @@ impl Database {
     ) -> Result<Vec<models::Repository>, DatabaseError> {
         let mut chain = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut current_pid = self.get_repository(repo_id)?.and_then(|r| r.parent_id);
+        let mut current_pid = self
+            .get_repository(repo_id)?
+            .and_then(|r| r.parent_id);
         while let Some(pid) = current_pid {
             if !visited.insert(pid.clone()) {
                 break; // cycle guard
@@ -2387,7 +2374,11 @@ impl Database {
 
     /// Resolve a credential (e.g. `secret_svn_password`) by walking the
     /// parent chain: repo → parent → grandparent → … → global.
-    pub fn resolve_credential_chain(&self, repo_id: &str, key_prefix: &str) -> Option<String> {
+    pub fn resolve_credential_chain(
+        &self,
+        repo_id: &str,
+        key_prefix: &str,
+    ) -> Option<String> {
         // 1. Repo-specific key
         if let Some(val) = self
             .get_state(&format!("{}_{}", key_prefix, repo_id))
@@ -2541,7 +2532,10 @@ impl Database {
     /// Delete an encrypted secret by key.
     pub fn delete_secret(&self, key: &str) -> Result<(), DatabaseError> {
         let conn = self.conn();
-        conn.execute("DELETE FROM encrypted_secrets WHERE key = ?1", params![key])?;
+        conn.execute(
+            "DELETE FROM encrypted_secrets WHERE key = ?1",
+            params![key],
+        )?;
         Ok(())
     }
 

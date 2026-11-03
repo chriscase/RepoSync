@@ -133,11 +133,7 @@ impl SvnClient {
     pub async fn commit(&self, path: &Path, message: &str, _author: &str) -> Result<i64, SvnError> {
         let path_str = path.to_string_lossy().to_string();
         let output = self
-            .run_svn_in_dir_with_input(
-                path,
-                &["commit", "--file", "-", "--encoding", "UTF-8", &path_str],
-                Some(crate::commit_message::input(message)?),
-            )
+            .run_svn_in_dir(path, &["commit", "-m", message, &path_str])
             .await?;
 
         // SVN returns exit 0 with empty output when there's nothing to commit.
@@ -207,11 +203,7 @@ impl SvnClient {
             .filter(|l| !l.is_empty())
             .map(|l| l.trim_end_matches('/').to_string())
             .collect();
-        debug!(
-            rev,
-            count = entries.len(),
-            "listed top-level entries at rev"
-        );
+        debug!(rev, count = entries.len(), "listed top-level entries at rev");
         Ok(entries)
     }
 
@@ -274,7 +266,10 @@ impl SvnClient {
 
     /// Delete an SVN branch (or directory) from the repository.
     #[instrument(skip(self), fields(url = %self.url))]
-    pub async fn delete_branch(&self, branch_path: &str) -> Result<(), SvnError> {
+    pub async fn delete_branch(
+        &self,
+        branch_path: &str,
+    ) -> Result<(), SvnError> {
         if branch_path.contains("..") {
             return Err(SvnError::CommandFailed {
                 exit_code: 1,
@@ -291,10 +286,7 @@ impl SvnClient {
             Err(e) => {
                 let err_str = e.to_string();
                 // Treat "not found" as success — branch may already be gone
-                if err_str.contains("E200009")
-                    || err_str.contains("non-existent")
-                    || err_str.contains("E160013")
-                {
+                if err_str.contains("E200009") || err_str.contains("non-existent") || err_str.contains("E160013") {
                     info!(branch_path, "SVN branch already deleted or not found");
                     Ok(())
                 } else {
@@ -373,8 +365,7 @@ impl SvnClient {
             return Ok(());
         }
         for file in files {
-            self.run_svn_in_dir(path, &["add", "--force", "--parents", file])
-                .await?;
+            self.run_svn_in_dir(path, &["add", "--force", "--parents", file]).await?;
         }
         debug!(count = files.len(), "svn add completed");
         Ok(())
@@ -393,8 +384,7 @@ impl SvnClient {
         // A "new" directory is one that exists on disk but whose parent
         // IS versioned in SVN (i.e., the parent is part of the checkout).
         // We detect this by checking `svn info` on each ancestor.
-        let mut top_dirs_added: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut top_dirs_added: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for file in files {
             let file_path = std::path::Path::new(file);
@@ -403,12 +393,12 @@ impl SvnClient {
             let mut topmost_new: Option<String> = None;
             let mut cur = file_path.parent();
             while let Some(p) = cur {
-                if p.as_os_str().is_empty() {
-                    break;
-                }
+                if p.as_os_str().is_empty() { break; }
                 let dir_str = p.to_string_lossy().to_string();
                 // Check if this directory is versioned by running svn info
-                let info_result = self.run_svn_in_dir(wc_path, &["info", &dir_str]).await;
+                let info_result = self.run_svn_in_dir(
+                    wc_path, &["info", &dir_str]
+                ).await;
                 if info_result.is_err() {
                     // Not versioned — this might be the topmost new dir
                     topmost_new = Some(dir_str);
@@ -425,15 +415,17 @@ impl SvnClient {
                     // Add the topmost new directory — SVN will recursively
                     // add everything inside it since --force doesn't skip
                     // unversioned contents.
-                    self.run_svn_in_dir(wc_path, &["add", "--force", top_dir])
-                        .await?;
+                    self.run_svn_in_dir(
+                        wc_path, &["add", "--force", top_dir]
+                    ).await?;
                     top_dirs_added.insert(top_dir.clone());
                 }
                 // File is already added by the recursive dir add
             } else {
                 // Parent is versioned, just add the file directly
-                self.run_svn_in_dir(wc_path, &["add", "--force", file])
-                    .await?;
+                self.run_svn_in_dir(
+                    wc_path, &["add", "--force", file]
+                ).await?;
             }
         }
         debug!(count = files.len(), "svn add completed");
@@ -534,28 +526,12 @@ impl SvnClient {
     }
 
     /// Public wrapper for running SVN commands in a working copy directory.
-    pub async fn run_svn_in_dir_public(
-        &self,
-        dir: &Path,
-        args: &[&str],
-    ) -> Result<String, SvnError> {
+    pub async fn run_svn_in_dir_public(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
         self.run_svn_in_dir(dir, args).await
     }
 
     async fn run_svn_in_dir(&self, dir: &Path, args: &[&str]) -> Result<String, SvnError> {
-        self.run_svn_in_dir_with_input(dir, args, None).await
-    }
-
-    async fn run_svn_in_dir_with_input(
-        &self,
-        dir: &Path,
-        args: &[&str],
-        input: Option<std::fs::File>,
-    ) -> Result<String, SvnError> {
         let mut cmd = Command::new("svn");
-        if let Some(input) = input {
-            cmd.stdin(Stdio::from(input));
-        }
         cmd.current_dir(dir)
             .args(args)
             .arg("--non-interactive")
@@ -630,7 +606,10 @@ fn parse_committed_revision(output: &str) -> Option<i64> {
         let lower = trimmed.to_lowercase();
         if let Some(pos) = lower.find("revision ") {
             let after = &trimmed[pos + 9..];
-            let num_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let num_str: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             if !num_str.is_empty() {
                 if let Ok(rev) = num_str.parse::<i64>() {
                     return Some(rev);

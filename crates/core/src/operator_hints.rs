@@ -235,9 +235,7 @@ mod tests {
         assert_eq!(hint.category, "filesystem_permission");
         assert_eq!(hint.severity, Severity::NeedsAttention);
         assert!(hint.suggested_fix.contains("chown"));
-        assert!(hint
-            .suggested_fix
-            .contains("/opt/reposync/repos/abc/git-repo"));
+        assert!(hint.suggested_fix.contains("/opt/reposync/repos/abc/git-repo"));
     }
 
     #[test]
