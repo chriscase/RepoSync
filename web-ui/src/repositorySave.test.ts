@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError, type Repository, type RepositorySaveReceipt } from './api';
 import {
-  beginReviewedRepositorySave, RepositoryEditorOwnership, repositoryEditorKey, sameImportPreferences, canContinueWithPreferences,
+  selectRepositoryCredentialInputs, beginReviewedRepositorySave, RepositoryEditorOwnership, repositoryEditorKey, sameImportPreferences, canContinueWithPreferences,
   beginRepositorySave, prepareRepositorySaveAttempt, publicConfiguration, submittedCredentialSnapshot, retainUnsavedCredentials, RepositorySaveJournal, repositorySaveComplete,
   runRepositorySave, samePublicConfiguration,
   type PublicConfiguration, type JournalStorage, type RepositorySaveAttempt, type RepositorySaveTransport,
@@ -299,5 +299,46 @@ describe('#115 whole-story review corrections',()=>{
     const effects=[f.state.configEffects,f.state.credentialEffects];expect(canContinueWithPreferences(done,configuration,{})).toBe(true);
     expect({repoId:done.repoId,preferences:reopened.read()?.draftPreferences}).toEqual({repoId:'repo-created',preferences});
     expect([f.state.configEffects,f.state.credentialEffects]).toEqual(effects);expect(done.configRequestId).toBe(f.attempt.configRequestId);expect(canContinueWithPreferences(done,{...configuration,name:'not just preferences'},{})).toBe(false);
+  });
+});
+
+describe('#115 RS115-2 same-form credential re-entry',()=>{
+  it.each([{}, {git_token:'partial-first-token'}])('finishes reviewed recovery without unmount after no-write inputs %j',async firstInputs=>{
+    const f=fixture();
+    const conflict=beginRepositorySave('actor','update',configuration,secrets,'repo-created',time);
+    conflict.configurationStage='conflict';
+    // Same transition called by Use reviewed settings after load-current cleared the form secrets.
+    const reviewed=beginReviewedRepositorySave(conflict,{id:'repo-created',updated_at:time},configuration,{},'actor');
+    f.journal.write(reviewed);
+    let cached: typeof secrets | null=null;
+    const prepared=prepareRepositorySaveAttempt(f.journal.read(),configuration,firstInputs,{owner:'actor',targetId:'repo-created',expectedUpdatedAt:time});
+    const first=selectRepositoryCredentialInputs(cached,firstInputs,prepared.attempt.credentialFields,prepared.replacePrivateInputs);
+    expect(first.cached).toBeNull();
+    cached=first.cached as typeof secrets | null;
+    await expect(runRepositorySave(prepared.attempt,first.submitted,f.journal,f.transport)).rejects.toThrow('credentials are not confirmed');
+    const pending=f.journal.read()!;
+    expect(pending.configurationStage).toBe('saved');expect(pending.credentialStage).toBe('unknown');expect(f.state.configEffects).toBe(1);expect(f.state.credentialCalls).toBe(0);
+    expect(pending.repoId).toBe(reviewed.repoId);expect(pending.configRequestId).toBe(reviewed.configRequestId);expect(pending.credentialRequestId).toBe(reviewed.credentialRequestId);
+    // No close/reopen/reset: this is the exact retained input cache passed through the hook selector again.
+    const next=prepareRepositorySaveAttempt(pending,configuration,secrets,{owner:'actor',targetId:'repo-created',expectedUpdatedAt:time});
+    expect(next.replacePrivateInputs).toBe(false);
+    const reentered=selectRepositoryCredentialInputs(cached,secrets,next.attempt.credentialFields,next.replacePrivateInputs);
+    expect(reentered.submitted).toEqual(secrets);expect(reentered.cached).toEqual(secrets);
+    const done=await runRepositorySave(next.attempt,reentered.submitted,f.journal,f.transport);
+    expect(repositorySaveComplete(done)).toBe(true);expect(done.repoId).toBe(reviewed.repoId);
+    expect(done.configRequestId).toBe(reviewed.configRequestId);expect(done.credentialRequestId).toBe(reviewed.credentialRequestId);
+    expect(f.state.configEffects).toBe(1);expect(f.state.credentialCalls).toBe(1);expect(f.state.credentialEffects).toBe(1);
+  });
+  it('keeps a complete possibly committed payload immutable and still refuses different bytes under its identity',async()=>{
+    const f=fixture();const selected=selectRepositoryCredentialInputs(null,secrets,f.attempt.credentialFields,true);
+    f.state.loseCredentials=true;
+    await expect(runRepositorySave(f.attempt,selected.submitted,f.journal,f.transport)).rejects.toThrow('credential response lost');
+    const pending=f.journal.read()!,changed={...secrets,git_token:'different-not-authorized-for-this-request'};
+    const prepared=prepareRepositorySaveAttempt(pending,configuration,changed,{owner:'actor'});
+    const retry=selectRepositoryCredentialInputs(selected.cached,changed,pending.credentialFields,prepared.replacePrivateInputs);
+    expect(retry.cached).toEqual(secrets);expect(retry.submitted).toEqual(secrets);expect(f.state.credentialEffects).toBe(1);
+    // The preserved server/protocol payload comparison must not accept the different value under the old UUID.
+    await expect(runRepositorySave(pending,changed,f.journal,f.transport)).rejects.toThrow('different credential payload');
+    expect(f.state.credentialEffects).toBe(1);expect(f.state.secretValue).not.toContain(changed.git_token);
   });
 });

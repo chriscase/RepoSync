@@ -313,6 +313,15 @@ export function samePublicConfiguration(left: PublicConfiguration, right: Public
   return canonical(left)===canonical(right);
 }
 
+/** Only a complete potentially submitted payload is immutable. Empty/partial inputs never authorize a credential POST. */
+export function selectRepositoryCredentialInputs(cached: CredentialInputs | null, inputs: CredentialInputs,
+  required: Array<keyof CredentialInputs>, replace: boolean): {cached: CredentialInputs | null; submitted: CredentialInputs} {
+  const complete=(value: CredentialInputs | null): value is CredentialInputs => !!value && required.length>0 && required.every(field=>!!value[field]);
+  if(!replace && complete(cached))return {cached,submitted:cached};
+  const selected={...inputs};
+  return {cached:complete(selected) ? selected:null,submitted:selected};
+}
+
 export function submittedCredentialSnapshot(attempt: RepositorySaveAttempt, inputs: CredentialInputs): CredentialInputs {
   if(!attempt.credentialFields.every(field=>!!inputs[field]))return {};
   return Object.fromEntries(attempt.credentialFields.map(field=>[field,inputs[field]]));

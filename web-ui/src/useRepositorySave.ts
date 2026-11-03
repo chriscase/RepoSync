@@ -2,7 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, type Repository } from './api';
 import {
   publicConfiguration, prepareRepositorySaveAttempt, RepositorySaveFailure, RepositorySaveJournal,
-  repositorySaveComplete, runRepositorySave, submittedCredentialSnapshot, beginReviewedRepositorySave, RepositoryEditorOwnership,
+  repositorySaveComplete, runRepositorySave, submittedCredentialSnapshot, beginReviewedRepositorySave, RepositoryEditorOwnership, selectRepositoryCredentialInputs,
   type CredentialInputs, type PublicConfiguration, type RepositorySaveAttempt, type RepositorySaveTransport,
 } from './repositorySave';
 import { getStoredUser } from './utils/auth';
@@ -76,8 +76,9 @@ export function useRepositorySave(targetId: string | undefined, visible: boolean
     const operation=(async () => {
       const prepared=prepareRepositorySaveAttempt(context.journal.read(),configuration,inputs,{owner,targetId,expectedUpdatedAt,preferences});
       const state=prepared.attempt;
-      if(prepared.replacePrivateInputs)context.privateInputs={...inputs};
-      const submitted=context.privateInputs ?? {...inputs};
+      const selected=selectRepositoryCredentialInputs(context.privateInputs,inputs,state.credentialFields,prepared.replacePrivateInputs);
+      context.privateInputs=selected.cached;
+      const submitted=selected.submitted;
       setPending(true);setError(null);
       try {
         const final=await runRepositorySave(state,submitted,context.journal,transport(session),next=>{
