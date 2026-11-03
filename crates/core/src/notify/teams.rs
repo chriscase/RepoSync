@@ -237,11 +237,7 @@ impl TeamsNotifier {
 
                     // First line as summary, rest as details
                     let first_line = message.lines().next().unwrap_or("(no message)");
-                    let summary = if first_line.len() > 120 {
-                        format!("{}…", &first_line[..120])
-                    } else {
-                        first_line.to_string()
-                    };
+                    let summary = truncate_for_card(first_line, 120);
 
                     // Commit entry with author, rev, direction, and file count
                     body.push(json!({
@@ -283,11 +279,7 @@ impl TeamsNotifier {
                     arr.iter()
                         .filter_map(|v| v.as_str())
                         .map(|s| {
-                            let truncated = if s.len() > 100 {
-                                format!("{}…", &s[..100])
-                            } else {
-                                s.to_string()
-                            };
+                            let truncated = truncate_for_card(s, 100);
                             format!("• {}", truncated)
                         })
                         .collect()
@@ -330,11 +322,7 @@ impl TeamsNotifier {
         };
 
         // Truncate error message for card display
-        let short_error = if error.len() > 300 {
-            format!("{}…", &error[..300])
-        } else {
-            error.to_string()
-        };
+        let short_error = truncate_for_card(error, 300);
 
         json!([
             {
@@ -394,11 +382,7 @@ impl TeamsNotifier {
             }
             "failed" => {
                 let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("");
-                let short_error = if error.len() > 300 {
-                    format!("{}…", &error[..300])
-                } else {
-                    error.to_string()
-                };
+                let short_error = truncate_for_card(error, 300);
 
                 let mut body = vec![json!({
                     "type": "TextBlock",
@@ -535,6 +519,18 @@ pub fn format_circuit_breaker(repo_name: &str, consecutive_errors: i64) -> serde
     ])
 }
 
+/// Preserve the existing byte budgets while backing up to a UTF-8 boundary.
+fn truncate_for_card(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +628,50 @@ mod tests {
         let card = format_path_violation("Test Repo", &violations, false);
         let card_str = card.to_string();
         assert!(card_str.contains("and 3 more"));
+    }
+
+    #[test]
+    fn candidate_228_unicode_crossing_all_card_byte_limits_is_safe() {
+        let notifier = TeamsNotifier::new("https://example.invalid".into());
+        for character in ["é", "界", "😀"] {
+            let prefix = "a".repeat(119);
+            let rich = notifier
+                .format_sync_completed(&json!({
+                    "git_to_svn":1,"commits":[{"message":format!("{prefix}{character}tail\nbody") }]
+                }))
+                .unwrap();
+            assert!(rich.to_string().contains(&format!("{prefix}…")));
+            assert!(!rich.to_string().contains("tail"));
+            let prefix = "a".repeat(99);
+            let legacy = notifier
+                .format_sync_completed(&json!({
+                    "svn_to_git":1,"messages":[format!("{prefix}{character}tail")]
+                }))
+                .unwrap();
+            assert!(legacy.to_string().contains(&format!("• {prefix}…")));
+            let prefix = "a".repeat(299);
+            let error = format!("{prefix}{character}tail");
+            let failed = notifier.format_sync_failed(&json!({"error":error}));
+            assert!(failed.to_string().contains(&format!("{prefix}…")));
+            let import = notifier
+                .format_import_progress(&json!({"phase":"failed","error":error}))
+                .unwrap();
+            assert!(import.to_string().contains(&format!("{prefix}…")));
+        }
+    }
+
+    #[test]
+    fn candidate_228_ascii_and_short_unicode_display_remain_unchanged() {
+        for limit in [100, 120, 300] {
+            assert_eq!(truncate_for_card("é界😀", limit), "é界😀");
+            assert_eq!(
+                truncate_for_card(&"x".repeat(limit), limit),
+                "x".repeat(limit)
+            );
+            assert_eq!(
+                truncate_for_card(&"x".repeat(limit + 1), limit),
+                format!("{}…", "x".repeat(limit))
+            );
+        }
     }
 }

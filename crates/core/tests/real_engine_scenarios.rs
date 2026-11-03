@@ -30,6 +30,7 @@ const CASE_CREDENTIAL: &str = "R17_SVNSERVE_CREDENTIAL_ISOLATION";
 const CASE_JOB: &str = "R17_SVNSERVE_JOB_ISOLATION";
 const CASE_SVN_MULTI: &str = "R01_SVNSERVE_MULTI_COMMIT_SVN_TO_GIT";
 const CASE_GIT_MULTI: &str = "R01_SVNSERVE_MULTI_COMMIT_GIT_TO_SVN";
+const CASE_LARGE_MESSAGE: &str = "R01_SVNSERVE_LARGE_MESSAGE_RETRY";
 const CASE_GIT_REMOTE: &str = "R16_SVNSERVE_GIT_REMOTE_UNREACHABLE";
 const CASE_SVN_REMOTE: &str = "R16_SVNSERVE_SVN_REMOTE_UNREACHABLE";
 const CASE_SVN_AUTH: &str = "R16_SVNSERVE_SVN_AUTH_DENIED";
@@ -3073,5 +3074,138 @@ async fn scenario_r17_svnserve_notification_isolation() {
             "notification_delivery_observed": notification_delivery_observed,
             "note": "SyncEngine does not read per-repo teams_webhook_url or invoke Notifier on svnserve cycles; webhook URL persistence and sync_status/audit confinement only",
         }),
+    );
+}
+
+/// #228: real SVN process, authentic team journal, failure before publication,
+/// observe-first authorized retry, exact UTF-8 history and unchanged quiet run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_r01_svnserve_large_message_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    if !require_toolchain(CASE_LARGE_MESSAGE) {
+        return;
+    }
+    let fixture = SingleRepoFixture::new();
+    let engine = fixture.make_engine();
+    assert_eq!(engine.run_sync_cycle().await.unwrap().svn_to_git_count, 1);
+    git_cli(&fixture.developer, &["pull", "--ff-only", "origin", "main"]);
+    let message = format!(
+        "{}😀 synthetic squash\n\n{}\n[reposync] original marker\n",
+        "a".repeat(119),
+        "é中文😀 '\"\\ multiline\n".repeat(16_384)
+    );
+    assert!(message.len() >= 256 * 1024);
+    std::fs::write(
+        fixture.developer.join("large-message.txt"),
+        "complete synthetic content\n",
+    )
+    .unwrap();
+    let developer = GitClient::new(&fixture.developer).unwrap();
+    let sha = developer
+        .commit_via_cli(
+            &message,
+            "Test User",
+            "test@example.com",
+            "Test User",
+            "test@example.com",
+        )
+        .unwrap()
+        .to_string();
+    drop(developer);
+    git_cli(&fixture.developer, &["push", "origin", "main"]);
+    let svn = SvnClient::new(
+        &fixture.repo.svn_url,
+        &fixture.repo.username,
+        &fixture.repo.password,
+    );
+    let before_revision = svn.info().await.unwrap().latest_rev;
+    let before_checkpoint = fixture.checkpoint_snapshot();
+    // An actual hook-interpreter launch failure, isolated to this disposable
+    // repository, is known to precede publication. No PATH/OS replacement.
+    let hook = fixture
+        .tmp
+        .path()
+        .join("svnserve-root")
+        .join(&fixture.repo.id)
+        .join("hooks/pre-commit");
+    assert!(!hook.exists());
+    std::fs::write(&hook, "#!/reposync-fixture-absent-interpreter\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let failure = engine.run_sync_cycle().await;
+    assert!(
+        matches!(failure, Err(SyncError::SvnError(_))),
+        "{failure:?}"
+    );
+    assert_eq!(svn.info().await.unwrap().latest_rev, before_revision);
+    assert_eq!(fixture.checkpoint_snapshot(), before_checkpoint);
+    let db = setup_db(&fixture.db_path);
+    let applied = || {
+        db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND git_sha=?2 AND direction='git_to_svn' AND status='applied'",rusqlite::params![fixture.repo.id,sha],|row|row.get::<_,i64>(0)).unwrap()
+    };
+    assert_eq!(applied(), 0);
+    let held = db
+        .active_svn_commit_operation(&fixture.repo.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        held.state,
+        reposync_core::db::svn_commit_operations::SvnCommitOperationState::ReconciliationRequired
+    );
+    std::fs::remove_file(&hook).unwrap();
+    // Keep the existing uncertainty policy: observing absence authorizes one
+    // recorded write. Restoring a binary/hook alone is never permission to replay.
+    let reconciled = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        &db,
+        &fixture.repo.id,
+        &held.id,
+        &svn,
+        &serde_json::json!({"allowed_paths":[],"blocked_patterns":[]}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(!reconciled.finalized && reconciled.resume_authorized);
+    assert_eq!(fixture.checkpoint_snapshot(), before_checkpoint);
+    assert_eq!(svn.info().await.unwrap().latest_rev, before_revision);
+    let applied_stats = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(applied_stats.git_to_svn_count, 1);
+    let after_revision = svn.info().await.unwrap().latest_rev;
+    assert_eq!(after_revision, before_revision + 1);
+    assert_eq!(applied(), 1);
+    let log = svn.log(after_revision, after_revision).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        log[0].message,
+        reposync_core::svn_commit::operation_commit_message(&message, &sha, &held.id)
+    );
+    assert_eq!(
+        svn_read_file(
+            &fixture.repo.svn_url,
+            &fixture.repo.username,
+            &fixture.repo.password,
+            after_revision,
+            "large-message.txt"
+        )
+        .await,
+        "complete synthetic content\n"
+    );
+    let after_checkpoint = fixture.checkpoint_snapshot();
+    assert_eq!(after_checkpoint.1, sha);
+    assert!(db
+        .active_svn_commit_operation(&fixture.repo.id)
+        .unwrap()
+        .is_none());
+    let repeated = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (repeated.svn_to_git_count, repeated.git_to_svn_count),
+        (0, 0)
+    );
+    assert_eq!(fixture.checkpoint_snapshot(), after_checkpoint);
+    assert_eq!(svn.info().await.unwrap().latest_rev, after_revision);
+    assert_eq!(applied(), 1);
+    emit_evidence(
+        CASE_LARGE_MESSAGE,
+        "PASS",
+        serde_json::json!({"message_bytes":message.len(),"exact_log_preserved":true,"known_hook_launch_failure_no_checkpoint":true,"observe_first_retry_once":true,"revision":after_revision,"git_sha":sha,"quiet_repeat":true}),
     );
 }
