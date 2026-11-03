@@ -7,6 +7,13 @@ use std::io::{Seek, Write};
 /// future is dropped. There is no named path to remove while the child reads.
 pub(crate) fn input(message: &str) -> std::io::Result<std::fs::File> {
     let mut file = tempfile::tempfile()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Linux's anonymous-file path can inherit a broader creation mode.
+        // Restrict this newly owned file before any message bytes are written.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     file.write_all(message.as_bytes())?;
     file.flush()?;
     file.rewind()?;
@@ -32,6 +39,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
             assert_eq!(metadata.permissions().mode() & 0o077, 0);
             assert_eq!(metadata.nlink(), 0, "message must have no public pathname");
         }
