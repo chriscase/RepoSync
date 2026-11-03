@@ -17,3 +17,20 @@ Record the exact legacy source, toolchain, compiled selectors and results indepe
 Preserve the existing pair, Git/SVN history, database and checkpoints. Inspect the actual sanitized error and remote state before deciding whether a write occurred. A confirmed missing executable or pre-commit hook launch refusal is different from a timeout, lost reply or post-publication error. This backport adds no authority to replay an uncertain write: retain evidence and use the existing operational recovery procedure with the responsible owner. A notifier panic alone does not establish sync failure.
 
 Do not reset/reimport, skip to HEAD, manually advance checkpoints, rewrite shared history or delete/recreate the pair. No company inputs, server access, settings/credential changes, installation or deployment are authorized by this source backport.
+
+## Reverse-direction acceptance addition
+
+`candidate_228_legacy_oversized_svn_to_git_reconstructed_repeat` uses the real
+local SVN client to publish a bounded >2MiB multiline Unicode/quotes message,
+then the normal legacy engine to create and push Git history. It compares the
+full source message, full remote Git message plus the existing provenance marker,
+remote blob content, preserved author timestamp, persisted applied mapping and
+both legacy cursors. A newly constructed engine reopens the database and performs
+a quiet repeat with the same Git/SVN heads, commit count and single mapping.
+The legacy global Git-origin cursor retains its existing independent meaning;
+this test does not pretend an SVN echo advances it.
+
+This closes a distinct test gap only when its exact-version run passes. Earlier
+Git-to-SVN success did not establish this reverse direction, and synthetic
+coverage does not identify the cause of a particular company incident. Existing
+sentinel/echo limits and recovery restrictions above remain unchanged.

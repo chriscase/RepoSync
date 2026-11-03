@@ -1012,3 +1012,154 @@ async fn candidate_228_legacy_large_message_failure_retry_and_repeat() {
         })
     );
 }
+
+// Reverse-direction #228 acceptance: SVN is the real source, and the normal
+// engine creates/pushes the Git result. No argv reconstruction or stubbed VCS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_228_legacy_oversized_svn_to_git_reconstructed_repeat() {
+    assert!(
+        svn_available(),
+        "#228 reverse qualification requires svn/svnadmin"
+    );
+    let tmp = TempDir::new().unwrap();
+    let svn_url = create_svn_repo(tmp.path());
+    let wc = tmp.path().join("source-wc");
+    svn_checkout(&svn_url, &wc);
+    svn_commit_file(&wc, ".gitkeep", "", "initial small SVN revision");
+    // >2MiB is larger than macOS's observed 1MiB ARG_MAX and Linux's
+    // 128KiB per-argument ceiling. The payload is fixed and bounded (<4MiB).
+    let message = format!(
+        "SVN origin 😀 synthetic multiline message\n\n{}\nsource-marker: exact-end",
+        "é中文😀 quotes: '\"\\ <xml>& line\n".repeat(65_536)
+    );
+    assert!(message.len() > 2 * 1024 * 1024 && message.len() < 4 * 1024 * 1024);
+    let content = "complete reverse-direction payload 雪\nsecond line\n";
+    std::fs::write(wc.join("oversized-svn.txt"), content).unwrap();
+    let svn = SvnClient::new(&svn_url, "fixture", "");
+    svn.add(&wc, &["oversized-svn.txt"]).await.unwrap();
+    let revision = svn.commit(&wc, &message, "fixture").await.unwrap();
+    assert_eq!(revision, 2);
+    let original = svn.log(revision, revision).await.unwrap();
+    assert_eq!(original.len(), 1);
+    assert_eq!(
+        original[0].author, "fixture",
+        "use genuine source author metadata, not an anonymous identity override"
+    );
+    assert!(
+        original[0].message.as_bytes() == message.as_bytes(),
+        "SVN source message differs before engine replay"
+    );
+
+    let work = tmp.path().join("mirror");
+    let bare_path = tmp.path().join("origin.git");
+    let git = setup_git_with_bare_origin(&work, &bare_path);
+    let initial = get_head_sha(&work);
+    let db_path = tmp.path().join("sync.db");
+    let db = setup_db(&db_path);
+    db.set_state("last_svn_rev", "1").unwrap();
+    db.set_state("last_git_hash", &initial).unwrap();
+    let engine = SyncEngine::new(
+        make_app_config(&svn_url, tmp.path()),
+        db,
+        svn.clone(),
+        git,
+        Arc::new(make_identity_mapper()),
+    );
+    let result = engine.run_sync_cycle().await.unwrap();
+    assert_eq!(
+        (
+            result.svn_to_git_count,
+            result.git_to_svn_count,
+            result.conflicts_detected
+        ),
+        (1, 0, 0)
+    );
+    let expected = format!("{message}\n\n[reposync] synced from SVN r{revision}");
+    let emitted = get_head_sha(&work);
+    assert_ne!(emitted, initial);
+    assert_eq!(count_git_commits(&work), 2);
+    let bare = git2::Repository::open_bare(&bare_path).unwrap();
+    let commit = bare
+        .find_reference("refs/heads/main")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap();
+    assert_eq!(commit.id().to_string(), emitted);
+    assert!(
+        commit.message_bytes() == expected.as_bytes(),
+        "Git message/marker differs: expected {} bytes, got {}",
+        expected.len(),
+        commit.message_bytes().len()
+    );
+    let source_date = chrono::DateTime::parse_from_rfc3339(&original[0].date).unwrap();
+    assert_eq!(commit.author().when().seconds(), source_date.timestamp());
+    let entry = commit
+        .tree()
+        .unwrap()
+        .get_path(Path::new("oversized-svn.txt"))
+        .unwrap();
+    assert_eq!(
+        bare.find_blob(entry.id()).unwrap().content(),
+        content.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(work.join("oversized-svn.txt")).unwrap(),
+        content.as_bytes()
+    );
+    drop(engine);
+
+    let reopened = Database::new(&db_path).unwrap();
+    let checkpoint = (
+        reopened.get_state("last_svn_rev").unwrap(),
+        reopened.get_state("last_git_hash").unwrap(),
+    );
+    // This legacy global Git cursor is the independent Git-origin frontier;
+    // an SVN echo does not invent its advancement. The applied mapping binds
+    // the SVN revision to the actual published Git SHA below.
+    assert_eq!(
+        checkpoint,
+        (Some(revision.to_string()), Some(initial.clone()))
+    );
+    let (mapped_sha, stored_message): (String,String) = reopened.conn().query_row("SELECT git_sha,message FROM sync_records WHERE direction='svn_to_git' AND svn_rev=?1 AND status='applied'", [revision], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(mapped_sha, emitted);
+    assert!(
+        stored_message.as_bytes() == message.as_bytes(),
+        "durable mapping must retain the full source message"
+    );
+    let mapped = |db: &Database| {
+        db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE direction='svn_to_git' AND svn_rev=?1 AND status='applied'", [revision], |row| row.get::<_,i64>(0)).unwrap()
+    };
+    assert_eq!(mapped(&reopened), 1);
+    let reconstructed = SyncEngine::new(
+        make_app_config(&svn_url, tmp.path()),
+        reopened,
+        SvnClient::new(&svn_url, "", ""),
+        GitClient::new(&work).unwrap(),
+        Arc::new(make_identity_mapper()),
+    );
+    let repeat = reconstructed.run_sync_cycle().await.unwrap();
+    assert_eq!((repeat.svn_to_git_count, repeat.git_to_svn_count), (0, 0));
+    assert_eq!(count_git_commits(&work), 2);
+    assert_eq!(get_head_sha(&work), emitted);
+    assert_eq!(
+        bare.find_reference("refs/heads/main")
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string(),
+        emitted
+    );
+    assert_eq!(svn.info().await.unwrap().latest_rev, revision);
+    assert_eq!(mapped(reconstructed.db()), 1);
+    assert_eq!(
+        (
+            reconstructed.db().get_state("last_svn_rev").unwrap(),
+            reconstructed.db().get_state("last_git_hash").unwrap()
+        ),
+        checkpoint
+    );
+    eprintln!(
+        "LEGACY_228_REVERSE_EVIDENCE {}",
+        serde_json::json!({"source_message_bytes":message.len(),"git_message_bytes":expected.len(),"svn_revision":revision,"git_sha":emitted,"exact_remote_message_and_content":true,"persisted_mapping_and_checkpoint":true,"reconstructed_repeat_no_duplicate":true,"status":"PASS"})
+    );
+}
