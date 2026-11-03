@@ -112,7 +112,7 @@ impl Scheduler {
         interval.tick().await;
 
         // Run maintenance (audit pruning, retention) every ~10 minutes.
-        let maintenance_ticks = (600 / self.poll_interval.as_secs().max(1)) as u64;
+        let maintenance_ticks = 600 / self.poll_interval.as_secs().max(1);
         let mut tick_count: u64 = 0;
 
         loop {
@@ -144,7 +144,13 @@ impl Scheduler {
                     // Per-repo scheduler handles all repos from the DB.
                     self.maybe_run_repo_cycles().await;
                     // Periodic maintenance (every ~10 minutes)
-                    if tick_count % maintenance_ticks == 0 {
+                    // Keep the legacy zero-period panic: is_multiple_of(0)
+                    // would silently change behavior for intervals above 600s.
+                    if tick_count
+                        .checked_rem(maintenance_ticks)
+                        .expect("attempt to calculate the remainder with a divisor of zero")
+                        == 0
+                    {
                         if let Err(e) = self.db.run_maintenance(90) {
                             warn!("periodic maintenance failed: {}", e);
                         }
