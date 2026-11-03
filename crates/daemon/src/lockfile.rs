@@ -70,8 +70,7 @@ pub fn acquire(data_dir: &Path) -> Result<LockGuard, String> {
                 // the flock when the process died, so try again.
                 warn!(
                     stale_pid = pid,
-                    "detected stale lock file (PID {} is not running), retrying",
-                    pid
+                    "detected stale lock file (PID {} is not running), retrying", pid
                 );
                 match file.try_lock_exclusive() {
                     Ok(()) => {

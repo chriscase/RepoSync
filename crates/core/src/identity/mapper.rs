@@ -122,7 +122,8 @@ impl IdentityMapper {
                 .write()
                 .map_err(|_| IdentityError::LdapError("LDAP lock poisoned".into()))?;
             let ldap_result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(resolver.lookup_by_username(svn_username))
+                tokio::runtime::Handle::current()
+                    .block_on(resolver.lookup_by_username(svn_username))
             })?;
             if let Some(identity) = ldap_result {
                 debug!(svn_username, "found via LDAP");

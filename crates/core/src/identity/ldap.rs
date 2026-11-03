@@ -109,10 +109,7 @@ impl LdapResolver {
     ///
     /// Searches `(mail={email})` under `base_dn` and returns the `uid`
     /// attribute of the first matching entry.
-    pub async fn lookup_by_email(
-        &mut self,
-        email: &str,
-    ) -> Result<Option<String>, IdentityError> {
+    pub async fn lookup_by_email(&mut self, email: &str) -> Result<Option<String>, IdentityError> {
         debug!(email, "LDAP reverse lookup by email");
         let mut ldap = self.connect().await?;
         self.connected = true;
@@ -134,11 +131,7 @@ impl LdapResolver {
             None => return Ok(None),
         };
 
-        let uid = entry
-            .attrs
-            .get("uid")
-            .and_then(|v| v.first())
-            .cloned();
+        let uid = entry.attrs.get("uid").and_then(|v| v.first()).cloned();
 
         debug!(email, uid = ?uid, "LDAP resolved uid");
         Ok(uid)

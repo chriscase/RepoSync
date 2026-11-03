@@ -94,7 +94,10 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/config/notifications",
             get(get_notification_config).post(save_notification_config),
         )
-        .route("/api/config/notifications/test", post(test_teams_notification))
+        .route(
+            "/api/config/notifications/test",
+            post(test_teams_notification),
+        )
 }
 
 async fn get_config(
@@ -205,7 +208,10 @@ async fn get_notification_config(
     .await?;
 
     let db = &state.db;
-    let teams_url = db.get_state("teams_webhook_url").unwrap_or(None).unwrap_or_default();
+    let teams_url = db
+        .get_state("teams_webhook_url")
+        .unwrap_or(None)
+        .unwrap_or_default();
 
     Ok(Json(serde_json::json!({
         "teams_webhook_url": teams_url,
@@ -266,7 +272,9 @@ async fn test_teams_notification(
         .unwrap_or_default();
 
     if url.is_empty() {
-        return Err(AppError::BadRequest("No Teams webhook URL configured".into()));
+        return Err(AppError::BadRequest(
+            "No Teams webhook URL configured".into(),
+        ));
     }
 
     let notifier = reposync_core::notify::teams::TeamsNotifier::new(url);

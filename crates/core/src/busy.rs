@@ -49,8 +49,5 @@ pub fn try_acquire(repo_id: &str) -> Option<BusyGuard> {
 /// Returns true if another task is currently holding the busy slot for
 /// this repo.
 pub fn is_busy(repo_id: &str) -> bool {
-    set()
-        .lock()
-        .map(|g| g.contains(repo_id))
-        .unwrap_or(false)
+    set().lock().map(|g| g.contains(repo_id)).unwrap_or(false)
 }
