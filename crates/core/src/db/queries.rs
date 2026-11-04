@@ -701,6 +701,65 @@ impl Database {
         Ok(entries)
     }
 
+    /// Raw conflict list page: filters precede pagination; count and rows share a read snapshot.
+    pub fn list_conflict_page(
+        &self,
+        status: Option<&str>,
+        repo_id: Option<&str>,
+        pagination: &models::Pagination,
+    ) -> Result<models::PaginatedResult<ConflictEntry>, DatabaseError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let predicates = "(?1 IS NULL OR status = ?1) AND (?2 IS NULL OR repo_id = ?2)";
+        let total: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM conflicts WHERE {predicates}"),
+            params![status, repo_id],
+            |row| row.get(0),
+        )?;
+        let page = pagination.page.max(1);
+        let per_page = pagination.per_page.max(1);
+        let offset = i64::from(page - 1)
+            .checked_mul(i64::from(per_page))
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
+        let items = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
+                 svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
+                 FROM conflicts WHERE {predicates} ORDER BY created_at DESC, id DESC LIMIT ?3 OFFSET ?4"
+            ))?;
+            let rows = stmt.query_map(params![status, repo_id, per_page, offset], |row| {
+                Ok(ConflictEntry {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    conflict_type: row.get(2)?,
+                    svn_content: row.get(3)?,
+                    git_content: row.get(4)?,
+                    base_content: row.get(5)?,
+                    svn_rev: row.get(6)?,
+                    git_sha: row.get(7)?,
+                    status: row.get(8)?,
+                    resolution: row.get(9)?,
+                    resolved_by: row.get(10)?,
+                    created_at: row.get(11)?,
+                    resolved_at: row.get(12)?,
+                    repo_id: row.get(13)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        let total = total as u64;
+        let total_pages = u32::try_from(total.div_ceil(u64::from(per_page)))
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, total as i64))?;
+        Ok(models::PaginatedResult {
+            items,
+            total,
+            page,
+            per_page,
+            total_pages,
+        })
+    }
+
     /// List conflicts with pagination support for the web layer.
     pub fn list_conflicts_paginated(
         &self,
@@ -717,92 +776,35 @@ impl Database {
         repo_id: Option<&str>,
         pagination: &models::Pagination,
     ) -> Result<models::PaginatedResult<models::WebConflict>, DatabaseError> {
-        let conn = self.conn();
-
-        // Build WHERE clause dynamically
-        let mut where_clauses: Vec<String> = Vec::new();
-        let mut count_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = status {
-            where_clauses.push(format!("status = ?{}", count_params.len() + 1));
-            count_params.push(Box::new(s.to_string()));
-        }
-        if let Some(r) = repo_id {
-            where_clauses.push(format!("repo_id = ?{}", count_params.len() + 1));
-            count_params.push(Box::new(r.to_string()));
-        }
-        let where_sql = if where_clauses.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {}", where_clauses.join(" AND "))
-        };
-
-        // Count total
-        let count_param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            count_params.iter().map(|p| p.as_ref()).collect();
-        let total: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM conflicts{}", where_sql),
-            count_param_refs.as_slice(),
-            |row| row.get(0),
-        )?;
-
-        let per_page = pagination.per_page.max(1);
-        let total_pages = ((total as u64).saturating_add(per_page as u64 - 1)) / per_page as u64;
-        let offset = ((pagination.page.max(1) - 1) as i64) * per_page as i64;
-
-        // Build the SELECT with the same WHERE plus LIMIT/OFFSET
-        let mut bound_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(s) = status {
-            bound_params.push(Box::new(s.to_string()));
-        }
-        if let Some(r) = repo_id {
-            bound_params.push(Box::new(r.to_string()));
-        }
-        bound_params.push(Box::new(per_page as i64));
-        bound_params.push(Box::new(offset));
-
-        let sql = format!(
-            "SELECT id, file_path, conflict_type, svn_content, git_content, base_content,
-             svn_rev, git_sha, status, resolution, resolved_by, created_at, resolved_at, repo_id
-             FROM conflicts{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-            where_sql,
-            bound_params.len() - 1,
-            bound_params.len()
-        );
-
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            bound_params.iter().map(|p| p.as_ref()).collect();
-        let items = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let created_at_str: String = row.get(11)?;
-                let resolved_at_str: Option<String> = row.get(12)?;
-                Ok(models::WebConflict {
-                    id: row.get(0)?,
-                    file_path: row.get(1)?,
-                    conflict_type: row.get(2)?,
-                    svn_content: row.get(3)?,
-                    git_content: row.get(4)?,
-                    base_content: row.get(5)?,
-                    diff: None,
-                    svn_revision: row.get(6)?,
-                    git_hash: row.get(7)?,
-                    status: row.get(8)?,
-                    resolution: row.get(9)?,
-                    resolved_content: None,
-                    resolved_by: row.get(10)?,
-                    detected_at: parse_datetime(&created_at_str),
-                    resolved_at: resolved_at_str.as_deref().map(parse_datetime),
-                    repo_id: row.get(13)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
+        let page = self.list_conflict_page(status, repo_id, pagination)?;
+        let items = page
+            .items
+            .into_iter()
+            .map(|c| models::WebConflict {
+                id: c.id,
+                file_path: c.file_path,
+                conflict_type: c.conflict_type,
+                svn_content: c.svn_content,
+                git_content: c.git_content,
+                base_content: c.base_content,
+                diff: None,
+                svn_revision: c.svn_rev,
+                git_hash: c.git_sha,
+                status: c.status,
+                resolution: c.resolution,
+                resolved_content: None,
+                resolved_by: c.resolved_by,
+                detected_at: parse_datetime(&c.created_at),
+                resolved_at: c.resolved_at.as_deref().map(parse_datetime),
+                repo_id: c.repo_id,
+            })
+            .collect();
         Ok(models::PaginatedResult {
             items,
-            total: total as u64,
-            page: pagination.page.max(1),
-            per_page,
-            total_pages: total_pages as u32,
+            total: page.total,
+            page: page.page,
+            per_page: page.per_page,
+            total_pages: page.total_pages,
         })
     }
 
@@ -1223,6 +1225,50 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
+    }
+
+    /// Filtered audit rows and matching total from one read transaction; no evidence is changed.
+    pub fn list_audit_log_filtered(
+        &self,
+        repo_id: Option<&str>,
+        success: Option<bool>,
+        action: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<(Vec<AuditLogEntry>, u64), DatabaseError> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let predicates = "(?1 IS NULL OR repo_id = ?1) AND (?2 IS NULL OR (success != 0) = ?2) AND (?3 IS NULL OR action = ?3)";
+        let total: i64 = tx.query_row(
+            &format!("SELECT COUNT(*) FROM audit_log WHERE {predicates}"),
+            params![repo_id, success, action],
+            |row| row.get(0),
+        )?;
+        let entries = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, action, direction, svn_rev, git_sha, author, details, created_at, success, repo_id
+                 FROM audit_log WHERE {predicates} ORDER BY id DESC LIMIT ?4 OFFSET ?5"
+            ))?;
+            let rows = stmt.query_map(params![repo_id, success, action, limit, offset], |row| {
+                Ok(AuditLogEntry {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    direction: row.get(2)?,
+                    svn_rev: row.get(3)?,
+                    git_sha: row.get(4)?,
+                    author: row.get(5)?,
+                    details: row.get(6)?,
+                    created_at: row.get(7)?,
+                    success: row.get::<_, i32>(8)? != 0,
+                    repo_id: row.get(9)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        tx.commit()?;
+        Ok((entries, total as u64))
     }
 
     /// List audit entries with web-layer types (for the web API).
@@ -5273,5 +5319,80 @@ mod tests {
             .create_repository_once(&repo, "admin", &save_id(), b"cannot-rotate")
             .is_err());
         assert!(db.get_state(REPOSITORY_SAVE_KEY).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod rs119_filtered_read_tests {
+    use super::*;
+    #[test]
+    fn rs119_shared_conflict_reader_preserves_tie_order_scope_and_refuses_offset_overflow() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        for i in 0..30 {
+            db.conn().execute("INSERT INTO conflicts(id,file_path,conflict_type,status,created_at,repo_id) VALUES(?1,'file','content','detected','2026-11-04T00:00:00Z',?2)",params![format!("id{i:03}"),if i%2==0 {"A"}else{"B"}]).unwrap();
+        }
+        let pagination = models::Pagination {
+            page: 2,
+            per_page: 7,
+        };
+        let raw = db
+            .list_conflict_page(Some("detected"), Some("A"), &pagination)
+            .unwrap();
+        let web = db
+            .list_conflicts_paginated_filtered(Some("detected"), Some("A"), &pagination)
+            .unwrap();
+        assert_eq!(raw.total, 15);
+        assert_eq!(raw.total_pages, 3);
+        assert_eq!(raw.items.len(), 7);
+        assert_eq!(
+            raw.items.iter().map(|x| &x.id).collect::<Vec<_>>(),
+            web.items.iter().map(|x| &x.id).collect::<Vec<_>>()
+        );
+        assert_eq!(raw.items[0].id, "id014");
+        assert_eq!(raw.items[6].id, "id002");
+        assert!(db
+            .list_conflict_page(
+                None,
+                None,
+                &models::Pagination {
+                    page: u32::MAX,
+                    per_page: u32::MAX
+                }
+            )
+            .is_err());
+        assert_eq!(db.list_conflicts(None, 100).unwrap().len(), 30);
+    }
+    #[test]
+    fn rs119_audit_filtered_count_preserves_legacy_nonzero_success_and_never_drops_bad_rows() {
+        let db = Database::in_memory().unwrap();
+        db.initialize().unwrap();
+        db.conn().execute("INSERT INTO audit_log(action,created_at,success,repo_id) VALUES('legacy','2026-11-04T00:00:00Z',2,'A')",[]).unwrap();
+        db.conn().execute("INSERT INTO audit_log(action,created_at,success,repo_id) VALUES('failed','2026-11-04T00:00:00Z',0,'B')",[]).unwrap();
+        let (rows, total) = db
+            .list_audit_log_filtered(Some("A"), Some(true), Some("legacy"), 50, 0)
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].success);
+        let (rows, total) = db
+            .list_audit_log_filtered(Some("A"), Some(false), None, 50, 0)
+            .unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+        db.conn()
+            .execute("UPDATE audit_log SET details=X'FF' WHERE repo_id='B'", [])
+            .unwrap();
+        assert!(db.list_audit_log_filtered(None, None, None, 50, 0).is_err());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(db
+            .list_audit_log_filtered(None, None, None, 50, u64::MAX)
+            .is_err());
     }
 }

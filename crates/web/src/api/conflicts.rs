@@ -18,6 +18,7 @@ use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct ListConflictsQuery {
+    pub page: Option<u32>,
     pub per_page: Option<u32>,
     pub status: Option<String>,
     pub repo_id: Option<String>,
@@ -34,6 +35,14 @@ struct ConflictListItem {
     created_at: String,
     resolved_at: Option<String>,
     repo_id: Option<String>,
+}
+
+/// `page` opts into the explicit page envelope. Unpaged legacy callers retain their array shape.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ConflictListResponse {
+    Legacy(Vec<ConflictListItem>),
+    Page(reposync_core::models::PaginatedResult<ConflictListItem>),
 }
 
 #[derive(Serialize)]
@@ -75,28 +84,33 @@ async fn list_conflicts(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ListConflictsQuery>,
-) -> Result<Json<Vec<ConflictListItem>>, AppError> {
+) -> Result<Json<ConflictListResponse>, AppError> {
     validate_session(
         &state,
         headers.get("authorization").and_then(|v| v.to_str().ok()),
     )
     .await?;
 
-    let limit = query.per_page.unwrap_or(20).min(100);
-    let status_filter = query.status.as_deref();
-    let repo_filter = query.repo_id.as_deref();
-
-    let db = &state.db;
-    let entries = db
-        .list_conflicts(status_filter, limit)
-        .map_err(|e| AppError::Internal(format!("database error: {}", e)))?;
-
-    let items = entries
+    if query.page == Some(0) || query.per_page == Some(0) || query.repo_id.as_deref() == Some("") {
+        return Err(AppError::BadRequest(
+            "page/per_page must be positive and repo_id must not be empty".into(),
+        ));
+    }
+    let pagination = reposync_core::models::Pagination {
+        page: query.page.unwrap_or(1),
+        per_page: query.per_page.unwrap_or(20).min(100),
+    };
+    let result = state
+        .db
+        .list_conflict_page(
+            query.status.as_deref().filter(|s| !s.is_empty()),
+            query.repo_id.as_deref(),
+            &pagination,
+        )
+        .map_err(|e| AppError::Internal(format!("database error: {e}")))?;
+    let items = result
+        .items
         .into_iter()
-        .filter(|c| match repo_filter {
-            Some(rid) => c.repo_id.as_deref() == Some(rid),
-            None => true,
-        })
         .map(|c| ConflictListItem {
             id: c.id,
             file_path: c.file_path,
@@ -109,8 +123,17 @@ async fn list_conflicts(
             repo_id: c.repo_id,
         })
         .collect();
-
-    Ok(Json(items))
+    Ok(Json(if query.page.is_some() {
+        ConflictListResponse::Page(reposync_core::models::PaginatedResult {
+            items,
+            total: result.total,
+            page: result.page,
+            per_page: result.per_page,
+            total_pages: result.total_pages,
+        })
+    } else {
+        ConflictListResponse::Legacy(items)
+    }))
 }
 
 async fn get_conflict(
