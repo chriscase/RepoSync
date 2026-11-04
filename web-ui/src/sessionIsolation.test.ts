@@ -117,6 +117,21 @@ describe('#120 cross-tab invalidation', () => {
     const delayed = deferred<Response>(); fetchMock.mockReturnValueOnce(delayed.promise); const result = api.getMe().catch(error => error);
     storage.setItem('session_token', 'synthetic-B'); storage.setItem('user', JSON.stringify(member)); delayed.resolve(new Response('{"id":"A"}')); expect(await result).toBeInstanceOf(Error); expect(cache.snapshot().session.token).toBe('synthetic-B');
   });
+  it('authenticates and logs out in documented HTTP contexts without crypto.randomUUID', () => {
+    const secureRandom = crypto.getRandomValues.bind(crypto);
+    const random = vi.fn(secureRandom);
+    vi.stubGlobal('crypto', { getRandomValues: random });
+    const session = clientSession(); const before = cache.snapshot();
+    expect(() => session.signIn({ token: 'synthetic-B', user: member }, session.snapshot())).not.toThrow();
+    const signedIn = session.snapshot();
+    expect(signedIn.token).toBe('synthetic-B'); expect(signedIn.boundary).toMatch(/^[0-9a-f]{32}$/);
+    expect(cache.snapshot().client).not.toBe(before.client);
+    expect(() => session.end(signedIn)).not.toThrow();
+    expect(session.snapshot().token).toBeNull(); expect(session.snapshot().boundary).not.toBe(signedIn.boundary);
+    const loggedOut = session.snapshot(); session.signIn({ token: 'synthetic-B', user: member }, loggedOut);
+    expect(session.snapshot().epoch).toBeGreaterThan(loggedOut.epoch); expect(session.snapshot().boundary).not.toBe(loggedOut.boundary);
+    expect(random).toHaveBeenCalledTimes(3); expect(random.mock.calls.every(call => call[0]?.byteLength === 16)).toBe(true);
+  });
   it('a storage failure cannot bind a new token to old admin metadata and still retires the old cache', () => {
     const memory = new MemoryStorage(); memory.setItem('session_token', 'A'); memory.setItem('user', JSON.stringify(admin)); const session = new ClientSession(memory); let notifications = 0; session.subscribe(() => notifications++);
     vi.spyOn(memory, 'setItem').mockImplementation(() => { throw new Error('Storage unavailable'); }); expect(() => session.signIn({ token: 'B', user: member }, session.snapshot())).toThrow('Storage unavailable');

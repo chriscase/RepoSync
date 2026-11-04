@@ -14,6 +14,13 @@ export interface SessionSnapshot {
 }
 type SessionStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 const BOUNDARY_KEY = 'reposync.session-boundary';
+// An opaque cross-tab incarnation marker, not a UUID or server authorization token.
+// getRandomValues also works on the project's documented non-localhost HTTP deployment.
+function boundaryNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 function principal(raw: string | null): string {
   try { const user = JSON.parse(raw ?? 'null'); return JSON.stringify([user?.id, user?.role]); }
   catch { return 'unknown'; }
@@ -58,7 +65,7 @@ export class ClientSession {
       this.storage.removeItem('session_token'); this.storage.removeItem('user');
       if (result.user) this.storage.setItem('user', JSON.stringify(result.user));
       else this.storage.removeItem('user'); // Legacy login must never inherit the preceding administrator.
-      this.storage.setItem(BOUNDARY_KEY, crypto.randomUUID());
+      this.storage.setItem(BOUNDARY_KEY, boundaryNonce());
       this.storage.setItem('session_token', result.token);
     } finally { this.snapshot(); }
   }
@@ -66,7 +73,7 @@ export class ClientSession {
     this.assertCurrent(origin);
     try {
       this.storage.removeItem('session_token'); this.storage.removeItem('user');
-      this.storage.setItem(BOUNDARY_KEY, crypto.randomUUID());
+      this.storage.setItem(BOUNDARY_KEY, boundaryNonce());
     } finally { this.snapshot(); }
     return origin.token;
   }
