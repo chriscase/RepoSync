@@ -1,35 +1,12 @@
-import { type SyncStatus as SyncStatusType } from '../api';
-import { syncStateVisual } from '../utils/syncStateColor';
+import { type StatusQueryObservation } from '../statusObservation';
+import { useStatusObservation } from '../useStatusObservation';
 
-interface Props {
-  status: SyncStatusType;
-}
-
-export default function SyncStatus({ status }: Props) {
-  const visual = syncStateVisual(status.state);
-  const stateColor =
-    visual === 'healthy'
-      ? 'bg-green-400'
-      : visual === 'error'
-        ? 'bg-red-400'
-        : visual === 'attention'
-          ? 'bg-yellow-400'
-          : visual === 'active'
-            ? 'bg-blue-400'
-            : 'bg-gray-500';
-
-  const stateLabel =
-    status.state.charAt(0).toUpperCase() + status.state.slice(1);
-
-  return (
-    <div className="flex items-center space-x-2 text-sm text-gray-300">
-      <span className={`inline-block w-2 h-2 rounded-full ${stateColor}`} />
-      <span>{stateLabel}</span>
-      {status.last_sync_at && (
-        <span className="text-gray-500">
-          Last sync: {new Date(status.last_sync_at).toLocaleTimeString()}
-        </span>
-      )}
-    </div>
-  );
+/** Navigation uses the same failed/stale observation model as overview and detail. */
+export default function SyncStatus({query}:{query:StatusQueryObservation}) {
+  const view=useStatusObservation(query);
+  const color=view.health==='idle' ? 'bg-green-400' : ['held','paused','error','conflict'].includes(view.health) ? 'bg-yellow-400':'bg-gray-500';
+  return <div role="status" aria-live="polite" aria-atomic="true" className="flex items-center space-x-2 text-sm text-gray-300">
+    <span aria-hidden="true" className={`inline-block w-2 h-2 rounded-full ${color}`}/>
+    <span>{view.healthLabel}. {view.availability}.</span>
+  </div>;
 }

@@ -1,16 +1,15 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
+import { errorStatusQuery } from '../errorStatus';
 import SyncStatus from './SyncStatus';
 import { getStoredUser } from '../utils/auth';
 import { LogoSvg } from './Logo';
 
 export default function Layout() {
   const navigate = useNavigate();
-  const { data: status } = useQuery({
-    queryKey: ['status'],
-    queryFn: () => api.getStatus(),
-  });
+  const statusQuery = useQuery({...errorStatusQuery(),refetchInterval:15000});
+  const status=statusQuery.isError ? undefined:statusQuery.data;
 
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
@@ -84,7 +83,7 @@ export default function Layout() {
               </div>
             </div>
             <div className="flex items-center space-x-4">
-              {status && <SyncStatus status={status} />}
+              <SyncStatus query={statusQuery} />
               {user && (
                 <span className="text-sm text-gray-400">
                   {user.display_name || user.username}

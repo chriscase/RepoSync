@@ -1,3 +1,4 @@
+import { decodeSyncStatus, type StatusObservation } from './statusObservation';
 import type { ErrorObservation, ErrorScope } from './errorAcknowledgement';
 import { buildBranchPairDeleteQuery } from './branchPairDeletion';
 import type { BranchPairRemovalResult } from './branchPairRemoval';
@@ -21,6 +22,7 @@ export class ApiError extends Error {
 }
 
 export interface SyncStatus {
+  observation?: StatusObservation;
   state: string;
   last_sync_at: string | null;
   last_svn_revision: number | null;
@@ -330,7 +332,7 @@ async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
 export const api = {
   getStatus: (repoId?: string) => {
     const params = repoId ? `?repo_id=${encodeURIComponent(repoId)}` : '';
-    return fetchJson<SyncStatus>(`/status${params}`);
+    return fetchJson<unknown>(`/status${params}`).then(value=>decodeSyncStatus(value,repoId));
   },
 
   getHealth: () => fetchJson<{ ok: boolean }>('/status/health'),
