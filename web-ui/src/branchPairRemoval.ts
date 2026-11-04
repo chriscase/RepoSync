@@ -1,4 +1,4 @@
-import { accountStorageKey } from './session';
+import { accountStorageKey, RetiredSessionError } from './session';
 /** UI-only classification for an existing branch-pair DELETE response. */
 
 export interface BranchPairRemovalResult {
@@ -124,4 +124,33 @@ export function clearPersistedBranchPairRemovalNotice(): void {
   } catch {
     /* ignore */
   }
+}
+
+
+/** Keep the initiating owner through the parent read and the destructive send. */
+export async function removeBranchPairForView(
+  input: { viewedId: string; target: { id: string; parent_id: string }; options: { delete_git?: boolean; delete_svn?: boolean } },
+  owner: { assertCurrent(): void },
+  transport: { lookupParent(id: string): Promise<unknown>; remove(id: string, options: { delete_git?: boolean; delete_svn?: boolean }): Promise<BranchPairRemovalResult> },
+) {
+  owner.assertCurrent();
+  const { viewedId, target, options } = input;
+  let parentExists: boolean | null = null;
+  if (target.id === viewedId) {
+    try {
+      await transport.lookupParent(target.parent_id);
+      owner.assertCurrent(); parentExists = true;
+    } catch (error) {
+      // Retirement/abort must never be downgraded to an uncertain destination.
+      owner.assertCurrent();
+      if (error instanceof RetiredSessionError || (error as { name?: string } | null)?.name === 'AbortError') throw error;
+      parentExists = isNotFoundError(error) ? false : null;
+    }
+  }
+  const destination = removalDestination({ viewedId, targetId: target.id, parentId: target.parent_id, parentExists });
+  owner.assertCurrent();
+  const result = await transport.remove(target.id, options);
+  const outcome = branchPairRemovalOutcome(result);
+  if (outcome === 'rejected') throw new Error(result.message || 'Branch pair was not removed');
+  return { result, destination, outcome };
 }

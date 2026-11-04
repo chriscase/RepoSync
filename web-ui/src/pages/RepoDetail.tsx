@@ -15,9 +15,8 @@ import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
-  branchPairRemovalOutcome,
+  removeBranchPairForView,
   isNotFoundError,
-  removalDestination,
   repoDetailQueryKeys,
   readBranchPairRemovalNotice,
   persistBranchPairRemovalNotice,
@@ -387,28 +386,14 @@ function RepositoryDetailEditor() {
           delete_git: gitOpt?.checked ?? removeBranchOpts.delete_git,
           delete_svn: svnOpt?.checked ?? removeBranchOpts.delete_svn,
         };
-        let parentExists: boolean | null = null;
-        if (target.id === id && target.parent_id) {
-          try {
-            await api.getRepo(target.parent_id);
-            parentExists = true;
-          } catch (lookupError) {
-            parentExists = isNotFoundError(lookupError) ? false : null;
-          }
-        }
-        const destination = removalDestination({
-          viewedId: id,
-          targetId: target.id,
-          parentId: target.parent_id,
-          parentExists,
-        });
-        const result = await api.deleteBranchPair(target.id, options);
-        const outcome = branchPairRemovalOutcome(result);
-        if (outcome === 'rejected') {
-          throw new Error(result.message || 'Branch pair was not removed');
-        }
+        const { result, destination, outcome } = await removeBranchPairForView(
+          { viewedId: id, target: { id: target.id, parent_id: target.parent_id }, options },
+          view,
+          { lookupParent: api.getRepo, remove: api.deleteBranchPair },
+        );
         return { kind: 'branch_pair' as const, result, target, destination, outcome };
       }
+      view.assertCurrent();
       const result = await api.removeManagedRepo(target.id);
       return { kind: 'managed' as const, result, target };
     },

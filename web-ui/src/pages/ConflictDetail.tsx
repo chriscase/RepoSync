@@ -7,6 +7,11 @@ import DiffViewer from '../components/DiffViewer';
 
 export default function ConflictDetail() {
   const { id } = useParams<{ id: string }>();
+  return <ConflictEditor key={id} />;
+}
+
+function ConflictEditor() {
+  const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [mergedContent, setMergedContent] = useState('');

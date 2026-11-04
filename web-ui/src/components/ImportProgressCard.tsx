@@ -105,19 +105,26 @@ function PhaseDots({ phase }: { phase: string }) {
 // Component (self-fetching)
 // ---------------------------------------------------------------------------
 
-export default function ImportProgressCard({
-  repoId,
-  repoName,
-  hideIfIdle = false,
-  defaultImportMode = DEFAULT_REPO_IMPORT_MODE,
-  defaultSvnRevision = 'HEAD',
-}: {
+interface ImportProgressProps {
   repoId?: string;
   repoName?: string;
   hideIfIdle?: boolean;
   defaultImportMode?: RepoImportMode;
   defaultSvnRevision?: string;
-} = {}) {
+}
+
+/** Subject changes retire local feedback, private preferences and mutation observers together. */
+export default function ImportProgressCard(props: ImportProgressProps = {}) {
+  return <ImportProgressSubject key={props.repoId ? `repository:${props.repoId}` : 'global'} {...props} />;
+}
+
+function ImportProgressSubject({
+  repoId,
+  repoName,
+  hideIfIdle = false,
+  defaultImportMode = DEFAULT_REPO_IMPORT_MODE,
+  defaultSvnRevision = 'HEAD',
+}: ImportProgressProps) {
   const queryClient = useQueryClient();
   const admin = getStoredUser()?.role === 'admin';
   const [importMode, setImportMode] = useState<RepoImportMode>(defaultImportMode);

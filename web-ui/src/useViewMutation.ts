@@ -5,9 +5,9 @@ import { clientSession } from './session';
 import { ViewOwnership, ownedMutation } from './viewOwnership';
 
 export function useViewOwnership() {
-  const { pathname } = useLocation(); const epoch = clientSession().snapshot().epoch;
-  const current = useRef({ path: pathname, epoch }); current.current = { path: pathname, epoch };
-  const owner = useMemo(() => new ViewOwnership({ path: pathname, epoch }, () => ({ ...current.current, path: typeof window === 'undefined' ? current.current.path : window.location.pathname, epoch: clientSession().snapshot().epoch })), [pathname, epoch]);
+  const { pathname, search } = useLocation(); const path = pathname + search; const epoch = clientSession().snapshot().epoch;
+  const current = useRef({ path, epoch }); current.current = { path, epoch };
+  const owner = useMemo(() => new ViewOwnership({ path, epoch }, () => ({ ...current.current, path: typeof window === 'undefined' ? current.current.path : window.location.pathname + (window.location.search ?? ''), epoch: clientSession().snapshot().epoch })), [path, epoch]);
   useLayoutEffect(() => { owner.setActive(true); return () => owner.setActive(false); }, [owner]);
   return owner;
 }
