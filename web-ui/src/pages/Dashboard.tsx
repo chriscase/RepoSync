@@ -1,11 +1,12 @@
+import { dashboardListLink } from '../listPagination';
 import { useStatusObservation } from '../useStatusObservation';
 import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
 import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorStatus';
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
-import { useState, useMemo } from 'react';
+import { useMemo } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { UIForgeActivityStream } from '@appforgeapps/uiforge';
 import { api, type CommitMapEntry, type Repository } from '../api';
 import { formatTimeAgo } from '../utils/time';
@@ -19,7 +20,9 @@ import { auditEntryToActivityEvent, syncRecordToActivityEvent } from '../utils/a
 export default function Dashboard() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [selectedRepoId, setSelectedRepoId] = useState<string>('all');
+  const [searchParams,setSearchParams]=useSearchParams();
+  const selectedRepoId=searchParams.get('repo_id') || 'all';
+  const setSelectedRepoId=(value:string)=>{const next=new URLSearchParams(searchParams);if(value==='all')next.delete('repo_id');else next.set('repo_id',value);setSearchParams(next);};
 
   const activeRepoId = selectedRepoId !== 'all' ? selectedRepoId : undefined;
 
@@ -32,7 +35,7 @@ export default function Dashboard() {
   const statusView=useStatusObservation(statusQuery);
   const errorCard=errorStatusView(status,isError);
 
-  const { data: recentActivity } = useQuery({
+  const { data: recentActivity,isPending:activityPending,isError:activityError,refetch:refetchActivity } = useQuery({
     queryKey: ['audit', 'recent', activeRepoId],
     queryFn: () => api.getAuditLog(20, undefined, undefined, activeRepoId),
     staleTime: 30000,
@@ -90,7 +93,7 @@ export default function Dashboard() {
     ? repos?.find(r => r.id === selectedRepoId)
     : null;
 
-  const repoContextLabel = selectedRepo ? selectedRepo.name : 'All Repositories';
+  const repoContextLabel = selectedRepo ? selectedRepo.name : activeRepoId ? `Repository ${activeRepoId}`:'All Repositories';
 
   const cmEntries = commitMap?.entries ?? [];
 
@@ -98,14 +101,15 @@ export default function Dashboard() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-100">Dashboard</h1>
-        {repos && repos.length > 1 && (
+        {(repos || activeRepoId) && (
           <select
             value={selectedRepoId}
             onChange={(e) => setSelectedRepoId(e.target.value)}
             className="bg-gray-800 border border-gray-600 text-gray-200 rounded-md px-3 py-1.5 text-sm"
           >
             <option value="all">All Repositories</option>
-            {repos.map(r => (
+            {activeRepoId && !repos?.some(r=>r.id===activeRepoId) && <option value={activeRepoId}>Repository {activeRepoId}</option>}
+            {repos?.map(r => (
               <option key={r.id} value={r.id}>{r.name}</option>
             ))}
           </select>
@@ -202,19 +206,19 @@ export default function Dashboard() {
           title="Total Syncs"
           value={statusView.metric('total_syncs')}
           color="blue"
-          onClick={() => navigate('/audit')}
+          navigationHref={dashboardListLink('/audit',activeRepoId)}
         />
         <StatusCard
           title="Active Conflicts"
           value={statusView.metric('active_conflicts')}
           color={status?.active_conflicts ? 'red' : 'gray'}
-          onClick={() => navigate('/conflicts')}
+          navigationHref={dashboardListLink('/conflicts',activeRepoId)}
         />
         <StatusCard
           title="Errors (24h)"
           value={statusView.metric('total_errors')}
           color={status?.total_errors ? 'red' : 'gray'}
-          onClick={() => navigate(`/audit?success=false${activeRepoId ? `&repo_id=${encodeURIComponent(activeRepoId)}` : ''}`)}
+          navigationHref={dashboardListLink('/audit',activeRepoId,{success:'false'})}
           subtitle={
             status?.last_error_at
               ? `Last: ${formatTimeAgo(status.last_error_at)}`
@@ -381,7 +385,9 @@ export default function Dashboard() {
             <span className="ml-2 text-sm font-normal text-blue-400">— {selectedRepo.name}</span>
           )}
         </h2>
-        <UIForgeActivityStream
+        {activityError ? <div role="alert">Error loading recent activity. Results are unknown. <button onClick={()=>void refetchActivity()}>Retry</button></div>
+        : activityPending || !recentActivity ? <div role="status">Loading recent activity…</div>
+        : <UIForgeActivityStream
           events={activityEvents}
           theme="dark"
           density="compact"
@@ -393,8 +399,8 @@ export default function Dashboard() {
           renderEvent={renderAuditEvent}
           renderIcon={renderAuditIcon}
           maxHeight="600px"
-          emptyMessage="No activity yet"
-        />
+          emptyMessage="No matching activity"
+        />}
       </div>
 
       {/* Server Monitor */}
@@ -411,14 +417,14 @@ function StatusCard({
   title,
   value,
   color,
-  onClick,
+  navigationHref,
   subtitle,
   action,
 }: {
   title: string;
   value: string;
   color: string;
-  onClick?: () => void;
+  navigationHref?: string;
   subtitle?: string;
   action?: React.ReactNode;
 }) {
@@ -430,21 +436,18 @@ function StatusCard({
     gray: 'bg-gray-800 border-gray-700',
   };
 
-  const clickableClasses = onClick
+  const clickableClasses = navigationHref
     ? 'cursor-pointer hover:border-blue-500/50 transition-colors'
     : '';
 
   return (
     <div
-      className={`rounded-lg border p-4 ${colorClasses[color] ?? colorClasses.gray} ${clickableClasses}`}
-      onClick={onClick}
-      role={onClick ? 'button' : undefined}
-      tabIndex={onClick ? 0 : undefined}
-      onKeyDown={onClick ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } } : undefined}
+      className={`relative rounded-lg border p-4 ${colorClasses[color] ?? colorClasses.gray} ${clickableClasses}`}
     >
+      {navigationHref && <Link to={navigationHref} aria-label={`View ${title}`} className="absolute inset-0 rounded-lg focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400"/>}
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-400">{title}</p>
-        {action}
+        {action && <div className="relative z-10">{action}</div>}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
       {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}

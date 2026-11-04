@@ -1,3 +1,4 @@
+import { decodeAuditPage, decodeConflictPage, type ConflictFilters } from './listPagination';
 import { decodeSyncStatus, type StatusObservation } from './statusObservation';
 import type { ErrorObservation, ErrorScope } from './errorAcknowledgement';
 import { buildBranchPairDeleteQuery } from './branchPairDeletion';
@@ -50,12 +51,12 @@ export interface Conflict {
   resolved_by: string | null;
   created_at: string;
   resolved_at: string | null;
-  repo_id?: string;
+  repo_id?: string | null;
 }
 
 export interface AuditEntry {
   id: number;
-  repo_id?: string;
+  repo_id?: string | null;
   action: string;
   direction: string | null;
   svn_rev: number | null;
@@ -66,9 +67,15 @@ export interface AuditEntry {
   success: boolean;
 }
 
+export type ConflictListItem = Pick<Conflict,'id'|'file_path'|'conflict_type'|'status'|'svn_revision'|'git_hash'|'created_at'|'resolved_at'|'repo_id'>;
+export interface ConflictPage {
+  items: ConflictListItem[];
+  total:number;page:number;per_page:number;total_pages:number;
+}
+
 export interface AuditListResponse {
   entries: AuditEntry[];
-  total: number;
+  total:number;page:number;per_page:number;total_pages:number;offset:number;
 }
 
 export interface AuthorMapping {
@@ -347,6 +354,13 @@ export const api = {
     return fetchJson<Conflict[]>(`/conflicts${qs ? `?${qs}` : ''}`);
   },
 
+  getConflictsPage: (filters:ConflictFilters) => {
+    const params=new URLSearchParams({page:String(filters.page),per_page:String(filters.perPage)});
+    if(filters.status)params.set('status',filters.status);
+    if(filters.repoId)params.set('repo_id',filters.repoId);
+    return fetchJson<unknown>(`/conflicts?${params}`).then(value=>decodeConflictPage(value,filters));
+  },
+
   getConflict: (id: string) => fetchJson<Conflict>(`/conflicts/${id}`),
 
   resolveConflict: (id: string, resolution: string, mergedContent?: string) =>
@@ -358,12 +372,13 @@ export const api = {
   deferConflict: (id: string) =>
     fetchJson<{ ok: boolean }>(`/conflicts/${id}/defer`, { method: 'POST' }),
 
-  getAuditLog: (limit = 50, page?: number, success?: boolean, repoId?: string) => {
+  getAuditLog: (limit = 50, page?: number, success?: boolean, repoId?: string, action?: string) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (page !== undefined) params.append('page', String(page));
     if (success !== undefined) params.append('success', String(success));
     if (repoId) params.append('repo_id', repoId);
-    return fetchJson<AuditListResponse>(`/audit?${params.toString()}`);
+    if(action)params.append('action',action);
+    return fetchJson<unknown>(`/audit?${params.toString()}`).then(value=>decodeAuditPage(value,{page:page ?? 1,perPage:limit,success,repoId,action}));
   },
 
   acknowledgeErrors: (scope: ErrorScope, observation: ErrorObservation) =>
