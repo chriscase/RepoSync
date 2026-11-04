@@ -21,8 +21,9 @@ npm run typecheck
 npm run lint
 npm test -- --reporter=verbose
 npm run build
+node --test node-tests/receipt-compatibility.test.mjs
 ```
 
 The normal repository CI remains an independent exact-revision gate for the assembled tree. Its current workflow has no npm/UI step, so its Rust/HTTP/scenario success cannot be reported as running these UI cases. Local UI evidence must stay separately labeled, or a separately admitted exact-source frontend profile must execute these commands. These tests include controlled event and server-rendered navigation composition; they do not claim a full browser, real identity-provider, remote account or production qualification. No backend/auth/schema/workflow/package-lock changes, deployment, main promotion, recovery activation or AC7 re-anchor implementation is included.
 
-The workspace Rust tests also run two direct Node `--experimental-strip-types` behavioral scripts from `repo_detail_removal_ui.rs`. These are separate from the npm suite. The managed-removal helper therefore keeps an explicit `.ts` transitive import and erasable TypeScript constructor syntax. `sessionNodeCompatibility.test.ts` executes those unchanged scripts with the installed Node executable, without a bundler, custom loader, transform flag or altered assertions. Local Node 25 evidence does not substitute for the hosted Node 24 run.
+The workspace Rust tests also run two direct Node `--experimental-strip-types` behavioral scripts from `repo_detail_removal_ui.rs`. These are separate from the npm suite. The managed-removal helper therefore keeps an explicit `.ts` transitive import and erasable TypeScript constructor syntax. `web-ui/node-tests/receipt-compatibility.test.mjs` executes those unchanged scripts with the installed Node executable, without a bundler, custom loader, transform flag or altered assertions. Local Node 25 evidence does not substitute for the hosted Node 24 run.
