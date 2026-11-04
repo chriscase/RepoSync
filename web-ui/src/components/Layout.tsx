@@ -94,7 +94,7 @@ export default function Layout() {
         </div>
       </nav>
 
-      <main className="py-6 px-6 sm:px-8 lg:px-12">
+      <main tabIndex={-1} className="py-6 px-6 sm:px-8 lg:px-12">
         <Outlet />
       </main>
     </div>

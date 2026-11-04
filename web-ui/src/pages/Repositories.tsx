@@ -1,3 +1,5 @@
+import { useId } from 'react';
+import Dialog from '../components/Dialog';
 import { clientSession } from '../session';
 import RepositoryStatusSummary from '../components/StatusObservation';
 import { useRepositorySave } from '../useRepositorySave';
@@ -97,6 +99,7 @@ export default function Repositories() {
 }
 
 function RepositoriesEditor() {
+  const fieldId = useId();
   const navigate = useNavigate();
   const location = useLocation();
   const removalNotice = readBranchPairRemovalNotice(location.state) ?? readPersistedBranchPairRemovalNotice();
@@ -362,13 +365,14 @@ function RepositoriesEditor() {
 
       {/* Add Repository Modal */}
       {showAddModal && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <Dialog title="Add Repository" description="Configure the registered SVN and Git endpoints and import policy. Review saved and pending stages before retrying." onClose={closeAdd} busy={saveFlow.pending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
             {/* Modal header */}
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-100">Add Repository</h2>
+
               <button
                 onClick={closeAdd}
+                aria-label="Close dialog" data-dialog-cancel disabled={saveFlow.pending}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -381,13 +385,13 @@ function RepositoriesEditor() {
 
               {/* Name */}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-1">Repository Name</label>
+                <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-1`}>Repository Name</label>
                 <input
                   type="text"
                   className={inputClass}
                   value={form.name}
                   onChange={(e) => setField('name', e.target.value)}
-                  placeholder="My Project"
+                  placeholder="My Project" id={`${fieldId}-1`}
                 />
               </div>
 
@@ -399,43 +403,43 @@ function RepositoriesEditor() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">SVN URL</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>SVN URL</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.svn_url}
                       onChange={(e) => setField('svn_url', e.target.value)}
-                      placeholder="https://svn.example.com/repo"
+                      placeholder="https://svn.example.com/repo" id={`${fieldId}-2`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Branch</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>Branch</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.svn_branch}
                       onChange={(e) => setField('svn_branch', e.target.value)}
-                      placeholder="trunk"
+                      placeholder="trunk" id={`${fieldId}-3`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Username</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Username</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.svn_username}
                       onChange={(e) => setField('svn_username', e.target.value)}
-                      placeholder="svn-user"
+                      placeholder="svn-user" id={`${fieldId}-4`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Password</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Password</label>
                     <input
                       type="password"
                       className={inputClass}
                       value={form.svn_password}
                       onChange={(e) => setField('svn_password', e.target.value)}
-                      placeholder="Enter SVN password"
+                      placeholder="Enter SVN password" id={`${fieldId}-5`}
                     />
                   </div>
                   <div className="md:col-span-2">
@@ -464,54 +468,54 @@ function RepositoriesEditor() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Provider</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>Provider</label>
                     <select
                       className={selectClass}
                       value={form.git_provider}
-                      onChange={(e) => setField('git_provider', e.target.value)}
+                      onChange={(e) => setField('git_provider', e.target.value)} id={`${fieldId}-6`}
                     >
                       <option value="github">GitHub</option>
                       <option value="gitea">Gitea</option>
                     </select>
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">API URL</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>API URL</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.git_api_url}
                       onChange={(e) => setField('git_api_url', e.target.value)}
-                      placeholder="https://api.github.com"
+                      placeholder="https://api.github.com" id={`${fieldId}-7`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Repository</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>Repository</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.git_repo}
                       onChange={(e) => setField('git_repo', e.target.value)}
-                      placeholder="owner/repo"
+                      placeholder="owner/repo" id={`${fieldId}-8`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Default Branch</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>Default Branch</label>
                     <input
                       type="text"
                       className={inputClass}
                       value={form.git_branch}
                       onChange={(e) => setField('git_branch', e.target.value)}
-                      placeholder="main"
+                      placeholder="main" id={`${fieldId}-9`}
                     />
                   </div>
                   <div className="md:col-span-2">
-                    <label className="block text-sm text-gray-400 mb-1">Git Token</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-10`}>Git Token</label>
                     <input
                       type="password"
                       className={inputClass}
                       value={form.git_token}
                       onChange={(e) => setField('git_token', e.target.value)}
-                      placeholder="Enter Git API token"
+                      placeholder="Enter Git API token" id={`${fieldId}-10`}
                     />
                   </div>
                   <div className="md:col-span-2">
@@ -551,39 +555,39 @@ function RepositoriesEditor() {
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Sync Mode</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-11`}>Sync Mode</label>
                     <select
                       className={selectClass}
                       value={form.sync_mode}
-                      onChange={(e) => setField('sync_mode', e.target.value)}
+                      onChange={(e) => setField('sync_mode', e.target.value)} id={`${fieldId}-11`}
                     >
                       <option value="direct">Direct</option>
                       <option value="pr">Pull Request</option>
                     </select>
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">Poll Interval (seconds)</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-12`}>Poll Interval (seconds)</label>
                     <input
                       type="number"
                       className={inputClass}
                       value={form.poll_interval_secs}
                       onChange={(e) => setField('poll_interval_secs', Number(e.target.value))}
-                      min={10}
+                      min={10} id={`${fieldId}-12`}
                     />
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-400 mb-1">LFS Threshold (MB, 0 = disabled)</label>
+                    <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-13`}>LFS Threshold (MB, 0 = disabled)</label>
                     <input
                       type="number"
                       className={inputClass}
                       value={form.lfs_threshold_mb}
                       onChange={(e) => setField('lfs_threshold_mb', Number(e.target.value))}
-                      min={0}
+                      min={0} id={`${fieldId}-13`}
                     />
                   </div>
                   <div className="flex items-end gap-3">
                     <div>
-                      <label className="block text-sm text-gray-400 mb-1">Auto Merge</label>
+                      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-14`}>Auto Merge</label>
                       <button
                         type="button"
                         role="switch"
@@ -592,7 +596,7 @@ function RepositoriesEditor() {
                         onClick={() => setField('auto_merge', !form.auto_merge)}
                         className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                           form.auto_merge ? 'bg-blue-600' : 'bg-gray-600'
-                        }`}
+                        }`} id={`${fieldId}-14`}
                       >
                         <span
                           className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -602,7 +606,7 @@ function RepositoriesEditor() {
                       </button>
                     </div>
                     <div>
-                      <label className="block text-sm text-gray-400 mb-1">Enabled</label>
+                      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-15`}>Enabled</label>
                       <button
                         type="button"
                         role="switch"
@@ -611,7 +615,7 @@ function RepositoriesEditor() {
                         onClick={() => setField('enabled', !form.enabled)}
                         className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                           form.enabled ? 'bg-green-600' : 'bg-gray-600'
-                        }`}
+                        }`} id={`${fieldId}-15`}
                       >
                         <span
                           className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
@@ -630,7 +634,7 @@ function RepositoriesEditor() {
               <button
                 onClick={closeAdd}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={saveFlow.pending}>
                 Cancel
               </button>
               <button
@@ -643,7 +647,7 @@ function RepositoriesEditor() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
     </div>
   );

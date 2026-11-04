@@ -289,7 +289,6 @@ function AuditRow({
   return (
     <>
       <tr
-        onClick={onToggle}
         className={`cursor-pointer transition-colors ${
           expanded ? 'bg-gray-700/50' : 'hover:bg-gray-700/30'
         }`}
@@ -322,7 +321,9 @@ function AuditRow({
           )}
         </td>
         <td className="px-4 py-3 text-sm text-gray-300 max-w-sm truncate">
-          {entry.details ?? '-'}
+          <button type="button" onClick={onToggle} aria-expanded={expanded} className="text-left text-blue-300 underline">
+            {expanded ? 'Hide audit details: ' : 'Show audit details: '}{entry.details ?? entry.action}
+          </button>
         </td>
         <td className="px-4 py-3 text-sm text-gray-300">
           {entry.author ?? '-'}

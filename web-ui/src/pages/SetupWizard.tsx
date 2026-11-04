@@ -1,3 +1,5 @@
+import ImportProgressMeter from '../components/ImportProgressMeter';
+import { useId } from 'react';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type AuthorMapping, type ImportStatus, type WizardSetupConfig } from '../api';
@@ -423,6 +425,7 @@ function StepIndicator({
         {steps.map((s, i) => (
           <div key={i} className="flex items-center flex-1 last:flex-none">
             <button
+              aria-current={i === currentStep ? 'step' : undefined}
               onClick={() => onStepClick(i)}
               disabled={i > currentStep}
               className="flex flex-col items-center group"
@@ -433,7 +436,7 @@ function StepIndicator({
                     ? 'bg-blue-600 border-blue-600 text-white'
                     : i === currentStep
                       ? 'border-blue-500 text-blue-400 bg-blue-500/10'
-                      : 'border-gray-600 text-gray-500 bg-gray-800'
+                      : 'border-gray-600 text-gray-300 bg-gray-800'
                 }`}
               >
                 {i < currentStep ? (
@@ -446,7 +449,7 @@ function StepIndicator({
               </div>
               <span
                 className={`mt-1.5 text-xs font-medium transition-colors ${
-                  i <= currentStep ? 'text-gray-300' : 'text-gray-500'
+                  i <= currentStep ? 'text-gray-300' : 'text-gray-300'
                 }`}
               >
                 {s.short}
@@ -506,7 +509,7 @@ function FormField({
     <div>
       <label htmlFor={name} className="block text-sm font-medium text-gray-300 mb-1">
         {label}
-        {required && <span className="text-red-400 ml-1">*</span>}
+        {required && <span aria-hidden="true" className="text-red-400 ml-1">*</span>}
       </label>
       <input
         id={name}
@@ -519,13 +522,15 @@ function FormField({
         className={`w-full rounded-lg border bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2.5 text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 ${
           error ? 'border-red-500' : 'border-gray-600'
         } ${mono ? 'font-mono' : ''} ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+        aria-invalid={error ? true : undefined}
+        aria-required={required || undefined}
         aria-describedby={error ? `${name}-error` : help ? `${name}-help` : undefined}
       />
       {error && (
-        <p id={`${name}-error`} className="text-red-400 text-xs mt-1">{error}</p>
+        <p id={`${name}-error`} role="alert" className="text-red-400 text-xs mt-1">{error}</p>
       )}
       {help && !error && (
-        <p id={`${name}-help`} className="text-gray-500 text-xs mt-1">{help}</p>
+        <p id={`${name}-help`} className="text-gray-300 text-xs mt-1">{help}</p>
       )}
     </div>
   );
@@ -560,7 +565,7 @@ function FormSelect({
           <option key={o.value} value={o.value}>{o.label}</option>
         ))}
       </select>
-      {help && <p className="text-gray-500 text-xs mt-1">{help}</p>}
+      {help && <p className="text-gray-300 text-xs mt-1">{help}</p>}
     </div>
   );
 }
@@ -595,7 +600,7 @@ function ToggleSwitch({
       </button>
       <div>
         <span className="text-sm font-medium text-gray-300">{label}</span>
-        {help && <p className="text-gray-500 text-xs mt-0.5">{help}</p>}
+        {help && <p className="text-gray-300 text-xs mt-0.5">{help}</p>}
       </div>
     </div>
   );
@@ -728,6 +733,7 @@ function SvnStep({
   svnPasswordDirty: boolean;
   onSvnPasswordChange: () => void;
 }) {
+  const fieldId = useId();
   return (
     <div className="space-y-6">
       <SectionHeading
@@ -760,15 +766,15 @@ function SvnStep({
           required
         />
         <div>
-          <label className="block text-sm font-medium text-gray-300 mb-1">Password</label>
+          <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-1`}>Password</label>
           <input
             type="password"
             value={data.svn_password}
             onChange={e => { update({ svn_password: e.target.value }); onSvnPasswordChange(); }}
             className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-            placeholder={svnPasswordSaved && !svnPasswordDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'Enter SVN password'}
+            placeholder={svnPasswordSaved && !svnPasswordDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'Enter SVN password'} id={`${fieldId}-1`}
           />
-          <p className="text-xs text-gray-500 mt-1">Stored securely on the server — never written to config files</p>
+          <p className="text-xs text-gray-300 mt-1">Stored securely on the server — never written to config files</p>
         </div>
       </div>
 
@@ -784,7 +790,7 @@ function SvnStep({
           ]}
           help="Standard layout uses trunk/, branches/, and tags/ under the repo root"
         />
-        <div className={`mt-4 grid grid-cols-1 md:grid-cols-3 gap-4 ${data.svn_layout === 'standard' ? 'opacity-50' : ''}`}>
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
           <FormField
             label="Trunk Path"
             name="svn_trunk_path"
@@ -840,6 +846,7 @@ function GitStep({
   gitTokenDirty: boolean;
   onGitTokenChange: () => void;
 }) {
+  const fieldId = useId();
   const handleProviderChange = (provider: string) => {
     const p = provider as 'github' | 'gitea';
     const apiUrl = p === 'github' ? 'https://api.github.com' : data.git_api_url;
@@ -906,15 +913,15 @@ function GitStep({
         />
         <div className="md:col-span-2">
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1">Personal Access Token</label>
+            <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-2`}>Personal Access Token</label>
             <input
               type="password"
               value={data.git_token}
               onChange={e => { update({ git_token: e.target.value }); onGitTokenChange(); }}
               className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              placeholder={gitTokenSaved && !gitTokenDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'ghp_xxxxxxxxxxxx or giteaToken'}
+              placeholder={gitTokenSaved && !gitTokenDirty ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022 (saved)' : 'ghp_xxxxxxxxxxxx or giteaToken'} id={`${fieldId}-2`}
             />
-            <p className="text-xs text-gray-500 mt-1">Needs <code className="text-gray-400">repo</code> scope. Stored securely on the server.</p>
+            <p className="text-xs text-gray-300 mt-1">Needs <code className="text-gray-400">repo</code> scope. Stored securely on the server.</p>
           </div>
         </div>
       </div>
@@ -939,6 +946,7 @@ function SyncStep({
   data: WizardData;
   update: (f: Partial<WizardData>) => void;
 }) {
+  const fieldId = useId();
   return (
     <div className="space-y-6">
       <SectionHeading
@@ -949,10 +957,10 @@ function SyncStep({
 
       {/* Mode selection */}
       <div>
-        <label className="block text-sm font-medium text-gray-300 mb-2">Sync Mode</label>
-        <div className="flex space-x-3">
+        <p id={`${fieldId}-sync-mode`} className="block text-sm font-medium text-gray-300 mb-2">Sync Mode</p>
+        <div role="group" aria-labelledby={`${fieldId}-sync-mode`} className="flex space-x-3">
           <button
-            onClick={() => update({ sync_mode: 'direct' })}
+            aria-pressed={data.sync_mode === 'direct'} onClick={() => update({ sync_mode: 'direct' })}
             className={`flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
               data.sync_mode === 'direct'
                 ? 'border-blue-500 bg-blue-600/10'
@@ -965,7 +973,7 @@ function SyncStep({
             <p className="text-xs text-gray-400 mt-1">Commits are pushed directly to the target branch</p>
           </button>
           <button
-            onClick={() => update({ sync_mode: 'pr' })}
+            aria-pressed={data.sync_mode === 'pr'} onClick={() => update({ sync_mode: 'pr' })}
             className={`flex-1 py-3 px-4 rounded-lg border text-left transition-all ${
               data.sync_mode === 'pr'
                 ? 'border-blue-500 bg-blue-600/10'
@@ -1000,26 +1008,26 @@ function SyncStep({
         <h3 className="text-sm font-semibold text-gray-200">File Policy & Large File Storage (LFS)</h3>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1">LFS Threshold (MB)</label>
+            <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-3`}>LFS Threshold (MB)</label>
             <input
               type="number"
               min="0"
               value={data.lfs_threshold_mb}
               onChange={e => update({ lfs_threshold_mb: Number(e.target.value) || 0 })}
               className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              placeholder="0 = disabled"
+              placeholder="0 = disabled" id={`${fieldId}-3`}
             />
             <p className="text-xs text-gray-400 mt-1">Files larger than this are tracked via Git LFS. Set 0 to disable.</p>
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-300 mb-1">Max File Size (MB)</label>
+            <label className="block text-sm font-medium text-gray-300 mb-1" htmlFor={`${fieldId}-4`}>Max File Size (MB)</label>
             <input
               type="number"
               min="0"
               value={data.max_file_size_mb}
               onChange={e => update({ max_file_size_mb: Number(e.target.value) || 0 })}
               className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-              placeholder="0 = no limit"
+              placeholder="0 = no limit" id={`${fieldId}-4`}
             />
             <p className="text-xs text-gray-400 mt-1">Files larger than this are skipped entirely. Set 0 for no limit.</p>
           </div>
@@ -1172,19 +1180,19 @@ function IdentityStep({
         )}
         <div className="flex space-x-2">
           <input
-            placeholder="SVN username"
+            aria-label="Mapping SVN username" placeholder="SVN username"
             value={newMapping.svn_username}
             onChange={(e) => setNewMapping({ ...newMapping, svn_username: e.target.value })}
             className="flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none font-mono"
           />
           <input
-            placeholder="Full Name"
+            aria-label="Mapping full name" placeholder="Full Name"
             value={newMapping.name}
             onChange={(e) => setNewMapping({ ...newMapping, name: e.target.value })}
             className="flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none"
           />
           <input
-            placeholder="email@company.com"
+            aria-label="Mapping email" placeholder="email@company.com"
             value={newMapping.email}
             onChange={(e) => setNewMapping({ ...newMapping, email: e.target.value })}
             className="flex-1 rounded-lg border border-gray-600 bg-gray-700 text-gray-100 placeholder-gray-500 px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 focus:outline-none"
@@ -1580,10 +1588,6 @@ function ImportStep() {
   const isFailed = phase === 'failed';
   const isCancelled = phase === 'cancelled';
   const isIdle = !status || phase === 'idle';
-  const percentage = status && status.total_revs > 0
-    ? Math.round((status.current_rev / status.total_revs) * 100)
-    : 0;
-
   // Elapsed time for push phase
   const pushElapsed = (() => {
     if (!status?.push_started_at) return '';
@@ -1625,33 +1629,15 @@ function ImportStep() {
               </span>
             ) : '▶ Start Full Import'}
           </button>
-          <p className="text-xs text-gray-500 mt-3">This will import all SVN revisions as individual Git commits.</p>
+          <p className="text-xs text-gray-300 mt-3">This will import all SVN revisions as individual Git commits.</p>
         </div>
       )}
 
       {/* Progress section */}
       {(isActive || isComplete || isFailed || isCancelled) && (
         <div className="space-y-4">
-          {/* Progress bar */}
-          <div className="relative">
-            <div className="w-full h-8 bg-gray-700 rounded-lg overflow-hidden">
-              <div
-                className={`h-full transition-all duration-500 ease-out ${
-                  isComplete ? 'bg-emerald-500' :
-                  isFailed ? 'bg-red-500' :
-                  isCancelled ? 'bg-yellow-500' :
-                  'bg-blue-500'
-                }`}
-                style={{ width: `${isComplete ? 100 : percentage}%` }}
-              />
-            </div>
-            <div className="absolute inset-0 flex items-center justify-center text-sm font-medium text-white drop-shadow">
-              {isComplete ? 'Complete' :
-               isFailed ? 'Failed' :
-               isCancelled ? 'Cancelled' :
-               `${percentage}%`}
-            </div>
-          </div>
+          {status && <ImportProgressMeter status={status} name="Setup import" />}
+          <p className="text-sm text-gray-200">{isComplete ? 'Complete' : isFailed ? 'Failed' : isCancelled ? 'Cancelled' : 'Import in progress'}</p>
 
           {/* Stats row */}
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
@@ -1733,11 +1719,12 @@ function ImportStep() {
         </div>
         <div
           ref={logRef}
+          aria-label="Import operation log" aria-live="off"
           onScroll={handleLogScroll}
           className="bg-gray-950 border border-gray-700 rounded-lg p-4 h-[400px] overflow-y-auto font-mono text-sm leading-relaxed"
         >
           {(!status?.log_lines || status.log_lines.length === 0) ? (
-            <p className="text-gray-600 italic">Waiting for import to start...</p>
+            <p className="text-gray-400 italic">Waiting for import to start...</p>
           ) : (
             status.log_lines.map((line, i) => (
               <div key={i} className={`whitespace-pre-wrap ${getLogLineColor(line)}`}>
@@ -1776,7 +1763,7 @@ function ImportStep() {
             {status?.commits_created} commit{status?.commits_created !== 1 ? 's' : ''} imported from {status?.total_revs} SVN revision{status?.total_revs !== 1 ? 's' : ''}
           </p>
           {(status?.lfs_unique_count ?? 0) > 0 && (
-            <p className="text-gray-500 text-sm mt-1">{status?.lfs_unique_count} unique files tracked via Git LFS</p>
+            <p className="text-gray-300 text-sm mt-1">{status?.lfs_unique_count} unique files tracked via Git LFS</p>
           )}
           {status?.verification && (
             <div className={`mt-3 text-sm ${status.verification.ok ? 'text-emerald-400' : 'text-yellow-400'}`}>
@@ -1825,7 +1812,7 @@ function getLogLineColor(line: string): string {
   if (stripped.startsWith('[ok]')) return 'text-emerald-400';
   if (stripped.startsWith('[error]')) return 'text-red-400';
   if (stripped.startsWith('[warn]')) return 'text-yellow-400';
-  if (stripped.startsWith('[skip]')) return 'text-gray-500';
+  if (stripped.startsWith('[skip]')) return 'text-gray-300';
   if (stripped.startsWith('[info]')) return 'text-blue-400';
   return 'text-gray-400';
 }
@@ -1834,7 +1821,7 @@ function StatCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="bg-gray-700/30 rounded-lg p-3 border border-gray-700 text-center">
       <div className="text-lg font-bold text-gray-100 font-mono">{value}</div>
-      <div className="text-xs text-gray-500 mt-0.5">{label}</div>
+      <div className="text-xs text-gray-300 mt-0.5">{label}</div>
     </div>
   );
 }
@@ -1857,7 +1844,7 @@ function SummaryCard({ title, color, items }: { title: string; color: string; it
       <dl className="space-y-1.5">
         {items.map(([label, value]) => (
           <div key={label} className="flex justify-between text-xs">
-            <dt className="text-gray-500">{label}</dt>
+            <dt className="text-gray-300">{label}</dt>
             <dd className="text-gray-300 font-mono truncate ml-3 max-w-[60%] text-right">{value || '-'}</dd>
           </div>
         ))}

@@ -39,7 +39,7 @@ export default function Config() {
   };
 
   if (isLoading) {
-    return <div className="text-center py-8 text-gray-500">Loading...</div>;
+    return <div className="text-center py-8 text-gray-300">Loading...</div>;
   }
 
   return (
@@ -85,7 +85,7 @@ export default function Config() {
                 </td>
                 <td className="px-4 py-2 text-sm text-gray-300">{m.name}</td>
                 <td className="px-4 py-2 text-sm text-gray-300">{m.email}</td>
-                <td className="px-4 py-2 text-sm text-gray-500">
+                <td className="px-4 py-2 text-sm text-gray-300">
                   {m.github ?? '-'}
                 </td>
                 <td className="px-4 py-2 text-right">
@@ -108,7 +108,7 @@ export default function Config() {
           </h3>
           <div className="flex space-x-2">
             <input
-              placeholder="SVN username"
+              aria-label="Mapping SVN username" placeholder="SVN username"
               value={newMapping.svn_username}
               onChange={(e) =>
                 setNewMapping({ ...newMapping, svn_username: e.target.value })
@@ -116,7 +116,7 @@ export default function Config() {
               className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <input
-              placeholder="Full Name"
+              aria-label="Mapping full name" placeholder="Full Name"
               value={newMapping.name}
               onChange={(e) =>
                 setNewMapping({ ...newMapping, name: e.target.value })
@@ -124,7 +124,7 @@ export default function Config() {
               className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <input
-              placeholder="email@company.com"
+              aria-label="Mapping email" placeholder="email@company.com"
               value={newMapping.email}
               onChange={(e) =>
                 setNewMapping({ ...newMapping, email: e.target.value })
@@ -236,7 +236,7 @@ function NotificationsConfig() {
             <li>Select the channel to post to and click <strong>Add workflow</strong></li>
             <li>Copy the <strong>webhook URL</strong> and paste it below</li>
           </ol>
-          <p className="text-xs text-gray-500 mt-2">
+          <p className="text-xs text-gray-300 mt-2">
             No admin permissions required — any team member can create a workflow on their channel.
           </p>
         </div>
@@ -244,11 +244,11 @@ function NotificationsConfig() {
 
       <div className="space-y-3">
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Teams Webhook URL</label>
+          <label className="block text-sm text-gray-400 mb-1" htmlFor="teams-webhook-url">Teams Webhook URL</label>
           <div className="flex gap-2">
             <input
               type="text"
-              value={teamsUrl}
+              id="teams-webhook-url" value={teamsUrl}
               onChange={(e) => setTeamsUrl(e.target.value)}
               placeholder="https://prod-XX.westus.logic.azure.com/workflows/..."
               className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
@@ -276,7 +276,7 @@ function NotificationsConfig() {
             </p>
           )}
         </div>
-        <p className="text-xs text-gray-500">
+        <p className="text-xs text-gray-300">
           Notifications will be sent for: sync activity, errors, circuit breaker alerts, imports, branch pair changes, and path violations.
           No-change sync cycles are automatically filtered out.
         </p>

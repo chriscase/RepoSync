@@ -6,7 +6,7 @@ import { useStatusObservation } from '../useStatusObservation';
 export function StatusObservationPanel({view}:{view:ReturnType<typeof statusObservationView>}) {
   const o=view.observation;
   const color=view.health==='idle' ? 'text-green-300' : ['held','paused','conflict','error'].includes(view.health) ? 'text-yellow-300':'text-gray-300';
-  return <section aria-label="Repository status and evidence" className="space-y-1 text-xs mt-3">
+  return <section aria-label="Repository status and evidence" className="space-y-1 text-xs text-gray-300 mt-3">
     <p role="status" aria-live="polite" aria-atomic="true" className={color}>{view.healthLabel}. {view.availability}.</p>
     <p>Sync configuration: {view.configured}. {view.notice}</p>
     <p>Observation: {o?.observed_at ?? 'Unknown'}. Last successful sync: {o?.last_successful_sync_at ?? (o?.data_freshness==='never_recorded' ? 'Not recorded':'Unknown')}.</p>

@@ -103,6 +103,7 @@ export default function Dashboard() {
         <h1 className="text-2xl font-bold text-gray-100">Dashboard</h1>
         {(repos || activeRepoId) && (
           <select
+            aria-label="Repository scope"
             value={selectedRepoId}
             onChange={(e) => setSelectedRepoId(e.target.value)}
             className="bg-gray-800 border border-gray-600 text-gray-200 rounded-md px-3 py-1.5 text-sm"
@@ -300,7 +301,7 @@ export default function Dashboard() {
             Individual commits synced between SVN and Git (click to expand)
           </p>
           {!selectedRepo && repos && repos.length > 1 && (
-            <p className="text-xs text-gray-500 mt-1">
+            <p className="text-xs text-gray-300 mt-1">
               Showing data from all repositories. Select a specific repository to filter.
             </p>
           )}
@@ -450,7 +451,7 @@ function StatusCard({
         {action && <div className="relative z-10">{action}</div>}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
-      {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
+      {subtitle && <p className="text-xs text-gray-300 mt-1">{subtitle}</p>}
     </div>
   );
 }
@@ -473,7 +474,7 @@ function DashboardBranchTree({
   return (
     <div className={`border-t border-gray-700/50 bg-gray-900/30 px-4 py-2 space-y-0.5 ${depth > 0 ? 'border-t-0 pl-6' : ''}`}>
       {depth === 0 && (
-        <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-gray-500 mb-1">
+        <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-gray-300 mb-1">
           <GitBranch className="w-2.5 h-2.5" />
           <span>Branches</span>
         </div>
@@ -486,9 +487,9 @@ function DashboardBranchTree({
           >
             <GitBranch className="w-3 h-3 text-purple-400 flex-shrink-0" />
             <span className="text-xs font-medium text-gray-300 truncate">{child.name.split(' / ').pop()}</span>
-            <span className="text-[10px] text-blue-400/60">{child.svn_branch}</span>
-            <ArrowRight className="w-2.5 h-2.5 text-gray-600 flex-shrink-0" />
-            <span className="text-[10px] text-purple-400/60">{child.git_branch}</span>
+            <span className="text-[10px] text-blue-300">{child.svn_branch}</span>
+            <ArrowRight className="w-2.5 h-2.5 text-gray-400 flex-shrink-0" />
+            <span className="text-[10px] text-purple-300">{child.git_branch}</span>
             <span className="ml-auto flex items-center gap-1.5 flex-shrink-0">
               <span className="text-[10px] text-gray-400">Configuration: {child.enabled ? 'enabled':'disabled'}</span>
             </span>

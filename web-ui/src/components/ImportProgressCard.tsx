@@ -1,3 +1,4 @@
+import ImportProgressMeter from './ImportProgressMeter';
 import { useViewMutation as useMutation } from '../useViewMutation';
 import { sessionFetch } from '../session';
 import { useEffect, useState } from 'react';
@@ -93,7 +94,7 @@ function PhaseDots({ phase }: { phase: string }) {
         return (
           <div key={step.key} className="flex flex-col items-center">
             <div className={`w-2 h-2 rounded-full ${dotClass}`} title={step.label} />
-            <span className="text-[9px] text-gray-500 mt-0.5 leading-none">{step.label}</span>
+            <span className="text-[9px] text-gray-300 mt-0.5 leading-none">{step.label}</span>
           </div>
         );
       })}
@@ -211,7 +212,7 @@ function ImportProgressSubject({
   if (!status) {
     return (
       <div className="bg-gray-800 border border-gray-700 rounded-xl p-5 shadow-lg">
-        <div className="text-sm text-gray-500 italic">{isError ? 'Import status unavailable' : 'Loading import status...'}</div>
+        <div className="text-sm text-gray-300 italic">{isError ? 'Import status unavailable' : 'Loading import status...'}</div>
       </div>
     );
   }
@@ -227,7 +228,7 @@ function ImportProgressSubject({
             <h3 className="text-sm font-semibold text-gray-200">
             SVN Import{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
           </h3>
-            <p className="text-xs text-gray-500 mt-1">No import history</p>
+            <p className="text-xs text-gray-300 mt-1">No import history</p>
             {repoId && admin && status.can_start && (
               <div className="mt-3 space-y-3">
                 <ImportModeFields
@@ -287,14 +288,12 @@ function ImportProgressSubject({
               SVN Import Complete{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
             </h3>
           </div>
-          <div className="flex items-center space-x-1 text-xs text-gray-500">
+          <div className="flex items-center space-x-1 text-xs text-gray-300">
             <Clock className="w-3.5 h-3.5" />
             <span>{formatElapsed(status.started_at, status.completed_at)}</span>
           </div>
         </div>
-        <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden mb-3">
-          <div className="h-full rounded-full bg-emerald-500 w-full" />
-        </div>
+        <ImportProgressMeter status={status} name={repoName} />
         <div className="grid grid-cols-4 gap-3 mb-3">
           <StatCell label="Revisions" value={`${status.total_revs}`} />
           <StatCell label="Commits" value={`${status.commits_created}`} />
@@ -319,18 +318,6 @@ function ImportProgressSubject({
   }
 
   // Active / failed / cancelled — full card
-  const percentage =
-    status.total_revs > 0
-      ? Math.round((status.current_rev / status.total_revs) * 100)
-      : 0;
-
-  const barColor =
-    status.phase === 'failed'
-      ? 'bg-red-500'
-      : status.phase === 'cancelled'
-        ? 'bg-yellow-500'
-        : 'bg-blue-500';
-
   const lastLogLines = (status.log_lines ?? []).slice(-5);
 
   return (
@@ -342,13 +329,13 @@ function ImportProgressSubject({
           <h3 className="text-sm font-semibold text-gray-200">
             SVN Import{repoName && <span className="text-blue-400 ml-1">— {repoName}</span>}
           </h3>
-          <span className="text-xs text-gray-400 bg-gray-700 px-2 py-0.5 rounded-full">
+          <span className="text-xs text-gray-200 bg-gray-700 px-2 py-0.5 rounded-full">
             {status.lifecycle === 'cancel_requested' || status.lifecycle === 'cancelling'
               ? 'Cancellation requested — stopping' : status.lifecycle === 'reconciliation_required'
                 ? 'Reconciliation required' : phaseLabel(status.phase)}
           </span>
         </div>
-        <div className="flex items-center space-x-1 text-xs text-gray-500">
+        <div className="flex items-center space-x-1 text-xs text-gray-300">
           <Clock className="w-3.5 h-3.5" />
           <span>{formatElapsed(status.started_at)}</span>
         </div>
@@ -360,13 +347,8 @@ function ImportProgressSubject({
       </div>
 
       {/* Progress bar */}
-      <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden mb-1">
-        <div
-          className={`h-full rounded-full transition-all duration-500 ease-out ${barColor}`}
-          style={{ width: `${percentage}%` }}
-        />
-      </div>
-      <div className="text-right text-xs text-gray-500 mb-3 font-mono">
+      <ImportProgressMeter status={status} name={repoName} />
+      <div className="text-right text-xs text-gray-300 mb-3 font-mono">
         {status.current_rev} / {status.total_revs}
       </div>
 
@@ -405,22 +387,22 @@ function ImportProgressSubject({
           {cancel.isPending ? 'Requesting stop…' : 'Stop import'}
         </button>
       )}
-      {cancel.isError && <p className="mb-3 text-xs text-red-400">{cancel.error.message}</p>}
+      {cancel.isError && <p role="alert" className="mb-3 text-xs text-red-400">{cancel.error.message}</p>}
       {repoId && admin && status.operation_id && status.lifecycle === 'reconciliation_required' && (
         <button type="button" onClick={() => reconcile.mutate(status.operation_id!)} disabled={reconcile.isPending}
           className="mb-3 rounded border border-blue-500 px-3 py-1 text-xs text-blue-200 disabled:opacity-50">
           {reconcile.isPending ? 'Verifying remote…' : 'Verify remote'}
         </button>
       )}
-      {reconcile.isError && <p className="mb-3 text-xs text-red-400">{reconcile.error.message}</p>}
+      {reconcile.isError && <p role="alert" className="mb-3 text-xs text-red-400">{reconcile.error.message}</p>}
       {reconcile.data?.remaining_reason && <p className="mb-3 text-xs text-yellow-300">{reconcile.data.remaining_reason}</p>}
 
       {/* Mini terminal */}
       {lastLogLines.length > 0 && (
-        <div className="bg-gray-950 border border-gray-700 rounded-lg p-3 mb-4">
+        <div aria-label="Recent import log" aria-live="off" className="bg-gray-950 border border-gray-700 rounded-lg p-3 mb-4">
           <div className="flex items-center space-x-1.5 mb-2">
-            <Terminal className="w-3 h-3 text-gray-500" />
-            <span className="text-[10px] text-gray-500 uppercase tracking-wider">Log</span>
+            <Terminal className="w-3 h-3 text-gray-300" />
+            <span className="text-[10px] text-gray-300 uppercase tracking-wider">Log</span>
           </div>
           <div className="space-y-0.5 font-mono text-xs leading-relaxed max-h-[100px] overflow-y-auto">
             {lastLogLines.map((line, i) => (
@@ -450,7 +432,7 @@ function StatCell({ label, value }: { label: string; value: string }) {
   return (
     <div className="text-center">
       <div className="text-base font-bold text-gray-100 font-mono">{value}</div>
-      <div className="text-[10px] text-gray-500 uppercase tracking-wider">{label}</div>
+      <div className="text-[10px] text-gray-300 uppercase tracking-wider">{label}</div>
     </div>
   );
 }
