@@ -156,6 +156,32 @@ function RepositoryDetailEditor() {
     auto_create_svn_branch: true,
     auto_create_git_branch: true,
   });
+  const gitBranchValidation = (() => {
+    const v = branchForm.git_branch;
+    const invalid = /[^a-zA-Z0-9._/-]/.test(v);
+    const traversal = v.includes('..');
+    const doubleSlash = v.includes('//');
+    const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
+    const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
+    return {
+      error: !v ? null : invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
+        : traversal ? 'Must not contain ".."'
+        : doubleSlash ? 'Must not contain "//"'
+        : badEdges ? 'Must not start/end with "/" or start with "-"'
+        : reserved ? 'Reserved name not allowed' : null,
+      // Preserve the existing preview refusal contract, independently of presentation.
+      previewRefused: !v.trim() || invalid || traversal || doubleSlash || badEdges || v === 'HEAD' || v.endsWith('.lock'),
+    };
+  })();
+  const svnBranchValidation = (() => {
+    const v = branchForm.svn_branch;
+    const invalid = /[^a-zA-Z0-9._/-]/.test(v);
+    const traversal = v.includes('..');
+    return {
+      error: !v ? null : invalid ? 'Invalid characters' : traversal ? 'Must not contain ".."' : null,
+      previewRefused: !v.trim() || invalid || traversal,
+    };
+  })();
   const [branchSuccess, setBranchSuccess] = useState(false);
   const [branchPlan, setBranchPlan] = useState<LatePairPlan | null>(null);
   const [refreshPlan, setRefreshPlan] = useState<PairRefreshPlan | null>(null);
@@ -1647,7 +1673,7 @@ function RepositoryDetailEditor() {
               </div>
 
               <div>
-                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Branch Name <span className="text-gray-600 text-xs">({branchForm.git_branch.length}/200)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Branch Name <span className="text-gray-300 text-xs">({branchForm.git_branch.length}/200)</span></label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1662,26 +1688,13 @@ function RepositoryDetailEditor() {
                     }));
                   }}
                   placeholder="e.g., fix-123, dev/james-wilson" id={`${fieldId}-5`}
+                  aria-invalid={gitBranchValidation.error ? true : undefined}
+                  aria-describedby={gitBranchValidation.error ? `${fieldId}-git-branch-error` : undefined}
                 />
-                {(() => {
-                  const v = branchForm.git_branch;
-                  if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
-                  const hasTraversal = v.includes('..');
-                  const hasDoubleSlash = v.includes('//');
-                  const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
-                  const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
-                  const err = invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
-                    : hasTraversal ? 'Must not contain ".."'
-                    : hasDoubleSlash ? 'Must not contain "//"'
-                    : badEdges ? 'Must not start/end with "/" or start with "-"'
-                    : reserved ? 'Reserved name not allowed'
-                    : null;
-                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
-                })()}
+                {gitBranchValidation.error && <p id={`${fieldId}-git-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{gitBranchValidation.error}</p>}
               </div>
               <div>
-                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>SVN Branch Path <span className="text-gray-600">(auto-derived, editable)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>SVN Branch Path <span className="text-gray-300">(auto-derived, editable)</span></label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1689,15 +1702,10 @@ function RepositoryDetailEditor() {
                   maxLength={200}
                   onChange={(e) => setBranchForm(prev => ({ ...prev, svn_branch: e.target.value }))}
                   placeholder="branches/fix-123" id={`${fieldId}-6`}
+                  aria-invalid={svnBranchValidation.error ? true : undefined}
+                  aria-describedby={svnBranchValidation.error ? `${fieldId}-svn-branch-error` : undefined}
                 />
-                {(() => {
-                  const v = branchForm.svn_branch;
-                  if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
-                  const hasTraversal = v.includes('..');
-                  const err = invalid ? 'Invalid characters' : hasTraversal ? 'Must not contain ".."' : null;
-                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
-                })()}
+                {svnBranchValidation.error && <p id={`${fieldId}-svn-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{svnBranchValidation.error}</p>}
               </div>
 
               {/* Auto-create options */}
@@ -1758,12 +1766,7 @@ function RepositoryDetailEditor() {
               </button>
               <button
                 onClick={() => branchMutation.mutate(branchForm)}
-                disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()
-                  || /[^a-zA-Z0-9._/-]/.test(branchForm.git_branch) || /[^a-zA-Z0-9._/-]/.test(branchForm.svn_branch)
-                  || branchForm.git_branch.includes('..') || branchForm.svn_branch.includes('..')
-                  || branchForm.git_branch.includes('//') || branchForm.git_branch.startsWith('/') || branchForm.git_branch.endsWith('/')
-                  || branchForm.git_branch.startsWith('-') || branchForm.git_branch === 'HEAD' || branchForm.git_branch.endsWith('.lock')
-                }
+                disabled={branchMutation.isPending || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />

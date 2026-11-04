@@ -176,7 +176,7 @@ function EditUserModal({ user, onClose, onUpdated }: EditUserModalProps) {
   };
 
   return (
-    <Dialog title="Edit User" description="Review the selected user's settings. Changes are submitted only by the save action." onClose={onClose} busy={saving}>
+    <Dialog title={`Edit User: ${user.username}`} description="Review the selected user's settings. Changes are submitted only by the save action." onClose={onClose} busy={saving}>
       <div className="bg-gray-800 rounded-lg border border-gray-700 shadow-xl w-full max-w-md p-6">
 
 

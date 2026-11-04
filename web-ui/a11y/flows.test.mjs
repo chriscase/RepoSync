@@ -125,3 +125,52 @@ test('rs121 settings, administration and setup forms have accessible controls wi
  assert.deepEqual(errors,[],'No application page errors in audited form routes');
  assert.equal(fixture.requests.filter(r=>r.method!=='GET'&&(r.path.startsWith('/api/users')||r.path.startsWith('/api/admin/ldap')||r.path.startsWith('/api/config'))).length,0);
 });
+
+async function replaceByKeyboard(page,control,value){await reach(page,control);await page.keyboard.press('ControlOrMeta+A');await page.keyboard.type(value)}
+async function describedFeedback(page,control,text){const id=await control.getAttribute('aria-describedby');assert.ok(id,'feedback must be associated');const feedback=page.locator(`[id="${id}"]`);assert.equal(await feedback.textContent(),text);assert.equal(await feedback.getAttribute('role'),'alert')}
+
+test('rs121 pairing validation associates each error and clears it after correction without sending a refused preview', {timeout:40000},async()=>{
+ const {page,close}=await open('/repos/A');try{
+  const writesBefore=fixture.requests.filter(r=>r.method!=='GET').length;
+  await press(page,page.getByRole('button',{name:'Add Branch Pair',exact:true}));
+  const modal=page.getByRole('dialog',{name:'Preview Branch Pair',exact:true});await modal.waitFor();
+  const git=page.getByRole('textbox',{name:/^Branch Name/}),svn=page.getByRole('textbox',{name:/^SVN Branch Path/}),preview=page.getByRole('button',{name:'Preview Pair',exact:true});
+  await replaceByKeyboard(page,git,'bad..name');await replaceByKeyboard(page,svn,'branches/valid');
+  assert.equal(await git.getAttribute('aria-invalid'),'true');await describedFeedback(page,git,'Must not contain ".."');assert.equal(await svn.getAttribute('aria-invalid'),null);assert.equal(await preview.isDisabled(),true);
+  await replaceByKeyboard(page,git,'valid');assert.equal(await git.getAttribute('aria-invalid'),null);assert.equal(await git.getAttribute('aria-describedby'),null);
+  await replaceByKeyboard(page,svn,'branches/bad path');assert.equal(await svn.getAttribute('aria-invalid'),'true');await describedFeedback(page,svn,'Invalid characters');assert.equal(await git.getAttribute('aria-invalid'),null);assert.equal(await preview.isDisabled(),true);
+  await audit(page,'pairing validation feedback');
+  await replaceByKeyboard(page,svn,'branches/valid');assert.equal(await svn.getAttribute('aria-invalid'),null);assert.equal(await svn.getAttribute('aria-describedby'),null);assert.equal(await preview.isDisabled(),false);
+  await page.keyboard.press('Escape');assert.equal(await modal.count(),0);assert.equal(fixture.requests.filter(r=>r.method!=='GET').length,writesBefore);
+ }finally{await close()}
+});
+
+test('rs121 LDAP and notification failures are announced and associated without invalidating or losing inputs', {timeout:45000},async()=>{
+ const {page,close}=await open('/ldap');try{
+  const ldapRequests=()=>fixture.requests.filter(r=>r.method!=='GET'&&r.path.startsWith('/api/admin/ldap'));
+  const beforeLdap=ldapRequests().length;
+  const url=page.getByLabel('Server URL',{exact:true});await url.waitFor();await replaceByKeyboard(page,url,'ldaps://synthetic-review.example.invalid');
+  const group=page.getByRole('group',{name:'LDAP configuration settings',exact:true});
+  await press(page,page.getByRole('button',{name:'Test Connection',exact:true}));await page.getByRole('alert').filter({hasText:'Synthetic directory test refused'}).waitFor();await describedFeedback(page,group,'Synthetic directory test refused');
+  assert.equal(await url.inputValue(),'ldaps://synthetic-review.example.invalid');assert.equal(await url.getAttribute('aria-invalid'),null);
+  await press(page,page.getByRole('button',{name:'Save Configuration',exact:true}));await page.getByRole('alert').filter({hasText:'Synthetic directory save refused'}).waitFor();await describedFeedback(page,group,'API error 503: {"error":"Synthetic directory save refused"}');assert.equal(await url.inputValue(),'ldaps://synthetic-review.example.invalid');assert.equal(await url.getAttribute('aria-invalid'),null);assert.equal(ldapRequests().length,beforeLdap+2);assert.deepEqual(ldapRequests().slice(-2).map(r=>[r.method,r.path]),[['POST','/api/admin/ldap/test'],['PUT','/api/admin/ldap']]);await audit(page,'LDAP failure feedback');
+  await page.goto(origin+'config');const teams=page.getByLabel('Teams Webhook URL',{exact:true});await teams.waitFor();await replaceByKeyboard(page,teams,'https://synthetic-notifications.example.invalid/fixture');
+  const notify=page.getByRole('group',{name:'Microsoft Teams notification settings',exact:true});const notifications=()=>fixture.requests.filter(r=>r.method!=='GET'&&r.path.startsWith('/api/config/notifications'));const beforeNotify=notifications().length;
+  await press(page,notify.getByRole('button',{name:'Save',exact:true}));await notify.getByRole('alert').filter({hasText:'Save failed'}).waitFor();await describedFeedback(page,teams,'Save failed');assert.equal(await teams.getAttribute('aria-invalid'),null);
+  await press(page,notify.getByRole('button',{name:'Test',exact:true}));await notify.getByRole('alert').filter({hasText:'Synthetic notification test refused'}).waitFor();await describedFeedback(page,teams,'Synthetic notification test refused');await describedFeedback(page,notify,'Synthetic notification test refused');assert.equal(await teams.inputValue(),'https://synthetic-notifications.example.invalid/fixture');assert.equal(await teams.getAttribute('aria-invalid'),null);assert.equal(notifications().length,beforeNotify+2);assert.deepEqual(notifications().slice(-2).map(r=>[r.method,r.path]),[['POST','/api/config/notifications'],['POST','/api/config/notifications/test']]);await audit(page,'notification failure feedback');
+ }finally{await close()}
+});
+
+test('rs121 Edit User retains immutable selected username, exact target, pending containment and focus return', {timeout:45000},async()=>{
+ const {page,close}=await open('/users');try{
+  const row=name=>page.getByRole('row').filter({has:page.getByRole('cell',{name,exact:true})});
+  const alpha=row('fixture-alpha'),beta=row('fixture-beta');await alpha.waitFor();
+  for(const r of [alpha,beta]){assert.equal(await r.getByRole('cell',{name:'Shared synthetic name',exact:true}).count(),1);assert.equal(await r.getByRole('cell',{name:'shared@example.invalid',exact:true}).count(),1)}
+  await press(page,alpha.getByRole('button',{name:'Edit',exact:true}));const first=page.getByRole('dialog',{name:'Edit User: fixture-alpha',exact:true});await first.waitFor();await contained(page);await page.keyboard.press('Escape');assert.equal(await first.count(),0);assert.ok(await alpha.getByRole('button',{name:'Edit',exact:true}).evaluate(el=>el===document.activeElement));
+  const edit=beta.getByRole('button',{name:'Edit',exact:true});await press(page,edit);const modal=page.getByRole('dialog',{name:'Edit User: fixture-beta',exact:true});await modal.waitFor();
+  await replaceByKeyboard(page,modal.getByLabel('Display Name',{exact:true}),'Edited synthetic name');await replaceByKeyboard(page,modal.getByLabel('Email',{exact:true}),'edited@example.invalid');assert.equal(await modal.getByRole('heading',{name:'Edit User: fixture-beta',exact:true}).count(),1);await audit(page,'edit selected account');
+  const writes=()=>fixture.requests.filter(r=>r.method==='PUT'&&r.path.startsWith('/api/users/'));const before=writes().length;
+  await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({hold:true})});await press(page,modal.getByRole('button',{name:'Save Changes',exact:true}));await page.waitForFunction(()=>document.querySelector('dialog')?.getAttribute('aria-busy')==='true');await page.keyboard.press('Escape');assert.equal(await modal.count(),1);assert.equal(await modal.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);assert.equal(await modal.getByRole('heading',{name:'Edit User: fixture-beta',exact:true}).count(),1);await contained(page);
+  await fetch(fixture.origin+'/__fixture/release',{method:'POST'});await modal.waitFor({state:'detached'});assert.equal(writes().length,before+1);assert.equal(writes().at(-1).path,'/api/users/fixture-beta');assert.deepEqual(writes().at(-1).body,{display_name:'Edited synthetic name',email:'edited@example.invalid',role:'user',enabled:true});assert.ok(await edit.evaluate(el=>el===document.activeElement));
+ }finally{await fetch(fixture.origin+'/__fixture/release',{method:'POST'});await close()}
+});

@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 
 export const syntheticUser = { id:'fixture-admin', enabled:true, username:'fixture-admin', role:'admin', display_name:'Synthetic administrator', email:'fixture@example.invalid', created_at:'2026-11-04T00:00:00Z', updated_at:'2026-11-04T00:00:00Z' };
+export const syntheticEditors = ['alpha','beta'].map(name=>({...syntheticUser,id:`fixture-${name}`,username:`fixture-${name}`,display_name:'Shared synthetic name',email:'shared@example.invalid',role:'user'}));
 const stamp=()=>new Date().toISOString();
 export function repository(id) { return {id,name:id==='A'?'Synthetic parent':id==='B'?'Synthetic branch':'Disposable fixture',svn_url:'file:///synthetic-only/'+id,svn_branch:id==='B'?'branches/feature':'trunk',svn_username:'fixture',git_provider:'github',git_api_url:'',git_repo:'synthetic/'+id,git_branch:id==='B'?'feature/synthetic':'main',sync_mode:'team',poll_interval_secs:300,lfs_threshold_mb:0,auto_merge:false,enabled:true,allowed_paths:null,blocked_patterns:null,parent_id:id==='B'?'A':null,pair_kind:id==='B'?'branch':'root',created_at:stamp(),updated_at:stamp(),status:'idle',last_svn_revision:null,last_git_hash:null,total_syncs:0,total_errors:0}; }
 export function status(repoId) { return {state:'idle',last_sync_at:null,last_svn_revision:null,last_git_hash:null,total_syncs:0,total_conflicts:0,active_conflicts:0,total_errors:0,last_error_at:null,error_observation:{through_id:'0',observed_at:stamp()},uptime_secs:0,observation:{version:1,scope:repoId?'repository':'global',repository_id:repoId||null,configured:'enabled',health:'idle',observed_at:stamp(),data_freshness:'never_recorded',last_successful_sync_at:null,remote_freshness:'not_verified_by_status',registry_busy:false,evidence_complete:true,operations:[],safe_next_action:'Inspect synthetic fixture.',uptime_available:false}}; }
@@ -23,7 +24,12 @@ export async function startFixture(port=0) {
   if(req.headers.authorization!=='Bearer synthetic-session-only')return reply(401,{error:'Synthetic session required'});
   requests.push({method:req.method,path,query:Object.fromEntries(url.searchParams),body});
   if(req.method!=='GET'){
-   if(held&&path.includes('/repos/'))await new Promise(resolve=>{const timer=setTimeout(done,5000);function done(){clearTimeout(timer);pending.delete(done);resolve()}pending.add(done)});
+   if(held&&(path.includes('/repos/')||path.startsWith('/api/users/')))await new Promise(resolve=>{const timer=setTimeout(done,5000);function done(){clearTimeout(timer);pending.delete(done);resolve()}pending.add(done)});
+   if(path==='/api/admin/ldap/test')return reply(200,{ok:false,message:'Synthetic directory test refused'});
+   if(path==='/api/admin/ldap')return reply(503,{error:'Synthetic directory save refused'});
+   if(path==='/api/config/notifications/test')return reply(200,{ok:false,error:'Synthetic notification test refused'});
+   if(path==='/api/config/notifications')return reply(503,{error:'Synthetic notification save refused'});
+   if(req.method==='PUT'&&syntheticEditors.some(u=>path===`/api/users/${u.id}`))return reply(200,{...syntheticEditors.find(u=>path===`/api/users/${u.id}`),...body});
    if(path.endsWith('/remove')&&removeResult==='completed'){const id=path.split('/')[3];removed.add(id);return reply(200,{ok:true,action:'managed_remove',state:'completed',operation_id:'synthetic-removal-'+id,message:'Synthetic receipt only; no actual repository changed',remote_git:'preserved',remote_svn:'preserved',restore_supported:true,retryable:false,registration_listed:false})}
    if(path.endsWith('/remove')||req.method==='DELETE')return reply(503,{error:'Synthetic cleanup refused; no real repository was changed'});
    return reply(200,{ok:true});
@@ -46,7 +52,7 @@ export async function startFixture(port=0) {
   if(path==='/api/audit')return reply(200,{entries:[],total:0,page:1,per_page:Number(url.searchParams.get('limit')||50),total_pages:0,offset:0});
   if(path==='/api/commit-map'||path==='/api/sync-records')return reply(200,{entries:[],total:0});
   if(path==='/api/config/identity')return reply(200,[]);
-  if(path==='/api/users')return reply(200,[syntheticUser]);
+  if(path==='/api/users')return reply(200,[syntheticUser,...syntheticEditors]);
   return reply(404,{error:'No such synthetic fixture resource'});
  });
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',()=>{server.off('error',reject);resolve()})});

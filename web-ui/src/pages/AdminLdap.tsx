@@ -131,6 +131,8 @@ export default function AdminLdap() {
 
       {message && (
         <div
+          id={`${fieldId}-feedback`}
+          role={message.type === 'error' ? 'alert' : 'status'}
           className={`px-4 py-3 rounded text-sm ${
             message.type === 'success'
               ? 'bg-green-900/40 border border-green-700 text-green-300'
@@ -141,7 +143,7 @@ export default function AdminLdap() {
         </div>
       )}
 
-      <div className="bg-gray-800 rounded-lg border border-gray-700 p-6 space-y-6">
+      <div role="group" aria-label="LDAP configuration settings" aria-describedby={message ? `${fieldId}-feedback` : undefined} className="bg-gray-800 rounded-lg border border-gray-700 p-6 space-y-6">
         {/* Enable/Disable */}
         <div className="flex items-center gap-3">
           <input
@@ -274,6 +276,7 @@ export default function AdminLdap() {
         <div className="flex items-center gap-3 pt-4 border-t border-gray-700">
           <button
             onClick={handleSave}
+            aria-describedby={message ? `${fieldId}-feedback` : undefined}
             disabled={saving}
             className="px-4 py-2 text-sm font-medium rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
           >
@@ -281,6 +284,7 @@ export default function AdminLdap() {
           </button>
           <button
             onClick={handleTest}
+            aria-describedby={message ? `${fieldId}-feedback` : undefined}
             disabled={testing || !url}
             className="px-4 py-2 text-sm font-medium rounded-md text-gray-200 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-gray-500"
           >
