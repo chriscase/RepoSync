@@ -1,6 +1,7 @@
+import { useViewMutation as useMutation } from '../useViewMutation';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type User, type CreateUserRequest } from '../api';
 import { getStoredUser } from '../utils/auth';
 import { ConfirmModal } from '../components/ConfirmModal';

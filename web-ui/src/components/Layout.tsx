@@ -1,4 +1,4 @@
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
 import { errorStatusQuery } from '../errorStatus';
@@ -7,21 +7,15 @@ import { getStoredUser } from '../utils/auth';
 import { LogoSvg } from './Logo';
 
 export default function Layout() {
-  const navigate = useNavigate();
   const statusQuery = useQuery({...errorStatusQuery(),refetchInterval:15000});
   const status=statusQuery.isError ? undefined:statusQuery.data;
 
   const user = getStoredUser();
   const isAdmin = user?.role === 'admin';
 
-  const handleLogout = async () => {
-    try {
-      await api.logout();
-    } finally {
-      localStorage.removeItem('session_token');
-      localStorage.removeItem('user');
-      navigate('/login');
-    }
+  const handleLogout = () => {
+    // ProtectedRoute reacts to synchronous retirement, even if server revocation is unavailable.
+    void api.logout().catch(() => {});
   };
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>

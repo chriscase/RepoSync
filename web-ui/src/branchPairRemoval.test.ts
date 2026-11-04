@@ -1,3 +1,4 @@
+import { accountStorageKey } from './session';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   branchPairRemovalOutcome,
@@ -67,13 +68,15 @@ describe('detail retirement and not-found classification', () => {
 });
 
 describe('branch-pair removal notices', () => {
-  const key = 'reposync.branchPairRemovalReceipt';
+  let key: string;
   const notice: BranchPairRemovalNotice = {
     outcome: 'completed', message: 'Registration removed', warnings: ['Git branch cleanup failed'],
     operationId: 'op-70', name: 'Child pair',
   };
 
   beforeEach(() => {
+    vi.stubGlobal('localStorage', {getItem: () => null});
+    key = accountStorageKey('reposync.branchPairRemovalReceipt');
     const values = new Map<string, string>();
     vi.stubGlobal('sessionStorage', {
       getItem: vi.fn((item: string) => values.get(item) ?? null),

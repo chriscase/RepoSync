@@ -1,5 +1,7 @@
+import { useViewMutation as useMutation } from '../useViewMutation';
+import { sessionFetch } from '../session';
 import { useEffect, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Clock, ArrowRight, Terminal, CheckCircle2 } from 'lucide-react';
 import { api, type ImportStatus } from '../api';
 import {
@@ -131,7 +133,7 @@ export default function ImportProgressCard({
     queryFn: async () => {
       if (repoId) {
         const token = localStorage.getItem('session_token');
-        const res = await fetch(`/api/repos/${repoId}/import/status`, {
+        const res = await sessionFetch(`/api/repos/${repoId}/import/status`, {
           headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
         });
         if (!res.ok) throw new Error(`Import status unavailable (${res.status})`);
@@ -153,7 +155,7 @@ export default function ImportProgressCard({
       } catch (e) {
         throw e instanceof Error ? e : new Error(String(e));
       }
-      const res = await fetch(`/api/repos/${repoId}/import`, {
+      const res = await sessionFetch(`/api/repos/${repoId}/import`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${localStorage.getItem('session_token')}`,
@@ -179,7 +181,7 @@ export default function ImportProgressCard({
   });
   const cancel = useMutation({
     mutationFn: async (operationId: string) => {
-      const res = await fetch(`/api/repos/${repoId}/import/${operationId}/cancel`, {
+      const res = await sessionFetch(`/api/repos/${repoId}/import/${operationId}/cancel`, {
         method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` },
       });
       if (!res.ok) throw new Error((await res.json()).error || `Cancellation failed (${res.status})`);
@@ -189,7 +191,7 @@ export default function ImportProgressCard({
   });
   const reconcile = useMutation({
     mutationFn: async (operationId: string) => {
-      const res = await fetch(`/api/repos/${repoId}/import/${operationId}/reconcile`, {
+      const res = await sessionFetch(`/api/repos/${repoId}/import/${operationId}/reconcile`, {
         method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('session_token')}` },
       });
       if (!res.ok) throw new Error((await res.json()).error || `Remote verification failed (${res.status})`);

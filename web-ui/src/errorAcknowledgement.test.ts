@@ -9,6 +9,7 @@ beforeEach(() => {
   storage = new Map([['session_token', 'session'], ['user', '{"role":"admin"}']]);
   vi.stubGlobal('localStorage', {
     getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => storage.set(key, value),
     removeItem: (key: string) => storage.delete(key),
   });
   vi.stubGlobal('window', { location: { pathname: '/dashboard', href: '/dashboard' } });
@@ -24,7 +25,7 @@ describe('#114 scoped acknowledgement client', () => {
     const [url, options] = fetchMock.mock.calls[0];
     expect(url).toBe('/api/status/acknowledge-errors');
     expect(options.method).toBe('POST');
-    expect(options.headers.Authorization).toBe('Bearer session');
+    expect(new Headers(options.headers).get('Authorization')).toBe('Bearer session');
     expect(JSON.parse(options.body)).toEqual({ scope: { kind: 'repository', repo_id: 'repo-a' }, observation: observed });
   });
   it('makes all-repositories explicit in both request and confirmation', async () => {

@@ -1,5 +1,7 @@
+import { useViewMutation as useMutation } from '../useViewMutation';
+import { sessionFetch } from '../session';
 import React, { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type AuthorMapping } from '../api';
 
 export default function Config() {
@@ -156,7 +158,7 @@ function NotificationsConfig() {
 
   React.useEffect(() => {
     const token = localStorage.getItem('session_token');
-    fetch('/api/config/notifications', {
+    sessionFetch('/api/config/notifications', {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     })
       .then((r) => r.json())
@@ -172,7 +174,7 @@ function NotificationsConfig() {
     setMessage('');
     const token = localStorage.getItem('session_token');
     try {
-      await fetch('/api/config/notifications', {
+      const response = await sessionFetch('/api/config/notifications', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -180,6 +182,8 @@ function NotificationsConfig() {
         },
         body: JSON.stringify({ teams_webhook_url: teamsUrl || null }),
       });
+      if (!response.ok) throw new Error(`Save failed (${response.status})`);
+      await response.text();
       setMessage('Saved');
       setTimeout(() => setMessage(''), 3000);
     } catch {
@@ -193,7 +197,7 @@ function NotificationsConfig() {
     setMessage('');
     const token = localStorage.getItem('session_token');
     try {
-      const res = await fetch('/api/config/notifications/test', {
+      const res = await sessionFetch('/api/config/notifications/test', {
         method: 'POST',
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });

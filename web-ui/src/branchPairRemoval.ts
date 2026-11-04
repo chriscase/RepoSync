@@ -1,3 +1,4 @@
+import { accountStorageKey } from './session';
 /** UI-only classification for an existing branch-pair DELETE response. */
 
 export interface BranchPairRemovalResult {
@@ -99,7 +100,7 @@ function normalizeBranchPairRemovalNotice(notice: BranchPairRemovalNotice): Bran
 
 export function persistBranchPairRemovalNotice(notice: BranchPairRemovalNotice): void {
   try {
-    sessionStorage.setItem(BRANCH_PAIR_RECEIPT_KEY, JSON.stringify(normalizeBranchPairRemovalNotice(notice)));
+    sessionStorage.setItem(accountStorageKey(BRANCH_PAIR_RECEIPT_KEY), JSON.stringify(normalizeBranchPairRemovalNotice(notice)));
   } catch {
     /* ignore */
   }
@@ -107,7 +108,7 @@ export function persistBranchPairRemovalNotice(notice: BranchPairRemovalNotice):
 
 export function readPersistedBranchPairRemovalNotice(): BranchPairRemovalNotice | null {
   try {
-    const raw = sessionStorage.getItem(BRANCH_PAIR_RECEIPT_KEY);
+    const raw = sessionStorage.getItem(accountStorageKey(BRANCH_PAIR_RECEIPT_KEY));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as BranchPairRemovalNotice;
     if (parsed.outcome !== 'completed' && parsed.outcome !== 'in_progress') return null;
@@ -119,7 +120,7 @@ export function readPersistedBranchPairRemovalNotice(): BranchPairRemovalNotice 
 
 export function clearPersistedBranchPairRemovalNotice(): void {
   try {
-    sessionStorage.removeItem(BRANCH_PAIR_RECEIPT_KEY);
+    sessionStorage.removeItem(accountStorageKey(BRANCH_PAIR_RECEIPT_KEY));
   } catch {
     /* ignore */
   }

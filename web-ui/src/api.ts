@@ -1,3 +1,5 @@
+import { ApiError, clientSession, sessionFetch } from './session';
+export { ApiError } from './session';
 import { decodeAuditPage, decodeConflictPage, type ConflictFilters } from './listPagination';
 import { decodeSyncStatus, type StatusObservation } from './statusObservation';
 import type { ErrorObservation, ErrorScope } from './errorAcknowledgement';
@@ -16,10 +18,6 @@ export interface RepositorySaveReceipt {
   configuration_updated_at: string;
   credential_fields: Array<'svn_password' | 'git_token'>;
   propagated_repositories: number;
-}
-
-export class ApiError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
 }
 
 export interface SyncStatus {
@@ -313,22 +311,7 @@ export interface LoginResponse {
 }
 
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const token = localStorage.getItem('session_token');
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
-
-  const res = await fetch(`${API_BASE}${url}`, { ...options, headers });
-  if (res.status === 401) {
-    // Clear credentials and redirect to login
-    localStorage.removeItem('session_token');
-    localStorage.removeItem('user');
-    if (window.location.pathname !== '/login') {
-      window.location.href = '/login';
-    }
-    throw new ApiError(401, 'Session expired — please log in again');
-  }
+  const res = await sessionFetch(`${API_BASE}${url}`, { ...options, headers: { 'Content-Type': 'application/json', ...options?.headers } });
   if (!res.ok) {
     const text = await res.text();
     throw new ApiError(res.status, `API error ${res.status}: ${text}`);
@@ -510,7 +493,7 @@ export const api = {
       delete_git: String(remoteOpts?.delete_git ?? false),
       delete_svn: String(remoteOpts?.delete_svn ?? false),
     });
-    const res = await fetch(`${API_BASE}/repos/${id}/remove?${params}`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/remove?${params}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -549,7 +532,7 @@ export const api = {
     message: string;
   }> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${id}/restore`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/restore`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -585,7 +568,7 @@ export const api = {
 
   getRemovalDependencyPreview: async (id: string): Promise<import('./managedRemoval').RemovalPreviewResponse> => {
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${id}/removal/preview`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/preview`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const text = await res.text();
@@ -611,7 +594,7 @@ export const api = {
     const params = operationId
       ? `?operation_id=${encodeURIComponent(operationId)}`
       : '';
-    const res = await fetch(`${API_BASE}/repos/${id}/removal${params}`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal${params}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     if (res.status === 404) {
@@ -659,7 +642,7 @@ export const api = {
   ): Promise<BranchPairRemovalResult> => {
     const params = buildBranchPairDeleteQuery(opts);
     const token = localStorage.getItem('session_token');
-    const res = await fetch(`${API_BASE}/repos/${repoId}/branch-pair?${params.toString()}`, {
+    const res = await sessionFetch(`${API_BASE}/repos/${repoId}/branch-pair?${params.toString()}`, {
       method: 'DELETE',
       headers: {
         'Content-Type': 'application/json',
@@ -676,14 +659,6 @@ export const api = {
       }
     }
     const message = body.error || body.message || text || `API error ${res.status}`;
-    if (res.status === 401 && !/admin access required/i.test(message)) {
-      localStorage.removeItem('session_token');
-      localStorage.removeItem('user');
-      if (window.location.pathname !== '/login') {
-        window.location.href = '/login';
-      }
-      throw new Error(message || 'Session expired — please log in again');
-    }
     if (!res.ok) {
       throw new Error(message);
     }
@@ -730,30 +705,34 @@ export const api = {
 
   // Auth - public info (no auth required) for login page LDAP hints
   getAuthInfo: async (): Promise<{ ldap_enabled: boolean; ldap_domain: string | null }> => {
-    const res = await fetch(`${API_BASE}/auth/info`);
+    const res = await sessionFetch(`${API_BASE}/auth/info`, {}, false);
     return res.json();
   },
 
   // Auth - multi-user login with real error messages
   login: async (username: string, password: string): Promise<LoginResponse> => {
-    const res = await fetch(`${API_BASE}/auth/login`, {
+    const session = clientSession(); const origin = session.snapshot();
+    const res = await sessionFetch(`${API_BASE}/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
-    });
+    }, false);
     if (!res.ok) {
       const data = await res.json().catch(() => ({ error: 'Login failed' }));
       throw new Error(data.error || `Login failed (${res.status})`);
     }
-    return res.json();
+    const result: LoginResponse = await res.json();
+    session.signIn(result, origin);
+    return result;
   },
 
   logout: () => {
-    const token = localStorage.getItem('session_token');
-    return fetchJson<{ ok: boolean }>('/auth/logout', {
-      method: 'POST',
+    // Local retirement is immediate. A late revocation response cannot clear a new login.
+    const token = clientSession().end();
+    return sessionFetch(`${API_BASE}/auth/logout`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: JSON.stringify({ token: token ?? '' }),
-    });
+    }, false).then(async response => { if (!response.ok) throw new ApiError(response.status, 'Server logout could not be confirmed'); return response.json(); });
   },
 
   getMe: () => fetchJson<User>('/auth/me'),
