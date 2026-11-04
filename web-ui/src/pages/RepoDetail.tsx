@@ -1211,7 +1211,7 @@ function RepositoryDetailEditor() {
                   const selected = pending.slice(0, skipSelectedCount).map((c) => c.sha);
                   skipMutation.mutate(selected);
                 }}
-                className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 text-sm text-white font-medium"
+                className="px-3 py-1.5 rounded-lg bg-yellow-700 hover:bg-yellow-800 disabled:opacity-50 text-sm text-white font-medium"
               >
                 {skipMutation.isPending ? 'Skipping…' : 'Skip selected'}
               </button>

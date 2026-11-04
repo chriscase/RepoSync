@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { chromium } from 'playwright-core';
 import { createServer as createViteServer } from 'vite';
-import { startFixture } from './fixture.mjs';
+import { startFixture, skipContext } from './fixture.mjs';
 const require=createRequire(import.meta.url);
 let fixture,vite,browser,origin;
 const errors=[];
@@ -173,4 +173,21 @@ test('rs121 Edit User retains immutable selected username, exact target, pending
   await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({hold:true})});await press(page,modal.getByRole('button',{name:'Save Changes',exact:true}));await page.waitForFunction(()=>document.querySelector('dialog')?.getAttribute('aria-busy')==='true');await page.keyboard.press('Escape');assert.equal(await modal.count(),1);assert.equal(await modal.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);assert.equal(await modal.getByRole('heading',{name:'Edit User: fixture-beta',exact:true}).count(),1);await contained(page);
   await fetch(fixture.origin+'/__fixture/release',{method:'POST'});await modal.waitFor({state:'detached'});assert.equal(writes().length,before+1);assert.equal(writes().at(-1).path,'/api/users/fixture-beta');assert.deepEqual(writes().at(-1).body,{display_name:'Edited synthetic name',email:'edited@example.invalid',role:'user',enabled:true});assert.ok(await edit.evaluate(el=>el===document.activeElement));
  }finally{await fetch(fixture.origin+'/__fixture/release',{method:'POST'});await close()}
+});
+
+test('rs121 rendered Skip dialog confirms only the selected observed prefix and closes when scoped status becomes held or unknown', {timeout:45000},async()=>{
+ const state=mode=>fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({skip_mode:mode})});
+ await state('eligible');const {page,close}=await open('/repos/A');try{
+  const writes=()=>fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/repos/A/skip-commit');const before=writes().length;
+  const trigger=page.getByTestId('skip-commit-button');await trigger.waitFor();await press(page,trigger);
+  const modal=page.getByRole('dialog',{name:'Skip selected pending commits',exact:true});await modal.waitFor();assert.equal(await modal.getAttribute('data-testid'),'skip-commit-modal');
+  const description=await modal.getAttribute('aria-describedby');assert.ok(description);assert.match(await page.locator(`[id="${description}"]`).textContent(),/Unselected work stays pending/);
+  const confirm=page.getByTestId('skip-commit-confirm');assert.equal(await confirm.isDisabled(),true);await contained(page);await page.keyboard.press('Escape');await modal.waitFor({state:'detached'});assert.ok(await trigger.evaluate(el=>el===document.activeElement));assert.equal(writes().length,before);
+  await press(page,trigger);await modal.waitFor();const first=page.getByTestId('skip-commit-select-0'),second=page.getByTestId('skip-commit-select-1');await reach(page,first);await page.keyboard.press('Space');assert.equal(await first.isChecked(),true);assert.equal(await second.isChecked(),false);assert.equal(await confirm.isDisabled(),false);await audit(page,'selected exact-tip Skip confirmation');await press(page,confirm);await modal.waitFor({state:'detached'});
+  assert.equal(writes().length,before+1);assert.deepEqual(writes().at(-1).body,{pinned_cursor:skipContext.pinned_cursor,selected_commits:[skipContext.pending_commits[0].sha],expected_remote_tip:skipContext.observed_remote_tip,expected_bridge_tip:skipContext.observed_bridge_tip,reason:'operator_exact_skip'});assert.ok(!writes().at(-1).body.selected_commits.includes(skipContext.pending_commits[1].sha));
+  for(const mode of ['held','unknown']){
+   await state('eligible');await page.goto(origin+'repos/A');await trigger.waitFor();await press(page,trigger);await modal.waitFor();await reach(page,page.getByTestId('skip-commit-select-0'));await page.keyboard.press('Space');assert.equal(await confirm.isDisabled(),false);
+   await state(mode);await modal.waitFor({state:'detached',timeout:8000});assert.equal(await trigger.count(),0);assert.equal(writes().length,before+1,'retired selected confirmation must send no additional request');
+  }
+ }finally{await state('off');await close()}
 });
