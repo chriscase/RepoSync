@@ -1,4 +1,4 @@
-import { accountStorageKey, clientSession } from './session';
+import { accountStorageKey, clientSession } from './session.ts';
 /** Managed root-repository removal (#65) — distinct from pause/disable. */
 
 export interface ManagedRemovalRecovery {

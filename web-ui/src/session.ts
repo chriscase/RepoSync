@@ -1,6 +1,7 @@
 /** Client identity boundaries. Cancellation never proves a server mutation rolled back. */
 export class ApiError extends Error {
-  constructor(readonly status: number, message: string) { super(message); }
+  readonly status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; }
 }
 export class RetiredSessionError extends Error {
   constructor() { super('The login session changed. Earlier requests cannot update this session; a submitted mutation may still need reconciliation.'); }
@@ -19,10 +20,12 @@ function principal(raw: string | null): string {
 }
 
 export class ClientSession {
+  private readonly storage: SessionStorage;
   private value: SessionSnapshot;
   private listeners = new Set<() => void>();
   private requests = new Set<AbortController>();
-  constructor(private readonly storage: SessionStorage) {
+  constructor(storage: SessionStorage) {
+    this.storage = storage;
     this.value = { epoch: 0, ...this.read() };
   }
   private read() {
