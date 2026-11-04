@@ -114,7 +114,8 @@ test('rs121 settings, administration and setup forms have accessible controls wi
    if(path==='/setup'){
     await press(page,page.getByRole('button',{name:'Get Started',exact:true}));
     console.log('# setup visible labels',JSON.stringify(await page.locator('label').allTextContents()));
-    assert.match(await page.locator('button[aria-current="step"]').textContent(),/SVN Repository/);
+    assert.equal((await page.locator('button[aria-current="step"]').textContent()).replace(/\s+/g,''),'2SVN');
+    await page.getByRole('heading',{name:'SVN Repository',exact:true}).waitFor();
     const input=page.getByRole('textbox',{name:'Repository URL',exact:true});await input.waitFor();await press(page,page.getByRole('button',{name:'Next',exact:true}));
     assert.equal(await input.getAttribute('aria-invalid'),'true');assert.equal(await input.getAttribute('aria-required'),'true');const errorId=await input.getAttribute('aria-describedby');assert.ok(errorId);assert.match(await page.locator(`[id="${errorId}"]`).textContent(),/required/);
    }
