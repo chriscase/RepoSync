@@ -1,3 +1,4 @@
+import { clientSession } from '../session';
 import RepositoryStatusSummary from '../components/StatusObservation';
 import { useRepositorySave } from '../useRepositorySave';
 import { samePublicConfiguration, retainUnsavedCredentials, sameImportPreferences, canContinueWithPreferences, repositoryEditorKey, publicConfiguration } from '../repositorySave';
@@ -91,7 +92,7 @@ const defaultForm: AddRepoForm = {
 };
 
 export default function Repositories() {
-  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',session:localStorage.getItem('session_token')});
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',session:clientSession().snapshot().token,epoch:clientSession().snapshot().epoch});
   return <RepositoriesEditor key={key} />;
 }
 

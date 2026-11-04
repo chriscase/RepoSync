@@ -1,3 +1,4 @@
+import { clientSession } from '../session';
 import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, type User, type CredentialSummary, type StoreCredentialRequest } from '../api';
@@ -206,12 +207,13 @@ function ProfileSection({ user }: { user: User }) {
   const isLdap = user.role === 'ldap';
 
   const handleSaveProfile = async () => {
+    const session = clientSession(); const origin = session.snapshot();
     setSaving(true);
     setError('');
     setMessage('');
     try {
       const updated = await api.updateUser(user.id, { display_name: displayName, email });
-      localStorage.setItem('user', JSON.stringify(updated));
+      session.updateUser(updated, origin);
       setMessage('Profile updated successfully');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update profile');

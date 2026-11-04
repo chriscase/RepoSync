@@ -1,3 +1,5 @@
+import { useViewMutation as useMutation, useViewOwnership } from '../useViewMutation';
+import { clientSession, sessionFetch } from '../session';
 import { canConfirmObservedSkip, runObservedSkip, latestScopedSkipObservation, type ScopedSkipObservation } from '../statusActions';
 import { useStatusObservation } from '../useStatusObservation';
 import RepositoryStatusSummary, { StatusObservationPanel } from '../components/StatusObservation';
@@ -8,14 +10,13 @@ import { errorStatusQuery, errorStatusView, refreshErrorStatus } from '../errorS
 import ErrorAcknowledgement from '../components/ErrorAcknowledgement';
 import { errorScope } from '../errorAcknowledgement';
 import React, { useEffect, useRef, useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams, useNavigate, useLocation, Link } from 'react-router-dom';
 import { api, type Repository, type SyncStatus, type SyncRecord, type CommitMapEntry, type AuditEntry, type LatePairPlan, type PairRefreshPlan, type SkipCommitContext } from '../api';
 import {
   type BranchPairRemovalNotice as RemovalNotice,
-  branchPairRemovalOutcome,
+  removeBranchPairForView,
   isNotFoundError,
-  removalDestination,
   repoDetailQueryKeys,
   readBranchPairRemovalNotice,
   persistBranchPairRemovalNotice,
@@ -102,11 +103,12 @@ const selectClass =
 
 export default function RepoDetail() {
   const {id}=useParams<{id:string}>();
-  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',targetId:id,session:localStorage.getItem('session_token')});
+  const key=repositoryEditorKey({owner:getStoredUser()?.id ?? 'legacy',targetId:id,session:clientSession().snapshot().token,epoch:clientSession().snapshot().epoch});
   return <RepositoryDetailEditor key={key} />;
 }
 
 function RepositoryDetailEditor() {
+  const view = useViewOwnership();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -237,7 +239,7 @@ function RepositoryDetailEditor() {
     queryKey: ['import-status', id],
     queryFn: async () => {
       const token = localStorage.getItem('session_token');
-      const res = await fetch(`/api/repos/${id}/import/status`, {
+      const res = await sessionFetch(`/api/repos/${id}/import/status`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
       if (!res.ok) throw new Error(`Import status unavailable (${res.status})`);
@@ -384,28 +386,14 @@ function RepositoryDetailEditor() {
           delete_git: gitOpt?.checked ?? removeBranchOpts.delete_git,
           delete_svn: svnOpt?.checked ?? removeBranchOpts.delete_svn,
         };
-        let parentExists: boolean | null = null;
-        if (target.id === id && target.parent_id) {
-          try {
-            await api.getRepo(target.parent_id);
-            parentExists = true;
-          } catch (lookupError) {
-            parentExists = isNotFoundError(lookupError) ? false : null;
-          }
-        }
-        const destination = removalDestination({
-          viewedId: id,
-          targetId: target.id,
-          parentId: target.parent_id,
-          parentExists,
-        });
-        const result = await api.deleteBranchPair(target.id, options);
-        const outcome = branchPairRemovalOutcome(result);
-        if (outcome === 'rejected') {
-          throw new Error(result.message || 'Branch pair was not removed');
-        }
+        const { result, destination, outcome } = await removeBranchPairForView(
+          { viewedId: id, target: { id: target.id, parent_id: target.parent_id }, options },
+          view,
+          { lookupParent: api.getRepo, remove: api.deleteBranchPair },
+        );
         return { kind: 'branch_pair' as const, result, target, destination, outcome };
       }
+      view.assertCurrent();
       const result = await api.removeManagedRepo(target.id);
       return { kind: 'managed' as const, result, target };
     },
@@ -441,6 +429,7 @@ function RepositoryDetailEditor() {
           for (const queryKey of repoDetailQueryKeys(target.id)) {
             await queryClient.cancelQueries({ queryKey });
           }
+          if (!view.isCurrent()) return;
           setRetiredId(target.id);
           setLocalNotice(null);
           persistBranchPairRemovalNotice(notice);
@@ -472,6 +461,7 @@ function RepositoryDetailEditor() {
         for (const queryKey of repoDetailQueryKeys(target.id)) {
           await queryClient.cancelQueries({ queryKey });
         }
+        if (!view.isCurrent()) return;
         setRetiredId(target.id);
         navigate('/repos', { replace: true });
       }
@@ -652,7 +642,7 @@ function RepositoryDetailEditor() {
         if (form.svn_username) body.svn_username = form.svn_username;
         if (form.svn_password) body.svn_password = form.svn_password;
       }
-      const res = await fetch(`/api/repos/${id}/test-svn`, {
+      const res = await sessionFetch(`/api/repos/${id}/test-svn`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -681,7 +671,7 @@ function RepositoryDetailEditor() {
         if (form.git_repo) body.git_repo = form.git_repo;
         if (form.git_token) body.git_token = form.git_token;
       }
-      const res = await fetch(`/api/repos/${id}/test-git`, {
+      const res = await sessionFetch(`/api/repos/${id}/test-git`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

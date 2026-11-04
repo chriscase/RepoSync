@@ -34,8 +34,8 @@ export function repositorySaveConflict(a: RepositorySaveAttempt): boolean {
   return a.configurationStage==='conflict' || a.credentialStage==='conflict' || !!a.protocolFailure;
 }
 
-export interface RepositoryEditorIdentity {owner: string; targetId?: string; session: string | null}
-export function repositoryEditorKey(value: RepositoryEditorIdentity): string { return JSON.stringify([value.owner,value.targetId,value.session]); }
+export interface RepositoryEditorIdentity {owner: string; targetId?: string; session: string | null; epoch?: number}
+export function repositoryEditorKey(value: RepositoryEditorIdentity): string { return JSON.stringify([value.owner,value.targetId,value.epoch ?? value.session]); }
 /** Used at the actual keyed editor/hook boundary; retired scopes cannot send or update replacement views. */
 export class RepositoryEditorOwnership {
   private retired=false;

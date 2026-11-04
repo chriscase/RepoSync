@@ -1,3 +1,4 @@
+import { clientSession } from './session';
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, type Repository } from './api';
 import {
@@ -18,8 +19,8 @@ interface SaveResult {
 
 export function useRepositorySave(targetId: string | undefined, visible: boolean) {
   const owner = getStoredUser()?.id ?? 'legacy';
-  const session=localStorage.getItem('session_token');
-  const liveScope=useRef({owner,targetId,session});liveScope.current={owner,targetId,session};
+  const {token:session,epoch}=clientSession().snapshot();
+  const liveScope=useRef({owner,targetId,session,epoch});liveScope.current={owner,targetId,session,epoch};
   const context = useMemo(() => {
     let name=targetId ? `repo:${targetId}` : 'create';
     let error: string | null=null;
@@ -30,9 +31,9 @@ export function useRepositorySave(targetId: string | undefined, visible: boolean
     const journal=new RepositorySaveJournal(owner,name,localStorage);
     let initial: RepositorySaveAttempt | null=null;
     try {initial=journal.read();} catch (cause) {error=cause instanceof Error ? cause.message : 'Recovery data could not be read.';}
-    const ownership=new RepositoryEditorOwnership({owner,targetId,session},()=>({...liveScope.current,owner:getStoredUser()?.id ?? 'legacy',session:localStorage.getItem('session_token')}));
-    return { key:`${owner}:${name}`, journal, initial, error, active:visible, ownership, session, privateInputs:null as CredentialInputs | null };
-  },[owner,targetId,visible,session]);
+    const ownership=new RepositoryEditorOwnership({owner,targetId,session,epoch},()=>({...liveScope.current,owner:getStoredUser()?.id ?? 'legacy',session:clientSession().snapshot().token,epoch:clientSession().snapshot().epoch}));
+    return { key:`${epoch}:${owner}:${name}`, journal, initial, error, active:visible, ownership, session, privateInputs:null as CredentialInputs | null };
+  },[owner,targetId,visible,session,epoch]);
   const [attempt,setAttempt]=useState<RepositorySaveAttempt | null>(context.initial);
   const [error,setError]=useState<string | null>(context.error);
   const [pending,setPending]=useState(false);

@@ -1,5 +1,6 @@
+import { clientSession } from '../session';
 import { useState, useEffect, FormEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Navigate } from 'react-router-dom';
 import { api } from '../api';
 
 export default function Login() {
@@ -9,7 +10,6 @@ export default function Login() {
   const [loading, setLoading] = useState(false);
   const [ldapEnabled, setLdapEnabled] = useState(false);
   const [ldapDomain, setLdapDomain] = useState<string | null>(null);
-  const navigate = useNavigate();
 
   // Fetch LDAP info on mount (public endpoint, no auth needed)
   useEffect(() => {
@@ -28,12 +28,7 @@ export default function Login() {
     setError('');
     setLoading(true);
     try {
-      const result = await api.login(username, password);
-      localStorage.setItem('session_token', result.token);
-      if (result.user) {
-        localStorage.setItem('user', JSON.stringify(result.user));
-      }
-      navigate('/');
+      await api.login(username, password);
     } catch (err) {
       // Show the real error message from the API
       const message = err instanceof Error ? err.message : 'Login failed';
@@ -44,6 +39,8 @@ export default function Login() {
       setLoading(false);
     }
   };
+
+  if (clientSession().snapshot().token) return <Navigate to="/" replace />;
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-900">

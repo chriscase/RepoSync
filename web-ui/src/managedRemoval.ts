@@ -1,3 +1,4 @@
+import { accountStorageKey, clientSession } from './session.ts';
 /** Managed root-repository removal (#65) — distinct from pause/disable. */
 
 export interface ManagedRemovalRecovery {
@@ -166,11 +167,13 @@ export function managedRemovalStatusFromReceipt(
 }
 
 function receiptStorageKey(repoId: string): string {
-  return `${RECEIPT_PREFIX}${repoId}`;
+  return `${accountStorageKey(RECEIPT_PREFIX)}${repoId}`;
 }
 
 function migrateLegacyReceipt(): void {
   try {
+    // Unscoped legacy evidence has no authenticated owner; retain it without adopting it.
+    if (typeof localStorage !== 'undefined' && clientSession().snapshot().token) return;
     const raw = sessionStorage.getItem(LEGACY_RECEIPT_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw) as ManagedRemovalReceipt;
@@ -215,7 +218,7 @@ export function readAllManagedRemovalReceipts(): ManagedRemovalReceipt[] {
   try {
     for (let i = 0; i < localStorage.length; i += 1) {
       const key = localStorage.key(i);
-      if (!key?.startsWith(RECEIPT_PREFIX)) continue;
+      if (!key?.startsWith(accountStorageKey(RECEIPT_PREFIX))) continue;
       const raw = localStorage.getItem(key);
       if (!raw) continue;
       const parsed = parseStoredReceipt(raw);
@@ -255,7 +258,7 @@ export function clearManagedRemovalReceipt(repoId?: string): void {
     }
     for (let i = localStorage.length - 1; i >= 0; i -= 1) {
       const key = localStorage.key(i);
-      if (key?.startsWith(RECEIPT_PREFIX)) {
+      if (key?.startsWith(accountStorageKey(RECEIPT_PREFIX))) {
         localStorage.removeItem(key);
       }
     }

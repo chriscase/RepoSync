@@ -1,3 +1,4 @@
+import { clientSession } from './session';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
@@ -15,7 +16,7 @@ import AdminLdap from './pages/AdminLdap';
 import SetupWizard from './pages/SetupWizard';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const token = localStorage.getItem('session_token');
+  const token = clientSession().snapshot().token;
   if (!token) {
     return <Navigate to="/login" replace />;
   }
