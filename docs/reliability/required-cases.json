@@ -1163,5 +1163,116 @@
     {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_IGNORES_MANAGED_CHAIN", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_ignores_managed_chain", "tier":"candidate_regression"},
     {"id":"RS11_SETUP_IMPORT_CONFIG_REMOTE_KEEPS_ORIGIN_ON_REVOCATION", "binary":"setup_wizard_busy", "test":"candidate_rs11_setup_import_config_remote_keeps_origin_on_revocation", "tier":"candidate_regression"},
     {"id":"R01_SVNSERVE_LARGE_MESSAGE_RETRY","binary":"real_engine_scenarios","test":"scenario_r01_svnserve_large_message_retry","tier":"candidate_regression"}
+  ],
+  "separate_qualification_profiles": [
+    {
+      "observed_head": "a887e048662c9b4804649be10feff13b0c7b22c7",
+      "observed_tree": "960d1536df6bcd0bad7ba5e893bb6c65eecc7a15",
+      "run_url": "https://github.com/chriscase/RepoSync/actions/runs/42023789883",
+      "workflow_id": 233594059,
+      "job_id": 127232824038,
+      "attempt": 1,
+      "original_API_log_bytes": 815900,
+      "original_API_log_sha256": "7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789",
+      "status": "PASS",
+      "registers_sealed_runtime_cases": false,
+      "execution_admission": "Observed ordinary CI only. Metadata does not launch a runner or grant any sealed/native/deployment profile.",
+      "id": "RS68_SNAPSHOT_CONTINUATION_LFS",
+      "step": "Test",
+      "binary": "managed_import_commit_map",
+      "tests": [
+        "rs68_snapshot_continues_bidirectionally_and_restarts_without_replay",
+        "rs68_snapshot_checkpoint_failure_reopens_and_reconciles_without_republication",
+        "rs68_missing_lfs_object_after_snapshot_never_writes_pointer_text_to_svn",
+        "rs68_literal_pointer_text_without_filter_remains_a_regular_file",
+        "rs68_explicit_filter_named_unspecified_is_not_treated_as_absent",
+        "rs68_snapshot_real_lfs_publication_fetch_and_missing_object_verification",
+        "rs68_cancel_before_snapshot_effects_preserves_uninitialized_target_across_reopen"
+      ],
+      "result": "All eight target cases passed, zero failed/ignored, including these seven additions. Real Git LFS3.8.1 lifecycle verifies raw/pointer/object bytes, fresh fetch, continuation/reopen and missing-object refusal."
+    },
+    {
+      "observed_head": "a887e048662c9b4804649be10feff13b0c7b22c7",
+      "observed_tree": "960d1536df6bcd0bad7ba5e893bb6c65eecc7a15",
+      "run_url": "https://github.com/chriscase/RepoSync/actions/runs/42023789883",
+      "workflow_id": 233594059,
+      "job_id": 127232824038,
+      "attempt": 1,
+      "original_API_log_bytes": 815900,
+      "original_API_log_sha256": "7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789",
+      "status": "PASS",
+      "registers_sealed_runtime_cases": false,
+      "execution_admission": "Observed ordinary CI only. Metadata does not launch a runner or grant any sealed/native/deployment profile.",
+      "id": "RS68_SNAPSHOT_LOST_REPLY_HTTP",
+      "step": "Snapshot and full-import feature qualification (#68)",
+      "binary": "server_freeze",
+      "tests": [
+        "rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once"
+      ],
+      "result": "Exact selection: one passed, zero failed/ignored, exit0. Actual authenticated reconcile after database/server reconstruction; one baseline mapping and repeated receipt."
+    },
+    {
+      "observed_head": "a887e048662c9b4804649be10feff13b0c7b22c7",
+      "observed_tree": "960d1536df6bcd0bad7ba5e893bb6c65eecc7a15",
+      "run_url": "https://github.com/chriscase/RepoSync/actions/runs/42023789883",
+      "workflow_id": 233594059,
+      "job_id": 127232824038,
+      "attempt": 1,
+      "original_API_log_bytes": 815900,
+      "original_API_log_sha256": "7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789",
+      "status": "PASS",
+      "registers_sealed_runtime_cases": false,
+      "execution_admission": "Observed ordinary CI only. Metadata does not launch a runner or grant any sealed/native/deployment profile.",
+      "id": "R12_PERSONAL_FULL_IMPORT",
+      "step": "Test",
+      "binary": "cli_personal_startup",
+      "tests": [
+        "fresh_full_import_records_two_real_revisions_and_repeat_keeps_published_history",
+        "fresh_personal_start_initializes_storage_and_restarts_after_joined_shutdown"
+      ],
+      "result": "Each exact existing CLI test passed once: two genuine revisions/mappings and no-op repeat; fresh startup and joined restart. This corrects the historical Personal catalog omission; it is not unknown production-version proof."
+    },
+    {
+      "observed_head": "a887e048662c9b4804649be10feff13b0c7b22c7",
+      "observed_tree": "960d1536df6bcd0bad7ba5e893bb6c65eecc7a15",
+      "run_url": "https://github.com/chriscase/RepoSync/actions/runs/42023789883",
+      "workflow_id": 233594059,
+      "job_id": 127232824038,
+      "attempt": 1,
+      "original_API_log_bytes": 815900,
+      "original_API_log_sha256": "7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789",
+      "status": "PASS",
+      "registers_sealed_runtime_cases": false,
+      "execution_admission": "Observed ordinary CI only. Metadata does not launch a runner or grant any sealed/native/deployment profile.",
+      "id": "R12_PINNED_INSTALLER_UPDATE",
+      "step": "Pinned synthetic installer/update qualification (#68)",
+      "binary": "team_mode_e2e",
+      "tests": [
+        "candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade"
+      ],
+      "mechanism_tests": 12,
+      "required_receipts": [
+        "R01_OLD_INSTALL_UPGRADE",
+        "R12_PINNED_INSTALLER_UPDATE"
+      ],
+      "result": "Exact case1pass/0fail/0ignored/exit0 after all12 mechanism tests. Real owned-root update, installed CLI/default full import/repeat, unchanged config/data/ref/WAL/key bytes/modes, then retained same-state in-process engine continuity. All17 foreground exits0; daemon version only; activation false.",
+      "old_source": "87379741779a6259f7eeb52a68cc6f061174e5ef",
+      "old_tree": "f383bb9b123f3f75b2dde7f17f7311a264946abd",
+      "old_lock_sha256": "9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05",
+      "old_package_sha256": "60a43a8ec2e1962609b41e0b09949b4776bf07251e606294e51a01cdbe9e485f",
+      "candidate_package": {
+        "source_head": "a887e048662c9b4804649be10feff13b0c7b22c7",
+        "source_tree": "960d1536df6bcd0bad7ba5e893bb6c65eecc7a15",
+        "bytes": 26017422,
+        "sha256": "46f4d78939d5115fd894628412c60d574c434e874b1c95be84f5485cde889e48",
+        "binaries": {
+          "reposync": "2d327785dd95fc09e9282301d4adee74fafbcfce12bd8bb61a1f2a2ff9b5d4d2",
+          "reposync-daemon": "877d52a0c90c00d655f4013d938c7a89058b83784692f7ccb1442bc2a39fde6c"
+        },
+        "platform": "x86_64-unknown-linux-gnu",
+        "profile": "dev no debuginfo; locked; synthetic build, not distributed release"
+      },
+      "limits": "Pinned-source synthetic dev artifacts, not a distributed/deployed release. No physical daemon/service restart, privileged/default installation, fresh templates or #118 platform-release qualification."
+    }
   ]
 }

@@ -200,3 +200,88 @@ results require source/artifact binding, independent review, fresh hosted
 qualification and post-integration repetition before the synthetic R12 gate is
 closed. The actual work-server version and active-environment acceptance stay
 unestablished. No older CI result or control clock transfers to a successor.
+
+
+## 2026-11-05 scoped R11/R12 qualification reconciliation
+
+This section supersedes the historical missing-continuation, Personal-catalog and
+unqualified synthetic installer/update statements above for the tested source
+`a887e048662c9b4804649be10feff13b0c7b22c7` / tree `960d1536df6bcd0bad7ba5e893bb6c65eecc7a15`.
+It does not erase prior failures or qualify a later source version by inference.
+
+[Exact Linux CI42023789883](https://github.com/chriscase/RepoSync/actions/runs/42023789883) and job127232824038 succeeded at
+2026-11-05T12:26:54Z. All23 steps passed. Original decoded API job log:815900
+bytes, SHA256 `7f8f6bad518c13ceb4043e9c80000e1eb135fba321aef7fc025366805b3f4789`; its separate operator original is1082655 bytes,
+SHA256 `97b4d3a7e4bd1179a56299bae94d60725a53fe2efdf8cd17233646e85eae8802`.
+These are separate decoded originals, not identically framed byte streams.
+
+### Whole #68 acceptance mapping
+
+| Criterion | Actual implementation and qualified evidence |
+| --- | --- |
+| Original1: explicit modes and defaults | Existing Add Repository/import card exposes full/default and pinned HEAD/revision choice; retained local mounted full-default/snapshot-boundary/invalid-revision cases and225UI checks have identical frontend/harness inputs. Current API R12_FULL_DEFAULT and installed-candidate omitted-mode two-revision full import/repeat pass. |
+| Original2: one fixed identity/revision | Current fixed-R, pin-after-advance and invalid-revision tests pass; verified UUID/canonical path/operative+peg pin remains shared with snapshot materialization and publication. Unsupported lineage is refused. |
+| Original3: genuine tree/publication/baseline | Actual snapshot materialization/projection and remote commit are verified; atomic import finalization records truthful applied baseline provenance. Normal and checkpoint-rollback/reconcile tests pass; empty cursor-only admission is not used. |
+| Original4: boundary and exact continuation | Existing starting revision/history boundary/earlier-history omission remain visible. rs68_snapshot_continues_bidirectionally_and_restarts_without_replay passes with SVN then Git advancement and reconstructed no-op. |
+| Original5: target safety | Mismatched/nonempty target refusal and exact baseline reconciliation controls pass; no reset, force publication or clone-failure fallback was added. |
+| Original6: initialization/cancel/restart | Current import journal controls, cancel-before-effects, finalizer rollback/reopen and actual accepted-lost-reply HTTP reconstruction/reconcile/repeat pass. No physical crashed-descendant collection claim. |
+| Original7: file policy/content/LFS | Existing shared no-follow/projection/file-type tests pass with the workspace. Real Git LFS3.8.1 publication, raw/pointer/object bytes, fresh fetch, later changes, reconstructed no-op and missing-object detection pass. Filter-managed unresolved pointer publication refuses before SVN mutation; ordinary literal pointer files remain supported. Unsupported properties/hydration work from #52/#44 is not claimed. |
+| Original8: optional baseline reuse | Not implemented; explicitly optional and not needed for delivery. No PASS is claimed for this feature. |
+| RS29-1: exact source/CI and R11/R12 | This exact head passed source review and Linux CI. Matrix R11/R12 now cite the scoped mandatory proof; issue68/61 remain open pending final-head/postmerge and all other epic requirements respectively. |
+| RS29-2: accepted/lost-push reply | rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once passes through the actual authenticated reconcile route, reconstructed DB/server, one applied baseline and repeat receipt. |
+| RS29-3: real LFS lifecycle | Default-selected rs68_snapshot_real_lfs_publication_fetch_and_missing_object_verification passes. This is genuine git-lfs execution, not pointer-text equivalence alone. |
+| RS29-4: independent file projection | Retained #88 shared manifest/file-type/confinement controls pass; no expected tree is copied from the candidate result and no new unsupported feature is activated. |
+| RS29-5: diagnostics remain honest | Initial writer-fence failures, parser rejections, native restricted loopback failure, browser timeout/inspection denial and successful explicitly authorized retry remain historical evidence. No failure is relabeled skipped or silently green. |
+| RS29-6: onboarding/default compatibility | The existing onboarding path already supplies explicit choices; no second wizard implementation is necessary. Defaults are checked at API, real installed CLI and retained mounted UI levels. |
+| RS29-7: boundary display | Existing API DTO/detail/import card show starting revision/history boundary and earlier-history omission; source-equivalent unit and mounted cases remain separately scoped local evidence. |
+| RS29-8: cancel/reconcile/refusal | Current #64 cancellation/refusal controls, new cancel-before-snapshot-effects and real HTTP/reopen/reconcile tests pass; no reset shortcuts or fence weakening. |
+| RS29-9: full/default and snapshot tests | Normal workspace plus all three separately selected feature cases pass. The records-only successor still requires its own independent review and exact CI; then the actual merge requires a fresh postmerge run. |
+
+### Authentic synthetic installed-update tier
+
+The added step ran all12 installer mechanism cases and exactly one nonignored
+`candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade`:1 passed,
+0 failed/ignored. The193-byte stdout matches its independently retained runtime
+SHA256. Both R01/R12 receipts match independent source/compiler/package records.
+Old source is87379741779a6259f7eeb52a68cc6f061174e5ef/tree
+f383bb9b123f3f75b2dde7f17f7311a264946abd; reviewed lock is
+`9feb01d8964bc93d67ff94014fcd1c7ff0f86111dc5e0efceaf288ec12cc2d05`. All200 old production bodies were checked before and
+after build; only the reviewed test generator and lock were added to preparation.
+
+Actual candidate Linux package:26017422 bytes,
+SHA256 `46f4d78939d5115fd894628412c60d574c434e874b1c95be84f5485cde889e48`.
+CLI SHA256 `2d327785dd95fc09e9282301d4adee74fafbcfce12bd8bb61a1f2a2ff9b5d4d2`;
+daemon SHA256 `877d52a0c90c00d655f4013d938c7a89058b83784692f7ccb1442bc2a39fde6c`.
+Actual old package SHA256 `60a43a8ec2e1962609b41e0b09949b4776bf07251e606294e51a01cdbe9e485f`.
+Both use the genuine two-binary layout. These are pinned-source dev/no-debuginfo
+synthetic artifacts, not distributed releases or proof of a historical deployment.
+
+Observed: old installed CLI status; actual real-entry owned-root binary update;
+config/data/refs/WAL/key byte-and-mode preservation; installed new CLI status and
+daemon VERSION ONLY; actual installed omitted-mode Personal import with two
+revisions/mappings and no-op repeat; then the original same-state in-process
+engine no-change, bidirectional, restore and reconstructed no-op assertions.
+All17 foreground command records exited0; schema12-to12; activation false.
+Installed executable observations and in-process engine observations stay distinct.
+
+`required-cases.json` records these ordinary-CI profiles separately from the old
+sealed diagnostic/candidate/browser case declarations. Registering the evidence
+metadata neither activates that sealed runtime nor grants a native/process profile.
+Current workflow assertions enforce these ordinary-CI selections and receipts.
+
+### Preserved exclusions and final gates
+
+- Actual actively deployed version/schema provenance remains NOT ESTABLISHED;
+  GOAL126 explicitly allows the initial pinned synthetic tier without it.
+- Privileged/default installation, fresh templates, physical daemon/service
+  restart, #118 platform/release packaging and work-server qualification remain
+  separate; no production/deployment effect occurred.
+- #67 late-pair replay remains open; only baseline admission/evidence is credited.
+  Optional baseline reuse and richer wizard polish are not declared delivered.
+- Broader real-engine scenarios remain17PASS/5PARTIAL/overallPARTIAL with CI-GATE
+  PASS; GHE is local DRY RUN, not enterprise qualification. #62/#61 are not closed.
+- #121 actual-reader/usability deferrals and frozen69/native/process holds remain.
+- The a887 head window is CLOSED_TERMINAL_SUCCESS. No obsolete clock acts.
+  This records-only successor needs retained review and its own exact-head run,
+  then qualified epic-only integration, equal-tree check and its OWN postmerge
+  qualification/clock before honest #68 closeout. No main promotion or deployment.
