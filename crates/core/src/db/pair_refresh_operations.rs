@@ -838,12 +838,9 @@ fn require_other_journals_quiet(tx: &Connection, repo_id: &str) -> Result<(), Da
                         &raw, &id, repo_id,
                     )?
                 }
-                "managed_remove_v1" => completed!(
-                    managed_remove,
-                    ManagedRemoveOperation,
-                    repo_id,
-                    ["managed_remove"]
-                ),
+                "managed_remove_v1" => {
+                    super::managed_remove::completed_for_foreign_journal(&raw, &id, repo_id)?
+                }
                 _ => return Err(refused("unsupported competing journal")),
             };
             if !completed {
@@ -2100,5 +2097,100 @@ impl Database {
         };
         tx.commit()?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod rs65_foreign_reader_tests {
+    use super::*;
+    use crate::db::managed_remove::{native_completed_reader_fixture, reader_fixture_snapshot};
+
+    fn read_only(db: &Database, repo: &str, quiet: bool) {
+        let conn = db.conn();
+        let before = reader_fixture_snapshot(&conn);
+        let result = require_other_journals_quiet(&conn, repo);
+        assert_eq!(result.is_ok(), quiet, "{result:?}");
+        assert_eq!(
+            reader_fixture_snapshot(&conn),
+            before,
+            "local quiet reader must not repair, adopt or delete evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn rs65_local_reader_preserves_native_tombstone_hold_and_allows_supported_restore() {
+        for version in [1, 2] {
+            let (db, op, _owned) = native_completed_reader_fixture(version).await;
+            let raw = db
+                .get_state(&format!("managed_remove_v1:document:{}", op.id))
+                .unwrap()
+                .unwrap();
+            read_only(&db, &op.repo_id, false);
+            let refusal = require_other_journals_quiet(&db.conn(), &op.repo_id)
+                .unwrap_err()
+                .to_string();
+            assert!(refusal.contains("managed removal owns the repository"),"the valid native document passes its family decoder before the independent tombstone hold: {refusal}");
+            assert_eq!(
+                db.get_state(&format!("managed_remove_v1:document:{}", op.id))
+                    .unwrap()
+                    .unwrap(),
+                raw
+            );
+            assert!(db.get_repository(&op.repo_id).unwrap().is_none());
+            db.restore_managed_registration(&op.repo_id).unwrap();
+            assert!(!db.get_repository(&op.repo_id).unwrap().unwrap().enabled);
+            read_only(&db, &op.repo_id, true);
+            assert_eq!(
+                db.get_state(&format!("managed_remove_v1:document:{}", op.id))
+                    .unwrap()
+                    .unwrap(),
+                raw,
+                "supported restore retains the original completed native evidence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rs65_local_reader_refuses_corrupt_identity_active_and_partial_evidence() {
+        let (db, op, _owned) = native_completed_reader_fixture(2).await;
+        let key = format!("managed_remove_v1:document:{}", op.id);
+        let original = db.get_state(&key).unwrap().unwrap();
+        let mut future = op.clone();
+        future.version = 3;
+        let mut blended = op.clone();
+        blended.version = 1;
+        let mut partial = op.clone();
+        partial.reviewed.as_mut().unwrap().cleanup_completed = false;
+        let mut wrong_owner = op.clone();
+        wrong_owner.repo_id = "foreign-owner".into();
+        let mut wrong_type = op.clone();
+        wrong_type.operation_type = "foreign_operation".into();
+        for raw in ["{malformed".into(),serde_json::to_string(&future).unwrap(),serde_json::to_string(&blended).unwrap(),serde_json::to_string(&partial).unwrap(),serde_json::to_string(&wrong_owner).unwrap(),serde_json::to_string(&wrong_type).unwrap(),original.replacen("\"policy\":","\"unrecognized_nested\":true,\"policy\":",1),original.replacen("\"policy\":\"reviewed_managed_removal_v2\"","\"policy\":\"reviewed_managed_removal_v2\",\"policy\":\"reviewed_managed_removal_v2\"",1),original.replacen("\"version\":2","\"version\":2,\"unrecognized\":true",1)] {
+            db.set_state(&key,&raw).unwrap();read_only(&db,&op.repo_id,false);
+        }
+        db.set_state(&key, &original).unwrap();
+        let active = format!("managed_remove_v1:active:{}", op.repo_id);
+        db.set_state(&active, &op.id).unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.conn()
+            .execute("DELETE FROM kv_state WHERE key=?1", [&active])
+            .unwrap();
+        let latest = format!("managed_remove_v1:latest:{}", op.repo_id);
+        db.set_state(&latest, "missing-document").unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.set_state("managed_remove_v1:document:foreign-key", &original)
+            .unwrap();
+        db.set_state(&latest, "foreign-key").unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.set_state(&latest, &op.id).unwrap();
+        read_only(&db, &op.repo_id, false);
+        db.conn()
+            .execute(
+                "DELETE FROM kv_state WHERE key='managed_remove_v1:document:foreign-key'",
+                [],
+            )
+            .unwrap();
+        db.restore_managed_registration(&op.repo_id).unwrap();
+        read_only(&db, &op.repo_id, true);
     }
 }

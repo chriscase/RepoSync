@@ -24,6 +24,63 @@ export async function startFixture(port=0) {
   if(path==='/api/auth/login')return body.username==='fixture-admin'&&body.password==='synthetic-only'?reply(200,{token:'synthetic-session-only',user:syntheticUser}):reply(401,{error:'Synthetic login refused'});
   if(req.headers.authorization!=='Bearer synthetic-session-only')return reply(401,{error:'Synthetic session required'});
   requests.push({method:req.method,path,query:Object.fromEntries(url.searchParams),body});
+  // #65 transport fixture only: no engine, native effect or real account.
+  const removalRequestRecord=requests.at(-1);
+  const removalRoute=/^\/api\/repos\/([ABC])\/removal\/(review|approve|continue|request)$/.exec(path);
+  const removalStatus=/^\/api\/repos\/([ABC])\/removal$/.exec(path);
+  const restoreRoute=/^\/api\/repos\/([ABC])\/restore$/.exec(path);
+  const restored=id=>requests.some(r=>r.syntheticRemovalRestored===id);
+  const generation=id=>requests.filter(r=>r.syntheticRemovalRestored===id).length;
+  const pinFor=(id,git,svn)=>(id.charCodeAt(0).toString(16)+Number(git)+Number(svn)+generation(id).toString(16).padStart(8,'0')).padEnd(64,'a');
+  const retained=id=>requests.filter(r=>r.syntheticRemovalReceipt?.repo_id===id).map(r=>r.syntheticRemovalReceipt);
+  const currentReceipt=receipt=>({...receipt,registration_listed:!removed.has(receipt.repo_id)});
+  if(removalRoute){
+   const [,id,action]=removalRoute;
+   if(action==='review'&&req.method==='POST'){
+    if(removed.has(id))return reply(404,{error:'Synthetic registration was removed'});
+    const git=body.delete_git??false,svn=body.delete_svn??false;
+    if(typeof git!=='boolean'||typeof svn!=='boolean'||((git||svn)&&id!=='B'))return reply(409,{error:'Synthetic exact choices refused'});
+    const repo=repository(id);
+    return reply(200,{ok:true,protocol:2,repo_id:id,review_pin:pinFor(id,git,svn),delete_git:git,delete_svn:svn,
+     git:git?{remote_url:`https://git.example.invalid/synthetic/${id}.git`,reference:`refs/heads/${repo.git_branch}`,expected_sha:'a'.repeat(40)}:null,
+     svn:svn?{root_url:repo.svn_url,uuid:'synthetic-uuid-'+id,url:repo.svn_url+'/'+repo.svn_branch,base_revision:7,expected_present:true}:null,
+     dependency_preview:{repo_id:id,repo_name:repo.name,parent:repo.parent_id?{id:repo.parent_id,name:repository(repo.parent_id).name}:null,children:[],credentials:[],managed_local_path:'/synthetic-only/'+id,sibling_local_paths_preserved:[],shared_git_registrations:[],parent_removal_blocked:false,block_reason:null},
+     retention:'Synthetic fixture only. Retained recovery; restore stays disabled and does not recreate remotes.'});
+   }
+   if(action==='approve'&&req.method==='POST'){
+    const previous=retained(id).find(r=>r.request_id===body.request_id&&r.review_pin===body.review_pin);
+    if(previous)return reply(200,currentReceipt(previous));
+    if(typeof body.delete_git!=='boolean'||typeof body.delete_svn!=='boolean'||body.review_pin!==pinFor(id,body.delete_git,body.delete_svn)||body.request_id!==`ui-remove-v2-${body.review_pin}`||((body.delete_git||body.delete_svn)&&id!=='B')||removed.has(id))return reply(409,{request_rejected:true,error:'Synthetic exact review refused'});
+    if(held)await new Promise(resolve=>{const timer=setTimeout(done,5000);function done(){clearTimeout(timer);pending.delete(done);resolve()}pending.add(done)});
+    if(removeResult!=='completed')return reply(503,{error:'Synthetic cleanup refused; no real repository was changed'});
+    const side=(requested,name)=>({phase:requested?'verified_deleted':'not_requested',operation_marker:`synthetic-removal-${id}:${name}`,errors:[]});
+    const receipt={ok:true,action:'managed_remove',protocol:2,repo_id:id,state:'completed',operation_id:`synthetic-removal-${id}-${generation(id)}`,request_id:body.request_id,review_pin:body.review_pin,updated_at:stamp(),message:'Synthetic receipt only; no actual repository changed',remote_git:body.delete_git?'deleted':'untouched',remote_svn:body.delete_svn?'deleted':'untouched',restore_supported:true,retryable:false,registration_listed:false,
+     reviewed:{git:side(body.delete_git,'git'),svn:side(body.delete_svn,'svn'),cleanup_started:true,cleanup_completed:true,cleanup_errors:[]},
+     recovery:{operation_id:`synthetic-removal-${id}-${generation(id)}`,name:repository(id).name,last_svn_rev:0,last_git_sha:'',commit_map_count:0,remote_git:body.delete_git?'deleted':'untouched',remote_svn:body.delete_svn?'deleted':'untouched',restore_supported:true,retention:'Synthetic retained recovery'}};
+    removalRequestRecord.syntheticRemovalReceipt=receipt;removed.add(id);return reply(200,receipt);
+   }
+   if(action==='request'&&req.method==='GET'){
+    const receipt=retained(id).find(r=>r.request_id===url.searchParams.get('request_id')&&r.review_pin===url.searchParams.get('review_pin'));
+    return receipt?reply(200,currentReceipt(receipt)):reply(404,{error:'No matching synthetic operation receipt'});
+   }
+   if(action==='continue'&&req.method==='POST'){
+    const receipt=retained(id).find(r=>r.operation_id===body.operation_id);
+    return receipt?reply(200,currentReceipt(receipt)):reply(404,{error:'No synthetic operation to continue'});
+   }
+  }
+  if(removalStatus&&req.method==='GET'){
+   const receipts=retained(removalStatus[1]);const receipt=url.searchParams.has('operation_id')?receipts.find(r=>r.operation_id===url.searchParams.get('operation_id')):receipts.at(-1);
+   return receipt?reply(200,currentReceipt(receipt)):reply(404,{error:'No synthetic removal receipt'});
+  }
+  if(restoreRoute&&req.method==='POST'){
+   const id=restoreRoute[1];if(!removed.has(id))return reply(200,{ok:true,action:'managed_restore',state:'already_listed',repo_id:id,enabled:!restored(id),message:'Synthetic registration already exists'});
+   removalRequestRecord.syntheticRemovalRestored=id;removed.delete(id);return reply(200,{ok:true,action:'managed_restore',state:'restored',repo_id:id,enabled:false,message:'Synthetic registration restored disabled; no actual data changed'});
+  }
+  if(req.method==='GET'&&/^\/api\/repos\/[ABC]$/.test(path)){
+   const id=path.at(-1);if(removed.has(id))return reply(404,{error:'Synthetic repository not found'});if(restored(id))return reply(200,{...repository(id),enabled:false});
+  }
+  if(req.method==='GET'&&path==='/api/repos'&&['A','B','C'].some(restored))return reply(200,['A','B','C'].filter(id=>!removed.has(id)).map(id=>({...repository(id),enabled:!restored(id)})));
+  if(req.method==='GET'&&path==='/api/status'&&restored(url.searchParams.get('repo_id'))){const value=status(url.searchParams.get('repo_id'));value.observation.configured='disabled';return reply(200,value);}
   if(req.method!=='GET'){
    if(held&&(path.includes('/repos/')||path.startsWith('/api/users/')))await new Promise(resolve=>{const timer=setTimeout(done,5000);function done(){clearTimeout(timer);pending.delete(done);resolve()}pending.add(done)});
    if(path==='/api/admin/ldap/test')return reply(200,{ok:false,message:'Synthetic directory test refused'});

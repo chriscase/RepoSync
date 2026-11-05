@@ -1,41 +1,144 @@
-# #65 slice: legacy disable and additive managed removal
+# Managed removal: retained recovery and explicit remote actions
 
-This is the smallest product slice of issue #65. It does **not** close #65 or #61.
+This contract covers whole issue #65: the seven original lifecycle criteria and
+four RS-16 requirements. It uses the existing operational schema 13 and KV
+journal namespace. It introduces no schema migration, daemon/process controller,
+refresh execution, service action or deployment.
 
-## What shipped
+## Separate actions
 
-| Operation | Route | Effect |
-| --- | --- | --- |
-| Legacy disable | `DELETE /api/repos/{id}` | Sets `enabled=false` only. Registration, mappings, secrets, local files, and remotes stay. Response `action` is `disable` and `message` remains `repository disabled`. No removal journal is written. |
-| Explicit disable | `POST /api/repos/{id}/disable` | Same contract as legacy DELETE for new UI clients. Adds `preservation`, `remote_git`, `remote_svn`, and `managed_removal: false`. |
-| Managed removal | `POST /api/repos/{id}/remove` | Explicit and additive. Uses the v12 `kv_state` journal `managed_remove_v1:` (same storage family as #64 import and Git→SVN journals). Schema stays v12. Optional query `explicit_remote_deletion_opts=true` with `delete_git` / `delete_svn` applies **only** to child (branch-pair) registrations and mirrors the branch-pair DELETE remote opt-in contract; omitted params stay non-destructive for new UI callers. Root registrations ignore remote deletion flags on this route. |
-| Removal status | `GET /api/repos/{id}/removal` | Read-only state for a managed-removal operation. Does not delete anything. Optional `operation_id` returns that journal document when it belongs to the repo; unknown ids are **404**. Without `operation_id`, returns the latest operation. Response includes `updated_at` (journal timestamp). Returns `operation_id`, `partial_cleanup` on failure/hold, and `recovery` tombstone metadata when present. HTTP status follows the operation: **`200`** when `state` is `completed`; **`202`** when `queued`, `cancelling`, or `running`; **`409`** when `failed` or `reconciliation_required`. Returns **`404`** when no managed-removal journal exists for the id. |
-| Removal dependency preview | `GET /api/repos/{id}/removal/preview` | Read-only. Lists parent/child registrations, per-repo and global credentials (what would be deleted vs preserved, including credential-chain inheritance), managed local path `repos/{id}`, sibling paths left intact, and other registrations sharing the same non-empty Git remote. When a managed removal is already active, the response body still includes `dependency_preview`, and the **HTTP status** mirrors that operation (`202` while waiting, `409` on `reconciliation_required` or parent blocked) plus `active_removal`. When no removal is active, HTTP **`200`**. |
-| Managed restore | `POST /api/repos/{id}/restore` | Restores a **completed** removal from its tombstone while retained mappings/recovery metadata still exist. Registration returns with **`enabled=false`** until the operator enables sync. **`409`** when removal is still in progress or recovery was purged. Idempotent **`200`** when the registration is already listed. |
-| Branch-pair remote delete | `DELETE /api/repos/{id}/branch-pair` | Legacy callers omitting `delete_git` / `delete_svn` still default both to **true**. The detail page removes branch pairs through this DELETE route (with explicit remote flags); child registrations may also use `POST /remove` with the same explicit remote opt-in query contract. Managed `POST /remove` on a root registration never deletes remotes. |
+- **Pause / disable** stops admission of new syncing. It preserves registration,
+  mappings, credentials, local data and both remotes. Root `DELETE /api/repos/:id`
+  remains disable-only; `POST /disable` is the explicit equivalent.
+- **Remove from RepoSync** disables the registration, waits for existing ownership
+  to become quiet, removes only its confined owned tree and registration/secrets,
+  and retains mappings, audit history and a recovery tombstone.
+- **Delete a remote Git ref or SVN path** is a separately selected part of a
+  reviewed removal. Both choices default to false. SVN path deletion retains SVN
+  history; Git ref deletion does not rewrite commits, but does not promise that a
+  remote will retain unreachable objects forever.
 
-Managed removal:
+Children are not cascaded. A parent with registered children is refused. A remote
+Git ref shared by another registration or an SVN deletion containing another
+registration's target is refused. Sibling paths and other owners' credentials
+remain intact. No action invokes reset, force import, checkpoint rollback or
+upstream repository deletion.
 
-1. Records a durable operation and disables the row before any local delete.
-2. If a non-terminal import or Git→SVN commit is active, or either journal is `reconciliation_required`, it does **not** delete files or secrets. Imports are cancel-requested. The response is `cancelling` (HTTP 202) or `reconciliation_required` (HTTP 409), with `ok: false`.
-3. If this process still holds the repository busy lock, or in-memory import progress is non-terminal, cleanup waits the same way.
-4. Parent removal is refused while child registration rows exist (HTTP 409, `state: blocked`, full `dependency_preview`). Children are not cascaded.
-5. Child removal deletes only that registration's per-repo secret keys (`secret_svn_password_{id}`, `secret_git_token_{id}`) and `repos/{id}`; parent, sibling, and global credentials and trees are preserved.
-6. After writers are quiet, cleanup deletes only `{data_dir}/repos/{id}` when that path is a direct real child of the managed root, plus the exact per-repo secret keys above.
-7. On full success the repository row is removed from active listings, a tombstone is kept, and the response is `completed` with `ok: true`. Commit-map rows, audit rows, per-repo watermark keys, and remote Git/SVN history are kept. **`restore_supported: true`** on new completions while recovery metadata remains.
-8. Symlink roots, traversal, and escapes fail the cleanup. `ok` stays false, `state` is `failed`, and the same POST retries. Repeated calls and a completed tombstone do not recreate the registration until restore.
-9. Recorded remote outcomes (`deleted`, `failed`) are sticky across retries; a retry that does not request a remote side does not re-fail because an earlier attempt left the other side `failed`.
+## Versioned records
 
-`POST /api/repos/{id}/remove` uses the same HTTP status mapping and response body shape as `GET /api/repos/{id}/removal` for the operation (including `updated_at`), except parent-with-children refusal returns **`409`** with `state: blocked` (not a journal state).
+Legacy valid version 1 removal documents and their omitted default fields remain
+readable. New reviewed operations explicitly use version 2 under the existing
+`managed_remove_v1:` namespace. They contain a nested reviewed plan, typed
+per-side receipts and independent local cleanup evidence. A v1/v2 blend, future
+version, unknown field, duplicate field, wrong owner/type/ID, contradictory
+summary or incomplete completion proof refuses. A dangling pointer is an error,
+not an absent operation. Existing active, history and tombstone guards remain.
 
-`remote_git` and `remote_svn` in the removal response are `untouched` unless explicitly opted in on child removal. This slice does not delete remote branches or SVN paths for root registrations.
+Version 2 plans bind the authenticated actor, request identity, repository and
+parent incarnations, configuration and credential generations, dependency
+registrations, canonical managed data root, exact selected targets and choices.
+Git capture records the endpoint, full ref and expected SHA or positively
+observed absence. SVN capture records repository UUID/root, literal path, baseline
+revision and positively observed presence/absence. Unavailable tooling, failed
+authentication and incomplete observations are not absence.
 
-## Still later
+The review pin is a digest of server-derived evidence. It is neither a bearer
+credential nor execution authority on its own. Approval recaptures the inputs;
+clients cannot submit their own plan, actor, effect receipt or completed flag.
 
-- Optional authenticated remote Git-ref / SVN-path deletion beyond branch-pair delete
-- Full trash/restore product polish (purge lifecycle, list removed entries)
-- Closing #65
+## HTTP and UI sequence
 
-## Tests
+1. An administrator posts explicit booleans to `/api/repos/:id/removal/review`.
+   This is read-only. It returns the exact targets, dependency information,
+   retention policy and opaque `review_pin`. Failed or unavailable review blocks
+   confirmation. Choice, target or configuration changes require a fresh review.
+2. Explicit approval posts `delete_git`, `delete_svn`, `review_pin` and a stable
+   `request_id` to `/removal/approve`. The browser retains that request before
+   sending it. The server atomically claims the durable identity and disables the
+   registration before any destructive native work.
+3. Read `/removal` or `/removal?operation_id=...` for the durable outcome. If the
+   approval reply was lost before an operation ID was received, use the read-only
+   `/removal/request?request_id=...&review_pin=...` lookup. It matches the original
+   authenticated actor, repository incarnation, request and pin. Reload never
+   sends another approval, continuation or restore automatically. An explicit
+   continuation uses the original operation, not a new set of flags.
+   `/removal/continue` accepts only its existing ID and same authenticated actor;
+   it does not approve different work. Failed local receipt storage retains the
+   original pending request for lookup instead of silently discarding it.
+4. A completed receipt remains available after the row disappears. Restore via
+   `POST /restore` returns a **disabled** registration. It does not recreate a
+   deleted remote branch/path or silently enable syncing. An old completed request
+   cannot remove the restored incarnation.
 
-Named cases are in `docs/reliability/required-cases.json` under R02: `R02_LEGACY_DELETE`, `R02_MANAGED_REMOVE`, `R02_REMOVE_RETRY`, `R02_PATH_CONFINEMENT`, and `R02_JOURNAL_RETRY`, plus RS-16 / dependency cases `R65_*`, and the existing `R02_R03_ROUTE` disable assertion.
+Missing/invalid sessions return 401. Valid users without the required role or
+operation ownership receive 403; that is not a logout instruction. Bodies reject
+unsupported fields. The UI preserves account/repository ownership, original
+mutation callbacks and receipts across navigation/reload. It keeps unresolved
+request evidence when a response is lost; a different preview cannot replace that
+request. A confirmed server rejection permits a fresh review. No browser storage
+contains plaintext VCS credentials.
+
+Legacy branch-pair DELETE requests that omit remote flags, or request either
+remote action, now receive **409 before effects**, with review/approval guidance.
+Their `remote_deletion` metadata describes the requested flags, not effects.
+Explicit-false local-only legacy requests retain supported managed removal.
+Existing v1 partial receipts remain retained and can retry local cleanup; they
+cannot authorize a new remote action. Root DELETE stays non-destructive.
+
+## Effect and cleanup protocol
+
+Each requested side has a durable `prepared` then `intent_recorded` state before
+native I/O. Git deletion uses an exact old-tip lease and empty refspec; a prior
+lookup followed by unconditional provider REST DELETE is not an equivalent CAS.
+SVN uses `svnmucc` with the captured revision and unique operation marker. The
+root/UUID and target are checked again. Private command configuration avoids
+ambient credential fallback; password input is owner-only before bytes are
+written. Supervised commands use the existing bounded process infrastructure.
+
+Successful native results are independently observed and stored through a
+non-deserializable producer capability. Per-side labels, evidence digests and
+completion agree. Requested and unrequested sides remain separate. Cleanup is
+admitted only after all selected sides have verified outcomes, current native
+writer/dependency/registration guards pass and owned-path preflight succeeds.
+Remote receipts are persisted before local cleanup; a cleanup failure cannot
+turn a completed remote action back into `untouched`.
+
+The exact path is `{data_dir}/repos/{repo_id}`. IDs are single safe components;
+root/target symlinks and escaped roots refuse before new effects. Nested links
+are unlinked rather than followed by the existing confined cleanup. A later
+filesystem change or cleanup error retains the registration and receipts.
+Cleanup retries recheck ownership and perform no second verified remote action.
+Ordered bounded errors remain present even after eventual completion.
+
+An intent without a persisted collected-result receipt is **not** automatically
+replayed. Git ref absence does not prove request attribution. An SVN marker may
+help inspection but does not prove predecessor collection. Unknown collection
+or effect evidence stays held. No PID absence, empty registry, acknowledgement,
+reset or journal deletion clears it. The current protocol does not provide an
+automatic release for such uncertainty; report the retained operation for
+explicit investigation instead of claiming it completed.
+
+Queued/cancelling means work still owns the registration. Running is not a
+completed local cleanup. Failed, reconciliation-required, each remote outcome,
+cleanup stage and registration visibility are shown separately. HTTP 202 is not
+success; held/failed operation receipts use 409. Only a completed durable receipt
+supports a removed outcome. Known busy/import ownership remains queued or
+cancelling; durable late-pair/refresh/import/replay/publication holds are honored.
+
+## Retention and qualification
+
+Tombstone, audit, mapping and recovery evidence are retained indefinitely. There
+is no automatic expiry/purge or advertised trash UI. Protect retained database
+and encryption-key backups as before. Restore availability is explicit; it does
+not promise that remote objects or paths can be reconstructed.
+
+The three bounded #69 foreign-reader compatibility edits consume strict v1/v2
+removal proof only. They do not relax other families, active/orphan/history/
+tombstone checks or enable refresh runtime. Future #69 composition must carry
+these helpers/consumers and the five accepted #67 dependencies together; frozen
+historical source packets remain unchanged.
+
+See `../65-managed-removal-closeout.md` for the whole acceptance map and exact
+case inventory. Author-local tests, independent review, exact-head hosted CI and
+separate postmerge proof remain distinct gates. #69 native/process/execution/AC7,
+#121 reader/usability, main promotion and production holds are unchanged.

@@ -188,7 +188,7 @@ import {
 } from './web-ui/src/managedRemoval.ts';
 
 if (removalDependencyPreviewConfirmReady({ isLoading: true, isFetching: false, isError: false, dependencyPreview: null })) process.exit(8);
-if (!removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: true, dependencyPreview: null })) process.exit(9);
+if (removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: true, dependencyPreview: null })) process.exit(9);
 if (removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: false, dependencyPreview: null })) process.exit(11);
 if (removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: true, isError: true, dependencyPreview: null })) process.exit(12);
 if (!removalDependencyPreviewConfirmReady({ isLoading: false, isFetching: false, isError: false, dependencyPreview: { repo_id: 'x', repo_name: 'x', parent: null, children: [], parent_removal_blocked: false, block_reason: null, credentials: [], managed_local_path: 'p', sibling_local_paths_preserved: [], shared_git_registrations: [] } })) process.exit(10);

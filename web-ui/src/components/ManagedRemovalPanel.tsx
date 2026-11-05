@@ -1,5 +1,6 @@
 import type { ManagedRemovalStatus } from '../managedRemoval';
-import { managedRemovalStateLabel } from '../managedRemoval';
+import { managedRemovalPanelHeading, reviewedRemovalDisplay, managedRemovalRetryLabel } from '../managedRemoval';
+
 
 export default function ManagedRemovalPanel({
   status,
@@ -30,9 +31,10 @@ export default function ManagedRemovalPanel({
       className={`border rounded-lg p-4 text-sm space-y-2 ${tone}`}
       role="status"
     >
-      <p className="font-medium">{managedRemovalStateLabel(status.state)}</p>
+      <p className="font-medium">{managedRemovalPanelHeading(status)}</p>
       <p>{status.message}</p>
       <p className="font-mono text-xs">Operation {status.operation_id}</p>
+      {status.protocol === 2 ? <ReviewedRemovalStages status={status} /> : <>
       <p className="text-xs" data-testid="managed-removal-remote-outcome">
         Remote Git: {status.remote_git} · SVN: {status.remote_svn}.
         {status.partial_cleanup?.retry_is_local_cleanup_only
@@ -53,6 +55,7 @@ export default function ManagedRemovalPanel({
           </p>
         </div>
       )}
+      </>}
       {status.recovery && (
         <div
           data-testid="managed-removal-recovery"
@@ -92,9 +95,22 @@ export default function ManagedRemovalPanel({
           onClick={onRetry}
           className="mt-2 px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-xs font-medium"
         >
-          {retryPending ? 'Retrying local cleanup…' : 'Retry local cleanup'}
+                    {managedRemovalRetryLabel(status, !!retryPending)}
+
         </button>
       )}
     </div>
   );
+}
+
+function ReviewedRemovalStages({ status }: { status: ManagedRemovalStatus }) {
+  const view = reviewedRemovalDisplay(status);
+  return <div data-testid="reviewed-removal-stages" className="text-xs border border-current/30 rounded p-2 space-y-1">
+    <p>Git: {view.git}</p>
+    <p>SVN: {view.svn}</p>
+    <p>Owned local cleanup: {view.cleanup}</p>
+    <p>Registration still listed: {status.registration_listed ? 'yes' : 'no'}</p>
+    {!view.known && <p role="alert">Verified completion evidence is unavailable.</p>}
+    {view.errors.map((error, index) => <p key={index}>{error}</p>)}
+  </div>;
 }

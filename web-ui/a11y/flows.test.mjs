@@ -49,7 +49,7 @@ test('rs121 keyboard managed removal contains focus, busy Escape refuses, error 
   await page.keyboard.press('Escape');assert.equal(await page.getByRole('dialog').count(),1);assert.equal(await page.getByTestId('cancel-managed-remove').isDisabled(),true);await contained(page);
   await fetch(fixture.origin+'/__fixture/release',{method:'POST'});await page.getByRole('alert').filter({hasText:'Synthetic cleanup refused'}).waitFor();
   await page.keyboard.press('Escape');assert.equal(await page.getByRole('dialog').count(),0);assert.ok(await trigger.evaluate(el=>el===document.activeElement));
-  assert.equal(fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/repos/C/remove').length,1);
+  assert.equal(fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/repos/C/removal/approve').length,1);
  }finally{await close()}
 });
 
@@ -99,7 +99,7 @@ test('rs121 completed synthetic removal returns focus to the current main landma
   const confirm=page.getByTestId('confirm-remove-from-reposync');await page.waitForFunction(()=>!document.querySelector('[data-testid="confirm-remove-from-reposync"]')?.disabled);await press(page,confirm);
   await page.waitForURL(url=>url.pathname==='/repos');await page.getByRole('heading',{name:'Repositories',exact:true}).waitFor();
   assert.equal(await page.getByRole('dialog').count(),0);assert.ok(await page.getByRole('main').evaluate(el=>el===document.activeElement));
-  const requests=fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/repos/C/remove');const request=requests.at(-1);assert.equal(request.query.delete_git,'false');assert.equal(request.query.delete_svn,'false');
+  const requests=fixture.requests.filter(r=>r.method==='POST'&&r.path==='/api/repos/C/removal/approve');const request=requests.at(-1);assert.equal(request.body.delete_git,false);assert.equal(request.body.delete_svn,false);assert.match(request.body.review_pin,/^[a-f0-9]{64}$/);
  }finally{await close();await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({removeResult:'refused'})})}
 });
 
@@ -133,7 +133,7 @@ test('rs121 pairing validation associates each error and clears it after correct
  const {page,close}=await open('/repos/A');try{
   const writesBefore=fixture.requests.filter(r=>r.method!=='GET').length;
   await press(page,page.getByRole('button',{name:'Add Branch Pair',exact:true}));
-  const modal=page.getByRole('dialog',{name:'Preview Branch Pair',exact:true});await modal.waitFor();
+  const modal=page.getByRole('dialog',{name:'Review Branch Pair',exact:true});await modal.waitFor();
   const git=page.getByRole('textbox',{name:/^Branch Name/}),svn=page.getByRole('textbox',{name:/^SVN Branch Path/}),preview=page.getByRole('button',{name:'Preview Pair',exact:true});
   await replaceByKeyboard(page,git,'bad..name');await replaceByKeyboard(page,svn,'branches/valid');
   assert.equal(await git.getAttribute('aria-invalid'),'true');await describedFeedback(page,git,'Must not contain ".."');assert.equal(await svn.getAttribute('aria-invalid'),null);assert.equal(await preview.isDisabled(),true);
@@ -190,4 +190,56 @@ test('rs121 rendered Skip dialog confirms only the selected observed prefix and 
    await state(mode);await modal.waitFor({state:'detached',timeout:8000});assert.equal(await trigger.count(),0);assert.equal(writes().length,before+1,'retired selected confirmation must send no additional request');
   }
  }finally{await state('off');await close()}
+});
+
+async function rs65RestoreSyntheticC(){
+ const response=await fetch(fixture.origin+'/api/repos/C/restore',{method:'POST',headers:{authorization:'Bearer synthetic-session-only','content-type':'application/json'},body:'{}'});
+ assert.equal(response.status,200,'controlled synthetic setup only');
+}
+
+test('rs65 keyboard confirmation refuses unavailable review and keeps fresh exact targets inside the modal', {timeout:45000},async()=>{
+ await rs65RestoreSyntheticC();const start=fixture.requests.length;const {page,close}=await open('/repos/C');try{
+  await page.route('**/api/repos/C/removal/review',route=>route.fulfill({status:503,contentType:'application/json',body:JSON.stringify({error:'Synthetic review unavailable'})}));
+  const trigger=page.getByTestId('remove-from-reposync');await press(page,trigger);
+  const modal=page.getByRole('dialog',{name:'Remove from RepoSync',exact:true});await modal.waitFor();
+  await modal.getByRole('alert').filter({hasText:'Synthetic review unavailable'}).waitFor();
+  assert.equal(await page.getByTestId('confirm-remove-from-reposync').isDisabled(),true);
+  assert.equal(fixture.requests.slice(start).filter(r=>r.path.endsWith('/removal/approve')).length,0);
+  await page.unroute('**/api/repos/C/removal/review');await press(page,modal.getByRole('button',{name:'Refresh exact-target review',exact:true}));
+  await page.waitForFunction(()=>!document.querySelector('[data-testid="confirm-remove-from-reposync"]')?.disabled);
+  const review=modal.getByTestId('reviewed-removal-targets');assert.equal(await review.isVisible(),true);
+  assert.match(await review.textContent(),/Git: preserved/);assert.match(await review.textContent(),/SVN: preserved/);
+  await contained(page);await audit(page,'rs65 exact-target review within native modal');
+  await page.keyboard.press('Escape');assert.equal(await modal.count(),0);assert.ok(await trigger.evaluate(el=>el===document.activeElement));
+  assert.equal(fixture.requests.slice(start).filter(r=>r.path.endsWith('/removal/approve')).length,0,'read-only review and cancellation never approve removal');
+  console.log('# RS65_BROWSER_REVIEW',JSON.stringify({read_only:true,unavailable_blocks:true,exact_targets_inside_modal:true,keyboard_focus_contained:true,axe_violations:0,approval_requests:0}));
+ }finally{await close()}
+});
+
+test('rs65 lost completed reply reload uses only request lookup, then explicit disabled restore', {timeout:60000},async()=>{
+ await rs65RestoreSyntheticC();await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({removeResult:'completed'})});
+ const start=fixture.requests.length;const {page,close}=await open('/repos/C');try{
+  let lostResolve,lostReject;const lost=new Promise((resolve,reject)=>{lostResolve=resolve;lostReject=reject});
+  await page.route('**/api/repos/C/removal/approve',async route=>{try{
+   const response=await route.fetch();assert.equal(response.status(),200);await response.body();await route.abort('failed');lostResolve();
+  }catch(error){lostReject(error);await route.abort('failed').catch(()=>{})}});
+  await press(page,page.getByTestId('remove-from-reposync'));
+  await page.waitForFunction(()=>!document.querySelector('[data-testid="confirm-remove-from-reposync"]')?.disabled);
+  await press(page,page.getByTestId('confirm-remove-from-reposync'));await lost;
+  const approvals=()=>fixture.requests.slice(start).filter(r=>r.method==='POST'&&r.path==='/api/repos/C/removal/approve');
+  assert.equal(approvals().length,1);assert.equal(approvals()[0].body.delete_git,false);assert.equal(approvals()[0].body.delete_svn,false);
+  await page.reload();await page.getByRole('heading',{name:'Repository not found',exact:true}).waitFor();
+  const recovery=page.getByTestId('removed-registration-recovery');await recovery.getByText('Removal completed; verified cleanup recorded',{exact:true}).waitFor();
+  const restore=recovery.getByRole('button',{name:'Restore registration (stays disabled)',exact:true});await restore.waitFor();assert.equal(await restore.isEnabled(),true);
+  const reads=fixture.requests.slice(start).filter(r=>r.method==='GET'&&r.path==='/api/repos/C/removal/request');assert.ok(reads.length>=1);
+  assert.equal(approvals().length,1,'reload must not replay approval');
+  assert.equal(fixture.requests.slice(start).filter(r=>r.method==='POST'&&r.path==='/api/repos/C/removal/continue').length,0,'lookup must not continue effects');
+  assert.equal(fixture.requests.slice(start).filter(r=>r.method==='POST'&&r.path==='/api/repos/C/restore').length,0,'rendering must not restore automatically');
+  await audit(page,'rs65 retained recovery after lost reply');await press(page,restore);
+  await page.getByRole('heading',{name:'Disposable fixture',exact:true}).waitFor();await page.getByText('Sync configured disabled',{exact:true}).waitFor();
+  assert.equal(fixture.requests.slice(start).filter(r=>r.method==='POST'&&r.path==='/api/repos/C/restore').length,1);
+  assert.equal(fixture.requests.slice(start).filter(r=>r.method==='PUT'&&r.path==='/api/repos/C').length,0,'restore must not enable sync or overwrite configuration');
+  assert.equal(approvals().length,1);assert.deepEqual(errors,[],'no application page errors');
+  console.log('# RS65_BROWSER_LOST_REPLY',JSON.stringify({approval_requests:1,remote_git:false,remote_svn:false,read_only_request_lookup:reads.length,no_automatic_effect_retry:true,explicit_restore_requests:1,restored_enabled:false,axe_violations:0}));
+ }finally{await close();await fetch(fixture.origin+'/__fixture/state',{method:'POST',body:JSON.stringify({removeResult:'refused'})})}
 });

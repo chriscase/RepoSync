@@ -493,6 +493,57 @@ export const api = {
       managed_removal: boolean;
     }>(`/repos/${id}/disable`, { method: 'POST' }),
 
+  reviewManagedRemoval: (id: string, options: { delete_git: boolean; delete_svn: boolean }, signal?: AbortSignal) =>
+    fetchJson<import('./managedRemoval').ReviewedRemovalPreview>(`/repos/${id}/removal/review`, { method: 'POST', signal, body: JSON.stringify(options) }),
+
+  approveManagedRemoval: async (id: string, review: import('./managedRemoval').ReviewedRemovalPreview, owner?: { assertCurrent(): void }): Promise<ManagedRemovalStatus> => {
+    const session = clientSession(); const origin = session.snapshot();
+    const journal = await import('./managedRemoval');
+    session.assertCurrent(origin); owner?.assertCurrent();
+    journal.retainPendingRemovalReview(id, review);
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
+      body: JSON.stringify({ delete_git: review.delete_git, delete_svn: review.delete_svn, review_pin: review.review_pin, request_id: `ui-remove-v2-${review.review_pin}` }),
+    });
+    const body = await res.json() as ManagedRemovalStatus & { error?: string; request_rejected?: boolean };
+    session.assertCurrent(origin);
+    if ((!res.ok && res.status !== 202 && res.status !== 409) || !body.operation_id) {
+      if (res.status === 409 && body.request_rejected === true) journal.clearPendingRemovalReview(id, review.review_pin);
+      throw new Error(body.error || body.message || `API error ${res.status}`);
+    }
+    journal.persistManagedRemovalReceipt(journal.managedRemovalReceiptFromStatus(id, body), true);
+    journal.clearPendingRemovalReview(id, review.review_pin);
+    return body;
+  },
+
+  continueManagedRemoval: async (id: string, operationId: string): Promise<ManagedRemovalStatus> => {
+    const session = clientSession(); const origin = session.snapshot();
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/continue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
+      body: JSON.stringify({ operation_id: operationId }),
+    });
+    const body = await res.json() as ManagedRemovalStatus & { error?: string };
+    if ((!res.ok && res.status !== 202 && res.status !== 409) || !body.operation_id) throw new Error(body.error || body.message || `API error ${res.status}`);
+    if (body.operation_id !== operationId || body.protocol !== 2) throw new Error('Continuation returned a different removal identity');
+    const journal = await import('./managedRemoval'); session.assertCurrent(origin);
+    journal.persistManagedRemovalReceipt(journal.managedRemovalReceiptFromStatus(id, body), true);
+    return body;
+  },
+
+  lookupRemovalRequest: async (id: string, reviewPin: string): Promise<ManagedRemovalStatus | null> => {
+    const params = new URLSearchParams({ request_id: `ui-remove-v2-${reviewPin}`, review_pin: reviewPin });
+    const res = await sessionFetch(`${API_BASE}/repos/${id}/removal/request?${params}`, {
+      headers: { Authorization: `Bearer ${localStorage.getItem('session_token') || ''}` },
+    });
+    if (res.status === 404) return null;
+    const body = await res.json() as ManagedRemovalStatus & { error?: string };
+    if ((!res.ok && res.status !== 202 && res.status !== 409) || !body.operation_id) throw new Error(body.error || body.message || `API error ${res.status}`);
+    if (body.protocol !== 2 || body.request_id !== `ui-remove-v2-${reviewPin}` || body.review_pin !== reviewPin) throw new Error('Removal lookup returned a different request identity');
+    return body;
+  },
+
   removeManagedRepo: async (
     id: string,
     remoteOpts?: { delete_git?: boolean; delete_svn?: boolean },
