@@ -17,6 +17,13 @@ class DeploymentError(RuntimeError):
     pass
 
 
+def sha256_field(receipt, field):
+    value = receipt.get(field)
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise DeploymentError(f"missing or malformed {field} confirmation")
+    return value
+
+
 def run(args, **kwargs):
     result = subprocess.run(args, check=True, text=True, **kwargs)
     return result.stdout.strip() if result.stdout else ""
@@ -76,7 +83,7 @@ def main(argv=None):
             raise DeploymentError(f"missing {phase} receipt")
         print("\n".join(lines[:-1]))
         receipt = json.loads(lines[-1])
-        if receipt.get("commit") != sha or receipt.get("phase") != phase:
+        if not isinstance(receipt, dict) or receipt.get("commit") != sha or receipt.get("phase") != phase:
             raise DeploymentError(f"foreign or malformed {phase} receipt")
         return receipt
 
@@ -114,8 +121,16 @@ def main(argv=None):
             finally:
                 git(root, "worktree", "remove", "--force", str(work))
         sealed = remote("seal", stage, archive_sha)
-        result = remote("activate", stage, sealed["manifest_sha256"])
-        if result.get("verified") is not True:
+        expected_manifest = sha256_field(sealed, "manifest_sha256")
+        expected_binary = sha256_field(sealed, "binary_sha256")
+        result = remote("activate", stage, expected_manifest)
+        pid = result.get("pid")
+        if (result.get("verified") is not True or
+                sha256_field(result, "manifest_sha256") != expected_manifest or
+                sha256_field(result, "binary_sha256") != expected_binary or
+                not isinstance(pid, str) or not re.fullmatch(r"[1-9][0-9]{0,9}", pid) or
+                result.get("executable_path") != f"{stage}/artifact/reposync-daemon" or
+                result.get("static_directory") != f"{stage}/artifact/static"):
             raise DeploymentError("deployment did not return verified artifact identity")
         print(json.dumps(result, sort_keys=True))
     return 0

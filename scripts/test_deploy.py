@@ -27,6 +27,18 @@ SHA = "a" * 40
 UI = "b" * 40
 
 
+def compatible_service(binary):
+    facts = dict.fromkeys(remote.SERVICE_FIELDS, "")
+    facts.update({field: "no" for field in remote.SERVICE_NO})
+    facts.update(ExecStart="{ path=" + str(binary) + " ; argv[]=synthetic ; }",
+                 User=str(os.getuid()), Group=str(os.getgid()))
+    return facts
+
+
+def service_text(facts):
+    return "\n".join(f"{key}={value}" for key, value in facts.items())
+
+
 def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args], stderr=subprocess.PIPE, text=True).strip()
 
@@ -97,7 +109,7 @@ class ClientTests(unittest.TestCase):
         self.assertIn("immutable HEAD", result.stderr)
         self.assertFalse((Path(self.temp.name) / "calls").exists())
 
-    def execute(self, fault=None, no_ui=False):
+    def execute(self, fault=None, no_ui=False, receipt_mutator=None):
         (self.root / "Cargo.lock").write_text("version = 3\n")
         original = client.run
 
@@ -119,10 +131,16 @@ class ClientTests(unittest.TestCase):
                     receipt["stage"] = self.stage
                 if phase == "seal":
                     receipt["manifest_sha256"] = "c" * 64
+                    receipt["binary_sha256"] = "e" * 64
                 if phase == "activate":
-                    receipt["verified"] = True
+                    receipt.update(verified=True, manifest_sha256="c" * 64,
+                                   binary_sha256="e" * 64, pid="12345",
+                                   executable_path=self.stage + "/artifact/reposync-daemon",
+                                   static_directory=self.stage + "/artifact/static")
                 if fault == "foreign_receipt":
                     receipt["commit"] = SHA
+                if receipt_mutator:
+                    receipt_mutator(phase, receipt)
                 return json.dumps(receipt)
             if args[0] == "scp":
                 if args[-1].endswith("ui.tar") and fault == "transfer":
@@ -137,8 +155,9 @@ class ClientTests(unittest.TestCase):
                 return ""
             self.fail(f"unmodeled effect: {args}")
 
+        self.output = io.StringIO()
         with patch.object(client, "__file__", str(self.root / "scripts/deploy.py")), \
-                patch.object(client, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                patch.object(client, "run", side_effect=run), contextlib.redirect_stdout(self.output):
             return client.main(["--no-web-ui"] if no_ui else [])
 
     def phases(self):
@@ -175,6 +194,48 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "npm" for c in self.calls))
         self.assertFalse(any(c[0] == "scp" and c[-1].endswith("ui.tar") for c in self.calls))
 
+    def test_rs117_client_rejects_missing_or_malformed_seal_identities_before_activation(self):
+        for field, value in [("manifest_sha256", None), ("manifest_sha256", "malformed"),
+                             ("binary_sha256", None), ("binary_sha256", "x" * 64)]:
+            with self.subTest(field=field, value=value):
+                self.calls.clear()
+
+                def mutate(phase, receipt):
+                    if phase == "seal":
+                        if value is None:
+                            receipt.pop(field)
+                        else:
+                            receipt[field] = value
+
+                with self.assertRaises(client.DeploymentError):
+                    self.execute(no_ui=True, receipt_mutator=mutate)
+                self.assertEqual(self.phases(), ["prepare", "build", "seal"])
+
+    def test_rs117_client_requires_complete_same_manifest_activation_receipt(self):
+        cases = [("manifest_sha256", None), ("manifest_sha256", "bad"),
+                 ("manifest_sha256", "d" * 64), ("binary_sha256", None),
+                 ("binary_sha256", "bad"), ("binary_sha256", "f" * 64),
+                 ("pid", None), ("pid", 123), ("pid", "0"), ("pid", "-1"),
+                 ("pid", "12x"), ("executable_path", None),
+                 ("executable_path", "/another/release/reposync-daemon"),
+                 ("static_directory", None), ("static_directory", "/another/release/static")]
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                self.calls.clear()
+
+                def mutate(phase, receipt):
+                    if phase == "activate":
+                        if value is None:
+                            receipt.pop(field)
+                        else:
+                            receipt[field] = value
+
+                with self.assertRaises(client.DeploymentError):
+                    self.execute(no_ui=True, receipt_mutator=mutate)
+                self.assertEqual(self.phases(), ["prepare", "build", "seal", "activate"],
+                                 "an incomplete confirmation must not trigger another activation or rollback")
+                self.assertNotIn('"verified": true', self.output.getvalue())
+
 
 class RemoteTests(unittest.TestCase):
     def setUp(self):
@@ -190,15 +251,16 @@ class RemoteTests(unittest.TestCase):
         self.old_static.mkdir()
         (self.old_static / "index.html").write_bytes(b"retained previous UI")
         self.store = self.root / "store"
-        self.store.mkdir()
+        self.store.mkdir(mode=0o700)
         self.stage = self.store / (SHA + "-fixture")
         self.stage.mkdir()
         self.artifact = self.stage / "artifact"
         self.artifact.mkdir()
         (self.artifact / "reposync-daemon").write_bytes(b"new synthetic daemon")
         (self.artifact / "reposync-daemon").chmod(0o755)
+        service = dict(compatible_service(self.binary), resolved_uid=os.getuid())
         remote.save(self.stage / "input.json", {"commit": SHA, "ui_source_tree": UI,
-                                               "previous": remote.live_state(self.binary)})
+                                               "previous": remote.live_state(self.binary), "service": service})
         remote.save(self.stage / "build.json", {"commit": SHA, "short": SHA[:7], "lock_sha256": "d" * 64,
                                                "binary_sha256": remote.digest(self.artifact / "reposync-daemon")})
         self.archive = self.stage / "ui.tar"
@@ -297,12 +359,12 @@ class RemoteTests(unittest.TestCase):
 
             def output(args, **kwargs):
                 if args[0] == "systemctl":
-                    return "{ path=" + str(self.binary) + " ; }"
+                    return service_text(compatible_service(self.binary))
                 self.assertEqual(args[0], "git")
                 return real_output(args, **kwargs)
 
             with patch.object(remote, "command", side_effect=command), patch.object(remote, "output", side_effect=output):
-                with patch.object(remote, "service_path", side_effect=ValueError("wrong existing service path")):
+                with patch.object(remote, "service_profile", side_effect=ValueError("wrong existing service path")):
                     with self.assertRaises(ValueError):
                         remote.prepare(self.repo, self.store, sha, ui)
                 self.assertEqual([c[3] for c in calls], ["status", "rev-parse", "rev-parse"],
@@ -359,20 +421,35 @@ class RemoteTests(unittest.TestCase):
             remote.seal(self.repo, self.stage, SHA, UI, "reuse")
         self.assertFalse((self.artifact / "static").exists())
 
-    def activate(self, checksum, health=None, physical=True):
+    def activate(self, checksum, health=None, physical=True, running_path=None,
+                 unavailable_executable=False, redirect_pointer=None, service_facts=None,
+                 static_view=None):
         self.effects = []
         original_digest = remote.digest
 
-        def digest(path):
-            if str(path).startswith("/proc/"):
-                self.effects.append("physical-binary-observation")
-                return original_digest(self.artifact / "reposync-daemon") if physical else "f" * 64
-            return original_digest(path)
+        def process_executable(pid):
+            self.effects.append("physical-binary-observation")
+            if unavailable_executable:
+                if unavailable_executable == "missing":
+                    raise FileNotFoundError("modeled missing executable association")
+                raise PermissionError("modeled unavailable executable association")
+            path = (running_path or self.artifact / "reposync-daemon").resolve()
+            info = path.stat()
+            checksum = original_digest(path) if physical else "f" * 64
+            return str(path), info.st_dev, info.st_ino, checksum
+
+        def process_static(pid, location):
+            self.effects.append("static-directory-observation")
+            directory = static_view or Path(location)
+            info = directory.stat()
+            return info.st_dev, info.st_ino, remote.manifest_files(directory)
 
         def output(args, **kwargs):
             self.effects.append(args)
             if args[0] == "systemctl" and "--property=ExecStart" in args:
-                return "{ path=" + str(self.binary) + " ; argv[]=synthetic ; }"
+                if isinstance(service_facts, str):
+                    return service_facts
+                return service_text(service_facts if service_facts is not None else compatible_service(self.binary))
             if args[0] == "systemctl" and "--property=MainPID" in args:
                 return "12345"
             if args[0] == "curl":
@@ -382,10 +459,14 @@ class RemoteTests(unittest.TestCase):
         def command(args, **kwargs):
             self.assertEqual(args, ["sudo", "-n", "systemctl", "restart", "reposync"])
             self.effects.append(args)
+            if redirect_pointer:
+                self.binary.unlink()
+                self.binary.symlink_to(redirect_pointer)
             return subprocess.CompletedProcess(args, 0)
 
         with patch.object(remote, "output", side_effect=output), patch.object(remote, "command", side_effect=command), \
-                patch.object(remote, "digest", side_effect=digest), patch.object(remote.time, "sleep"):
+                patch.object(remote, "process_executable", side_effect=process_executable), \
+                patch.object(remote, "process_static", side_effect=process_static), patch.object(remote.time, "sleep"):
             return remote.activate(self.repo, self.store, self.stage, SHA, UI, checksum)
 
     def test_rs117_sealed_identity_mismatch_prevents_promotion_and_restart(self):
@@ -439,12 +520,113 @@ class RemoteTests(unittest.TestCase):
             self.activate(checksum, physical=False)
         self.old_preserved()
 
+    def another_same_byte_release(self):
+        other = self.store / "other-release"
+        other.mkdir()
+        shutil.copy2(self.artifact / "reposync-daemon", other / "reposync-daemon")
+        (other / "static/assets").mkdir(parents=True)
+        (other / "static/index.html").write_bytes(b"different release index")
+        (other / "static/assets/app.js").write_bytes(b"different release JS")
+        self.assertEqual(remote.digest(other / "reposync-daemon"),
+                         remote.digest(self.artifact / "reposync-daemon"))
+        return other
+
+    def test_rs117_same_binary_bytes_in_another_running_release_are_refused(self):
+        checksum = self.seal()
+        other = self.another_same_byte_release()
+        with self.assertRaisesRegex(ValueError, "outside the sealed release"):
+            self.activate(checksum, running_path=other / "reposync-daemon")
+        self.old_preserved()
+
+    def test_rs117_pointer_redirected_to_same_byte_release_is_refused(self):
+        checksum = self.seal()
+        other = self.another_same_byte_release()
+        with self.assertRaisesRegex(ValueError, "pointer changed release"):
+            self.activate(checksum, redirect_pointer=other / "reposync-daemon")
+        self.assertEqual(self.binary.resolve(), (other / "reposync-daemon").resolve())
+        self.assertEqual(len([c for c in self.effects if isinstance(c, list) and c[0] == "sudo"]), 1)
+        self.old_preserved()
+
+    def test_rs117_unreadable_executable_location_refuses_confirmation(self):
+        checksum = self.seal()
+        with self.assertRaises(PermissionError):
+            self.activate(checksum, unavailable_executable=True)
+        self.old_preserved()
+
+    def test_rs117_missing_executable_location_refuses_confirmation(self):
+        checksum = self.seal()
+        with self.assertRaises(FileNotFoundError):
+            self.activate(checksum, unavailable_executable="missing")
+        self.old_preserved()
+
+    def test_rs117_different_process_static_view_is_refused(self):
+        checksum = self.seal()
+        other = self.another_same_byte_release()
+        with self.assertRaisesRegex(ValueError, "filesystem view differs"):
+            self.activate(checksum, static_view=other / "static")
+        self.old_preserved()
+
+    def test_rs117_incompatible_or_ambiguous_service_profile_refuses_before_promotion(self):
+        checksum = self.seal()
+        good = compatible_service(self.binary)
+        missing = dict(good)
+        missing.pop("User")
+        invalid = [dict(good, User=str(os.getuid() + 1000)), missing,
+                   dict(good, DynamicUser="yes"), dict(good, RootDirectory="/different-root"),
+                   dict(good, ProtectHome="yes"), dict(good, PrivateUsers="yes"),
+                   service_text(good) + "\nUser=1234"]
+        private_mode = self.store.stat().st_mode
+        for facts in invalid:
+            with self.subTest(facts=facts):
+                with self.assertRaises(ValueError):
+                    self.activate(checksum, service_facts=facts)
+                self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
+                self.assertFalse(self.binary.is_symlink())
+                self.assertFalse((self.stage / "promotion-intent.json").exists())
+                self.assertFalse(any(isinstance(c, list) and c[0] == "sudo" for c in self.effects))
+                self.assertEqual(self.store.stat().st_mode, private_mode)
+                self.old_preserved()
+
+    def test_rs117_service_profile_drift_refuses_before_promotion(self):
+        checksum = self.seal()
+        facts = dict(compatible_service(self.binary), Group="changed-group")
+        with self.assertRaisesRegex(ValueError, "profile changed since preparation"):
+            self.activate(checksum, service_facts=facts)
+        self.assertFalse((self.stage / "promotion-intent.json").exists())
+        self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
+        self.old_preserved()
+
+    def test_rs117_release_traversal_refusal_does_not_relax_permissions(self):
+        mode = self.artifact.stat().st_mode & 0o777
+        self.artifact.chmod(0o600)
+        try:
+            with self.assertRaisesRegex(ValueError, "cannot traverse"):
+                remote.release_access(self.artifact, {"resolved_uid": os.getuid()})
+            self.assertEqual(self.artifact.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
+        finally:
+            self.artifact.chmod(mode)
+
+    def test_rs117_named_static_user_must_resolve_to_helper_uid(self):
+        from types import SimpleNamespace
+        facts = dict(compatible_service(self.binary), User="synthetic-service-user")
+        with patch.object(remote, "output", return_value=service_text(facts)), \
+                patch.object(remote.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid())):
+            self.assertEqual(remote.service_profile(self.binary)["resolved_uid"], os.getuid())
+        with patch.object(remote, "output", return_value=service_text(facts)), \
+                patch.object(remote.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid() + 1000)):
+            with self.assertRaisesRegex(ValueError, "same static UID"):
+                remote.service_profile(self.binary)
+
     def test_rs117_success_retains_prior_assets_and_exact_receipt(self):
         checksum = self.seal()
         receipt = self.activate(checksum)
         self.assertTrue(receipt["verified"])
         self.assertEqual(receipt["manifest_sha256"], checksum)
         self.assertIn("physical-binary-observation", self.effects)
+        self.assertIn("static-directory-observation", self.effects)
+        self.assertEqual(receipt["executable_path"], str((self.artifact / "reposync-daemon").resolve()))
+        self.assertEqual(receipt["static_directory"], str((self.artifact / "static").resolve()))
         self.assertTrue(self.binary.is_symlink())
         self.assertEqual((self.stage / "previous-daemon").read_bytes(), b"retained previous binary")
         self.assertEqual((self.old_static / "index.html").read_bytes(), b"retained previous UI")

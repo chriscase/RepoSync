@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
 import shutil
 import stat
@@ -90,10 +91,93 @@ def live_state(binary):
             "sha256": digest(binary), "mode": stat.S_IMODE(binary.stat().st_mode)}
 
 
-def service_path(binary):
-    value = output(["systemctl", "show", "reposync", "--property=ExecStart", "--value"])
-    paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", value)
+SERVICE_EMPTY = ("RootDirectory", "RootImage", "InaccessiblePaths", "TemporaryFileSystem",
+                 "BindPaths", "BindReadOnlyPaths", "NoExecPaths", "MountImages",
+                 "ExtensionImages", "ExtensionDirectories", "SELinuxContext", "AppArmorProfile")
+SERVICE_NO = ("DynamicUser", "ProtectHome", "PrivateTmp", "PrivateUsers", "PrivateMounts")
+SERVICE_FIELDS = ("ExecStart", "User", "Group", "SupplementaryGroups", *SERVICE_EMPTY, *SERVICE_NO)
+
+
+def service_profile(binary):
+    value = output(["systemctl", "show", "reposync",
+                    *[f"--property={field}" for field in SERVICE_FIELDS]])
+    facts = {}
+    for line in value.splitlines():
+        key, separator, content = line.partition("=")
+        require(separator and key in SERVICE_FIELDS and key not in facts,
+                "ambiguous service execution profile")
+        facts[key] = content
+    require(set(facts) == set(SERVICE_FIELDS), "incomplete service execution profile")
+    paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", facts["ExecStart"])
     require(paths == [str(binary)], "service ExecStart does not name the managed deployment path")
+    require(all(facts[field] == "" for field in SERVICE_EMPTY) and
+            all(facts[field] == "no" for field in SERVICE_NO),
+            "unsupported service filesystem/dynamic-user profile; do not relax unit protections")
+    user = facts["User"]
+    if user == "":
+        uid = 0  # systemctl without --user addresses the system manager.
+    elif re.fullmatch(r"0|[1-9][0-9]*", user):
+        uid = int(user)
+    else:
+        uid = pwd.getpwnam(user).pw_uid
+    require(os.getuid() == os.geteuid() == uid,
+            "service User must be the same static UID as the deployment helper")
+    return dict(facts, resolved_uid=uid)
+
+
+def release_access(artifact, profile):
+    # Owner/public traversal avoids relying on the helper's supplementary groups.
+    uid = profile["resolved_uid"]
+    for directory in (artifact, *artifact.parents):
+        info = directory.stat()
+        needed = stat.S_IXUSR if info.st_uid == uid else stat.S_IXOTH
+        require(stat.S_ISDIR(info.st_mode) and info.st_mode & needed and
+                os.access(directory, os.X_OK), "service cannot traverse release path")
+    binary = artifact / "reposync-daemon"
+    info = binary.stat()
+    needed = stat.S_IRUSR | stat.S_IXUSR
+    require(info.st_uid == uid and info.st_mode & needed == needed and
+            os.access(binary, os.R_OK | os.X_OK),
+            "service cannot read/execute sealed daemon")
+    for path in (artifact / "static", *(artifact / "static").rglob("*")):
+        needed = os.R_OK | os.X_OK if path.is_dir() else os.R_OK
+        bits = stat.S_IRUSR | stat.S_IXUSR if path.is_dir() else stat.S_IRUSR
+        info = path.stat()
+        require(info.st_uid == uid and info.st_mode & bits == bits and os.access(path, needed),
+                "service cannot read/traverse sealed static resources")
+
+
+def process_executable(pid):
+    executable = Path("/proc") / pid / "exe"
+    location = os.readlink(executable)
+    info = executable.stat()
+    return location, info.st_dev, info.st_ino, digest(executable)
+
+
+def process_static(pid, location):
+    # Read the directory through the service's root, not just the helper's view.
+    directory = Path("/proc") / pid / "root" / str(location).lstrip("/")
+    info = directory.stat()
+    return info.st_dev, info.st_ino, manifest_files(directory)
+
+
+def verify_running_release(binary, artifact, manifest, pid):
+    expected = (artifact / "reposync-daemon").resolve(strict=True)
+    location, device, inode, checksum = process_executable(pid)
+    require(location == str(expected), "running executable is outside the sealed release")
+    info = expected.stat()
+    require((device, inode) == (info.st_dev, info.st_ino) and checksum == manifest["binary_sha256"],
+            "running service binary differs from sealed artifact")
+    require(binary.is_symlink() and binary.resolve(strict=True) == expected and
+            digest(binary) == manifest["binary_sha256"], "promoted pointer changed release")
+    static = Path(location).parent / "static"
+    require(static.resolve(strict=True) == (artifact / "static").resolve(strict=True) and
+            manifest_files(static) == manifest["static"], "running static release differs from sealed artifact")
+    device, inode, files = process_static(pid, static)
+    info = static.stat()
+    require((device, inode) == (info.st_dev, info.st_ino) and files == manifest["static"],
+            "service filesystem view differs from the sealed static release")
+    return {"executable_path": location, "static_directory": str(static)}
 
 
 def prepare(repo, store, sha, ui_tree):
@@ -104,12 +188,13 @@ def prepare(repo, store, sha, ui_tree):
     require(output(["git", "-C", str(repo), "rev-parse", f"{sha}:web-ui"]) == ui_tree,
             "remote UI source identity mismatch")
     binary = repo / "target/release/reposync-daemon"
-    service_path(binary)
+    service = service_profile(binary)
     previous = live_state(binary)
     stage = Path(tempfile.mkdtemp(prefix=sha + "-", dir=store))
     print(f"[deploy] retain staging on any failure: {stage}", file=sys.stderr)
     source = stage / "source"
-    save(stage / "input.json", {"commit": sha, "ui_source_tree": ui_tree, "previous": previous})
+    save(stage / "input.json", {"commit": sha, "ui_source_tree": ui_tree,
+                               "previous": previous, "service": service})
     command(["git", "-C", str(repo), "worktree", "add", "--detach", str(source), sha])
     return {"stage": str(stage)}
 
@@ -163,7 +248,8 @@ def seal(repo, stage, sha, ui_tree, archive_sha):
              "lock_sha256": build["lock_sha256"],
              "binary_sha256": build["binary_sha256"], "static": manifest_files(artifact / "static")}
     save(artifact / "manifest.json", value)
-    return {"manifest_sha256": digest(artifact / "manifest.json")}
+    return {"manifest_sha256": digest(artifact / "manifest.json"),
+            "binary_sha256": value["binary_sha256"]}
 
 
 def activate(repo, store, stage, sha, ui_tree, expected_manifest):
@@ -177,8 +263,11 @@ def activate(repo, store, stage, sha, ui_tree, expected_manifest):
                 digest(artifact / "reposync-daemon") == manifest["binary_sha256"] and
                 manifest_files(artifact / "static") == manifest["static"], "artifact identity mismatch")
         binary = repo / "target/release/reposync-daemon"
-        service_path(binary)
-        original = json.loads((stage / "input.json").read_text())["previous"]
+        metadata = json.loads((stage / "input.json").read_text())
+        service = service_profile(binary)
+        require(service == metadata["service"], "service execution profile changed since preparation")
+        release_access(artifact, service)
+        original = metadata["previous"]
         require(live_state(binary) == original, "deployment changed since preparation")
         save(stage / "promotion-intent.json", {"previous": original, "commit": sha,
                                                "manifest_sha256": expected_manifest})
@@ -208,14 +297,13 @@ def activate(repo, store, stage, sha, ui_tree, expected_manifest):
         require(isinstance(health, dict) and health.get("ok") is True and health.get("git_commit") == manifest["short"],
                 "health/build identity failed after promotion; reconcile, do not blindly roll back")
         pid = output(["systemctl", "show", "reposync", "--property=MainPID", "--value"])
-        require(pid.isdigit() and int(pid) > 0, "missing service process identity")
-        require(digest(Path("/proc") / pid / "exe") == manifest["binary_sha256"],
-                "running service binary differs from sealed artifact")
-        require(live_state(binary)["sha256"] == manifest["binary_sha256"], "promoted pointer changed")
+        require(re.fullmatch(r"[1-9][0-9]{0,9}", pid), "missing service process identity")
+        association = verify_running_release(binary, artifact, manifest, pid)
+        require(service_profile(binary) == service, "service execution profile changed during activation")
         save(stage / "verified.json", {"commit": sha, "manifest_sha256": expected_manifest,
-                                      "binary_sha256": manifest["binary_sha256"]})
+                                      "binary_sha256": manifest["binary_sha256"], **association})
         return {"verified": True, "manifest_sha256": expected_manifest,
-                "binary_sha256": manifest["binary_sha256"], "pid": pid}
+                "binary_sha256": manifest["binary_sha256"], "pid": pid, **association}
 
 
 def main(argv):
