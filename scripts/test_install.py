@@ -6,6 +6,7 @@ schema, service, or old-install runtime qualification.
 """
 import hashlib
 import argparse
+from contextlib import redirect_stdout
 import importlib.util
 import io
 import json
@@ -191,6 +192,64 @@ class OfflineInstaller(unittest.TestCase):
         self.assertEqual(len(stages), 1)
         self.assertEqual((stages[0] / "reposync.previous").read_bytes(), self.old["reposync"])
         self.assertEqual(self.state(), self.before)
+
+    def test_replacement_and_cleanup_failures_preserve_primary_and_rollback(self):
+        checksum = self.package()
+        replace = os.replace
+
+        def fail_second(source, destination):
+            if Path(source).name == "reposync-daemon":
+                raise OSError("fixture second replacement failed")
+            return replace(source, destination)
+
+        output = io.StringIO()
+        with patch.object(offline.os, "replace", side_effect=fail_second) as replacements, \
+                patch.object(offline.shutil, "rmtree", side_effect=OSError("fixture cleanup failed")) as cleanup, \
+                redirect_stdout(output):
+            status = offline.main(["--root", str(self.root), "--archive", str(self.archive),
+                                   "--sha256", checksum])
+        self.assertEqual(status, 1)
+        receipt = json.loads(output.getvalue())
+        self.assertIn("second replacement failed", receipt["error"])
+        self.assertIn("cleanup failed", receipt["cleanup_error"])
+        self.assertEqual(receipt["update_outcome"], "failed")
+        self.assertEqual(receipt["rollback_outcome"], "completed")
+        self.assertFalse(receipt["cleanup_completed"])
+        self.assertNotIn("update_receipt", receipt)
+        self.assertFalse(receipt["activation_performed"])
+        self.assertTrue(Path(receipt["staging_path"]).is_dir())
+        self.assertEqual(replacements.call_count, 3)
+        cleanup.assert_called_once()
+        self.assert_old()
+
+    def test_completed_update_survives_cleanup_failure_without_retry_or_rollback(self):
+        checksum = self.package()
+        output = io.StringIO()
+        with patch.object(offline.os, "replace", wraps=os.replace) as replacements, \
+                patch.object(offline.shutil, "rmtree", side_effect=OSError("fixture cleanup failed")) as cleanup, \
+                redirect_stdout(output):
+            status = offline.main(["--root", str(self.root), "--archive", str(self.archive),
+                                   "--sha256", checksum])
+        self.assertEqual(status, 1)
+        receipt = json.loads(output.getvalue())
+        self.assertEqual(receipt["update_outcome"], "completed")
+        self.assertEqual(receipt["rollback_outcome"], "not_attempted")
+        self.assertFalse(receipt["cleanup_completed"])
+        self.assertIn("cleanup failed", receipt["cleanup_error"])
+        update = receipt["update_receipt"]
+        self.assertEqual(update["package_sha256"], checksum)
+        self.assertEqual(update["changed"], list(offline.BINARIES))
+        self.assertFalse(update["activation_performed"])
+        self.assertFalse(update["configuration_or_database_opened"])
+        for name, content in self.new.items():
+            p = self.root / "bin" / name
+            self.assertEqual(p.read_bytes(), content)
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o700)
+            self.assertEqual(update["binary_sha256"][name], hashlib.sha256(content).hexdigest())
+        self.assertEqual(self.state(), self.before)
+        self.assertTrue(Path(receipt["staging_path"]).is_dir())
+        self.assertEqual(replacements.call_count, 2)
+        cleanup.assert_called_once()
 
     def test_supplied_invalid_qualification_spec_fails_without_fallback(self):
         specification = self.area / "invalid-spec.json"

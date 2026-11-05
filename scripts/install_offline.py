@@ -23,6 +23,20 @@ BINARIES = ("reposync", "reposync-daemon")
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
 
 
+class CleanupFailure(RuntimeError):
+    """A secondary cleanup error must not hide the observed update outcome."""
+
+    def __init__(self, stage, cleanup, primary, receipt, rollback):
+        super().__init__(str(primary) if primary is not None else
+                         "update completed but staging cleanup failed")
+        self.result = {"error": str(self), "cleanup_error": str(cleanup),
+                       "cleanup_completed": False, "staging_path": str(stage),
+                       "update_outcome": "completed" if receipt is not None else "failed",
+                       "rollback_outcome": rollback, "activation_performed": False}
+        if receipt is not None:
+            self.result["update_receipt"] = receipt
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)
@@ -94,6 +108,9 @@ def update(root, archive, expected):
                             "existing binary mode changed during package validation")
                 stage = Path(tempfile.mkdtemp(prefix=".reposync-update-", dir=root / "bin"))
                 retain = False
+                primary = None
+                receipt = None
+                rollback = "not_attempted"
                 try:
                     hashes = {}
                     for name in BINARIES:
@@ -128,14 +145,23 @@ def update(root, archive, expected):
                             retain = True
                             raise RuntimeError(f"update failed: {cause}; rollback uncertain: {errors}; "
                                                f"retain recovery files at {stage}") from cause
+                        rollback = "completed"
                         raise
-                    return {"mode": "offline-owned-root-update", "root": str(root),
-                            "package_sha256": expected, "binary_sha256": hashes,
-                            "changed": changed, "activation_performed": False,
-                            "configuration_or_database_opened": False}
+                    receipt = {"mode": "offline-owned-root-update", "root": str(root),
+                               "package_sha256": expected, "binary_sha256": hashes,
+                               "changed": changed, "activation_performed": False,
+                               "configuration_or_database_opened": False}
+                    return receipt
+                except Exception as error:
+                    primary = error
+                    raise
                 finally:
                     if not retain:
-                        shutil.rmtree(stage)
+                        try:
+                            shutil.rmtree(stage)
+                        except OSError as cleanup:
+                            raise CleanupFailure(stage, cleanup, primary, receipt, rollback) from (
+                                primary if primary is not None else cleanup)
 
 
 def main(argv=None):
@@ -147,6 +173,9 @@ def main(argv=None):
     try:
         print(json.dumps(update(args.root, args.archive, args.sha256), sort_keys=True))
         return 0
+    except CleanupFailure as error:
+        print(json.dumps(error.result, sort_keys=True))
+        return 1
     except (OSError, ValueError, RuntimeError, tarfile.TarError) as error:
         print(json.dumps({"error": str(error), "activation_performed": False}))
         return 1
