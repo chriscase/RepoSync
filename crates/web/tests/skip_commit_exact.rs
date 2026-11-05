@@ -562,8 +562,13 @@ fn repo_detail_ui_binds_skip_to_observed_tips_and_selected_commits() {
         "UI must bind skip to observed tips via context endpoint"
     );
     assert!(
-        src.contains("data-testid=\"skip-commit-modal\""),
+        src.contains("testId=\"skip-commit-modal\""),
         "skip modal must exist for selected-commit confirmation"
+    );
+    let dialog = include_str!("../../../web-ui/src/components/Dialog.tsx");
+    assert!(
+        dialog.contains("data-testid={testId}"),
+        "shared dialog must forward the selected-commit confirmation marker"
     );
     assert!(
         !src.contains("Skip-to-HEAD is disabled until exact per-commit skip disposition exists"),

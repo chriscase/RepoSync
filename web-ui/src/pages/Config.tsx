@@ -39,7 +39,7 @@ export default function Config() {
   };
 
   if (isLoading) {
-    return <div className="text-center py-8 text-gray-500">Loading...</div>;
+    return <div className="text-center py-8 text-gray-300">Loading...</div>;
   }
 
   return (
@@ -85,7 +85,7 @@ export default function Config() {
                 </td>
                 <td className="px-4 py-2 text-sm text-gray-300">{m.name}</td>
                 <td className="px-4 py-2 text-sm text-gray-300">{m.email}</td>
-                <td className="px-4 py-2 text-sm text-gray-500">
+                <td className="px-4 py-2 text-sm text-gray-300">
                   {m.github ?? '-'}
                 </td>
                 <td className="px-4 py-2 text-right">
@@ -108,7 +108,7 @@ export default function Config() {
           </h3>
           <div className="flex space-x-2">
             <input
-              placeholder="SVN username"
+              aria-label="Mapping SVN username" placeholder="SVN username"
               value={newMapping.svn_username}
               onChange={(e) =>
                 setNewMapping({ ...newMapping, svn_username: e.target.value })
@@ -116,7 +116,7 @@ export default function Config() {
               className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <input
-              placeholder="Full Name"
+              aria-label="Mapping full name" placeholder="Full Name"
               value={newMapping.name}
               onChange={(e) =>
                 setNewMapping({ ...newMapping, name: e.target.value })
@@ -124,7 +124,7 @@ export default function Config() {
               className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <input
-              placeholder="email@company.com"
+              aria-label="Mapping email" placeholder="email@company.com"
               value={newMapping.email}
               onChange={(e) =>
                 setNewMapping({ ...newMapping, email: e.target.value })
@@ -149,11 +149,12 @@ export default function Config() {
 }
 
 function NotificationsConfig() {
+  const feedbackId = React.useId();
   const [teamsUrl, setTeamsUrl] = React.useState('');
   const [loading, setLoading] = React.useState(true);
   const [saving, setSaving] = React.useState(false);
   const [testing, setTesting] = React.useState(false);
-  const [message, setMessage] = React.useState('');
+  const [message, setMessage] = React.useState<{type: 'success' | 'error'; text: string} | null>(null);
   const [showSetup, setShowSetup] = React.useState(false);
 
   React.useEffect(() => {
@@ -171,7 +172,7 @@ function NotificationsConfig() {
 
   const save = async () => {
     setSaving(true);
-    setMessage('');
+    setMessage(null);
     const token = localStorage.getItem('session_token');
     try {
       const response = await sessionFetch('/api/config/notifications', {
@@ -184,17 +185,17 @@ function NotificationsConfig() {
       });
       if (!response.ok) throw new Error(`Save failed (${response.status})`);
       await response.text();
-      setMessage('Saved');
-      setTimeout(() => setMessage(''), 3000);
+      setMessage({type: 'success', text: 'Saved'});
+      setTimeout(() => setMessage(null), 3000);
     } catch {
-      setMessage('Save failed');
+      setMessage({type: 'error', text: 'Save failed'});
     }
     setSaving(false);
   };
 
   const testNotification = async () => {
     setTesting(true);
-    setMessage('');
+    setMessage(null);
     const token = localStorage.getItem('session_token');
     try {
       const res = await sessionFetch('/api/config/notifications/test', {
@@ -202,9 +203,9 @@ function NotificationsConfig() {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       const d = await res.json();
-      setMessage(d.ok ? 'Test notification sent!' : d.error || 'Failed');
+      setMessage({type: d.ok ? 'success' : 'error', text: d.ok ? 'Test notification sent!' : d.error || 'Failed'});
     } catch {
-      setMessage('Failed to send test');
+      setMessage({type: 'error', text: 'Failed to send test'});
     }
     setTesting(false);
   };
@@ -212,7 +213,7 @@ function NotificationsConfig() {
   if (loading) return null;
 
   return (
-    <div className="bg-gray-800/60 border border-gray-700 rounded-lg p-6">
+    <div role="group" aria-label="Microsoft Teams notification settings" aria-describedby={message ? feedbackId : undefined} className="bg-gray-800/60 border border-gray-700 rounded-lg p-6">
       <h2 className="text-lg font-semibold text-gray-100 mb-4">
         Notifications — Microsoft Teams
       </h2>
@@ -236,7 +237,7 @@ function NotificationsConfig() {
             <li>Select the channel to post to and click <strong>Add workflow</strong></li>
             <li>Copy the <strong>webhook URL</strong> and paste it below</li>
           </ol>
-          <p className="text-xs text-gray-500 mt-2">
+          <p className="text-xs text-gray-300 mt-2">
             No admin permissions required — any team member can create a workflow on their channel.
           </p>
         </div>
@@ -244,17 +245,19 @@ function NotificationsConfig() {
 
       <div className="space-y-3">
         <div>
-          <label className="block text-sm text-gray-400 mb-1">Teams Webhook URL</label>
+          <label className="block text-sm text-gray-400 mb-1" htmlFor="teams-webhook-url">Teams Webhook URL</label>
           <div className="flex gap-2">
             <input
               type="text"
-              value={teamsUrl}
+              id="teams-webhook-url" value={teamsUrl}
+              aria-describedby={message ? feedbackId : undefined}
               onChange={(e) => setTeamsUrl(e.target.value)}
               placeholder="https://prod-XX.westus.logic.azure.com/workflows/..."
               className="flex-1 rounded-md border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:ring-blue-500 focus:border-blue-500"
             />
             <button
               onClick={save}
+              aria-describedby={message ? feedbackId : undefined}
               disabled={saving}
               className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 text-sm font-medium"
             >
@@ -263,6 +266,7 @@ function NotificationsConfig() {
             {teamsUrl && (
               <button
                 onClick={testNotification}
+                aria-describedby={message ? feedbackId : undefined}
                 disabled={testing}
                 className="px-4 py-2 border border-gray-600 text-gray-300 rounded-md hover:border-blue-500 hover:text-white disabled:opacity-50 text-sm font-medium"
               >
@@ -271,12 +275,12 @@ function NotificationsConfig() {
             )}
           </div>
           {message && (
-            <p className={`text-xs mt-1 ${message.includes('fail') ? 'text-red-400' : 'text-green-400'}`}>
-              {message}
+            <p id={feedbackId} role={message.type === 'error' ? 'alert' : 'status'} className={`text-xs mt-1 ${message.type === 'error' ? 'text-red-400' : 'text-green-400'}`}>
+              {message.text}
             </p>
           )}
         </div>
-        <p className="text-xs text-gray-500">
+        <p className="text-xs text-gray-300">
           Notifications will be sent for: sync activity, errors, circuit breaker alerts, imports, branch pair changes, and path violations.
           No-change sync cycles are automatically filtered out.
         </p>

@@ -1,3 +1,5 @@
+import { useId } from 'react';
+import Dialog from '../components/Dialog';
 import { useViewMutation as useMutation, useViewOwnership } from '../useViewMutation';
 import { clientSession, sessionFetch } from '../session';
 import { canConfirmObservedSkip, runObservedSkip, latestScopedSkipObservation, type ScopedSkipObservation } from '../statusActions';
@@ -108,6 +110,7 @@ export default function RepoDetail() {
 }
 
 function RepositoryDetailEditor() {
+  const fieldId = useId();
   const view = useViewOwnership();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -153,6 +156,32 @@ function RepositoryDetailEditor() {
     auto_create_svn_branch: true,
     auto_create_git_branch: true,
   });
+  const gitBranchValidation = (() => {
+    const v = branchForm.git_branch;
+    const invalid = /[^a-zA-Z0-9._/-]/.test(v);
+    const traversal = v.includes('..');
+    const doubleSlash = v.includes('//');
+    const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
+    const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
+    return {
+      error: !v ? null : invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
+        : traversal ? 'Must not contain ".."'
+        : doubleSlash ? 'Must not contain "//"'
+        : badEdges ? 'Must not start/end with "/" or start with "-"'
+        : reserved ? 'Reserved name not allowed' : null,
+      // Preserve the existing preview refusal contract, independently of presentation.
+      previewRefused: !v.trim() || invalid || traversal || doubleSlash || badEdges || v === 'HEAD' || v.endsWith('.lock'),
+    };
+  })();
+  const svnBranchValidation = (() => {
+    const v = branchForm.svn_branch;
+    const invalid = /[^a-zA-Z0-9._/-]/.test(v);
+    const traversal = v.includes('..');
+    return {
+      error: !v ? null : invalid ? 'Invalid characters' : traversal ? 'Must not contain ".."' : null,
+      previewRefused: !v.trim() || invalid || traversal,
+    };
+  })();
   const [branchSuccess, setBranchSuccess] = useState(false);
   const [branchPlan, setBranchPlan] = useState<LatePairPlan | null>(null);
   const [refreshPlan, setRefreshPlan] = useState<PairRefreshPlan | null>(null);
@@ -885,7 +914,7 @@ function RepositoryDetailEditor() {
 
       {/* Mutation errors */}
       {syncMutation.isError && (
-        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm">
+        <div className="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-300 text-sm" role="alert">
           Failed to trigger sync: {syncMutation.error?.message}
         </div>
       )}
@@ -908,13 +937,13 @@ function RepositoryDetailEditor() {
                 <FieldInput label="Branch" value={form.svn_branch} onChange={(v) => setField('svn_branch', v)} />
                 <FieldInput label="Username" value={form.svn_username} onChange={(v) => setField('svn_username', v)} />
                 <div>
-                  <label className="block text-sm text-gray-400 mb-1">SVN Password</label>
+                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-1`}>SVN Password</label>
                   <input
                     type="password"
                     className={inputClass}
                     value={form.svn_password}
                     onChange={(e) => setField('svn_password', e.target.value)}
-                    placeholder={credStatus?.svn_password_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter password'}
+                    placeholder={credStatus?.svn_password_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter password'} id={`${fieldId}-1`}
                   />
                 </div>
                 <button
@@ -965,13 +994,13 @@ function RepositoryDetailEditor() {
                 <FieldInput label="Repository" value={form.git_repo} onChange={(v) => setField('git_repo', v)} placeholder="owner/repo" />
                 <FieldInput label="Default Branch" value={form.git_branch} onChange={(v) => setField('git_branch', v)} />
                 <div>
-                  <label className="block text-sm text-gray-400 mb-1">Git Token</label>
+                  <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-2`}>Git Token</label>
                   <input
                     type="password"
                     className={inputClass}
                     value={form.git_token}
                     onChange={(e) => setField('git_token', e.target.value)}
-                    placeholder={credStatus?.git_token_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter token'}
+                    placeholder={credStatus?.git_token_set ? '\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF\u25CF (saved)' : 'Enter token'} id={`${fieldId}-2`}
                   />
                 </div>
                 <button
@@ -1023,26 +1052,26 @@ function RepositoryDetailEditor() {
             <FieldToggle label="Auto Merge" checked={form.auto_merge} onChange={(v) => setField('auto_merge', v)} />
             <div className="col-span-full grid grid-cols-2 gap-4">
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Allowed SVN Paths <span className="text-gray-600">(one per line)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-3`}>Allowed SVN Paths <span className="text-gray-600">(one per line)</span></label>
                 <textarea
                   className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   rows={3}
                   value={form.allowed_paths}
                   onChange={(e) => setField('allowed_paths', e.target.value)}
-                  placeholder={"source/\nconfig/"}
+                  placeholder={"source/\nconfig/"} id={`${fieldId}-3`}
                 />
-                <p className="text-xs text-gray-500 mt-1">Files must be under these path prefixes. Leave empty for no restriction.</p>
+                <p className="text-xs text-gray-300 mt-1">Files must be under these path prefixes. Leave empty for no restriction.</p>
               </div>
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Blocked Patterns <span className="text-gray-600">(one per line)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-4`}>Blocked Patterns <span className="text-gray-600">(one per line)</span></label>
                 <textarea
                   className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   rows={3}
                   value={form.blocked_patterns}
                   onChange={(e) => setField('blocked_patterns', e.target.value)}
-                  placeholder={"*.exe\ntemp/"}
+                  placeholder={"*.exe\ntemp/"} id={`${fieldId}-4`}
                 />
-                <p className="text-xs text-gray-500 mt-1">Files matching these patterns will be excluded from SVN sync.</p>
+                <p className="text-xs text-gray-300 mt-1">Files matching these patterns will be excluded from SVN sync.</p>
               </div>
             </div>
           </div>
@@ -1140,9 +1169,9 @@ function RepositoryDetailEditor() {
       )}
 
       {showSkipModal && skipContextEnabled && skipContext && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" data-testid="skip-commit-modal">
+        <Dialog title="Skip selected pending commits" description="Only the selected observed pending prefix will be excluded. Unselected work stays pending." onClose={() => { setShowSkipModal(false); setSkipError(null); }} busy={skipMutation.isPending} testId="skip-commit-modal">
           <div className="bg-gray-800 border border-gray-600 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">Skip selected pending commits</h3>
+
             <p className="text-sm text-gray-400 mb-4">
               Select the oldest contiguous pending prefix to exclude. Unselected commits remain pending.
               Observed remote tip: <span className="font-mono text-gray-300">{skipContext.observed_remote_tip?.slice(0, 12) ?? 'unavailable'}</span>
@@ -1163,13 +1192,13 @@ function RepositoryDetailEditor() {
                 </label>
               ))}
             </div>
-            {skipError && <p className="text-sm text-red-400 mb-3">{skipError}</p>}
+            {skipError && <p className="text-sm text-red-400 mb-3" role="alert">{skipError}</p>}
             <div className="flex justify-end gap-2">
               <button
                 type="button"
                 onClick={() => { setShowSkipModal(false); setSkipError(null); }}
                 className="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-sm text-gray-200"
-              >
+               data-dialog-cancel disabled={skipMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -1182,13 +1211,13 @@ function RepositoryDetailEditor() {
                   const selected = pending.slice(0, skipSelectedCount).map((c) => c.sha);
                   skipMutation.mutate(selected);
                 }}
-                className="px-3 py-1.5 rounded-lg bg-yellow-600 hover:bg-yellow-700 disabled:opacity-50 text-sm text-white font-medium"
+                className="px-3 py-1.5 rounded-lg bg-yellow-700 hover:bg-yellow-800 disabled:opacity-50 text-sm text-white font-medium"
               >
                 {skipMutation.isPending ? 'Skipping…' : 'Skip selected'}
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       <StatusObservationPanel view={statusView}/>
@@ -1213,7 +1242,7 @@ function RepositoryDetailEditor() {
           title="Active Conflicts"
           value={statusView.metric('active_conflicts')}
           color={status?.active_conflicts ? 'red' : 'gray'}
-          onClick={() => navigate('/conflicts')}
+          to="/conflicts"
         />
         <StatusCard
           title="Errors (24h)"
@@ -1224,7 +1253,7 @@ function RepositoryDetailEditor() {
               ? `Last: ${formatTimeAgo(errorCard.lastErrorAt)}`
               : errorCard.description
           }
-          onClick={() => navigate(`/audit?success=false&repo_id=${id}`)}
+          to={`/audit?success=false&repo_id=${id}`}
           action={
             <ErrorAcknowledgement key={id ?? 'all'} scope={errorScope(id)}
               repositoryName={repo?.name ?? id ?? ''} observation={errorCard.observation}
@@ -1348,18 +1377,18 @@ function RepositoryDetailEditor() {
                     <React.Fragment key={group.key}>
                       <tr
                         className={`hover:bg-gray-700/50 ${isGroup ? 'cursor-pointer' : ''}`}
-                        onClick={() => {
+
+                      >
+                        <td className="px-6 py-3">
+                          <div className="flex items-center space-x-1">
+                            {isGroup && <button type="button" onClick={() => {
                           if (!isGroup) return;
                           setExpandedAuditGroups(prev => {
                             const next = new Set(prev);
                             if (next.has(group.key)) next.delete(group.key); else next.add(group.key);
                             return next;
                           });
-                        }}
-                      >
-                        <td className="px-6 py-3">
-                          <div className="flex items-center space-x-1">
-                            {isGroup && <span className="text-gray-500 text-xs">{isGrpExpanded ? '\u25BE' : '\u25B8'}</span>}
+                        }} aria-expanded={isGrpExpanded} aria-label={`Audit group: ${latest.action}, ${group.entries.length} entries`} className="text-blue-300 underline">{isGrpExpanded ? 'Hide group' : 'Show group'}</button>}
                             {latest.success ? (
                               <CheckCircle className="w-4 h-4 text-green-400" />
                             ) : (
@@ -1380,9 +1409,7 @@ function RepositoryDetailEditor() {
                         <td className="px-6 py-3 text-sm text-gray-300">{latest.author ?? '-'}</td>
                         <td className="px-6 py-3 text-sm text-gray-400">
                           <div>
-                            <span
-                              className={isLong ? 'cursor-pointer hover:text-gray-200' : ''}
-                              onClick={(e) => {
+                            {isLong ? <button type="button" onClick={(e) => {
                                 if (!isLong) return;
                                 e.stopPropagation();
                                 setExpandedDetails(prev => {
@@ -1390,10 +1417,7 @@ function RepositoryDetailEditor() {
                                   if (next.has(latest.id)) next.delete(latest.id); else next.add(latest.id);
                                   return next;
                                 });
-                              }}
-                            >
-                              {isDetExpanded ? detailText : (isLong ? `${detailText.substring(0, 80)}...` : detailText)}
-                            </span>
+                              }} aria-expanded={isDetExpanded} className="text-left text-blue-300 underline">{isDetExpanded ? detailText : (isLong ? `${detailText.substring(0, 80)}...` : detailText)}</button> : <span>{detailText}</span>}
                             {isDetExpanded && (
                               <pre className="mt-2 p-3 bg-gray-900 rounded text-xs font-mono text-gray-300 whitespace-pre-wrap break-words max-w-lg">
                                 {detailText}
@@ -1401,7 +1425,7 @@ function RepositoryDetailEditor() {
                             )}
                           </div>
                         </td>
-                        <td className="px-6 py-3 text-sm text-gray-500">
+                        <td className="px-6 py-3 text-sm text-gray-300">
                           {new Date(latest.created_at).toLocaleString()}
                         </td>
                       </tr>
@@ -1410,7 +1434,7 @@ function RepositoryDetailEditor() {
                           <td className="px-6 py-2"></td>
                           <td className="px-6 py-2"><ActionBadge action={entry.action} /></td>
                           <td className="px-6 py-2 text-sm text-gray-400">{entry.author ?? '-'}</td>
-                          <td className="px-6 py-2 text-sm text-gray-500 truncate max-w-[300px]">{entry.details || entry.action}</td>
+                          <td className="px-6 py-2 text-sm text-gray-300 truncate max-w-[300px]">{entry.details || entry.action}</td>
                           <td className="px-6 py-2 text-sm text-gray-600">{new Date(entry.created_at).toLocaleString()}</td>
                         </tr>
                       ))}
@@ -1488,7 +1512,7 @@ function RepositoryDetailEditor() {
                 <p className="text-amber-200">Conflicts: {refreshPlan.conflicts.join(', ')}. Resolution is not in this slice.</p>
               )}
               <p>{refreshPlan.intended_result.summary}</p>
-              <p className="text-xs text-gray-500">
+              <p className="text-xs text-gray-300">
                 Discards unsynced work: {String(refreshPlan.intended_result.discards_unsynced_work)}. Execute: {refreshPlan.execute_status}. Re-anchor: {refreshPlan.reanchor_status}.
               </p>
             </div>
@@ -1542,10 +1566,9 @@ function RepositoryDetailEditor() {
                   <tr
                     key={bp.id}
                     data-testid={`branch-pair-row-${bp.id}`}
-                    onClick={() => navigate(`/repos/${bp.id}`)}
                     className="hover:bg-gray-700/50 cursor-pointer transition-colors"
                   >
-                    <td className="px-6 py-3 text-sm text-gray-200 font-medium">{bp.name}</td>
+                    <td className="px-6 py-3 text-sm text-gray-200 font-medium"><Link to={`/repos/${bp.id}`} className="text-blue-300 underline">{bp.name}</Link></td>
                     <td className="px-6 py-3 text-sm font-mono text-blue-400">{bp.svn_branch}</td>
                     <td className="px-6 py-3 text-sm font-mono text-purple-400">{bp.git_branch}</td>
                     <td className="px-6 py-3">
@@ -1591,7 +1614,7 @@ function RepositoryDetailEditor() {
                               setRemoveBranchOpts({ delete_git: false, delete_svn: false });
                               removeMutation.reset();
                             }}
-                            className="text-gray-500 hover:text-red-400 transition-colors p-1"
+                            className="text-gray-300 hover:text-red-400 transition-colors p-1"
                             title="Delete branch pair"
                           >
                             <Trash2 className="w-4 h-4" />
@@ -1611,20 +1634,20 @@ function RepositoryDetailEditor() {
 
       {/* Add Branch Pair Modal */}
       {showBranchModal && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <Dialog title="Preview Branch Pair" description="Review the branch identity and pairing mode before requesting a preview." onClose={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }} busy={branchMutation.isPending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="flex items-center justify-between p-6 border-b border-gray-700">
-              <h2 className="text-lg font-semibold text-gray-100">Preview Branch Pair</h2>
+
               <button
                 onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="text-gray-400 hover:text-gray-200 transition-colors"
-              >
+               aria-label="Close dialog" data-dialog-cancel disabled={branchMutation.isPending}>
                 <X className="w-5 h-5" />
               </button>
             </div>
             <div className="p-6 space-y-4">
               {branchMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm">
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" role="alert">
                   Pairing refused: {branchMutation.error?.message}
                 </div>
               )}
@@ -1643,14 +1666,14 @@ function RepositoryDetailEditor() {
 
               {/* Parent context */}
               <div className="bg-gray-900/50 border border-gray-700/50 rounded-lg px-3 py-2 text-xs text-gray-400">
-                <span className="text-gray-500">Branching from:</span>{' '}
+                <span className="text-gray-300">Branching from:</span>{' '}
                 <span className="text-blue-400 font-mono">{repo?.svn_branch || 'trunk'}</span>
                 {' \u2192 '}
                 <span className="text-purple-400 font-mono">{repo?.git_branch || 'main'}</span>
               </div>
 
               <div>
-                <label className="block text-sm text-gray-400 mb-1">Branch Name <span className="text-gray-600 text-xs">({branchForm.git_branch.length}/200)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-5`}>Branch Name <span className="text-gray-300 text-xs">({branchForm.git_branch.length}/200)</span></label>
                 <input
                   type="text"
                   className={inputClass}
@@ -1664,43 +1687,25 @@ function RepositoryDetailEditor() {
                       svn_branch: name ? `branches/${name}` : '',
                     }));
                   }}
-                  placeholder="e.g., fix-123, dev/james-wilson"
+                  placeholder="e.g., fix-123, dev/james-wilson" id={`${fieldId}-5`}
+                  aria-invalid={gitBranchValidation.error ? true : undefined}
+                  aria-describedby={gitBranchValidation.error ? `${fieldId}-git-branch-error` : undefined}
                 />
-                {(() => {
-                  const v = branchForm.git_branch;
-                  if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
-                  const hasTraversal = v.includes('..');
-                  const hasDoubleSlash = v.includes('//');
-                  const badEdges = v.startsWith('/') || v.endsWith('/') || v.startsWith('-');
-                  const reserved = v === 'HEAD' || v.startsWith('refs/') || v.endsWith('.lock');
-                  const err = invalid ? 'Invalid characters (use letters, numbers, . _ - / only)'
-                    : hasTraversal ? 'Must not contain ".."'
-                    : hasDoubleSlash ? 'Must not contain "//"'
-                    : badEdges ? 'Must not start/end with "/" or start with "-"'
-                    : reserved ? 'Reserved name not allowed'
-                    : null;
-                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
-                })()}
+                {gitBranchValidation.error && <p id={`${fieldId}-git-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{gitBranchValidation.error}</p>}
               </div>
               <div>
-                <label className="block text-sm text-gray-400 mb-1">SVN Branch Path <span className="text-gray-600">(auto-derived, editable)</span></label>
+                <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-6`}>SVN Branch Path <span className="text-gray-300">(auto-derived, editable)</span></label>
                 <input
                   type="text"
                   className={inputClass}
                   value={branchForm.svn_branch}
                   maxLength={200}
                   onChange={(e) => setBranchForm(prev => ({ ...prev, svn_branch: e.target.value }))}
-                  placeholder="branches/fix-123"
+                  placeholder="branches/fix-123" id={`${fieldId}-6`}
+                  aria-invalid={svnBranchValidation.error ? true : undefined}
+                  aria-describedby={svnBranchValidation.error ? `${fieldId}-svn-branch-error` : undefined}
                 />
-                {(() => {
-                  const v = branchForm.svn_branch;
-                  if (!v) return null;
-                  const invalid = /[^a-zA-Z0-9._/-]/.test(v);
-                  const hasTraversal = v.includes('..');
-                  const err = invalid ? 'Invalid characters' : hasTraversal ? 'Must not contain ".."' : null;
-                  return err ? <p className="mt-1 text-xs text-red-400">{err}</p> : null;
-                })()}
+                {svnBranchValidation.error && <p id={`${fieldId}-svn-branch-error`} role="alert" className="mt-1 text-xs text-red-400">{svnBranchValidation.error}</p>}
               </div>
 
               {/* Auto-create options */}
@@ -1712,7 +1717,7 @@ function RepositoryDetailEditor() {
                     onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_svn_branch: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-blue-600"
                   />
-                  <span className="text-sm text-gray-300">Create SVN branch <span className="text-gray-500">(svn copy)</span></span>
+                  <span className="text-sm text-gray-300">Create SVN branch <span className="text-gray-300">(svn copy)</span></span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
@@ -1721,14 +1726,14 @@ function RepositoryDetailEditor() {
                     onChange={(e) => setBranchForm(prev => ({ ...prev, auto_create_git_branch: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-purple-600"
                   />
-                  <span className="text-sm text-gray-300">Create Git branch <span className="text-gray-500">(from {repo?.git_branch || 'main'})</span></span>
+                  <span className="text-sm text-gray-300">Create Git branch <span className="text-gray-300">(from {repo?.git_branch || 'main'})</span></span>
                 </label>
               </div>
 
               {/* Import mode */}
               <div>
-                <label className="block text-sm text-gray-400 mb-2">Pairing mode</label>
-                <div className="space-y-2">
+                <p id="pairing-mode-label" className="block text-sm text-gray-400 mb-2">Pairing mode</p>
+                <div role="radiogroup" aria-labelledby="pairing-mode-label" className="space-y-2">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
                       type="radio"
@@ -1737,7 +1742,7 @@ function RepositoryDetailEditor() {
                       onChange={() => setBranchForm(prev => ({ ...prev, skip_import: false }))}
                       className="text-blue-600"
                     />
-                    <span className="text-sm text-gray-300">Preview from verified SVN baseline <span className="text-gray-500">(this slice)</span></span>
+                    <span className="text-sm text-gray-300">Preview from verified SVN baseline <span className="text-gray-300">(this slice)</span></span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
@@ -1756,17 +1761,12 @@ function RepositoryDetailEditor() {
               <button
                 onClick={() => { setShowBranchModal(false); setBranchForm({ svn_branch: '', git_branch: '', skip_import: false, auto_create_svn_branch: true, auto_create_git_branch: true }); setBranchPlan(null); branchMutation.reset(); }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={branchMutation.isPending}>
                 Cancel
               </button>
               <button
                 onClick={() => branchMutation.mutate(branchForm)}
-                disabled={branchMutation.isPending || !branchForm.svn_branch.trim() || !branchForm.git_branch.trim()
-                  || /[^a-zA-Z0-9._/-]/.test(branchForm.git_branch) || /[^a-zA-Z0-9._/-]/.test(branchForm.svn_branch)
-                  || branchForm.git_branch.includes('..') || branchForm.svn_branch.includes('..')
-                  || branchForm.git_branch.includes('//') || branchForm.git_branch.startsWith('/') || branchForm.git_branch.endsWith('/')
-                  || branchForm.git_branch.startsWith('-') || branchForm.git_branch === 'HEAD' || branchForm.git_branch.endsWith('.lock')
-                }
+                disabled={branchMutation.isPending || gitBranchValidation.previewRefused || svnBranchValidation.previewRefused}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
               >
                 <GitBranch className="w-4 h-4" />
@@ -1774,7 +1774,7 @@ function RepositoryDetailEditor() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Server Monitor */}
@@ -1788,14 +1788,14 @@ function RepositoryDetailEditor() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-gray-300 font-medium">Reset & Reimport</p>
-                <p className="text-sm text-gray-500 mt-0.5">Unavailable during safe import cancellation. Request a reviewed recovery plan for an existing repository.</p>
+                <p className="text-sm text-gray-300 mt-0.5">Unavailable during safe import cancellation. Request a reviewed recovery plan for an existing repository.</p>
               </div>
             </div>
             {!repo?.parent_id && (
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm text-gray-300 font-medium">Pause / disable sync (explicit API)</p>
-                  <p className="text-sm text-gray-500 mt-0.5">
+                  <p className="text-sm text-gray-300 mt-0.5">
                     Calls POST /disable (same contract as legacy DELETE). Stops scheduling; registration,
                     mappings, secrets, local files, and remotes stay. The header toggle only updates
                     enabled on the registration.
@@ -1816,7 +1816,7 @@ function RepositoryDetailEditor() {
                 <p className="text-sm text-gray-300 font-medium">
                   {repo?.parent_id ? 'Remove branch pair' : 'Remove from RepoSync'}
                 </p>
-                <p className="text-sm text-gray-500 mt-0.5">
+                <p className="text-sm text-gray-300 mt-0.5">
                   {repo?.parent_id
                     ? 'Remove this pair from RepoSync. Remote Git/SVN deletion is opt-in in the dialog.'
                     : 'Stop work, clean only owned local data, and drop the registration from active views. Remotes and history stay unless you separately authorize branch deletion.'}
@@ -1860,15 +1860,15 @@ function RepositoryDetailEditor() {
       )}
 
       {showDisableConfirm && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+        <Dialog title="Pause / disable sync" description="Disable syncing without removing data or changing remotes." onClose={() => setShowDisableConfirm(false)} busy={disableMutation.isPending}>
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">Pause / disable sync</h3>
+
             <p className="text-sm text-gray-400 mb-6">
               Disable <span className="font-semibold text-gray-200">{repo.name}</span>? This does not remove
               data or touch remotes. You can re-enable later.
             </p>
             {disableMutation.isError && (
-              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4">
+              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
                 Failed to disable: {disableMutation.error?.message}
               </div>
             )}
@@ -1876,7 +1876,7 @@ function RepositoryDetailEditor() {
               <button
                 onClick={() => setShowDisableConfirm(false)}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={disableMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -1889,15 +1889,20 @@ function RepositoryDetailEditor() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {branchPairDeleteSubject && (
-        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" data-testid="delete-branch-modal">
+        <Dialog title="Delete branch pair" description="Review dependency and remote-deletion choices. Remote deletion is off by default." onClose={() => {
+                  setBranchPairDeleteTarget(null);
+                  setBranchPairDeleteError(null);
+                  setRemoveConfirmText('');
+                  removeMutation.reset();
+                }} busy={removeMutation.isPending} testId="delete-branch-modal">
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="p-6 space-y-4">
               {removeMutation.isError && (
-                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error">
+                <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error" role="alert">
                   {removeMutation.error?.message}
                 </div>
               )}
@@ -1952,7 +1957,7 @@ function RepositoryDetailEditor() {
                 </div>
               )}
               {branchPairPreviewQuery.isError && (
-                <div className="text-sm text-red-300 space-y-2">
+                <div className="text-sm text-red-300 space-y-2" role="alert">
                   <p data-testid="branch-removal-preview-error">
                     Could not load dependency preview: {branchPairPreviewQuery.error?.message}
                   </p>
@@ -1979,23 +1984,23 @@ function RepositoryDetailEditor() {
                     data-testid="delete-git-opt"
                     onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_git: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
-                  <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-500 font-mono">({branchPairDeleteSubject.git_branch})</span></span>
+                  <span className="text-sm text-gray-300">Delete Git branch <span className="text-gray-300 font-mono">({branchPairDeleteSubject.git_branch})</span></span>
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={removeBranchOpts.delete_svn}
                     data-testid="delete-svn-opt"
                     onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_svn: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
-                  <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-500 font-mono">({branchPairDeleteSubject.svn_branch})</span></span>
+                  <span className="text-sm text-gray-300">Delete SVN branch <span className="text-gray-300 font-mono">({branchPairDeleteSubject.svn_branch})</span></span>
                 </label>
               </div>
               <div>
-                <p className="text-sm text-gray-400 mb-2">
+                <label htmlFor="branch-removal-name" className="block text-sm text-gray-400 mb-2">
                   Type <span className="font-mono text-yellow-300">{branchPairDeleteSubject.git_branch}</span> to confirm:
-                </p>
+                </label>
                 <input
                   type="text"
-                  data-testid="delete-branch-confirm-input"
+                  id="branch-removal-name" data-testid="delete-branch-confirm-input"
                   className="w-full bg-gray-700 border border-gray-600 rounded-md px-3 py-2 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-red-500"
                   value={removeConfirmText}
                   onChange={(e) => setRemoveConfirmText(e.target.value)}
@@ -2013,7 +2018,7 @@ function RepositoryDetailEditor() {
                   removeMutation.reset();
                 }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={removeMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -2032,16 +2037,17 @@ function RepositoryDetailEditor() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {showRemoveConfirm && removalSubject && !branchPairDeleteSubject && (
-        <div
-          className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
-          data-testid="managed-remove-modal"
-        >
+        <Dialog title={removalConfirmLabel} description="Remove the managed registration and owned local data. Remote history is preserved." onClose={() => {
+                  setShowRemoveConfirm(false);
+                  setRemovalTarget(null);
+                  setRemoveConfirmText('');
+                }} busy={removeMutation.isPending} testId="managed-remove-modal">
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
-            <h3 className="text-lg font-semibold text-gray-100 mb-2">{removalConfirmLabel}</h3>
+
             <p className="text-sm text-gray-400 mb-4">
               Remove <span className="font-semibold text-gray-200">{removalSubject.name}</span> from active listings and
               clean only RepoSync-owned local data. Remote Git and SVN history are not modified by this action.
@@ -2123,7 +2129,7 @@ function RepositoryDetailEditor() {
               </div>
             )}
             {removalPreviewQuery.isError && (
-              <div className="text-sm text-red-300 mb-4 space-y-2">
+              <div className="text-sm text-red-300 mb-4 space-y-2" role="alert">
                 <p data-testid="removal-preview-error">
                   Could not load dependency preview: {removalPreviewQuery.error?.message}
                 </p>
@@ -2142,7 +2148,7 @@ function RepositoryDetailEditor() {
               </div>
             )}
             {removeMutation.isError && (
-              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4">
+              <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm mb-4" role="alert">
                 {removeMutation.error?.message}
               </div>
             )}
@@ -2155,7 +2161,7 @@ function RepositoryDetailEditor() {
                   setRemoveConfirmText('');
                 }}
                 className="px-4 py-2 rounded-lg border border-gray-600 text-gray-300 hover:text-white text-sm font-medium transition-colors"
-              >
+               data-dialog-cancel disabled={removeMutation.isPending}>
                 Cancel
               </button>
               <button
@@ -2172,7 +2178,7 @@ function RepositoryDetailEditor() {
               </button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
     </div>
@@ -2201,15 +2207,16 @@ function FieldInput({
   onChange: (v: string) => void;
   placeholder?: string;
 }) {
+  const fieldId = useId();
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
+      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-7`}>{label}</label>
       <input
         type="text"
         className={inputClass}
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
+        placeholder={placeholder} id={`${fieldId}-7`}
       />
     </div>
   );
@@ -2226,15 +2233,16 @@ function FieldNumber({
   onChange: (v: number) => void;
   min?: number;
 }) {
+  const fieldId = useId();
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
+      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-8`}>{label}</label>
       <input
         type="number"
         className={inputClass}
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}
-        min={min}
+        min={min} id={`${fieldId}-8`}
       />
     </div>
   );
@@ -2251,10 +2259,11 @@ function FieldSelect({
   options: { value: string; label: string }[];
   onChange: (v: string) => void;
 }) {
+  const fieldId = useId();
   return (
     <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
-      <select className={selectClass} value={value} onChange={(e) => onChange(e.target.value)}>
+      <label className="block text-sm text-gray-400 mb-1" htmlFor={`${fieldId}-9`}>{label}</label>
+      <select className={selectClass} value={value} onChange={(e) => onChange(e.target.value)} id={`${fieldId}-9`}>
         {options.map((o) => (
           <option key={o.value} value={o.value}>
             {o.label}
@@ -2265,33 +2274,13 @@ function FieldSelect({
   );
 }
 
-function FieldToggle({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: (v: boolean) => void;
-}) {
-  return (
-    <div>
-      <label className="block text-sm text-gray-400 mb-1">{label}</label>
-      <button
-        type="button"
-        onClick={() => onChange(!checked)}
-        className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors mt-1 ${
-          checked ? 'bg-blue-600' : 'bg-gray-600'
-        }`}
-      >
-        <span
-          className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-            checked ? 'translate-x-6' : 'translate-x-1'
-          }`}
-        />
-      </button>
-    </div>
-  );
+function FieldToggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+  const fieldId = useId();
+  return <div>
+    <label htmlFor={fieldId} className="block text-sm text-gray-300 mb-1">{label}</label>
+    <input id={fieldId} type="checkbox" checked={checked} onChange={event => onChange(event.target.checked)}
+      className="h-5 w-5 rounded border-gray-500 accent-blue-500" />
+  </div>;
 }
 
 function StatCard({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
@@ -2310,14 +2299,14 @@ function StatusCard({
   title,
   value,
   color,
-  onClick,
+  to,
   subtitle,
   action,
 }: {
   title: string;
   value: string;
   color: string;
-  onClick?: () => void;
+  to?: string;
   subtitle?: string;
   action?: React.ReactNode;
 }) {
@@ -2329,21 +2318,20 @@ function StatusCard({
     gray: 'bg-gray-800 border-gray-700',
   };
 
-  const clickableClasses = onClick
+  const clickableClasses = to
     ? 'cursor-pointer hover:border-blue-500/50 transition-colors'
     : '';
 
   return (
     <div
       className={`rounded-lg border p-4 ${colorClasses[color] ?? colorClasses.gray} ${clickableClasses}`}
-      onClick={onClick}
     >
       <div className="flex items-center justify-between">
-        <p className="text-sm text-gray-400">{title}</p>
+        {to ? <Link to={to} className="text-sm text-blue-300 underline">{title}</Link> : <p className="text-sm text-gray-400">{title}</p>}
         {action}
       </div>
       <p className="text-2xl font-bold capitalize text-gray-100">{value}</p>
-      {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
+      {subtitle && <p className="text-xs text-gray-300 mt-1">{subtitle}</p>}
     </div>
   );
 }
@@ -2361,6 +2349,7 @@ function SyncRecordRow({ record }: { record: SyncRecord }) {
   return (
     <div>
       <button
+        aria-expanded={expanded}
         onClick={() => setExpanded(!expanded)}
         className="w-full px-6 py-3 flex items-center justify-between hover:bg-gray-700/50 text-left transition-colors"
       >
@@ -2379,7 +2368,7 @@ function SyncRecordRow({ record }: { record: SyncRecord }) {
           {record.git_sha && (
             <span className="text-xs font-mono text-purple-400">{record.git_sha.substring(0, 8)}</span>
           )}
-          <span className="text-xs text-gray-500">
+          <span className="text-xs text-gray-300">
             {new Date(record.synced_at).toLocaleString()}
           </span>
           <ChevronDown
@@ -2392,38 +2381,38 @@ function SyncRecordRow({ record }: { record: SyncRecord }) {
           <div className="bg-gray-900 rounded-lg p-4 border border-gray-700">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 text-sm">
               <div>
-                <span className="text-gray-500 text-xs uppercase">Record ID</span>
+                <span className="text-gray-300 text-xs uppercase">Record ID</span>
                 <p className="font-mono text-gray-300 truncate">{record.id}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">SVN Revision</span>
+                <span className="text-gray-300 text-xs uppercase">SVN Revision</span>
                 <p className="font-mono text-blue-400">{record.svn_rev ? `r${record.svn_rev}` : 'N/A'}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Git SHA</span>
+                <span className="text-gray-300 text-xs uppercase">Git SHA</span>
                 <p className="font-mono text-purple-400">{record.git_sha || 'N/A'}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Status</span>
+                <span className="text-gray-300 text-xs uppercase">Status</span>
                 <p className={statusColor + ' font-medium capitalize'}>{record.status}</p>
               </div>
             </div>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
               <div>
-                <span className="text-gray-500 text-xs uppercase">Author</span>
+                <span className="text-gray-300 text-xs uppercase">Author</span>
                 <p className="text-gray-300">{record.author}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Committed</span>
+                <span className="text-gray-300 text-xs uppercase">Committed</span>
                 <p className="text-gray-300">{new Date(record.timestamp).toLocaleString()}</p>
               </div>
               <div>
-                <span className="text-gray-500 text-xs uppercase">Synced At</span>
+                <span className="text-gray-300 text-xs uppercase">Synced At</span>
                 <p className="text-gray-300">{new Date(record.synced_at).toLocaleString()}</p>
               </div>
             </div>
             <div className="mt-4">
-              <span className="text-gray-500 text-xs uppercase">Commit Message</span>
+              <span className="text-gray-300 text-xs uppercase">Commit Message</span>
               <div className="mt-1 bg-gray-800 rounded p-3 border border-gray-700">
                 <pre className="text-sm text-gray-200 whitespace-pre-wrap font-mono">{record.message}</pre>
               </div>
