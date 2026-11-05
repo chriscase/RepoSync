@@ -213,6 +213,7 @@ fn import_config() -> ImportConfig {
 
 #[tokio::test]
 async fn managed_imports_tag_commit_map_repo_id() {
+    let _serial = managed_import_test_lock().lock().await;
     if !toolchain_available() {
         eprintln!("SKIPPED: svn/svnadmin/git not found in PATH");
         return;
@@ -373,6 +374,7 @@ enum SnapshotGitPayload {
 }
 
 async fn snapshot_continuation(fail_checkpoint: bool, payload: SnapshotGitPayload) {
+    let _serial = managed_import_test_lock().lock().await;
     assert!(toolchain_available(), "real SVN/Git tools are required");
     let tmp = TempDir::new().unwrap();
     let svn_url = create_svn_repo(tmp.path());
@@ -779,6 +781,7 @@ fn checked_git(workdir: &Path, args: &[&str]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rs68_snapshot_real_lfs_publication_fetch_and_missing_object_verification() {
     use sha2::{Digest, Sha256};
+    let _serial = managed_import_test_lock().lock().await;
     assert!(toolchain_available(), "real SVN/Git tools are required");
     let available = Command::new("git")
         .args(["lfs", "version"])
@@ -1057,6 +1060,7 @@ token_env = "RS68_SYNTHETIC_UNUSED"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rs68_cancel_before_snapshot_effects_preserves_uninitialized_target_across_reopen() {
     use reposync_core::db::import_operations::ImportOperationState;
+    let _serial = managed_import_test_lock().lock().await;
     assert!(toolchain_available(), "real SVN/Git tools are required");
     let tmp = TempDir::new().unwrap();
     let svn_url = create_svn_repo(tmp.path());
@@ -1165,4 +1169,12 @@ async fn rs68_cancel_before_snapshot_effects_preserves_uninitialized_target_acro
         .unwrap()
         .find_reference("refs/heads/main")
         .is_err());
+}
+
+// WriterFenceGuard owns one process-wide local identity, even when the fixture
+// databases are distinct. Keep each fixture's lease, asynchronous work and guard
+// destruction inside one lifetime; libtest may still schedule tests in parallel.
+fn managed_import_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
 }
