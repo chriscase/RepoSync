@@ -9732,8 +9732,159 @@ async fn candidate_rsc03_success_stores_observed_not_intended_svn_tree() {
 // RS-C02 / #89: projected changeset before SVN WC mutation
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
+struct Rsc02WorkingCopyProbeState {
+    working_copy: Option<PathBuf>,
+    filtered: Vec<Option<std::process::Output>>,
+}
+
+/// Observe the real reused WC at the existing all-filtered event, while its
+/// TempDir is still alive. This never changes engine behavior or WC contents.
+#[derive(Clone, Default)]
+struct Rsc02WorkingCopyProbe(Arc<std::sync::Mutex<Rsc02WorkingCopyProbeState>>);
+
+#[derive(Default)]
+struct Rsc02EventFields {
+    message: String,
+    working_copy: Option<PathBuf>,
+}
+
+impl tracing::field::Visit for Rsc02EventFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "wc_path" => self.working_copy = Some(PathBuf::from(format!("{value:?}"))),
+            _ => {}
+        }
+    }
+}
+
+impl tracing::Subscriber for Rsc02WorkingCopyProbe {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = Rsc02EventFields::default();
+        event.record(&mut fields);
+        let mut state = self.0.lock().unwrap();
+        if fields
+            .message
+            .contains("checking out SVN HEAD into temp working copy")
+        {
+            state.working_copy = Some(
+                fields
+                    .working_copy
+                    .expect("checkout event must identify WC"),
+            );
+        }
+        if fields
+            .message
+            .contains("skipping entire commit: all files are outside the active projection")
+        {
+            let status = state.working_copy.as_ref().map(|wc| {
+                assert!(
+                    wc.join(".svn").is_dir(),
+                    "observe the actual initialized WC"
+                );
+                Command::new("svn")
+                    .args(["status", "--no-ignore", "--non-interactive", "--"])
+                    .arg(format!("{}@", wc.display()))
+                    .output()
+                    .expect("inspect the owned WC before filtered receipt")
+            });
+            state.filtered.push(status);
+        }
+    }
+}
+
+impl Rsc02WorkingCopyProbe {
+    fn assert_filtered_pristine(&self, initialized: bool) {
+        let state = self.0.lock().unwrap();
+        assert_eq!(
+            state.filtered.len(),
+            1,
+            "must observe the all-filtered boundary"
+        );
+        if initialized {
+            let status = state.filtered[0]
+                .as_ref()
+                .expect("reused WC must be observed");
+            assert!(
+                status.status.success(),
+                "{}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            assert!(
+                status.stderr.is_empty(),
+                "status warnings cannot prove a pristine WC"
+            );
+            assert!(
+                status.stdout.is_empty(),
+                "filtered WC has residue: {}",
+                String::from_utf8_lossy(&status.stdout)
+            );
+        } else {
+            assert!(state.working_copy.is_none());
+            assert!(
+                state.filtered[0].is_none(),
+                "all-filtered first commit must not initialize WC"
+            );
+        }
+    }
+}
+
+async fn assert_rsc02_revision(
+    pair: &QualifiedPair,
+    revision: i64,
+    expected_tree: &BTreeMap<String, Vec<u8>>,
+    expected_paths: &[(&str, &str)],
+) {
+    assert_eq!(
+        &svn_tree(pair, revision).await,
+        expected_tree,
+        "full SVN tree at r{revision}"
+    );
+    let output = Command::new("svnlook")
+        .args([
+            "changed",
+            "-r",
+            &revision.to_string(),
+            pair.svn_repo_root.strip_prefix("file://").unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut actual: Vec<_> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let (action, path) = line.split_at(4);
+            (action.trim().to_string(), path.to_string())
+        })
+        .collect();
+    let mut expected: Vec<_> = expected_paths
+        .iter()
+        .map(|(a, p)| (a.to_string(), p.to_string()))
+        .collect();
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected, "exact SVN changed paths at r{revision}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue() {
+    use tracing::instrument::WithSubscriber;
     let mut pair = QualifiedPair::new().await;
     pair.developer_commit(
         "handled.txt",
@@ -9763,11 +9914,30 @@ async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue()
         "Allowed commit after filtered",
     );
     git_cli(&pair.developer, &["push", "origin", "main"]);
+    let probe = Rsc02WorkingCopyProbe::default();
     assert_eq!(
-        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        pair.engine
+            .run_sync_cycle()
+            .with_subscriber(probe.clone())
+            .await
+            .unwrap()
+            .git_to_svn_count,
         2
     );
+    probe.assert_filtered_pristine(true);
     assert_eq!(svn_youngest(&pair.svn_url), svn_before + 2);
+    let mut after_prime = before_tree.clone();
+    after_prime.insert("public0.txt".into(), b"prime wc\n".to_vec());
+    assert_rsc02_revision(&pair, svn_before + 1, &after_prime, &[("A", "public0.txt")]).await;
+    let mut after_allowed = after_prime;
+    after_allowed.insert("public.txt".into(), b"allowed successor\n".to_vec());
+    assert_rsc02_revision(
+        &pair,
+        svn_before + 2,
+        &after_allowed,
+        &[("A", "public.txt")],
+    )
+    .await;
     let receipt_key = format!("handled_git_no_target_pair_{filtered}");
     let receipt: serde_json::Value =
         serde_json::from_str(&pair.engine.db().get_state(&receipt_key).unwrap().unwrap()).unwrap();
@@ -9811,8 +9981,266 @@ async fn candidate_rsc02_filtered_then_allowed_cycle_leaves_no_blocked_residue()
             "case":"RS_C02_FILTERED_THEN_ALLOWED",
             "primed":primed, "filtered":filtered, "allowed":allowed,
             "svn_rev_delta":2, "blocked_residue":false,
-            "journal_paths":journal_paths, "restart_quiet":true
+            "journal_paths":journal_paths, "restart_quiet":true,
+            "actual_filtered_wc_status_pristine":true,
+            "each_revision_full_tree_and_changed_paths_verified":true
         })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs89_rsc02_filtered_restart_allowed_preserves_receipt_and_tree() {
+    use tracing::instrument::WithSubscriber;
+    let mut pair = QualifiedPair::new().await;
+    pair.developer_commit("handled.txt", "baseline\n", "Establish outbound baseline");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let blocked = vec!["secret/".to_string()];
+    pair.engine.set_path_rules(Vec::new(), blocked.clone());
+    let before_rev = svn_youngest(&pair.svn_repo_root);
+    let before_tree = svn_tree(&pair, before_rev).await;
+    let before_watermark = pair.engine.db().get_repo_watermark("pair").unwrap();
+    let before_mappings = git_to_svn_mappings(pair.engine.db(), "pair");
+    let filtered =
+        pair.developer_commit("secret/leak.txt", "excluded\n", "All-filtered first cycle");
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let probe = Rsc02WorkingCopyProbe::default();
+    assert_eq!(
+        pair.engine
+            .run_sync_cycle()
+            .with_subscriber(probe.clone())
+            .await
+            .unwrap()
+            .git_to_svn_count,
+        0
+    );
+    probe.assert_filtered_pristine(false);
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev);
+    assert_eq!(svn_tree(&pair, before_rev).await, before_tree);
+    assert_eq!(
+        git_to_svn_mappings(pair.engine.db(), "pair"),
+        before_mappings
+    );
+    assert_eq!(
+        pair.engine.db().get_repo_watermark("pair").unwrap(),
+        (before_watermark.0, filtered.clone())
+    );
+    let key = format!("handled_git_no_target_pair_{filtered}");
+    let receipt = pair.engine.db().get_state(&key).unwrap().unwrap();
+    let decoded: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(decoded["outcome"], "filtered");
+    assert_eq!(decoded["git_sha"], filtered);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(decoded["projection"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"allowed_paths":[],"blocked_patterns":blocked})
+    );
+    let mut restarted = reopen_pair(&pair);
+    restarted.set_path_rules(Vec::new(), blocked.clone());
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        0
+    );
+    assert_eq!(
+        restarted.db().get_state(&key).unwrap().as_deref(),
+        Some(receipt.as_str())
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev);
+    assert_eq!(
+        git_output(&pair.bare, &["rev-parse", "refs/heads/main"]),
+        filtered
+    );
+    let allowed = pair.developer_commit(
+        "public.txt",
+        "allowed after restart\n",
+        "Allowed second cycle",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        restarted.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let mut expected = before_tree;
+    expected.insert("public.txt".into(), b"allowed after restart\n".to_vec());
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    assert_rsc02_revision(&pair, before_rev + 1, &expected, &[("A", "public.txt")]).await;
+    assert_eq!(
+        restarted.db().get_repo_watermark("pair").unwrap().1,
+        allowed
+    );
+    assert_eq!(
+        git_to_svn_mappings(restarted.db(), "pair"),
+        before_mappings + 1
+    );
+    assert_eq!(
+        restarted.db().get_state(&key).unwrap().as_deref(),
+        Some(receipt.as_str())
+    );
+    let mut repeated = reopen_pair(&pair);
+    repeated.set_path_rules(Vec::new(), blocked);
+    let checkpoint = repeated.db().get_repo_watermark("pair").unwrap();
+    assert_eq!(repeated.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(
+        repeated.db().get_repo_watermark("pair").unwrap(),
+        checkpoint
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    assert_eq!(svn_tree(&pair, before_rev + 1).await, expected);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS89_TWO_CYCLES_RESTART","filtered":filtered,"allowed":allowed,"no_wc_initialized_for_filtered":true,"filtered_receipt_unchanged":true,"svn_revision_delta":1,"full_tree_and_paths":true,"repeat_quiet":true})
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs89_rsc02_mixed_lost_reply_reconciles_only_projected_paths() {
+    use reposync_core::db::svn_commit_operations::SvnCommitOperationState;
+    let mut pair = QualifiedPair::new_with_repo_id("rs89-mixed-lost-reply").await;
+    pair.developer_commit_tree(
+        &[
+            ("team/base.txt", Some("base\n")),
+            ("team/retained.exe", Some("blocked suffix baseline\n")),
+            ("secret/keep.txt", Some("excluded baseline\n")),
+            ("team-other/keep.txt", Some("sibling baseline\n")),
+        ],
+        "Seed excluded files and directories",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    assert_eq!(
+        pair.engine.run_sync_cycle().await.unwrap().git_to_svn_count,
+        1
+    );
+    let allowed = vec!["team".to_string()];
+    let blocked = vec!["*.exe".to_string()];
+    pair.engine.set_path_rules(allowed.clone(), blocked.clone());
+    let projection =
+        serde_json::json!({"allowed_paths":allowed,"blocked_patterns":blocked}).to_string();
+    let before_rev = svn_youngest(&pair.svn_repo_root);
+    let mut expected = svn_tree(&pair, before_rev).await;
+    let watermark = pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let mappings = git_to_svn_mappings(pair.engine.db(), &pair.repo_id);
+    let mixed = pair.developer_commit_tree(
+        &[
+            ("team/allowed.txt", Some("published exactly once\n")),
+            ("team/retained.exe", Some("blocked replacement\n")),
+            ("secret/keep.txt", None),
+            ("team-other/keep.txt", Some("sibling replacement\n")),
+        ],
+        "Mixed projected commit with lost reply",
+    );
+    git_cli(&pair.developer, &["push", "origin", "main"]);
+    let fault = SvnCommitFaultGuard::set("REPOSYNC_SVN_COMMIT_LOST_REPLY", &pair.repo_id);
+    let result = pair.engine.run_sync_cycle().await;
+    drop(fault);
+    assert!(
+        matches!(&result, Err(SyncError::SvnCommitHeld{reason,..}) if reason=="lost_commit_reply"),
+        "{result:?}"
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    expected.insert(
+        "team/allowed.txt".into(),
+        b"published exactly once\n".to_vec(),
+    );
+    assert_rsc02_revision(
+        &pair,
+        before_rev + 1,
+        &expected,
+        &[("A", "team/allowed.txt")],
+    )
+    .await;
+    assert_eq!(
+        pair.engine.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        watermark
+    );
+    assert_eq!(
+        git_to_svn_mappings(pair.engine.db(), &pair.repo_id),
+        mappings
+    );
+    let op = pair
+        .engine
+        .db()
+        .active_svn_commit_operation(&pair.repo_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(op.state, SvnCommitOperationState::ReconciliationRequired);
+    assert_eq!(op.source_git_sha, mixed);
+    assert_eq!(op.projection, projection);
+    assert_eq!(
+        op.intended_changed_paths
+            .iter()
+            .map(|p| (p.action.as_str(), p.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("A", "team/allowed.txt")]
+    );
+    let mut restarted = reopen_pair(&pair);
+    restarted.set_path_rules(allowed.clone(), blocked.clone());
+    let svn = SvnClient::new(&pair.svn_url, "", "");
+    let reconciled = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        restarted.db(),
+        &pair.repo_id,
+        &op.id,
+        &svn,
+        &projection,
+    )
+    .await
+    .unwrap();
+    assert!(reconciled.finalized, "{reconciled:?}");
+    assert!(!reconciled.resume_authorized);
+    assert_eq!(
+        reconciled.operation.state,
+        SvnCommitOperationState::Completed
+    );
+    assert_eq!(
+        reconciled.operation.last_confirmed_svn_rev,
+        Some(before_rev + 1)
+    );
+    assert_eq!(
+        svn_youngest(&pair.svn_repo_root),
+        before_rev + 1,
+        "reconciliation must not publish again"
+    );
+    assert_eq!(
+        git_to_svn_mappings(restarted.db(), &pair.repo_id),
+        mappings + 1
+    );
+    assert_eq!(
+        restarted.db().get_repo_watermark(&pair.repo_id).unwrap().1,
+        mixed
+    );
+    assert!(restarted
+        .db()
+        .active_svn_commit_operation(&pair.repo_id)
+        .unwrap()
+        .is_none());
+    let again = reposync_core::svn_commit::apply_svn_commit_reconciliation(
+        restarted.db(),
+        &pair.repo_id,
+        &op.id,
+        &svn,
+        &projection,
+    )
+    .await
+    .unwrap();
+    assert!(again.finalized);
+    assert_eq!(
+        git_to_svn_mappings(restarted.db(), &pair.repo_id),
+        mappings + 1
+    );
+    let checkpoint = restarted.db().get_repo_watermark(&pair.repo_id).unwrap();
+    let mut repeated = reopen_pair(&pair);
+    repeated.set_path_rules(allowed, blocked);
+    assert_eq!(repeated.run_sync_cycle().await.unwrap().git_to_svn_count, 0);
+    assert_eq!(
+        repeated.db().get_repo_watermark(&pair.repo_id).unwrap(),
+        checkpoint
+    );
+    assert_eq!(svn_youngest(&pair.svn_repo_root), before_rev + 1);
+    assert_eq!(svn_tree(&pair, before_rev + 1).await, expected);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS89_FILTERED_LOST_REPLY","operation_id":op.id,"mixed":mixed,"journal_paths":["team/allowed.txt"],"excluded_files_and_dirs_preserved":true,"svn_revision_delta":1,"mapping_added_once":true,"repeat_quiet":true})
     );
 }
 
