@@ -225,16 +225,29 @@ jobs:
 
           def selected_result(text, case, status):
               require(status == 0, "qualification process failed")
-              require(re.findall(r"(?m)^running (\d+) tests?$", text) == ["1"],
+              lines = [line.strip() for line in text.splitlines() if line.strip()]
+              runs = [(i, line) for i, line in enumerate(lines) if line.startswith("running ")]
+              require(len(runs) == 1 and runs[0][1] == "running 1 test",
                       "expected exactly one admitted test")
-              starts = list(re.finditer(r"(?m)^test (\S+) \.\.\. ", text))
+              starts = [(i, match.group(1)) for i, line in enumerate(lines)
+                        if (match := re.match(r"test (\S+) \.\.\.(?: |$)", line))]
               require(len(starts) == 1 and starts[0][1] == case, "wrong or duplicate selected test")
-              tail = text[starts[0].end():]
-              terminal = re.findall(r"(?m)^(ok|FAILED|ignored)(?:\b[^\n]*)?$", tail)
-              require(terminal == ["ok"], "missing passing selected-test terminal result")
-              summaries = re.findall(
-                  r"(?m)^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$", text)
-              require(summaries == [("ok", "1", "0", "0")], "wrong or duplicate test summary")
+              summaries = [(i, line) for i, line in enumerate(lines) if line.startswith("test result:")]
+              require(len(summaries) == 1, "missing, duplicate or contradictory test summary")
+              summary_index, summary = summaries[0]
+              require(re.fullmatch(r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                                   r"\d+ filtered out; finished in \d+(?:\.\d+)?s", summary),
+                      "expected one complete passing summary")
+              require(summary_index == len(lines) - 1, "unexpected output after final summary")
+              # Child stdout can split libtest's prefix from its result. Count malformed
+              # result-like lines too, then require the sole result to be exactly supported.
+              terminals = [(i, line) for i, line in enumerate(lines)
+                           if re.match(r"(?:ok|FAILED|ignored)(?:\b|$)", line)
+                           or re.match(r"test \S+ \.\.\. (?:ok|FAILED|ignored)(?:\b|$)", line)]
+              require(len(terminals) == 1 and terminals[0][1] in ("ok", f"test {case} ... ok"),
+                      "missing, malformed or contradictory passing terminal")
+              require(runs[0][0] < starts[0][0] <= terminals[0][0] == summary_index - 1,
+                      "selected test, terminal and final summary are out of order")
 
 
           def receipts(text):
