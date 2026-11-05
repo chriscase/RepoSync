@@ -95,7 +95,39 @@ SERVICE_EMPTY = ("RootDirectory", "RootImage", "InaccessiblePaths", "TemporaryFi
                  "BindPaths", "BindReadOnlyPaths", "NoExecPaths", "MountImages",
                  "ExtensionImages", "ExtensionDirectories", "SELinuxContext", "AppArmorProfile")
 SERVICE_NO = ("DynamicUser", "ProtectHome", "PrivateTmp", "PrivateUsers", "PrivateMounts")
-SERVICE_FIELDS = ("ExecStart", "User", "Group", "SupplementaryGroups", *SERVICE_EMPTY, *SERVICE_NO)
+SERVICE_FIELDS = ("User", "Group", "SupplementaryGroups", *SERVICE_EMPTY, *SERVICE_NO)
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        require(key not in value, "duplicate command evidence field")
+        value[key] = item
+    return value
+
+
+def command_configuration(encoded, binary):
+    # ExecStart's human rendering loses argv boundaries and includes live state.
+    # Its typed Ex counterpart preserves argv/flags separately from invocation.
+    value = json.loads(encoded, object_pairs_hook=unique_object)
+    require(isinstance(value, dict) and set(value) == {"type", "data"} and
+            value["type"] == "a(sasasttttuii)", "unsupported command evidence signature")
+    records = value["data"]
+    require(isinstance(records, list) and len(records) == 1 and
+            isinstance(records[0], list) and len(records[0]) == 10,
+            "missing or ambiguous service command")
+    path, argv, flags, *invocation = records[0]
+    require(path == str(binary) and isinstance(argv, list) and argv and argv[0] == path and
+            all(isinstance(arg, str) and "\0" not in arg for arg in argv),
+            "unsupported service executable or argument evidence")
+    require(isinstance(flags, list) and flags == [], "unsupported service command flags")
+    bounds = [(0, 2**64 - 1)] * 4 + [(0, 2**32 - 1)] + [(-2**31, 2**31 - 1)] * 2
+    require(all(type(item) is int and low <= item <= high
+                for item, (low, high) in zip(invocation, bounds)),
+            "malformed service invocation evidence")
+    # Validate invocation shape, but never compare timestamps/PID/exit state as
+    # configuration across the restart that this operation deliberately requests.
+    return {"path": path, "argv": argv, "flags": flags}
 
 
 def service_profile(binary):
@@ -108,8 +140,10 @@ def service_profile(binary):
                 "ambiguous service execution profile")
         facts[key] = content
     require(set(facts) == set(SERVICE_FIELDS), "incomplete service execution profile")
-    paths = re.findall(r"(?:^|[ {;])path=([^ ;}]+)", facts["ExecStart"])
-    require(paths == [str(binary)], "service ExecStart does not name the managed deployment path")
+    encoded_command = output(["busctl", "--system", "--auto-start=no", "--json=short", "get-property",
+                              "org.freedesktop.systemd1", "/org/freedesktop/systemd1/unit/reposync_2eservice",
+                              "org.freedesktop.systemd1.Service", "ExecStartEx"])
+    configured_command = command_configuration(encoded_command, binary)
     require(all(facts[field] == "" for field in SERVICE_EMPTY) and
             all(facts[field] == "no" for field in SERVICE_NO),
             "unsupported service filesystem/dynamic-user profile; do not relax unit protections")
@@ -122,7 +156,7 @@ def service_profile(binary):
         uid = pwd.getpwnam(user).pw_uid
     require(os.getuid() == os.geteuid() == uid,
             "service User must be the same static UID as the deployment helper")
-    return dict(facts, resolved_uid=uid)
+    return dict(facts, ExecStart=configured_command, resolved_uid=uid)
 
 
 def release_access(artifact, profile):

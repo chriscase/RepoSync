@@ -29,7 +29,7 @@ fn rs117_deployment_dry_run_and_failure_contracts() {
         stderr
     );
     assert!(
-        stderr.contains("Ran 35 tests") && stderr.trim_end().ends_with("OK"),
+        stderr.contains("Ran 44 tests") && stderr.trim_end().ends_with("OK"),
         "require the complete, nonempty #117 suite: {stderr}"
     );
 }

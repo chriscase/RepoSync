@@ -30,9 +30,21 @@ UI = "b" * 40
 def compatible_service(binary):
     facts = dict.fromkeys(remote.SERVICE_FIELDS, "")
     facts.update({field: "no" for field in remote.SERVICE_NO})
-    facts.update(ExecStart="{ path=" + str(binary) + " ; argv[]=synthetic ; }",
-                 User=str(os.getuid()), Group=str(os.getgid()))
+    facts.update(User=str(os.getuid()), Group=str(os.getgid()))
     return facts
+
+
+def command_evidence(binary, restarted=False):
+    invocation = [1700000000000000, 7000000, 1700000005000000, 12000000, 701, 1, 1]
+    if restarted:
+        invocation = [1700000010000000, 17000000, 0, 0, 12345, 0, 0]
+    return {"type": "a(sasasttttuii)", "data": [[str(binary),
+             [str(binary), "--config", "/etc/reposync/synthetic config.toml"], [], *invocation]]}
+
+
+def prepared_service(binary):
+    return dict(compatible_service(binary), resolved_uid=os.getuid(),
+                ExecStart=remote.command_configuration(json.dumps(command_evidence(binary)), binary))
 
 
 def service_text(facts):
@@ -74,7 +86,7 @@ class ClientTests(unittest.TestCase):
         bins = Path(self.temp.name) / "bin"
         bins.mkdir(exist_ok=True)
         stub = '#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$RS117_CALLS"\nexit 90\n'
-        for name in ["ssh", "scp", "npm", "cargo", "sudo", "systemctl", "curl"]:
+        for name in ["ssh", "scp", "npm", "cargo", "sudo", "systemctl", "busctl", "curl"]:
             p = bins / name
             p.write_text(stub)
             p.chmod(0o755)
@@ -258,7 +270,7 @@ class RemoteTests(unittest.TestCase):
         self.artifact.mkdir()
         (self.artifact / "reposync-daemon").write_bytes(b"new synthetic daemon")
         (self.artifact / "reposync-daemon").chmod(0o755)
-        service = dict(compatible_service(self.binary), resolved_uid=os.getuid())
+        service = prepared_service(self.binary)
         remote.save(self.stage / "input.json", {"commit": SHA, "ui_source_tree": UI,
                                                "previous": remote.live_state(self.binary), "service": service})
         remote.save(self.stage / "build.json", {"commit": SHA, "short": SHA[:7], "lock_sha256": "d" * 64,
@@ -360,6 +372,8 @@ class RemoteTests(unittest.TestCase):
             def output(args, **kwargs):
                 if args[0] == "systemctl":
                     return service_text(compatible_service(self.binary))
+                if args[0] == "busctl":
+                    return json.dumps(command_evidence(self.binary))
                 self.assertEqual(args[0], "git")
                 return real_output(args, **kwargs)
 
@@ -423,8 +437,10 @@ class RemoteTests(unittest.TestCase):
 
     def activate(self, checksum, health=None, physical=True, running_path=None,
                  unavailable_executable=False, redirect_pointer=None, service_facts=None,
-                 static_view=None):
+                 static_view=None, command_before=None, command_after=None,
+                 service_after=None):
         self.effects = []
+        restarted = False
         original_digest = remote.digest
 
         def process_executable(pid):
@@ -446,10 +462,20 @@ class RemoteTests(unittest.TestCase):
 
         def output(args, **kwargs):
             self.effects.append(args)
-            if args[0] == "systemctl" and "--property=ExecStart" in args:
-                if isinstance(service_facts, str):
-                    return service_facts
-                return service_text(service_facts if service_facts is not None else compatible_service(self.binary))
+            if args[0] == "systemctl" and "--property=User" in args:
+                facts = service_after if restarted and service_after is not None else service_facts
+                if isinstance(facts, str):
+                    return facts
+                return service_text(facts if facts is not None else compatible_service(self.binary))
+            if args[0] == "busctl":
+                evidence = command_after if restarted else command_before
+                if evidence is None:
+                    evidence = command_evidence(self.binary, restarted)
+                if isinstance(evidence, BaseException):
+                    raise evidence
+                if isinstance(evidence, str):
+                    return evidence
+                return json.dumps(evidence)
             if args[0] == "systemctl" and "--property=MainPID" in args:
                 return "12345"
             if args[0] == "curl":
@@ -457,8 +483,10 @@ class RemoteTests(unittest.TestCase):
             self.fail(f"unmodeled command {args}")
 
         def command(args, **kwargs):
+            nonlocal restarted
             self.assertEqual(args, ["sudo", "-n", "systemctl", "restart", "reposync"])
             self.effects.append(args)
+            restarted = True
             if redirect_pointer:
                 self.binary.unlink()
                 self.binary.symlink_to(redirect_pointer)
@@ -596,6 +624,110 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
         self.old_preserved()
 
+    def test_rs117_runtime_command_changes_after_restart_confirm_once(self):
+        checksum = self.seal()
+        before = command_evidence(self.binary)
+        after = command_evidence(self.binary, restarted=True)
+        self.assertTrue(all(a != b for a, b in zip(before["data"][0][3:], after["data"][0][3:])))
+        self.assertEqual(remote.command_configuration(json.dumps(before), self.binary),
+                         remote.command_configuration(json.dumps(after), self.binary))
+        self.assertEqual(before["data"][0][1][-1], "/etc/reposync/synthetic config.toml")
+        literal_arguments = command_evidence(self.binary)
+        literal_arguments["data"][0][1].extend(["", "literal 'quoted' argument"])
+        self.assertEqual(remote.command_configuration(json.dumps(literal_arguments), self.binary)["argv"],
+                         literal_arguments["data"][0][1], "preserve empty/quoted arguments without shell parsing")
+        receipt = self.activate(checksum, command_before=before, command_after=after)
+        self.assertTrue(receipt["verified"])
+        self.assertEqual(len([c for c in self.effects if isinstance(c, list) and c[0] == "sudo"]), 1)
+        self.assertEqual(json.loads((self.stage / "verified.json").read_text())["manifest_sha256"], checksum)
+        self.assertTrue((self.stage / "previous-daemon").is_file())
+
+    def test_rs117_stable_command_drift_refuses_before_promotion(self):
+        checksum = self.seal()
+        original = command_evidence(self.binary)
+        changed_path = command_evidence(self.binary)
+        changed_path["data"][0][0] = "/other/daemon"
+        changed_argv = command_evidence(self.binary)
+        changed_argv["data"][0][1][-1] = "/etc/reposync/other.toml"
+        changed_boundaries = command_evidence(self.binary)
+        changed_boundaries["data"][0][1][-1:] = ["/etc/reposync/synthetic", "config.toml"]
+        self.assertEqual(" ".join(original["data"][0][1]), " ".join(changed_boundaries["data"][0][1]),
+                         "human output can conceal different argument boundaries")
+        changed_flags = command_evidence(self.binary)
+        changed_flags["data"][0][2] = ["ignore-failure"]
+        for evidence in [changed_path, changed_argv, changed_boundaries, changed_flags]:
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(ValueError):
+                    self.activate(checksum, command_before=evidence)
+                self.assertFalse((self.stage / "promotion-intent.json").exists())
+                self.assertFalse(self.binary.is_symlink())
+                self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
+                self.assertFalse(any(isinstance(c, list) and c[0] == "sudo" for c in self.effects))
+                self.old_preserved()
+
+    def assert_post_restart_configuration_refused(self, command=None, facts=None):
+        checksum = self.seal()
+        with self.assertRaises(ValueError):
+            self.activate(checksum, command_after=command, service_after=facts)
+        self.assertEqual(len([c for c in self.effects if isinstance(c, list) and c[0] == "sudo"]), 1)
+        self.assertEqual(self.binary.resolve(), (self.artifact / "reposync-daemon").resolve())
+        self.assertEqual((self.stage / "previous-daemon").read_bytes(), b"retained previous binary")
+        self.assertTrue((self.stage / "promotion-intent.json").exists())
+        self.old_preserved()
+
+    def test_rs117_executable_configuration_drift_after_restart_refuses_success(self):
+        value = command_evidence(self.binary, restarted=True)
+        value["data"][0][0] = "/another/daemon"
+        self.assert_post_restart_configuration_refused(command=value)
+
+    def test_rs117_argument_configuration_drift_after_restart_refuses_success(self):
+        value = command_evidence(self.binary, restarted=True)
+        value["data"][0][1].append("--pair-refresh-recovery")
+        self.assert_post_restart_configuration_refused(command=value)
+
+    def test_rs117_command_flag_drift_after_restart_refuses_success(self):
+        value = command_evidence(self.binary, restarted=True)
+        value["data"][0][2] = ["fully-privileged"]
+        self.assert_post_restart_configuration_refused(command=value)
+
+    def test_rs117_user_configuration_drift_after_restart_refuses_success(self):
+        value = dict(compatible_service(self.binary), User=str(os.getuid() + 1000))
+        self.assert_post_restart_configuration_refused(facts=value)
+
+    def test_rs117_filesystem_configuration_drift_after_restart_refuses_success(self):
+        value = dict(compatible_service(self.binary), ProtectHome="yes")
+        self.assert_post_restart_configuration_refused(facts=value)
+
+    def test_rs117_malformed_or_ambiguous_command_evidence_refuses_before_promotion(self):
+        checksum = self.seal()
+        good = command_evidence(self.binary)
+        records = good["data"]
+        duplicate_key = '{"type":"a(sasasttttuii)","type":"a(sasasttttuii)","data":' + json.dumps(records) + '}'
+        invalid = ["not-json", {}, {"type": good["type"], "data": []},
+                   {"type": good["type"], "data": records + records},
+                   {"type": "a(sasbttttuii)", "data": records}, duplicate_key]
+        for index, replacement in [(1, "lossy joined arguments"), (2, ["unsupported-flag"]),
+                                   (3, True), (4, -1), (7, "701"), (8, 2**40)]:
+            value = command_evidence(self.binary)
+            value["data"][0][index] = replacement
+            invalid.append(value)
+        for evidence in invalid:
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(ValueError):
+                    self.activate(checksum, command_before=evidence)
+                self.assertFalse((self.stage / "promotion-intent.json").exists())
+                self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
+                self.old_preserved()
+
+    def test_rs117_missing_typed_command_reader_refuses_without_fallback(self):
+        checksum = self.seal()
+        with self.assertRaises(FileNotFoundError):
+            self.activate(checksum, command_before=FileNotFoundError("modeled unavailable busctl"))
+        self.assertFalse((self.stage / "promotion-intent.json").exists())
+        self.assertFalse(any(isinstance(c, list) and c[0] == "sudo" for c in self.effects))
+        self.assertEqual(self.binary.read_bytes(), b"retained previous binary")
+        self.old_preserved()
+
     def test_rs117_release_traversal_refusal_does_not_relax_permissions(self):
         mode = self.artifact.stat().st_mode & 0o777
         self.artifact.chmod(0o600)
@@ -610,10 +742,13 @@ class RemoteTests(unittest.TestCase):
     def test_rs117_named_static_user_must_resolve_to_helper_uid(self):
         from types import SimpleNamespace
         facts = dict(compatible_service(self.binary), User="synthetic-service-user")
-        with patch.object(remote, "output", return_value=service_text(facts)), \
+        def output(args, **kwargs):
+            return json.dumps(command_evidence(self.binary)) if args[0] == "busctl" else service_text(facts)
+
+        with patch.object(remote, "output", side_effect=output), \
                 patch.object(remote.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid())):
             self.assertEqual(remote.service_profile(self.binary)["resolved_uid"], os.getuid())
-        with patch.object(remote, "output", return_value=service_text(facts)), \
+        with patch.object(remote, "output", side_effect=output), \
                 patch.object(remote.pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=os.getuid() + 1000)):
             with self.assertRaisesRegex(ValueError, "same static UID"):
                 remote.service_profile(self.binary)
