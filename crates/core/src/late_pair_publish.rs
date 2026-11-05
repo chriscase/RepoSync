@@ -195,6 +195,25 @@ pub mod reviewed {
         Ok(git)
     }
 
+    // Starting another effect requires the reviewed source, regardless of the
+    // outer journal phase. Inspecting an existing native intent is separate:
+    // in particular, a consumed Git publication legitimately changed this ref.
+    fn check_git_before_new_effect(
+        db: &Database,
+        parent: &Repository,
+        workdir: &Path,
+        plan: &PreparedPlan,
+    ) -> Result<()> {
+        ensure!(
+            git_client(db, parent, workdir)?
+                .ls_remote_ref("origin", &plan.git_branch)?
+                .as_deref()
+                == Some(plan.git_tip.as_str()),
+            "Git tip changed before effects"
+        );
+        Ok(())
+    }
+
     async fn copy_evidence(
         target: &SvnClient,
         parent: &Repository,
@@ -344,6 +363,7 @@ pub mod reviewed {
     async fn apply_step(
         db: &Database,
         parent: &Repository,
+        workdir: &Path,
         target: &SvnClient,
         op: &mut LatePairPublishOperation,
     ) -> Result<()> {
@@ -377,6 +397,7 @@ pub mod reviewed {
             save(db, op, next)?;
             producer
         } else {
+            check_git_before_new_effect(db, parent, workdir, plan)?;
             check_svn(target, plan, revision, before).await?;
             check_parent(db, plan)?;
             if step.before_digest == step.intended_digest {
@@ -436,6 +457,7 @@ pub mod reviewed {
             stage(target, &wc, before, &step.intended_tree).await?;
             check_parent(db, plan)?;
             check_svn(target, plan, revision, before).await?;
+            check_git_before_new_effect(db, parent, workdir, plan)?;
             let message = crate::svn_commit::operation_commit_message(
                 &step.message,
                 &step.git_result.sha,
@@ -704,13 +726,7 @@ pub mod reviewed {
         let target = SvnClient::new(&plan.target_url, &parent.svn_username, password);
         let result: Result<()> = async {
             if progress(&op)?.phase == Phase::Prepared {
-                ensure!(
-                    git_client(db, parent, workdir)?
-                        .ls_remote_ref("origin", &plan.git_branch)?
-                        .as_deref()
-                        == Some(plan.git_tip.as_str()),
-                    "Git tip changed before effects"
-                );
+                check_git_before_new_effect(db, parent, workdir, &plan)?;
                 let mut next = op.clone();
                 next.reconciliation.as_deref_mut().unwrap().phase =
                     if plan.target_revision.is_some() {
@@ -741,10 +757,13 @@ pub mod reviewed {
                 p.phase = Phase::SourceReady;
                 save(db, &mut op, next)?;
             }
+            if progress(&op)?.child_scope_uuid.is_none() {
+                check_git_before_new_effect(db, parent, workdir, &plan)?;
+            }
             register_child(db, parent, &mut op)?;
             while progress(&op)?.receipts.len() < plan.steps.len() {
                 check_parent_source(parent, password, &plan).await?;
-                apply_step(db, parent, &target, &mut op).await?;
+                apply_step(db, parent, workdir, &target, &mut op).await?;
             }
             check_parent_source(parent, password, &plan).await?;
             if progress(&op)?.publication.is_none() {
