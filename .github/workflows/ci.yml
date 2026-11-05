@@ -129,12 +129,50 @@ jobs:
               -- --exact --nocapture --test-threads=1 --format pretty --color never \
               > "$receipt_dir/$case_id.stdout.log" 2> "$receipt_dir/$case_id.stderr.log" || case_status=$?
             cat "$receipt_dir/$case_id.stdout.log" "$receipt_dir/$case_id.stderr.log"
-            if ! awk -v wanted="test $case_id ... ok" '$0 == wanted { n++ } END { exit(n != 1) }' "$receipt_dir/$case_id.stdout.log"; then
-              echo "::error::Required snapshot case $case_id did not report exactly one passing result"
-              if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
-            fi
-            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$receipt_dir/$case_id.stdout.log"; then
-              echo "::error::Required snapshot case $case_id lacks a one-pass, zero-failed, zero-ignored summary"
+            if ! python3 - "$case_id" "$case_status" "$receipt_dir/$case_id.stdout.log" \
+              "$receipt_dir/normal.list" "$receipt_dir/ignored.list" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          case_id, status, stdout_path, normal_path, ignored_path = sys.argv[1:]
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(f"{case_id}: {message}")
+
+          require(int(status) == 0, "test process exited nonzero")
+          expected = f"{case_id}: test"
+          normal = pathlib.Path(normal_path).read_text().splitlines()
+          ignored = pathlib.Path(ignored_path).read_text().splitlines()
+          require(normal.count(expected) == 1 and ignored.count(expected) == 0,
+                  "expected exactly one nonignored selector")
+          lines = [line.strip() for line in pathlib.Path(stdout_path).read_text().splitlines()
+                   if line.strip()]
+          runs = [line for line in lines if re.fullmatch(r"running \d+ tests?", line)]
+          require(runs == ["running 1 test"], "expected exactly one executed test")
+          starts = [(i, match.group(1)) for i, line in enumerate(lines)
+                    if (match := re.match(r"test (\S+) \.\.\.(?: |$)", line))]
+          require(len(starts) == 1 and starts[0][1] == case_id,
+                  "missing, wrong or duplicate executed identity")
+          summaries = [(i, line) for i, line in enumerate(lines) if line.startswith("test result:")]
+          require(len(summaries) == 1, "missing or contradictory test summaries")
+          summary_index, summary = summaries[0]
+          require(re.fullmatch(r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                               r"\d+ filtered out; finished in \S+", summary),
+                  "expected one pass, zero failures and zero ignored tests")
+          require(summary_index == len(lines) - 1, "unexpected output after terminal summary")
+          # Inherited child stdout can split libtest's named prefix from its final ok.
+          terminals = [(i, line) for i, line in enumerate(lines)
+                       if line in {"ok", "FAILED", "ignored"}
+                       or re.fullmatch(r"test \S+ \.\.\. (?:ok|FAILED|ignored(?:,.*)?)", line)]
+          require(len(terminals) == 1 and terminals[0][1] in {"ok", f"test {case_id} ... ok"},
+                  "missing or contradictory terminal result")
+          require(lines.index("running 1 test") < starts[0][0] <= terminals[0][0] == summary_index - 1,
+                  "terminal result is outside the selected test")
+          PY
+            then
+              echo "::error::Required snapshot case $case_id failed result qualification"
               if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
             fi
             printf 'Snapshot feature case %s exit: %s\n' "$case_id" "$case_status"
