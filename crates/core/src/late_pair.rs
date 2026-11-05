@@ -159,22 +159,32 @@ pub fn collect_verified_mappings(
     if let Some(op) = db.latest_import_operation(repo_id)? {
         if op.state == ImportOperationState::Completed {
             if let (Some(sha), Some(rev)) = (op.last_confirmed_git_sha, op.last_confirmed_svn_rev) {
-                if is_full_git_oid(&sha)
-                    && !mappings
+                if is_full_git_oid(&sha) {
+                    let snapshot =
+                        op.snapshot_pin.is_some() || op.operation_type == "snapshot_import";
+                    if let Some(existing) = mappings
                         .iter()
-                        .any(|item| item.git_sha == sha && item.svn_revision == rev)
-                {
-                    mappings.push(VerifiedMapping {
-                        git_sha: sha,
-                        svn_revision: rev,
-                        evidence: if op.snapshot_pin.is_some()
-                            || op.operation_type == "snapshot_import"
-                        {
-                            "snapshot_import_confirmed".into()
-                        } else {
-                            "import_confirmed".into()
-                        },
-                    });
+                        .position(|item| item.git_sha == sha && item.svn_revision == rev)
+                    {
+                        // The atomic snapshot finalizer also emits the applied
+                        // record consumed by ordinary sync. Preserve the richer
+                        // history-boundary classification for this identical
+                        // completed-import SHA/revision, without admitting any
+                        // additional baseline or relabeling ordinary full imports.
+                        if snapshot {
+                            mappings[existing].evidence = "snapshot_import_confirmed".into();
+                        }
+                    } else {
+                        mappings.push(VerifiedMapping {
+                            git_sha: sha,
+                            svn_revision: rev,
+                            evidence: if snapshot {
+                                "snapshot_import_confirmed".into()
+                            } else {
+                                "import_confirmed".into()
+                            },
+                        });
+                    }
                 }
             }
         }

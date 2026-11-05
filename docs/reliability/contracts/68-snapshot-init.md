@@ -55,3 +55,93 @@ R11 and R12 stay **PARTIAL**. This slice does not close #68.
 ## Tests
 
 Named cases: `R11_SNAPSHOT_FIXED_R`, `R11_PIN_HOLDS_AFTER_ADVANCE`, `R11_MISMATCHED_TARGET`, `R11_INVALID_REV`, plus supporting `R11_SNAPSHOT_LFS` and `R11_SNAPSHOT_RECONCILE`. `R12_FULL_DEFAULT` stays next to the existing full-import cases `64A_ORDINARY` / `74_APPLY_POSITIVE` / `74_LFS_POSITIVE`. UI: `candidate_r68_import_card_full_default_ui`, `candidate_r68_import_card_snapshot_boundary_ui`, and `candidate_r68_import_card_invalid_revision_refusal_ui` (mounted import card, headless Chrome). API: `candidate_r68_refused_snapshot_status_omits_verified_boundary`. Unit: `web-ui/src/importBaseline.test.ts`. The journal unit `snapshot_reconcile_completes_exact_baseline_and_refuses_dishonest_evidence` covers exact-SHA completion, confirmed-receipt recovery, and refusals (wrong SHA, missing pin, drifted pin, widened total, non-import type) without a second remote write.
+
+
+## Whole-story continuation contract — 2026-11-05
+
+The earlier slice and its PARTIAL evidence are retained above. This section
+specifies the additional closeout behavior and required qualification; it does
+not declare #68, R11, R12 or the reliability epic complete.
+
+A newly finalized snapshot writes one repository-scoped applied SVN-origin
+baseline record, keyed by its import operation, in the same transaction as
+operation completion and both checkpoint copies. This happens only after the
+existing exact-ref publication confirmation and single-pinned-baseline checks.
+A failed finalizer rolls back the applied record as well as the checkpoints.
+Reopening a held import and verifying its actual target through the authenticated
+reconcile API can finish that same transaction; repeating its receipt does not
+publish again or create another mapping. Ordinary sync then has genuine producer
+evidence for its initial handled frontier. The strict history reader, full-import
+writer, schema and native fencing contract are unchanged.
+
+When that same SHA/revision also appears in the completed snapshot operation,
+late-pair inspection retains `snapshot_import_confirmed` rather than hiding the
+history-boundary classification behind its new applied record. This enriches an
+already verified identical mapping; it does not admit another SHA/revision or
+execute late pairing.
+
+The outbound byte bridge must not write an LFS pointer as SVN file contents.
+For pointer-shaped changed blobs it inspects `filter` at the exact source commit
+with [Git's source-tree attribute query](https://git-scm.com/docs/git-check-attr).
+LFS/other filtered pointer content, local attribute overrides, unavailable query
+capability or incomplete output causes a durable pre-publication refusal.
+Unfiltered literal pointer-shaped text remains a supported ordinary file. Later
+attribute changes cannot retroactively reinterpret an earlier commit in a replay
+batch. Modified LFS payload hydration is not implemented by this change; #44 and
+#52 remain separate. Snapshot LFS publication still requires real tooling and
+object verification, and ordinary supported changes on that baseline must not
+replace unchanged SVN binary contents with pointer bytes.
+
+Old completed import documents are not silently rewritten or used to repair
+missing/split legacy provenance. Keep such pairs held for their existing #63
+recovery/admission process; do not manufacture applied rows, reset watermarks or
+reimport over an existing target. For an active held snapshot, preserve its
+operation ID and use the authenticated remote-verification action. An absent or
+mismatched ref remains held rather than granting permission to republish.
+
+### Required exact-source closeout evidence
+
+- Existing full/default and selected-revision API cases, pin-after-advance,
+  nonempty-target and invalid-revision refusal, truthful boundary metadata and
+  snapshot-derived late-pair preview must remain passing.
+- `rs68_snapshot_continues_bidirectionally_and_restarts_without_replay` verifies
+  real later SVN and Git work, scoped mappings and reconstructed-engine repeats.
+- `rs68_snapshot_checkpoint_failure_reopens_and_reconciles_without_republication`
+  verifies atomic rollback, real target observation and continued ordinary sync.
+- `rs68_cancel_before_snapshot_effects_preserves_uninitialized_target_across_reopen`
+  verifies cancellation before effects without inventing a baseline.
+- `rs68_missing_lfs_object_after_snapshot_never_writes_pointer_text_to_svn` is a
+  modeled skip-smudge negative, including a queued filter change and durable
+  refusal after reopening. It is not a real LFS lifecycle pass.
+- `rs68_literal_pointer_text_without_filter_remains_a_regular_file` preserves the
+  ordinary-file positive control.
+- `rs68_snapshot_real_lfs_publication_fetch_and_missing_object_verification`
+  requires actual installed git-lfs, a 1.1 MB SVN binary, a verified snapshot
+  pointer/object, a fresh real fetch, ordinary two-way continuation and a failing
+  object check after deliberate loss of that fixture's fetched object. It has no
+  skip or pointer-substitute fallback. The standard hosted workflow already
+  installs git-lfs; local absence is not a pass or permission to install it.
+- The feature-qualified
+  `rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once` checks
+  a real accepted push with lost reply, reconstructed server/database, absent-ref
+  refusal, authenticated reconciliation and repeated receipt. Its owned Git
+  command trace must show fresh observation and no publication command.
+- Reuse the #88 independent raw-export/type/projection cases and existing real
+  snapshot LFS and full-default controls. Do not replace expected bytes with a
+  second run of the copier.
+- The three mounted R68 import-card cases and importBaseline unit tests remain
+  required. The standalone card uses the real router context required by #120.
+  Its browser runtime uses the existing installed sandbox-enabled Playwright
+  route and awaits context closure; callers collect their owned Vite handle
+  before asserting results. A timeout is a failed gate, not cleanup proof.
+
+Run environment-qualified fixture cases separately with `--exact` and
+`--test-threads=1`, retaining original logs, selected inventory, source identity
+and all prior failures. The new lost-reply case is feature-gated and must be
+explicitly selected; the normal workspace run alone does not execute it. Local
+UI, browser, hosted Rust and real LFS evidence are separate classes. Retained
+independent review, exact-head CI, publisher acceptance mapping and actual
+postmerge verification are required before any whole-story closeout. R11/R12
+remain PARTIAL and #68/#61 remain open until their required proofs are accepted.
+No native/process hold, unknown descendant, deployment, live credential, main
+promotion, changed-child execution or #121 reader/usability gate is released.

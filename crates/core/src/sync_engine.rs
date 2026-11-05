@@ -3660,6 +3660,70 @@ impl SyncEngine {
                     item.content = Some(read.map_err(SyncError::GitError)?.ok_or_else(|| {
                         SyncError::GitError(crate::errors::GitError::RefNotFound(item.path.clone()))
                     })?);
+                    if item.content.as_deref().is_some_and(|bytes| {
+                        bytes.starts_with(b"version https://git-lfs.github.com/spec/v1")
+                    }) {
+                        // Checkout may intentionally skip smudging. The SVN
+                        // writer below consumes committed blobs, not hydrated
+                        // worktree bytes, so it must never publish an LFS
+                        // pointer as the actual file. Inspect this exact source
+                        // commit, not HEAD/index (which may be a later commit).
+                        // Higher-priority local overrides make that evidence
+                        // ambiguous; ordinary literal pointer text remains
+                        // supported when its source has no filter.
+                        if !matches!(std::fs::symlink_metadata(git.repo().path().join("info/attributes")),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            return Err(self.record_history_block("unsupported_git_semantics",
+                                "LFS pointer filter is ambiguous because local attribute overrides exist",
+                                Some(&change.sha), None, None, None));
+                        }
+                        let source = format!("--source={}", change.sha);
+                        let attributes = sync_git_command_output(git.repo_path(),
+                            &["check-attr", "-z", &source, "--all", "--", &item.path],
+                            Duration::from_secs(5), None)
+                            .filter(|output| output.status.success())
+                            .ok_or_else(|| self.record_history_block("unsupported_git_semantics",
+                                "LFS pointer source attributes could not be verified; no SVN publication is permitted",
+                                Some(&change.sha), None, None, None))?;
+                        let fields: Vec<_> = attributes.stdout.split(|byte| *byte == 0).collect();
+                        if attributes.stdout.len() > 65_536
+                            || fields.len() % 3 != 1
+                            || !fields.last().is_some_and(|field| field.is_empty())
+                            || fields[..fields.len() - 1]
+                                .as_chunks::<3>()
+                                .0
+                                .iter()
+                                .any(|record| {
+                                    record[0] != item.path.as_bytes() || record[1].is_empty()
+                                })
+                        {
+                            return Err(self.record_history_block(
+                                "unsupported_git_semantics",
+                                "LFS pointer source attribute response is incomplete or malformed",
+                                Some(&change.sha),
+                                None,
+                                None,
+                                None,
+                            ));
+                        }
+                        // A single-attribute query prints both absence and a
+                        // driver literally named "unspecified" identically.
+                        // --all omits an absent attribute, proving that no
+                        // filter applies without trusting those sentinel words.
+                        // Explicit definitions (including ambiguous "unset")
+                        // remain held until qualified typed handling exists.
+                        if fields[..fields.len() - 1]
+                            .as_chunks::<3>()
+                            .0
+                            .iter()
+                            .any(|record| record[1] == b"filter")
+                        {
+                            return Err(self.record_history_block("unsupported_git_semantics",
+                                "Git LFS or filtered pointer content requires qualified object hydration; pointer text cannot be written to SVN",
+                                Some(&change.sha), None, None, None));
+                        }
+                    }
                 }
             }
             let file_contents = projected.into_file_contents();
