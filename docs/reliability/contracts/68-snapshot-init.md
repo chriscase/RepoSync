@@ -145,3 +145,58 @@ postmerge verification are required before any whole-story closeout. R11/R12
 remain PARTIAL and #68/#61 remain open until their required proofs are accepted.
 No native/process hold, unknown descendant, deployment, live credential, main
 promotion, changed-child execution or #121 reader/usability gate is released.
+
+
+## Synthetic installer/update qualification
+
+GOAL section 6 permits a pinned old executable/schema with synthetic history;
+the unknown work-server version does not prevent this tier. Production-version,
+privileged installer, service lifecycle and broader #118 platform/release proof
+remain separate. Do not describe a successful source build or library-only open
+as a successful installation update.
+
+The explicit offline entry is:
+
+```sh
+bash scripts/install.sh --offline-update \
+  --root /absolute/canonical/private/existing-prefix \
+  --archive /path/to/pinned-two-binary-package.tar.gz \
+  --sha256 EXPECTED_PACKAGE_SHA256
+```
+
+This Unix-only mode updates an already-configured, user-owned prefix containing
+`bin/reposync`, `bin/reposync-daemon`, `config/config.toml` and
+`data/reposync.db`. It requires a private root and refuses linked targets. The
+package must contain exactly the two regular executable members used by the
+historical release layout. Configuration, authors, database/WAL, key material
+and repository contents are separately owned existing state, not invented
+release members. Missing historical templates are not fixed by this mode.
+
+Package digest and complete member inventory are checked before target changes.
+Only the two binaries are replaced; their prior modes are preserved. A normal
+replacement error attempts to restore already-replaced binaries. If restoration
+is uncertain, the original/secondary errors and recovery staging path remain
+visible and the staging files are retained. The mode is not a crash-atomic pair
+transaction, a signature or ABI check, a migration, a process stop/start command,
+or permission to operate a live installation. Use a stopped owned installation
+and keep the pinned package/provenance. No sudo, network, account, ownership or
+service action occurs. The existing default installer flow remains byte-exact.
+
+The opt-in pinned-old fixture reuses the canonical `8737974` source and retained
+reviewed lock to construct synthetic old history/schema. It installs actual old
+binaries into a separately configured temporary prefix, runs their CLI status,
+updates through the real offline entry, and checks unchanged state bytes/modes.
+It then executes the installed candidate's status and daemon version only, plus
+an actual omitted-mode Personal full import/repeat through the existing local
+Git HTTP fixture. Finally, every retained in-process engine preservation,
+bidirectional, mapping and reconstructed-no-op assertion must pass before the
+additional installer receipt is emitted. A supplied invalid specification fails;
+it cannot silently fall back to the library-only test path.
+
+These observations remain distinct: installed CLI launch/inspection is not
+engine synchronization; in-process engine reconstruction is not a physical
+service restart; an actual two-revision default import is not a snapshot. Local
+results require source/artifact binding, independent review, fresh hosted
+qualification and post-integration repetition before the synthetic R12 gate is
+closed. The actual work-server version and active-environment acceptance stay
+unestablished. No older CI result or control clock transfers to a successor.
