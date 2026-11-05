@@ -93,6 +93,61 @@ jobs:
           GIT_COMMITTER_NAME: "Test User"
           GIT_COMMITTER_EMAIL: "test@example.com"
 
+      - name: Snapshot and full-import feature qualification (#68)
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          receipt_dir="$(mktemp -d "$RUNNER_TEMP/reposync-snapshot-http.XXXXXX")"
+          trap 'rm -rf -- "$receipt_dir"' EXIT
+          printf 'Qualified snapshot source: %s\n' "$GITHUB_SHA"
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          git lfs version
+          sha256sum Cargo.lock
+          cases=(
+            candidate_74_incremental_apply_completes_through_supervised_command
+            candidate_74_lfs_enabled_import_completes_with_pointer_publication
+            rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once
+          )
+          cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze --no-run
+          cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze \
+            -- --list --format pretty --color never > "$receipt_dir/normal.list"
+          cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze \
+            -- --ignored --list --format pretty --color never > "$receipt_dir/ignored.list"
+          cat "$receipt_dir/normal.list" "$receipt_dir/ignored.list"
+          for case_id in "${cases[@]}"; do
+            matches="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/normal.list")"
+            ignored="$(awk -v wanted="$case_id: test" '$0 == wanted { n++ } END { print n + 0 }' "$receipt_dir/ignored.list")"
+            if [[ "$matches" -ne 1 || "$ignored" -ne 0 ]]; then
+              echo "::error::Expected one nonignored $case_id; found $matches normal and $ignored ignored"
+              exit 1
+            fi
+          done
+          failed=0
+          for case_id in "${cases[@]}"; do
+            case_status=0
+            cargo test --locked -p reposync-web --features reliability-fixture --test server_freeze "$case_id" \
+              -- --exact --nocapture --test-threads=1 --format pretty --color never \
+              > "$receipt_dir/$case_id.stdout.log" 2> "$receipt_dir/$case_id.stderr.log" || case_status=$?
+            cat "$receipt_dir/$case_id.stdout.log" "$receipt_dir/$case_id.stderr.log"
+            if ! awk -v wanted="test $case_id ... ok" '$0 == wanted { n++ } END { exit(n != 1) }' "$receipt_dir/$case_id.stdout.log"; then
+              echo "::error::Required snapshot case $case_id did not report exactly one passing result"
+              if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+            fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$receipt_dir/$case_id.stdout.log"; then
+              echo "::error::Required snapshot case $case_id lacks a one-pass, zero-failed, zero-ignored summary"
+              if [[ "$case_status" -eq 0 ]]; then case_status=1; fi
+            fi
+            printf 'Snapshot feature case %s exit: %s\n' "$case_id" "$case_status"
+            if [[ "$case_status" -ne 0 ]]; then failed=1; fi
+          done
+          exit "$failed"
+        env:
+          RUST_BACKTRACE: 1
+          GIT_AUTHOR_NAME: "Test User"
+          GIT_AUTHOR_EMAIL: "test@example.com"
+          GIT_COMMITTER_NAME: "Test User"
+          GIT_COMMITTER_EMAIL: "test@example.com"
+
       - name: Authenticated read-only review HTTP qualification
         timeout-minutes: 10
         run: |
