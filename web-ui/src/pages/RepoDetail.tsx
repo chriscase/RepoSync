@@ -42,6 +42,9 @@ import {
   managedRemovalReceiptFromStatus,
   managedRemovalStatusFromReceipt,
   removalDependencyPreviewConfirmReady,
+  reviewedRemovalReady,
+  readPendingRemovalReview,
+  clearPendingRemovalReview,
   shouldPersistPolledManagedRemovalReceipt,
   persistManagedRemovalReceipt,
   readManagedRemovalReceipt,
@@ -409,6 +412,30 @@ function RepositoryDetailEditor() {
   const removalSubjectId = removalSubject?.id ?? id;
   const branchPairDeleteSubject = branchPairDeleteTarget;
 
+  const reviewedRemovalTarget = branchPairDeleteTarget ?? removalTarget ?? repo;
+  const reviewedRemovalOptions = reviewedRemovalTarget?.parent_id
+    ? removeBranchOpts : { delete_git: false, delete_svn: false };
+  const reviewedRemovalQuery = useQuery({
+    queryKey: ['reviewed-removal', id, reviewedRemovalTarget?.id, reviewedRemovalOptions.delete_git, reviewedRemovalOptions.delete_svn],
+    queryFn: ({ signal }) => api.reviewManagedRemoval(reviewedRemovalTarget!.id, reviewedRemovalOptions, signal),
+    enabled: isAdmin && detailLive && !!reviewedRemovalTarget?.id && (showRemoveConfirm || !!branchPairDeleteTarget),
+    staleTime: 0,
+    retry: false,
+  });
+  const reviewedRemovalConfirmReady = reviewedRemovalReady(reviewedRemovalQuery.data, reviewedRemovalTarget?.id, reviewedRemovalOptions,
+    reviewedRemovalQuery.isFetching || reviewedRemovalQuery.isError);
+  const pendingRemovalReview = (() => {
+    try { return { review: reviewedRemovalTarget?.id ? readPendingRemovalReview(reviewedRemovalTarget.id) : null, error: null }; }
+    catch (error) { return { review: null, error: error instanceof Error ? error.message : String(error) }; }
+  })();
+  const branchRemovalStatusQuery = useQuery({
+    queryKey: ['managed-removal-target', id, branchPairDeleteSubject?.id],
+    queryFn: () => api.getManagedRemoval(branchPairDeleteSubject!.id),
+    enabled: isAdmin && detailLive && !!branchPairDeleteSubject?.id,
+    retry: false,
+    refetchInterval: query => managedRemovalNeedsPoll(query.state.data?.state) ? 2000 : false,
+  });
+
   const removeMutation = useMutation({
     mutationFn: async () => {
       setBranchPairDeleteError(null);
@@ -416,22 +443,56 @@ function RepositoryDetailEditor() {
       if (!target?.id || !id) {
         throw new Error('No repository selected for removal');
       }
+      const pending = readPendingRemovalReview(target.id);
+      if (pending) {
+        view.assertCurrent();
+        const matching = await api.lookupRemovalRequest(target.id, pending.review_pin);
+        view.assertCurrent();
+        if (matching) {
+          persistManagedRemovalReceipt(managedRemovalReceiptFromStatus(target.id, matching), true);
+          clearPendingRemovalReview(target.id, pending.review_pin);
+        }
+        const result = matching
+          ? matching.state === 'completed' ? matching : await api.continueManagedRemoval(target.id, matching.operation_id)
+          : await api.approveManagedRemoval(target.id, pending, view);
+        return { kind: 'managed' as const, result, target };
+      }
+      const retained = readManagedRemovalReceipt(target.id);
+      if (retained && retained.protocol !== 2 && retained.state !== 'completed') {
+        view.assertCurrent();
+        const result = await api.removeManagedRepo(target.id, { delete_git: false, delete_svn: false });
+        return { kind: 'managed' as const, result, target };
+      }
+      if (retained?.protocol === 2 && retained.state !== 'completed') {
+        view.assertCurrent();
+        const result = await api.continueManagedRemoval(target.id, retained.operationId);
+        return { kind: 'managed' as const, result, target };
+      }
+      view.assertCurrent();
+      const observed = await api.getManagedRemoval(target.id);
+      view.assertCurrent();
+      if (observed?.protocol === 2 && observed.state !== 'completed') {
+        const result = await api.continueManagedRemoval(target.id, observed.operation_id);
+        return { kind: 'managed' as const, result, target };
+      }
+      if (!reviewedRemovalConfirmReady || reviewedRemovalQuery.data?.repo_id !== target.id) {
+        throw new Error('A fresh exact-target removal review is required');
+      }
+      const review = reviewedRemovalQuery.data;
       if (target.parent_id) {
-        const gitOpt = document.querySelector('[data-testid="delete-git-opt"]') as HTMLInputElement | null;
-        const svnOpt = document.querySelector('[data-testid="delete-svn-opt"]') as HTMLInputElement | null;
         const options = {
-          delete_git: gitOpt?.checked ?? removeBranchOpts.delete_git,
-          delete_svn: svnOpt?.checked ?? removeBranchOpts.delete_svn,
+          delete_git: review.delete_git,
+          delete_svn: review.delete_svn,
         };
         const { result, destination, outcome } = await removeBranchPairForView(
           { viewedId: id, target: { id: target.id, parent_id: target.parent_id }, options },
           view,
-          { lookupParent: api.getRepo, remove: api.deleteBranchPair },
+          { lookupParent: api.getRepo, remove: () => api.approveManagedRemoval(target.id, review, view) },
         );
-        return { kind: 'branch_pair' as const, result, target, destination, outcome };
+        return { kind: 'branch_pair' as const, result: result as ManagedRemovalStatus, target, destination, outcome };
       }
       view.assertCurrent();
-      const result = await api.removeManagedRepo(target.id);
+      const result = await api.approveManagedRemoval(target.id, review, view);
       return { kind: 'managed' as const, result, target };
     },
     onError: (error) => {
@@ -440,6 +501,16 @@ function RepositoryDetailEditor() {
       }
     },
     onSuccess: async (payload) => {
+      const durableReceipt = managedRemovalReceiptFromStatus(payload.target.id, payload.result);
+      persistManagedRemovalReceipt(durableReceipt);
+      setRemovalReceipt(durableReceipt);
+      queryClient.setQueryData(['managed-removal', payload.target.id, payload.result.operation_id], payload.result);
+      queryClient.invalidateQueries({ queryKey: ['managed-removal-target', id, payload.target.id] });
+      if (!payload.result.ok) {
+        setBranchPairDeleteError(payload.result.message);
+        queryClient.invalidateQueries({ queryKey: ['repos'] });
+        return;
+      }
       setShowRemoveConfirm(false);
       setRemovalTarget(null);
       setBranchPairDeleteTarget(null);
@@ -508,6 +579,7 @@ function RepositoryDetailEditor() {
   const restoreMutation = useMutation({
     mutationFn: () => api.restoreManagedRepo(id!),
     onSuccess: () => {
+      removeMutation.reset();
       clearManagedRemovalReceipt(id!);
       setRemovalReceipt(null);
       queryClient.removeQueries({ queryKey: ['managed-removal', id] });
@@ -542,6 +614,56 @@ function RepositoryDetailEditor() {
   });
   const removalDependencyPreview = removalPreviewQuery.data?.dependency_preview;
 
+  useEffect(() => {
+    const target = branchPairDeleteSubject?.id;
+    const status = branchRemovalStatusQuery.data;
+    if (!target || !status || !view.isCurrent()) return;
+    const stored = readManagedRemovalReceipt(target);
+    let pending;
+    try { pending = readPendingRemovalReview(target); } catch { return; }
+    const matchesPending = pending && status.protocol === 2 && status.review_pin === pending.review_pin && status.request_id === `ui-remove-v2-${pending.review_pin}`;
+    if (!matchesPending && !shouldPersistPolledManagedRemovalReceipt(stored, status)) return;
+    try {
+      persistManagedRemovalReceipt(managedRemovalReceiptFromStatus(target, status), !!matchesPending);
+      if (matchesPending && pending) clearPendingRemovalReview(target, pending.review_pin);
+    } catch (error) {
+      setBranchPairDeleteError(`The original request is retained because its result could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (status.state === 'completed' && status.registration_listed === false) queryClient.invalidateQueries({ queryKey: ['branch-pairs', id] });
+  }, [branchPairDeleteSubject?.id, branchRemovalStatusQuery.data, id, queryClient, view]);
+
+  useEffect(() => {
+    if (!id || !isAdmin) return;
+    let pending;
+    try { pending = readPendingRemovalReview(id); }
+    catch (error) {
+      setLocalNotice({ outcome: 'in_progress', message: error instanceof Error ? error.message : String(error), warnings: ['Retained request evidence is unavailable. No automatic action was taken.'] });
+      return;
+    }
+    if (!pending) return;
+    const captured = pending;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const status = await api.lookupRemovalRequest(id, captured.review_pin);
+        if (cancelled || !view.isCurrent() || readPendingRemovalReview(id)?.review_pin !== captured.review_pin) return;
+        if (!status) {
+          setLocalNotice({ outcome: 'in_progress', message: 'No matching server operation was found for the retained request. It remains available for explicit recovery; no automatic retry was sent.', warnings: [] });
+          return;
+        }
+        const receipt = managedRemovalReceiptFromStatus(id, status);
+        persistManagedRemovalReceipt(receipt, true);
+        clearPendingRemovalReview(id, captured.review_pin);
+        setRemovalReceipt(receipt);
+        setLocalNotice({ outcome: status.state === 'completed' && status.registration_listed === false ? 'completed' : 'in_progress', message: status.state === 'completed' && status.registration_listed ? 'The historical removal completed, but this registration currently exists or was restored. No new removal was started.' : status.message, operationId: status.operation_id, warnings: [] });
+      } catch (error) {
+        if (!cancelled && view.isCurrent()) setLocalNotice({ outcome: 'in_progress', message: error instanceof Error ? error.message : String(error), warnings: ['The original request is retained. Outcome verification is unavailable; no automatic retry was sent.'] });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id, isAdmin, view]);
+
   const trackedRemovalOperationId =
     removalReceipt && removalReceipt.repoId === id ? removalReceipt.operationId : undefined;
 
@@ -551,8 +673,7 @@ function RepositoryDetailEditor() {
     enabled:
       !!id
       && isAdmin
-      && detailLive
-      && !repo?.parent_id
+      && id !== retiredId
       && !branchPairDeleteTarget
       && (showRemoveConfirm
         || removeMutation.isPending
@@ -583,6 +704,32 @@ function RepositoryDetailEditor() {
     dependencyPreview: removalDependencyPreview,
   });
   const removalConfirmLabel = childRemovalConfirm ? 'Remove branch pair' : 'Remove from RepoSync';
+  const displayedRemovalStatus = removeMutation.data && removeMutation.data.target.id === reviewedRemovalTarget?.id
+    ? removeMutation.data.result
+    : branchPairDeleteSubject ? branchRemovalStatusQuery.data : removalPanelStatus;
+
+  const reviewedRemovalPanel = ((branchPairDeleteSubject || showRemoveConfirm) && (
+        <div className="border border-gray-600 rounded p-3 text-sm space-y-2" role="status" data-testid="reviewed-removal-targets">
+          {reviewedRemovalQuery.isFetching && <p>Observing exact removal targets…</p>}
+          {reviewedRemovalQuery.isError && <p role="alert">Removal review unavailable: {reviewedRemovalQuery.error.message}. No new deletion is authorized.</p>}
+          {pendingRemovalReview.error && <p role="alert">{pendingRemovalReview.error}</p>}
+          {branchPairDeleteError && <p role="alert">{branchPairDeleteError}</p>}
+          {pendingRemovalReview.review && <div role="alert">
+            <p>A previously approved removal request has no retained outcome receipt. Recover that same request before approving different work. Git deletion: {String(pendingRemovalReview.review.delete_git)}; SVN deletion: {String(pendingRemovalReview.review.delete_svn)}.</p>
+            <button type="button" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>Recover retained removal request</button>
+          </div>}
+          {reviewedRemovalConfirmReady && reviewedRemovalQuery.data && <>
+            <p>Review for {reviewedRemovalQuery.data.repo_id}</p>
+            <p className="break-all">Git: {reviewedRemovalQuery.data.git ? `${reviewedRemovalQuery.data.git.remote_url} · ${reviewedRemovalQuery.data.git.reference} · ${reviewedRemovalQuery.data.git.expected_sha ?? 'already absent'}` : 'preserved'}</p>
+            <p className="break-all">SVN: {reviewedRemovalQuery.data.svn ? `${reviewedRemovalQuery.data.svn.url} · UUID ${reviewedRemovalQuery.data.svn.uuid} · r${reviewedRemovalQuery.data.svn.base_revision} · ${reviewedRemovalQuery.data.svn.expected_present ? 'present' : 'already absent'}` : 'preserved'}</p>
+            <p>{reviewedRemovalQuery.data.retention}</p>
+          </>}
+          <button type="button" disabled={reviewedRemovalQuery.isFetching || removeMutation.isPending} onClick={() => reviewedRemovalQuery.refetch()}>Refresh exact-target review</button>
+          {displayedRemovalStatus && (
+            <ManagedRemovalPanel status={displayedRemovalStatus} onRetry={displayedRemovalStatus.retryable ? () => removeMutation.mutate() : undefined} retryPending={removeMutation.isPending} />
+          )}
+        </div>
+      ));
 
   const auditEntries = auditLog?.entries ?? [];
 
@@ -769,6 +916,19 @@ function RepositoryDetailEditor() {
     return (
         <div className="max-w-lg mx-auto py-16 text-center space-y-4" data-testid="repo-not-found">
           {removalNotice && <BranchPairRemovalNotice notice={removalNotice} />}
+          {isAdmin && (
+            <section data-testid="removed-registration-recovery" className="text-left space-y-3">
+              <p className="text-sm text-gray-400">Retained removal evidence. Actions require a fresh operation-status read.</p>
+              {removalStatusQuery.isFetching && <p role="status">Verifying the retained removal receipt…</p>}
+              {removalStatusQuery.isError && <p role="alert">Current removal verification is unavailable: {removalStatusQuery.error.message}. Recovery actions remain disabled.</p>}
+              {removalPanelStatus && <ManagedRemovalPanel status={removalPanelStatus}
+                retryPending={removeMutation.isPending}
+                onRestore={removalStatusQuery.data?.recovery?.restore_supported && removalStatusQuery.data.state === 'completed' && removalStatusQuery.data.registration_listed === false && !removalStatusQuery.isFetching && !removalStatusQuery.isError ? () => restoreMutation.mutate() : undefined}
+                restorePending={restoreMutation.isPending} />}
+              {removalPanelStatus && removalPanelStatus.state !== 'completed' && <p role="alert">An incomplete operation with a missing registration needs evidence reconciliation. No cleanup retry is sent from this missing-registration view.</p>}
+              {restoreMutation.isError && <p role="alert">Restore failed: {restoreMutation.error.message}</p>}
+            </section>
+          )}
           <h1 className="text-xl font-semibold text-gray-100">Repository not found</h1>
           <p className="text-sm text-gray-400">
             This repository or branch pair is no longer available. It may have been removed.
@@ -1913,6 +2073,10 @@ function RepositoryDetailEditor() {
         </Dialog>
       )}
 
+      {isAdmin && repo.parent_id && removalPanelStatus && (
+        <ManagedRemovalPanel status={removalPanelStatus} onRetry={removalPanelStatus.retryable ? () => removeMutation.mutate() : undefined} retryPending={removeMutation.isPending} />
+      )}
+
       {branchPairDeleteSubject && (
         <Dialog title="Delete branch pair" description="Review dependency and remote-deletion choices. Remote deletion is off by default." onClose={() => {
                   setBranchPairDeleteTarget(null);
@@ -1922,6 +2086,7 @@ function RepositoryDetailEditor() {
                 }} busy={removeMutation.isPending} testId="delete-branch-modal">
           <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-xl w-full max-w-md">
             <div className="p-6 space-y-4">
+              {reviewedRemovalPanel}
               {removeMutation.isError && (
                 <div className="bg-red-900/30 border border-red-700 rounded-lg p-3 text-red-300 text-sm" data-testid="delete-branch-error" role="alert">
                   {removeMutation.error?.message}
@@ -1986,8 +2151,7 @@ function RepositoryDetailEditor() {
                     className="text-amber-200 text-xs"
                     data-testid="branch-removal-preview-unavailable"
                   >
-                    Dependency preview is unavailable. You can still remove this branch pair from
-                    RepoSync; remote deletion stays opt-in below and defaults to off.
+                    Dependency preview is unavailable. Removal is blocked until current dependency and exact-target evidence are available.
                   </p>
                   <button
                     type="button"
@@ -2002,6 +2166,7 @@ function RepositoryDetailEditor() {
               <div className="space-y-2">
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={removeBranchOpts.delete_git}
+                    disabled={removeMutation.isPending}
                     data-testid="delete-git-opt"
                     onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_git: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
@@ -2009,6 +2174,7 @@ function RepositoryDetailEditor() {
                 </label>
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" checked={removeBranchOpts.delete_svn}
+                    disabled={removeMutation.isPending}
                     data-testid="delete-svn-opt"
                     onChange={(e) => setRemoveBranchOpts((p) => ({ ...p, delete_svn: e.target.checked }))}
                     className="rounded border-gray-600 bg-gray-700 text-red-600" />
@@ -2049,6 +2215,8 @@ function RepositoryDetailEditor() {
                   removeMutation.isPending
                   || removeConfirmText !== branchPairDeleteSubject.git_branch
                   || !branchPairPreviewReady
+                  || !reviewedRemovalConfirmReady
+                  || !!pendingRemovalReview.review || !!pendingRemovalReview.error
                   || branchPairDependencyPreview?.parent_removal_blocked
                 }
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
@@ -2068,6 +2236,7 @@ function RepositoryDetailEditor() {
                   setRemoveConfirmText('');
                 }} busy={removeMutation.isPending} testId="managed-remove-modal">
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 max-w-md w-full shadow-xl">
+            {reviewedRemovalPanel}
 
             <p className="text-sm text-gray-400 mb-4">
               Remove <span className="font-semibold text-gray-200">{removalSubject.name}</span> from active listings and
@@ -2155,8 +2324,7 @@ function RepositoryDetailEditor() {
                   Could not load dependency preview: {removalPreviewQuery.error?.message}
                 </p>
                 <p className="text-amber-200 text-xs" data-testid="removal-preview-unavailable">
-                  Dependency preview is unavailable. Confirm only if you accept proceeding without
-                  shared-credential and child-dependency metadata from the server.
+                  Dependency preview is unavailable. Removal is blocked until current shared-credential, child-dependency and exact-target evidence are available.
                 </p>
                 <button
                   type="button"
@@ -2191,6 +2359,8 @@ function RepositoryDetailEditor() {
                 disabled={
                   removeMutation.isPending
                   || !removalPreviewReady
+                  || !reviewedRemovalConfirmReady
+                  || !!pendingRemovalReview.review || !!pendingRemovalReview.error
                   || removalDependencyPreview?.parent_removal_blocked
                 }
                 className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium transition-colors"
