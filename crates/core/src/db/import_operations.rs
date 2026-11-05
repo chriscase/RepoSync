@@ -493,6 +493,20 @@ fn complete_import_tx(
             "import cannot complete with unflushed commit mappings".into(),
         ));
     }
+    let now = Utc::now().to_rfc3339();
+    if op.operation_type == "snapshot_import" {
+        snapshot_hold_is_honest(&op).map_err(DatabaseError::Other)?;
+        // The ordinary engine consumes an applied, repository-scoped origin
+        // record as provenance for its first handled Git frontier. A snapshot
+        // produces only one such baseline, and only after exact-ref publication
+        // confirmation. Commit it atomically with both checkpoint copies and
+        // operation completion; a failed finalizer must leave no applied proof.
+        tx.execute(
+            "INSERT INTO sync_records (id, repo_id, svn_rev, git_sha, direction, author, message, timestamp, synced_at, status)
+             VALUES (?1, ?2, ?3, ?4, 'svn_to_git', '', 'Verified SVN snapshot baseline', ?5, ?5, 'applied')",
+            params![format!("snapshot-import:{op_id}"), repo_id, svn_rev, sha, now],
+        )?;
+    }
     if tx.execute(
         "UPDATE repositories SET last_svn_rev=?1,last_git_sha=?2,last_sync_at=datetime('now') WHERE id=?3",
         params![svn_rev, sha, repo_id],
@@ -502,7 +516,6 @@ fn complete_import_tx(
         ));
     }
     write_value(tx, &format!("last_svn_rev_{repo_id}"), &svn_rev.to_string())?;
-    let now = Utc::now().to_rfc3339();
     crate::echo_receipt_scope::write_scoped_last_git_sha_kv(tx, repo_id, sha, &now)?;
     op.state = ImportOperationState::Completed;
     op.updated_at = Utc::now().to_rfc3339();

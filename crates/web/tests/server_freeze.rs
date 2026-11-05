@@ -5888,17 +5888,21 @@ async fn candidate_r68_import_card_full_default_ui() {
     let barrier = tmp.path().join(&id);
     std::fs::create_dir(&barrier).unwrap();
     let (browser, mut vite) = run_import_card_browser(addr, &id, &barrier, "full-default").await;
-    let output = tokio::time::timeout(Duration::from_secs(60), browser.wait_with_output())
-        .await
-        .unwrap()
+    let output = tokio::time::timeout(Duration::from_secs(60), browser.wait_with_output()).await;
+    // Retain and collect this owned server handle before any browser failure
+    // assertion can unwind the test. Never discover or signal by process name.
+    if vite.try_wait().expect("observe owned Vite child").is_none() {
+        vite.kill().expect("stop owned Vite child");
+    }
+    vite.wait().expect("join owned Vite child");
+    let output = output
+        .expect("browser deadline; Node/Chrome collection remains unverified")
         .unwrap();
     assert!(
         output.status.success(),
         "browser: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    vite.kill().unwrap();
-    vite.wait().unwrap();
     server.abort();
 }
 
@@ -5911,17 +5915,21 @@ async fn candidate_r68_import_card_snapshot_boundary_ui() {
     std::fs::create_dir(&barrier).unwrap();
     let (browser, mut vite) =
         run_import_card_browser(addr, &id, &barrier, "snapshot-boundary").await;
-    let output = tokio::time::timeout(Duration::from_secs(180), browser.wait_with_output())
-        .await
-        .unwrap()
+    let output = tokio::time::timeout(Duration::from_secs(180), browser.wait_with_output()).await;
+    // Retain and collect this owned server handle before any browser failure
+    // assertion can unwind the test. Never discover or signal by process name.
+    if vite.try_wait().expect("observe owned Vite child").is_none() {
+        vite.kill().expect("stop owned Vite child");
+    }
+    vite.wait().expect("join owned Vite child");
+    let output = output
+        .expect("browser deadline; Node/Chrome collection remains unverified")
         .unwrap();
     assert!(
         output.status.success(),
         "browser: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    vite.kill().unwrap();
-    vite.wait().unwrap();
     assert_eq!(git_rev_list_count(&bare), 1);
     assert_eq!(state.db.get_repo_watermark(&id).unwrap().0, 2);
     server.abort();
@@ -5936,17 +5944,21 @@ async fn candidate_r68_import_card_invalid_revision_refusal_ui() {
     std::fs::create_dir(&barrier).unwrap();
     let (browser, mut vite) =
         run_import_card_browser(addr, &id, &barrier, "snapshot-invalid-rev").await;
-    let output = tokio::time::timeout(Duration::from_secs(90), browser.wait_with_output())
-        .await
-        .unwrap()
+    let output = tokio::time::timeout(Duration::from_secs(90), browser.wait_with_output()).await;
+    // Retain and collect this owned server handle before any browser failure
+    // assertion can unwind the test. Never discover or signal by process name.
+    if vite.try_wait().expect("observe owned Vite child").is_none() {
+        vite.kill().expect("stop owned Vite child");
+    }
+    vite.wait().expect("join owned Vite child");
+    let output = output
+        .expect("browser deadline; Node/Chrome collection remains unverified")
         .unwrap();
     assert!(
         output.status.success(),
         "browser: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    vite.kill().unwrap();
-    vite.wait().unwrap();
     server.abort();
 }
 
@@ -9362,5 +9374,218 @@ async fn candidate_r65_managed_remove_missing_parent_fails_operation() {
     assert_eq!(op.state, ManagedRemoveState::Failed);
     assert!(state.db.get_repository(child_id).unwrap().is_some());
 
+    server.abort();
+}
+
+/// #68 / RS-29: a snapshot push accepted by Git with a lost reply remains held
+/// across a server/database reconstruction and finishes through the real API.
+/// Run this fixture-qualified selector alone with --test-threads=1, as its
+/// existing fault injector uses process environment variables.
+#[cfg(feature = "reliability-fixture")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rs68_snapshot_lost_push_reply_reopens_and_reconciles_through_http_once() {
+    struct FaultEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for FaultEnvironment {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let (addr, state, server, tmp, id, bare) = import_fixture().await;
+    let environment = FaultEnvironment(vec![
+        (
+            "REPOSYNC_FIXTURE_ROOT",
+            std::env::var_os("REPOSYNC_FIXTURE_ROOT"),
+        ),
+        (
+            "REPOSYNC_IMPORT_LOST_PUSH_REPLY",
+            std::env::var_os("REPOSYNC_IMPORT_LOST_PUSH_REPLY"),
+        ),
+        ("GIT_TRACE2_EVENT", std::env::var_os("GIT_TRACE2_EVENT")),
+    ]);
+    std::env::set_var("REPOSYNC_FIXTURE_ROOT", tmp.path());
+    std::env::set_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY", &id);
+    let client = authed_client();
+    let base = format!("http://{addr}/api/repos/{id}/import");
+    let start = client
+        .post(&base)
+        .json(&serde_json::json!({"import_mode":"snapshot","svn_revision":"2"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(start.status().is_success());
+    let start: serde_json::Value = start.json().await.unwrap();
+    let operation_id = start["operation_id"].as_str().unwrap().to_owned();
+    let held = wait_import_terminal(&client, &base).await;
+    assert_eq!(held["lifecycle"], "reconciliation_required", "{held}");
+    let operation = state
+        .db
+        .get_import_operation(&id, &operation_id)
+        .unwrap()
+        .unwrap();
+    let intended = operation
+        .intended_git_sha
+        .clone()
+        .expect("durable publication intent");
+    assert!(operation.last_confirmed_git_sha.is_none());
+    assert_eq!(
+        state.db.get_repo_watermark(&id).unwrap(),
+        (0, String::new())
+    );
+    assert_eq!(git_rev_list_count(&bare), 1);
+    assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+    assert_eq!(
+        state
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND status='applied'",
+                [&id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    std::env::remove_var("REPOSYNC_IMPORT_LOST_PUSH_REPLY");
+    let trace = tmp.path().join("snapshot-reconcile-git-events.jsonl");
+    std::env::set_var("GIT_TRACE2_EVENT", &trace);
+
+    // Reuse the production WebServer initialization and the same isolated
+    // fixture data/engine, replacing only the stopped HTTP server and DB handle.
+    let config = state.config.clone();
+    let engine = state.sync_engine.clone();
+    let trigger = state.sync_trigger.clone();
+    server.abort();
+    drop(state);
+    let db = Database::new(tmp.path().join("reposync.db")).unwrap();
+    db.initialize().unwrap();
+    db.hold_interrupted_imports().unwrap();
+    let state = reposync_web::WebServer::new(
+        config,
+        db,
+        engine,
+        trigger,
+        tmp.path().join("config.toml"),
+        Arc::new(tokio::sync::RwLock::new(ImportProgress::default())),
+    )
+    .app_state();
+    state.sessions.write().await.insert(
+        TEST_TOKEN.into(),
+        chrono::Utc::now() + chrono::Duration::hours(1),
+    );
+    let app = Router::new()
+        .merge(api::repos::routes())
+        .with_state(state.clone());
+    let (addr, server) = spawn_isolated_test_server(app);
+    let reconcile = format!("http://{addr}/api/repos/{id}/import/{operation_id}/reconcile");
+    // A disappeared ref is uncertainty, never permission to publish or advance
+    // a checkpoint. Restore only this fixture's exact previously observed ref
+    // before exercising the positive authenticated reconciliation.
+    git_cmd(
+        tmp.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "-d",
+            "refs/heads/main",
+            &intended,
+        ],
+    );
+    let absent = client.post(&reconcile).send().await.unwrap();
+    assert_eq!(absent.status(), reqwest::StatusCode::OK);
+    let absent: serde_json::Value = absent.json().await.unwrap();
+    assert_eq!(absent["lifecycle"], "reconciliation_required", "{absent}");
+    assert_eq!(absent["checkpoint_completed"], false);
+    assert_eq!(
+        state.db.get_repo_watermark(&id).unwrap(),
+        (0, String::new())
+    );
+    assert_eq!(
+        state
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND status='applied'",
+                [&id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    git_cmd(
+        tmp.path(),
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            &intended,
+            &"0".repeat(40),
+        ],
+    );
+    for attempt in 0..2 {
+        let response = client.post(&reconcile).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let result: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            result["lifecycle"], "completed",
+            "attempt {attempt}: {result}"
+        );
+        assert_eq!(result["checkpoint_completed"], true);
+        assert_eq!(
+            state.db.get_repo_watermark(&id).unwrap(),
+            (2, intended.clone())
+        );
+        assert_eq!(git_rev_list_count(&bare), 1);
+        assert_eq!(git_show(&bare, "main:history.txt"), b"first\n");
+        assert_eq!(state.db.conn().query_row("SELECT COUNT(*) FROM sync_records WHERE repo_id=?1 AND status='applied' AND svn_rev=2 AND git_sha=?2", rusqlite::params![id, intended], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            state
+                .db
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM commit_map WHERE repo_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(state.db.active_import_operation(&id).unwrap().is_none());
+    }
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "start")
+        .filter_map(|event| event["argv"].as_array())
+        .collect();
+    assert!(
+        starts
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "ls-remote")),
+        "fresh Git observation must actually execute"
+    );
+    assert!(
+        !starts.iter().any(|args| args
+            .iter()
+            .filter_map(|arg| arg.as_str())
+            .any(|arg| matches!(arg, "push" | "send-pack" | "receive-pack")
+                || arg.ends_with("git-receive-pack"))),
+        "reconcile and repeated receipts must not issue Git publication commands"
+    );
+    drop(environment);
+    eprintln!(
+        "RELIABILITY_EVIDENCE {}",
+        serde_json::json!({"case":"RS68_SNAPSHOT_LOST_REPLY_HTTP", "operation_id":operation_id,"snapshot_revision":2,"remote_commits":1,"applied_baseline_records":1,"database_and_server_reopened":true,"receipt_repeated":true})
+    );
     server.abort();
 }

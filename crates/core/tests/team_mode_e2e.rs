@@ -2510,7 +2510,12 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
         .expect("old generator did not report production import provenance");
     let original = old_root.join("install");
-    let candidate = tmp.path().join("candidate-install");
+    let installer_spec = std::env::var_os("REPOSYNC_INSTALL_UPDATE_SPEC");
+    let candidate = if installer_spec.is_some() {
+        tmp.path().join("installed-prefix/data")
+    } else {
+        tmp.path().join("candidate-install")
+    };
     let restored = tmp.path().join("restored-prewrite-install");
     copy_install_tree(&original, &candidate);
     copy_install_tree(&original, &restored);
@@ -2541,6 +2546,39 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
         git_output(&bare, &["rev-parse", "refs/heads/main"]),
         old_tip
     );
+    // Opt-in installer qualification uses this SAME authentic old-state copy.
+    // A supplied bad specification fails; it never falls back to library-only proof.
+    let installer_receipt = installer_spec.as_ref().map(|spec| {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test_install.py");
+        let output = Command::new("python3")
+            .arg(script)
+            .arg("--qualify-existing-update")
+            .arg("--root")
+            .arg(candidate.parent().unwrap())
+            .arg("--spec")
+            .arg(spec)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .expect("run the owned installer qualification fixture");
+        assert!(
+            output.status.success(),
+            "installed update qualification: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("complete installer qualification receipt");
+        assert_eq!(receipt["case"], "R12_PINNED_INSTALLER_UPDATE");
+        assert_eq!(receipt["old_source"], old_generation["generator_code"]);
+        let expected_head = std::env::var("REPOSYNC_INSTALL_UPDATE_HEAD")
+            .expect("installer qualification must bind the exact candidate head");
+        assert_eq!(receipt["candidate_source"], expected_head);
+        assert_eq!(receipt["installer_preserved_state_bytes_and_modes"], true);
+        assert_eq!(receipt["installed_cli_executed"], true);
+        assert_eq!(receipt["omitted_mode_full_import_revisions"], 2);
+        assert_eq!(receipt["full_import_repeat_noop"], true);
+        receipt
+    });
     let mut config = make_app_config(&svn_url, &candidate);
     config.svn.layout = reposync_core::config::SvnLayout::Custom;
     let db_path = candidate.join("reposync.db");
@@ -2804,6 +2842,11 @@ async fn candidate_r01_old_import_cursor_survives_svn_only_poll_and_upgrade() {
             "repository_mapping_rows":mapped_rows,
         })
     );
+    // Publish the installer-tier receipt only after every retained engine,
+    // preservation, bidirectional and reconstructed-no-op assertion succeeds.
+    if let Some(receipt) = installer_receipt {
+        eprintln!("RELIABILITY_EVIDENCE {}", receipt);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
