@@ -192,6 +192,19 @@ class OfflineInstaller(unittest.TestCase):
         self.assertEqual((stages[0] / "reposync.previous").read_bytes(), self.old["reposync"])
         self.assertEqual(self.state(), self.before)
 
+    def test_supplied_invalid_qualification_spec_fails_without_fallback(self):
+        specification = self.area / "invalid-spec.json"
+        for content in ("not json", '{"kind":"unsupported"}'):
+            with self.subTest(content=content):
+                specification.write_text(content)
+                result = subprocess.run([sys.executable, str(SCRIPTS / "test_install.py"),
+                                         "--qualify-existing-update", "--root", str(self.root),
+                                         "--spec", str(specification)],
+                                        capture_output=True, text=True, timeout=15)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("R12_PINNED_INSTALLER_UPDATE", result.stdout)
+                self.assert_old()
+
 
 def package_into(record, destination):
     """Fixture construction from an authentic, separately pinned product package."""
